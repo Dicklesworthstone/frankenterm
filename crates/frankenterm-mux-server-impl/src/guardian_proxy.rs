@@ -62,6 +62,9 @@ const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
+/// A checkpoint publication, or its wait for the pane's lease, slower than
+/// this says where its time went (a recovery capture has 30 s for all panes).
+const SLOW_CHECKPOINT_PHASE: Duration = Duration::from_millis(1_000);
 // The protocol's largest chunk: a pane's reader uploads its checkpoint inline,
 // and every chunk is a guardian round trip under the Stage directory lock.
 const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 =
@@ -2266,15 +2269,39 @@ impl GuardianCheckpointPublisher {
         transport: &mut dyn GuardianCheckpointStageTransport,
         pending: &mut PendingGuardianCheckpointPublication,
     ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+        let started = Instant::now();
         let completion_id = pending.drive_to_sealed(transport)?;
+        let sealed = started.elapsed();
         let adoption_receipt = if let Some(receipt) = pending.adoption_receipt {
             receipt
         } else {
-            let receipt = actor.lock().publish_checkpoint(pending.intent())?;
+            let mut actor = actor.lock();
+            let lease_wait = started.elapsed().saturating_sub(sealed);
+            let receipt = actor.publish_checkpoint(pending.intent())?;
+            drop(actor);
+            if lease_wait > SLOW_CHECKPOINT_PHASE {
+                log::warn!(
+                    "guardian checkpoint adoption waited {} ms for the pane's lease",
+                    lease_wait.as_millis()
+                );
+            }
             pending.adoption_receipt = Some(receipt);
             receipt
         };
+        let adopted = started.elapsed();
         pending.drive_ack(transport, completion_id)?;
+        let total = started.elapsed();
+        if total > SLOW_CHECKPOINT_PHASE {
+            // Which phase a slow capture spent its time in: the staged
+            // upload, the catalog adoption (lease wait included), the Ack.
+            log::warn!(
+                "guardian checkpoint publication took {} ms: stage {} ms, adoption {} ms, ack {} ms",
+                total.as_millis(),
+                sealed.as_millis(),
+                adopted.saturating_sub(sealed).as_millis(),
+                total.saturating_sub(adopted).as_millis()
+            );
+        }
         Ok(adoption_receipt)
     }
 

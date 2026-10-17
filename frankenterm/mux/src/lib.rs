@@ -5987,12 +5987,29 @@ mod pane_registration_handle {
                     .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?;
                 cursor.source
             };
+            let started = Instant::now();
             let capture = self
                 .capture_live_parser_checkpoint_source_cancelling(
                     source, limits, timeout, cancelled,
                 )
                 .map_err(anyhow::Error::new)?;
-            self.publish_and_record_guardian_checkpoint(capture)
+            let captured = started.elapsed();
+            let payload_bytes = capture.terminal_checkpoint().canonical_payload().len();
+            let published = self.publish_and_record_guardian_checkpoint(capture);
+            let total = started.elapsed();
+            if total > Duration::from_secs(1) {
+                // A recovery capture takes every pane's checkpoint in turn
+                // within one budget: say what a slow one spent its time on.
+                log::warn!(
+                    "guardian checkpoint of pane {} took {} ms: parser {} ms, publication {} ms, {} payload bytes",
+                    self.generation.pane_id,
+                    total.as_millis(),
+                    captured.as_millis(),
+                    total.saturating_sub(captured).as_millis(),
+                    payload_bytes
+                );
+            }
+            published
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
