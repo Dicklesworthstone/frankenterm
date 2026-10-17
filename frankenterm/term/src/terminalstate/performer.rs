@@ -4241,6 +4241,72 @@ mod tests {
         }
     }
 
+    /// Prints `pieces` in reads of `read` bytes, with the segmenter alone
+    /// or not, into a `cols`-wide screen on the chosen engine.
+    fn print_pieces(
+        pieces: &[&str],
+        cols: usize,
+        read: usize,
+        page: bool,
+        force_segmenter: bool,
+    ) -> String {
+        #[derive(Debug)]
+        struct EngineConfig(crate::config::GridEngine);
+        impl TerminalConfiguration for EngineConfig {
+            fn scrollback_size(&self) -> usize {
+                16
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig::default()
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> crate::config::GridEngine {
+                self.0
+            }
+        }
+        let engine = if page {
+            crate::config::GridEngine::Page
+        } else {
+            crate::config::GridEngine::Legacy
+        };
+        let stream = pieces.concat();
+        FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(EngineConfig(engine));
+        let size = TerminalSize {
+            rows: 4,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: 64,
+            dpi: 96,
+        };
+        let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+        for chunk in stream.as_bytes().chunks(read) {
+            terminal.advance_bytes(chunk);
+        }
+        terminal.advance_bytes(b"Z");
+        FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+        format!("{:?}", snapshot_terminal(&terminal))
+    }
+
+    /// The proptest's first failure, which was another test's global
+    /// switch flipping between its two prints (both now hold
+    /// `test_switches`), kept as a fixed case.
+    #[test]
+    fn plain_run_regression_insert_mode_after_a_zwj_tail() {
+        let _switches = test_switches();
+        let pieces = [
+            "\x1b[?7h", "\x08", "\x1b[?69l", "\u{4e2d}", "\u{1f600}", "\t", "\x1b[4l", " ",
+            "\n", "\n", "a\u{200d}", "\u{1f3fb}", "\t", "\u{903}", "\x1b[m", "\u{200b}",
+            "\x1b[31m", "\n", "\x1b[m", "\x1b[4h", "\u{645}\u{631}", "\u{1f3fb}", "\x1b[4l",
+        ];
+        assert_eq!(
+            print_pieces(&pieces, 9, 11, false, false),
+            print_pieces(&pieces, 9, 11, false, true)
+        );
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(160))]
 
@@ -4265,49 +4331,12 @@ mod tests {
             read in 1usize..24,
             page in proptest::bool::ANY,
         ) {
-            #[derive(Debug)]
-            struct EngineConfig(crate::config::GridEngine);
-            impl TerminalConfiguration for EngineConfig {
-                fn scrollback_size(&self) -> usize {
-                    16
-                }
-                fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
-                    ScrollbackTierConfig::default()
-                }
-                fn color_palette(&self) -> ColorPalette {
-                    ColorPalette::default()
-                }
-                fn grid_engine(&self) -> crate::config::GridEngine {
-                    self.0
-                }
-            }
-            let engine = if page {
-                crate::config::GridEngine::Page
-            } else {
-                crate::config::GridEngine::Legacy
-            };
-            let stream = pieces.concat();
-            let print = |force_segmenter: bool| {
-                FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
-                let config: Arc<dyn TerminalConfiguration + Send + Sync> =
-                    Arc::new(EngineConfig(engine));
-                let size = TerminalSize {
-                    rows: 4,
-                    cols,
-                    pixel_width: cols * 8,
-                    pixel_height: 64,
-                    dpi: 96,
-                };
-                let mut terminal =
-                    Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
-                for chunk in stream.as_bytes().chunks(read) {
-                    terminal.advance_bytes(chunk);
-                }
-                terminal.advance_bytes(b"Z");
-                FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
-                snapshot_terminal(&terminal)
-            };
-            proptest::prop_assert_eq!(print(false), print(true));
+            // Other tests flip process-wide print switches while holding it.
+            let _switches = test_switches();
+            proptest::prop_assert_eq!(
+                print_pieces(&pieces, cols, read, page, false),
+                print_pieces(&pieces, cols, read, page, true)
+            );
         }
     }
 
