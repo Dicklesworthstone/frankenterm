@@ -268,8 +268,9 @@ mod tests {
         )
         .chars()
         .collect();
-        let sampled =
-            |cp: u32| cp < 0x2_0000 || (0xe_0000..0xf_0000).contains(&cp) || (cp >> 8) % 17 == 0;
+        let sampled = |cp: u32| {
+            cp < 0x2_0000 || (0xe_0000..0xf_0000).contains(&cp) || (cp >> 8).is_multiple_of(17)
+        };
         let mut table = PrintCharTable::default();
         let mut text = String::new();
         for c in (0..=0x10_ffff_u32)

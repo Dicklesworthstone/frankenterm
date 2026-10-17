@@ -7197,16 +7197,25 @@ impl Screen {
             .saturating_mul(LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER.max(1))
     }
 
+    /// Every cell write lands here; with no frame retained (the usual case)
+    /// it is one inlined check.
+    #[inline]
     fn invalidate_last_good_frame(
         &mut self,
         transition: LastGoodFrameTransition,
         seqno: Option<SequenceNo>,
     ) {
-        // Every cell write lands here; with no frame retained (the usual
-        // case) there is nothing to move out of the slot.
-        if self.last_good_frame.is_none() {
-            return;
+        if self.last_good_frame.is_some() {
+            self.invalidate_retained_last_good_frame(transition, seqno);
         }
+    }
+
+    #[inline(never)]
+    fn invalidate_retained_last_good_frame(
+        &mut self,
+        transition: LastGoodFrameTransition,
+        seqno: Option<SequenceNo>,
+    ) {
         if let Some(prior) = self.last_good_frame.take() {
             self.last_good_frame_lifecycle.invalidation_count = self
                 .last_good_frame_lifecycle
