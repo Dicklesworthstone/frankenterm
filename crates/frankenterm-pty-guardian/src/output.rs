@@ -154,9 +154,9 @@ const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
 /// the newer root supersedes it), and every capture that published a member
 /// but failed before its whole-mux commit adds one the guardian cannot tell
 /// apart (each is acknowledged before that commit). Live checkpoints adopt
-/// members too, so the mux adopts at most three of them after the newest
-/// root's member (`GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT`); the newest 8 then
-/// survive three failed root captures in a row. At 4, two failures on a busy
+/// members too, so while it publishes roots the mux adopts none after the
+/// newest root's member (`GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT`); the newest 8
+/// then survive six failed root captures in a row. At 4, two failures on a busy
 /// guardian reclaimed the older root's member and the mux's recovery store
 /// rejected its own committed graph for good.
 const CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS: usize = CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS;
@@ -3660,11 +3660,12 @@ impl GuardianCheckpointStageStore {
                 }
                 census = checkpoint_stage_census(inner)?;
             }
-            let inspection = checkpoint_inspect_upload(
+            let inspection = checkpoint_inspect_upload_chunks(
                 inner,
                 &census,
                 &shape,
                 CheckpointStageSealInspection::Reject,
+                CheckpointStageChunkInspection::Structure,
             )?
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             Ok(GuardianCheckpointStageReplyV1::Ready {
@@ -3689,11 +3690,12 @@ impl GuardianCheckpointStageStore {
             .map_err(GuardianCheckpointStageStoreError::Protocol)?;
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
-            let inspection = checkpoint_inspect_upload(
+            let inspection = checkpoint_inspect_upload_chunks(
                 inner,
                 &census,
                 &shape,
                 CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+                CheckpointStageChunkInspection::Structure,
             )?
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if index < inspection.next_index {
@@ -8249,6 +8251,48 @@ fn checkpoint_write_created_record(
     Ok(())
 }
 
+/// What [`checkpoint_read_record`] does for a record's durability, without
+/// reading it: a record this store incarnation has not synced (one found on
+/// disk after a restart, or whose creator lost its reply between the data and
+/// the directory sync) is synced once before it can count toward a Ready or
+/// Progress reply.
+fn checkpoint_ensure_record_durable(
+    inner: &GuardianCheckpointStageStoreInner,
+    entry: &CheckpointStageCensusEntry,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let file = open_private_file_at(&inner.directory, &inner.directory_path, &entry.path, false)?;
+    let metadata = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-record-durability-metadata", error)
+    })?;
+    validate_private_file_metadata(&metadata, Some(entry.bytes))?;
+    let identity = FileIdentity::capture(&metadata, Some(entry.bytes));
+    let durability_known = inner
+        .durable_records
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?
+        .contains(&identity);
+    if durability_known {
+        return Ok(());
+    }
+    file.sync_all().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-record-retry-sync", error)
+    })?;
+    inner.directory.sync_all().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-record-retry-directory-sync", error)
+    })?;
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    validate_file_identity_at(
+        &inner.directory,
+        &inner.directory_path,
+        &entry.path,
+        identity,
+    )?;
+    checkpoint_remember_durable_record(inner, identity)
+}
+
 fn checkpoint_remember_durable_record(
     inner: &GuardianCheckpointStageStoreInner,
     identity: FileIdentity,
@@ -8496,6 +8540,39 @@ fn checkpoint_inspect_upload(
     shape: &CheckpointStageRequestShape,
     seal_inspection: CheckpointStageSealInspection,
 ) -> Result<Option<CheckpointStageUploadInspection>, GuardianCheckpointStageStoreError> {
+    checkpoint_inspect_upload_chunks(
+        inner,
+        census,
+        shape,
+        seal_inspection,
+        CheckpointStageChunkInspection::Authenticate,
+    )
+}
+
+/// How [`checkpoint_inspect_upload_chunks`] treats the chunks already staged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointStageChunkInspection {
+    /// Decrypt and authenticate every chunk and, once all are present,
+    /// derive the ordered chunk-set identity a Seal binds.
+    Authenticate,
+    /// Check each chunk's index, publication and exact record size from the
+    /// census, and that it is durable (synced once per store incarnation),
+    /// without decrypting it: what a Begin or a Chunk needs (the next index
+    /// and the bytes committed). Each chunk was authenticated right after
+    /// this store wrote it, and a Seal authenticates every one again.
+    /// Decrypting the whole prefix for every chunk made an upload
+    /// quadratic: an 11 MB checkpoint's 45 chunks cost the guardian's single
+    /// checkpoint worker 5-7 s, ahead of every other pane's capture.
+    Structure,
+}
+
+fn checkpoint_inspect_upload_chunks(
+    inner: &GuardianCheckpointStageStoreInner,
+    census: &CheckpointStageCensus,
+    shape: &CheckpointStageRequestShape,
+    seal_inspection: CheckpointStageSealInspection,
+    chunk_inspection: CheckpointStageChunkInspection,
+) -> Result<Option<CheckpointStageUploadInspection>, GuardianCheckpointStageStoreError> {
     let mut candidate = None;
     let mut chunks = BTreeMap::new();
     let mut seal = None;
@@ -8611,6 +8688,20 @@ fn checkpoint_inspect_upload(
         let expected_bytes = remaining.min(u64::from(shape.chunk_bytes));
         let expected_bytes_u32 = u32::try_from(expected_bytes)
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        if chunk_inspection == CheckpointStageChunkInspection::Structure {
+            let record_bytes = checkpoint_record_bytes_for_plaintext(
+                usize::try_from(expected_bytes)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            if entry.bytes != record_bytes {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            checkpoint_ensure_record_durable(inner, entry)?;
+            committed_bytes = committed_bytes
+                .checked_add(expected_bytes)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            continue;
+        }
         let (context, plaintext) = checkpoint_open_record(inner, entry, expected_bytes_u32)?;
         let plaintext_bytes = u64::try_from(plaintext.len())
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
@@ -8635,12 +8726,15 @@ fn checkpoint_inspect_upload(
     }
     let next_index =
         u32::try_from(chunks.len()).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
-    let ordered_chunk_set_identity =
-        if next_index == shape.total_chunks && committed_bytes == shape.total_bytes {
-            Some(ordered_chunk_set.finish()?)
-        } else {
-            None
-        };
+    let ordered_chunk_set_identity = if chunk_inspection
+        == CheckpointStageChunkInspection::Authenticate
+        && next_index == shape.total_chunks
+        && committed_bytes == shape.total_bytes
+    {
+        Some(ordered_chunk_set.finish()?)
+    } else {
+        None
+    };
     Ok(Some(CheckpointStageUploadInspection {
         publication_id,
         next_index,
@@ -21853,6 +21947,77 @@ mod tests {
                 next_index: total_chunks,
                 committed_bytes: u64::try_from(payload.len())?,
             }
+        );
+        Ok(())
+    }
+
+    /// A Chunk checks the staged prefix by structure only (each chunk was
+    /// authenticated when written), so an upload stays linear; whatever
+    /// authenticates the upload (a Query here, a Seal in production) still
+    /// decrypts every chunk and refuses one damaged since.
+    #[test]
+    fn a_chunk_trusts_the_staged_prefix_and_authentication_still_catches_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-structure-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0x51);
+        let upload_id = Uuid::from_u128(0x52);
+        let payload = b"structure-checked-checkpoint-chunks";
+        let chunk_bytes = 8;
+        let request = |kind, chunk: Option<(u32, &[u8])>| {
+            checkpoint_test_genesis_request(
+                kind,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                chunk,
+            )
+        };
+        store.apply_begin(&request(GuardianCheckpointStageKindV1::Begin, None)?)?;
+        let chunks: Vec<&[u8]> = payload.chunks(usize::try_from(chunk_bytes)?).collect();
+        for (index, bytes) in chunks.iter().take(2).enumerate() {
+            let index = u32::try_from(index)?;
+            store.apply_chunk(request(
+                GuardianCheckpointStageKindV1::Chunk,
+                Some((index, bytes)),
+            )?)?;
+        }
+        // Damage the first chunk's record without changing its size.
+        store.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let first = census
+                .entries
+                .iter()
+                .find(|entry| matches!(entry.role, CheckpointStageFileRole::Chunk { index: 0, .. }))
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            let mut bytes = std::fs::read(&first.path)
+                .map_err(|error| GuardianCheckpointStageStoreError::io("fixture-read", error))?;
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x5a;
+            std::fs::write(&first.path, &bytes)
+                .map_err(|error| GuardianCheckpointStageStoreError::io("fixture-write", error))?;
+            Ok(())
+        })?;
+        assert_eq!(
+            store.apply_chunk(request(
+                GuardianCheckpointStageKindV1::Chunk,
+                Some((2, chunks[2])),
+            )?)?,
+            GuardianCheckpointStageReplyV1::Progress {
+                upload_id,
+                next_index: 3,
+                committed_bytes: 24,
+            }
+        );
+        // Authenticating the upload decrypts every chunk: the damaged one
+        // quarantines it.
+        assert_eq!(
+            store.apply_query(request(GuardianCheckpointStageKindV1::Query, None)?)?,
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id }
         );
         Ok(())
     }
