@@ -532,11 +532,17 @@ struct GuardianCheckpointStageStoreInner {
     gate: Mutex<()>,
     durable_records: Mutex<Vec<FileIdentity>>,
     replay: Mutex<GuardianReplayState>,
+    /// Checksums of catalog candidates whose records this store has already
+    /// authenticated (see `checkpoint_catalog_validate_candidate_records`).
+    validated_candidates: Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>>,
     #[cfg(test)]
     custody_sync_failure: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     custody_publication_cut: std::sync::atomic::AtomicU8,
 }
+
+/// Validated candidate checksums a store remembers before it starts over.
+const CHECKPOINT_CATALOG_VALIDATED_MEMO_ENTRIES: usize = 4096;
 
 /// Authenticated durable intent, not a Claim acknowledgement or live lease.
 pub struct GuardianDurableRecoveryClaimIntentV1 {
@@ -3569,6 +3575,7 @@ impl GuardianCheckpointStageStore {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
+                validated_candidates: Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 #[cfg(test)]
@@ -12836,6 +12843,44 @@ fn checkpoint_catalog_validate_candidate_records(
     checkpoint_catalog_candidate_completion(inner, candidate).map(drop)
 }
 
+/// [`checkpoint_catalog_validate_candidate_records`] for a candidate just
+/// decoded from its file, once per distinct candidate.
+///
+/// Every catalog scan authenticates every member: it decrypts each chunk and
+/// validates the whole checkpoint payload. A publication and its Ack scanned
+/// a pane's catalog up to seven times, re-validating up to eight unchanged
+/// members each time, so captures grew slower as catalogs filled until twelve
+/// panes overran the capture budget. The result depends only on the
+/// candidate's header and records and this store's keys, and a decoded
+/// candidate's checksum is a domain-separated SHA-256 of exactly those bytes,
+/// which decoding verified. A checksum this store has authenticated
+/// therefore names bytes that authenticate again, and is not checked twice.
+/// A candidate built in memory has no checksum yet and must take the
+/// unmemoized check.
+fn checkpoint_catalog_validate_decoded_candidate_records(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    fn memo(
+        inner: &GuardianCheckpointStageStoreInner,
+    ) -> std::sync::MutexGuard<'_, BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>> {
+        inner
+            .validated_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    if memo(inner).contains(&candidate.checksum) {
+        return Ok(());
+    }
+    checkpoint_catalog_validate_candidate_records(inner, candidate)?;
+    let mut validated = memo(inner);
+    if validated.len() >= CHECKPOINT_CATALOG_VALIDATED_MEMO_ENTRIES {
+        validated.clear();
+    }
+    validated.insert(candidate.checksum);
+    Ok(())
+}
+
 /// Authenticate a catalog candidate's copied stage records (Begin, every
 /// chunk, Seal) and return the upload shape and the durable completion they
 /// prove, exactly as the stage upload itself would.
@@ -13502,7 +13547,7 @@ fn checkpoint_catalog_scan(
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+        checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
         let authenticated_generic_restore = match (
             candidate.format,
             candidate.metadata.identity.scope,
@@ -17045,6 +17090,7 @@ mod tests {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
+                validated_candidates: Mutex::new(BTreeSet::new()),
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
             }),
@@ -17435,6 +17481,60 @@ mod tests {
             Ok(scan.published.len())
         })?;
         assert_eq!(published, 2);
+        Ok(())
+    }
+
+    /// A scan remembers which candidates it authenticated, by checksum. A
+    /// member corrupted after a scan remembered it fails the next scan all
+    /// the same: decoding checks the checksum against the bytes first.
+    #[test]
+    fn a_candidate_corrupted_after_a_scan_still_fails_the_next_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-memo-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xac100);
+        let mux = Uuid::from_u128(0xac101);
+        let pane = Uuid::from_u128(0xac102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xac_0000,
+            b"first;", b"first;",
+        )?;
+        let candidate_path = store.with_exclusive_directory(|inner| {
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(scan.published.len(), 1);
+            assert!(
+                inner
+                    .validated_candidates
+                    .lock()
+                    .unwrap()
+                    .contains(&scan.published[0].candidate_checksum),
+                "the scan remembers the member it authenticated"
+            );
+            Ok(scan.published[0].candidate_path.clone())
+        })?;
+        // Flip a byte inside the records, past the fixed header.
+        let mut bytes = std::fs::read(&candidate_path)?;
+        let at = CHECKPOINT_CATALOG_HEADER_BYTES + 8;
+        bytes[at] ^= 0x40;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&candidate_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let rescanned = store.with_exclusive_directory(|inner| {
+            checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })
+        });
+        assert!(
+            matches!(rescanned, Err(GuardianCheckpointStageStoreError::Poisoned)),
+            "a corrupted member fails the scan: {:?}",
+            rescanned.map(|scan| scan.published.len())
+        );
         Ok(())
     }
 
