@@ -35,6 +35,7 @@ mod keyboard;
 mod kitty;
 mod mouse;
 pub(crate) mod performer;
+mod print_segments;
 mod sixel;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
@@ -549,6 +550,10 @@ pub struct TerminalState {
     /// While false, a multi-byte grapheme cannot continue its left neighbour,
     /// so `print` skips the cluster-continuation scan entirely.
     zwj_tail_cell_possible: bool,
+
+    /// The print path's character classes and widths (ft-yccm0.3.2.6), a
+    /// cache that follows `unicode_version`.
+    print_char_table: print_segments::PrintCharTable,
 
     enable_conpty_quirks: bool,
     /// On Windows, the ConPTY layer emits an OSC sequence to
@@ -1131,6 +1136,7 @@ impl TerminalState {
             unicode_version,
             unicode_version_stack: vec![],
             zwj_tail_cell_possible: false,
+            print_char_table: Default::default(),
             suppress_initial_title_change: false,
             enable_conpty_quirks: false,
             accumulating_title: None,

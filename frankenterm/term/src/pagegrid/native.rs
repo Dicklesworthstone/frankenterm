@@ -237,13 +237,13 @@ fn write_grapheme(
 }
 
 /// Legacy `Line::set_cell_grapheme` of each `(text, width)` in `cells`, one
-/// after the other from column `x` (widths 1 or 2), when the run appends at
-/// the row's end: one style classification, header update and seqno move
-/// for the run. Returns false, writing nothing, for any other run (one
-/// that overwrites, starts past a clustered row's end, holds text that a
-/// cell would not keep as it is, carries images, or that
-/// [`Page::append_graphemes`] declines); the caller then writes it cell by
-/// cell.
+/// after the other from column `x` (widths 1 or 2): one style
+/// classification, header update and seqno move for the run, which
+/// [`Page::append_graphemes`] stores at or past the row's end and
+/// [`Page::put_graphemes`] over it. Returns false, writing nothing, for a
+/// run that starts past a clustered row's end, holds text that a cell would
+/// not keep as it is, carries images, or that the page declines; the caller
+/// then writes it cell by cell.
 pub fn set_grapheme_run(
     page: &mut Page,
     row: u32,
@@ -260,18 +260,19 @@ pub fn set_grapheme_run(
         !matches!(text.as_bytes(), [] | b"\r\n" | [0x00..=0x1f | 0x7f])
             && text.len() <= MAX_GRAPHEME_BYTES
     };
-    if x < len
-        || (clustered && x > len)
+    if (clustered && x > len)
         || !cells.iter().all(|&(text, _)| kept_whole(text))
         || attr.images().is_some_and(|images| !images.is_empty())
     {
         return false;
     }
+    let overwrite = x < len;
     // A clustered row stays clustered while each cell's first character
     // breaks from the text before it (`ClusteredLine::can_append_cell_at`);
-    // the first that does not makes it a vector row, which changes no cell.
-    let mut vector = false;
-    if clustered {
+    // the first that does not, or a cell that does not append, makes it a
+    // vector row, which changes no cell.
+    let mut vector = clustered && overwrite;
+    if clustered && !overwrite {
         let mut prev = last_char(page, row);
         for &(text, _) in cells {
             let mut chars = text.chars();
@@ -296,14 +297,22 @@ pub fn set_grapheme_run(
     write.semantic = attr.semantic_type();
     write.wrapped = attr.wrapped();
     write.hyperlink = attr.hyperlink();
-    if !page.append_graphemes(row, x, cells, write, seqno) {
+    let stored = if overwrite {
+        page.put_graphemes(row, x, cells, write, seqno)
+    } else {
+        page.append_graphemes(row, x, cells, write, seqno)
+    };
+    if !stored {
         return false;
     }
     if vector {
         set_vector(page, row);
     }
     if attr.protected() {
-        let end = x + cells.iter().map(|&(_, width)| usize::from(width)).sum::<usize>();
+        let end = x + cells
+            .iter()
+            .map(|&(_, width)| usize::from(width))
+            .sum::<usize>();
         page.protect_cells(row, x..end);
     }
     true

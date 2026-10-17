@@ -5158,6 +5158,7 @@ impl TerminalState {
             // Restored cells were not written by this performer, so any of
             // them may end in ZWJ; keep the continuation scan enabled.
             zwj_tail_cell_possible: true,
+            print_char_table: Default::default(),
             enable_conpty_quirks,
             suppress_initial_title_change,
             accumulating_title,

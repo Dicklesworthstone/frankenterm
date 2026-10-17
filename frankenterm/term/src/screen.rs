@@ -7202,6 +7202,11 @@ impl Screen {
         transition: LastGoodFrameTransition,
         seqno: Option<SequenceNo>,
     ) {
+        // Every cell write lands here; with no frame retained (the usual
+        // case) there is nothing to move out of the slot.
+        if self.last_good_frame.is_none() {
+            return;
+        }
         if let Some(prior) = self.last_good_frame.take() {
             self.last_good_frame_lifecycle.invalidation_count = self
                 .last_good_frame_lifecycle

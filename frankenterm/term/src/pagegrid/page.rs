@@ -1241,9 +1241,7 @@ impl Page {
             let glyph = Glyph::from_text(text);
             let wide = width == 2;
             let off = self.offset(slot, col);
-            let mut head = template
-                .with_codepoint(glyph.codepoint())
-                .with_wide(wide);
+            let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
             if let Glyph::Cluster(text) = glyph {
                 self.graphemes.insert(off, text);
                 head = head.with_grapheme(true);
@@ -1268,6 +1266,98 @@ impl Page {
         self.set_header(row, header.with_len(end).with_flags(flags, true));
         self.touch(slot, seqno);
         self.debug_check_cells(row, old_len.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
+    }
+
+    /// [`Self::append_graphemes`] for a run that starts within the row (or
+    /// at its end) and may extend it: each old cell's side entries released
+    /// first, as [`Self::write`] releases them. Returns false, writing
+    /// nothing, for an empty run, one that starts past the end, passes the
+    /// page's stride or carries images, or one that meets a cell whose
+    /// overwrite `write` handles specially: a wide or hidden cell, or one
+    /// with images, among the cells it covers, or a wide cell just before
+    /// it. Every covered cell was then narrow and visible, so nothing past
+    /// the run was hidden by one of them, and none is by the run either.
+    pub fn put_graphemes(
+        &mut self,
+        row: u32,
+        x: usize,
+        cells: &[(&str, u8)],
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(cells.iter().all(|&(_, width)| matches!(width, 1 | 2)));
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let stored: usize = cells.iter().map(|&(_, width)| usize::from(width)).sum();
+        let end = x.saturating_add(stored);
+        if cells.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
+            return false;
+        }
+        if x > 0 && self.cell_at(slot, x - 1).is_wide() {
+            return false;
+        }
+        let kept = end.min(old_len);
+        if (x..kept).any(|col| {
+            let old = self.cell_at(slot, col);
+            old.is_wide() || old.is_hidden() || old.has_image()
+        }) {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        // Acquire before release (D3).
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            for _ in 1..stored {
+                self.styles.add_ref(id);
+            }
+        }
+        for col in x..kept {
+            let off = self.offset(slot, col);
+            let old = self.cell_at(slot, col);
+            self.release(off, old, false);
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        let mut col = x;
+        let mut any_cluster = false;
+        for &(text, width) in cells {
+            let glyph = Glyph::from_text(text);
+            let wide = width == 2;
+            let off = self.offset(slot, col);
+            let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
+            if let Glyph::Cluster(text) = glyph {
+                self.graphemes.insert(off, text);
+                head = head.with_grapheme(true);
+                any_cluster = true;
+            }
+            if let Some(link) = cell.hyperlink {
+                self.links.attach(off, link);
+            }
+            self.set_cell_at(slot, col, head);
+            if wide {
+                if let Some(link) = cell.hyperlink {
+                    self.links.attach(off + 1, link);
+                }
+                self.set_cell_at(slot, col + 1, template.with_hidden(true));
+            }
+            col += usize::from(width);
+        }
+        let mut flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        if any_cluster {
+            flags |= RowHeader::GRAPHEME;
+        }
+        self.set_header(
+            row,
+            header.with_len(old_len.max(end)).with_flags(flags, true),
+        );
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, x.saturating_sub(1)..(end + 1).min(self.stride()));
         true
     }
 

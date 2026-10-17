@@ -1,4 +1,5 @@
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::print_segments::{PrintCharTable, PrintSegments};
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, ProtectedMode, TabStop, UnicodeVersionStackEntry,
 };
@@ -7,7 +8,9 @@ use crate::{
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::{grapheme_column_width, is_white_space_grapheme, SemanticType};
+use frankenterm_cell::{
+    grapheme_column_width, is_white_space_grapheme, SemanticType, UnicodeVersion,
+};
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Sgr,
 };
@@ -352,6 +355,48 @@ impl<'a> Iterator for PrintGraphemes<'a> {
     }
 }
 
+/// Kill switch for the print path's per-character segmentation fast path
+/// (ft-yccm0.3.2.6): falsey segments with `PrintGraphemes` and computes
+/// every width.
+const PRINT_SEGMENT_FAST_PATH_ENV: &str = "FT_PRINT_SEGMENT_FAST_PATH";
+
+/// The graphemes of a print buffer, each with its column width when the
+/// segmentation already knows it: [`PrintSegments`], or with its fast path
+/// off (the kill switch, or the segmenter oracle in tests) `PrintGraphemes`,
+/// which knows no widths.
+enum PrintGraphemeWidths<'a, 't> {
+    Fast(PrintSegments<'a, 't>),
+    Plain(PrintGraphemes<'a>),
+}
+
+impl<'a, 't> PrintGraphemeWidths<'a, 't> {
+    fn new(text: &'a str, table: &'t mut PrintCharTable, version: &UnicodeVersion) -> Self {
+        #[cfg(test)]
+        if FORCE_GRAPHEME_SEGMENTER.with(|force| force.get()) {
+            return Self::Plain(PrintGraphemes::new(text));
+        }
+        static ENABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| !moonshot_env_falsey(PRINT_SEGMENT_FAST_PATH_ENV));
+        if *ENABLED {
+            Self::Fast(table.segments(text, version))
+        } else {
+            Self::Plain(PrintGraphemes::new(text))
+        }
+    }
+}
+
+impl<'a> Iterator for PrintGraphemeWidths<'a, '_> {
+    type Item = (&'a str, Option<usize>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Fast(segments) => segments.next(),
+            Self::Plain(graphemes) => graphemes.next().map(|g| (g, None)),
+        }
+    }
+}
+
 /// Whether grapheme `g` may continue the cell before it with no ZWJ between
 /// them (ft-cklgg): as a regional indicator, a wide Extend such as an emoji
 /// modifier, a spacing mark, Hangul jamo or a syllable, a conjunct's
@@ -501,7 +546,17 @@ impl<'a> Performer<'a> {
     }
 
     /// Writes the cells `flush_print` left pending; see [`PendingCells`].
+    #[inline]
     fn write_pending_cells(&mut self, pending: &mut PendingCells<'_>, seqno: usize) {
+        if !pending.cells.is_empty() {
+            self.write_pending_cell_run(pending, seqno);
+        }
+    }
+
+    /// Kept out of `flush_print`, which checks for pending cells at every
+    /// step, so that the print loop stays small.
+    #[inline(never)]
+    fn write_pending_cell_run(&mut self, pending: &mut PendingCells<'_>, seqno: usize) {
         let (x, y) = (pending.x, pending.y);
         match pending.cells[..] {
             [] => return,
@@ -956,19 +1011,22 @@ impl<'a> Performer<'a> {
         // After a grapheme that printed nothing, `g` may yet continue the
         // cell before it.
         let mut printed_cell = true;
-        let graphemes = PrintGraphemes::new(text);
+        let mut table = std::mem::take(&mut self.print_char_table);
+        let graphemes = PrintGraphemeWidths::new(text, &mut table, &self.unicode_version);
         // Cells are written in runs (`PendingCells`), except in insert mode,
-        // where each one first shifts the row, and for a lone grapheme (T0
+        // where each one first shifts the row, and for a lone character (T0
         // flushes one per SGR pair), which a run would only slow down.
-        let batch = !self.insert
-            && matches!(graphemes, PrintGraphemes::Segmented(_))
-            && print_cell_runs_enabled();
+        let lone = {
+            let mut chars = text.chars();
+            chars.next().is_some() && chars.next().is_none()
+        };
+        let batch = !self.insert && !lone && print_cell_runs_enabled();
         let mut pending = PendingCells::new(if batch {
             std::mem::take(&mut self.pending_cells)
         } else {
             Vec::new()
         });
-        for g in graphemes {
+        for (g, known_width) in graphemes {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             if let Some(cell) = junction.take() {
                 // Only the first grapheme meets the junction: nothing pends.
@@ -977,9 +1035,15 @@ impl<'a> Performer<'a> {
                     continue;
                 }
             }
+            let segmented = g;
             let g = self.remap_grapheme(g);
 
-            let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
+            let mut print_width = match known_width {
+                // A DEC or UK charset remaps some ASCII, whose width is then
+                // the replacement's.
+                Some(width) if std::ptr::eq(g, segmented) => width,
+                _ => grapheme_column_width(g, Some(&self.unicode_version)),
+            };
             if print_width == 0 {
                 // We got a zero-width grapheme.
 
@@ -1029,8 +1093,7 @@ impl<'a> Performer<'a> {
 
             // A multi-byte grapheme only continues its left neighbour when that
             // cell ends in ZWJ, which cannot exist until one has been written.
-            if g.len() > 1 && self.zwj_tail_cell_possible && !self.zwj_continuation_ruled_out()
-            {
+            if g.len() > 1 && self.zwj_tail_cell_possible && !self.zwj_continuation_ruled_out() {
                 self.write_pending_cells(&mut pending, seqno);
                 if self.recluster_at_cursor(g, true) {
                     continue;
@@ -1142,6 +1205,7 @@ impl<'a> Performer<'a> {
         if batch {
             self.pending_cells = pending.into_buffer();
         }
+        self.print_char_table = table;
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
@@ -3575,6 +3639,99 @@ mod tests {
             snapshot_terminal(&terminal)
         };
         assert_eq!(print(false), print(true));
+    }
+
+    /// ft-yccm0.3.2.6: printed cells written in runs leave every row, the
+    /// cursor and each row's storage form as writing them one by one does,
+    /// on both grid engines, whole and split into reads of a few bytes.
+    #[test]
+    fn printed_cell_runs_match_cell_by_cell_printing() {
+        #[derive(Debug)]
+        struct EngineConfig(crate::config::GridEngine);
+        impl TerminalConfiguration for EngineConfig {
+            fn scrollback_size(&self) -> usize {
+                64
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig::default()
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> crate::config::GridEngine {
+                self.0
+            }
+        }
+        let mixed = "\u{4e2d}\u{6587} abc \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301}x \
+                     \u{5d0}\u{5d1} \u{645}\u{631} \u{1f1fa}\u{1f1f8}\u{2764}\u{fe0f}|";
+        let mut stream = String::new();
+        for _ in 0..4 {
+            stream.push_str(mixed);
+        }
+        stream.push_str(concat!(
+            // Over existing cells: wide over narrow, narrow over wide, and
+            // a run that ends past the row's end.
+            "\x1b[1;3H\u{4e2d}a\u{1f600}b\u{6587}\u{6587}\u{6587}\u{6587}\u{6587}\u{6587}",
+            // Past the end of an empty row.
+            "\x1b[5;15Hxy\u{4e2d}",
+            // Autowrap off: a wide cell on the last column, then VS16.
+            "\x1b[?7l\x1b[6;14H\u{4e2d}\u{4e2d}a\u{2764}\u{fe0f}\u{4e2d}\x1b[?7h",
+            // Insert mode.
+            "\x1b[4h\x1b[2;2H\u{4e2d}z\u{6587}\x1b[4l",
+            // DEC special graphics.
+            "\x1b(0lqqk\u{4e2d}x\x1b(B",
+            // A hyperlink, then protected cells.
+            "\x1b]8;;http://example.com\x1b\\link\u{4e2d}\u{1f600}\x1b]8;;\x1b\\",
+            "\x1b[1\"qprot\u{4e2d}\u{6587}\x1b[0\"q",
+            // A ZWJ tail, continued after a flush; a mark after a flush.
+            "a\u{200d}\x1b[m\u{1f600}\u{4e2d}b e\x1b[1m\u{301}\u{4e2d}\x1b[m",
+            // Left and right margins.
+            "\x1b[?69h\x1b[3;10s\x1b[7;3H\u{4e2d}\u{6587}\u{4e2d}\u{6587}abcdef\u{1f600}\x1b[?69l",
+            // A scroll region, scrolled.
+            "\x1b[2;5r\x1b[5;1H\n\n\u{4e2d}x\u{1f600}\n\u{6587}\x1b[r",
+            // Colors, a tab and a backspace.
+            "\x1b[38;5;100m\u{4e2d}abc\x1b[48;2;1;2;3m\u{1f600}\u{6587}\x1b[m",
+            "\x1b[8;1Ha\tb\x08\u{4e2d}\u{6587}z",
+            // Overwrites over wide cells.
+            "\x1b[1;1H\u{4e2d}\u{6587}\x1b[1;2Hab\u{1f600}",
+        ));
+        let bytes = stream.as_bytes();
+        let print = |engine: crate::config::GridEngine, cell_by_cell: bool, read: usize| {
+            FORCE_CELL_BY_CELL_PRINT.with(|force| force.set(cell_by_cell));
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                Arc::new(EngineConfig(engine));
+            let size = TerminalSize {
+                rows: 8,
+                cols: 17,
+                pixel_width: 136,
+                pixel_height: 128,
+                dpi: 96,
+            };
+            let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            for chunk in bytes.chunks(read) {
+                terminal.advance_bytes(chunk);
+            }
+            FORCE_CELL_BY_CELL_PRINT.with(|force| force.set(false));
+            let storage: Vec<bool> = terminal
+                .screen()
+                .all_lines()
+                .iter()
+                .map(Line::has_clustered_storage)
+                .collect();
+            (snapshot_terminal(&terminal), storage)
+        };
+        for engine in [
+            crate::config::GridEngine::Legacy,
+            crate::config::GridEngine::Page,
+        ] {
+            for read in [bytes.len(), 7, 3] {
+                assert_eq!(
+                    print(engine, false, read),
+                    print(engine, true, read),
+                    "{engine:?}, reads of {read} bytes"
+                );
+            }
+        }
     }
 
     #[test]
