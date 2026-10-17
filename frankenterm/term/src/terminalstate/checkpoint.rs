@@ -7264,7 +7264,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
 
         /// Any output, in a small pane whose history scrolls, restores alike
         /// from either encoding.
