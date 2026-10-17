@@ -76,7 +76,25 @@ impl PageRows {
             .list
             .effective_seqno(stable)
             .expect("a retained row has a seqno");
-        line_view(row.page, row.row, seqno)
+        let mut line = line_view(row.page, row.row, seqno);
+        // A row enters scrollback only through a scroll, which legacy
+        // compresses as it goes and the page engine compresses here, when the
+        // row is first read (`Screen::page_compress_for_scrollback`).
+        if index + self.list.viewport_rows() < self.views.len()
+            && crate::screen::scrollback_compression_enabled()
+        {
+            line.compress_for_scrollback();
+        }
+        line
+    }
+
+    /// Drops row `index`'s cached view, unless an edit made it the row's
+    /// content; the next read builds it again.
+    pub fn drop_view(&mut self, index: usize) {
+        let view = &mut self.views[index];
+        if !view.edited {
+            view.line.take();
+        }
     }
 
     fn ensure_view(&mut self, index: usize) {
@@ -766,6 +784,53 @@ mod tests {
         (1..=lines)
             .flat_map(|n| format!("{}\n", n).into_bytes())
             .collect()
+    }
+
+    /// Rows that scroll into scrollback are compressed there: legacy as they
+    /// go, the page engine when a row is first read. Whatever the text, each
+    /// row reads back as the same `Line` in the same storage form and
+    /// length, and the lazy compression leaves no row held by a view.
+    #[test]
+    fn scrollback_rows_read_back_in_legacy_storage_form() {
+        let texts = [
+            "plain ascii",
+            "e\u{301} combining",
+            "\u{4e2d}\u{6587}wide",
+            "\u{1f468}\u{200d}\u{1f469} zwj",
+            "\u{2500}\u{2502}\u{250c} box",
+            // A wide character on the last column wraps whole.
+            "abcdefghi\u{4e2d}",
+            "\u{2764}\u{fe0f}\u{200d}",
+            "x\u{301}\u{301}y",
+        ];
+        let mut bytes = Vec::new();
+        for round in 0..6 {
+            for text in texts {
+                bytes.extend_from_slice(format!("{} {}\r\n", round, text).as_bytes());
+            }
+        }
+        let mut legacy = terminal(GridEngine::Legacy);
+        let mut page = terminal(GridEngine::Page);
+        legacy.advance_bytes(&bytes);
+        page.advance_bytes(&bytes);
+        assert_eq!(page.screen().grid_engine(), GridEngine::Page);
+        assert_eq!(page.screen().rows_held_by_views(), 0);
+        assert_eq!(decoded(&page), decoded(&legacy));
+        let forms = |terminal: &Terminal| {
+            terminal
+                .screen()
+                .all_lines()
+                .iter()
+                .map(|line| (line.has_clustered_storage(), line.len()))
+                .collect::<Vec<_>>()
+        };
+        let page_forms = forms(&page);
+        assert_eq!(page_forms, forms(&legacy));
+        let scrollback = page_forms.len() - 6;
+        assert!(scrollback > texts.len());
+        assert!(page_forms[..scrollback]
+            .iter()
+            .any(|(clustered, _)| *clustered));
     }
 
     /// ft-yccm0.3.3.4: page-engine rows decode exactly as legacy rows after

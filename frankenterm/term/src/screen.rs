@@ -4117,7 +4117,7 @@ fn cold_geometry_capture_enabled() -> bool {
     })
 }
 
-fn scrollback_compression_enabled() -> bool {
+pub(crate) fn scrollback_compression_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         scrollback_switch_on(std::env::var_os("FT_SCROLLBACK_WARM_COMPRESS").as_deref())
@@ -10427,9 +10427,19 @@ impl Screen {
 
     /// `Line::compress_for_scrollback` on row `index`, natively when the
     /// page-engine row allows it.
+    /// Legacy's `compress_for_scrollback` on the page-engine row about to
+    /// enter scrollback. A row a legacy edit left in its view is that view,
+    /// compressed in place as legacy does. A page row is compressed lazily,
+    /// when its view is built (`PageRows::build_view`): nothing writes a
+    /// scrollback row, so the view built later is the `Line` legacy holds,
+    /// and the rows nobody reads (most of a flood) never pay for the
+    /// segmentation check, about a third of a unicode flood's ingest. A view
+    /// cached while the row was visible is dropped, so the next read builds
+    /// the compressed one.
     fn page_compress_for_scrollback(&mut self, index: PhysRowIndex) {
-        if let Some((page, row)) = self.page_row(index) {
-            if native::compress_for_scrollback(page, row) {
+        if let Some(rows) = self.lines.page_mut() {
+            if !rows.is_edited(index) {
+                rows.drop_view(index);
                 return;
             }
         }
