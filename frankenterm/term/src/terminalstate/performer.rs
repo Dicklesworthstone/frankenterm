@@ -1082,11 +1082,19 @@ impl<'a> Performer<'a> {
             // pending run, `last_printed`, the cursor), without the checks
             // that cannot apply to it. Per-grapheme checks were the largest
             // part of a mixed-script flush (ft-yccm0.3.2.6).
+            //
+            // A ZWJ tail is ruled out as the general path rules it out: by
+            // the cell just printed, when it does not end in ZWJ. The
+            // terminal-wide flag alone, once a single cell anywhere ended in
+            // ZWJ, sent every later multi-byte character down the general
+            // path for the rest of the terminal's life.
             if plain_print
                 && follows_segmented_cell
                 && junction.is_none()
                 && !self.wrap_next
-                && (g.len() == 1 || !self.zwj_tail_cell_possible)
+                && (g.len() == 1
+                    || !self.zwj_tail_cell_possible
+                    || self.zwj_continuation_ruled_out())
             {
                 if let Some(width @ (1 | 2)) = known_width {
                     let x = self.cursor.x;
