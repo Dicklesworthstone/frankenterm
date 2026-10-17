@@ -63,6 +63,24 @@ pub struct RecoveryOptions {
 
 /// One error and every cause beneath it, colon separated. Capture errors
 /// carry identities and reasons, never pane content.
+/// Names what left recovery root authority unresolved: a refusal that says
+/// only "requires reconciliation" cannot be acted on. The reasons are fixed
+/// strings; nothing from the roots themselves is logged.
+fn log_unresolved_root_authority<T>(
+    stage: &str,
+    selected: &frankenterm_core::snapshot_publication::VerifiedRootSelection<T>,
+) {
+    for diagnostic in &selected.torn_or_rejected {
+        log::warn!(
+            "recovery root authority at {stage}: slot={:?} generation={:?} authority={:?} reason={}",
+            diagnostic.slot,
+            diagnostic.generation,
+            diagnostic.authority,
+            diagnostic.reason
+        );
+    }
+}
+
 fn recovery_error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
@@ -204,6 +222,7 @@ pub fn load_recovery_for_startup(
     #[cfg(not(unix))]
     anyhow::ensure!(custody.is_none(), "guardian custody requires Unix");
     let selected = select_verified_recovery_roots_with_cx(cx, &store, &verifier)?;
+    log_unresolved_root_authority("restore", &selected);
     anyhow::ensure!(
         !selected.has_unresolved_authority(),
         "recovery root authority requires reconciliation"
@@ -298,6 +317,7 @@ impl CaptureState {
             None => verifier,
         };
         let selected = select_verified_recovery_roots_with_cx(cx, &self.store, &verifier)?;
+        log_unresolved_root_authority("predecessor selection", &selected);
         // Never silently fall back past corruption and overwrite a newer root.
         anyhow::ensure!(
             !selected.has_unresolved_authority(),
