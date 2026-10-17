@@ -161,9 +161,17 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `resize_wrap_kp_*` (optional) | unset | advanced KP tuning knobs |
 | `[[ssh_domains]]` (optional) | auto-discovered from `~/.ssh/config` | explicit named SSH targets |
 | `max_fps` | `60` | lower on constrained GPUs |
-| `front_end` | `"WebGpu"` | rendering backend preference |
+| `front_end` | `"WebGpu"` | rendering backend; without a config file the built-in default is `"OpenGL"`. Values: `"WebGpu"`, `"OpenGL"`, `"Software"`, `"Metal"` (see below) |
 | `check_for_updates` | `false` | disable update checks by default |
 | `automatically_reload_config` | `true` | hot-reload config changes |
+
+`front_end = "Metal"` selects the native Metal renderer on macOS. It is in
+development: today it only clears the window to the background color and draws
+no terminal content, so keep `"WebGpu"` for daily use. When Metal is unavailable
+(not macOS, no Metal device, a GPU older than the Apple7/M1 family, or a window
+without a `CAMetalLayer`), the GUI logs
+`front_end=Metal unavailable (reason=<code>)` and falls back to WebGpu. The
+`Renderer initialized: ...` log line names the backend actually in use.
 
 Swap layouts and floating panes are currently keybinding-driven features, not
 TOML-gated features. The default sample config does not list `swap_layout_*` or
@@ -502,3 +510,14 @@ If GUI-native events are missing:
    directory is owned by the effective user with mode `0700`.
 4. Check logs for authentication, known queue-drop, indeterminate-write, or
    reconnect warnings.
+
+If a paste does not arrive:
+
+- A paste larger than 64 MiB is refused whole, never truncated. The GUI shows a
+  "Paste was not sent" notice; split the text or send it to the program as a
+  file instead.
+- Keystrokes, pastes and mouse reports are queued for the program in order and
+  never dropped, even when the program stops reading its input. Only the
+  terminal's own answers to the program's queries (device attributes, cursor
+  position reports and similar) are dropped once 64 KiB of them are waiting
+  unread; the log then says `terminal reply backlog is full`.

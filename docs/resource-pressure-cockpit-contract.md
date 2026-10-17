@@ -210,6 +210,73 @@ Storage IO reason codes may use the storage scheduler reasons directly under a
 domain prefix, for example `storage_io.defer.queue_full` or
 `storage_io.fail_closed.io_error`.
 
+## Scrollback Durability Under Overload
+
+**Decision (ft-yccm0.2.1.6, recorded 2026-10-06).** Durable scrollback trades
+completeness for never throttling a pane. This extends the ordering-not-flush
+trade accepted in ft-y0gy9 on 2026-09-28, under the owner's delegation of
+durability calls.
+
+- **Asynchronous, ordered.** The PTY parse thread queues evicted rows in
+  memory, and one `scrollback-durability` writer thread stores them in order.
+- **Not durable until written.** Queued rows are lost if the process dies.
+- **Power loss.** The store syncs with ordering barriers (F_BARRIERFSYNC on
+  macOS), so a power loss may also drop the newest written batch. It never
+  reorders rows.
+- **Overload drops rows explicitly.** The queue has a byte budget,
+  `scrollback_durability_queue_max_mb` (default 64 MiB per process, shared by
+  every pane). When admitting a row would exceed it, the admitting pane's
+  oldest queued rows are dropped from durability. The writer is never waited
+  on, so the PTY is never throttled.
+- **Dropped rows become a gap record.** Each gap is written in order as one
+  store row:
+
+  ```text
+  [durability gap: N rows (a..b), B bytes, reason=overload, at_unix_ms=T]
+  ```
+
+  `a..b` are the pane's stable rows. A transcript, an export or a recovered
+  session shows this marker where the rows were. Loss is never silent.
+- **Hysteresis.** Shedding frees queued bytes down to half the budget, so gaps
+  are few and large. Adjacent gaps coalesce into one.
+- **Live view.** Rows of a gap read as the marker followed by empty rows.
+  Checkpoint snapshots expand the marker back to the gap's full row range.
+
+What an operator sees:
+
+- **Logs.** A warning when a pane enters overload (pane, row range, rows,
+  bytes, queued and budget bytes). A warning when the queue drains below half
+  the budget. Each further gap is logged at debug level.
+- **Metrics.**
+  - `mux.scrollback.durability_queue_bytes` (gauge);
+  - `mux.scrollback.durability_gap_rows_total` and
+    `mux.scrollback.durability_gap_bytes_total` (counters);
+  - `mux.scrollback.durability_gap_markers` (markers written);
+  - `mux.scrollback.durability_commit_latency_us` (histogram).
+
+- **`ft doctor --json`.** Each live GUI's resource snapshot carries a
+  `durability` section with:
+  - `queue_bytes` and `queue_budget_bytes`;
+  - `gaps_total` (markers written);
+  - `gap_rows_total` and `gap_bytes_total`.
+
+  A headless `frankenterm-mux-server` publishes no resource snapshot, so its
+  durability shows only in its logs and metrics.
+
+- **`ft session list-durable`.** Each pane's manifest carries the gap totals
+  of its lineage: `durability_gaps` with `markers`, `rows` and `bytes` in the
+  JSON output, and a "Gap rows" column in the table. The listing reads them
+  from the manifest without decoding rows. Each marker's own transaction
+  updates them, so every marker the store has published is counted.
+  - **Lifetime.** The totals count from the pane's first row or its last
+    clear. A clear resets them to zero. A replacement (reflow) keeps them.
+    Retention may prune old markers, but their rows still count.
+  - **Unknown, never zero.** A manifest without the field lists them as
+    unknown (JSON `null`). Older builds wrote such manifests.
+  - **After a crash.** Recovery may adopt rows that no WAL names. If one of
+    those rows reads like a marker, the totals become unknown, and they stay
+    unknown until the next clear.
+
 ## Worker Pool Pressure
 
 The worker-pool domain is for live swarm capacity and remote execution
