@@ -4312,6 +4312,40 @@ mod tests {
     }
 
     fn line_flood_terminal(rows: usize, cols: usize, flood: bool) -> Terminal {
+        line_flood_terminal_with(rows, cols, flood, 64, None)
+    }
+
+    /// A flood test's scrollback size and, when given, grid engine (else
+    /// `FT_GRID_ENGINE`'s): line batches need the scrollback full.
+    #[derive(Debug)]
+    struct FloodTermConfig {
+        scrollback: usize,
+        engine: Option<crate::config::GridEngine>,
+    }
+
+    impl TerminalConfiguration for FloodTermConfig {
+        fn scrollback_size(&self) -> usize {
+            self.scrollback
+        }
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            ScrollbackTierConfig::default()
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn grid_engine(&self) -> crate::config::GridEngine {
+            self.engine
+                .unwrap_or_else(crate::config::GridEngine::from_env)
+        }
+    }
+
+    fn line_flood_terminal_with(
+        rows: usize,
+        cols: usize,
+        flood: bool,
+        scrollback: usize,
+        engine: Option<crate::config::GridEngine>,
+    ) -> Terminal {
         let mut term = Terminal::new(
             TerminalSize {
                 rows,
@@ -4320,7 +4354,7 @@ mod tests {
                 pixel_height: rows * 16,
                 dpi: 96,
             },
-            Arc::new(GateTermConfig),
+            Arc::new(FloodTermConfig { scrollback, engine }),
             "WezTerm",
             "test",
             Box::new(Vec::new()),
@@ -4344,11 +4378,17 @@ mod tests {
             rows in 1usize..6,
             cols in 1usize..14,
             cuts in proptest::collection::vec(1usize..40, 1..8),
+            // Small enough for the scrollback to fill, which line batches need.
+            scrollback in proptest::prop_oneof![
+                proptest::strategy::Just(0usize),
+                proptest::strategy::Just(2usize),
+                proptest::strategy::Just(64usize),
+            ],
         ) {
             let bytes: Vec<u8> = pieces.concat();
-            let mut per_line = line_flood_terminal(rows, cols, false);
-            let mut flood = line_flood_terminal(rows, cols, true);
-            let mut fed = line_flood_terminal(rows, cols, true);
+            let mut per_line = line_flood_terminal_with(rows, cols, false, scrollback, None);
+            let mut flood = line_flood_terminal_with(rows, cols, true, scrollback, None);
+            let mut fed = line_flood_terminal_with(rows, cols, true, scrollback, None);
             let mut fed_parser = Parser::new();
             let mut diverted = Vec::new();
             let mut start = 0;
@@ -4394,6 +4434,58 @@ mod tests {
         term.line_flood = false;
         let mut performer = Performer::new(&mut term);
         assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
+    }
+
+    /// ft-wd6cy: with the scrollback full on the page engine, where each
+    /// flood line scrolls a row out through `PageList::scroll_line`'s trim,
+    /// a flood leaves what the per-line path leaves: `seq`'s staircase of
+    /// line feeds without carriage returns, which reaches the margin and
+    /// wraps now and then, CR LF lines, empty lines, and lines too long for
+    /// a row, in reads that split lines anywhere. (A batch that scrolled a
+    /// screenful of such lines at once and then wrote them cut seq's
+    /// instructions 8% but cost 6.6% more cycles: the bulk scroll still
+    /// trims, appends and rotates views row by row, every line was scanned
+    /// twice and every row touched twice.)
+    #[test]
+    fn floods_with_the_scrollback_full_leave_what_the_per_line_path_leaves() {
+        let mut bytes = Vec::new();
+        for n in 0..400 {
+            bytes.extend_from_slice(format!("{n}\n").as_bytes());
+        }
+        for n in 0..300 {
+            bytes.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\n\n\r\n\r\n");
+        for n in 0..60 {
+            bytes.extend_from_slice(format!("{}\r\n", "x".repeat(n % 23)).as_bytes());
+        }
+        let page = Some(crate::config::GridEngine::Page);
+        for (rows, cols, scrollback, read) in [
+            (5, 17, 0, 997),
+            (5, 17, 3, 61),
+            (8, 40, 7, 4096),
+            (3, 9, 0, 13),
+            (1, 9, 0, 997),
+        ] {
+            let mut per_line = line_flood_terminal_with(rows, cols, false, scrollback, page);
+            let mut flood = line_flood_terminal_with(rows, cols, true, scrollback, page);
+            for chunk in bytes.chunks(read) {
+                per_line.advance_bytes(chunk);
+                flood.advance_bytes(chunk);
+            }
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{rows}x{cols} scrollback {scrollback}, reads of {read}"
+            );
+            per_line.advance_bytes(b"Z");
+            flood.advance_bytes(b"Z");
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{rows}x{cols} scrollback {scrollback}, reads of {read} + Z"
+            );
+        }
     }
 
     /// A flood remembers where a line's first tabs and carriage returns
