@@ -799,6 +799,20 @@ pub trait GuardianLiveOutputReader: Send {
             Arc<[u8]>,
         ) -> std::io::Result<()>,
     ) -> std::io::Result<GuardianLiveOutputDelivery>;
+
+    /// Anchors the snapshots the reader opens from now on at a checkpoint
+    /// this lease just adopted (`checkpoint_id`, captured at lease generation
+    /// `capture_generation`), whose output boundary it has already delivered.
+    /// An open snapshot pins its anchor's catalog member, and the guardian
+    /// reclaims a pane's members oldest first: a reader still anchored where
+    /// the pane was restored would keep that member, and the whole catalog,
+    /// from moving past it, refusing every later adoption.
+    fn reanchor(
+        &mut self,
+        _checkpoint_id: crate::guardian_protocol::GuardianCheckpointIdentityDigest,
+        _capture_generation: u64,
+    ) {
+    }
 }
 
 /// Durable publisher for one exact live-parser checkpoint capability.

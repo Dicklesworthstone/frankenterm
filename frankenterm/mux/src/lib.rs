@@ -13269,7 +13269,11 @@ fn read_from_guardian_live_output(
                 segment,
                 output,
             ) {
-                Ok(_) => {
+                Ok(receipt) => {
+                    // Later snapshots resume from this checkpoint, whose
+                    // boundary this reader delivered, and stop pinning the
+                    // one the pane was restored from.
+                    reader.reanchor(receipt.intent().checkpoint_identity(), receipt.generation());
                     metrics::counter!(
                         "mux.guardian_checkpoint.publication_total",
                         "outcome" => "committed"

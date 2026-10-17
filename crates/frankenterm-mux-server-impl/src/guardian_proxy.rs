@@ -4274,6 +4274,9 @@ struct GuardianReplayTailReader {
     maximum_record_bytes: u32,
     maximum_page_records: u16,
     idle_poll_interval: Duration,
+    /// The anchor of the next snapshot opened, from a checkpoint adopted
+    /// since the current one opened ([`GuardianLiveOutputReader::reanchor`]).
+    next_anchor: Option<(GuardianCheckpointIdentityDigest, u64)>,
 }
 
 impl fmt::Debug for GuardianReplayTailReader {
@@ -4335,7 +4338,19 @@ impl GuardianReplayTailReader {
             maximum_record_bytes,
             maximum_page_records,
             idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
+            next_anchor: None,
         })
+    }
+
+    /// Takes a new anchor only when a snapshot is about to be opened: an
+    /// open snapshot's completion names the checkpoint it was opened at.
+    fn apply_next_anchor(&mut self) {
+        if self.cursor.is_none() && self.pending_replay.is_none() {
+            if let Some((checkpoint_id, capture_generation)) = self.next_anchor.take() {
+                self.checkpoint_id = checkpoint_id;
+                self.capture_generation = capture_generation;
+            }
+        }
     }
 
     fn retain_transport_retry(&mut self, error: GuardianProxyError) -> io::Error {
@@ -4422,6 +4437,7 @@ impl GuardianReplayTailReader {
             let (request_id, request) = match self.pending_replay {
                 Some(pending) => pending,
                 None => {
+                    self.apply_next_anchor();
                     let pending = (Uuid::new_v4(), self.request());
                     self.pending_replay = Some(pending);
                     pending
@@ -4652,6 +4668,14 @@ fn guardian_replay_remaining_idle_delay(
 impl GuardianLiveOutputReader for GuardianReplayTailReader {
     fn has_pending_transport_retry(&self) -> bool {
         self.transport_retry_pending
+    }
+
+    fn reanchor(
+        &mut self,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        capture_generation: u64,
+    ) {
+        self.next_anchor = Some((checkpoint_id, capture_generation));
     }
 
     fn deliver_next_record(
@@ -13633,6 +13657,58 @@ mod tests {
         assert_eq!(second_payload.as_deref(), Some(b"second".as_slice()));
         assert!(second.has_durable_replay_page_ack());
         assert_eq!(replay_state.lock().acks.len(), 1);
+    }
+
+    #[test]
+    fn tail_reader_takes_a_new_anchor_only_at_its_next_open() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive tail boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page_records(&fixture, &[b"first"])]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct tail reader");
+        // A checkpoint adopted before the first open anchors it.
+        let digest = |byte| GuardianCheckpointIdentityDigest::from_bytes([byte; 32]).unwrap();
+        let adopted = digest(0x5a);
+        reader.reanchor(adopted, 7);
+        reader
+            .deliver_next_record(&mut |_, _, _| Ok(()))
+            .expect("deliver the page's record");
+        assert!(matches!(
+            replay_state.lock().requests[0].1,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
+                    capture_generation: 7,
+                    ..
+                },
+                ..
+            } if checkpoint_id == adopted
+        ));
+        // Inside the open snapshot a later anchor waits for the next open:
+        // the snapshot's completion names the checkpoint it opened at.
+        reader.reanchor(digest(0x6b), 8);
+        reader.apply_next_anchor();
+        assert_eq!(reader.capture_generation, 7);
+        assert!(matches!(
+            reader.request(),
+            GuardianReplayRequestV1::Continue { .. }
+        ));
     }
 
     #[test]
