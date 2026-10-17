@@ -206,11 +206,18 @@ impl<'a> Glyph<'a> {
     /// tell a printed space from an erased cell either. A cluster that starts
     /// with a space keeps U+0020 as its first scalar.
     pub fn from_text(text: &'a str) -> Self {
-        let mut chars = text.chars();
-        match (chars.next(), chars.next()) {
-            (None, _) | (Some(' '), None) => Glyph::Blank,
-            (Some(ch), None) => Glyph::Char(ch),
-            (Some(_), Some(_)) => Glyph::Cluster(text),
+        // One scalar fills the whole text: no second decode, whose
+        // length-dependent branches mispredict on mixed-script runs.
+        match text.chars().next() {
+            None => Glyph::Blank,
+            Some(ch) if text.len() == ch.len_utf8() => {
+                if ch == ' ' {
+                    Glyph::Blank
+                } else {
+                    Glyph::Char(ch)
+                }
+            }
+            Some(_) => Glyph::Cluster(text),
         }
     }
 
