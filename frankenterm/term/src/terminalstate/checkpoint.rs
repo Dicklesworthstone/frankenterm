@@ -1307,6 +1307,24 @@ impl CheckpointLine {
                 attributes: CheckpointCellAttributes::capture(cell.attrs())?,
             });
         }
+        // A row's trailing default blanks are what a line past its end shows
+        // anyway (`Line::prune_trailing_blanks` drops them likewise); a
+        // scroll creates a row with a full width of them. Stored, they made
+        // every pane's checkpoint about 2 MB, whatever it showed, and the
+        // guardian stages, scans, validates and acknowledges every byte. A
+        // wrapped row's last cell carries the wrap and stays.
+        if cells
+            .last()
+            .is_some_and(|cell| cell.width == 1 && cell.text == " ")
+        {
+            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank())?;
+            while cells
+                .last()
+                .is_some_and(|cell| cell.width == 1 && cell.text == " " && cell.attributes == blank)
+            {
+                cells.pop();
+            }
+        }
         let scale = if line.is_double_height_top() {
             CheckpointLineScale::DoubleHeightTop
         } else if line.is_double_height_bottom() {
@@ -5599,6 +5617,64 @@ mod tests {
             checkpoint.primary_screen.lines,
             checkpoint.alternate_screen.lines
         );
+    }
+
+    /// A scroll creates rows a full width of default blanks; a checkpoint
+    /// stores none of a row's trailing ones (what a line past its end shows
+    /// anyway), but keeps a colored blank and a wrapped row's last cell.
+    #[test]
+    fn trailing_default_blanks_are_not_stored() {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 80,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 1280,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTestConfig),
+            "FrankenTerm",
+            "checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for tick in 0..200 {
+            terminal.advance_bytes(format!("tick {tick}\r\n").as_bytes());
+        }
+        terminal.advance_bytes(b"red:\x1b[41m \x1b[0m\r\n");
+        terminal.advance_bytes([b'w'; 121]);
+        let checkpoint = TerminalCheckpointV3::capture(&terminal).expect("capture terminal");
+        let blank =
+            CheckpointCellAttributes::capture(&CellAttributes::blank()).expect("blank attributes");
+        let lines = &checkpoint.primary_screen.lines;
+        assert!(lines
+            .iter()
+            .all(|line| line.cells.last().is_none_or(|cell| {
+                !(cell.width == 1 && cell.text == " " && cell.attributes == blank)
+            })));
+        // The colored blank and the wrapped row's last cell stay.
+        assert!(lines.iter().any(|line| line
+            .cells
+            .last()
+            .is_some_and(|cell| cell.text == " " && cell.attributes != blank)));
+        assert!(lines.iter().any(|line| line.cells.len() == 120
+            && line
+                .cells
+                .last()
+                .is_some_and(|cell| cell.attributes.wrapped)));
+
+        let limits = TerminalCheckpointLimits::default();
+        let payload = checkpoint
+            .to_canonical_json(limits)
+            .expect("encode checkpoint");
+        // Its ~280 rows, each stored a full 120 cells wide, were about 8 MB;
+        // their short lines alone are well under 1 MB.
+        assert!(payload.len() < 1024 * 1024, "{} bytes", payload.len());
+        let decoded =
+            TerminalCheckpointV3::decode_canonical_json(&payload, limits).expect("decode");
+        assert_eq!(decoded.checkpoint(), &checkpoint);
+        decoded
+            .restore_inert(Arc::new(CheckpointTestConfig))
+            .expect("restore");
     }
 
     #[test]
