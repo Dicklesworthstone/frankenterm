@@ -2161,6 +2161,8 @@ struct ReclaimedOutputFiles {
     segment_files: usize,
     manifest_files: usize,
     bytes: u64,
+    /// Segments whose unlink failed, to retry at the next rollover.
+    stranded: Vec<SegmentPathAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2220,10 +2222,23 @@ struct PaneJournalAuthority {
     total_records: u64,
     physical_segment_files: usize,
     relevant_files: usize,
+    /// Reclaimed segments whose unlink failed. They stay counted in the
+    /// physical totals, so they still bound growth, but a rollover retries
+    /// them and the caps a live append checks look past them: one failed
+    /// unlink on a full chain must not fail every later append of the pane.
+    stranded_segments: Vec<SegmentPathAuthority>,
     failed: bool,
 }
 
 impl PaneJournalAuthority {
+    /// The bytes the stranded segments hold.
+    fn stranded_bytes(&self) -> u64 {
+        self.stranded_segments
+            .iter()
+            .map(|segment| segment.file_identity.expected_len.unwrap_or(0))
+            .fold(0_u64, u64::saturating_add)
+    }
+
     fn append_broker_delivery(
         &mut self,
         token: &crate::broker::BrokerOutputDeliveryTokenV1,
@@ -2382,10 +2397,21 @@ impl PaneJournalAuthority {
                 .checked_add(self.history_base_segments - 1)
                 != Some(self.segments.len())
             || self.physical_segment_files < self.segments.len()
-            || self.physical_segment_files > self.policy.max_segments
+            || self.physical_segment_files
+                - self
+                    .stranded_segments
+                    .len()
+                    .min(self.physical_segment_files)
+                > self.policy.max_segments
             || self.relevant_files < minimum_relevant_files
-            || self.relevant_files > OUTPUT_MAX_RELEVANT_FILES_PER_PANE
-            || self.total_relevant_file_bytes > self.policy.max_durable_pane_bytes
+            || self
+                .relevant_files
+                .saturating_sub(self.stranded_segments.len())
+                > OUTPUT_MAX_RELEVANT_FILES_PER_PANE
+            || self
+                .total_relevant_file_bytes
+                .saturating_sub(self.stranded_bytes())
+                > self.policy.max_durable_pane_bytes
             || self.total_committed_log_bytes > self.total_relevant_file_bytes
             || self.total_records > maximum_records
             || self.current_journal.is_poisoned()
@@ -2637,7 +2663,10 @@ impl PaneJournalAuthority {
         self.segments.push(successor_path);
         self.history_base_segments = self.segments.len();
         self.manifest = next_manifest;
-        let unlinked = self.unlink_reclaimed(&superseded, &reclaimed_segments);
+        let previously_stranded = std::mem::take(&mut self.stranded_segments);
+        let mut unlinked =
+            self.unlink_reclaimed(&superseded, &reclaimed_segments, previously_stranded);
+        self.stranded_segments = std::mem::take(&mut unlinked.stranded);
         self.physical_segment_files = self
             .physical_segment_files
             .checked_sub(unlinked.segment_files)
@@ -2703,9 +2732,10 @@ impl PaneJournalAuthority {
         &self,
         superseded: &[ManifestPathAuthority],
         reclaimed: &[SegmentPathAuthority],
+        previously_stranded: Vec<SegmentPathAuthority>,
     ) -> ReclaimedOutputFiles {
         let mut unlinked = ReclaimedOutputFiles::default();
-        for segment in reclaimed {
+        for segment in reclaimed.iter().cloned().chain(previously_stranded) {
             if unlink_counted_output_file(
                 &self.directory,
                 &self.directory_path,
@@ -2714,7 +2744,18 @@ impl PaneJournalAuthority {
                 &mut unlinked,
             ) {
                 unlinked.segment_files += 1;
+            } else {
+                unlinked.stranded.push(segment);
             }
+        }
+        // Segments go durably before the manifests that named them: a power
+        // loss must never keep the manifests' unlinks and lose the segments',
+        // stranding a segment no manifest names and no sweep finds.
+        if unlinked.segment_files != 0
+            && !superseded.is_empty()
+            && let Err(error) = self.directory.sync_all()
+        {
+            log::warn!("guardian output reclamation directory sync failed: {error}");
         }
         for manifest in superseded {
             unlink_superseded_manifest(
@@ -5045,33 +5086,42 @@ impl GuardianCheckpointStageStore {
     ) -> Result<u64, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| {
             let catalog = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
-            let Some(oldest) = catalog.published.first() else {
-                return Ok(0);
-            };
-            let bytes = checkpoint_catalog_read_file(
-                inner,
-                &oldest.candidate_path,
-                oldest.candidate_file_identity,
-                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
-            )?;
-            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
-            let record = candidate
-                .records
-                .first()
-                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let plaintext = inner.cipher.open(
-                &record.context(),
-                record,
-                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
-                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
-            )?;
-            let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
-            Ok(begin
-                .descriptor()
-                .canonical_descriptor()?
-                .origin()
-                .output_sequence()
-                .map_or(0, |sequence| sequence.saturating_sub(1)))
+            // Every retained member must still replay, and generation order
+            // is not output order: a capture after a restore from an older
+            // checkpoint sits before a newer member's boundary. Keep from the
+            // smallest boundary any member names, not the oldest member's.
+            let mut floor: Option<u64> = None;
+            for member in &catalog.published {
+                let bytes = checkpoint_catalog_read_file(
+                    inner,
+                    &member.candidate_path,
+                    member.candidate_file_identity,
+                    CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+                )?;
+                let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+                let record = candidate
+                    .records
+                    .first()
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let plaintext = inner.cipher.open(
+                    &record.context(),
+                    record,
+                    u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+                let Some(sequence) = begin
+                    .descriptor()
+                    .canonical_descriptor()?
+                    .origin()
+                    .output_sequence()
+                else {
+                    return Ok(0);
+                };
+                let kept = sequence.saturating_sub(1);
+                floor = Some(floor.map_or(kept, |floor| floor.min(kept)));
+            }
+            Ok(floor.unwrap_or(0))
         })
     }
 
@@ -5730,6 +5780,21 @@ fn guardian_replay_capture_output(
         } => {
             let origin =
                 genesis_origin.ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            // Once the pane's own checkpoints made the output from its birth
+            // unnecessary, reclamation rebased the journal past it, and the
+            // Genesis member can no longer replay: an absent checkpoint, not
+            // a forged origin.
+            if authority
+                .manifest
+                .snapshot
+                .segments
+                .first()
+                .is_some_and(|first| first.predecessor().is_some() && first.first_sequence() > 1)
+                && origin.initial_segment.first_sequence() == 1
+                && origin.initial_segment.predecessor().is_none()
+            {
+                return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+            }
             if parser_stream_bytes != 0
                 || spawn_effect_id != origin.reservation.spawn_effect_id
                 || descriptor.checkpoint_id().into_bytes()
@@ -10364,15 +10429,18 @@ fn select_manifest_chain(
     manifests.sort_by_key(|candidate| candidate.snapshot.revision);
     // A rebased publication supersedes every earlier revision. Reclamation
     // unlinks those right after publishing it, so any that remain are crash
-    // leftovers, never history.
-    let base = manifests
-        .iter()
-        .rposition(|candidate| {
-            candidate
-                .snapshot
-                .segments
-                .first()
-                .is_some_and(manifest_segment_is_rebased_base)
+    // leftovers, never history. The newest rebase is the newest manifest
+    // whose first segment follows a reclaimed predecessor and differs from
+    // the revision before it: every later publication keeps that same first
+    // segment and is history, checked revision by revision below, not a
+    // rebase (taking the newest such segment made the head its own base and
+    // let a fork or a gap after a rebase pass unchecked).
+    let base = (0..manifests.len())
+        .rev()
+        .find(|&index| {
+            let first = manifests[index].snapshot.segments.first();
+            first.is_some_and(manifest_segment_is_rebased_base)
+                && (index == 0 || manifests[index - 1].snapshot.segments.first() != first)
         })
         .unwrap_or(0);
     if base > 0 {
@@ -10633,6 +10701,7 @@ fn open_or_create_pane_segment_manager(
         total_records: 0,
         physical_segment_files: 1,
         relevant_files: 3,
+        stranded_segments: Vec::new(),
         failed: false,
     };
     authority.validate_path_authority().map_err(|_| {
@@ -10775,6 +10844,7 @@ fn open_scanned_pane_segment_manager(
         total_records,
         physical_segment_files,
         relevant_files,
+        stranded_segments: Vec::new(),
         failed: false,
     };
     authority.validate_path_authority().map_err(|_| {
