@@ -5690,7 +5690,11 @@ fn guardian_replay_open_catalog_descriptor(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+    // Every replay snapshot a pane's reader opens lands here, often once a
+    // second, and the full check decodes the whole terminal checkpoint, so
+    // a growing scrollback made each open slower until the checkpoint
+    // worker was saturated and recovery captures overran their budget.
+    checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
     if let Some(origin) = genesis_origin {
         if candidate.checksum != origin.catalog_candidate_checksum
             || !checkpoint_catalog_genesis_metadata_matches_reservation(
@@ -6205,7 +6209,7 @@ fn guardian_replay_validate_catalog_pin(
         {
             return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
         }
-        checkpoint_catalog_validate_candidate_records(inner, &selected)?;
+        checkpoint_catalog_validate_decoded_candidate_records(inner, &selected)?;
     } else {
         let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
     }
@@ -14421,7 +14425,7 @@ fn checkpoint_catalog_publish_genesis_stage(
             {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
-            checkpoint_catalog_validate_candidate_records(inner, &decoded)?;
+            checkpoint_catalog_validate_decoded_candidate_records(inner, &decoded)?;
             checkpoint_catalog_resync_file(
                 inner,
                 &existing.path,
@@ -14499,6 +14503,23 @@ fn checkpoint_catalog_publish_genesis_stage(
     Ok(head.clone())
 }
 
+/// Whether a replay snapshot keeps the catalog members it opened at (its
+/// selected member and the settled head), given its last issued page as
+/// (terminal, acknowledged), the lease generation that opened it, and the
+/// publishing lease's. One whose terminal page its mux acknowledged has
+/// replayed everything it pinned. One an older lease of the pane opened can
+/// never be continued or acknowledged (that lease is fenced): a mux replaced
+/// mid-replay leaves one per pane, and pinned forever they filled every
+/// catalog of its successor, which then refused every recovery capture.
+fn replay_snapshot_pins_members(
+    issued: Option<(bool, bool)>,
+    snapshot_generation: u64,
+    lease_generation: Option<u64>,
+) -> bool {
+    !issued.is_some_and(|(terminal, acknowledged)| terminal && acknowledged)
+        && lease_generation.is_none_or(|current| snapshot_generation >= current)
+}
+
 /// Before a Pane publication, unlink every published member older than the
 /// newest `CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS - 1`, so the scope holds at
 /// most that many once the new member is published, and finish any
@@ -14508,9 +14529,13 @@ fn checkpoint_catalog_publish_genesis_stage(
 /// its candidate, so an interruption leaves an unmarked candidate older than
 /// every published member, which a scan never mistakes for a publication in
 /// flight. Returns how many members went.
+///
+/// `lease_generation` is the publishing lease's; see
+/// [`replay_snapshot_pins_members`].
 fn checkpoint_catalog_reclaim_oldest_pane_members(
     inner: &GuardianCheckpointStageStoreInner,
     scan: &CheckpointCatalogScan,
+    lease_generation: Option<u64>,
 ) -> Result<usize, GuardianCheckpointStageStoreError> {
     let Some(oldest) = scan.published.first() else {
         return Ok(0);
@@ -14591,9 +14616,13 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
             .snapshots
             .values()
             .filter(|snapshot| {
-                !snapshot
-                    .issued
-                    .is_some_and(|issued| issued.terminal && issued.acknowledged)
+                replay_snapshot_pins_members(
+                    snapshot
+                        .issued
+                        .map(|issued| (issued.terminal, issued.acknowledged)),
+                    snapshot.generation,
+                    lease_generation,
+                )
             })
             .flat_map(|snapshot| {
                 [
@@ -14681,7 +14710,7 @@ fn checkpoint_catalog_publish_sealed_stage(
             if !metadata_matches || !checksum_matches {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
-            checkpoint_catalog_validate_candidate_records(inner, &recovered_candidate)?;
+            checkpoint_catalog_validate_decoded_candidate_records(inner, &recovered_candidate)?;
             drop(checkpoint_catalog_recover_adoption_evidence_with_seed(
                 inner,
                 &recovered_candidate,
@@ -14741,7 +14770,14 @@ fn checkpoint_catalog_publish_sealed_stage(
     if matches!(scope, CheckpointCatalogScope::Pane { .. })
         && scan.unpublished_candidates.is_empty()
         && scan.staged_files.is_empty()
-        && checkpoint_catalog_reclaim_oldest_pane_members(inner, &scan)? != 0
+        && checkpoint_catalog_reclaim_oldest_pane_members(
+            inner,
+            &scan,
+            match shape.path_scope {
+                CheckpointStagePathScope::Pane { generation, .. } => Some(generation),
+                CheckpointStagePathScope::Genesis { .. } => None,
+            },
+        )? != 0
     {
         scan = checkpoint_catalog_scan(inner, scope)?;
     }
@@ -14808,7 +14844,7 @@ fn checkpoint_catalog_publish_sealed_stage(
             {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
-            checkpoint_catalog_validate_candidate_records(inner, &recovered_candidate)?;
+            checkpoint_catalog_validate_decoded_candidate_records(inner, &recovered_candidate)?;
             drop(checkpoint_catalog_recover_adoption_evidence_with_seed(
                 inner,
                 &recovered_candidate,
@@ -17446,6 +17482,28 @@ mod tests {
         })?;
         assert_eq!(members, CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS);
         Ok(())
+    }
+
+    #[test]
+    fn only_an_unfinished_snapshot_of_the_current_lease_pins_catalog_members() {
+        for issued in [
+            None,
+            Some((false, false)),
+            Some((false, true)),
+            Some((true, false)),
+        ] {
+            // Unfinished, opened under the publishing lease (or a newer one).
+            assert!(replay_snapshot_pins_members(issued, 2, Some(2)));
+            assert!(replay_snapshot_pins_members(issued, 3, Some(2)));
+            assert!(replay_snapshot_pins_members(issued, 1, None));
+            // Opened under an older, fenced lease of the pane: never
+            // continued, never acknowledged, so it pins nothing.
+            assert!(!replay_snapshot_pins_members(issued, 1, Some(2)));
+        }
+        // Its terminal page acknowledged, a snapshot has replayed what it
+        // pinned.
+        let finished = Some((true, true));
+        assert!(!replay_snapshot_pins_members(finished, 2, Some(2)));
     }
 
     #[test]
