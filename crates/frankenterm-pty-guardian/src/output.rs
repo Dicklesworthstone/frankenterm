@@ -14570,9 +14570,16 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
         .len()
         .saturating_sub(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS - 1);
     let mut reclaimed = 0;
-    if excess > 0
-        && let Ok(replay) = inner.replay.try_lock()
-    {
+    let replay = if excess > 0 {
+        let replay = inner.replay.try_lock();
+        if replay.is_err() {
+            log::warn!("guardian catalog reclamation skipped: the replay state is busy");
+        }
+        replay.ok()
+    } else {
+        None
+    };
+    if let Some(replay) = replay {
         // A snapshot whose terminal page its mux acknowledged has replayed
         // everything it pinned; only one still replaying keeps its members.
         // A finished restore's snapshot lingers until eviction, and pinning
@@ -14595,6 +14602,10 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
         drop(replay);
         for member in scan.published.iter().take(excess) {
             if pinned.contains(&member.metadata.identity) {
+                log::warn!(
+                    "guardian catalog reclamation stopped at generation {}: a replay still pins it",
+                    member.metadata.identity.generation
+                );
                 break;
             }
             unlink_owned_output_file(
