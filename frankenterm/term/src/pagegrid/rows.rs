@@ -24,11 +24,13 @@ use std::collections::VecDeque;
 use std::ops::{Bound, Index, IndexMut, Range, RangeBounds};
 use std::sync::OnceLock;
 
-/// A retained row's legacy view.
+/// A retained row's legacy view. Boxed: every scroll pushes one view and pops
+/// another, and every native write takes the line out, so the slot stays a
+/// pointer wide rather than a whole `Line`.
 #[derive(Debug, Default)]
 struct RowView {
     /// Built when first read; dropped when the page row changes.
-    line: OnceLock<Line>,
+    line: OnceLock<Box<Line>>,
     /// A legacy operation edited the row through `&mut Line`: the view, not
     /// the page row, is the row's content.
     edited: bool,
@@ -79,7 +81,7 @@ impl PageRows {
 
     fn ensure_view(&mut self, index: usize) {
         if self.views[index].line.get().is_none() {
-            let line = self.build_view(index);
+            let line = Box::new(self.build_view(index));
             let _ = self.views[index].line.set(line);
         }
     }
@@ -88,7 +90,7 @@ impl PageRows {
     pub fn line(&self, index: usize) -> &Line {
         self.views[index]
             .line
-            .get_or_init(|| self.build_view(index))
+            .get_or_init(|| Box::new(self.build_view(index)))
     }
 
     /// Row `index` for a legacy edit: its view becomes the row's content.
@@ -108,7 +110,7 @@ impl PageRows {
             .range_mut(range)
             .map(|view| {
                 view.edited = true;
-                view.line.get_mut().expect("the view was built above")
+                &mut **view.line.get_mut().expect("the view was built above")
             })
             .collect()
     }
@@ -117,7 +119,7 @@ impl PageRows {
     pub fn row_len(&self, index: usize) -> usize {
         let view = &self.views[index];
         if view.edited {
-            return view.line.get().map_or(0, Line::len);
+            return view.line.get().map_or(0, |line| line.len());
         }
         let row = self.list.row(self.stable(index)).expect("a retained row");
         row.page.row_len(row.row)
@@ -285,7 +287,7 @@ impl PageRows {
         let mut lines = VecDeque::with_capacity(self.views.len());
         for index in 0..self.views.len() {
             let line = match self.views[index].line.take() {
-                Some(line) => line,
+                Some(line) => *line,
                 None => self.build_view(index),
             };
             lines.push_back(line);
