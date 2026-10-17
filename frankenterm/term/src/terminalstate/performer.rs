@@ -215,6 +215,71 @@ pub(crate) struct Performer<'a> {
     /// sit in `print`, where the next printed text would be segmented
     /// together with it (see `merge_into_junction`).
     ascii_junction: Option<PrintedCell>,
+    /// The buffer of [`PendingCells`], kept empty between `flush_print`s.
+    pending_cells: Vec<(&'static str, u8)>,
+}
+
+/// Cells `flush_print` has placed but not yet written: graphemes side by
+/// side on one row, all printed with the pen, which
+/// `Screen::set_cell_grapheme_run` writes in one call (ft-yccm0.3.2.6).
+/// Anything in the print loop that reads or changes the screen otherwise
+/// writes them first, so the screen it sees is the one cell-by-cell
+/// printing would have left.
+struct PendingCells<'t> {
+    y: VisibleRowIndex,
+    x: usize,
+    /// One past the last pending cell's columns.
+    end: usize,
+    cells: Vec<(&'t str, u8)>,
+}
+
+impl<'t> PendingCells<'t> {
+    fn new(cells: Vec<(&'t str, u8)>) -> Self {
+        debug_assert!(cells.is_empty());
+        Self {
+            y: 0,
+            x: 0,
+            end: 0,
+            cells,
+        }
+    }
+
+    /// Whether a cell at (`x`, `y`) continues the pending ones.
+    fn continued_by(&self, x: usize, y: VisibleRowIndex) -> bool {
+        !self.cells.is_empty() && self.y == y && self.end == x
+    }
+
+    /// The emptied buffer, for the next `flush_print`. Collecting an
+    /// emptied `vec::IntoIter` into a `Vec` of the same layout reuses its
+    /// allocation, which frees the buffer from the text it borrowed.
+    fn into_buffer(mut self) -> Vec<(&'static str, u8)> {
+        self.cells.clear();
+        self.cells
+            .into_iter()
+            .map(|_| -> (&'static str, u8) { unreachable!("the buffer is empty") })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Writes each printed cell on its own, the oracle the batched writes of
+    /// [`PendingCells`] are checked against.
+    static FORCE_CELL_BY_CELL_PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Kill switch for batching printed cells (ft-yccm0.3.2.6): falsey writes
+/// each cell on its own.
+const PRINT_CELL_RUNS_ENV: &str = "FT_PRINT_CELL_RUNS";
+
+fn print_cell_runs_enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_CELL_BY_CELL_PRINT.with(std::cell::Cell::get) {
+        return false;
+    }
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !moonshot_env_falsey(PRINT_CELL_RUNS_ENV));
+    *ENABLED
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -431,7 +496,28 @@ impl<'a> Performer<'a> {
             print: String::new(),
             last_printed: None,
             ascii_junction: None,
+            pending_cells: Vec::new(),
         }
+    }
+
+    /// Writes the cells `flush_print` left pending; see [`PendingCells`].
+    fn write_pending_cells(&mut self, pending: &mut PendingCells<'_>, seqno: usize) {
+        let (x, y) = (pending.x, pending.y);
+        match pending.cells[..] {
+            [] => return,
+            // A lone cell (T0 prints one per SGR pair) takes the cell write.
+            [(text, width)] => {
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, text, usize::from(width), pen, seqno);
+            }
+            _ => {
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme_run(x, y, &pending.cells, &pen, seqno);
+            }
+        }
+        pending.cells.clear();
     }
 
     /// Records the cell the print path just wrote; see `last_printed`.
@@ -870,9 +956,15 @@ impl<'a> Performer<'a> {
         // After a grapheme that printed nothing, `g` may yet continue the
         // cell before it.
         let mut printed_cell = true;
+        // Cells are written in runs (`PendingCells`), except in insert mode,
+        // where each one first shifts the row.
+        let batch = !self.insert && print_cell_runs_enabled();
+        let mut pending = PendingCells::new(std::mem::take(&mut self.pending_cells));
         for g in PrintGraphemes::new(text) {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             if let Some(cell) = junction.take() {
+                // Only the first grapheme meets the junction: nothing pends.
+                debug_assert!(pending.cells.is_empty());
                 if self.merge_into_junction(cell, g, seqno) {
                     continue;
                 }
@@ -918,6 +1010,7 @@ impl<'a> Performer<'a> {
                     // as before, while width-changing continuations such as VS16
                     // can now expand the prior cell through the same line setter
                     // used by normal double-width graphemes.
+                    self.write_pending_cells(&mut pending, seqno);
                     let attached = self.recluster_at_cursor(g, false);
                     if !attached {
                         log::trace!("Eliding zero-width grapheme {:?}", g);
@@ -928,19 +1021,23 @@ impl<'a> Performer<'a> {
 
             // A multi-byte grapheme only continues its left neighbour when that
             // cell ends in ZWJ, which cannot exist until one has been written.
-            if g.len() > 1 && self.zwj_tail_cell_possible && self.recluster_at_cursor(g, true) {
-                continue;
+            if g.len() > 1 && self.zwj_tail_cell_possible && !self.zwj_continuation_ruled_out()
+            {
+                self.write_pending_cells(&mut pending, seqno);
+                if self.recluster_at_cursor(g, true) {
+                    continue;
+                }
             }
             // ft-cklgg: as above, after a grapheme that printed nothing.
-            if !follows_segmented_cell
-                && g.len() > 1
-                && may_continue_without_zwj(g)
-                && self.recluster_at_cursor(g, false)
-            {
-                continue;
+            if !follows_segmented_cell && g.len() > 1 && may_continue_without_zwj(g) {
+                self.write_pending_cells(&mut pending, seqno);
+                if self.recluster_at_cursor(g, false) {
+                    continue;
+                }
             }
 
             if self.wrap_next {
+                self.write_pending_cells(&mut pending, seqno);
                 self.wrap_before_print(seqno);
             }
 
@@ -955,30 +1052,34 @@ impl<'a> Performer<'a> {
             // narrow without it: Ghostty prints its base, then drops the
             // selector that cannot widen it, as `recluster_at_cursor` does
             // when the selector arrives in a later read.
-            let narrowed: String;
-            let (g, print_width) = if self.wide_grapheme_overflows(self.cursor.x, print_width) {
+            // `narrowed` replaces `g` as the cell's text, which then cannot
+            // pend: it lives only as long as this iteration.
+            let mut narrowed = String::new();
+            let mut narrow = false;
+            let print_width = if self.wide_grapheme_overflows(self.cursor.x, print_width) {
+                self.write_pending_cells(&mut pending, seqno);
                 if self.dec_auto_wrap {
                     self.wrap_for_wide_grapheme(seqno);
-                    (g, print_width)
+                    print_width
                 } else {
                     narrowed = g.replace('\u{fe0f}', "");
                     if narrowed.len() < g.len()
                         && grapheme_column_width(&narrowed, Some(&self.unicode_version)) == 1
                     {
-                        (narrowed.as_str(), 1)
+                        narrow = true;
+                        1
                     } else {
                         continue;
                     }
                 }
             } else {
-                (g, print_width)
+                print_width
             };
+            let cell_text = if narrow { narrowed.as_str() } else { g };
 
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
-
-            let pen = self.pen.clone();
 
             let next_x = x.saturating_add(print_width);
             let wrappable = next_x >= width;
@@ -998,15 +1099,27 @@ impl<'a> Performer<'a> {
                 y,
                 print_width,
                 width,
-                g,
+                cell_text,
                 self.pen
             );
-            let ends_in_zwj = g.ends_with('\u{200d}');
+            let ends_in_zwj = cell_text.ends_with('\u{200d}');
             if ends_in_zwj {
                 self.zwj_tail_cell_possible = true;
             }
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            if batch && !narrow && matches!(print_width, 1 | 2) {
+                if !pending.continued_by(x, y) {
+                    self.write_pending_cells(&mut pending, seqno);
+                    pending.y = y;
+                    pending.x = x;
+                }
+                pending.cells.push((g, print_width as u8));
+                pending.end = next_x;
+            } else {
+                self.write_pending_cells(&mut pending, seqno);
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, cell_text, print_width, pen, seqno);
+            }
             self.note_printed(y, x, print_width, ends_in_zwj);
             printed_cell = true;
 
@@ -1017,9 +1130,22 @@ impl<'a> Performer<'a> {
                 self.wrap_next = self.dec_auto_wrap;
             }
         }
+        self.write_pending_cells(&mut pending, seqno);
+        self.pending_cells = pending.into_buffer();
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
+    }
+
+    /// Whether `recluster_at_cursor(_, true)` returns false without reading
+    /// the screen: with autowrap on and no wrap pending, the continuation
+    /// would join the cell left of the cursor, and `last_printed` rules out
+    /// a ZWJ tail there. Cells pending in `flush_print` then need not be
+    /// written first.
+    fn zwj_continuation_ruled_out(&self) -> bool {
+        self.dec_auto_wrap
+            && !self.wrap_next
+            && self.last_printed_rules_out_zwj_tail(self.cursor.x, self.cursor.y, false)
     }
 
     /// Whether a grapheme `width` cells wide does not fit at column `x`

@@ -14,6 +14,7 @@
 //! applies the legacy method to the row's `Line` view instead.
 
 use super::cell::{classify, Glyph, PackedCell, StyleClass};
+use super::grapheme::MAX_GRAPHEME_BYTES;
 use super::page::{CellWrite, Page, StyleSpec};
 use super::row::RowHeader;
 use crate::config::BidiMode;
@@ -233,6 +234,79 @@ fn write_grapheme(
         page.protect_cells(row, x..x + width);
     }
     written
+}
+
+/// Legacy `Line::set_cell_grapheme` of each `(text, width)` in `cells`, one
+/// after the other from column `x` (widths 1 or 2), when the run appends at
+/// the row's end: one style classification, header update and seqno move
+/// for the run. Returns false, writing nothing, for any other run (one
+/// that overwrites, starts past a clustered row's end, holds text that a
+/// cell would not keep as it is, carries images, or that
+/// [`Page::append_graphemes`] declines); the caller then writes it cell by
+/// cell.
+pub fn set_grapheme_run(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    cells: &[(&str, u8)],
+    attr: &CellAttributes,
+    seqno: SequenceNo,
+) -> bool {
+    let len = page.row_len(row);
+    let clustered = is_clustered(page, row);
+    // Text a cell keeps whole: not what `stored_text` replaces, nor longer
+    // than the arena keeps (whose last character a later check would read).
+    let kept_whole = |text: &str| {
+        !matches!(text.as_bytes(), [] | b"\r\n" | [0x00..=0x1f | 0x7f])
+            && text.len() <= MAX_GRAPHEME_BYTES
+    };
+    if x < len
+        || (clustered && x > len)
+        || !cells.iter().all(|&(text, _)| kept_whole(text))
+        || attr.images().is_some_and(|images| !images.is_empty())
+    {
+        return false;
+    }
+    // A clustered row stays clustered while each cell's first character
+    // breaks from the text before it (`ClusteredLine::can_append_cell_at`);
+    // the first that does not makes it a vector row, which changes no cell.
+    let mut vector = false;
+    if clustered {
+        let mut prev = last_char(page, row);
+        for &(text, _) in cells {
+            let mut chars = text.chars();
+            let first = chars.next().unwrap_or(' ');
+            if !clustered_append_breaks(prev, first) {
+                vector = true;
+                break;
+            }
+            prev = Some(chars.next_back().unwrap_or(first));
+        }
+    }
+    let class = classify(attr);
+    let mut cache = None;
+    let style = match &class {
+        StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
+        StyleClass::Rich(rich) => StyleSpec::Rich {
+            style: rich,
+            cache: &mut cache,
+        },
+    };
+    let mut write = CellWrite::new(Glyph::Blank, style);
+    write.semantic = attr.semantic_type();
+    write.wrapped = attr.wrapped();
+    write.hyperlink = attr.hyperlink();
+    if !page.append_graphemes(row, x, cells, write, seqno) {
+        return false;
+    }
+    if vector {
+        set_vector(page, row);
+    }
+    if attr.protected() {
+        let end = x + cells.iter().map(|&(_, width)| usize::from(width)).sum::<usize>();
+        page.protect_cells(row, x..end);
+    }
+    true
 }
 
 /// Legacy `Screen::set_ascii_cell_run`: each byte of the printable-ASCII

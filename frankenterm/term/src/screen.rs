@@ -9670,6 +9670,49 @@ impl Screen {
         line.set_cell_grapheme(x, text, width, attr, seqno);
     }
 
+    /// [`Self::set_cell_grapheme`] of each `(text, width)` in `cells`, one
+    /// after the other from column `x` of row `y`, each `width` (1 or 2)
+    /// columns past the one before: the print path's run of graphemes on
+    /// one row. A page-engine row that the run appends to takes it in one
+    /// write (ft-yccm0.3.2.6).
+    pub fn set_cell_grapheme_run(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        cells: &[(&str, u8)],
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        if cells.is_empty() {
+            return;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        let line_idx = self.phys_row(y);
+        let mut col = x;
+        if self.lines.page_mut().is_none() {
+            let line = self.line_mut(line_idx);
+            for &(text, width) in cells {
+                let width = usize::from(width);
+                line.set_cell_grapheme(col, text, width, attr.clone(), seqno);
+                col += width;
+            }
+            return;
+        }
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::set_grapheme_run(page, row, x, cells, attr, seqno) {
+                return;
+            }
+        }
+        // Declined: cell by cell, as `set_cell_grapheme` writes each (a
+        // cell the page declines goes through the row's `Line` view, and
+        // the next one back to the page).
+        for &(text, width) in cells {
+            let width = usize::from(width);
+            self.set_cell_grapheme(col, y, text, width, attr.clone(), seqno);
+            col += width;
+        }
+    }
+
     pub fn set_ascii_cell_run(
         &mut self,
         x: usize,

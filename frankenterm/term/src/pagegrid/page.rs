@@ -1187,6 +1187,90 @@ impl Page {
         true
     }
 
+    /// A run of graphemes from column `x`, at or past the row's end, each
+    /// `(text, width)` stored as [`Self::write`] stores a cell of that text
+    /// and width (1 or 2) written there, one after the other: the style
+    /// resolved once and one header update for the run (the non-ASCII
+    /// counterpart of [`Self::append_ascii`]). `cell`'s glyph and width are
+    /// ignored. Returns false, writing nothing, for an empty run, one that
+    /// starts before the row's end or passes the page's stride, one that
+    /// carries images, or a row whose last cell is wide (`write` blanks or
+    /// hides around it).
+    pub fn append_graphemes(
+        &mut self,
+        row: u32,
+        x: usize,
+        cells: &[(&str, u8)],
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(cells.iter().all(|&(_, width)| matches!(width, 1 | 2)));
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let stored: usize = cells.iter().map(|&(_, width)| usize::from(width)).sum();
+        let end = x.saturating_add(stored);
+        if cells.is_empty()
+            || x < old_len
+            || end > self.stride()
+            || !cell.images.is_empty()
+            || (old_len > 0 && self.cell_at(slot, old_len - 1).is_wide())
+        {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            // One reference per stored cell, spacers included; resolving
+            // took the first.
+            for _ in 1..stored {
+                self.styles.add_ref(id);
+            }
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        // Cells past the end were zero (I2), and no cell before `x` is wide,
+        // so the padding stays default blanks and only spacers are hidden.
+        let mut col = x;
+        let mut any_cluster = false;
+        for &(text, width) in cells {
+            let glyph = Glyph::from_text(text);
+            let wide = width == 2;
+            let off = self.offset(slot, col);
+            let mut head = template
+                .with_codepoint(glyph.codepoint())
+                .with_wide(wide);
+            if let Glyph::Cluster(text) = glyph {
+                self.graphemes.insert(off, text);
+                head = head.with_grapheme(true);
+                any_cluster = true;
+            }
+            if let Some(link) = cell.hyperlink {
+                self.links.attach(off, link);
+            }
+            self.set_cell_at(slot, col, head);
+            if wide {
+                if let Some(link) = cell.hyperlink {
+                    self.links.attach(off + 1, link);
+                }
+                self.set_cell_at(slot, col + 1, template.with_hidden(true));
+            }
+            col += usize::from(width);
+        }
+        let mut flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        if any_cluster {
+            flags |= RowHeader::GRAPHEME;
+        }
+        self.set_header(row, header.with_len(end).with_flags(flags, true));
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, old_len.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
+    }
+
     /// Legacy `Screen::insert_cell` (ICH and insert mode): bump the seqno,
     /// `Line::insert_cell(x, Cell::default(), right_margin)`, then truncate
     /// to `limit` (the screen width, at most `cols`) if the row grew past it.
