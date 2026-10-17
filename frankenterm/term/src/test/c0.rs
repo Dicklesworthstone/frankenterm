@@ -21,6 +21,29 @@ fn test_lf() {
 }
 
 #[test]
+fn lf_under_origin_mode_moves_down_one_row_in_the_same_column() {
+    let mut term = TestTerm::new(10, 10, 0);
+    term.set_scroll_region(3, 7);
+    term.set_mode("?6", true);
+    term.assert_cursor_pos(0, 3, Some("DECOM homes the cursor to the region"), None);
+    term.print("a\n");
+    term.assert_cursor_pos(1, 4, Some("LF moves down one row"), None);
+    term.print("\n\n\n");
+    term.assert_cursor_pos(1, 7, Some("LF reaches the bottom margin"), None);
+    term.print("\n");
+    term.assert_cursor_pos(1, 7, Some("LF at the bottom margin scrolls"), None);
+
+    let mut term = TestTerm::new(10, 10, 0);
+    term.set_mode("?69", true);
+    term.set_left_and_right_margins(2, 6);
+    term.set_scroll_region(3, 7);
+    term.set_mode("?6", true);
+    term.assert_cursor_pos(2, 3, Some("DECOM homes the cursor to the margins"), None);
+    term.print("ab\n");
+    term.assert_cursor_pos(4, 4, Some("LF keeps the column"), None);
+}
+
+#[test]
 fn test_cr() {
     let mut term = TestTerm::new(3, 10, 0);
     term.print("hello\r");

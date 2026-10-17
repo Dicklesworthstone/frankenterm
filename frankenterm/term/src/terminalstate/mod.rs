@@ -2045,7 +2045,26 @@ impl TerminalState {
         } else {
             next_row_saturating(y)
         };
-        self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Absolute(y as i64));
+        // x and y are screen coordinates already: they take only the clamp
+        // a cursor move applies. As `Position::Absolute` they were offset by
+        // the margins' starts again under origin mode, which moved a line
+        // feed below a top margin past the next row.
+        let (x_end, y_end) = if self.dec_origin_mode {
+            (
+                self.left_and_right_margins.end,
+                self.top_and_bottom_margins.end,
+            )
+        } else {
+            let screen = self.screen();
+            (
+                screen.physical_cols,
+                usize_to_i64_saturating(screen.physical_rows),
+            )
+        };
+        self.set_cursor_position_absolute(
+            x.min(x_end.saturating_sub(1)),
+            y.min(y_end.saturating_sub(1)).max(0),
+        );
     }
 
     /// Moves the cursor down one line in the same column.
