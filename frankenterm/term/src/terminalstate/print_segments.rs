@@ -13,7 +13,10 @@
 //! cluster the fast path does not settle is taken from `Graphemes` started
 //! at the cluster's first character, exactly where `Graphemes` itself
 //! starts it. On mixed-script text most clusters are a single such
-//! character, and segmenting them was a fifth of the ingest.
+//! character, and segmenting them was a fifth of the ingest. A plain
+//! character followed by continuing characters that each leave the machine
+//! plain again (a letter and its combining marks) is settled the same way:
+//! the cluster ends before the first character that does not continue it.
 //!
 //! [`PrintCharTable`] also keeps each character's `grapheme_column_width`
 //! under the terminal's Unicode version, so the print path looks a lone
@@ -28,6 +31,10 @@ use std::sync::{Arc, OnceLock};
 const PLAIN: u8 = 0b01;
 /// Continues the cluster before it.
 const CONTINUES: u8 = 0b10;
+/// Continues a cluster and, after a plain character, leaves the machine in
+/// its plain state again (a combining mark after a letter, say). (Bit 2 is
+/// [`WIDTH_KNOWN`]'s.)
+const RESUMES: u8 = 0b1000;
 
 /// Blocks of 256 characters in the code space.
 const BLOCKS: usize = 0x11_0000 >> 8;
@@ -48,6 +55,18 @@ fn class_block(block: usize) -> &'static [u8; 256] {
     })
 }
 
+/// Followers the plain state splits from and some other state joins.
+const SPLIT_FROM_PLAIN: [&str; 8] = [
+    "a",
+    "\u{1f642}",
+    "\u{1f1e6}",
+    "\u{1100}",
+    "\u{1161}",
+    "\u{ac00}",
+    "\u{11a8}",
+    "\u{915}",
+];
+
 /// The clusters `Graphemes` finds in `before`, `c`, `after`.
 fn clusters(probe: &mut String, before: &str, c: char, after: &str) -> usize {
     probe.clear();
@@ -65,6 +84,14 @@ fn clusters(probe: &mut String, before: &str, c: char, after: &str) -> usize {
 /// ZWJ and a second emoji, a regional indicator a second one, Hangul L a
 /// V, Hangul V, LV, T and LVT a T, and an InCB consonant a linker and a
 /// second consonant. CR, which pairs with LF, is never plain.
+///
+/// A continuing character resumes the plain state when, after `a` and it,
+/// the machine still joins a continuing character and splits before every
+/// follower that some other state would join: another character, an
+/// emoji, a regional indicator, Hangul L, V, LV and T, and an InCB
+/// consonant. Every plain character leaves the machine in the same state
+/// as `a`, so this holds after any plain character, and after any run of
+/// resuming characters.
 fn classify(c: char, probe: &mut String) -> u8 {
     let continues = clusters(probe, "a", c, "") == 1;
     let plain = c != '\r'
@@ -76,7 +103,14 @@ fn classify(c: char, probe: &mut String) -> u8 {
         && clusters(probe, "", c, "\u{1161}") == 2
         && clusters(probe, "", c, "\u{11a8}") == 2
         && clusters(probe, "", c, "\u{94d}\u{915}") == 2;
-    (if plain { PLAIN } else { 0 }) | (if continues { CONTINUES } else { 0 })
+    let resumes = continues
+        && clusters(probe, "a", c, "\u{301}") == 1
+        && SPLIT_FROM_PLAIN
+            .iter()
+            .all(|follower| clusters(probe, "a", c, follower) == 2);
+    (if plain { PLAIN } else { 0 })
+        | (if continues { CONTINUES } else { 0 })
+        | (if resumes { RESUMES } else { 0 })
 }
 
 /// An entry of [`PrintCharTable`]: the class in the low byte and, when
@@ -206,9 +240,38 @@ impl<'a> Iterator for PrintSegments<'a, '_> {
             let width = (entry & WIDTH_KNOWN != 0).then(|| usize::from(entry >> 8));
             return Some((&rest[..len], width));
         }
+        if u16::from(PLAIN) & entry != 0 {
+            if let Some(len) = self.plain_cluster_len(rest, c.len_utf8()) {
+                self.pos += len;
+                return Some((&rest[..len], None));
+            }
+        }
         let grapheme = Graphemes::new(rest).next()?;
         self.pos += grapheme.len();
         Some((grapheme, None))
+    }
+}
+
+impl PrintSegments<'_, '_> {
+    /// The length of the cluster that the plain character `first` bytes
+    /// long at the front of `rest` starts, when each character continuing
+    /// it resumes the plain state: it then ends before the first character
+    /// that does not continue it (a letter and its combining marks, say).
+    /// `None` when a continuing character does not resume it.
+    #[inline]
+    fn plain_cluster_len(&mut self, rest: &str, first: usize) -> Option<usize> {
+        let mut len = first;
+        for k in rest[first..].chars() {
+            let entry = self.table.entry(k);
+            if u16::from(CONTINUES) & entry == 0 {
+                break;
+            }
+            if u16::from(RESUMES) & entry == 0 {
+                return None;
+            }
+            len += k.len_utf8();
+        }
+        Some(len)
     }
 }
 
@@ -291,6 +354,57 @@ mod tests {
                 assert_eq!(expected.next(), None, "{:?}", text.escape_unicode());
             }
         }
+    }
+
+    /// A plain character, one or two of a continuing character that
+    /// resumes the plain state, and a follower of each grapheme property:
+    /// the fast path ends the cluster exactly where `Graphemes` does, for
+    /// every such character of planes 0, 1 and 14 after plain characters of
+    /// several scripts.
+    #[test]
+    fn resuming_characters_end_clusters_as_graphemes_ends_them() {
+        let bases = [
+            'a', '\u{e9}', '\u{4e2d}', '\u{5d0}', '\u{645}', '\u{3042}', '\u{2500}',
+        ];
+        let followers: Vec<char> = concat!(
+            "a\u{301}\u{903}\u{200d}\n\r\u{1}\u{600}\u{1f642}\u{1f1e6}",
+            "\u{1100}\u{1161}\u{11a8}\u{ac00}\u{ac01}\u{915}\u{94d}\u{fe0f}\u{e0020}",
+        )
+        .chars()
+        .collect();
+        let mut table = PrintCharTable::default();
+        for &base in &bases {
+            assert_ne!(u16::from(PLAIN) & table.entry(base), 0, "{:?}", base);
+        }
+        let mut text = String::new();
+        let mut resuming = 0;
+        for k in (0..0x2_0000_u32)
+            .chain(0xe_0000..0xf_0000)
+            .filter_map(char::from_u32)
+        {
+            if u16::from(RESUMES) & table.entry(k) == 0 {
+                continue;
+            }
+            resuming += 1;
+            for &base in &bases {
+                for repeat in 1..=2 {
+                    for &follower in &followers {
+                        text.clear();
+                        text.push(base);
+                        for _ in 0..repeat {
+                            text.push(k);
+                        }
+                        text.push(follower);
+                        let fast: Vec<&str> =
+                            table.segments(&text, &latest()).map(|(g, _)| g).collect();
+                        let expected: Vec<&str> = Graphemes::new(&text).collect();
+                        assert_eq!(fast, expected, "{:?}", text.escape_unicode());
+                    }
+                }
+            }
+        }
+        // The combining marks alone are well over a thousand.
+        assert!(resuming > 1000, "{} resuming characters", resuming);
     }
 
     fn mixed_char() -> impl Strategy<Value = char> {
