@@ -1038,8 +1038,49 @@ impl<'a> Performer<'a> {
         } else {
             Vec::new()
         });
+        // No DEC or UK charset remaps a grapheme (nor insert mode, which
+        // turns batching off): the fast path below may run.
+        let plain_print = batch && self.active_charset() == CharSet::Ascii;
         for (g, known_width) in graphemes {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
+            // The common case, decided in a few compares: a lone character
+            // whose width the segmentation knows, after a printed cell, with
+            // no junction to merge, no ZWJ tail it could continue, no
+            // pending wrap and room before the margin. It is printed exactly
+            // as the general path below prints it (a cell joining the
+            // pending run, `last_printed`, the cursor), without the checks
+            // that cannot apply to it. Per-grapheme checks were the largest
+            // part of a mixed-script flush (ft-yccm0.3.2.6).
+            if plain_print
+                && follows_segmented_cell
+                && junction.is_none()
+                && !self.wrap_next
+                && (g.len() == 1 || !self.zwj_tail_cell_possible)
+            {
+                if let Some(width @ (1 | 2)) = known_width {
+                    let x = self.cursor.x;
+                    if !self.wide_grapheme_overflows(x, width) {
+                        let y = self.cursor.y;
+                        let next_x = x.saturating_add(width);
+                        if !pending.continued_by(x, y) {
+                            self.write_pending_cells(&mut pending, seqno);
+                            pending.y = y;
+                            pending.x = x;
+                        }
+                        pending.cells.push((g, width as u8));
+                        pending.end = next_x;
+                        self.note_printed(y, x, width, false);
+                        printed_cell = true;
+                        if next_x >= self.left_and_right_margins.end {
+                            self.wrap_next = self.dec_auto_wrap;
+                        } else {
+                            self.cursor.x = next_x;
+                            self.wrap_next = false;
+                        }
+                        continue;
+                    }
+                }
+            }
             if let Some(cell) = junction.take() {
                 // Only the first grapheme meets the junction: nothing pends.
                 debug_assert!(pending.cells.is_empty());
