@@ -7320,10 +7320,17 @@ impl WholeMuxRecoveryVerifier {
                 return Err(fail());
             }
         }
+        // The store's error tells a reclaimed checkpoint (absent) from a
+        // catalog caught mid-adoption (out of order) or a damaged one.
         custody
             .reopen_checkpoint(selector)
             .map(Some)
-            .map_err(|_| fail())
+            .map_err(|error| WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                pane_id: pane.pane_id as u64,
+                reason: format!(
+                    "existing guardian custody/catalog/ACK does not authenticate the manifest entry: {error:?}"
+                ),
+            })
     }
 
     /// Authorize offline validation of this exact freshly published capture.
