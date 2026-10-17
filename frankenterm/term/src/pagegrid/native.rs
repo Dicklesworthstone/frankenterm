@@ -73,6 +73,7 @@ pub fn make_vector(page: &mut Page, row: u32) {
 
 /// The last character of the row's text as clustered storage holds it: the
 /// last visible cell's, `' '` for a blank. `None` for an empty row.
+#[inline]
 fn last_char(page: &Page, row: u32) -> Option<char> {
     let mut x = page.row_len(row).checked_sub(1)?;
     while x > 0 && page.cell(row, x).is_hidden() {
@@ -87,6 +88,7 @@ fn last_char(page: &Page, row: u32) -> Option<char> {
 
 /// `ClusteredLine::can_append_cell_at` for a cell whose text starts with
 /// `first`.
+#[inline]
 fn clustered_can_append(page: &Page, row: u32, x: usize, first: char) -> bool {
     let len = page.row_len(row);
     if x < len {

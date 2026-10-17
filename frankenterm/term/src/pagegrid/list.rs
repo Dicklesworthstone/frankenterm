@@ -831,9 +831,21 @@ impl PageList {
 
     /// Seals every eligible page: not the tail, and every row at least
     /// [`SEAL_DISTANCE`] above the viewport top.
+    #[inline]
     fn seal_eligible(&mut self) {
         let cutoff = self.seal_cutoff();
         let tail = self.pages.len().saturating_sub(1);
+        if self.sealed < tail && self.pages[self.sealed].end_stable() - 1 <= cutoff {
+            self.seal_through(cutoff, tail);
+        }
+    }
+
+    /// [`Self::seal_eligible`]'s sealing, kept out of line: it runs once a
+    /// page, and inline its `Arc` conversion made every line feed save and
+    /// restore every register.
+    #[cold]
+    #[inline(never)]
+    fn seal_through(&mut self, cutoff: StableRowIndex, tail: usize) {
         while self.sealed < tail && self.pages[self.sealed].end_stable() - 1 <= cutoff {
             self.pages[self.sealed].seal();
             self.sealed += 1;
