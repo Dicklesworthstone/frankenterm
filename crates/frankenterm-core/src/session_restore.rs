@@ -8059,6 +8059,16 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
         let cx = crate::cx::for_request();
         self.verify_root_with_cx(&cx, candidate, store)
     }
+
+    /// Guardian evidence an older root names goes once a newer capture of
+    /// the pane is adopted; the rejection is raised only after the root's
+    /// envelope and image authenticated (see `settle_root_authority`).
+    fn superseded_by_newer(&self, error: &Self::Error) -> bool {
+        matches!(
+            error,
+            WholeMuxRecoveryError::UnprovedGuardianAuthority { .. }
+        )
+    }
 }
 
 /// Reconstructed inert terminal instance with pane identification and layout context.

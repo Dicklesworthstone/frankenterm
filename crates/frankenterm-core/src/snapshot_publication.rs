@@ -502,6 +502,14 @@ pub trait RootVerifier {
         candidate: &RootSlotCandidate,
         store: &SnapshotPublicationStore,
     ) -> Result<Self::Verified, Self::Error>;
+
+    /// Whether `error`, from [`Self::verify_root`] of an authenticated root,
+    /// only says that evidence a newer verified root supersedes is gone, so
+    /// that the rejected root may be overwritten when it is the older one.
+    /// No rejection is by default.
+    fn superseded_by_newer(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 impl<F, T, E> RootVerifier for F
@@ -2368,22 +2376,44 @@ impl SnapshotPublicationStore {
         // 2. Re-inspect existing candidates and determine verified active root
         //    (inside publication lock to avoid races with concurrent publishers)
         let (ordinary_candidates, _) = self.inspect_root_candidates()?;
-        // Retain only each candidate and its verdict, never the decoded graph.
-        let verify_candidate = |candidate: &RootSlotCandidate| -> Result<bool, PublicationError> {
-            let valid = verifier.verify_root(candidate, self).is_ok();
-            if let Some(protection) = protection {
-                Self::checkpoint_publication(protection.cx)?;
-            }
-            Ok(valid)
-        };
+        // Retain only each candidate and its verdict, never the decoded graph:
+        // whether it verified, and if not, whether a newer verified root
+        // supersedes what it lacks (`RootVerifier::superseded_by_newer`).
+        let verify_candidate =
+            |candidate: &RootSlotCandidate| -> Result<(bool, bool), PublicationError> {
+                let verdict = match verifier.verify_root(candidate, self) {
+                    Ok(_) => (true, false),
+                    Err(error) => (false, verifier.superseded_by_newer(&error)),
+                };
+                if let Some(protection) = protection {
+                    Self::checkpoint_publication(protection.cx)?;
+                }
+                Ok(verdict)
+            };
         // Drop retained candidate buffers before their reconstruction permits,
         // including when publication exits early.
         let mut recovered_candidate_permits = Vec::with_capacity(2);
         let mut candidates = Vec::with_capacity(2);
+        let mut superseded_generations = Vec::with_capacity(2);
         for candidate in ordinary_candidates {
-            let valid = verify_candidate(&candidate)?;
+            let (valid, superseded) = verify_candidate(&candidate)?;
+            if superseded {
+                superseded_generations.push(candidate.generation);
+            }
             candidates.push((candidate, valid));
         }
+        // A committed root rejected only for what a newer verified root
+        // supersedes (the guardian keeps only the newest adopted checkpoint
+        // of each pane) is the older slot, which this publication overwrites:
+        // it does not block. Any other rejected committed graph does.
+        let newest_valid = candidates
+            .iter()
+            .filter(|(_, valid)| *valid)
+            .map(|(candidate, _)| candidate.generation)
+            .max();
+        let overwritable = |generation: u64, superseded: bool| {
+            superseded && newest_valid.is_some_and(|newest| generation < newest)
+        };
         if let Some(protection) = protection {
             let (discoveries, discovery_diagnostics) = self.inspect_repair_discovery(
                 protection.namespace,
@@ -2400,7 +2430,8 @@ impl SnapshotPublicationStore {
                 let ordinary = candidates.iter().find(|(c, _)| c.slot == discovery.slot);
                 if let Some((candidate, valid)) = ordinary {
                     if self.root_candidate_matches_discovery(candidate, &discovery)? {
-                        if *valid {
+                        let superseded = superseded_generations.contains(&candidate.generation);
+                        if *valid || overwritable(candidate.generation, superseded) {
                             continue;
                         }
                         return Err(PublicationError::InvalidDiscovery(
@@ -2447,9 +2478,17 @@ impl SnapshotPublicationStore {
                     shared_admission_controller().acquire(repaired.reconstructed_envelope.len())?;
                 let recovered =
                     self.decode_recovered_root(discovery.slot, &repaired.reconstructed_envelope)?;
-                if !self.root_candidate_matches_discovery(&recovered, &discovery)?
-                    || !verify_candidate(&recovered)?
-                {
+                if !self.root_candidate_matches_discovery(&recovered, &discovery)? {
+                    return Err(PublicationError::InvalidDiscovery(
+                        "committed repair graph rejected",
+                    ));
+                }
+                let (valid, superseded) = verify_candidate(&recovered)?;
+                if !valid {
+                    if overwritable(recovered.generation, superseded) {
+                        // An older committed root this publication overwrites.
+                        continue;
+                    }
                     return Err(PublicationError::InvalidDiscovery(
                         "committed repair graph rejected",
                     ));
@@ -3676,6 +3715,32 @@ mod tests {
         }
     }
 
+    /// Verifier that rejects one generation, a rejection a newer verified
+    /// root supersedes or not, and accepts the rest.
+    struct RejectGenerationVerifier {
+        generation: u64,
+        superseded: bool,
+    }
+    impl RootVerifier for RejectGenerationVerifier {
+        type Error = std::io::Error;
+        type Verified = RootSlotCandidate;
+
+        fn verify_root(
+            &self,
+            candidate: &RootSlotCandidate,
+            _store: &SnapshotPublicationStore,
+        ) -> Result<Self::Verified, Self::Error> {
+            if candidate.generation == self.generation {
+                return Err(std::io::Error::other("evidence gone"));
+            }
+            Ok(candidate.clone())
+        }
+
+        fn superseded_by_newer(&self, _error: &Self::Error) -> bool {
+            self.superseded
+        }
+    }
+
     /// Verifier that requires specific objects to exist in the store.
     struct ObjectRequiringVerifier {
         required_objects: Vec<String>,
@@ -4110,6 +4175,69 @@ mod tests {
         assert_eq!(discoveries.len(), 1);
         assert_eq!(discoveries[0].generation, 1);
         assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn only_a_superseded_older_committed_root_is_overwritten_rejected() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let cx = Cx::for_testing();
+        let key = b"independent-repair-key";
+        let root_id = [43; 32];
+        let publish = |generation: u64,
+                       predecessor: Option<&GenerationPublicationReceipt>,
+                       verifier: &RejectGenerationVerifier| {
+            let request = GenerationRootPublishRequest {
+                generation,
+                publisher_id: "publisher".to_owned(),
+                predecessor: predecessor.map(|receipt| PredecessorBinding {
+                    expected_generation: receipt.generation,
+                    expected_hash: receipt.sha256.clone(),
+                }),
+                manifest_bytes: format!("generation {generation}").into_bytes(),
+                created_at_ms: 1000 + generation,
+            };
+            store.publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                verifier,
+            )
+        };
+        let accept = RejectGenerationVerifier {
+            generation: 0,
+            superseded: false,
+        };
+        let first = publish(1, None, &accept).unwrap();
+        let second = publish(2, Some(&first), &accept).unwrap();
+        let rejected = |generation, superseded| RejectGenerationVerifier {
+            generation,
+            superseded,
+        };
+        // Any other rejection of a committed graph blocks, and so does a
+        // superseded one of the newest root.
+        for verifier in [rejected(1, false), rejected(2, true), rejected(2, false)] {
+            assert!(matches!(
+                publish(3, Some(&second), &verifier),
+                Err(PublicationError::InvalidDiscovery(_))
+            ));
+        }
+        // The older root, rejected only for what the newer one supersedes, is
+        // the slot generation 3 overwrites.
+        let third = publish(3, Some(&second), &rejected(1, true)).unwrap();
+        assert_eq!(third.generation, 3);
+        let mut generations: Vec<u64> = store
+            .inspect_root_candidates()
+            .unwrap()
+            .0
+            .iter()
+            .map(|candidate| candidate.generation)
+            .collect();
+        generations.sort_unstable();
+        assert_eq!(generations, [2, 3]);
     }
 
     #[test]
