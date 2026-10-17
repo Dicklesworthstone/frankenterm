@@ -345,10 +345,9 @@ pub fn set_ascii_run(
     }
     let class = classify(attr);
     let mut cache = None;
-    let images: Vec<Box<ImageCell>> = attr
-        .images()
-        .map(|images| images.into_iter().map(Box::new).collect())
-        .unwrap_or_default();
+    // Only the per-byte path below stores images; the bulk paths refuse a
+    // pen that has any, without building their list for every run.
+    let has_images = attr.has_image_attachments();
     let Some(&first) = text.as_bytes().first() else {
         return true;
     };
@@ -376,7 +375,7 @@ pub fn set_ascii_run(
     } else {
         x >= len
     };
-    if images.is_empty() && (appends || x < len) {
+    if !has_images && (appends || x < len) {
         let style = match &class {
             StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
             StyleClass::Rich(rich) => StyleSpec::Rich {
@@ -404,6 +403,10 @@ pub fn set_ascii_run(
         }
     }
 
+    let images: Vec<Box<ImageCell>> = attr
+        .images()
+        .map(|images| images.into_iter().map(Box::new).collect())
+        .unwrap_or_default();
     let blank_is_default = Cell::new(' ', attr.clone()) == Cell::blank();
     for (offset, byte) in text.bytes().enumerate() {
         let at = x + offset;
