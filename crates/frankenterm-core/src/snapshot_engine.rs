@@ -288,6 +288,39 @@ fn pane_bindings_agree(
         })
 }
 
+/// The pane checkpoints of one whole-mux capture, timed so that a capture
+/// out of budget names how far it got and which pane spent the most: the
+/// panes are captured one after another under one total budget.
+#[cfg(feature = "frankenterm-deps")]
+struct CaptureTiming {
+    started: Instant,
+    panes: usize,
+    taken: usize,
+    slowest: Option<(usize, Duration)>,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl CaptureTiming {
+    fn pane_taken(&mut self, pane_id: usize, took: Duration) {
+        self.taken += 1;
+        if self.slowest.is_none_or(|(_, slowest)| took > slowest) {
+            self.slowest = Some((pane_id, took));
+        }
+    }
+
+    /// [`WholeMuxCaptureError::CaptureDeadline`], logged with the timing.
+    fn deadline(&self) -> WholeMuxCaptureError {
+        log::warn!(
+            "model capture budget exhausted after {} ms with {} of {} pane checkpoints taken; slowest (pane, ms): {:?}",
+            self.started.elapsed().as_millis(),
+            self.taken,
+            self.panes,
+            self.slowest.map(|(pane, took)| (pane, took.as_millis())),
+        );
+        WholeMuxCaptureError::CaptureDeadline
+    }
+}
+
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
@@ -361,7 +394,8 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     if attempt.authority.reconciliation_is_required() {
         return Err(WholeMuxCaptureError::ReconciliationRequired);
     }
-    let deadline = Instant::now()
+    let started = Instant::now();
+    let deadline = started
         .checked_add(capture_timeout)
         .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
     let config = mux::MuxTopologyCaptureConfig {
@@ -378,12 +412,19 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
     let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default();
+    let mut timing = CaptureTiming {
+        started,
+        panes: captured.pane_bindings.len(),
+        taken: 0,
+        slowest: None,
+    };
     for pane in &captured.pane_bindings {
         snapshot_cx_checkpoint(cx)?;
+        let pane_started = Instant::now();
         let remaining = deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(pane_started)
             .filter(|duration| !duration.is_zero())
-            .ok_or(WholeMuxCaptureError::CaptureDeadline)?;
+            .ok_or_else(|| timing.deadline())?;
         let mut cancellation = None;
         let mut capture_deadline_reached = false;
         let checkpoint = if pane.spawn_custody.is_some() {
@@ -404,7 +445,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 return Err(WholeMuxCaptureError::Context(error));
             }
             if capture_deadline_reached {
-                return Err(WholeMuxCaptureError::CaptureDeadline);
+                return Err(timing.deadline());
             }
             snapshot_cx_checkpoint(cx)?;
             let published = result.map_err(|source| {
@@ -461,7 +502,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 return Err(WholeMuxCaptureError::Context(error));
             }
             if capture_deadline_reached {
-                return Err(WholeMuxCaptureError::CaptureDeadline);
+                return Err(timing.deadline());
             }
             snapshot_cx_checkpoint(cx)?;
             let ack = result.map_err(|source| match source {
@@ -490,11 +531,12 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             CapturedPaneCheckpoint::Model(ack)
         };
         checkpoints.push(checkpoint);
+        timing.pane_taken(pane.pane_id, pane_started.elapsed());
     }
     after_capture();
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
-        return Err(WholeMuxCaptureError::CaptureDeadline);
+        return Err(timing.deadline());
     }
     // Every checkpoint precedes every validation read. Unchanged monotonic
     // witnesses establish a common cut between those two passes; equal visible
@@ -528,7 +570,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     }
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
-        return Err(WholeMuxCaptureError::CaptureDeadline);
+        return Err(timing.deadline());
     }
     // Capture identity is caller-owned; storage names additionally include the
     // observed cut time so a failed encryption attempt is not blindly replayed.

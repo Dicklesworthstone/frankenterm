@@ -884,7 +884,15 @@ fn execute_checkpoint_job(
             let receipt = match job
                 .protocol
                 .apply_checkpoint_transactionally(&job.request, |permit| {
-                    store.publish_checkpoint_catalog_adoption(permit)
+                    store
+                        .publish_checkpoint_catalog_adoption(permit)
+                        .inspect_err(|error| {
+                            // The mux sees only an indeterminate outcome, and
+                            // quarantines the lease: this names the cause.
+                            log::warn!(
+                                "guardian checkpoint catalog adoption failed; outcome indeterminate: {error:?}"
+                            );
+                        })
                 }) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -1290,6 +1298,11 @@ fn replay_store_error_response(
 ) -> Option<GuardianResponseEnvelope> {
     use crate::output::GuardianCheckpointStageStoreError;
 
+    // The mux sees only the rejection code, which folds several causes.
+    log::warn!(
+        "guardian {:?} store request failed: {error:?}",
+        request.header().operation
+    );
     let rejection = match error {
         GuardianCheckpointStageStoreError::Protocol(error) => {
             GuardianRejectionCode::from_protocol_error(error)
@@ -1396,7 +1409,14 @@ fn execute_checkpoint_stage_job(
             if reply.is_ok() { "applied" } else { "refused" }
         );
     }
-    let reply = reply.ok()?;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The mux sees no reply at all: this names the refusal.
+            log::warn!("guardian checkpoint {kind:?} refused: {error:?}");
+            return None;
+        }
+    };
     job.retain_genesis_begin = retain_genesis_begin;
     GuardianResponseEnvelope::reply(&job.request, &GuardianReply::CheckpointStage(reply)).ok()
 }
