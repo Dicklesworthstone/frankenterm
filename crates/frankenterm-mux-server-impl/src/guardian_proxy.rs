@@ -10219,9 +10219,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication without predecessor custody must fail predecessor reconciliation: {err:?}"
             );
@@ -10265,9 +10265,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication with wrong predecessor custody must fail predecessor reconciliation: {err:?}"
             );
@@ -10307,9 +10307,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication with wrong predecessor image digest must fail predecessor reconciliation: {err:?}"
             );

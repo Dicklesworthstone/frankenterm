@@ -279,6 +279,13 @@ pub enum PublicationError {
     #[error("Repair discovery validation failed: {0}")]
     InvalidDiscovery(&'static str),
 
+    /// A committed root's graph failed the publisher's verifier, which
+    /// says why: a refused publication logs this as its cause.
+    #[error(
+        "Repair discovery validation failed: committed graph rejected (generation {generation}): {reason}"
+    )]
+    CommittedGraphRejected { generation: u64, reason: String },
+
     #[error("Publication cancelled")]
     Cancelled,
 }
@@ -2379,29 +2386,46 @@ impl SnapshotPublicationStore {
         // Retain only each candidate and its verdict, never the decoded graph:
         // whether it verified, and if not, whether a newer verified root
         // supersedes what it lacks (`RootVerifier::superseded_by_newer`).
-        let verify_candidate =
-            |candidate: &RootSlotCandidate| -> Result<(bool, bool), PublicationError> {
-                let verdict = match verifier.verify_root(candidate, self) {
-                    Ok(_) => (true, false),
-                    Err(error) => (false, verifier.superseded_by_newer(&error)),
-                };
-                if let Some(protection) = protection {
-                    Self::checkpoint_publication(protection.cx)?;
-                }
-                Ok(verdict)
+        let verify_candidate = |candidate: &RootSlotCandidate| -> Result<
+            (bool, bool, Option<String>),
+            PublicationError,
+        > {
+            let verdict = match verifier.verify_root(candidate, self) {
+                Ok(_) => (true, false, None),
+                Err(error) => (
+                    false,
+                    verifier.superseded_by_newer(&error),
+                    Some(error.to_string()),
+                ),
             };
+            if let Some(protection) = protection {
+                Self::checkpoint_publication(protection.cx)?;
+            }
+            Ok(verdict)
+        };
         // Drop retained candidate buffers before their reconstruction permits,
         // including when publication exits early.
         let mut recovered_candidate_permits = Vec::with_capacity(2);
         let mut candidates = Vec::with_capacity(2);
         let mut superseded_generations = Vec::with_capacity(2);
+        let mut rejections = Vec::with_capacity(2);
         for candidate in ordinary_candidates {
-            let (valid, superseded) = verify_candidate(&candidate)?;
+            let (valid, superseded, reason) = verify_candidate(&candidate)?;
             if superseded {
                 superseded_generations.push(candidate.generation);
             }
+            if let Some(reason) = reason {
+                rejections.push((candidate.generation, reason));
+            }
             candidates.push((candidate, valid));
         }
+        let rejected = |generation: u64| {
+            let reason = rejections
+                .iter()
+                .find(|(rejected, _)| *rejected == generation)
+                .map_or_else(String::new, |(_, reason)| reason.clone());
+            PublicationError::CommittedGraphRejected { generation, reason }
+        };
         // A committed root rejected only for what a newer verified root
         // supersedes (the guardian keeps only the newest adopted checkpoint
         // of each pane) is the older slot, which this publication overwrites:
@@ -2434,9 +2458,7 @@ impl SnapshotPublicationStore {
                         if *valid || overwritable(candidate.generation, superseded) {
                             continue;
                         }
-                        return Err(PublicationError::InvalidDiscovery(
-                            "committed graph rejected",
-                        ));
+                        return Err(rejected(candidate.generation));
                     }
                 }
                 let expected = ExpectedRecoveryIdentity::new(
@@ -2483,15 +2505,16 @@ impl SnapshotPublicationStore {
                         "committed repair graph rejected",
                     ));
                 }
-                let (valid, superseded) = verify_candidate(&recovered)?;
+                let (valid, superseded, reason) = verify_candidate(&recovered)?;
                 if !valid {
                     if overwritable(recovered.generation, superseded) {
                         // An older committed root this publication overwrites.
                         continue;
                     }
-                    return Err(PublicationError::InvalidDiscovery(
-                        "committed repair graph rejected",
-                    ));
+                    return Err(PublicationError::CommittedGraphRejected {
+                        generation: recovered.generation,
+                        reason: reason.unwrap_or_default(),
+                    });
                 }
                 // A newer ordinary root can be the durable commit of a publication
                 // whose discovery write failed. Otherwise the authenticated
@@ -4222,7 +4245,7 @@ mod tests {
         for verifier in [rejected(1, false), rejected(2, true), rejected(2, false)] {
             assert!(matches!(
                 publish(3, Some(&second), &verifier),
-                Err(PublicationError::InvalidDiscovery(_))
+                Err(PublicationError::CommittedGraphRejected { .. })
             ));
         }
         // The older root, rejected only for what the newer one supersedes, is
