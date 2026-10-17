@@ -541,17 +541,53 @@ struct GuardianCheckpointStageStoreInner {
     gate: Mutex<()>,
     durable_records: Mutex<Vec<FileIdentity>>,
     replay: Mutex<GuardianReplayState>,
-    /// Checksums of catalog candidates whose records this store has already
-    /// authenticated (see `checkpoint_catalog_validate_candidate_records`).
-    validated_candidates: Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>>,
+    /// Checksums of catalog candidates whose records a store of this process
+    /// has already authenticated in this directory under this key (see
+    /// `checkpoint_catalog_validate_decoded_candidate_records`).
+    validated_candidates: CheckpointCatalogValidatedMemo,
     #[cfg(test)]
     custody_sync_failure: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     custody_publication_cut: std::sync::atomic::AtomicU8,
 }
 
-/// Validated candidate checksums a store remembers before it starts over.
+/// Validated candidate checksums a memo remembers before it starts over.
 const CHECKPOINT_CATALOG_VALIDATED_MEMO_ENTRIES: usize = 4096;
+
+/// Directories (with their keys) whose memos this process keeps with no
+/// store open before it forgets those.
+const CHECKPOINT_CATALOG_VALIDATED_MEMO_SCOPES: usize = 64;
+
+type CheckpointCatalogValidatedMemo = Arc<Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>>>;
+
+/// The validated-candidate memo every store of this process shares for one
+/// output directory and key.
+///
+/// The recovery verifier reopens a pane's custody through a fresh store for
+/// every pane, twice per capture (once to select the predecessor root, once
+/// to verify the new one), and each reopen scans the whole catalog. A memo
+/// per store never hit, so every capture re-authenticated every member of
+/// every catalog: more than half of a successor's capture time, growing with
+/// the catalogs. A checksum authenticates the same bytes again under the same
+/// key, and the key id commits to that key, so a memo scoped to the directory
+/// and the key id keeps exactly the guarantee the per-store memo had.
+fn checkpoint_catalog_validated_memo(
+    directory: DirectoryIdentity,
+    key_id: [u8; 8],
+) -> CheckpointCatalogValidatedMemo {
+    static MEMOS: Mutex<BTreeMap<(DirectoryIdentity, [u8; 8]), CheckpointCatalogValidatedMemo>> =
+        Mutex::new(BTreeMap::new());
+    let mut memos = MEMOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !memos.contains_key(&(directory, key_id))
+        && memos.len() >= CHECKPOINT_CATALOG_VALIDATED_MEMO_SCOPES
+    {
+        // An open store keeps its memo; only memos no store holds go.
+        memos.retain(|_, memo| Arc::strong_count(memo) > 1);
+    }
+    Arc::clone(memos.entry((directory, key_id)).or_default())
+}
 
 /// Authenticated durable intent, not a Claim acknowledgement or live lease.
 pub struct GuardianDurableRecoveryClaimIntentV1 {
@@ -3578,13 +3614,16 @@ impl GuardianCheckpointStageStore {
                 })?,
                 directory_path: directory_path.to_path_buf(),
                 cipher: GuardianCheckpointCipher::from_output_cipher(output_cipher),
-                persistence,
                 policy,
                 name_max,
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
-                validated_candidates: Mutex::new(BTreeSet::new()),
+                validated_candidates: checkpoint_catalog_validated_memo(
+                    persistence.directory_identity,
+                    output_cipher.key_id(),
+                ),
+                persistence,
                 #[cfg(test)]
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 #[cfg(test)]
@@ -12960,7 +12999,8 @@ fn checkpoint_catalog_validate_candidate_records(
 /// panes overran the capture budget. The result depends only on the
 /// candidate's header and records and this store's keys, and a decoded
 /// candidate's checksum is a domain-separated SHA-256 of exactly those bytes,
-/// which decoding verified. A checksum this store has authenticated
+/// which decoding verified. A checksum authenticated by any store of this
+/// process for the same directory and key (`checkpoint_catalog_validated_memo`)
 /// therefore names bytes that authenticate again, and is not checked twice.
 /// A candidate built in memory has no checksum yet and must take the
 /// unmemoized check.
@@ -17245,7 +17285,7 @@ mod tests {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
-                validated_candidates: Mutex::new(BTreeSet::new()),
+                validated_candidates: Arc::clone(&inner.validated_candidates),
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
             }),
@@ -17711,6 +17751,66 @@ mod tests {
             matches!(rescanned, Err(GuardianCheckpointStageStoreError::Poisoned)),
             "a corrupted member fails the scan: {:?}",
             rescanned.map(|scan| scan.published.len())
+        );
+        Ok(())
+    }
+
+    /// The recovery verifier reopens custody through a fresh store for every
+    /// pane on every capture. Every store of this process on one directory
+    /// with one key shares what the others authenticated; a store under
+    /// another key starts with nothing.
+    #[test]
+    fn a_reopened_store_remembers_what_an_earlier_store_authenticated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-shared-memo-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xad100);
+        let mux = Uuid::from_u128(0xad101);
+        let pane = Uuid::from_u128(0xad102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xad_0000,
+            b"shared;", b"shared;",
+        )?;
+        let checksum = store.with_exclusive_directory(|inner| {
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            Ok(scan.published[0].candidate_checksum)
+        })?;
+        let open = |cipher: &GuardianOutputCipher| {
+            GuardianCheckpointStageStore::open(
+                &pipeline.directory,
+                &pipeline.directory_path,
+                cipher,
+                Arc::clone(&pipeline.persistence),
+                GuardianCheckpointStagePolicy::production(),
+            )
+        };
+        let remembers = |store: &GuardianCheckpointStageStore| {
+            store
+                .inner
+                .validated_candidates
+                .lock()
+                .unwrap()
+                .contains(&checksum)
+        };
+        let reopened = open(&pipeline.cipher)?;
+        assert!(
+            remembers(&reopened),
+            "a reopened store knows the member is authenticated"
+        );
+        let rescanned = reopened.with_exclusive_directory(|inner| {
+            checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })
+        })?;
+        assert_eq!(rescanned.published.len(), 1);
+        let foreign = open(&GuardianOutputKey::generate()?.cipher()?)?;
+        assert!(
+            !remembers(&foreign),
+            "a store under another key authenticates for itself"
         );
         Ok(())
     }
