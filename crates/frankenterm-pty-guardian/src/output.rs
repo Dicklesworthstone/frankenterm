@@ -3774,13 +3774,12 @@ impl GuardianCheckpointStageStore {
                 if !census.entries.iter().any(|entry| entry.key == shape.key()) {
                     // A full stage reclaims acknowledged uploads, a pane's
                     // newest included; its published member answers for it.
-                    return Ok(checkpoint_stage_query_published(inner, &shape)?
-                        .map_or(
-                            GuardianCheckpointStageReplyV1::Absent {
-                                upload_id: shape.upload_id,
-                            },
-                            |(reply, _)| reply,
-                        ));
+                    return Ok(checkpoint_stage_query_published(inner, &shape)?.map_or(
+                        GuardianCheckpointStageReplyV1::Absent {
+                            upload_id: shape.upload_id,
+                        },
+                        |(reply, _)| reply,
+                    ));
                 }
                 let inspection = checkpoint_inspect_upload(
                     inner,
