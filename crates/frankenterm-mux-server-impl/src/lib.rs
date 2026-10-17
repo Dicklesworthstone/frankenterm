@@ -468,11 +468,11 @@ mod deferred_scrollback {
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
     use std::time::{Duration, Instant};
     use wezterm_term::config::{
-        ScrollbackCapacityWait, ScrollbackClearCommit, ScrollbackIntervalCapture,
-        ScrollbackIntervalIdentity, ScrollbackLineAdmission, ScrollbackPrefix,
-        ScrollbackReplaceCommit, ScrollbackSnapshot, ScrollbackSnapshotGeneration,
-        ScrollbackSnapshotLimits, ScrollbackSpillError, ScrollbackSpillSink, ScrollbackUsage,
-        ScrollbackUsageCapture,
+        ScrollbackAncestry, ScrollbackCapacityWait, ScrollbackClearCommit,
+        ScrollbackIntervalCapture, ScrollbackIntervalIdentity, ScrollbackLineAdmission,
+        ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
+        ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
+        ScrollbackSpillSink, ScrollbackUsage, ScrollbackUsageCapture,
     };
     use wezterm_term::{Line, StableRowIndex};
 
@@ -2752,16 +2752,16 @@ mod deferred_scrollback {
             prefix: ScrollbackPrefix<'_>,
             retention: usize,
         ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-            self.replace_prefix_with(expected, false, prefix, retention)
+            self.replace_prefix_with(expected, None, prefix, retention)
         }
 
         fn replace_scrollback_prefix_superseding(
             &self,
-            ancestor: ScrollbackSnapshotGeneration,
+            ancestry: ScrollbackAncestry,
             prefix: ScrollbackPrefix<'_>,
             retention: usize,
         ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-            self.replace_prefix_with(Some(ancestor), true, prefix, retention)
+            self.replace_prefix_with(Some(ancestry.ancestor), Some(ancestry), prefix, retention)
         }
 
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
@@ -2833,7 +2833,7 @@ mod deferred_scrollback {
         fn replace_prefix_with(
             &self,
             expected: Option<ScrollbackSnapshotGeneration>,
-            supersede: bool,
+            supersede: Option<ScrollbackAncestry>,
             prefix: ScrollbackPrefix<'_>,
             retention: usize,
         ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
@@ -2865,11 +2865,11 @@ mod deferred_scrollback {
             // The backing sink checks a superseding ancestor under its own
             // mutation boundary, while these locks keep this sink's writer
             // from admitting a row in between.
-            let replaced = match expected {
-                Some(ancestor) if supersede => self
+            let replaced = match supersede {
+                Some(ancestry) => self
                     .backing
-                    .replace_scrollback_prefix_superseding(ancestor, prefix, retention),
-                expected => self
+                    .replace_scrollback_prefix_superseding(ancestry, prefix, retention),
+                None => self
                     .backing
                     .replace_scrollback_prefix(expected, prefix, retention),
             };
@@ -2882,15 +2882,16 @@ mod deferred_scrollback {
                 }
             };
             let generation = receipt.generation();
-            let valid_generation = match expected {
-                Some(expected) => {
+            let valid_generation = match (supersede, expected) {
+                (Some(ancestry), _) => ancestry.admits_receipt(generation),
+                (None, Some(expected)) => {
                     generation.content_epoch() == expected.content_epoch()
-                        && expected.revision().checked_add(1).is_some_and(|revision| {
-                            generation.revision() == revision
-                                || (supersede && generation.revision() > revision)
-                        })
+                        && expected
+                            .revision()
+                            .checked_add(1)
+                            .is_some_and(|revision| generation.revision() == revision)
                 }
-                None => generation.revision() == 1,
+                (None, None) => generation.revision() == 1,
             };
             if receipt.oldest_stable_row() != oldest
                 || receipt.newest_stable_row_exclusive() != newest
@@ -16964,19 +16965,24 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         wezterm_term::config::ScrollbackReplaceCommit,
         wezterm_term::config::ScrollbackSpillError,
     > {
-        self.replace_scrollback_prefix_with(expected_generation, false, prefix, max_retained_rows)
+        self.replace_scrollback_prefix_with(expected_generation, None, prefix, max_retained_rows)
     }
 
     fn replace_scrollback_prefix_superseding(
         &self,
-        ancestor: wezterm_term::config::ScrollbackSnapshotGeneration,
+        ancestry: wezterm_term::config::ScrollbackAncestry,
         prefix: wezterm_term::config::ScrollbackPrefix<'_>,
         max_retained_rows: usize,
     ) -> Result<
         wezterm_term::config::ScrollbackReplaceCommit,
         wezterm_term::config::ScrollbackSpillError,
     > {
-        self.replace_scrollback_prefix_with(Some(ancestor), true, prefix, max_retained_rows)
+        self.replace_scrollback_prefix_with(
+            Some(ancestry.ancestor),
+            Some(ancestry),
+            prefix,
+            max_retained_rows,
+        )
     }
 
     fn clear_scrollback(
@@ -17049,14 +17055,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
 impl LiveScrollbackSpillSink {
     /// The compare-and-swap behind both replacement entry points. With
-    /// `supersede`, an expected generation is an ancestor: the published
-    /// generation is accepted when it shares the ancestor's content epoch at
-    /// a revision no older than the ancestor's, and it becomes the
+    /// `supersede`, the published generation is accepted when the ancestry
+    /// admits it (the ancestor's epoch at a revision no older than its, or a
+    /// later epoch after a clear the caller replayed), and it becomes the
     /// predecessor the successor manifest names.
     fn replace_scrollback_prefix_with(
         &self,
         expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
-        supersede: bool,
+        supersede: Option<wezterm_term::config::ScrollbackAncestry>,
         prefix: wezterm_term::config::ScrollbackPrefix<'_>,
         max_retained_rows: usize,
     ) -> Result<
@@ -17101,19 +17107,18 @@ impl LiveScrollbackSpillSink {
                 .line_count(previous_ledger_pane_id)
         };
         // Superseding: rows this lineage gained after the ancestor (tail
-        // windows a dead writer committed, or adopted on reopen) are replaced
-        // under this same mutation boundary, never merged.
-        let expected_generation = match expected_generation {
-            Some(ancestor) if supersede => {
+        // windows a dead writer committed, adopted on reopen, or a clear it
+        // published) are replaced under this same mutation boundary, never
+        // merged.
+        let expected_generation = match supersede {
+            Some(ancestry) => {
                 let published = previous_state.snapshot_generation();
-                if published.content_epoch() != ancestor.content_epoch()
-                    || published.revision() < ancestor.revision()
-                {
+                if !ancestry.admits(published) {
                     return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
                 }
                 Some(published)
             }
-            expected => expected,
+            None => expected_generation,
         };
         let successor_generation = match expected_generation {
             Some(expected) => {
@@ -19281,12 +19286,16 @@ mod tests {
     #[test]
     fn deferred_scrollback_superseding_replacement_replaces_rows_spilled_after_the_ancestor() {
         use wezterm_term::config::{
-            ScrollbackPrefix, ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits,
-            ScrollbackSpillError,
+            ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotGeneration,
+            ScrollbackSnapshotLimits, ScrollbackSpillError,
         };
         let (_dir, backing, deferred) = deferred_test_sink();
         let attrs = CellAttributes::blank();
         let row = |text: &str| Line::from_text(text, &attrs, 5, None);
+        let strict = |ancestor| ScrollbackAncestry {
+            ancestor,
+            cleared_since: false,
+        };
         assert!(deferred.store_scrollback_line(10, &row("checkpointed"), 8));
         let ancestor = deferred
             .snapshot_scrollback(
@@ -19318,7 +19327,7 @@ mod tests {
         for refused in [foreign, ahead] {
             assert_eq!(
                 deferred
-                    .replace_scrollback_prefix_superseding(refused, prefix(), 8)
+                    .replace_scrollback_prefix_superseding(strict(refused), prefix(), 8)
                     .map(|_| ()),
                 Err(ScrollbackSpillError::SnapshotGenerationMismatch),
                 "only a same-epoch ancestor at or behind the store may be superseded"
@@ -19331,7 +19340,7 @@ mod tests {
         assert!(published.revision() > ancestor.revision());
 
         let receipt = deferred
-            .replace_scrollback_prefix_superseding(ancestor, prefix(), 8)
+            .replace_scrollback_prefix_superseding(strict(ancestor), prefix(), 8)
             .unwrap();
         assert_eq!(
             receipt.generation(),
@@ -19355,6 +19364,83 @@ mod tests {
         assert_eq!(deferred.retained_scrollback_rows(), 2);
         assert!(deferred.store_scrollback_line(12, &row("live again"), 8));
         assert_eq!(deferred.load_scrollback_line(12), Some(row("live again")));
+    }
+
+    /// A restored model that replayed a clear after its checkpoint supersedes
+    /// the store that writer cleared, in whatever epoch it reached since;
+    /// one that replayed none still may not.
+    #[test]
+    fn deferred_scrollback_superseding_replacement_follows_a_replayed_clear() {
+        use wezterm_term::config::{
+            ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotLimits, ScrollbackSpillError,
+        };
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |text: &str| Line::from_text(text, &attrs, 5, None);
+        assert!(deferred.store_scrollback_line(10, &row("checkpointed"), 8));
+        let ancestor = deferred
+            .snapshot_scrollback(
+                11,
+                ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap()
+            .generation();
+        // The writer cleared twice after the checkpoint, with rows reaching
+        // the store in between, so the store sits two epochs past it.
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(20, &row("between clears"), 8));
+        deferred.flush_scrollback().unwrap();
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(30, &row("after the clears"), 8));
+        deferred.flush_scrollback().unwrap();
+        let published = backing
+            .lock_state("superseding across clears")
+            .unwrap()
+            .snapshot_generation();
+        assert_ne!(published.content_epoch(), ancestor.content_epoch());
+
+        let model = [row("replayed after the clears")];
+        let prefix = || ScrollbackPrefix::from_slices(Some(30), 31, &model, &[]).unwrap();
+        assert_eq!(
+            deferred
+                .replace_scrollback_prefix_superseding(
+                    ScrollbackAncestry {
+                        ancestor,
+                        cleared_since: false,
+                    },
+                    prefix(),
+                    8,
+                )
+                .map(|_| ()),
+            Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+            "a model that replayed no clear cannot vouch for another epoch"
+        );
+        let receipt = deferred
+            .replace_scrollback_prefix_superseding(
+                ScrollbackAncestry {
+                    ancestor,
+                    cleared_since: true,
+                },
+                prefix(),
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.generation().content_epoch(),
+            published.content_epoch()
+        );
+        assert_eq!(receipt.generation().revision(), published.revision() + 1);
+        assert_eq!(
+            deferred.load_scrollback_line(30),
+            Some(row("replayed after the clears"))
+        );
+        assert_eq!(deferred.load_scrollback_line(20), None);
+        assert_eq!(deferred.retained_scrollback_rows(), 1);
     }
 
     #[test]

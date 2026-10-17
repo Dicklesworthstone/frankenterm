@@ -12421,7 +12421,13 @@ fn attempt_live_parser_checkpoint(
         }
         Ok(Err(error)) => {
             if error.leaves_live_parser_consistent() {
-                log::warn!("live parser checkpoint capture failed; the pane continues: {error:?}");
+                // The pane lives on, but no whole-mux recovery image can be
+                // published without it, so an upgrade waits; name the pane.
+                log::warn!(
+                    "live parser checkpoint capture of pane {} failed; the pane continues, \
+                     but whole-mux recovery cannot publish until it captures: {error:?}",
+                    generation.pane_id
+                );
                 control.complete_capture(
                     request.request_id(),
                     Err(LiveParserCheckpointError::CaptureAndBind),

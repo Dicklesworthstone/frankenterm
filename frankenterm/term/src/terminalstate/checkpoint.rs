@@ -6095,6 +6095,74 @@ mod tests {
     /// model: activation supersedes the advanced store with the model's
     /// exact cold prefix, keeping neither the stale row nor a duplicate.
     #[test]
+    fn cold_seam_checkpoint_supersedes_a_store_its_replay_cleared() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        assert!(sink.retained_scrollback_rows() > 0);
+        // The writer printed ESC[3J after the checkpoint and committed that
+        // clear, which moves a real store to a content epoch the restored
+        // model cannot name; replaying the same bytes tells activation so.
+        live.advance_bytes(b"\x1b[3J");
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        inert.replay_bytes(b"\x1b[3J").unwrap();
+        let model = inert.checkpoint().unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("superseding activation failed: {:?}", failure.error()),
+        };
+        assert!(sink
+            .last_supersede_cleared
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let restored = TerminalCheckpointV3::capture_with_limits(&activated, limits).unwrap();
+        assert_eq!(restored.primary_screen.lines, model.primary_screen.lines);
+    }
+
+    #[test]
+    fn scrollback_ancestry_admits_only_its_lineage() {
+        use crate::config::{ScrollbackAncestry, ScrollbackSnapshotGeneration};
+
+        let epoch = [7; 16];
+        let other = [9; 16];
+        let ancestor = ScrollbackSnapshotGeneration::new(epoch, 5);
+        let strict = ScrollbackAncestry {
+            ancestor,
+            cleared_since: false,
+        };
+        let cleared = ScrollbackAncestry {
+            cleared_since: true,
+            ..strict
+        };
+        let generation = ScrollbackSnapshotGeneration::new;
+        // The ancestor's epoch: no older than the ancestor, either way.
+        for ancestry in [strict, cleared] {
+            assert!(ancestry.admits(generation(epoch, 5)));
+            assert!(ancestry.admits(generation(epoch, 9)));
+            assert!(!ancestry.admits(generation(epoch, 4)));
+            assert!(ancestry.admits_receipt(generation(epoch, 6)));
+            assert!(!ancestry.admits_receipt(generation(epoch, 5)));
+        }
+        // Another epoch only after a replayed clear, and a receipt there is a
+        // published revision.
+        assert!(!strict.admits(generation(other, 0)));
+        assert!(!strict.admits_receipt(generation(other, 1)));
+        assert!(cleared.admits(generation(other, 0)));
+        assert!(cleared.admits_receipt(generation(other, 1)));
+        assert!(!cleared.admits_receipt(generation(other, 0)));
+    }
+
+    #[test]
     fn cold_seam_checkpoint_supersedes_an_advanced_store_when_asked() {
         use crate::config::ScrollbackSpillSink;
 

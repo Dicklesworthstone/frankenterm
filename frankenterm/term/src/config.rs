@@ -560,6 +560,43 @@ impl std::fmt::Debug for ScrollbackSnapshotGeneration {
     }
 }
 
+/// What a superseding replacement knows about its cold lineage since the
+/// generation its checkpoint recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackAncestry {
+    /// The generation the caller's checkpoint recorded.
+    pub ancestor: ScrollbackSnapshotGeneration,
+    /// The caller's model applied a scrollback clear after `ancestor`. Every
+    /// committed clear starts a new content epoch derived from the store's
+    /// revision at that moment, which a replayed model cannot name, so the
+    /// published generation may then sit in any later epoch.
+    pub cleared_since: bool,
+}
+
+impl ScrollbackAncestry {
+    /// Whether `published`, a sink's current generation, descends from the
+    /// ancestor as far as the caller's model can tell: the ancestor's epoch at
+    /// a revision no older than its, or another epoch after a replayed clear.
+    pub fn admits(self, published: ScrollbackSnapshotGeneration) -> bool {
+        if published.content_epoch() == self.ancestor.content_epoch() {
+            published.revision() >= self.ancestor.revision()
+        } else {
+            self.cleared_since
+        }
+    }
+
+    /// Whether `committed`, a superseding replacement's receipt, is one the
+    /// sink could have published: past the ancestor in its epoch, or the
+    /// first revision or later of another epoch after a replayed clear.
+    pub fn admits_receipt(self, committed: ScrollbackSnapshotGeneration) -> bool {
+        if committed.content_epoch() == self.ancestor.content_epoch() {
+            committed.revision() > self.ancestor.revision()
+        } else {
+            self.cleared_since && committed.revision() >= 1
+        }
+    }
+}
+
 /// Hard limits enforced by a cold sink while it holds its snapshot boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScrollbackSnapshotLimits {
@@ -1313,22 +1350,21 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError>;
 
     /// [`Self::replace_scrollback_prefix`] for a caller whose model is
-    /// authoritative past `ancestor`, such as a guardian restore that has
-    /// replayed every output record after its checkpoint. Under the same
+    /// authoritative past `ancestry.ancestor`, such as a guardian restore that
+    /// has replayed every output record after its checkpoint. Under the same
     /// mutation boundary, the sink accepts its currently published generation
-    /// when it shares `ancestor`'s content epoch at a revision no older than
-    /// `ancestor`'s: rows a dead writer appended or published after the
-    /// checkpoint are superseded by `prefix`, never merged with it. The
-    /// receipt keeps the epoch and advances the current revision by exactly
-    /// one, so its revision exceeds `ancestor`'s. The default accepts only
-    /// `ancestor` itself.
+    /// when [`ScrollbackAncestry::admits`] it: rows a dead writer appended,
+    /// published or cleared after the checkpoint are superseded by `prefix`,
+    /// never merged with it. The receipt keeps the published epoch and
+    /// advances the published revision by exactly one. The default accepts
+    /// only the ancestor itself.
     fn replace_scrollback_prefix_superseding(
         &self,
-        ancestor: ScrollbackSnapshotGeneration,
+        ancestry: ScrollbackAncestry,
         prefix: ScrollbackPrefix<'_>,
         max_retained_rows: usize,
     ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-        self.replace_scrollback_prefix(Some(ancestor), prefix, max_retained_rows)
+        self.replace_scrollback_prefix(Some(ancestry.ancestor), prefix, max_retained_rows)
     }
 
     /// Commit a logical clear before returning success.

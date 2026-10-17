@@ -3,7 +3,7 @@ use super::*;
 use crate::config::{BidiMode, GridEngine, ScrollbackSnapshotGeneration, ScrollbackSpillError};
 #[cfg(feature = "use_serde")]
 use crate::config::{
-    ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
+    ScrollbackActivationError, ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
 use crate::pagegrid::cell::Glyph;
@@ -2904,6 +2904,11 @@ struct RecoveryScrollbackBoundary {
     /// `ScrollbackSpillSink::replace_scrollback_prefix_superseding`).
     #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
     supersede_cold_successors: bool,
+    /// The model erased scrollback after its checkpoint. The writer that
+    /// produced the same output committed that clear live, so the store sits
+    /// in a content epoch this model cannot name.
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
+    cleared_since_checkpoint: bool,
 }
 
 /// Semantic screen fields retained by the guardian checkpoint codec.
@@ -6301,6 +6306,7 @@ impl Screen {
             expected_generation: parts.cold_snapshot_generation,
             original_cold_prefix_newest_exclusive,
             supersede_cold_successors: false,
+            cleared_since_checkpoint: false,
         });
         screen.keyboard_stack = parts.keyboard_stack;
         screen.saved_cursor = parts.saved_cursor;
@@ -6554,8 +6560,9 @@ impl Screen {
     }
 
     /// Let activation supersede a cold store that advanced past the
-    /// checkpoint's generation in the same content epoch. Only a caller
-    /// whose model is authoritative past the checkpoint may ask for this.
+    /// checkpoint's generation, through any clear the model replayed. Only a
+    /// caller whose model is authoritative past the checkpoint may ask for
+    /// this.
     #[cfg(feature = "use_serde")]
     pub(crate) fn supersede_recovered_cold_successors(&mut self) {
         if let Some(recovery) = self.recovery_scrollback.as_mut() {
@@ -6642,23 +6649,34 @@ impl Screen {
                 &second[..second_count],
             )
             .map_err(ScrollbackActivationError::Spill)?;
-            let supersede = recovery.supersede_cold_successors;
-            let commit = match recovery.expected_generation {
-                Some(ancestor) if supersede => {
-                    sink.replace_scrollback_prefix_superseding(ancestor, prefix, max_retained_rows)
+            let ancestry = recovery
+                .expected_generation
+                .filter(|_| recovery.supersede_cold_successors)
+                .map(|ancestor| ScrollbackAncestry {
+                    ancestor,
+                    cleared_since: recovery.cleared_since_checkpoint,
+                });
+            let commit = match ancestry {
+                Some(ancestry) => {
+                    sink.replace_scrollback_prefix_superseding(ancestry, prefix, max_retained_rows)
                 }
-                expected => sink.replace_scrollback_prefix(expected, prefix, max_retained_rows),
+                None => sink.replace_scrollback_prefix(
+                    recovery.expected_generation,
+                    prefix,
+                    max_retained_rows,
+                ),
             }
             .map_err(ScrollbackActivationError::Spill)?;
-            let generation_is_valid = match recovery.expected_generation {
-                Some(expected) => {
+            let generation_is_valid = match (ancestry, recovery.expected_generation) {
+                (Some(ancestry), _) => ancestry.admits_receipt(commit.generation()),
+                (None, Some(expected)) => {
                     commit.generation().content_epoch() == expected.content_epoch()
-                        && expected.revision().checked_add(1).is_some_and(|revision| {
-                            let published = commit.generation().revision();
-                            published == revision || (supersede && published > revision)
-                        })
+                        && expected
+                            .revision()
+                            .checked_add(1)
+                            .is_some_and(|revision| commit.generation().revision() == revision)
                 }
-                None => commit.generation().revision() == 1,
+                (None, None) => commit.generation().revision() == 1,
             };
             if !generation_is_valid
                 || commit.oldest_stable_row() != oldest_stable_row
@@ -10458,6 +10476,7 @@ impl Screen {
             recovery_boundary_after_clear,
         ) {
             recovery.original_cold_prefix_newest_exclusive = boundary;
+            recovery.cleared_since_checkpoint = true;
         }
         self.scrollback_tiering.reset();
         self.cold_scrollback_worker.reset();
@@ -17286,6 +17305,9 @@ pub(crate) mod tests {
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
         revision: AtomicU64,
+        /// What the last superseding replacement said about clears since its
+        /// ancestor.
+        pub(crate) last_supersede_cleared: AtomicBool,
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
@@ -17566,7 +17588,7 @@ pub(crate) mod tests {
 
         fn replace_scrollback_prefix_superseding(
             &self,
-            ancestor: crate::config::ScrollbackSnapshotGeneration,
+            ancestry: crate::config::ScrollbackAncestry,
             prefix: crate::config::ScrollbackPrefix<'_>,
             max_retained_rows: usize,
         ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
@@ -17575,9 +17597,9 @@ pub(crate) mod tests {
                 [0; 16],
                 self.revision.load(Ordering::Relaxed),
             );
-            if current.content_epoch() != ancestor.content_epoch()
-                || current.revision() < ancestor.revision()
-            {
+            self.last_supersede_cleared
+                .store(ancestry.cleared_since, Ordering::Relaxed);
+            if !ancestry.admits(current) {
                 return Err(crate::config::ScrollbackSpillError::SnapshotGenerationMismatch);
             }
             self.replace_scrollback_prefix(Some(current), prefix, max_retained_rows)
