@@ -1992,6 +1992,20 @@ impl TerminalState {
 
     fn scroll_up(&mut self, num_rows: usize) {
         let seqno = self.seqno;
+        // A line feed at the bottom of the whole screen under a pen whose
+        // blank is the default: the page engine's own path, without the
+        // blank or the region arguments built (ft-yccm0.3.2.6).
+        if num_rows == 1 && self.pen.sgr_only_is_blank() {
+            let bidi_mode = self.get_bidi_mode();
+            if self.screen.scroll_up_line(
+                &self.top_and_bottom_margins,
+                &self.left_and_right_margins,
+                seqno,
+                &bidi_mode,
+            ) {
+                return;
+            }
+        }
         let blank_attr = self.pen.clone_sgr_only();
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();

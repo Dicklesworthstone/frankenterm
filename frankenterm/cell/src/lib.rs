@@ -984,6 +984,23 @@ impl CellAttributes {
         res
     }
 
+    /// Whether [`Self::clone_sgr_only`] is [`Self::blank`], without building
+    /// the clone: the test a line feed makes for the row it adds.
+    #[inline]
+    pub fn sgr_only_is_blank(&self) -> bool {
+        // The bits `clone_sgr_only` resets: underline, strikethrough,
+        // overline, semantic type and protection.
+        const RESET: u32 = (0b111 << 2) | (1 << 9) | (1 << 12) | (0b11 << 13) | (1 << 17);
+        self.attributes & !RESET == 0
+            && self.foreground == SmallColor::Default
+            && self.background == SmallColor::Default
+            && self.fat.as_ref().is_none_or(|fat| {
+                fat.foreground == ColorAttribute::Default
+                    && fat.background == ColorAttribute::Default
+                    && fat.underline_color == ColorAttribute::Default
+            })
+    }
+
     pub fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
         self.fat.as_ref().and_then(|fat| fat.hyperlink.as_ref())
     }
@@ -2504,6 +2521,44 @@ mod test {
         assert!(!cloned.protected());
         assert!(cloned.reverse());
         assert_eq!(cloned.background(), ColorAttribute::PaletteIndex(4));
+    }
+
+    #[test]
+    fn sgr_only_is_blank_answers_as_the_clone() {
+        // No bit, then each attribute bit alone, under every mix of the
+        // colors and extras `clone_sgr_only` keeps or drops.
+        let colors = [
+            ColorAttribute::Default,
+            ColorAttribute::PaletteIndex(4),
+            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.5, 0.25, 0.0, 1.0)),
+        ];
+        for bit in core::iter::once(None).chain((0..32).map(Some)) {
+            for fg in colors {
+                for bg in colors {
+                    for underline_color in colors {
+                        for link in [false, true] {
+                            let mut a = CellAttributes::blank();
+                            if let Some(bit) = bit {
+                                a.attributes |= 1 << bit;
+                            }
+                            a.set_foreground(fg)
+                                .set_background(bg)
+                                .set_underline_color(underline_color);
+                            if link {
+                                let link = Hyperlink::new("https://example.com");
+                                a.set_hyperlink(Some(Arc::new(link)));
+                            }
+                            assert_eq!(
+                                a.sgr_only_is_blank(),
+                                a.clone_sgr_only() == CellAttributes::blank(),
+                                "bit {bit:?} fg {fg:?} bg {bg:?} underline {underline_color:?} \
+                                 link {link}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -542,6 +542,11 @@ enum Op {
         hold: bool,
         keep_sealed: bool,
     },
+    /// One full-screen line feed with nothing held and every row admitted
+    /// (`PageList::scroll_line`), with row flags `flags`.
+    ScrollLine {
+        flags: u64,
+    },
     /// A region `0..bottom` with `footer` rows below it.
     Footer {
         n: usize,
@@ -595,6 +600,13 @@ fn op_strategy() -> impl Strategy<Value = Op> {
                 hold,
                 keep_sealed,
             }),
+        4 => proptest::bool::ANY.prop_map(|clustered| Op::ScrollLine {
+            flags: if clustered {
+                RowHeader::LEGACY_FORM_C
+            } else {
+                0
+            },
+        }),
         2 => (1..3_usize, 1..3_usize).prop_map(|(n, footer)| Op::Footer { n, footer }),
         2 => (0..6_usize, 0..6_usize, 1..3_usize)
             .prop_map(|(top, height, n)| Op::RotateUp { top, height, n }),
@@ -670,6 +682,18 @@ fn run_ops(page_rows: u32, viewport: usize, cap: usize, ops: &[Op]) {
                 assert_eq!((scrolled.trimmed, scrolled.refused), (trimmed, refused));
                 assert_eq!(scrolled.first_new, model.end() - n as StableRowIndex);
                 readers.extend(kept.into_iter().map(Reader::new));
+            }
+            Op::ScrollLine { flags } => {
+                let scrolled = list.scroll_line(seqno, flags);
+                let (trimmed, refused) = model.scroll(1, seqno, false, |_, _| true);
+                assert_eq!((scrolled.trimmed, scrolled.refused), (trimmed, refused));
+                assert_eq!(scrolled.first_new, model.end() - 1);
+                let new_row = list.row(model.end() - 1).expect("the new row");
+                assert_eq!(
+                    new_row.page.header(new_row.row).has(RowHeader::LEGACY_FORM_C),
+                    flags != 0,
+                    "the new row carries the flags"
+                );
             }
             Op::Footer { n, footer } => {
                 list.scroll_above_footer(n, footer, seqno, false, admit_all);

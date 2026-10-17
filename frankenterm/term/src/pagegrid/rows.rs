@@ -222,6 +222,18 @@ impl PageRows {
         scrolled
     }
 
+    /// [`Self::scroll_with_row_flags`] of one row with nothing held and
+    /// every trimmed row admitted ([`PageList::scroll_line`]).
+    pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
+        let scrolled = self.list.scroll_line(seqno, flags);
+        self.views.push_back(RowView::default());
+        for _ in 0..scrolled.trimmed {
+            self.views.pop_front();
+        }
+        debug_assert_eq!(self.views.len(), self.list.retained_rows());
+        scrolled
+    }
+
     /// Legacy's `physical_rows + hot_scrollback_size()`, which can change
     /// between scrolls (a config change or a resize).
     pub fn set_hot_cap(&mut self, hot_cap: usize) {

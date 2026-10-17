@@ -505,6 +505,46 @@ impl PageList {
         }
     }
 
+    /// [`Self::scroll_with_row_flags`] of one row with nothing held and
+    /// every trimmed row admitted: the line feed at the bottom of the
+    /// screen, once per line of a `cat` flood (ft-yccm0.3.2.6). With at most
+    /// one row over the cap coming in, and a front row to trim for it, this
+    /// trims that row and appends one straight through; any other shape
+    /// takes the general path.
+    pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
+        let excess = (self.retained_rows + 1).saturating_sub(self.hot_cap);
+        let front_trims =
+            excess == 1 && self.pages.front().is_some_and(|slot| slot.retained() > 0);
+        if excess > 1 || (excess == 1 && !front_trims) {
+            return self.scroll_with_row_flags(1, seqno, false, flags, |_| true);
+        }
+        let first_new = self.next_stable;
+        if front_trims {
+            // `trim_front` of one row.
+            let slot = self.pages.front_mut().expect("checked above");
+            slot.front_trim += 1;
+            slot.first_stable += 1;
+            self.retained_rows -= 1;
+            if slot.retained() == 0 && slot.is_full() {
+                self.recycle_front();
+            }
+            if !self.range_floors.is_empty() {
+                let first = self.first_stable();
+                self.range_floors.retain(|floor| floor.end > first);
+            }
+        }
+        self.append_row(seqno, flags);
+        self.seal_eligible();
+        // The one row over the cap, if any, was trimmed.
+        self.over_cap = None;
+        self.debug_check_counts();
+        Scrolled {
+            trimmed: excess,
+            refused: false,
+            first_new,
+        }
+    }
+
     /// Legacy's scroll with top margin 0 and a bottom margin above the
     /// screen's last row (D5): scrollback is fed as by [`Self::scroll`], and
     /// the `n` new rows are inserted above the `footer` rows below the

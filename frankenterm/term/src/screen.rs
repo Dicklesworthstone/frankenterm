@@ -9940,6 +9940,35 @@ impl Screen {
     /// Blank rows are added at the bottom.
     /// If left and right margins are set smaller than the screen width, scrolled rows
     /// will not be placed into scrollback, because they are not complete rows.
+    /// [`Self::scroll_up_within_margins`] of one row with the default blank
+    /// (a pen whose `clone_sgr_only` is blank), when the region and margins
+    /// are the whole screen and the page engine's line feed path
+    /// ([`Self::page_scroll_up_line`]) applies: the line feed at the bottom
+    /// of the screen, without the general path's blank and region
+    /// arguments (ft-yccm0.3.2.6). Returns false, having changed nothing,
+    /// otherwise.
+    pub fn scroll_up_line(
+        &mut self,
+        scroll_region: &Range<VisibleRowIndex>,
+        left_and_right_margins: &Range<usize>,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        if self.lines.page().is_none()
+            || self.physical_rows == 0
+            || scroll_region.start != 0
+            || scroll_region.end as usize != self.physical_rows
+            || left_and_right_margins.start != 0
+            || left_and_right_margins.end != self.physical_cols
+            || !self.allow_scrollback
+            || self.recovery_scrollback.is_some()
+            || self.scrollback_policy.tier.enabled
+        {
+            return false;
+        }
+        self.page_scroll_up_line(seqno, &CellAttributes::blank(), bidi_mode)
+    }
+
     pub fn scroll_up_within_margins(
         &mut self,
         scroll_region: &Range<VisibleRowIndex>,
@@ -10501,11 +10530,10 @@ impl Screen {
         let default_blank = *blank_attr == CellAttributes::blank();
         let rows = self.lines.page_mut().expect("page rows");
         rows.set_hot_cap(max_allowed);
-        let scrolled = rows.scroll_with_row_flags(
-            1,
+        // Every row leaving the cap is admitted, so the list's own count
+        // of them is `admitted`.
+        let scrolled = rows.scroll_line(
             seqno,
-            false,
-            admitted,
             if default_blank {
                 crate::pagegrid::RowHeader::LEGACY_FORM_C
             } else {
