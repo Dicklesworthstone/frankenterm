@@ -142,10 +142,20 @@ impl PageSlot {
 
     /// The page, writable: an active page in place, a sealed one in place
     /// while no reader holds it and forked under a fresh serial otherwise.
+    #[inline]
     fn page_mut(&mut self, next_serial: &mut u64) -> &mut Page {
         if self.active.is_some() {
             return self.active.as_deref_mut().expect("checked above");
         }
+        self.sealed_page_mut(next_serial)
+    }
+
+    /// [`Self::page_mut`] of a sealed page, kept out of line: every printed
+    /// run writes an active page, and the fork here made each of those
+    /// writes save and restore every register it might use.
+    #[cold]
+    #[inline(never)]
+    fn sealed_page_mut(&mut self, next_serial: &mut u64) -> &mut Page {
         let sealed = self.sealed.as_mut().expect("a page slot holds its page");
         if Arc::get_mut(sealed).is_none() {
             let serial = *next_serial;
@@ -368,6 +378,7 @@ impl PageList {
 
     /// Where `stable` lives: the page's position in the list and the row
     /// within it. O(1) for the tail page, O(log pages) otherwise.
+    #[inline]
     pub fn locate(&self, stable: StableRowIndex) -> Option<(usize, u32)> {
         if stable < self.first_stable() || stable >= self.next_stable {
             return None;
@@ -428,6 +439,7 @@ impl PageList {
 
     /// The row at `stable` for writing, through copy-on-write if its page
     /// is sealed (D8). Callers bump the row's seqno through the page.
+    #[inline]
     pub fn row_mut(&mut self, stable: StableRowIndex) -> Option<(&mut Page, u32)> {
         let (index, row) = self.locate(stable)?;
         Some((self.page_mut(index), row))
@@ -436,6 +448,7 @@ impl PageList {
     /// The page at `index`, writable. Active pages are owned outright. A
     /// sealed page is written in place while no reader holds it, and
     /// otherwise forked under a fresh serial, leaving readers their copy.
+    #[inline]
     fn page_mut(&mut self, index: usize) -> &mut Page {
         let PageList {
             pages, next_serial, ..
