@@ -196,6 +196,10 @@ struct StartingBrokerPane {
     read_retry_at: Option<Instant>,
     /// The wait after the next Read that finds no output.
     read_backoff: Duration,
+    /// When a Read last delivered output.
+    last_output_at: Option<Instant>,
+    /// When the broker last answered a ChildStatus.
+    status_checked_at: Option<Instant>,
     terminal: bool,
     child_exit_observed: bool,
     status_due: bool,
@@ -212,22 +216,56 @@ struct StartingBrokerPane {
 const BROKER_READ_RETRY_FIRST: Duration = Duration::from_micros(250);
 /// The longest wait between broker Reads of a pane with no output.
 const BROKER_READ_RETRY_MAX: Duration = Duration::from_millis(25);
+/// A pane that delivered output this recently is streaming: a Read that
+/// finds none is most likely waiting on a drain the broker has in flight.
+const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
+/// The longest a pane goes without a ChildStatus while its PTY stays open.
+const BROKER_CHILD_STATUS_INTERVAL: Duration = Duration::from_millis(250);
 
 impl StartingBrokerPane {
     /// The broker answers a Read with no output at once, whether its PTY is
     /// idle or a drain is still syncing, so reading again at once spun the
     /// guardian and the broker on every idle pane (a core between them). Back
     /// off from [`BROKER_READ_RETRY_FIRST`], doubling to
-    /// [`BROKER_READ_RETRY_MAX`]; output or input resets it.
+    /// [`BROKER_READ_RETRY_MAX`]; output or input resets it. A streaming pane
+    /// keeps the first wait, so it picks up a drain's record soon after the
+    /// broker has synced it.
     fn defer_read(&mut self, now: Instant) {
-        self.read_backoff =
-            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, BROKER_READ_RETRY_MAX);
+        let streaming = self
+            .last_output_at
+            .is_some_and(|at| now.saturating_duration_since(at) < BROKER_READ_STREAMING_WINDOW);
+        self.read_backoff = if streaming {
+            BROKER_READ_RETRY_FIRST
+        } else {
+            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, BROKER_READ_RETRY_MAX)
+        };
         self.read_retry_at = Some(now + self.read_backoff);
+        self.child_status_due_by(now);
     }
 
     fn read_promptly(&mut self) {
         self.read_backoff = Duration::ZERO;
         self.read_retry_at = None;
+    }
+
+    fn output_delivered(&mut self, now: Instant) {
+        self.read_promptly();
+        self.last_output_at = Some(now);
+        self.child_status_due_by(now);
+    }
+
+    /// A ChildStatus after every Read was one more broker round trip per
+    /// record. Ask at most every [`BROKER_CHILD_STATUS_INTERVAL`] instead: a
+    /// child's exit closes its PTY, and that end (`terminal`) still asks at
+    /// once; only a child whose PTY another process holds open waits for the
+    /// interval.
+    fn child_status_due_by(&mut self, now: Instant) {
+        if self
+            .status_checked_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= BROKER_CHILD_STATUS_INTERVAL)
+        {
+            self.status_due = true;
+        }
     }
 
     fn read_due(&self, now: Instant) -> bool {
@@ -2719,6 +2757,8 @@ impl GuardianRuntime {
                 read_reservation: 0,
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
+                last_output_at: None,
+                status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,
@@ -4096,7 +4136,7 @@ impl GuardianRuntime {
                                 {
                                     self.buffered_output_bytes += delivery.bytes().len();
                                     pane.pending_delivery = Some(delivery);
-                                    pane.read_promptly();
+                                    pane.output_delivered(Instant::now());
                                 }
                                 Ok(BrokerPaneOutputV1::Pending) => pane.defer_read(Instant::now()),
                                 Ok(BrokerPaneOutputV1::Terminal { sequence })
@@ -4121,6 +4161,7 @@ impl GuardianRuntime {
                         BrokerPaneIoCompletionV1::ChildStatus { handle, result } => {
                             pane.handle = Some(handle);
                             pane.status_due = false;
+                            pane.status_checked_at = Some(Instant::now());
                             match result {
                                 Ok(BrokerPaneChildStatusV1::Running) => {}
                                 Ok(BrokerPaneChildStatusV1::Exited { exit_code, .. }) => {
@@ -4316,7 +4357,6 @@ impl GuardianRuntime {
                     continue;
                 };
                 pane.read_reservation = maximum_bytes;
-                pane.status_due = true;
                 self.buffered_output_bytes += maximum_bytes;
                 BrokerPaneIoCommandV1::Read {
                     handle,
@@ -7093,6 +7133,8 @@ mod tests {
                 read_reservation: 0,
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
+                last_output_at: None,
+                status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: false,
@@ -7146,6 +7188,26 @@ mod tests {
         assert!(pane.read_due(now));
         pane.defer_read(now);
         assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
+
+        // A streaming pane keeps the first wait while a drain is in flight,
+        // and backs off once its output has stopped.
+        pane.output_delivered(now);
+        assert!(pane.read_due(now));
+        for _ in 0..4 {
+            pane.defer_read(now);
+            assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
+        }
+        pane.defer_read(now + BROKER_READ_STREAMING_WINDOW);
+        assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST * 2);
+
+        // ChildStatus is due at most once an interval while the PTY is open.
+        pane.status_due = false;
+        pane.status_checked_at = Some(now);
+        pane.output_delivered(now + Duration::from_millis(1));
+        pane.defer_read(now + Duration::from_millis(2));
+        assert!(!pane.status_due);
+        pane.output_delivered(now + BROKER_CHILD_STATUS_INTERVAL);
+        assert!(pane.status_due);
     }
 
     #[test]
@@ -7169,6 +7231,8 @@ mod tests {
                 read_reservation: 0,
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
+                last_output_at: None,
+                status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,
