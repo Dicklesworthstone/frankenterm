@@ -192,6 +192,10 @@ struct StartingBrokerPane {
     pending_delivery: Option<BrokerOutputDeliveryV1>,
     pending_ack: Option<GuardianDurableBrokerOutputAckV1>,
     read_reservation: usize,
+    /// No Read is sent before this: the last one found no output.
+    read_retry_at: Option<Instant>,
+    /// The wait after the next Read that finds no output.
+    read_backoff: Duration,
     terminal: bool,
     child_exit_observed: bool,
     status_due: bool,
@@ -202,6 +206,33 @@ struct StartingBrokerPane {
     retry_before_publication: Option<Box<GenesisSpawnJob>>,
     activation: Option<GuardianGenesisActivationContinuationV1>,
     replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+/// The first wait after a broker Read finds no output (ft-2pgul).
+const BROKER_READ_RETRY_FIRST: Duration = Duration::from_micros(250);
+/// The longest wait between broker Reads of a pane with no output.
+const BROKER_READ_RETRY_MAX: Duration = Duration::from_millis(25);
+
+impl StartingBrokerPane {
+    /// The broker answers a Read with no output at once, whether its PTY is
+    /// idle or a drain is still syncing, so reading again at once spun the
+    /// guardian and the broker on every idle pane (a core between them). Back
+    /// off from [`BROKER_READ_RETRY_FIRST`], doubling to
+    /// [`BROKER_READ_RETRY_MAX`]; output or input resets it.
+    fn defer_read(&mut self, now: Instant) {
+        self.read_backoff =
+            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, BROKER_READ_RETRY_MAX);
+        self.read_retry_at = Some(now + self.read_backoff);
+    }
+
+    fn read_promptly(&mut self) {
+        self.read_backoff = Duration::ZERO;
+        self.read_retry_at = None;
+    }
+
+    fn read_due(&self, now: Instant) -> bool {
+        self.read_retry_at.is_none_or(|at| at <= now)
+    }
 }
 
 struct RuntimeBrokerConnection {
@@ -1801,6 +1832,19 @@ impl GuardianRuntime {
         self.pty_tokens.contains_key(&token)
     }
 
+    /// When the first broker pane whose last Read found no output may read
+    /// again; the service loop must wake by then. Only times after `now`: a
+    /// pane already due but not read waits on a busy connection or journal,
+    /// whose completion wakes the loop, and a past time would spin it.
+    #[must_use]
+    pub fn next_broker_read_retry(&self, now: Instant) -> Option<Instant> {
+        self.starting_broker_panes
+            .values()
+            .filter_map(|pane| pane.read_retry_at)
+            .filter(|at| *at > now)
+            .min()
+    }
+
     /// Install one authenticated broker-WAL Spawn fence during startup.
     ///
     /// Recovery must finish before any pane, worker-owned protocol transfer, or
@@ -2055,7 +2099,7 @@ impl GuardianRuntime {
                 GuardianRejectionCode::InvalidRequest,
             ));
         };
-        if let Some(pane) = self.starting_broker_panes.get(&pane_id) {
+        if let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) {
             if !pane.activated {
                 return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
                     &request,
@@ -2070,6 +2114,8 @@ impl GuardianRuntime {
             let Some(protocol) = self.protocol.take() else {
                 return GuardianInputSubmission::CloseRetryably;
             };
+            // Input usually brings output (an echo): read it promptly.
+            pane.read_promptly();
             self.pending_broker_input = Some(PendingBrokerInput {
                 route,
                 pane_id,
@@ -2671,6 +2717,8 @@ impl GuardianRuntime {
                 pending_delivery: None,
                 pending_ack: None,
                 read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,
@@ -4048,8 +4096,9 @@ impl GuardianRuntime {
                                 {
                                     self.buffered_output_bytes += delivery.bytes().len();
                                     pane.pending_delivery = Some(delivery);
+                                    pane.read_promptly();
                                 }
-                                Ok(BrokerPaneOutputV1::Pending) => {}
+                                Ok(BrokerPaneOutputV1::Pending) => pane.defer_read(Instant::now()),
                                 Ok(BrokerPaneOutputV1::Terminal { sequence })
                                     if sequence == output.durable_plaintext_bytes =>
                                 {
@@ -4189,6 +4238,7 @@ impl GuardianRuntime {
             let Some(worker) = connection.worker.as_mut() else {
                 continue;
             };
+            let now = Instant::now();
             let eligible = |pane: &StartingBrokerPane| {
                 let Some(output) = pane.output.as_ref() else {
                     return false;
@@ -4204,7 +4254,9 @@ impl GuardianRuntime {
                             && ((pane.activated
                                 && !pane.child_exit_observed
                                 && (pane.status_due || pane.terminal))
-                                || (!pane.terminal && output.remaining_record_capacity != 0))))
+                                || (!pane.terminal
+                                    && output.remaining_record_capacity != 0
+                                    && pane.read_due(now)))))
             };
             let pane_id = self
                 .starting_broker_panes
@@ -7021,6 +7073,82 @@ mod tests {
     }
 
     #[test]
+    fn broker_reads_that_find_no_output_back_off_until_output_or_input() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let pane_id = Uuid::new_v4();
+        runtime.starting_broker_panes.insert(
+            pane_id,
+            StartingBrokerPane {
+                mux_incarnation: Uuid::new_v4(),
+                spawn_request_id: Uuid::new_v4(),
+                spawn_effect_id: Uuid::new_v4(),
+                spawn_payload_digest: [1; 32],
+                custody_ack_id: Uuid::new_v4(),
+                initial_pending: false,
+                failed_before_spawn: false,
+                output: None,
+                handle: None,
+                pending_delivery: None,
+                pending_ack: None,
+                read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
+                terminal: false,
+                child_exit_observed: false,
+                status_due: false,
+                input_journal: None,
+                activated: false,
+                original_spawn: None,
+                original_begin: None,
+                retry_before_publication: None,
+                activation: None,
+                replay_origin: None,
+            },
+        );
+        let now = Instant::now();
+        assert_eq!(runtime.next_broker_read_retry(now), None);
+        let pane = runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .expect("inserted pane");
+        assert!(pane.read_due(now));
+
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            pane.defer_read(now);
+            waits.push(pane.read_backoff);
+        }
+        assert_eq!(
+            waits,
+            [
+                250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 25_000, 25_000, 25_000
+            ]
+            .map(Duration::from_micros)
+        );
+        assert!(!pane.read_due(now));
+        assert!(pane.read_due(now + BROKER_READ_RETRY_MAX));
+        assert_eq!(
+            runtime.next_broker_read_retry(now),
+            Some(now + BROKER_READ_RETRY_MAX)
+        );
+        // A due retry is not a wake time: whatever keeps the pane from
+        // reading wakes the loop when it completes.
+        assert_eq!(
+            runtime.next_broker_read_retry(now + BROKER_READ_RETRY_MAX),
+            None
+        );
+
+        let pane = runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .expect("inserted pane");
+        pane.read_promptly();
+        assert!(pane.read_due(now));
+        pane.defer_read(now);
+        assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
+    }
+
+    #[test]
     fn failed_before_broker_spawn_retains_identity_without_live_occupancy() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         let pane_id = Uuid::new_v4();
@@ -7039,6 +7167,8 @@ mod tests {
                 pending_delivery: None,
                 pending_ack: None,
                 read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,

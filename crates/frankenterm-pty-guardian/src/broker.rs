@@ -3805,24 +3805,102 @@ struct BrokerOutputDrainJobV1 {
     token_lease: GuardianTokenEffectLease,
 }
 
+/// What one drain job read from its pane's PTY.
+#[derive(Debug, Eq, PartialEq)]
+enum BrokerPtyDrainV1 {
+    Empty,
+    Bytes(usize),
+    Terminal(BrokerOutputTerminalReasonV1),
+}
+
+/// A burst at least this large found the PTY full (a macOS PTY holds about
+/// 1 KiB), so its writer is likely blocked on this reader.
+const BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES: usize = 1024;
+/// How long one drain job waits for a blocked writer to refill the PTY.
+const BROKER_OUTPUT_DRAIN_FILL_WAIT: Duration = Duration::from_millis(2);
+
+/// Fill `buffer` from a nonblocking PTY reader for one journal record
+/// (ft-2pgul). Each record costs a synchronized journal append, and a writer
+/// blocked on a full PTY refills it only after this reader empties it, so a
+/// drain that stopped at the first empty read synced about 1 KiB at a time.
+/// While the bytes read since the last empty read show a full PTY, wait up
+/// to [`BROKER_OUTPUT_DRAIN_FILL_WAIT`] in all for it to refill; a smaller
+/// burst (an echo, a prompt) ends the record at once. End of output or an
+/// error after some bytes ends the record with those bytes; the next drain
+/// reads it again.
+fn drain_pty_reader(
+    reader: &mut dyn PollablePtyReader,
+    buffer: &mut [u8],
+) -> Result<BrokerPtyDrainV1, ()> {
+    let mut filled = 0;
+    let mut burst = 0;
+    let mut fill_deadline = None;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) if filled == 0 => {
+                return Ok(BrokerPtyDrainV1::Terminal(
+                    BrokerOutputTerminalReasonV1::ZeroLengthRead,
+                ));
+            }
+            Ok(0) => break,
+            Ok(read) => {
+                filled += read;
+                burst += read;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if filled == 0 {
+                    return Ok(BrokerPtyDrainV1::Empty);
+                }
+                if burst < BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES {
+                    break;
+                }
+                let deadline = *fill_deadline
+                    .get_or_insert_with(|| Instant::now() + BROKER_OUTPUT_DRAIN_FILL_WAIT);
+                let Some(wait) = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|wait| !wait.is_zero())
+                else {
+                    break;
+                };
+                // Whole milliseconds, rounded up: poll(2) takes no finer.
+                let wait = u8::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u8::MAX);
+                let mut fds = [nix::poll::PollFd::new(
+                    reader.as_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                )];
+                match nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(wait)) {
+                    Ok(ready) if ready > 0 => burst = 0,
+                    Ok(_) => break,
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => break,
+                }
+            }
+            Err(error) if filled == 0 && is_pty_terminal_eio(&error) => {
+                return Ok(BrokerPtyDrainV1::Terminal(
+                    BrokerOutputTerminalReasonV1::PtyIoClosed,
+                ));
+            }
+            Err(_) if filled == 0 => return Err(()),
+            Err(_) => break,
+        }
+    }
+    Ok(BrokerPtyDrainV1::Bytes(filled))
+}
+
 impl BrokerOutputDrainJobV1 {
     fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, ()> {
         self.token_lease.validate().map_err(|_| ())?;
-        let read = match self.reader.read(&mut self.bytes) {
-            Ok(0) => {
-                self.bytes.clear();
-                return Ok(Some(BrokerOutputTerminalReasonV1::ZeroLengthRead));
-            }
-            Ok(read) => read,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+        let read = match drain_pty_reader(&mut *self.reader, &mut self.bytes)? {
+            BrokerPtyDrainV1::Empty => {
                 self.bytes.clear();
                 return Ok(None);
             }
-            Err(error) if is_pty_terminal_eio(&error) => {
+            BrokerPtyDrainV1::Terminal(reason) => {
                 self.bytes.clear();
-                return Ok(Some(BrokerOutputTerminalReasonV1::PtyIoClosed));
+                return Ok(Some(reason));
             }
-            Err(_) => return Err(()),
+            BrokerPtyDrainV1::Bytes(read) => read,
         };
         self.bytes.truncate(read);
         self.journal
@@ -28858,6 +28936,71 @@ mod tests {
         fn as_fd(&self) -> BorrowedFd<'_> {
             self.fd.as_fd()
         }
+    }
+
+    fn nonblocking_test_pipe() -> (Box<dyn PollablePtyReader>, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("create drain test pipe");
+        let flags = nix::fcntl::fcntl(&reader, nix::fcntl::F_GETFL).expect("read pipe flags");
+        nix::fcntl::fcntl(
+            &reader,
+            nix::fcntl::F_SETFL(
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )
+        .expect("make drain test pipe nonblocking");
+        (Box::new(reader), writer)
+    }
+
+    #[test]
+    fn drain_fills_a_record_from_a_full_pty_and_ends_one_at_a_small_burst() {
+        let (mut reader, mut writer) = nonblocking_test_pipe();
+        let mut record = [0_u8; BROKER_OUTPUT_PUMP_CHUNK_BYTES];
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Empty)
+        );
+
+        writer.write_all(b"echo").expect("write a small burst");
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(4))
+        );
+        assert_eq!(&record[..4], b"echo");
+
+        // More than a record: the first drain fills its buffer, the second
+        // takes the rest after its full burst waits in vain for more.
+        let bulk: Vec<u8> = (0..BROKER_OUTPUT_PUMP_CHUNK_BYTES + 1500)
+            .map(|index| u8::try_from(index % 251).expect("byte"))
+            .collect();
+        writer.write_all(&bulk).expect("write more than a record");
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(BROKER_OUTPUT_PUMP_CHUNK_BYTES))
+        );
+        assert_eq!(record[..], bulk[..BROKER_OUTPUT_PUMP_CHUNK_BYTES]);
+        let started = Instant::now();
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(1500))
+        );
+        assert_eq!(record[..1500], bulk[BROKER_OUTPUT_PUMP_CHUNK_BYTES..]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // Output that ends after some bytes yields those bytes first; the next
+        // drain reports the end.
+        writer.write_all(b"last").expect("write the last burst");
+        drop(writer);
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(4))
+        );
+        assert_eq!(&record[..4], b"last");
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Terminal(
+                BrokerOutputTerminalReasonV1::ZeroLengthRead
+            ))
+        );
     }
 
     #[test]

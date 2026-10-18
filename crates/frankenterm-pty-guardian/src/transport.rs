@@ -1209,12 +1209,15 @@ impl GuardianService {
         bounded_replay_poll_timeout(
             self.poll_interval,
             now,
-            self.connections.values().filter_map(|connection| {
-                connection
-                    .deferred_replay
-                    .as_ref()
-                    .map(|deferred| deferred.deadline)
-            }),
+            self.connections
+                .values()
+                .filter_map(|connection| {
+                    connection
+                        .deferred_replay
+                        .as_ref()
+                        .map(|deferred| deferred.deadline)
+                })
+                .chain(self.runtime.next_broker_read_retry(now)),
         )
     }
 

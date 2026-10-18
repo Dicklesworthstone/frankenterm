@@ -3364,6 +3364,26 @@ fn require_guardian_output_read_write_descriptor(
     Ok(())
 }
 
+/// Synchronize one appended output record (ft-2pgul).
+///
+/// The broker and the guardian each sync every record before the next PTY
+/// read, and a macOS PTY holds about 1 KiB, so this sync paces a pane's
+/// child. On macOS `File::sync_all` is `F_FULLFSYNC`, a drive-cache flush
+/// (~3.9 ms): two per KiB held a guardian pane to 66 KB/s. `F_BARRIERFSYNC`
+/// (~0.3 ms) keeps the writes in order, which is what the journal's crash
+/// protocol needs (a torn or missing newest record is an uncommitted tail),
+/// and gives up only the newest records on power loss, which also ends every
+/// pane. The live scrollback store makes the same trade (ft-y0gy9), as does
+/// SQLite by default on macOS. A filesystem that rejects the barrier falls
+/// back to a full sync. Elsewhere this is `sync_all`.
+fn sync_appended_record(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
+        return Ok(());
+    }
+    file.sync_all()
+}
+
 #[cfg(any(
     target_os = "android",
     target_os = "dragonfly",
@@ -4301,7 +4321,7 @@ impl GuardianOutputJournal {
             self.file.seek(SeekFrom::Start(self.committed_bytes))?;
             self.file.write_all(&header)?;
             self.file.write_all(&ciphertext)?;
-            self.file.sync_all()
+            sync_appended_record(&self.file)
         })();
         if let Err(error) = result {
             self.poisoned = true;
