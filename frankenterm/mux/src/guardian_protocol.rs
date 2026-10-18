@@ -13971,10 +13971,8 @@ mod tests {
         // Guardians predating image scrollback rows knew bits 1, 2, 4 and 8.
         assert_ne!(rows[5] & !15, 0);
         let mut all = hello.encode_requiring_successor_rotation();
-        all[5] |= hello.encode_requiring_compact_checkpoints()[5]
-            | graphics[5]
-            | protection[5]
-            | rows[5];
+        all[5] |=
+            hello.encode_requiring_compact_checkpoints()[5] | graphics[5] | protection[5] | rows[5];
         assert!(GuardianHelloBuildIdentityV1::decode(&all).is_ok());
         all[5] |= 32;
         assert!(GuardianHelloBuildIdentityV1::decode(&all).is_err());

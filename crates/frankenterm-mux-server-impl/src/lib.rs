@@ -14137,7 +14137,9 @@ fn attach_exact_scrollback_row_images(
             shown.push(next);
         }
         anyhow::ensure!(
-            shown.windows(2).all(|pair| pair[0].z_index <= pair[1].z_index),
+            shown
+                .windows(2)
+                .all(|pair| pair[0].z_index <= pair[1].z_index),
             "a cell's image layers are in z-index order"
         );
         let mut attached = Vec::with_capacity(shown.len());
@@ -14848,10 +14850,9 @@ fn decode_exact_semantic_scrollback_plaintext(
         codec::bounded_varbincode_deserialize(&mut reader)
             .context("bounded decode of semantic scrollback row")?;
     let images = if semantic.schema == EXACT_SCROLLBACK_SCHEMA_IMAGES {
-        Some(
-            codec::bounded_varbincode_deserialize::<ExactScrollbackRowImagesV1>(&mut reader)
-                .context("bounded decode of semantic scrollback row images")?,
-        )
+        let images: ExactScrollbackRowImagesV1 = codec::bounded_varbincode_deserialize(&mut reader)
+            .context("bounded decode of semantic scrollback row images")?;
+        Some(images)
     } else {
         None
     };

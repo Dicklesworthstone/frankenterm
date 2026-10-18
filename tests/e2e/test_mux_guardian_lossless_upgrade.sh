@@ -91,10 +91,29 @@ IMAGES=${E2E_IMAGES:-0}
 # A 16x16 PNG; and 2x2 RGBA pixels, for Kitty.
 PNG=iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAADpklEQVR42gXBC0AMBhzA4b8ep8fV5Vacyq10dFKkpRqXHjglIstql0iRmpbHNIWSpJgmLCF5tlqNZZEizwljWVbLGGtjNmOMMcZs9tv3iYjgYC64KQRfayFUKUxWCUlqYb6TkK8R1rsIu7TCZ+7CKZ3wtadww0v4w0eQnv2EPm498PQwI3CgOeMGWRDnbcmcoQoW+/WkeLgVm4Os+XikDc2jbPkiTMmVMXb8Os6eZ+NViP0IQRtsxpBQC0aNVhBttGJ6pA2ZE5TkTbJn3RQHdkxVUx/vyImE3rRP1/DDTGcezHLlvzlaxClOGGAyZ3iigrFJ1kxNUTI7VUVWuppVGU5smqeheqELh7K0nM125/JSHb/kefJ0hReWhT6I6yLBe7EFhiVWTMhVMi3fgYyVjiwr0lCyxpXKEjf2leo4tlHPxU3efL/Fl/vb/Pl3RxDK3QbEY4PwWpklozfb8EaFipTtjry7qy8rq7R8WONBVZ2eg/t8aN3vxzcHArl1yMCfh8MwP2rklRNRiFe9MKJBwfhGJaZmNW+3aFhyXMv7p3RUtHrxyTlfWi4E8OVFA9cuhfNbZwQvLkdjczUW5+smZFibENbek5gOe2Z2ObHgiisrrnmwoduL3TeG0XAriM9vh9Bx18jN+xN59DCWHo8T6PU0Gffn6UjQHSHinhXxDxxIe6Qh+4kbq5/p2fLCl9qXQRyWUM6bR3BVMZk71vE8VyZhpUpDo56P3ikbCbEUJllZM8NWzTx7F5b30lHq6MPOPgHsdw7hZL8ILrnF8KOHiYcDU2BQBirvLF4dmsdQv2LE2F94c4ANqXpH3huspWiInvJhftT4G2gKNHJuxGS+DTZxO3QWf43ORGHMpndkAQMnlBAwqRyZGCIkhtvyztje5Ea480GUN9ujA/k0JpzjsRP5Ki6eblMKvydm8jIpB7uUQvqlluKTXkFwRjUSO02YNUPJomQNhbN1lKX58tFcA42ZEZxZEEvXoiR+XpzBkyXZWOQW4pi/Ht3KSvyLahmzphFJyBHmLrNj6XJn1hZ4sm2VP3tXh3F0bTRt6xK4viGNe2VZ/LO5ANuKUly2VzJ4Vx0jq5qIqmlFksuFhVvtKah0ZeNOL/bsCeJAtZHTtbF07k3mp/r5PG7Iw6yxBHVzBf1bavE73kT4qTNMae1E0g8KOU0q1hzRsvWYD3UnDRw5HcWFsya+O5/O3bZs/m4vxrqjnL5d1Qy60sjr11qJ7O7krRs3+R/oey7fcMgA/AAAAABJRU5ErkJggg==
 RGBA=AAECAwQFBgcICQoLDA0ODw==
+# E2E_IMAGE_SCROLL=N (with E2E_IMAGES=1) makes image panes also show a
+# 512x256 noise PNG (64 by 16 cells) and then print N lines, so its rows
+# leave the 1000-line hot tier for durable storage: each such row, its 64
+# cells repeating the half-megabyte image, used to exceed what a durable row
+# may hold and stall the pane's durability.
+SCROLL=${E2E_IMAGE_SCROLL:-0}
+if [ "$IMAGES" = 1 ] && [ "$SCROLL" -gt 0 ]; then
+  python3 -I -c '
+import base64, random, struct, zlib
+w, h = 512, 256
+noise = random.Random(7)
+rows = b"".join(b"\x00" + bytes(noise.getrandbits(8) for _ in range(w * 4)) for _ in range(h))
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows, 1)) + chunk(b"IEND", b"")
+print(base64.b64encode(png).decode(), end="")
+' > "$HOME/scroll-image.b64" || { echo "FAIL: generate the scroll image"; exit 1; }
+fi
 images() {  # -> shell commands showing and storing the images
   echo "printf '\\033]1337;File=inline=1:%s\\007\\n' $PNG; "
   echo "printf '\\033_Ga=T,f=32,s=2,v=2,i=31,q=2;%s\\033\\\\\\n' $RGBA; "
   echo "printf '\\033_Ga=t,f=32,s=2,v=2,i=32,q=2;%s\\033\\\\' $RGBA; "
+  [ "$SCROLL" -gt 0 ] && echo "printf '\\033]1337;File=inline=1:'; cat '$HOME/scroll-image.b64'; printf '\\007\\n'; j=0; while [ \$j -lt $SCROLL ]; do echo scroll \$j; j=\$((j+1)); done; "
 }
 PROTECTED=${E2E_PROTECTED:-0}
 prog() {  # <pane index> -> its shell program
@@ -190,16 +209,21 @@ check_history() {
 child_pid() { pgrep -f "^/bin/bash -c .*echo \"$MARK tick" | head -1; }
 count() { command ls "$1" 2>/dev/null | grep -c -- "$2"; }
 # Restores so far of a checkpoint holding images (the mux logs each one).
+# An image pane's checkpoint holds its iTerm PNG and two Kitty images, and
+# with E2E_IMAGE_SCROLL the scroll image, read back from durable storage.
+SHOWN=3
+[ "$SCROLL" -gt 0 ] && SHOWN=4
 image_restores() {
-  grep -c "restoring a terminal checkpoint holding [1-9]" "$STATE/logs/mux-server.log" 2>/dev/null
+  grep -o "restoring a terminal checkpoint holding [0-9]* image" \
+    "$STATE/logs/mux-server.log" 2>/dev/null | awk -v shown="$SHOWN" '$6 >= shown' | wc -l | tr -d ' '
 }
 # <label> <restores before it>: with E2E_IMAGES, every image pane restored its images.
 check_image_restores() {
   [ "$IMAGES" = 1 ] || return 0
   local restored=$(( $(image_restores) - $2 ))
   [ "$restored" -ge $(( PANES / 2 )) ] \
-    && pass "$1 restored images ($restored checkpoints holding images, $(( PANES / 2 )) image panes)" \
-    || fail "$1 restored images from $restored checkpoints for $(( PANES / 2 )) image panes"
+    && pass "$1 restored images ($restored checkpoints holding $SHOWN images, $(( PANES / 2 )) image panes)" \
+    || fail "$1 restored images from $restored checkpoints holding $SHOWN images for $(( PANES / 2 )) image panes"
 }
 
 step "install $(basename "$OLD")"
