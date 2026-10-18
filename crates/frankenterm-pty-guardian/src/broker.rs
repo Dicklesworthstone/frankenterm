@@ -28995,8 +28995,19 @@ mod tests {
             Ok(BrokerPtyDrainV1::Bytes(4))
         );
         assert_eq!(&record[..4], b"last");
+        // A child another test forks before its exec briefly holds a copy of
+        // the write end, so the end may show only after a few empty drains.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let end = loop {
+            match drain_pty_reader(&mut *reader, &mut record) {
+                Ok(BrokerPtyDrainV1::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => break other,
+            }
+        };
         assert_eq!(
-            drain_pty_reader(&mut *reader, &mut record),
+            end,
             Ok(BrokerPtyDrainV1::Terminal(
                 BrokerOutputTerminalReasonV1::ZeroLengthRead
             ))
