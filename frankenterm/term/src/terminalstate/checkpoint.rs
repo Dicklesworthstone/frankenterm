@@ -6660,6 +6660,13 @@ impl ValidatedTerminalCheckpointV3 {
         &self.checkpoint
     }
 
+    /// Whether the checkpoint holds graphics state, so that a terminal
+    /// restored from it, which replays image output, captures it again.
+    #[must_use]
+    pub const fn captures_graphics(&self) -> bool {
+        self.limits.capture_graphics
+    }
+
     /// Consume the wrapper and return the validated `TerminalCheckpointV3`.
     #[must_use]
     pub fn into_checkpoint(self) -> TerminalCheckpointV3 {
@@ -9693,6 +9700,18 @@ mod tests {
             restored.replay_bytes(&iterm_image(&png_of(8, 16, 1))),
             Err(crate::InertTerminalError::UnsupportedGraphicsAction)
         );
+        // Restored from the admitted payload, as a guardian birth restores a
+        // pane's first output, it applies the image and captures it again,
+        // whatever limits its caller restored it under.
+        let decoded =
+            TerminalCheckpointV3::decode_canonical_json(&admitted, runs_limits()).unwrap();
+        assert!(decoded.captures_graphics());
+        let mut restored = decoded.restore_inert(graphics_config()).unwrap();
+        restored
+            .replay_bytes(&iterm_image(&png_of(8, 16, 1)))
+            .expect("replay the first image");
+        let recaptured = restored.checkpoint().expect("capture the replayed image");
+        assert_eq!(recaptured.images.as_ref().map(Vec::len), Some(1));
     }
 
     /// Restore reads nothing but the journal: Kitty data from a file or

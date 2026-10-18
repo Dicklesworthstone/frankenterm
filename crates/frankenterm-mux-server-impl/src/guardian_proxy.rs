@@ -395,6 +395,13 @@ impl Domain for GuardianDomain {
             pixel_height: size.pixel_height.try_into()?,
         };
         validate_pty_size(pty_size)?;
+        // The birth model holds the graphics configuration, so that replay
+        // applies the child's first image output, exactly when this mux's
+        // guardian admits graphics state.
+        let birth_limits = TerminalCheckpointLimits {
+            capture_graphics: mux.guardian_checkpoint_limits().capture_graphics,
+            ..TerminalCheckpointLimits::default()
+        };
         let socket = self.socket_path.clone();
         let token = self.token_path.clone();
         let mux_incarnation = self.mux_incarnation;
@@ -470,7 +477,7 @@ impl Domain for GuardianDomain {
                 config::wezterm_version(),
                 Box::new(io::sink()),
             )
-            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .capture_recovery_checkpoint(birth_limits)
             .context("capture guardian initial terminal model")?;
             let descriptor =
                 GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &checkpoint)?;
@@ -555,7 +562,7 @@ impl Domain for GuardianDomain {
                 .with_spawn_custody(custody)?
                 .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
                 .context("claim guardian birth lease")?
-                .restore_and_activate(config, TerminalCheckpointLimits::default())
+                .restore_and_activate(config, birth_limits)
                 .context("restore and activate guardian birth")?;
             let unpublished = UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
                 pane_id,
