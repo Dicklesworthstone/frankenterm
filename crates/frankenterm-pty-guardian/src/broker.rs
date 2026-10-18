@@ -3813,8 +3813,8 @@ enum BrokerPtyDrainV1 {
     Terminal(BrokerOutputTerminalReasonV1),
 }
 
-/// A burst at least this large found the PTY full (a macOS PTY holds about
-/// 1 KiB), so its writer is likely blocked on this reader.
+/// A first burst at least this large found the PTY full (a macOS PTY holds
+/// about 1 KiB), so its writer is likely blocked on this reader.
 const BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES: usize = 1024;
 /// How long one drain job waits for a blocked writer to refill the PTY.
 const BROKER_OUTPUT_DRAIN_FILL_WAIT: Duration = Duration::from_millis(2);
@@ -3823,17 +3823,18 @@ const BROKER_OUTPUT_DRAIN_FILL_WAIT: Duration = Duration::from_millis(2);
 /// (ft-2pgul). Each record costs a synchronized journal append, and a writer
 /// blocked on a full PTY refills it only after this reader empties it, so a
 /// drain that stopped at the first empty read synced about 1 KiB at a time.
-/// While the bytes read since the last empty read show a full PTY, wait up
-/// to [`BROKER_OUTPUT_DRAIN_FILL_WAIT`] in all for it to refill; a smaller
-/// burst (an echo, a prompt) ends the record at once. End of output or an
-/// error after some bytes ends the record with those bytes; the next drain
-/// reads it again.
+/// When the bytes read before the first empty read show a full PTY, keep
+/// filling the record until it is full or [`BROKER_OUTPUT_DRAIN_FILL_WAIT`]
+/// has passed. That is decided once: a line-buffered writer refills a line
+/// at a time, so later bursts are small however fast the output. A smaller
+/// first burst (an echo, a prompt) ends the record at once. End of output or
+/// an error after some bytes ends the record with those bytes; the next
+/// drain reads it again.
 fn drain_pty_reader(
     reader: &mut dyn PollablePtyReader,
     buffer: &mut [u8],
 ) -> Result<BrokerPtyDrainV1, ()> {
     let mut filled = 0;
-    let mut burst = 0;
     let mut fill_deadline = None;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {
@@ -3843,20 +3844,19 @@ fn drain_pty_reader(
                 ));
             }
             Ok(0) => break,
-            Ok(read) => {
-                filled += read;
-                burst += read;
-            }
+            Ok(read) => filled += read,
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 if filled == 0 {
                     return Ok(BrokerPtyDrainV1::Empty);
                 }
-                if burst < BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES {
-                    break;
-                }
-                let deadline = *fill_deadline
-                    .get_or_insert_with(|| Instant::now() + BROKER_OUTPUT_DRAIN_FILL_WAIT);
+                let deadline = match fill_deadline {
+                    Some(deadline) => deadline,
+                    None if filled >= BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES => {
+                        *fill_deadline.insert(Instant::now() + BROKER_OUTPUT_DRAIN_FILL_WAIT)
+                    }
+                    None => break,
+                };
                 let Some(wait) = deadline
                     .checked_duration_since(Instant::now())
                     .filter(|wait| !wait.is_zero())
@@ -3870,7 +3870,7 @@ fn drain_pty_reader(
                     nix::poll::PollFlags::POLLIN,
                 )];
                 match nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(wait)) {
-                    Ok(ready) if ready > 0 => burst = 0,
+                    Ok(ready) if ready > 0 => {}
                     Ok(_) => break,
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(_) => break,
