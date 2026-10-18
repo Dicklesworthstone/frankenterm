@@ -60,10 +60,12 @@ const GUARDIAN_CENSUS_REFRESH_ATTEMPTS: usize = 2;
 const GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
 /// A restore whose replay ends inside an escape sequence (a child part way
-/// through writing an image) waits this long for the rest, this many times,
-/// before it fails.
-const GUARDIAN_RESTORE_SEQUENCE_WAIT: Duration = Duration::from_millis(50);
-const GUARDIAN_RESTORE_SEQUENCE_WAITS: usize = 40;
+/// through writing an image) waits for the rest: first this long, doubling
+/// to at most a second, for this long in all, before it fails. The guardian
+/// journals a pane's output one synced 8 KiB record at a time, so a
+/// half-megabyte image took more than two seconds to reach it on macOS.
+const GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT: Duration = Duration::from_millis(50);
+const GUARDIAN_RESTORE_SEQUENCE_WAIT_TOTAL: Duration = Duration::from_secs(20);
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -4332,7 +4334,8 @@ fn consume_guardian_replay_for_restore(
     selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
     let mut expired = 0;
-    let mut inside_sequence = 0;
+    let mut waited = Duration::ZERO;
+    let mut wait = GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT;
     loop {
         match consume_one_guardian_replay_snapshot(
             transport,
@@ -4353,17 +4356,26 @@ fn consume_guardian_replay_for_restore(
                 .increment(1);
             }
             Err(GuardianProxyError::ReplayEndsInsideSequence)
-                if inside_sequence < GUARDIAN_RESTORE_SEQUENCE_WAITS =>
+                if waited < GUARDIAN_RESTORE_SEQUENCE_WAIT_TOTAL =>
             {
-                inside_sequence += 1;
                 metrics::counter!(
                     "mux.guardian_proxy.replay_snapshot_reopen_total",
                     "phase" => "restore_inside_sequence",
                 )
                 .increment(1);
-                std::thread::sleep(GUARDIAN_RESTORE_SEQUENCE_WAIT);
+                std::thread::sleep(wait);
+                waited += wait;
+                wait = (wait * 2).min(Duration::from_secs(1));
             }
-            result => return result,
+            result => {
+                if result.is_ok() && !waited.is_zero() {
+                    log::info!(
+                        "guardian restore waited {} ms for an escape sequence its replay ended inside",
+                        waited.as_millis()
+                    );
+                }
+                return result;
+            }
         }
     }
 }
