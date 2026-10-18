@@ -198,6 +198,8 @@ struct StartingBrokerPane {
     read_backoff: Duration,
     /// When a Read last delivered output.
     last_output_at: Option<Instant>,
+    /// When the pane last had output or input.
+    active_at: Option<Instant>,
     /// When the broker last answered a ChildStatus.
     status_checked_at: Option<Instant>,
     terminal: bool,
@@ -216,40 +218,57 @@ struct StartingBrokerPane {
 const BROKER_READ_RETRY_FIRST: Duration = Duration::from_micros(250);
 /// The longest wait between broker Reads of a pane with no output.
 const BROKER_READ_RETRY_MAX: Duration = Duration::from_millis(25);
+/// The longest wait once a pane has had no output or input for
+/// [`BROKER_READ_IDLE_AFTER`]: every Read costs the broker a token effect
+/// lease, and twelve idle panes at 25 ms held a broker at ~43% CPU (mac).
+const BROKER_READ_RETRY_IDLE_MAX: Duration = Duration::from_millis(100);
+const BROKER_READ_IDLE_AFTER: Duration = Duration::from_secs(1);
 /// A pane that delivered output this recently is streaming: a Read that
 /// finds none is most likely waiting on a drain the broker has in flight.
 const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
 /// The longest a pane goes without a ChildStatus while its PTY stays open.
-const BROKER_CHILD_STATUS_INTERVAL: Duration = Duration::from_millis(250);
+const BROKER_CHILD_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 impl StartingBrokerPane {
     /// The broker answers a Read with no output at once, whether its PTY is
     /// idle or a drain is still syncing, so reading again at once spun the
     /// guardian and the broker on every idle pane (a core between them). Back
     /// off from [`BROKER_READ_RETRY_FIRST`], doubling to
-    /// [`BROKER_READ_RETRY_MAX`]; output or input resets it. A streaming pane
+    /// [`BROKER_READ_RETRY_MAX`], or to [`BROKER_READ_RETRY_IDLE_MAX`] once
+    /// the pane has gone quiet; output or input resets it. A streaming pane
     /// keeps the first wait, so it picks up a drain's record soon after the
     /// broker has synced it.
     fn defer_read(&mut self, now: Instant) {
         let streaming = self
             .last_output_at
             .is_some_and(|at| now.saturating_duration_since(at) < BROKER_READ_STREAMING_WINDOW);
+        let maximum = if self
+            .active_at
+            .is_some_and(|at| now.saturating_duration_since(at) < BROKER_READ_IDLE_AFTER)
+        {
+            BROKER_READ_RETRY_MAX
+        } else {
+            BROKER_READ_RETRY_IDLE_MAX
+        };
         self.read_backoff = if streaming {
             BROKER_READ_RETRY_FIRST
         } else {
-            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, BROKER_READ_RETRY_MAX)
+            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, maximum)
         };
         self.read_retry_at = Some(now + self.read_backoff);
         self.child_status_due_by(now);
     }
 
-    fn read_promptly(&mut self) {
+    /// Input or output: read again at once, and back off only to
+    /// [`BROKER_READ_RETRY_MAX`] for a while.
+    fn read_promptly(&mut self, now: Instant) {
         self.read_backoff = Duration::ZERO;
         self.read_retry_at = None;
+        self.active_at = Some(now);
     }
 
     fn output_delivered(&mut self, now: Instant) {
-        self.read_promptly();
+        self.read_promptly(now);
         self.last_output_at = Some(now);
         self.child_status_due_by(now);
     }
@@ -2153,7 +2172,7 @@ impl GuardianRuntime {
                 return GuardianInputSubmission::CloseRetryably;
             };
             // Input usually brings output (an echo): read it promptly.
-            pane.read_promptly();
+            pane.read_promptly(Instant::now());
             self.pending_broker_input = Some(PendingBrokerInput {
                 route,
                 pane_id,
@@ -2758,6 +2777,7 @@ impl GuardianRuntime {
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
                 last_output_at: None,
+                active_at: None,
                 status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
@@ -7134,6 +7154,7 @@ mod tests {
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
                 last_output_at: None,
+                active_at: None,
                 status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
@@ -7155,6 +7176,8 @@ mod tests {
             .expect("inserted pane");
         assert!(pane.read_due(now));
 
+        // An active pane backs off to 25 ms ...
+        pane.read_promptly(now);
         let mut waits = Vec::new();
         for _ in 0..10 {
             pane.defer_read(now);
@@ -7167,6 +7190,16 @@ mod tests {
             ]
             .map(Duration::from_micros)
         );
+        // ... and a quiet one on to 100 ms.
+        let quiet = now + BROKER_READ_IDLE_AFTER;
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            pane.defer_read(quiet);
+            waits.push(pane.read_backoff);
+        }
+        assert_eq!(waits, [50, 100, 100].map(Duration::from_millis));
+        pane.read_backoff = BROKER_READ_RETRY_MAX;
+        pane.read_retry_at = Some(now + BROKER_READ_RETRY_MAX);
         assert!(!pane.read_due(now));
         assert!(pane.read_due(now + BROKER_READ_RETRY_MAX));
         assert_eq!(
@@ -7184,7 +7217,7 @@ mod tests {
             .starting_broker_panes
             .get_mut(&pane_id)
             .expect("inserted pane");
-        pane.read_promptly();
+        pane.read_promptly(now);
         assert!(pane.read_due(now));
         pane.defer_read(now);
         assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
@@ -7232,6 +7265,7 @@ mod tests {
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
                 last_output_at: None,
+                active_at: None,
                 status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
