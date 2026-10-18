@@ -564,9 +564,14 @@ data=d.get("data") or []
 print(" ".join(str(p["pane_id"]) for p in sorted(data, key=lambda p: p["pane_id"])))' 2>/dev/null || true
 }
 
-newest_publication() {  # mtime (epoch) of the newest recovery publication, or 0
+newest_publication() {  # mtime (epoch) of the newest committed recovery root, or 0
+  # A root slot is rewritten only when a publication commits. Its objects
+  # land first and stay behind when a capture fails or is cancelled, so
+  # judging freshness by them swapped muxes with no snapshot to restore:
+  # run-mux then started the new mux fresh beside the guardian's live panes,
+  # and its startup spawned a duplicate set (12, 24, 36 guardian panes).
   local f newest=0 t
-  for f in "$REC/store/objects/"guardian-*.obj; do
+  for f in "$REC/store/roots/"*.root; do
     [ -e "$f" ] || continue
     if [ "$OS" = Darwin ]; then t=$(stat -f %m "$f"); else t=$(stat -c %Y "$f"); fi
     [ "$t" -gt "$newest" ] && newest=$t
