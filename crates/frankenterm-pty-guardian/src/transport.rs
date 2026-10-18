@@ -4605,6 +4605,24 @@ fn validate_absolute_path(path: &Path) -> Result<(), GuardianServiceError> {
     Ok(())
 }
 
+/// How long one thread trusts its last walk of a guardian path's ancestors
+/// (ft-2pgul). Every broker request took a token effect lease that walked the
+/// token path about a dozen times, an `lstat` per component each time: 30-40%
+/// of a streaming broker's CPU, on the path of every round trip. The walk
+/// only proves hygiene (no symlink, no group- or other-writable non-sticky
+/// directory): each caller still checks the immediate parent's owner and mode
+/// every time, and the pinned-descriptor checks still resolve the whole path
+/// and compare identities, so a replaced or redirected ancestor fails at
+/// once; a loosened ancestor mode fails within this interval.
+const PRIVATE_PARENT_WALK_TTL: Duration = Duration::from_millis(250);
+const PRIVATE_PARENT_WALKS_RETAINED: usize = 8;
+
+std::thread_local! {
+    /// Parent directories whose ancestors this thread walked, and when.
+    static PRIVATE_PARENT_WALKS: std::cell::RefCell<Vec<(PathBuf, Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
     validate_absolute_path(path)?;
     let parent = path
@@ -4612,28 +4630,36 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
         .ok_or(GuardianServiceError::FilesystemSecurity(
             "guardian path has no parent directory",
         ))?;
-    let mut current = PathBuf::from("/");
-    for component in parent.components() {
-        match component {
-            Component::RootDir => continue,
-            Component::Normal(part) => current.push(part),
-            _ => {
+    let now = Instant::now();
+    let walked = PRIVATE_PARENT_WALKS.with(|walks| {
+        walks.borrow().iter().any(|(walked, at)| {
+            walked == parent && now.saturating_duration_since(*at) < PRIVATE_PARENT_WALK_TTL
+        })
+    });
+    if !walked {
+        let mut current = PathBuf::from("/");
+        for component in parent.components() {
+            match component {
+                Component::RootDir => continue,
+                Component::Normal(part) => current.push(part),
+                _ => {
+                    return Err(GuardianServiceError::FilesystemSecurity(
+                        "guardian parent path is not normalized",
+                    ));
+                }
+            }
+            let metadata = std::fs::symlink_metadata(&current)
+                .map_err(|error| GuardianServiceError::io("parent-metadata", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(GuardianServiceError::FilesystemSecurity(
-                    "guardian parent path is not normalized",
+                    "guardian parent path contains a symlink or non-directory",
                 ));
             }
-        }
-        let metadata = std::fs::symlink_metadata(&current)
-            .map_err(|error| GuardianServiceError::io("parent-metadata", error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(GuardianServiceError::FilesystemSecurity(
-                "guardian parent path contains a symlink or non-directory",
-            ));
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            return Err(GuardianServiceError::FilesystemSecurity(
-                "guardian parent path contains a group-or-other-writable non-sticky directory",
-            ));
+            if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+                return Err(GuardianServiceError::FilesystemSecurity(
+                    "guardian parent path contains a group-or-other-writable non-sticky directory",
+                ));
+            }
         }
     }
     let metadata = std::fs::symlink_metadata(parent)
@@ -4642,6 +4668,16 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian immediate parent must be owned by the current user and owner-only",
         ));
+    }
+    if !walked {
+        PRIVATE_PARENT_WALKS.with(|walks| {
+            let mut walks = walks.borrow_mut();
+            walks.retain(|(walked, _)| walked != parent);
+            if walks.len() >= PRIVATE_PARENT_WALKS_RETAINED {
+                walks.remove(0);
+            }
+            walks.push((parent.to_path_buf(), now));
+        });
     }
     Ok(())
 }
@@ -8895,6 +8931,35 @@ mod tests {
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(validate_private_parent(&private.join("guardian.sock")).is_err());
+    }
+
+    #[test]
+    fn a_reused_ancestor_walk_still_checks_the_immediate_parent_and_expires() {
+        let canonical_temp = crate::canonical_test_temp_root();
+        let directory = tempfile::Builder::new()
+            .prefix("frankenterm-guardian-walk-reuse-")
+            .tempdir_in(canonical_temp)
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = directory.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = shared.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("guardian.sock");
+        validate_private_parent(&path).expect("private path");
+
+        // The immediate parent is checked on every call, walked or not.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(validate_private_parent(&path).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A loosened ancestor fails once the last walk has expired.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::thread::sleep(PRIVATE_PARENT_WALK_TTL);
+        assert!(validate_private_parent(&path).is_err());
     }
 
     #[test]
