@@ -195,6 +195,23 @@ pub fn guardian_admits_protection_checkpoints(socket: &Path, token: &Path) -> bo
     admitted
 }
 
+/// Whether the guardian at `socket` comes from a build that reads durable
+/// scrollback rows showing images in their own schema, for
+/// `crate::set_image_scrollback_rows`; a probe like
+/// `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_image_scrollback_rows(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_image_scrollback_rows(socket, token);
+    log::info!(
+        "guardian scrollback: {}",
+        if admitted {
+            "rows showing images hold each image once"
+        } else {
+            "rows showing images repeat each image in every cell (the guardian, or this build, predates image rows)"
+        }
+    );
+    admitted
+}
+
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
 /// transaction; an unadopted birth fences further spawning in this domain.

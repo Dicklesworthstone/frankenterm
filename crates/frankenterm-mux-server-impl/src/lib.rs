@@ -69,6 +69,27 @@ const EXACT_SCROLLBACK_COMPACT_MIN_CELLS: usize = 3;
 /// storage, serialized as its attribute runs (1 is the cell vector, 2 the
 /// compact printable-ASCII form).
 const EXACT_SCROLLBACK_SCHEMA_CLUSTERED: u32 = 3;
+/// An exact row's plaintext schema for a row showing images: schema 1's cell
+/// vector and width sidecar with the images detached, then each image object
+/// the row shows once and every cell's image layers naming them
+/// (`ExactScrollbackRowImagesV1`). The other schemas carry an attribute
+/// run's whole image in every run, so a screenshot's row came to tens of
+/// megabytes, more than any row may hold, and the pane's durability stalled
+/// on it.
+const EXACT_SCROLLBACK_SCHEMA_IMAGES: u32 = 4;
+
+/// Whether rows showing images seal as schema 4 (`set_image_scrollback_rows`).
+static IMAGE_SCROLLBACK_ROWS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Seal rows showing images as schema 4 from now on. The caller learned that
+/// this mux's guardian admits it (`GuardianClient::admits_image_scrollback_rows`):
+/// every mux that will read this store then decodes it, as for compact
+/// checkpoints, since the guardian stays on the family it was installed
+/// with. A reader older than schema 4 cannot read such a row.
+pub fn set_image_scrollback_rows(enabled: bool) {
+    IMAGE_SCROLLBACK_ROWS.store(enabled, std::sync::atomic::Ordering::Release);
+}
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -13720,7 +13741,24 @@ fn serialize_exact_semantic_scrollback_line_into(
     line: &wezterm_term::Line,
     out: &mut Vec<u8>,
 ) -> bool {
+    serialize_exact_semantic_scrollback_line_into_with(
+        line,
+        out,
+        IMAGE_SCROLLBACK_ROWS.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// `serialize_exact_semantic_scrollback_line_into`, sealing a row showing
+/// images as schema 4 exactly when `image_rows`.
+fn serialize_exact_semantic_scrollback_line_into_with(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+    image_rows: bool,
+) -> bool {
     wipe_scrollback_plaintext(out);
+    if image_rows && line.has_image_attachments() {
+        return serialize_image_semantic_scrollback_line_into(line, out);
+    }
     #[cfg(test)]
     let clustered = line.has_clustered_storage() && !FORCE_CELL_SCHEMAS.with(std::cell::Cell::get);
     #[cfg(not(test))]
@@ -13966,6 +14004,172 @@ struct ExactSemanticScrollbackLineV1 {
     schema: u32,
     line: wezterm_term::Line,
     cell_widths: Vec<u8>,
+}
+
+/// Schema 4's sidecar, after its `ExactSemanticScrollbackLineV1`: the image
+/// objects the row shows, each once, and its cells' image layers, cell by
+/// cell, each cell's in its z-index order.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactScrollbackRowImagesV1 {
+    images: Vec<termwiz::image::ImageData>,
+    layers: Vec<ExactScrollbackImageLayerV1>,
+}
+
+/// `ExactScrollbackRowImagesV1` over borrowed images: the same bytes.
+#[derive(Serialize)]
+struct ExactScrollbackRowImagesRef<'a> {
+    images: Vec<&'a termwiz::image::ImageData>,
+    layers: &'a [ExactScrollbackImageLayerV1],
+}
+
+/// One image a cell shows: a region of the row's `image`th object, as
+/// `ImageCell` holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactScrollbackImageLayerV1 {
+    cell: u32,
+    image: u32,
+    top_left: termwiz::image::TextureCoordinate,
+    bottom_right: termwiz::image::TextureCoordinate,
+    z_index: i32,
+    padding: (u16, u16, u16, u16),
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+}
+
+/// Schema 4 for a row showing images, written into `out`; false, with `out`
+/// wiped, for a row it cannot seal.
+fn serialize_image_semantic_scrollback_line_into(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+) -> bool {
+    let mut stripped = line.clone();
+    let cells = stripped.cells_mut();
+    if cells.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+        return false;
+    }
+    let mut cell_widths = Vec::new();
+    if cell_widths.try_reserve_exact(cells.len()).is_err() {
+        return false;
+    }
+    let mut images: Vec<Arc<termwiz::image::ImageData>> = Vec::new();
+    let mut entries = std::collections::HashMap::new();
+    let mut layers = Vec::new();
+    for (index, cell) in cells.iter_mut().enumerate() {
+        let Ok(width) = u8::try_from(cell.width()) else {
+            return false;
+        };
+        if !matches!(width, 1 | 2) {
+            return false;
+        }
+        cell_widths.push(width);
+        let Some(shown) = cell.attrs().images() else {
+            continue;
+        };
+        let Ok(cell_index) = u32::try_from(index) else {
+            return false;
+        };
+        for image in shown {
+            let data = image.image_data();
+            let key = Arc::as_ptr(data) as usize;
+            let entry = match entries.get(&key) {
+                Some(entry) => *entry,
+                None => {
+                    let Ok(entry) = u32::try_from(images.len()) else {
+                        return false;
+                    };
+                    images.push(Arc::clone(data));
+                    entries.insert(key, entry);
+                    entry
+                }
+            };
+            layers.push(ExactScrollbackImageLayerV1 {
+                cell: cell_index,
+                image: entry,
+                top_left: image.top_left(),
+                bottom_right: image.bottom_right(),
+                z_index: image.z_index(),
+                padding: image.padding(),
+                image_id: image.image_id(),
+                placement_id: image.placement_id(),
+            });
+        }
+        cell.attrs_mut().clear_images();
+    }
+    let semantic = ExactSemanticScrollbackLineV1 {
+        schema: EXACT_SCROLLBACK_SCHEMA_IMAGES,
+        line: stripped,
+        cell_widths,
+    };
+    let sidecar = ExactScrollbackRowImagesRef {
+        images: images.iter().map(AsRef::as_ref).collect(),
+        layers: &layers,
+    };
+    serialize_semantic_scrollback_payload_into(&semantic, out)
+        && serialize_semantic_scrollback_payload_into(&sidecar, out)
+}
+
+/// Attach schema 4's images to the cells of its decoded row.
+fn attach_exact_scrollback_row_images(
+    line: &mut wezterm_term::Line,
+    sidecar: ExactScrollbackRowImagesV1,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !line.has_image_attachments() && !sidecar.layers.is_empty(),
+        "an image scrollback row shows its images only through its layers"
+    );
+    let images: Vec<Arc<termwiz::image::ImageData>> =
+        sidecar.images.into_iter().map(Arc::new).collect();
+    let mut named = vec![false; images.len()];
+    let cells = line.cells_mut();
+    let mut layers = sidecar.layers.into_iter().peekable();
+    let mut previous_cell = None;
+    while let Some(first) = layers.next() {
+        anyhow::ensure!(
+            previous_cell.is_none_or(|previous| previous < first.cell),
+            "image scrollback row layers are grouped cell by cell, in cell order"
+        );
+        previous_cell = Some(first.cell);
+        let cell = first.cell;
+        let mut shown = vec![first];
+        while let Some(next) = layers.next_if(|layer| layer.cell == cell) {
+            shown.push(next);
+        }
+        anyhow::ensure!(
+            shown.windows(2).all(|pair| pair[0].z_index <= pair[1].z_index),
+            "a cell's image layers are in z-index order"
+        );
+        let mut attached = Vec::with_capacity(shown.len());
+        for layer in shown {
+            let data = images
+                .get(layer.image as usize)
+                .ok_or_else(|| anyhow::anyhow!("an image layer names no image of its row"))?;
+            named[layer.image as usize] = true;
+            let (left, top, right, bottom) = layer.padding;
+            attached.push(Box::new(termwiz::image::ImageCell::with_z_index(
+                layer.top_left,
+                layer.bottom_right,
+                Arc::clone(data),
+                layer.z_index,
+                left,
+                top,
+                right,
+                bottom,
+                layer.image_id,
+                layer.placement_id,
+            )));
+        }
+        let target = cells
+            .get_mut(cell as usize)
+            .ok_or_else(|| anyhow::anyhow!("an image layer names no cell of its row"))?;
+        target.attrs_mut().set_images(attached);
+    }
+    anyhow::ensure!(
+        named.iter().all(|named| *named),
+        "every image of an image scrollback row is shown"
+    );
+    Ok(())
 }
 
 /// `ExactSemanticScrollbackLineV1` over a borrowed row and sidecar: the same
@@ -14643,12 +14847,23 @@ fn decode_exact_semantic_scrollback_plaintext(
     let mut semantic: ExactSemanticScrollbackLineV1 =
         codec::bounded_varbincode_deserialize(&mut reader)
             .context("bounded decode of semantic scrollback row")?;
+    let images = if semantic.schema == EXACT_SCROLLBACK_SCHEMA_IMAGES {
+        Some(
+            codec::bounded_varbincode_deserialize::<ExactScrollbackRowImagesV1>(&mut reader)
+                .context("bounded decode of semantic scrollback row images")?,
+        )
+    } else {
+        None
+    };
     anyhow::ensure!(
         reader.is_empty(),
         "semantic scrollback row contains trailing plaintext"
     );
     anyhow::ensure!(
-        matches!(semantic.schema, 1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED),
+        matches!(
+            semantic.schema,
+            1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED | EXACT_SCROLLBACK_SCHEMA_IMAGES
+        ),
         "unsupported semantic scrollback row schema"
     );
     if semantic.schema == EXACT_SCROLLBACK_SCHEMA_CLUSTERED {
@@ -14698,6 +14913,9 @@ fn decode_exact_semantic_scrollback_plaintext(
             cell.attrs().clone(),
         );
         *cell = restored;
+    }
+    if let Some(images) = images {
+        attach_exact_scrollback_row_images(&mut semantic.line, images)?;
     }
     Ok((
         semantic.line,
@@ -23287,6 +23505,182 @@ mod tests {
             assert!(line.has_clustered_storage(), "{:?}", line.as_str());
         }
         rows
+    }
+
+    /// A row of 80 cells showing slices of one 512x256 RGBA image (512 KiB),
+    /// as Screen hands it over.
+    fn image_row(width: u32, height: u32) -> Line {
+        use termwiz::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let pixels: Vec<u8> = (0..width * height * 4).map(|byte| byte as u8).collect();
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            width, height, pixels,
+        )));
+        let mut line = Line::with_width(80, 1);
+        for column in 0..80 {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_image(Box::new(ImageCell::new(
+                TextureCoordinate::new_f32(column as f32 / 80.0, 0.0),
+                TextureCoordinate::new_f32((column + 1) as f32 / 80.0, 1.0 / 16.0),
+                Arc::clone(&image),
+            )));
+            line.set_cell(column, termwiz::cell::Cell::blank_with_attrs(attrs), 1);
+        }
+        line.compress_for_scrollback();
+        line
+    }
+
+    /// The images each cell of `decoded` shows are `original`'s, field by
+    /// field and byte by byte; returns the distinct objects `decoded` holds.
+    fn assert_same_row_images(original: &Line, decoded: &Line) -> usize {
+        let mut objects = std::collections::HashSet::new();
+        assert_eq!(original.len(), decoded.len());
+        for (left, right) in original.visible_cells().zip(decoded.visible_cells()) {
+            assert_eq!(left.str(), right.str());
+            assert_eq!(left.width(), right.width());
+            assert_eq!(left.attrs(), right.attrs());
+            let (left, right) = (left.attrs().images(), right.attrs().images());
+            assert_eq!(left.is_some(), right.is_some());
+            for (left, right) in left.iter().flatten().zip(right.iter().flatten()) {
+                assert_eq!(left.z_index(), right.z_index());
+                assert_eq!(left.top_left(), right.top_left());
+                assert!(*left.image_data().data() == *right.image_data().data());
+                assert_eq!(
+                    left.image_data().current_content_hash(),
+                    right.image_data().current_content_hash()
+                );
+                objects.insert(Arc::as_ptr(right.image_data()) as usize);
+            }
+        }
+        objects.len()
+    }
+
+    /// A row showing a screenshot seals each image object once as schema 4;
+    /// sealed as the other schemas, every cell repeats the whole image, and
+    /// the row exceeds what any row may hold, so the pane's durability used
+    /// to stall on it. It decodes to the same cells, sharing one object.
+    #[test]
+    fn image_rows_seal_each_image_once_and_decode_exactly() {
+        let line = image_row(512, 256);
+        let mut plaintext = Vec::new();
+        assert!(
+            !serialize_exact_semantic_scrollback_line_into_with(&line, &mut plaintext, false),
+            "without schema 4 the row cannot be sealed"
+        );
+        assert!(serialize_exact_semantic_scrollback_line_into_with(
+            &line,
+            &mut plaintext,
+            true
+        ));
+        assert!(
+            plaintext.len() < 512 * 256 * 4 + 64 * 1024,
+            "{} bytes",
+            plaintext.len()
+        );
+        let (decoded, _, fidelity) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext.clone()),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+        assert_eq!(assert_same_row_images(&line, &decoded), 1);
+
+        // A row without images seals as before, whatever the switch says.
+        for line in clustered_test_rows() {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            assert!(serialize_exact_semantic_scrollback_line_into_with(
+                &line,
+                &mut before,
+                false
+            ));
+            assert!(serialize_exact_semantic_scrollback_line_into_with(
+                &line, &mut after, true
+            ));
+            assert_eq!(before, after);
+        }
+    }
+
+    /// Two images, overlapping layers in z-index order, and plain text
+    /// round-trip; a layer naming no image of its row fails decoding.
+    #[test]
+    fn image_rows_keep_layers_and_refuse_dangling_ones() {
+        use termwiz::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let image = |seed: u8| {
+            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                4,
+                4,
+                vec![seed; 64],
+            )))
+        };
+        let (under, over) = (image(1), image(2));
+        let mut line = Line::from_text("text then images", &CellAttributes::blank(), 1, None);
+        for column in 10..14 {
+            let mut attrs = CellAttributes::blank();
+            for (z_index, data) in [(-1, &under), (0, &over), (0, &under)] {
+                attrs.attach_image(Box::new(ImageCell::with_z_index(
+                    TextureCoordinate::new_f32(0.0, 0.0),
+                    TextureCoordinate::new_f32(1.0, 1.0),
+                    Arc::clone(data),
+                    z_index,
+                    1,
+                    2,
+                    3,
+                    4,
+                    Some(7),
+                    Some(column as u32),
+                )));
+            }
+            line.set_cell(column, termwiz::cell::Cell::blank_with_attrs(attrs), 1);
+        }
+        line.compress_for_scrollback();
+        let mut plaintext = Vec::new();
+        assert!(serialize_exact_semantic_scrollback_line_into_with(
+            &line,
+            &mut plaintext,
+            true
+        ));
+        let (decoded, _, _) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        assert_eq!(assert_same_row_images(&line, &decoded), 2);
+
+        let mut stripped = Line::from_text("x", &CellAttributes::blank(), 1, None);
+        let semantic = ExactSemanticScrollbackLineV1 {
+            schema: EXACT_SCROLLBACK_SCHEMA_IMAGES,
+            cell_widths: vec![1; stripped.cells_mut().len()],
+            line: stripped,
+        };
+        let dangling = [ExactScrollbackImageLayerV1 {
+            cell: 0,
+            image: 0,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            z_index: 0,
+            padding: (0, 0, 0, 0),
+            image_id: None,
+            placement_id: None,
+        }];
+        let mut plaintext = Vec::new();
+        assert!(serialize_semantic_scrollback_payload_into(
+            &semantic,
+            &mut plaintext
+        ));
+        assert!(serialize_semantic_scrollback_payload_into(
+            &ExactScrollbackRowImagesRef {
+                images: Vec::new(),
+                layers: &dangling,
+            },
+            &mut plaintext
+        ));
+        assert!(
+            decode_exact_semantic_scrollback_plaintext(
+                Zeroizing::new(plaintext),
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .is_err()
+        );
     }
 
     /// ft-yccm0.2.1.4: durable bytes written and syncs per MiB of T0 input,

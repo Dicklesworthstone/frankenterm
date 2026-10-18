@@ -412,6 +412,14 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
             socket, token,
         )
     });
+    #[cfg(unix)]
+    frankenterm_mux_server_impl::set_image_scrollback_rows(guardian_paths.as_ref().is_some_and(
+        |(socket, token)| {
+            frankenterm_mux_server_impl::guardian_proxy::guardian_admits_image_scrollback_rows(
+                socket, token,
+            )
+        },
+    ));
     let executor = promise::spawn::SimpleExecutor::with_io_runtime()
         .context("initialize headless mux I/O reactor")?;
     let (mux, restored) = if opts.recovery_restore {
