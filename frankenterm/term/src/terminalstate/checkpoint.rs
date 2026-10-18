@@ -1546,6 +1546,9 @@ struct CheckpointImageRegistry {
     images: Vec<PinnedImage>,
     live: HashMap<usize, u32>,
     copies: HashMap<([u8; 32], [u8; 32]), u32>,
+    /// Copy objects already looked up, so that the cells of a row sharing
+    /// one hash its content once; it holds them, so no address is reused.
+    copy_objects: HashMap<usize, (u32, Arc<ImageData>)>,
 }
 
 impl CheckpointImageRegistry {
@@ -1604,16 +1607,27 @@ impl CheckpointImageRegistry {
                 .copied()
                 .ok_or(TerminalCheckpointError::StaleGraphicsGeneration);
         }
-        let revision = data.current_content_hash();
-        let key = (data.hash(), revision);
-        if let Some(index) = self.copies.get(&key) {
+        let object = Arc::as_ptr(data) as usize;
+        if let Some((index, _)) = self.copy_objects.get(&object) {
             return Ok(*index);
         }
-        let index = self.push(data, revision)?;
-        self.copies
+        let revision = data.current_content_hash();
+        let key = (data.hash(), revision);
+        let index = match self.copies.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = self.push(data, revision)?;
+                self.copies
+                    .try_reserve(1)
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                self.copies.insert(key, index);
+                index
+            }
+        };
+        self.copy_objects
             .try_reserve(1)
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
-        self.copies.insert(key, index);
+        self.copy_objects.insert(object, (index, Arc::clone(data)));
         Ok(index)
     }
 
