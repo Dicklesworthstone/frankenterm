@@ -28,6 +28,12 @@
 # E2E_PANES=N (default 1) runs N panes; every one must keep its process,
 # id and history across the upgrade and the rollback.
 #
+# E2E_IMAGES=1 (with E2E_PANES > 1) makes every odd pane show an iTerm2
+# PNG and a Kitty image, and store a second Kitty image, before it ticks.
+# Recovery must still publish (a pane showing an image refused capture
+# before graphics checkpoints), and each restore after the upgrade and
+# after the rollback must report the images it restored.
+#
 # POST_UPGRADE_SOAK_SECONDS=N (default 0) keeps the upgraded mux running N
 # seconds before the rollback; it must publish a recovery generation in
 # that time, as a successor whose restore pinned the guardian's catalog
@@ -76,11 +82,21 @@ BURST=""
 # ticking "$MARK pk tick". The guardian's stage, catalog and replay limits
 # are per guardian, so one pane alone never meets them.
 PANES=${E2E_PANES:-1}
+IMAGES=${E2E_IMAGES:-0}
+# A 16x16 PNG; and 2x2 RGBA pixels, for Kitty.
+PNG=iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAADpklEQVR42gXBC0AMBhzA4b8ep8fV5Vacyq10dFKkpRqXHjglIstql0iRmpbHNIWSpJgmLCF5tlqNZZEizwljWVbLGGtjNmOMMcZs9tv3iYjgYC64KQRfayFUKUxWCUlqYb6TkK8R1rsIu7TCZ+7CKZ3wtadww0v4w0eQnv2EPm498PQwI3CgOeMGWRDnbcmcoQoW+/WkeLgVm4Os+XikDc2jbPkiTMmVMXb8Os6eZ+NViP0IQRtsxpBQC0aNVhBttGJ6pA2ZE5TkTbJn3RQHdkxVUx/vyImE3rRP1/DDTGcezHLlvzlaxClOGGAyZ3iigrFJ1kxNUTI7VUVWuppVGU5smqeheqELh7K0nM125/JSHb/kefJ0hReWhT6I6yLBe7EFhiVWTMhVMi3fgYyVjiwr0lCyxpXKEjf2leo4tlHPxU3efL/Fl/vb/Pl3RxDK3QbEY4PwWpklozfb8EaFipTtjry7qy8rq7R8WONBVZ2eg/t8aN3vxzcHArl1yMCfh8MwP2rklRNRiFe9MKJBwfhGJaZmNW+3aFhyXMv7p3RUtHrxyTlfWi4E8OVFA9cuhfNbZwQvLkdjczUW5+smZFibENbek5gOe2Z2ObHgiisrrnmwoduL3TeG0XAriM9vh9Bx18jN+xN59DCWHo8T6PU0Gffn6UjQHSHinhXxDxxIe6Qh+4kbq5/p2fLCl9qXQRyWUM6bR3BVMZk71vE8VyZhpUpDo56P3ikbCbEUJllZM8NWzTx7F5b30lHq6MPOPgHsdw7hZL8ILrnF8KOHiYcDU2BQBirvLF4dmsdQv2LE2F94c4ANqXpH3huspWiInvJhftT4G2gKNHJuxGS+DTZxO3QWf43ORGHMpndkAQMnlBAwqRyZGCIkhtvyztje5Ea480GUN9ujA/k0JpzjsRP5Ki6eblMKvydm8jIpB7uUQvqlluKTXkFwRjUSO02YNUPJomQNhbN1lKX58tFcA42ZEZxZEEvXoiR+XpzBkyXZWOQW4pi/Ht3KSvyLahmzphFJyBHmLrNj6XJn1hZ4sm2VP3tXh3F0bTRt6xK4viGNe2VZ/LO5ANuKUly2VzJ4Vx0jq5qIqmlFksuFhVvtKah0ZeNOL/bsCeJAtZHTtbF07k3mp/r5PG7Iw6yxBHVzBf1bavE73kT4qTNMae1E0g8KOU0q1hzRsvWYD3UnDRw5HcWFsya+O5/O3bZs/m4vxrqjnL5d1Qy60sjr11qJ7O7krRs3+R/oey7fcMgA/AAAAABJRU5ErkJggg==
+RGBA=AAECAwQFBgcICQoLDA0ODw==
+images() {  # -> shell commands showing and storing the images
+  echo "printf '\\033]1337;File=inline=1:%s\\007\\n' $PNG; "
+  echo "printf '\\033_Ga=T,f=32,s=2,v=2,i=31,q=2;%s\\033\\\\\\n' $RGBA; "
+  echo "printf '\\033_Ga=t,f=32,s=2,v=2,i=32,q=2;%s\\033\\\\' $RGBA; "
+}
 prog() {  # <pane index> -> its shell program
-  local tag="" burst=""
+  local tag="" burst="" shown=""
   [ "$1" -gt 0 ] && tag="p$1 "
   [ "$1" = 0 ] && burst=$BURST
-  echo "${burst}i=0; while :; do echo \"$MARK ${tag}tick \$i\"; i=\$((i+1)); sleep 1; done"
+  [ "$IMAGES" = 1 ] && [ $(( $1 % 2 )) = 1 ] && shown=$(images | tr -d '\n')
+  echo "${burst}${shown}i=0; while :; do echo \"$MARK ${tag}tick \$i\"; i=\$((i+1)); sleep 1; done"
 }
 if [ "$PANES" -gt 1 ]; then
   # Only a Lua config can open more than one pane at startup (a mux-startup
@@ -165,6 +181,18 @@ check_history() {
 }
 child_pid() { pgrep -f "^/bin/bash -c .*echo \"$MARK tick" | head -1; }
 count() { command ls "$1" 2>/dev/null | grep -c -- "$2"; }
+# Restores so far of a checkpoint holding images (the mux logs each one).
+image_restores() {
+  grep -c "restoring a terminal checkpoint holding [1-9]" "$STATE/logs/mux-server.log" 2>/dev/null
+}
+# <label> <restores before it>: with E2E_IMAGES, every image pane restored its images.
+check_image_restores() {
+  [ "$IMAGES" = 1 ] || return 0
+  local restored=$(( $(image_restores) - $2 ))
+  [ "$restored" -ge $(( PANES / 2 )) ] \
+    && pass "$1 restored images ($restored checkpoints holding images, $(( PANES / 2 )) image panes)" \
+    || fail "$1 restored images from $restored checkpoints for $(( PANES / 2 )) image panes"
+}
 
 step "install $(basename "$OLD")"
 if "$TOOL" install --family "$OLD" --manager direct; then pass "install"; else fail "install"; fi
@@ -216,6 +244,7 @@ UPGRADE_FLAGS=()
 # One available build: still prove a real lossless restart onto the same family.
 [ "$(cd "$OLD" && pwd -P)" = "$(cd "$NEW" && pwd -P)" ] && UPGRADE_FLAGS=(--force)
 # bash 3.2 (macOS /bin/bash) calls an empty "${a[@]}" unbound under set -u.
+RESTORES=$(image_restores)
 if "$TOOL" upgrade --family "$NEW" ${UPGRADE_FLAGS[@]+"${UPGRADE_FLAGS[@]}"}; then
   pass "upgrade reported success"
 else
@@ -226,6 +255,7 @@ PID2=$(child_pid)
   || fail "pane process changed across upgrade: $PID1 -> ${PID2:-none}"
 check_history upgrade "$NEW"
 check_other_panes upgrade "$NEW"
+check_image_restores upgrade "$RESTORES"
 
 if [ "$POST_SOAK" -gt 0 ]; then
   # The successor must go on publishing recovery generations: a catalog
@@ -243,11 +273,13 @@ if [ "$POST_SOAK" -gt 0 ]; then
 fi
 
 step "rollback"
+RESTORES=$(image_restores)
 if "$TOOL" rollback; then pass "rollback reported success"; else fail "rollback"; fi
 PID3=$(child_pid)
 [ "$PID1" = "$PID3" ] && pass "same pane process after rollback" || fail "pane process changed across rollback"
 check_history rollback "$OLD"
 check_other_panes rollback "$OLD"
+check_image_restores rollback "$RESTORES"
 
 step "power loss + reinstall"
 for f in "$STATE"/run.*.pid; do kill -KILL "$(cat "$f")" 2>/dev/null; done

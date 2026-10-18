@@ -6715,6 +6715,17 @@ impl ValidatedTerminalCheckpointV3 {
             }
             revision
         };
+        let images = self.checkpoint.images.as_ref().map_or(0, Vec::len);
+        let kitty_images = self
+            .checkpoint
+            .kitty
+            .as_ref()
+            .map_or(0, |kitty| kitty.images.len());
+        if images != 0 || kitty_images != 0 {
+            log::info!(
+                "restoring a terminal checkpoint holding {images} image(s); Kitty stores {kitty_images}"
+            );
+        }
         let replay_projection = self.checkpoint.replay_config.clone();
         let replay_config: Arc<dyn TerminalConfiguration> = Arc::new(
             replay_projection.to_replay_configuration(self.limits, &custom_cell_width_maps)?,
