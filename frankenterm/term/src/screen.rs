@@ -847,6 +847,8 @@ struct ColdReadCharge {
     used: usize,
     limit: usize,
     index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Image allocations already charged to this read.
+    images: std::collections::HashSet<usize>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -867,7 +869,48 @@ impl ColdReadCharge {
         }
     }
 
+    /// Charge one line: its serialized form, plus each image allocation it
+    /// holds once per read. Serializing an image cell writes its whole image,
+    /// so a durable image row (every cell of a 0.5 MB picture names it)
+    /// charged ~100 MB a row and every read that touched one failed with
+    /// `ColdReadPayloadLimit`. The image bytes a read holds are its distinct
+    /// allocations; the rows are charged without them.
     fn serialize_line(&mut self, line: &Line) -> anyhow::Result<()> {
+        if !line.has_image_attachments() {
+            return self.serialize_plain_line(line);
+        }
+        let mut stripped = line.clone();
+        for cell in stripped.cells_mut_for_attr_changes_only() {
+            let Some(images) = cell.attrs().images() else {
+                continue;
+            };
+            for image in images {
+                let data = image.image_data();
+                if self.images.insert(Arc::as_ptr(data) as usize) {
+                    self.charge(data.len())
+                        .map_err(|error| anyhow::Error::new(error).context(ColdReadPayloadLimit))?;
+                }
+            }
+            cell.attrs_mut().clear_images();
+        }
+        self.serialize_plain_line(&stripped)
+    }
+
+    fn charge(&mut self, bytes: usize) -> std::io::Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                if let Some(failed) = &self.index_failure {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                std::io::Error::other(ColdReadPayloadLimit)
+            })?;
+        Ok(())
+    }
+
+    fn serialize_plain_line(&mut self, line: &Line) -> anyhow::Result<()> {
         serde_json::to_writer(self, line).map_err(|error| {
             // This writer performs no IO: its only IO error is its byte cap.
             // Preserve a typed context explicitly; serde_json and io::Error
@@ -884,16 +927,7 @@ impl ColdReadCharge {
 #[cfg(feature = "use_serde")]
 impl std::io::Write for ColdReadCharge {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.used = self
-            .used
-            .checked_add(bytes.len())
-            .filter(|n| *n <= self.limit)
-            .ok_or_else(|| {
-                if let Some(failed) = &self.index_failure {
-                    failed.store(true, std::sync::atomic::Ordering::Release);
-                }
-                std::io::Error::other(ColdReadPayloadLimit)
-            })?;
+        self.charge(bytes.len())?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -932,6 +966,7 @@ impl ColdSeamReflow {
             used: 0,
             limit: ScreenLineRead::MAX_PAYLOAD_BYTES,
             index_failure: None,
+            images: Default::default(),
         };
         // A completed seam already owns every replacement row and its exact
         // logical-group boundary. If that complete source is still retained at
@@ -1034,7 +1069,7 @@ impl ColdSeamReflow {
                 cells <= ScreenLineRead::MAX_PAYLOAD_BYTES / std::mem::size_of::<Cell>(),
                 "cold seam cell limit"
             );
-            serde_json::to_writer(&mut charge, source)?;
+            charge.serialize_line(source)?;
             let mut line = source.clone();
             let seqno = line.current_seqno();
             line.set_last_cell_was_wrapped(false, seqno);
@@ -1095,7 +1130,7 @@ impl ColdSeamReflow {
         }
         for line in &mut wrapped {
             let _ = line.cells_mut_for_attr_changes_only();
-            serde_json::to_writer(&mut charge, line)?;
+            charge.serialize_line(line)?;
         }
         let replacement_resident = wrapped.split_off(wrapped.len() - self.resident.len());
         anyhow::ensure!(
@@ -1146,7 +1181,7 @@ impl ColdSeamReflow {
         if let Some(previous) = &self.previous {
             for (key, line) in previous.rows.range(retained.clone()) {
                 anyhow::ensure!(!cancelled(), "cold seam cancelled");
-                serde_json::to_writer(&mut charge, line)?;
+                charge.serialize_line(line)?;
                 replacements.insert(*key, line.clone());
             }
         }
@@ -1164,7 +1199,7 @@ impl ColdSeamReflow {
             let remainder = prefix.split_off(take, seqno);
             prefix.set_last_cell_was_wrapped(true, seqno);
             let _ = prefix.cells_mut_for_attr_changes_only();
-            serde_json::to_writer(&mut charge, &prefix)?;
+            charge.serialize_line(&prefix)?;
             replacements.insert(first + index as StableRowIndex, prefix);
             prefix = remainder;
         }
@@ -1640,6 +1675,7 @@ impl ScreenLineRead {
             used: 0,
             limit,
             index_failure: Some(Arc::clone(&self.index_budget_exhausted)),
+            images: Default::default(),
         };
         while row < self.hot_top {
             anyhow::ensure!(!cancelled(), "cold index cancelled");
@@ -1966,6 +2002,7 @@ impl ScreenLineRead {
             used: 0,
             limit,
             index_failure: None,
+            images: Default::default(),
         };
         let fragment_alignment_retained = self.fragments.as_ref().is_some_and(|fragments| {
             self.cold
@@ -19462,6 +19499,61 @@ pub(crate) mod tests {
             "pruned targets cannot authorize full logical reuse"
         );
         assert_eq!(screen.lines.back().unwrap().as_str(), "jkl");
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn a_cold_read_charges_each_image_allocation_once() {
+        use frankenterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+
+        // A 0.5 MB picture across a 64-column row, as a durable image row
+        // decodes it: every cell names the same allocation.
+        let image_row = |image: &Arc<ImageData>| {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_image(Box::new(ImageCell::new(
+                TextureCoordinate::new_f32(0.0, 0.0),
+                TextureCoordinate::new_f32(1.0, 1.0),
+                Arc::clone(image),
+            )));
+            Line::from_text(&" ".repeat(64), &attrs, 1, None)
+        };
+        let picture = || {
+            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                256,
+                512,
+                vec![7; 256 * 512 * 4],
+            )))
+        };
+        let charge = |limit| ColdReadCharge {
+            used: 0,
+            limit,
+            index_failure: None,
+            images: Default::default(),
+        };
+        let shared = picture();
+        let row = image_row(&shared);
+        let mut plain = row.clone();
+        for cell in plain.cells_mut_for_attr_changes_only() {
+            cell.attrs_mut().clear_images();
+        }
+        let mut plain_charge = charge(ScreenLineRead::MAX_PAYLOAD_BYTES);
+        plain_charge.serialize_line(&plain).unwrap();
+        let row_bytes = plain_charge.used;
+
+        let mut read = charge(ScreenLineRead::MAX_PAYLOAD_BYTES);
+        for _ in 0..16 {
+            read.serialize_line(&row)
+                .expect("rows sharing one picture fit a read");
+        }
+        assert_eq!(read.used, shared.len() + 16 * row_bytes);
+        // A row decoded on its own holds its own copy, charged once more.
+        read.serialize_line(&image_row(&picture())).unwrap();
+        assert_eq!(read.used, 2 * shared.len() + 17 * row_bytes);
+
+        // The limit still holds, with its typed error.
+        let mut tight = charge(shared.len());
+        let error = tight.serialize_line(&row).unwrap_err();
+        assert!(error.downcast_ref::<ColdReadPayloadLimit>().is_some());
     }
 
     #[test]
