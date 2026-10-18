@@ -59,6 +59,11 @@ const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_CENSUS_REFRESH_ATTEMPTS: usize = 2;
 const GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
+/// A restore whose replay ends inside an escape sequence (a child part way
+/// through writing an image) waits this long for the rest, this many times,
+/// before it fails.
+const GUARDIAN_RESTORE_SEQUENCE_WAIT: Duration = Duration::from_millis(50);
+const GUARDIAN_RESTORE_SEQUENCE_WAITS: usize = 40;
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -642,6 +647,8 @@ pub enum GuardianProxyError {
     GuardianIncarnationChanged,
     #[error("guardian replay snapshot expired; durable restore must be reopened")]
     ReplaySnapshotExpired,
+    #[error("guardian replay ends inside an escape sequence; durable restore must be reopened")]
+    ReplayEndsInsideSequence,
     #[error("guardian replay has an authenticated output gap")]
     ReplayGap,
     #[error("guardian replay checkpoint was compacted during restore")]
@@ -718,6 +725,7 @@ impl From<GuardianProxyError> for io::Error {
             GuardianProxyError::InputDurabilityPending
             | GuardianProxyError::PendingInputPayloadRequired
             | GuardianProxyError::ReplaySnapshotExpired
+            | GuardianProxyError::ReplayEndsInsideSequence
             | GuardianProxyError::ReplayCompacted => Self::new(io::ErrorKind::WouldBlock, error),
             GuardianProxyError::ReplayGap
             | GuardianProxyError::ReplayInvariant(_)
@@ -4196,9 +4204,11 @@ fn consume_one_guardian_replay_snapshot(
                         "terminal replay witness does not match the consumed checkpoint and suffix",
                     ));
                 }
-                restored
-                    .checkpoint()
-                    .map_err(GuardianProxyError::TerminalReplay)?;
+                let at_ground = match restored.checkpoint() {
+                    Ok(_) => true,
+                    Err(InertTerminalError::ParserNotRecoveryGround) => false,
+                    Err(error) => return Err(GuardianProxyError::TerminalReplay(error)),
+                };
                 let ack = replay_page_ack_plan(
                     snapshot_id,
                     snapshot_digest,
@@ -4210,6 +4220,13 @@ fn consume_one_guardian_replay_snapshot(
                     terminal_record_digest,
                 );
                 replay_ack_with_exact_retry(transport, &ack)?;
+                // The output so far ends inside an escape sequence (an
+                // image's, most often), whose end is still on its way. The
+                // acknowledgement released the snapshot; one reopened once
+                // more output has arrived ends past it.
+                if !at_ground {
+                    return Err(GuardianProxyError::ReplayEndsInsideSequence);
+                }
                 return Ok(VerifiedGuardianReplayRestore {
                     inert_terminal: inert_terminal.ok_or(GuardianProxyError::ReplayInvariant(
                         "verified terminal disappeared before activation",
@@ -4279,7 +4296,9 @@ fn consume_guardian_replay_for_restore(
     limits: TerminalCheckpointLimits,
     selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
-    for attempt in 0..GUARDIAN_RESTORE_REOPEN_ATTEMPTS {
+    let mut expired = 0;
+    let mut inside_sequence = 0;
+    loop {
         match consume_one_guardian_replay_snapshot(
             transport,
             identity,
@@ -4289,18 +4308,29 @@ fn consume_guardian_replay_for_restore(
             selected,
         ) {
             Err(GuardianProxyError::ReplaySnapshotExpired)
-                if attempt + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
+                if expired + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
             {
+                expired += 1;
                 metrics::counter!(
                     "mux.guardian_proxy.replay_snapshot_reopen_total",
                     "phase" => "restore",
                 )
                 .increment(1);
             }
+            Err(GuardianProxyError::ReplayEndsInsideSequence)
+                if inside_sequence < GUARDIAN_RESTORE_SEQUENCE_WAITS =>
+            {
+                inside_sequence += 1;
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_snapshot_reopen_total",
+                    "phase" => "restore_inside_sequence",
+                )
+                .increment(1);
+                std::thread::sleep(GUARDIAN_RESTORE_SEQUENCE_WAIT);
+            }
             result => return result,
         }
     }
-    Err(GuardianProxyError::ReplaySnapshotExpired)
 }
 
 /// Blocking raw-output reader that resumes from the exact terminal witness
@@ -12493,6 +12523,160 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One replay snapshot of a Genesis checkpoint followed by the output
+    /// records `payloads`, then its completion.
+    fn genesis_pages_with_output(
+        descriptor: GuardianCheckpointDescriptorV1,
+        checkpoint: Zeroizing<Vec<u8>>,
+        snapshot: u128,
+        payloads: &[&[u8]],
+    ) -> VecDeque<GuardianReplayPageDelivery> {
+        let snapshot_id = id(snapshot);
+        let snapshot_digest = [0x61; 32];
+        let cursor = |page: u32, next_sequence: u64, previous_digest: [u8; 32]| {
+            GuardianReplayCursorV1::new(
+                snapshot_id,
+                snapshot_digest,
+                GuardianReplayPhaseV1::Output,
+                page,
+                0,
+                next_sequence,
+                previous_digest,
+                0,
+                GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+                GUARDIAN_MAX_REPLAY_RECORDS,
+            )
+            .expect("construct Genesis output cursor")
+        };
+        let first = cursor(1, 1, [0; 32]);
+        let checkpoint_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            [0; 32],
+            0,
+            Some(first),
+            GuardianReplayPageBodyDelivery::CheckpointChunk(
+                GuardianCheckpointChunkDelivery::new(descriptor, 0, checkpoint)
+                    .expect("construct Genesis checkpoint delivery"),
+            ),
+        )
+        .expect("construct Genesis checkpoint page");
+        // A journal's committed bytes include its file and record headers.
+        let (mut sequence, mut digest, mut cumulative, mut log_bytes) =
+            (0u64, [0u8; 32], 0u64, 4096u64);
+        let mut deliveries = Vec::new();
+        for payload in payloads {
+            sequence += 1;
+            cumulative += payload.len() as u64;
+            log_bytes += payload.len() as u64 + 256;
+            digest = Sha256::digest(payload).into();
+            let metadata = GuardianReplayRecordMetadataV1::new(
+                id(0x650),
+                1,
+                None,
+                sequence,
+                u32::try_from(payload.len()).unwrap(),
+                cumulative,
+                log_bytes,
+                digest,
+            )
+            .expect("construct Genesis record metadata");
+            deliveries.push(
+                GuardianReplayRecordDelivery::new(metadata, Zeroizing::new(payload.to_vec()))
+                    .expect("construct Genesis record delivery"),
+            );
+        }
+        let records = GuardianReplayOutputRecordsDelivery::new(1, [0; 32], deliveries)
+            .expect("construct Genesis output page body");
+        let second = cursor(2, sequence + 1, digest);
+        let output_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            first.digest(),
+            1,
+            Some(second),
+            GuardianReplayPageBodyDelivery::OutputRecords(records),
+        )
+        .expect("construct Genesis output page");
+        let complete_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            second.digest(),
+            2,
+            None,
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: descriptor.checkpoint_id(),
+                through_sequence: sequence,
+                terminal_record_digest: digest,
+                cumulative_plaintext_bytes: cumulative,
+            },
+        )
+        .expect("construct Genesis completion page");
+        VecDeque::from([checkpoint_page, output_page, complete_page])
+    }
+
+    /// A replay that ends inside an escape sequence (a child part way through
+    /// writing an image) is released and reopened once the rest has arrived,
+    /// instead of failing the restore.
+    #[test]
+    fn restore_reopens_a_replay_that_ends_inside_an_escape_sequence() {
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        let mut pages = genesis_pages_with_output(
+            descriptor,
+            checkpoint.clone(),
+            0x600,
+            &[b"\x1b]0;half a ti"],
+        );
+        pages.extend(genesis_pages_with_output(
+            descriptor,
+            checkpoint,
+            0x601,
+            &[b"\x1b]0;half a ti", b"tle\x07ground"],
+        ));
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages,
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let restored = consume_guardian_replay_for_restore(
+            &mut FakeReplayTransport {
+                state: Arc::clone(&state),
+            },
+            identity(),
+            size(24, 80),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+            None,
+        )
+        .expect("restore once the sequence ends");
+        assert_eq!(restored.boundary.next_sequence, 3);
+        let terminal = restored
+            .inert_terminal
+            .activate(Box::new(std::io::sink()))
+            .expect("activate the restored terminal")
+            .0;
+        assert_eq!(terminal.get_title(), "half a title");
+        let state = state.lock();
+        assert!(state.pages.is_empty());
+        // Both snapshots were released: each completion was acknowledged.
+        assert_eq!(
+            state
+                .acks
+                .iter()
+                .filter(|(_, ack)| ack.release_if_complete())
+                .count(),
+            2
+        );
     }
 
     #[test]
