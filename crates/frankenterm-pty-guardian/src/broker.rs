@@ -10624,9 +10624,21 @@ impl BrokerVerifiedKernelChildV1 {
         if terminal_status.is_none() {
             let (rechecked_boot_id, rechecked_start_ticks, rechecked_state) =
                 linux_process_birth_identity(process_id)?;
-            if rechecked_boot_id != boot_id
-                || rechecked_start_ticks != start_ticks
-                || matches!(rechecked_state, b'Z' | b'X' | b'x')
+            if rechecked_boot_id != boot_id || rechecked_start_ticks != start_ticks {
+                return Err(BrokerChildIncarnationError::InvalidIdentity);
+            }
+            // A child that exited after try_wait looked is a zombie of this
+            // same incarnation (its pid cannot be reused before this owner
+            // reaps it): reap it as if try_wait had seen it exit. Refusing it
+            // failed the spawn of any command that exits at once.
+            if matches!(rechecked_state, b'Z' | b'X' | b'x')
+                && child
+                    .try_wait()
+                    .map_err(|source| BrokerChildIncarnationError::Io {
+                        site: "post-recheck-child-status",
+                        source,
+                    })?
+                    .is_none()
             {
                 return Err(BrokerChildIncarnationError::InvalidIdentity);
             }
@@ -10680,9 +10692,19 @@ impl BrokerVerifiedKernelChildV1 {
                     site: "post-start-token-child-status",
                     source,
                 })?;
+        // A child that exited after try_wait looked no longer reads as
+        // running, but its pid cannot be reused before this owner reaps it:
+        // reap it as if try_wait had seen it exit.
         if terminal_status.is_none()
             && LocalProcessInfo::observe_process_start_time(process_id)
                 != ProcessStartTimeObservation::Running(start_token)
+            && child
+                .try_wait()
+                .map_err(|source| BrokerChildIncarnationError::Io {
+                    site: "post-recheck-child-status",
+                    source,
+                })?
+                .is_none()
         {
             return Err(BrokerChildIncarnationError::InvalidIdentity);
         }
