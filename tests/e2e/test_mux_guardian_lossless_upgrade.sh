@@ -170,7 +170,13 @@ check_other_panes() {
   for id in $(pane_ids "$2"); do
     text=$(ft_text "$2" "$id")
     tag=$(echo "$text" | grep -o "$MARK p[0-9]* tick" | head -1 | awk '{print $2}')
-    [ -n "$tag" ] || continue
+    if [ -z "$tag" ]; then
+      # Pane 0 ticks untagged (check_history reads it); any other pane
+      # without a tick row lost its history or could not be read.
+      echo "$text" | grep -q "$MARK tick" && continue
+      fail "pane $id shows no tick rows after $1 (get-text: $(echo "$text" | head -c 240))"
+      continue
+    fi
     t=$(echo "$text" | grep -o "$MARK $tag tick [0-9]*" | awk '{print $4}' | sort -n)
     n=$(echo "$t" | grep -c .); last=$(echo "$t" | tail -1); dups=$(echo "$t" | uniq -d | grep -c .)
     if [ "$(echo "$t" | head -1)" = 0 ] && [ "$n" = $((last + 1)) ] && [ "$dups" = 0 ]; then
