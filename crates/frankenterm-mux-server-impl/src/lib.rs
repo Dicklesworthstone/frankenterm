@@ -14111,6 +14111,39 @@ fn serialize_image_semantic_scrollback_line_into(
 }
 
 /// Attach schema 4's images to the cells of its decoded row.
+/// Live images decoded rows may share, by content hash: at most this many.
+const ROW_IMAGE_INTERN_ENTRIES: usize = 64;
+
+std::thread_local! {
+    static ROW_IMAGE_INTERN: std::cell::RefCell<Vec<([u8; 32], std::sync::Weak<termwiz::image::ImageData>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Each durable row of a picture holds its own copy (ft-nyofz), so a picture
+/// across 16 rows decoded into 16 allocations, held as long as the rows were.
+/// Rows decoded on one thread share one object per content hash while any of
+/// them holds it, as a live picture's cells share one.
+fn intern_row_image(image: termwiz::image::ImageData) -> Arc<termwiz::image::ImageData> {
+    let hash = image.hash();
+    ROW_IMAGE_INTERN.with(|table| {
+        let mut table = table.borrow_mut();
+        table.retain(|(_, live)| live.strong_count() > 0);
+        if let Some(shared) = table
+            .iter()
+            .find(|(known, _)| *known == hash)
+            .and_then(|(_, live)| live.upgrade())
+        {
+            return shared;
+        }
+        let shared = Arc::new(image);
+        if table.len() >= ROW_IMAGE_INTERN_ENTRIES {
+            table.remove(0);
+        }
+        table.push((hash, Arc::downgrade(&shared)));
+        shared
+    })
+}
+
 fn attach_exact_scrollback_row_images(
     line: &mut wezterm_term::Line,
     sidecar: ExactScrollbackRowImagesV1,
@@ -14120,7 +14153,7 @@ fn attach_exact_scrollback_row_images(
         "an image scrollback row shows its images only through its layers"
     );
     let images: Vec<Arc<termwiz::image::ImageData>> =
-        sidecar.images.into_iter().map(Arc::new).collect();
+        sidecar.images.into_iter().map(intern_row_image).collect();
     let mut named = vec![false; images.len()];
     let cells = line.cells_mut();
     let mut layers = sidecar.layers.into_iter().peekable();
@@ -23584,6 +23617,20 @@ mod tests {
         .unwrap();
         assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
         assert_eq!(assert_same_row_images(&line, &decoded), 1);
+        // Another row of the same picture, decoded while this one lives,
+        // shares its image object rather than holding a second copy.
+        let (again, _, _) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext.clone()),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        let first_image = |line: &Line| {
+            line.visible_cells()
+                .find_map(|cell| cell.attrs().images())
+                .and_then(|images| images.first().map(|image| Arc::clone(image.image_data())))
+                .expect("an image cell")
+        };
+        assert!(Arc::ptr_eq(&first_image(&decoded), &first_image(&again)));
 
         // A row without images seals as before, whatever the switch says.
         for line in clustered_test_rows() {
