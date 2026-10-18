@@ -2574,6 +2574,23 @@ impl GuardianClient {
         .is_ok()
     }
 
+    /// Whether the guardian at `socket_path` validates terminal checkpoints
+    /// holding graphics state, probed as `admits_compact_checkpoints` probes
+    /// version 4. Every failure reads as no, and the mux keeps refusing to
+    /// checkpoint a pane that shows an image.
+    pub fn admits_graphics_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_graphics_checkpoints().to_vec(),
+        )
+        .is_ok()
+    }
+
     /// Authenticate the build compiled into this mux for Genesis staging.
     /// This does not reserve or start a child.
     pub fn connect_for_genesis(
@@ -6370,8 +6387,7 @@ mod tests {
             .prefix("ft-compact-probe-")
             .tempdir_in(crate::canonical_test_temp_root())
             .unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let token = directory.path().join("token");
         let socket = directory.path().join("guardian.sock");
         provision_guardian_token(&token).unwrap();
@@ -6398,8 +6414,10 @@ mod tests {
             });
             ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
             let compact = GuardianClient::admits_compact_checkpoints(&socket, &token);
+            let graphics = GuardianClient::admits_graphics_checkpoints(&socket, &token);
             let sealed = GuardianClient::connect_for_genesis(&socket, &token, Uuid::new_v4());
             assert_eq!(compact, sealed.is_ok());
+            assert_eq!(graphics, sealed.is_ok());
             drop(sealed);
             GuardianClient::connect(&socket, &token, Uuid::new_v4())
                 .expect("the guardian still serves an ordinary connection");

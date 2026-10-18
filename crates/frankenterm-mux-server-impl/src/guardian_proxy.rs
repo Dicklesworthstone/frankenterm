@@ -158,6 +158,22 @@ pub fn guardian_admits_compact_checkpoints(socket: &Path, token: &Path) -> bool 
     admitted
 }
 
+/// Whether the guardian at `socket` validates terminal checkpoints holding
+/// graphics state, for `Mux::set_guardian_graphics_checkpoints`; a probe like
+/// `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_graphics_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_graphics_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "graphics state held (images, Kitty state)"
+        } else {
+            "no graphics state (the guardian, or this build, predates it); a pane showing an image refuses capture"
+        }
+    );
+    admitted
+}
+
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
 /// transaction; an unadopted birth fences further spawning in this domain.

@@ -2972,6 +2972,8 @@ pub(crate) struct ScreenCheckpointLimits {
     pub max_cols: usize,
     pub max_visible_grid_cells: usize,
     pub max_retained_capture_bytes: usize,
+    /// Whether a line may show images: the capture holds graphics state.
+    pub allow_images: bool,
     pub estimated_bytes_per_line: usize,
     pub estimated_bytes_per_cell: usize,
 }
@@ -4173,7 +4175,7 @@ fn inspect_checkpoint_line(
     limits: &ScreenCheckpointLimits,
     usage: &mut ScreenCheckpointUsage,
 ) -> Result<(), ScreenCheckpointCaptureError> {
-    if line.has_image_attachments() {
+    if !limits.allow_images && line.has_image_attachments() {
         return Err(ScreenCheckpointCaptureError::UnsupportedGraphicsState);
     }
     accumulate_checkpoint_usage(&mut usage.lines, 1, limits.max_total_lines, "screen_lines")?;
@@ -5981,6 +5983,14 @@ impl Screen {
             inspect_checkpoint_line(line, limits, usage)?;
         }
         Ok(())
+    }
+
+    /// The resident lines that show an image.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn lines_with_images(&self) -> impl Iterator<Item = &Line> {
+        self.lines
+            .iter()
+            .filter(|line| line.has_image_attachments())
     }
 
     #[cfg(feature = "use_serde")]

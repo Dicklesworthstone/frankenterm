@@ -788,6 +788,24 @@ impl std::fmt::Debug for InertTerminal {
 }
 
 #[cfg(feature = "use_serde")]
+/// Whether applying `image` would read its data from a file or shared
+/// memory rather than from the output itself.
+fn kitty_image_reads_outside_journal(image: &frankenterm_escape_parser::apc::KittyImage) -> bool {
+    use frankenterm_escape_parser::apc::{KittyImage, KittyImageData};
+    match image {
+        KittyImage::TransmitData { transmit, .. }
+        | KittyImage::TransmitDataAndDisplay { transmit, .. }
+        | KittyImage::Query { transmit }
+        | KittyImage::TransmitFrame { transmit, .. } => !matches!(
+            transmit.data,
+            KittyImageData::Direct(_) | KittyImageData::DirectBin(_)
+        ),
+        KittyImage::Display { .. }
+        | KittyImage::Delete { .. }
+        | KittyImage::ComposeFrame { .. } => false,
+    }
+}
+
 impl InertTerminal {
     pub(crate) fn from_restored_state(
         state: TerminalState,
@@ -957,13 +975,22 @@ impl InertTerminal {
             });
         }
 
+        // Image output replays only under the graphics configuration the
+        // live terminal applied it with (a checkpoint holding graphics
+        // state), and never from a file or shared memory: restore reads
+        // nothing but the journal.
+        let graphics = self.replay_projection.admits_graphics();
         let unsupported = actions.iter().any(|action| match action {
-            Action::Sixel(_) | Action::KittyImage(_) => true,
-            Action::OperatingSystemCommand(command) => matches!(
-                command.as_ref(),
-                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
-                    if file.inline
-            ),
+            Action::Sixel(_) => !graphics,
+            Action::KittyImage(image) => !graphics || kitty_image_reads_outside_journal(image),
+            Action::OperatingSystemCommand(command) => {
+                !graphics
+                    && matches!(
+                        command.as_ref(),
+                        OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
+                            if file.inline
+                    )
+            }
             _ => false,
         });
         if unsupported {

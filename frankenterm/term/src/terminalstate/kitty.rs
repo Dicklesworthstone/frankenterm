@@ -139,6 +139,12 @@ impl KittyImageState {
         self.used_memory = 1;
     }
 
+    /// The images stored by id, in no order.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn stored_images(&self) -> impl Iterator<Item = &Arc<ImageData>> {
+        self.id_to_data.values()
+    }
+
     /// Whether a chunked transmission has chunks but not yet its last.
     #[cfg(feature = "use_serde")]
     pub(crate) fn transmission_in_flight(&self) -> bool {

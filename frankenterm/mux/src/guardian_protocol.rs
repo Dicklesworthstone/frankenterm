@@ -108,8 +108,10 @@ const HELLO_BUILD_IDENTITY_PAYLOAD_BYTES: usize = 40;
 // A guardian refuses a bit it does not know; the first decoder refused all.
 const HELLO_REQUIRES_SUCCESSOR_ROTATION: u8 = 1;
 const HELLO_REQUIRES_COMPACT_CHECKPOINTS: u8 = 2;
-const HELLO_KNOWN_REQUIREMENTS: u8 =
-    HELLO_REQUIRES_SUCCESSOR_ROTATION | HELLO_REQUIRES_COMPACT_CHECKPOINTS;
+const HELLO_REQUIRES_GRAPHICS_CHECKPOINTS: u8 = 4;
+const HELLO_KNOWN_REQUIREMENTS: u8 = HELLO_REQUIRES_SUCCESSOR_ROTATION
+    | HELLO_REQUIRES_COMPACT_CHECKPOINTS
+    | HELLO_REQUIRES_GRAPHICS_CHECKPOINTS;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
 const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;
@@ -1206,6 +1208,17 @@ impl GuardianHelloBuildIdentityV1 {
     pub fn encode_requiring_compact_checkpoints(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
         let mut payload = self.encode();
         payload[5] |= HELLO_REQUIRES_COMPACT_CHECKPOINTS;
+        payload
+    }
+
+    /// Require that the guardian validate terminal checkpoints holding
+    /// graphics state (images in cells, Kitty state). A guardian predating
+    /// them rejects this reserved bit, so an accepted Hello is the mux's
+    /// only evidence that it may publish them.
+    #[must_use]
+    pub fn encode_requiring_graphics_checkpoints(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_GRAPHICS_CHECKPOINTS;
         payload
     }
 
@@ -13898,8 +13911,28 @@ mod tests {
         let mut both = hello.encode_requiring_successor_rotation();
         both[5] |= compact[5];
         assert!(GuardianHelloBuildIdentityV1::decode(&both).is_ok());
-        both[5] |= 4;
+        both[5] |= 8;
         assert!(GuardianHelloBuildIdentityV1::decode(&both).is_err());
+    }
+
+    #[test]
+    fn graphics_checkpoints_are_an_explicit_hello_requirement() {
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x53)),
+        );
+        let ordinary = hello.encode();
+        let graphics = hello.encode_requiring_graphics_checkpoints();
+        assert_eq!(graphics[5], 4);
+        assert_eq!(graphics[..5], ordinary[..5]);
+        assert_eq!(graphics[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&graphics).is_ok());
+        // Guardians predating graphics checkpoints knew bits 1 and 2 only.
+        assert_ne!(graphics[5] & !3, 0);
+        let mut all = hello.encode_requiring_successor_rotation();
+        all[5] |= hello.encode_requiring_compact_checkpoints()[5] | graphics[5];
+        assert!(GuardianHelloBuildIdentityV1::decode(&all).is_ok());
+        all[5] |= 8;
+        assert!(GuardianHelloBuildIdentityV1::decode(&all).is_err());
     }
 
     #[test]
@@ -13915,7 +13948,7 @@ mod tests {
         // Hello remains byte-for-byte unchanged; requiring the extension cannot
         // be mistaken for an ordinary connection by a historical guardian.
         assert!(extended[5..8].iter().any(|byte| *byte != 0));
-        extended[5] = 4;
+        extended[5] = 8;
         assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_err());
         for generation in [1, 2, 3, u64::MAX] {
             for delta in [-1_isize, 0, 1] {
