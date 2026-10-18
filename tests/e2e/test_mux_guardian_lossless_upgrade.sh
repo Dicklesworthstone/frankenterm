@@ -113,7 +113,10 @@ images() {  # -> shell commands showing and storing the images
   echo "printf '\\033]1337;File=inline=1:%s\\007\\n' $PNG; "
   echo "printf '\\033_Ga=T,f=32,s=2,v=2,i=31,q=2;%s\\033\\\\\\n' $RGBA; "
   echo "printf '\\033_Ga=t,f=32,s=2,v=2,i=32,q=2;%s\\033\\\\' $RGBA; "
-  [ "$SCROLL" -gt 0 ] && echo "printf '\\033]1337;File=inline=1:'; cat '$HOME/scroll-image.b64'; printf '\\007\\n'; j=0; while [ \$j -lt $SCROLL ]; do echo scroll \$j; j=\$((j+1)); done; "
+  # After the pane's birth, as a shell's first output comes: the guardian
+  # journals a pane's output a synced record at a time (ft-2pgul), so a
+  # birth replaying the half-megabyte image waited for it 15-20 s on a Mac.
+  [ "$SCROLL" -gt 0 ] && echo "sleep 3; printf '\\033]1337;File=inline=1:'; cat '$HOME/scroll-image.b64'; printf '\\007\\n'; j=0; while [ \$j -lt $SCROLL ]; do echo scroll \$j; j=\$((j+1)); done; "
 }
 PROTECTED=${E2E_PROTECTED:-0}
 prog() {  # <pane index> -> its shell program
