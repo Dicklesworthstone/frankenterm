@@ -23868,7 +23868,19 @@ mod tests {
 
         // Models PTY spawn or mio registration failure after preparation:
         // the exact empty publication is reopened rather than create_new'd.
-        let retry = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        // A child another test forks before its exec briefly holds a copy of
+        // the dropped journal's descriptor, and with it the writer lease.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let retry = loop {
+            match pipeline.prepare_pane(guardian_incarnation, pane_id) {
+                Err(GuardianOutputError::Journal(
+                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(_),
+                )) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => break other?,
+            }
+        };
         {
             let authority = retry
                 .authority
