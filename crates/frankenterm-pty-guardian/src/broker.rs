@@ -33301,14 +33301,25 @@ mod tests {
             secret_lease_generation: 1,
         };
         let encoded = binding.encode();
+        // Each inspection takes the catalog lock. A child another test forks
+        // meanwhile can briefly hold the previous inspection's descriptor
+        // (see reopen_test_catalog_after_owner_drop): wait that out.
         let inspect = |bytes: &[u8], context: &GuardianSpawnCustodyContextV1| {
-            inspect_historical_genesis_binding(
-                &catalog,
-                &token,
-                identity.journal_id,
-                bytes,
-                context,
-            )
+            for attempt in 0..100 {
+                match inspect_historical_genesis_binding(
+                    &catalog,
+                    &token,
+                    identity.journal_id,
+                    bytes,
+                    context,
+                ) {
+                    Err(BrokerSpawnWalError::CatalogAlreadyOwned) if attempt < 99 => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("the bounded inspection loop always returns")
         };
         inspect(&encoded, &custody).unwrap();
         for offset in [16, 48, 72, 172, 176, 208, 240] {
