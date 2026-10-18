@@ -2411,6 +2411,13 @@ impl ImageData {
         Self::with_data_and_hash(decoded, hash)
     }
 
+    /// Rebuild an image from a checkpoint: `data` as it was captured and the
+    /// stable identity [`Self::hash`] it was created with, which a Kitty edit
+    /// keeps while the content changes.
+    pub fn with_data_and_identity(data: ImageDataType, hash: [u8; 32]) -> Self {
+        Self::with_data_and_hash(data, hash)
+    }
+
     fn with_data_and_hash(data: ImageDataType, hash: [u8; 32]) -> Self {
         let current_revision = data.compute_hash();
         Self {

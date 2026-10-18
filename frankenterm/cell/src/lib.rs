@@ -933,6 +933,18 @@ impl CellAttributes {
         self
     }
 
+    /// Replace the cell's images with `images`, kept in the order given,
+    /// which the caller keeps in z-index order as `attach_image` does: how a
+    /// checkpoint restores a list exactly, equal z-indexes included.
+    pub fn set_images(&mut self, images: Vec<Box<ImageCell>>) -> &mut Self {
+        if images.is_empty() {
+            return self.clear_images();
+        }
+        self.allocate_fat_attributes();
+        self.fat.as_mut().unwrap().image = images;
+        self
+    }
+
     /// Clear all images from a cell
     pub fn clear_images(&mut self) -> &mut Self {
         if let Some(fat) = self.fat.as_mut() {

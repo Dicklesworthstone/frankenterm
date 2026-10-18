@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::color::{ColorAttribute, SrgbaTuple};
+use frankenterm_cell::image::{ImageCell, ImageDataType, TextureCoordinate};
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
+use ordered_float::NotNan;
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1147,6 +1149,656 @@ impl CheckpointHyperlink {
     }
 }
 
+/// A capture writes an image's bytes as base64 strings of this many bytes
+/// (65536 characters) each, the last holding the rest: far under the
+/// decoder's per-string limit, whatever the image's size.
+const CHECKPOINT_IMAGE_CHUNK_BYTES: usize = 48 * 1024;
+
+/// Image bytes in canonical JSON, `CHECKPOINT_IMAGE_CHUNK_BYTES` to a base64
+/// string. Decoding admits any chunking; re-encoding the decoded checkpoint
+/// then refuses every one but this.
+mod checkpoint_image_bytes {
+    use super::CHECKPOINT_IMAGE_CHUNK_BYTES;
+    use base64::Engine as _;
+    use serde::ser::SerializeSeq;
+
+    const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let chunks = bytes.chunks(CHECKPOINT_IMAGE_CHUNK_BYTES);
+        let mut sequence = serializer.serialize_seq(Some(chunks.len()))?;
+        let mut text = String::new();
+        for chunk in chunks {
+            text.clear();
+            BASE64.encode_string(chunk, &mut text);
+            sequence.serialize_element(&text)?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Chunks;
+
+        impl<'de> serde::de::Visitor<'de> for Chunks {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("base64 strings of image bytes")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut chunks: A,
+            ) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = chunks.next_element::<String>()? {
+                    BASE64
+                        .decode_vec(chunk.as_bytes(), &mut bytes)
+                        .map_err(serde::de::Error::custom)?;
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_seq(Chunks)
+    }
+}
+
+/// One image a cell shows: a region of an entry of the checkpoint's image
+/// table, as `ImageCell` holds it, its texture coordinates as f32 bits.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImageCell {
+    image: u32,
+    top_left: (u32, u32),
+    bottom_right: (u32, u32),
+    z_index: i32,
+    padding: (u16, u16, u16, u16),
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+}
+
+impl CheckpointImageCell {
+    fn capture(cell: &ImageCell, image: u32) -> Self {
+        let bits = |coordinate: TextureCoordinate| {
+            (
+                coordinate.x.into_inner().to_bits(),
+                coordinate.y.into_inner().to_bits(),
+            )
+        };
+        Self {
+            image,
+            top_left: bits(cell.top_left()),
+            bottom_right: bits(cell.bottom_right()),
+            z_index: cell.z_index(),
+            padding: cell.padding(),
+            image_id: cell.image_id(),
+            placement_id: cell.placement_id(),
+        }
+    }
+
+    fn coordinate((x, y): (u32, u32)) -> Result<TextureCoordinate, TerminalCheckpointError> {
+        let number = |bits| {
+            NotNan::new(f32::from_bits(bits)).map_err(|_| TerminalCheckpointError::InvalidField {
+                field: "image_cell.texture",
+                reason: "texture coordinates must be numbers",
+            })
+        };
+        Ok(TextureCoordinate::new(number(x)?, number(y)?))
+    }
+
+    fn validate(&self, images: usize) -> Result<(), TerminalCheckpointError> {
+        if self.image as usize >= images {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "image_cell.image",
+                reason: "an image cell must name an entry of the image table",
+            });
+        }
+        Self::coordinate(self.top_left)?;
+        Self::coordinate(self.bottom_right)?;
+        Ok(())
+    }
+
+    fn into_live(self, images: &[Arc<ImageData>]) -> Result<ImageCell, TerminalCheckpointError> {
+        let data = images
+            .get(self.image as usize)
+            .ok_or(TerminalCheckpointError::InvalidField {
+                field: "image_cell.image",
+                reason: "an image cell must name an entry of the image table",
+            })?;
+        let (left, top, right, bottom) = self.padding;
+        Ok(ImageCell::with_z_index(
+            Self::coordinate(self.top_left)?,
+            Self::coordinate(self.bottom_right)?,
+            Arc::clone(data),
+            self.z_index,
+            left,
+            top,
+            right,
+            bottom,
+            self.image_id,
+            self.placement_id,
+        ))
+    }
+}
+
+/// An entry of a checkpoint's image table: one image object's content as
+/// `ImageDataType` holds it, and the stable identity it was created with
+/// (`ImageData::hash`, lowercase hex), which a Kitty edit keeps while the
+/// content changes. Embedded pixel hashes are derived again on restore.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImage {
+    identity: String,
+    data: CheckpointImageData,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum CheckpointImageData {
+    /// An image file's bytes: `EncodedFile`, or the blob of `EncodedLease`,
+    /// which restores as `EncodedFile` with the same content and identity.
+    Encoded {
+        #[serde(with = "checkpoint_image_bytes")]
+        bytes: Vec<u8>,
+    },
+    Rgba8 {
+        width: u32,
+        height: u32,
+        #[serde(with = "checkpoint_image_bytes")]
+        bytes: Vec<u8>,
+    },
+    Animation {
+        width: u32,
+        height: u32,
+        frames: Vec<CheckpointImageFrame>,
+    },
+}
+
+/// An animation frame: how long it shows (seconds, nanoseconds) and its
+/// RGBA bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImageFrame {
+    duration: (u64, u32),
+    #[serde(with = "checkpoint_image_bytes")]
+    bytes: Vec<u8>,
+}
+
+/// The bytes of a `width` by `height` RGBA frame; `None` for no pixels,
+/// which a decoded image never has (`ImageDataType::new_single_frame`).
+fn rgba_bytes(width: u32, height: u32) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    usize::try_from(u128::from(width) * u128::from(height) * 4).ok()
+}
+
+impl CheckpointImage {
+    /// Copy a pinned image's content, outside the terminal lock: refused if
+    /// an edit has changed it since it was pinned.
+    fn capture(pinned: &PinnedImage) -> Result<Self, TerminalCheckpointError> {
+        fn copy(bytes: &[u8]) -> Result<Vec<u8>, TerminalCheckpointError> {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+            copied.extend_from_slice(bytes);
+            Ok(copied)
+        }
+        let content = pinned
+            .data
+            .data_for_content_revision(pinned.revision)
+            .ok_or(TerminalCheckpointError::StaleGraphicsGeneration)?;
+        let data = match &*content {
+            ImageDataType::EncodedFile(bytes) => CheckpointImageData::Encoded {
+                bytes: copy(bytes)?,
+            },
+            ImageDataType::EncodedLease(lease) => CheckpointImageData::Encoded {
+                bytes: lease
+                    .get_data()
+                    .map_err(|_| TerminalCheckpointError::InvalidField {
+                        field: "images",
+                        reason: "an image's stored blob could not be read",
+                    })?,
+            },
+            ImageDataType::Rgba8 {
+                data,
+                width,
+                height,
+                ..
+            } => CheckpointImageData::Rgba8 {
+                width: *width,
+                height: *height,
+                bytes: copy(data)?,
+            },
+            ImageDataType::AnimRgba8 {
+                width,
+                height,
+                durations,
+                frames,
+                ..
+            } => {
+                if durations.len() != frames.len() {
+                    return Err(TerminalCheckpointError::InvalidField {
+                        field: "images",
+                        reason: "an animation needs one duration per frame",
+                    });
+                }
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(frames.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                for (duration, frame) in durations.iter().zip(frames) {
+                    captured.push(CheckpointImageFrame {
+                        duration: (duration.as_secs(), duration.subsec_nanos()),
+                        bytes: copy(frame)?,
+                    });
+                }
+                CheckpointImageData::Animation {
+                    width: *width,
+                    height: *height,
+                    frames: captured,
+                }
+            }
+        };
+        Ok(Self {
+            identity: hex::encode(pinned.data.hash()),
+            data,
+        })
+    }
+
+    /// The bytes it holds.
+    fn bytes(&self) -> usize {
+        match &self.data {
+            CheckpointImageData::Encoded { bytes } | CheckpointImageData::Rgba8 { bytes, .. } => {
+                bytes.len()
+            }
+            CheckpointImageData::Animation { frames, .. } => {
+                frames.iter().map(|frame| frame.bytes.len()).sum()
+            }
+        }
+    }
+
+    fn identity(&self) -> Result<[u8; 32], TerminalCheckpointError> {
+        let invalid = || TerminalCheckpointError::InvalidField {
+            field: "image.identity",
+            reason: "an image identity is 32 bytes in lowercase hex",
+        };
+        let mut identity = [0u8; 32];
+        hex::decode_to_slice(&self.identity, &mut identity).map_err(|_| invalid())?;
+        if hex::encode(identity) != self.identity {
+            return Err(invalid());
+        }
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), TerminalCheckpointError> {
+        self.identity()?;
+        let geometry = TerminalCheckpointError::InvalidField {
+            field: "image.bytes",
+            reason: "decoded image bytes must be width times height RGBA pixels",
+        };
+        match &self.data {
+            CheckpointImageData::Encoded { .. } => {}
+            CheckpointImageData::Rgba8 {
+                width,
+                height,
+                bytes,
+            } => {
+                if rgba_bytes(*width, *height) != Some(bytes.len()) {
+                    return Err(geometry);
+                }
+            }
+            CheckpointImageData::Animation {
+                width,
+                height,
+                frames,
+            } => {
+                if frames.is_empty() || frames.len() > frankenterm_cell::image::MAX_IMAGE_WIRE_FRAMES
+                {
+                    return Err(TerminalCheckpointError::InvalidField {
+                        field: "image.frames",
+                        reason: "an animation holds between one frame and the wire limit",
+                    });
+                }
+                for frame in frames {
+                    if rgba_bytes(*width, *height) != Some(frame.bytes.len()) {
+                        return Err(geometry);
+                    }
+                    if frame.duration.1 >= 1_000_000_000 {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "image.frames.duration",
+                            reason: "a frame duration's nanoseconds are under one second",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_live(self) -> Result<Arc<ImageData>, TerminalCheckpointError> {
+        let identity = self.identity()?;
+        let data = match self.data {
+            CheckpointImageData::Encoded { bytes } => ImageDataType::EncodedFile(bytes),
+            CheckpointImageData::Rgba8 {
+                width,
+                height,
+                bytes,
+            } => ImageDataType::new_single_frame(width, height, bytes),
+            CheckpointImageData::Animation {
+                width,
+                height,
+                frames,
+            } => {
+                let mut durations = Vec::new();
+                let mut hashes = Vec::new();
+                let mut bytes = Vec::new();
+                for reserved in [
+                    durations.try_reserve_exact(frames.len()),
+                    hashes.try_reserve_exact(frames.len()),
+                    bytes.try_reserve_exact(frames.len()),
+                ] {
+                    reserved.map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                }
+                for frame in frames {
+                    durations.push(std::time::Duration::new(frame.duration.0, frame.duration.1));
+                    hashes.push(ImageDataType::hash_bytes(&frame.bytes));
+                    bytes.push(frame.bytes);
+                }
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    durations,
+                    frames: bytes,
+                    hashes,
+                }
+            }
+        };
+        Ok(Arc::new(ImageData::with_data_and_identity(data, identity)))
+    }
+}
+
+/// An image object a capture names, and the content revision it had when
+/// pinned: under the terminal lock for a live object, which a Kitty edit
+/// may change once the lock is released.
+struct PinnedImage {
+    data: Arc<ImageData>,
+    revision: [u8; 32],
+}
+
+/// The images a capture's cells and Kitty state name, one entry per image
+/// object, numbered as they enter. A live object stays one object however
+/// many cells and Kitty ids hold it: an edit through any of them changes it
+/// for all. Rows read back from cold storage hold copies no edit reaches,
+/// so equal copies share an entry.
+#[derive(Default)]
+struct CheckpointImageRegistry {
+    images: Vec<PinnedImage>,
+    live: HashMap<usize, u32>,
+    copies: HashMap<([u8; 32], [u8; 32]), u32>,
+}
+
+impl CheckpointImageRegistry {
+    fn push(
+        &mut self,
+        data: &Arc<ImageData>,
+        revision: [u8; 32],
+    ) -> Result<u32, TerminalCheckpointError> {
+        let index = u32::try_from(self.images.len())
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("images"))?;
+        self.images
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.images.push(PinnedImage {
+            data: Arc::clone(data),
+            revision,
+        });
+        Ok(index)
+    }
+
+    /// The entry of a live object, pinned at its current revision; called
+    /// under the terminal lock.
+    fn pin(&mut self, data: &Arc<ImageData>) -> Result<u32, TerminalCheckpointError> {
+        let key = Arc::as_ptr(data) as usize;
+        if let Some(index) = self.live.get(&key) {
+            return Ok(*index);
+        }
+        let index = self.push(data, data.current_content_hash())?;
+        self.live
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.live.insert(key, index);
+        Ok(index)
+    }
+
+    /// Pin every image the lines' cells show; called under the terminal lock.
+    fn pin_lines(&mut self, lines: &[Line]) -> Result<(), TerminalCheckpointError> {
+        for line in lines.iter().filter(|line| line.has_image_attachments()) {
+            for cell in line.visible_cells() {
+                for image in cell.attrs().images().into_iter().flatten() {
+                    self.pin(image.image_data())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The entry of an image a captured cell shows: a live object's from
+    /// its pin, which an image no lock pinned does not have; a copy's
+    /// (`copy`, a row read back from cold storage) from its content.
+    fn entry(&mut self, data: &Arc<ImageData>, copy: bool) -> Result<u32, TerminalCheckpointError> {
+        if !copy {
+            return self
+                .live
+                .get(&(Arc::as_ptr(data) as usize))
+                .copied()
+                .ok_or(TerminalCheckpointError::StaleGraphicsGeneration);
+        }
+        let revision = data.current_content_hash();
+        let key = (data.hash(), revision);
+        if let Some(index) = self.copies.get(&key) {
+            return Ok(*index);
+        }
+        let index = self.push(data, revision)?;
+        self.copies
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.copies.insert(key, index);
+        Ok(index)
+    }
+
+    /// The bytes and count of the images pinned, for replay's resource check.
+    fn usage(&self) -> (usize, usize) {
+        let bytes = self
+            .images
+            .iter()
+            .fold(0usize, |total, image| total.saturating_add(image.data.len()));
+        (self.images.len(), bytes)
+    }
+}
+
+/// Kitty graphics state outside the cells: stored images by id (entries of
+/// the image table), image numbers with the ids they name, and placements,
+/// each in ascending key order. A chunked transmission without its last
+/// chunk refuses capture instead.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointKittyState {
+    images: Vec<(u32, u32)>,
+    numbers: Vec<(u32, u32)>,
+    placements: Vec<CheckpointKittyPlacement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointKittyPlacement {
+    image_id: u32,
+    placement_id: Option<u32>,
+    first_row: i64,
+    rows: u64,
+    cols: u64,
+}
+
+impl CheckpointKittyState {
+    /// `None` for a state holding nothing; its images are pinned.
+    fn capture(
+        parts: &KittyCheckpointParts,
+        registry: &mut CheckpointImageRegistry,
+    ) -> Result<Option<Self>, TerminalCheckpointError> {
+        if parts.images.is_empty() && parts.numbers.is_empty() && parts.placements.is_empty() {
+            return Ok(None);
+        }
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(parts.images.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.images"))?;
+        for (id, data) in &parts.images {
+            images.push((*id, registry.pin(data)?));
+        }
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(parts.placements.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.placements"))?;
+        for ((image_id, placement_id), info) in &parts.placements {
+            placements.push(CheckpointKittyPlacement {
+                image_id: *image_id,
+                placement_id: *placement_id,
+                first_row: i64::try_from(info.first_row)
+                    .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("kitty.placements"))?,
+                rows: u64_from_usize(info.rows, "kitty.placements.rows")?,
+                cols: u64_from_usize(info.cols, "kitty.placements.cols")?,
+            });
+        }
+        Ok(Some(Self {
+            images,
+            numbers: parts.numbers.clone(),
+            placements,
+        }))
+    }
+
+    fn validate(
+        &self,
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<(), TerminalCheckpointError> {
+        fn ascending<K: Ord>(keys: impl Iterator<Item = K>) -> bool {
+            let mut previous = None;
+            keys.into_iter().all(|key| {
+                let ascends = previous.as_ref().is_none_or(|previous| *previous < key);
+                previous = Some(key);
+                ascends
+            })
+        }
+        if self.images.is_empty() && self.numbers.is_empty() && self.placements.is_empty() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty",
+                reason: "a Kitty state holding nothing is absent",
+            });
+        }
+        ensure_limit("kitty_images", self.images.len(), limits.max_images)?;
+        ensure_limit(
+            "kitty_image_numbers",
+            self.numbers.len(),
+            MAX_KITTY_NUMBER_TO_ID_ENTRIES,
+        )?;
+        ensure_limit(
+            "kitty_placements",
+            self.placements.len(),
+            limits.max_total_cell_records,
+        )?;
+        if !ascending(self.images.iter().map(|(id, _)| *id))
+            || !ascending(self.numbers.iter().map(|(number, _)| *number))
+            || !ascending(
+                self.placements
+                    .iter()
+                    .map(|placement| (placement.image_id, placement.placement_id)),
+            )
+        {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty",
+                reason: "Kitty images, numbers and placements are in ascending key order",
+            });
+        }
+        if !self.numbers.iter().all(|(_, id)| {
+            self.images
+                .binary_search_by_key(id, |(image, _)| *image)
+                .is_ok()
+        }) {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty.numbers",
+                reason: "an image number names a stored image",
+            });
+        }
+        for placement in &self.placements {
+            StableRowIndex::try_from(placement.first_row)
+                .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("kitty.placements"))?;
+            usize_from_u64(placement.rows, "kitty.placements.rows")?;
+            usize_from_u64(placement.cols, "kitty.placements.cols")?;
+        }
+        let records = self.images.len() + self.numbers.len() + self.placements.len();
+        let bytes = records
+            .checked_mul(64)
+            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                "retained_capture_bytes",
+            ))?;
+        checked_accumulate(
+            &mut usage.retained_capture_bytes,
+            bytes,
+            limits.max_retained_capture_bytes,
+            "retained_capture_bytes",
+        )
+    }
+
+    fn into_parts(
+        self,
+        max_image_id: u32,
+        images: &[Arc<ImageData>],
+    ) -> Result<KittyCheckpointParts, TerminalCheckpointError> {
+        let mut stored = Vec::new();
+        stored
+            .try_reserve_exact(self.images.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.images"))?;
+        for (id, image) in self.images {
+            let data = images
+                .get(image as usize)
+                .ok_or(TerminalCheckpointError::InvalidField {
+                    field: "kitty.images",
+                    reason: "a stored Kitty image must name an entry of the image table",
+                })?;
+            stored.push((id, Arc::clone(data)));
+        }
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(self.placements.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.placements"))?;
+        for placement in self.placements {
+            placements.push((
+                (placement.image_id, placement.placement_id),
+                PlacementInfo {
+                    first_row: StableRowIndex::try_from(placement.first_row).map_err(|_| {
+                        TerminalCheckpointError::ArithmeticOverflow("kitty.placements")
+                    })?,
+                    rows: usize_from_u64(placement.rows, "kitty.placements.rows")?,
+                    cols: usize_from_u64(placement.cols, "kitty.placements.cols")?,
+                },
+            ));
+        }
+        Ok(KittyCheckpointParts {
+            max_image_id,
+            images: stored,
+            numbers: self.numbers,
+            placements,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointCellAttributes {
@@ -1165,6 +1817,9 @@ struct CheckpointCellAttributes {
     background: CheckpointColorAttribute,
     underline_color: CheckpointColorAttribute,
     hyperlink: Option<CheckpointHyperlink>,
+    /// The images the cell shows, in its z-index order; absent for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<CheckpointImageCell>>,
 }
 
 // Keys a capture's attribute table. The parser's enums have no Hash; their
@@ -1189,14 +1844,34 @@ impl std::hash::Hash for CheckpointCellAttributes {
         self.background.hash(state);
         self.underline_color.hash(state);
         self.hyperlink.hash(state);
+        self.images.hash(state);
     }
 }
 
 impl CheckpointCellAttributes {
-    fn capture(value: &CellAttributes) -> Result<Self, TerminalCheckpointError> {
-        if value.has_image_attachments() {
-            return Err(TerminalCheckpointError::UnsupportedGraphicsState);
-        }
+    /// Capture `value`; its images enter `images` (`copy` for a row read
+    /// back from cold storage). Without a registry, as for a pen, an image
+    /// refuses capture.
+    fn capture(
+        value: &CellAttributes,
+        images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Self, TerminalCheckpointError> {
+        let images = match (value.images(), images) {
+            (None, _) => None,
+            (Some(_), None) => return Err(TerminalCheckpointError::UnsupportedGraphicsState),
+            (Some(cells), Some(registry)) => {
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(cells.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("cell.images"))?;
+                for cell in &cells {
+                    let entry = registry.entry(cell.image_data(), copy)?;
+                    captured.push(CheckpointImageCell::capture(cell, entry));
+                }
+                Some(captured)
+            }
+        };
         // A protected cell or pen would come back unprotected.
         if value.protected() {
             return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
@@ -1219,10 +1894,12 @@ impl CheckpointCellAttributes {
             hyperlink: value
                 .hyperlink()
                 .map(|link| CheckpointHyperlink::capture(link)),
+            images,
         })
     }
 
-    fn into_live(self) -> Result<CellAttributes, TerminalCheckpointError> {
+    /// `images` is the restored image table.
+    fn into_live(self, images: &[Arc<ImageData>]) -> Result<CellAttributes, TerminalCheckpointError> {
         let mut value = CellAttributes::blank();
         value
             .set_intensity(self.intensity)
@@ -1245,17 +1922,53 @@ impl CheckpointCellAttributes {
                 .transpose()?
                 .map(Arc::new),
         );
+        if let Some(cells) = self.images {
+            let mut live = Vec::new();
+            live.try_reserve_exact(cells.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("cell.images"))?;
+            for cell in cells {
+                live.push(Box::new(cell.into_live(images)?));
+            }
+            value.set_images(live);
+        }
         Ok(value)
     }
 
+    /// `images` is the length of the checkpoint's image table.
     fn validate(
         &self,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
         self.foreground.validate()?;
         self.background.validate()?;
         self.underline_color.validate()?;
+        if let Some(cells) = self.images.as_ref() {
+            // `CellAttributes::attach_image` keeps a cell's images in
+            // z-index order and binary-searches that order.
+            if cells.is_empty() || cells.windows(2).any(|pair| pair[0].z_index > pair[1].z_index) {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "cell.images",
+                    reason: "a cell's images are present, and in z-index order",
+                });
+            }
+            for cell in cells {
+                cell.validate(images)?;
+            }
+            let bytes = cells
+                .len()
+                .checked_mul(std::mem::size_of::<ImageCell>() + std::mem::size_of::<CheckpointImageCell>())
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
+            checked_accumulate(
+                &mut usage.retained_capture_bytes,
+                bytes,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+        }
         let Some(link) = self.hyperlink.as_ref() else {
             return Ok(());
         };
@@ -1499,17 +2212,21 @@ fn line_encoding_mismatch() -> TerminalCheckpointError {
 
 impl CheckpointLine {
     /// Capture `line` as cells (version 3) or, given its screen's attribute
-    /// table, as runs (version 4).
+    /// table, as runs (version 4). Its images enter `images` (`copy` for a
+    /// row read back from cold storage); without a registry they refuse
+    /// capture.
     fn capture(
         line: &Line,
         table: Option<&mut CheckpointAttributeTable>,
+        images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
     ) -> Result<Self, TerminalCheckpointError> {
-        if line.has_image_attachments() {
+        if images.is_none() && line.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
         }
         let (cells, runs) = match table {
-            None => (Some(Self::capture_cells(line)?), None),
-            Some(table) => (None, Some(Self::capture_runs(line, table)?)),
+            None => (Some(Self::capture_cells(line, images, copy)?), None),
+            Some(table) => (None, Some(Self::capture_runs(line, table, images, copy)?)),
         };
         let scale = if line.is_double_height_top() {
             CheckpointLineScale::DoubleHeightTop
@@ -1531,7 +2248,11 @@ impl CheckpointLine {
         })
     }
 
-    fn capture_cells(line: &Line) -> Result<Vec<CheckpointCell>, TerminalCheckpointError> {
+    fn capture_cells(
+        line: &Line,
+        mut images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Vec<CheckpointCell>, TerminalCheckpointError> {
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(line.len())
@@ -1540,7 +2261,11 @@ impl CheckpointLine {
             cells.push(CheckpointCell {
                 text: cell.str().to_string(),
                 width: checkpoint_cell_width(cell.width())?,
-                attributes: CheckpointCellAttributes::capture(cell.attrs())?,
+                attributes: CheckpointCellAttributes::capture(
+                    cell.attrs(),
+                    images.as_deref_mut(),
+                    copy,
+                )?,
             });
         }
         // A row's trailing default blanks are what a line past its end shows
@@ -1553,7 +2278,7 @@ impl CheckpointLine {
             .last()
             .is_some_and(|cell| cell.width == 1 && cell.text == " ")
         {
-            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank())?;
+            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank(), None, false)?;
             while cells
                 .last()
                 .is_some_and(|cell| cell.width == 1 && cell.text == " " && cell.attributes == blank)
@@ -1566,7 +2291,7 @@ impl CheckpointLine {
 
     /// How many of the line's leading cells `capture_cells` keeps: all but
     /// its trailing default blanks (one-column " " whose attributes capture
-    /// as the blank's).
+    /// as the blank's; a cell showing an image never does).
     fn kept_cells(line: &Line) -> Result<usize, TerminalCheckpointError> {
         let live_blank = CellAttributes::blank();
         let mut blank = None;
@@ -1574,12 +2299,13 @@ impl CheckpointLine {
         for (index, cell) in line.visible_cells().enumerate() {
             let default_blank = cell.width() == 1 && cell.str() == " " && {
                 let attributes = cell.attrs();
-                *attributes == live_blank || {
-                    if blank.is_none() {
-                        blank = Some(CheckpointCellAttributes::capture(&live_blank)?);
+                *attributes == live_blank
+                    || !attributes.has_image_attachments() && {
+                        if blank.is_none() {
+                            blank = Some(CheckpointCellAttributes::capture(&live_blank, None, false)?);
+                        }
+                        Some(CheckpointCellAttributes::capture(attributes, None, false)?) == blank
                     }
-                    Some(CheckpointCellAttributes::capture(attributes)?) == blank
-                }
             };
             if !default_blank {
                 kept = index + 1;
@@ -1598,6 +2324,8 @@ impl CheckpointLine {
     fn capture_runs(
         line: &Line,
         table: &mut CheckpointAttributeTable,
+        mut images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
     ) -> Result<Vec<CheckpointRun>, TerminalCheckpointError> {
         let kept = Self::kept_cells(line)?;
         let mut runs: Vec<CheckpointRun> = Vec::new();
@@ -1609,8 +2337,14 @@ impl CheckpointLine {
                 CellRef::CellRef { cell, .. } => (cell.str(), cell.attrs()),
                 CellRef::ClusterRef { text, attrs, .. } => (text, attrs),
             };
-            if previous != Some(attributes) {
-                entry = table.intern(CheckpointCellAttributes::capture(attributes)?)?;
+            // Live attributes compare images by content: equal attributes
+            // can show two objects, which must stay two entries.
+            if previous != Some(attributes) || attributes.has_image_attachments() {
+                entry = table.intern(CheckpointCellAttributes::capture(
+                    attributes,
+                    images.as_deref_mut(),
+                    copy,
+                )?)?;
                 previous = Some(attributes);
             }
             let continues = runs.last().is_some_and(|run| {
@@ -1656,10 +2390,16 @@ impl CheckpointLine {
         None
     }
 
-    fn into_live(self, table: Option<&[CellAttributes]>) -> Result<Line, TerminalCheckpointError> {
+    /// `table` is its screen's restored version 4 attribute table, `images`
+    /// the restored image table.
+    fn into_live(
+        self,
+        table: Option<&[CellAttributes]>,
+        images: &[Arc<ImageData>],
+    ) -> Result<Line, TerminalCheckpointError> {
         let seqno = usize_from_u64(self.seqno, "line.seqno")?;
         let cells = match (self.cells, self.runs, table) {
-            (Some(cells), None, None) => Self::cells_into_live(cells)?,
+            (Some(cells), None, None) => Self::cells_into_live(cells, images)?,
             (None, Some(runs), Some(table)) => Self::runs_into_live(&runs, table)?,
             _ => return Err(line_encoding_mismatch()),
         };
@@ -1675,7 +2415,10 @@ impl CheckpointLine {
         Ok(line)
     }
 
-    fn cells_into_live(cells: Vec<CheckpointCell>) -> Result<Vec<Cell>, TerminalCheckpointError> {
+    fn cells_into_live(
+        cells: Vec<CheckpointCell>,
+        images: &[Arc<ImageData>],
+    ) -> Result<Vec<Cell>, TerminalCheckpointError> {
         let mut live = Vec::new();
         let stored_cells = cells.iter().try_fold(0usize, |total, cell| {
             total
@@ -1686,7 +2429,7 @@ impl CheckpointLine {
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
         for cell in cells {
             let width = usize::from(cell.width);
-            let attributes = cell.attributes.into_live()?;
+            let attributes = cell.attributes.into_live(images)?;
             live.push(Cell::new_grapheme_with_width(
                 &cell.text,
                 width,
@@ -1748,13 +2491,14 @@ impl CheckpointLine {
     }
 
     /// `table` is its screen's version 4 attribute table; a version 3 line
-    /// has none.
+    /// has none. `images` is the length of the image table.
     fn validate(
         &self,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
         table: Option<&[CheckpointCellAttributes]>,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
         if self.seqno > terminal_seqno {
             return Err(TerminalCheckpointError::InvalidField {
@@ -1770,7 +2514,7 @@ impl CheckpointLine {
             "retained_capture_bytes",
         )?;
         let occupied_columns = match (&self.cells, &self.runs, table) {
-            (Some(cells), None, None) => Self::validate_cells(cells, limits, usage)?,
+            (Some(cells), None, None) => Self::validate_cells(cells, limits, usage, images)?,
             (None, Some(runs), Some(table)) => {
                 Self::validate_runs(runs, table.len(), limits, usage)?
             }
@@ -1897,6 +2641,7 @@ impl CheckpointLine {
         cells: &[CheckpointCell],
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
+        images: usize,
     ) -> Result<usize, TerminalCheckpointError> {
         let mut occupied_columns = 0usize;
         for cell in cells {
@@ -1942,7 +2687,7 @@ impl CheckpointLine {
                 limits.max_retained_capture_bytes,
                 "retained_capture_bytes",
             )?;
-            cell.attributes.validate(limits, usage)?;
+            cell.attributes.validate(limits, usage, images)?;
         }
         Ok(occupied_columns)
     }
@@ -2374,6 +3119,35 @@ pub(crate) struct CheckpointReplayConfigV2 {
     normalize_output_to_unicode_nfc: bool,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
+    /// Present exactly when the checkpoint holds graphics state: replay of
+    /// image output then runs under these values, as the live terminal did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graphics: Option<CheckpointGraphicsConfig>,
+}
+
+/// The configuration that changes how image output changes the terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointGraphicsConfig {
+    enable_kitty_graphics: bool,
+    kitty_image_budget_bytes: u64,
+    kitty_image_max_transmission_bytes: u64,
+}
+
+impl CheckpointGraphicsConfig {
+    fn capture(config: &dyn TerminalConfiguration) -> Result<Self, TerminalCheckpointError> {
+        Ok(Self {
+            enable_kitty_graphics: config.enable_kitty_graphics(),
+            kitty_image_budget_bytes: u64_from_usize(
+                config.kitty_image_budget_bytes(),
+                "config.kitty_image_budget_bytes",
+            )?,
+            kitty_image_max_transmission_bytes: u64_from_usize(
+                config.kitty_image_max_transmission_bytes(),
+                "config.kitty_image_max_transmission_bytes",
+            )?,
+        })
+    }
 }
 
 struct PendingReplayConfigV2 {
@@ -2388,6 +3162,7 @@ struct PendingReplayConfigV2 {
     normalize_output_to_unicode_nfc: bool,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
+    graphics: CheckpointGraphicsConfig,
 }
 
 impl PendingReplayConfigV2 {
@@ -2406,6 +3181,7 @@ impl PendingReplayConfigV2 {
         let bidi = config.bidi_mode();
         let palette = config.color_palette();
         let unicode_version = config.unicode_version();
+        let graphics = CheckpointGraphicsConfig::capture(config)?;
         let custom_widths = unicode_version
             .cell_widths
             .as_ref()
@@ -2456,6 +3232,7 @@ impl PendingReplayConfigV2 {
             normalize_output_to_unicode_nfc,
             bidi_enabled: bidi.enabled,
             bidi_hint: bidi.hint.into(),
+            graphics,
         };
         if config.revision() != revision_before {
             return Err(TerminalCheckpointError::ConfigurationChangedDuringProjection);
@@ -2463,9 +3240,11 @@ impl PendingReplayConfigV2 {
         Ok(projection)
     }
 
+    /// `graphics`: the checkpoint holds graphics state.
     fn into_checkpoint(
         self,
         tables: &[CheckpointCustomCellWidthMap],
+        graphics: bool,
     ) -> Result<CheckpointReplayConfigV2, TerminalCheckpointError> {
         Ok(CheckpointReplayConfigV2 {
             version: self.version,
@@ -2479,6 +3258,7 @@ impl PendingReplayConfigV2 {
             normalize_output_to_unicode_nfc: self.normalize_output_to_unicode_nfc,
             bidi_enabled: self.bidi_enabled,
             bidi_hint: self.bidi_hint,
+            graphics: graphics.then_some(self.graphics),
         })
     }
 
@@ -2498,7 +3278,10 @@ impl PendingReplayConfigV2 {
             && expected_unicode == self.unicode_version
             && checkpoint.normalize_output_to_unicode_nfc == self.normalize_output_to_unicode_nfc
             && checkpoint.bidi_enabled == self.bidi_enabled
-            && checkpoint.bidi_hint == self.bidi_hint)
+            && checkpoint.bidi_hint == self.bidi_hint
+            && checkpoint
+                .graphics
+                .is_none_or(|graphics| graphics == self.graphics))
     }
 }
 
@@ -2587,7 +3370,29 @@ impl CheckpointReplayConfigV2 {
                 enabled: self.bidi_enabled,
                 hint: self.bidi_hint.into_live(),
             },
+            graphics: self
+                .graphics
+                .map(|graphics| -> Result<_, TerminalCheckpointError> {
+                    Ok((
+                        graphics.enable_kitty_graphics,
+                        usize_from_u64(
+                            graphics.kitty_image_budget_bytes,
+                            "config.kitty_image_budget_bytes",
+                        )?,
+                        usize_from_u64(
+                            graphics.kitty_image_max_transmission_bytes,
+                            "config.kitty_image_max_transmission_bytes",
+                        )?,
+                    ))
+                })
+                .transpose()?,
         })
+    }
+
+    /// Whether replay may apply image output: only under the graphics
+    /// configuration the live terminal applied it with.
+    pub(crate) fn admits_graphics(&self) -> bool {
+        self.graphics.is_some()
     }
 
     pub(crate) fn matches_stable(
@@ -2611,6 +3416,20 @@ struct ReplayTerminalConfiguration {
     unicode_version: UnicodeVersion,
     normalize_output_to_unicode_nfc: bool,
     bidi_mode: BidiMode,
+    /// Kitty graphics enabled, image budget, transmission cap; without
+    /// them, replay refuses image output and these are the defaults.
+    graphics: Option<(bool, usize, usize)>,
+}
+
+/// `TerminalConfiguration`'s own defaults, for a value a replay
+/// configuration does not hold.
+#[derive(Debug)]
+struct ConfigurationDefaults;
+
+impl TerminalConfiguration for ConfigurationDefaults {
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
 }
 
 impl std::fmt::Debug for ReplayTerminalConfiguration {
@@ -2662,6 +3481,23 @@ impl TerminalConfiguration for ReplayTerminalConfiguration {
     fn bidi_mode(&self) -> BidiMode {
         self.bidi_mode
     }
+
+    fn enable_kitty_graphics(&self) -> bool {
+        self.graphics
+            .map_or_else(|| ConfigurationDefaults.enable_kitty_graphics(), |g| g.0)
+    }
+
+    fn kitty_image_budget_bytes(&self) -> usize {
+        self.graphics
+            .map_or_else(|| ConfigurationDefaults.kitty_image_budget_bytes(), |g| g.1)
+    }
+
+    fn kitty_image_max_transmission_bytes(&self) -> usize {
+        self.graphics.map_or_else(
+            || ConfigurationDefaults.kitty_image_max_transmission_bytes(),
+            |g| g.2,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2682,7 +3518,7 @@ impl CheckpointSavedCursor {
             position: CheckpointCursorPosition::capture(value.position)?,
             wrap_next: value.wrap_next,
             wrap_next_column: value.wrap_next_column.map(|column| column as u64),
-            pen: CheckpointCellAttributes::capture(&value.pen)?,
+            pen: CheckpointCellAttributes::capture(&value.pen, None, false)?,
             dec_origin_mode: value.dec_origin_mode,
             g0_charset: value.g0_charset.into(),
             g1_charset: value.g1_charset.into(),
@@ -2697,7 +3533,7 @@ impl CheckpointSavedCursor {
                 .wrap_next_column
                 .map(|column| usize_from_u64(column, "screen.saved_cursor.wrap_next_column"))
                 .transpose()?,
-            pen: self.pen.into_live()?,
+            pen: self.pen.into_live(&[])?,
             dec_origin_mode: self.dec_origin_mode,
             g0_charset: self.g0_charset.into_live(),
             g1_charset: self.g1_charset.into_live(),
@@ -2722,7 +3558,8 @@ impl CheckpointSavedCursor {
                 reason: "pending wrap requires a bounded insertion point after the cursor",
             });
         }
-        self.pen.validate(limits, usage)
+        // A pen shows no image.
+        self.pen.validate(limits, usage, 0)
     }
 }
 
@@ -2777,9 +3614,13 @@ struct CheckpointScreen {
 }
 
 impl CheckpointScreen {
+    /// Capture `value`, its images entering `images`; without a registry an
+    /// image refuses capture. Its cold prefix holds rows read back from cold
+    /// storage, whose images are copies.
     fn capture(
         value: crate::screen::ScreenCheckpointParts,
         encoding: TerminalCheckpointLineEncoding,
+        mut images: Option<&mut CheckpointImageRegistry>,
     ) -> Result<Self, TerminalCheckpointError> {
         let mut lines = Vec::new();
         lines
@@ -2789,8 +3630,14 @@ impl CheckpointScreen {
             TerminalCheckpointLineEncoding::Cells => None,
             TerminalCheckpointLineEncoding::Runs => Some(CheckpointAttributeTable::default()),
         };
-        for line in &value.lines {
-            lines.push(CheckpointLine::capture(line, table.as_mut())?);
+        for (index, line) in value.lines.iter().enumerate() {
+            let copy = index < value.cold_prefix_line_count;
+            lines.push(CheckpointLine::capture(
+                line,
+                table.as_mut(),
+                images.as_deref_mut(),
+                copy,
+            )?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2880,7 +3727,39 @@ impl CheckpointScreen {
             .cell(col, self.attributes.as_deref())
     }
 
-    fn into_live(self) -> Result<crate::screen::ScreenCheckpointParts, TerminalCheckpointError> {
+    /// Its attribute sets in the order its lines first use them: its
+    /// table's entries (version 4), or every cell's (version 3).
+    fn attribute_sets(&self) -> Box<dyn Iterator<Item = &CheckpointCellAttributes> + '_> {
+        match &self.attributes {
+            Some(table) => Box::new(table.iter()),
+            None => Box::new(
+                self.lines
+                    .iter()
+                    .flat_map(|line| line.cells.iter().flatten())
+                    .map(|cell| &cell.attributes),
+            ),
+        }
+    }
+
+    fn attribute_sets_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = &mut CheckpointCellAttributes> + '_> {
+        match &mut self.attributes {
+            Some(table) => Box::new(table.iter_mut()),
+            None => Box::new(
+                self.lines
+                    .iter_mut()
+                    .flat_map(|line| line.cells.iter_mut().flatten())
+                    .map(|cell| &mut cell.attributes),
+            ),
+        }
+    }
+
+    /// `images` is the restored image table.
+    fn into_live(
+        self,
+        images: &[Arc<ImageData>],
+    ) -> Result<crate::screen::ScreenCheckpointParts, TerminalCheckpointError> {
         // Each entry becomes live attributes once; its cells share clones.
         let table = match self.attributes {
             None => None,
@@ -2889,7 +3768,7 @@ impl CheckpointScreen {
                 live.try_reserve_exact(entries.len())
                     .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
                 for entry in entries {
-                    live.push(entry.into_live()?);
+                    live.push(entry.into_live(images)?);
                 }
                 Some(live)
             }
@@ -2899,7 +3778,7 @@ impl CheckpointScreen {
             .try_reserve_exact(self.lines.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
         for line in self.lines {
-            lines.push(line.into_live(table.as_deref())?);
+            lines.push(line.into_live(table.as_deref(), images)?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2943,6 +3822,7 @@ impl CheckpointScreen {
         })
     }
 
+    /// `images` is the length of the checkpoint's image table.
     fn validate(
         &self,
         expected_scrollback: bool,
@@ -2950,6 +3830,7 @@ impl CheckpointScreen {
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
         encoding: TerminalCheckpointLineEncoding,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
         let table = match (encoding, self.attributes.as_deref()) {
             (TerminalCheckpointLineEncoding::Cells, None) => None,
@@ -2975,7 +3856,7 @@ impl CheckpointScreen {
                     limits.max_retained_capture_bytes,
                     "retained_capture_bytes",
                 )?;
-                entry.validate(limits, usage)?;
+                entry.validate(limits, usage, images)?;
             }
         }
         if self.allow_scrollback != expected_scrollback {
@@ -3088,7 +3969,7 @@ impl CheckpointScreen {
             });
         }
         for line in &self.lines {
-            line.validate(limits, usage, terminal_seqno, table)?;
+            line.validate(limits, usage, terminal_seqno, table, images)?;
         }
         if let Some(saved) = self.saved_cursor.as_ref() {
             saved.validate(terminal_seqno, limits, usage)?;
@@ -3142,6 +4023,16 @@ pub struct TerminalCheckpointLimits {
     /// either encoding; a terminal restored from a checkpoint captures
     /// again in the encoding it was restored from.
     pub line_encoding: TerminalCheckpointLineEncoding,
+    /// Whether a capture holds graphics state (images in cells, Kitty
+    /// state) and the configuration replay of image output needs; without
+    /// it, graphics state refuses capture. A reader older than graphics
+    /// checkpoints refuses one that holds them, so a writer captures them
+    /// only for a reader known to admit them. Decoding admits graphics
+    /// state either way; a terminal restored from a checkpoint captures it
+    /// again exactly when the checkpoint held it.
+    pub capture_graphics: bool,
+    pub max_images: usize,
+    pub max_total_image_bytes: usize,
 }
 
 impl Default for TerminalCheckpointLimits {
@@ -3177,6 +4068,9 @@ impl Default for TerminalCheckpointLimits {
             max_pixel_dimension: 1_048_576,
             max_dpi: 1_000_000,
             line_encoding: TerminalCheckpointLineEncoding::Cells,
+            capture_graphics: false,
+            max_images: 4_096,
+            max_total_image_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -3212,6 +4106,9 @@ impl TerminalCheckpointLimits {
     const ABSOLUTE_MAX_TERMINAL_STRING_BYTES: usize = 32 * 1024 * 1024;
     const ABSOLUTE_MAX_PIXEL_DIMENSION: usize = 1_048_576;
     const ABSOLUTE_MAX_DPI: u32 = 1_000_000;
+    const ABSOLUTE_MAX_IMAGES: usize = 65_536;
+    // Base64 makes these 213 MiB, within the absolute encoded ceiling.
+    const ABSOLUTE_MAX_TOTAL_IMAGE_BYTES: usize = 160 * 1024 * 1024;
 
     fn validate_policy(self) -> Result<(), TerminalCheckpointError> {
         for (resource, observed, maximum) in [
@@ -3355,6 +4252,16 @@ impl TerminalCheckpointLimits {
                 self.max_pixel_dimension,
                 Self::ABSOLUTE_MAX_PIXEL_DIMENSION,
             ),
+            (
+                "configured_max_images",
+                self.max_images,
+                Self::ABSOLUTE_MAX_IMAGES,
+            ),
+            (
+                "configured_max_total_image_bytes",
+                self.max_total_image_bytes,
+                Self::ABSOLUTE_MAX_TOTAL_IMAGE_BYTES,
+            ),
         ] {
             ensure_limit(resource, observed, maximum)?;
         }
@@ -3442,6 +4349,7 @@ impl TerminalCheckpointLimits {
             max_cols: self.max_cols,
             max_visible_grid_cells: self.max_visible_grid_cells,
             max_retained_capture_bytes: self.max_retained_capture_bytes,
+            allow_images: self.capture_graphics,
             estimated_bytes_per_line: std::mem::size_of::<Line>()
                 .saturating_add(std::mem::size_of::<CheckpointLine>()),
             estimated_bytes_per_cell: std::mem::size_of::<Cell>()

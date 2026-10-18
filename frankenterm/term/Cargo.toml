@@ -17,11 +17,12 @@ use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-esc
 
 [dependencies]
 anyhow.workspace = true
+base64 = { workspace = true, features = ["alloc"] }
 bitflags.workspace = true
 csscolorparser.workspace = true
 downcast-rs.workspace = true
 finl_unicode.workspace = true
-hex.workspace = true
+hex = { workspace = true, features = ["alloc"] }
 humansize.workspace = true
 image.workspace = true
 lazy_static.workspace = true

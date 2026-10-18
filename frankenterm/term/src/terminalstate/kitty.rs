@@ -41,6 +41,18 @@ pub struct KittyImageState {
     pub(crate) max_transmission_bytes: usize,
 }
 
+/// The Kitty state a terminal checkpoint holds (see
+/// [`KittyImageState::checkpoint_parts`]).
+#[cfg(feature = "use_serde")]
+pub(crate) struct KittyCheckpointParts {
+    pub max_image_id: u32,
+    /// Stored images by id.
+    pub images: Vec<(u32, Arc<ImageData>)>,
+    /// Image numbers and the ids they name.
+    pub numbers: Vec<(u32, u32)>,
+    pub placements: Vec<((u32, Option<u32>), PlacementInfo)>,
+}
+
 /// Fully checked resource-ledger transaction for one image append.
 ///
 /// The image performs all fallible validation and allocation separately. This
@@ -127,6 +139,101 @@ impl KittyImageState {
         self.used_memory = 1;
     }
 
+    /// Whether a chunked transmission has chunks but not yet its last.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn transmission_in_flight(&self) -> bool {
+        !self.accumulator.is_empty() || self.accumulator_encoded_bytes != 0
+    }
+
+    /// Everything a checkpoint holds of this state, each list in ascending
+    /// key order. The caller first refuses a transmission in flight: its
+    /// chunks are not checkpoint state, and it ends within a few records.
+    /// `used_memory` is not held either: it is what the images retain, and
+    /// a state where it is not refuses capture.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn checkpoint_parts(&self) -> anyhow::Result<KittyCheckpointParts> {
+        anyhow::ensure!(
+            !self.transmission_in_flight(),
+            "a Kitty transmission is unfinished"
+        );
+        let mut images: Vec<(u32, Arc<ImageData>)> = self
+            .id_to_data
+            .iter()
+            .map(|(id, data)| (*id, Arc::clone(data)))
+            .collect();
+        images.sort_unstable_by_key(|(id, _)| *id);
+        let resident = images.iter().try_fold(0usize, |total, (_, data)| {
+            total
+                .checked_add(checked_image_len(data)?)
+                .context("kitty image resident byte count overflow")
+        })?;
+        anyhow::ensure!(
+            resident == self.used_memory,
+            "Kitty image memory accounting ({}) differs from its images ({})",
+            self.used_memory,
+            resident
+        );
+        let mut numbers: Vec<(u32, u32)> = self
+            .number_to_id
+            .iter()
+            .map(|(number, id)| (*number, *id))
+            .collect();
+        numbers.sort_unstable();
+        let mut placements: Vec<((u32, Option<u32>), PlacementInfo)> = self
+            .placements
+            .iter()
+            .map(|(key, info)| (*key, *info))
+            .collect();
+        placements.sort_unstable_by_key(|(key, _)| *key);
+        Ok(KittyCheckpointParts {
+            max_image_id: self.max_image_id,
+            images,
+            numbers,
+            placements,
+        })
+    }
+
+    /// Rebuild the state `checkpoint_parts` captured, under the restoring
+    /// configuration's limits; `used_memory` is what the images retain.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn from_checkpoint_parts(
+        image_budget_bytes: usize,
+        max_transmission_bytes: usize,
+        parts: KittyCheckpointParts,
+    ) -> anyhow::Result<Self> {
+        let used_memory = parts.images.iter().try_fold(0usize, |total, (_, data)| {
+            total
+                .checked_add(checked_image_len(data)?)
+                .context("kitty image resident byte count overflow")
+        })?;
+        let mut id_to_data = HashMap::new();
+        id_to_data
+            .try_reserve(parts.images.len())
+            .context("reserving Kitty images")?;
+        id_to_data.extend(parts.images);
+        let mut number_to_id = HashMap::new();
+        number_to_id
+            .try_reserve(parts.numbers.len())
+            .context("reserving Kitty image numbers")?;
+        number_to_id.extend(parts.numbers);
+        let mut placements = HashMap::new();
+        placements
+            .try_reserve(parts.placements.len())
+            .context("reserving Kitty placements")?;
+        placements.extend(parts.placements);
+        let mut state = Self {
+            max_image_id: parts.max_image_id,
+            number_to_id,
+            id_to_data,
+            placements,
+            used_memory,
+            image_budget_bytes,
+            ..Self::default()
+        };
+        state.set_max_transmission_bytes(max_transmission_bytes);
+        Ok(state)
+    }
+
     /// Override the per-image transmission-size cap.
     pub(crate) fn set_max_transmission_bytes(&mut self, bytes: usize) {
         self.max_transmission_bytes = bytes;
@@ -185,7 +292,7 @@ const MAX_KITTY_ANIMATION_FRAMES: usize = MAX_IMAGE_WIRE_FRAMES;
 /// Maximum number of image-number-to-id mappings before deterministic
 /// numeric-key eviction. Prevents unbounded HashMap growth in long-running
 /// sessions with many unique image numbers.
-const MAX_KITTY_NUMBER_TO_ID_ENTRIES: usize = 4096;
+pub(crate) const MAX_KITTY_NUMBER_TO_ID_ENTRIES: usize = 4096;
 
 /// Default per-image transmission-size cap for Kitty graphics, applied
 /// to the post-decompression payload. Prevents memory bombs from
