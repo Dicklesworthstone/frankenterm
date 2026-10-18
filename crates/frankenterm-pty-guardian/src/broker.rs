@@ -4512,10 +4512,21 @@ pub struct BrokerControlServiceV1 {
     fenced_live_leases: u64,
     quarantined_live_leases: u64,
     lease_submission_cursor: Option<Uuid>,
+    pending_output_prefetch: Option<BrokerOutputPrefetchV1>,
     #[cfg(test)]
     lease_job_probe: Option<BrokerSpawnWorkerEffectLeaseProbeV1>,
     #[cfg(test)]
     rotation_lease_fault: Option<(Uuid, BrokerPaneLeaseWalPhaseV1)>,
+}
+
+/// A drain to start once the response to the data Read that queued it has
+/// been written ([`BrokerControlServiceV1::run_output_prefetch`]).
+#[derive(Clone, Copy)]
+struct BrokerOutputPrefetchV1 {
+    token: Token,
+    generation: u64,
+    pane_id: Uuid,
+    maximum: usize,
 }
 
 impl BrokerControlServiceV1 {
@@ -4792,6 +4803,7 @@ impl BrokerControlServiceV1 {
             fenced_live_leases: 0,
             quarantined_live_leases: 0,
             lease_submission_cursor: None,
+            pending_output_prefetch: None,
             #[cfg(test)]
             lease_job_probe: None,
             #[cfg(test)]
@@ -4943,6 +4955,7 @@ impl BrokerControlServiceV1 {
         self.expire_unauthenticated_connections();
         self.drain_spawn_completion();
         self.submit_pending_lease_transition();
+        self.run_output_prefetch();
         Ok(())
     }
 
@@ -5574,7 +5587,19 @@ impl BrokerControlServiceV1 {
                 return self.dispatch_successor_acknowledgement(owner, request);
             }
             BrokerControlOperationV1::ReadOutput => {
-                return self.dispatch_output_read(owner, request);
+                let response = self.dispatch_output_read(owner, request);
+                if let (Ok(served), Ok(maximum)) =
+                    (&response, <[u8; 4]>::try_from(request.payload()))
+                    && served.header.status == BrokerControlResponseStatusV1::Applied
+                {
+                    self.pending_output_prefetch = Some(BrokerOutputPrefetchV1 {
+                        token,
+                        generation,
+                        pane_id: request.header.durable_pane_id,
+                        maximum: usize::try_from(u32::from_be_bytes(maximum)).unwrap_or(0),
+                    });
+                }
+                return response;
             }
             BrokerControlOperationV1::AcknowledgeOutput => {
                 return self.dispatch_output_ack(owner, request);
@@ -5810,37 +5835,7 @@ impl BrokerControlServiceV1 {
                 .token_authority
                 .acquire_effect_lease()
                 .map_err(|_| ())?;
-            let bytes = Zeroizing::new(vec![0; count]);
-            // Allocate before transferring either irreplaceable facet.
-            let reader = pane.proxy_reader.take().ok_or(())?;
-            let Some(mut journal) = pane.output_journal.take() else {
-                pane.proxy_reader = Some(reader);
-                return Err(());
-            };
-            journal.release_through(pane.buffer_start_sequence);
-            let job = BrokerOutputDrainJobV1 {
-                pane_id: request.header.durable_pane_id,
-                sequence: pane.next_output_sequence,
-                reader,
-                journal,
-                bytes,
-                result: Err(()),
-                token_lease,
-            };
-            let Some(sender) = self.output_worker.jobs.as_ref() else {
-                pane.proxy_reader = Some(job.reader);
-                pane.output_journal = Some(job.journal);
-                return Err(());
-            };
-            let submitted = (job.pane_id, job.sequence);
-            match sender.try_send(job) {
-                Ok(()) => self.output_worker.active = Some(submitted),
-                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
-                    pane.proxy_reader = Some(job.reader);
-                    pane.output_journal = Some(job.journal);
-                    return Err(());
-                }
-            }
+            self.submit_output_drain(request.header.durable_pane_id, count, token_lease)?;
             return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
         }
         let permit = live
@@ -5868,6 +5863,112 @@ impl BrokerControlServiceV1 {
             }
             Err(_) => Err(()),
         }
+    }
+
+    /// Hand a pane's PTY reader and output journal to the output worker for
+    /// one drain of at most `count` bytes; both return with its completion.
+    /// A refused submission restores them here.
+    fn submit_output_drain(
+        &mut self,
+        pane_id: Uuid,
+        count: usize,
+        token_lease: GuardianTokenEffectLease,
+    ) -> Result<(), ()> {
+        let pane = &mut self.live_spawns.get_mut(&pane_id).ok_or(())?.adoption.pane;
+        let bytes = Zeroizing::new(vec![0; count]);
+        // Allocate before transferring either irreplaceable facet.
+        let reader = pane.proxy_reader.take().ok_or(())?;
+        let Some(mut journal) = pane.output_journal.take() else {
+            pane.proxy_reader = Some(reader);
+            return Err(());
+        };
+        journal.release_through(pane.buffer_start_sequence);
+        let job = BrokerOutputDrainJobV1 {
+            pane_id,
+            sequence: pane.next_output_sequence,
+            reader,
+            journal,
+            bytes,
+            result: Err(()),
+            token_lease,
+        };
+        let Some(sender) = self.output_worker.jobs.as_ref() else {
+            pane.proxy_reader = Some(job.reader);
+            pane.output_journal = Some(job.journal);
+            return Err(());
+        };
+        let submitted = (job.pane_id, job.sequence);
+        match sender.try_send(job) {
+            Ok(()) => self.output_worker.active = Some(submitted),
+            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                pane.proxy_reader = Some(job.reader);
+                pane.output_journal = Some(job.journal);
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the drain a data Read queued, once that Read's response has
+    /// been written (ft-2pgul). Draining only when the guardian asked again
+    /// left the PTY full, and its writer blocked, while the guardian synced
+    /// and acknowledged each record; now the next record drains meanwhile.
+    /// Best effort: a busy worker, a full buffer or any refusal skips it,
+    /// and the guardian's next Read drains as before.
+    fn run_output_prefetch(&mut self) {
+        let Some(prefetch) = self.pending_output_prefetch else {
+            return;
+        };
+        if self
+            .connections
+            .get(&prefetch.token)
+            .is_some_and(|connection| {
+                connection.generation == prefetch.generation && connection.write_frame.is_some()
+            })
+        {
+            return;
+        }
+        self.pending_output_prefetch = None;
+        if self.output_worker.active.is_some() {
+            return;
+        }
+        let Some(live) = self.live_spawns.get_mut(&prefetch.pane_id) else {
+            return;
+        };
+        let pane = &mut live.adoption.pane;
+        if pane.output_terminal.is_some()
+            || pane.proxy_reader.is_none()
+            || pane
+                .output_journal
+                .as_ref()
+                .is_none_or(|journal| journal.failed)
+            || matches!(
+                pane.status().lifecycle,
+                BrokerPaneLifecycleV1::Quarantined(_)
+            )
+        {
+            return;
+        }
+        let Some(remaining) = pane
+            .limits
+            .max_buffered_output_bytes
+            .checked_sub(pane.output_buffer.len())
+        else {
+            return;
+        };
+        let count = prefetch.maximum.min(remaining);
+        if count == 0
+            || u64::try_from(count)
+                .ok()
+                .and_then(|count| pane.next_output_sequence.checked_add(count))
+                .is_none()
+        {
+            return;
+        }
+        let Ok(token_lease) = self.token_authority.acquire_effect_lease() else {
+            return;
+        };
+        let _ = self.submit_output_drain(prefetch.pane_id, count, token_lease);
     }
 
     fn dispatch_spawn(
