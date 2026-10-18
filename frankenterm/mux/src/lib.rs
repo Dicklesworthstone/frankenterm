@@ -10689,6 +10689,9 @@ pub struct Mux {
     /// This mux's guardian validates checkpoints holding graphics state
     /// (`set_guardian_graphics_checkpoints`).
     guardian_graphics_checkpoints: AtomicBool,
+    /// This mux's guardian validates checkpoints holding character
+    /// protection (`set_guardian_protection_checkpoints`).
+    guardian_protection_checkpoints: AtomicBool,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
     pane_removal_cleanup_outstanding_leases: AtomicUsize,
@@ -13775,6 +13778,7 @@ impl Mux {
             guardian_root_retention: AtomicBool::new(false),
             guardian_compact_checkpoints: AtomicBool::new(false),
             guardian_graphics_checkpoints: AtomicBool::new(false),
+            guardian_protection_checkpoints: AtomicBool::new(false),
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
             pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
@@ -22030,8 +22034,18 @@ impl Mux {
             .store(enabled, Ordering::Release);
     }
 
-    /// The limits for checkpoints this mux publishes: version 4 lines and
-    /// graphics state each when its guardian admits them.
+    /// Whether this mux's guardian validates terminal checkpoints holding
+    /// character protection (`GuardianClient::admits_protection_checkpoints`),
+    /// as for `set_guardian_graphics_checkpoints`: without it a pane holding
+    /// protected cells (DECSCA, SPA) refuses capture.
+    pub fn set_guardian_protection_checkpoints(&self, enabled: bool) {
+        self.guardian_protection_checkpoints
+            .store(enabled, Ordering::Release);
+    }
+
+    /// The limits for checkpoints this mux publishes: version 4 lines,
+    /// graphics state and character protection each when its guardian
+    /// admits them.
     pub fn guardian_checkpoint_limits(&self) -> TerminalCheckpointLimits {
         let line_encoding = if self.guardian_compact_checkpoints.load(Ordering::Acquire) {
             TerminalCheckpointLineEncoding::Runs
@@ -22041,6 +22055,7 @@ impl Mux {
         TerminalCheckpointLimits {
             line_encoding,
             capture_graphics: self.guardian_graphics_checkpoints.load(Ordering::Acquire),
+            capture_protection: self.guardian_protection_checkpoints.load(Ordering::Acquire),
             ..TerminalCheckpointLimits::default()
         }
     }

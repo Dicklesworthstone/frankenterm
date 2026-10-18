@@ -1822,6 +1822,13 @@ struct CheckpointCellAttributes {
     /// The images the cell shows, in its z-index order; absent for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<CheckpointImageCell>>,
+    /// DECSCA or SPA protection; absent for none.
+    #[serde(default, skip_serializing_if = "is_false")]
+    protected: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // Keys a capture's attribute table. The parser's enums have no Hash; their
@@ -1847,6 +1854,7 @@ impl std::hash::Hash for CheckpointCellAttributes {
         self.underline_color.hash(state);
         self.hyperlink.hash(state);
         self.images.hash(state);
+        self.protected.hash(state);
     }
 }
 
@@ -1874,10 +1882,9 @@ impl CheckpointCellAttributes {
                 Some(captured)
             }
         };
-        // A protected cell or pen would come back unprotected.
-        if value.protected() {
-            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
-        }
+        // Protection without `TerminalCheckpointLimits::capture_protection`
+        // refused capture earlier, where the screen and the pens were
+        // inspected.
         Ok(Self {
             intensity: value.intensity(),
             underline: value.underline(),
@@ -1897,6 +1904,7 @@ impl CheckpointCellAttributes {
                 .hyperlink()
                 .map(|link| CheckpointHyperlink::capture(link)),
             images,
+            protected: value.protected(),
         })
     }
 
@@ -1920,7 +1928,8 @@ impl CheckpointCellAttributes {
             .set_vertical_align(self.vertical_align)
             .set_foreground(self.foreground.into_live())
             .set_background(self.background.into_live())
-            .set_underline_color(self.underline_color.into_live());
+            .set_underline_color(self.underline_color.into_live())
+            .set_protected(self.protected);
         value.set_hyperlink(
             self.hyperlink
                 .map(CheckpointHyperlink::into_live)
@@ -4054,6 +4063,14 @@ pub struct TerminalCheckpointLimits {
     pub capture_graphics: bool,
     pub max_images: usize,
     pub max_total_image_bytes: usize,
+    /// Whether a capture holds character protection (DECSCA, SPA): each
+    /// cell's and pen's protection, and the protection mode, which decides
+    /// the erases that keep protected cells. Without it, protection refuses
+    /// capture. A reader older than protection checkpoints refuses one that
+    /// holds it, so a writer captures it only for a reader known to admit
+    /// it; a terminal restored from a checkpoint captures it again exactly
+    /// when the checkpoint held it.
+    pub capture_protection: bool,
 }
 
 impl Default for TerminalCheckpointLimits {
@@ -4092,6 +4109,7 @@ impl Default for TerminalCheckpointLimits {
             capture_graphics: false,
             max_images: 4_096,
             max_total_image_bytes: 64 * 1024 * 1024,
+            capture_protection: false,
         }
     }
 }
@@ -4371,6 +4389,7 @@ impl TerminalCheckpointLimits {
             max_visible_grid_cells: self.max_visible_grid_cells,
             max_retained_capture_bytes: self.max_retained_capture_bytes,
             allow_images: self.capture_graphics,
+            allow_protection: self.capture_protection,
             estimated_bytes_per_line: std::mem::size_of::<Line>()
                 .saturating_add(std::mem::size_of::<CheckpointLine>()),
             estimated_bytes_per_cell: std::mem::size_of::<Cell>()
@@ -4464,6 +4483,38 @@ pub struct TerminalCheckpointV3 {
     /// Absent when Kitty holds no image, number or placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kitty: Option<CheckpointKittyState>,
+    /// The protection mode, present exactly when the checkpoint holds
+    /// character protection: a terminal restored from it captures
+    /// protection again, whatever replay protects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_mode: Option<CheckpointProtectedMode>,
+}
+
+/// Which erases keep protected cells (`ProtectedMode`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointProtectedMode {
+    Off,
+    Iso,
+    Dec,
+}
+
+impl CheckpointProtectedMode {
+    fn capture(value: ProtectedMode) -> Self {
+        match value {
+            ProtectedMode::Off => Self::Off,
+            ProtectedMode::Iso => Self::Iso,
+            ProtectedMode::Dec => Self::Dec,
+        }
+    }
+
+    fn into_live(self) -> ProtectedMode {
+        match self {
+            Self::Off => ProtectedMode::Off,
+            Self::Iso => ProtectedMode::Iso,
+            Self::Dec => ProtectedMode::Dec,
+        }
+    }
 }
 
 impl std::fmt::Debug for TerminalCheckpointV3 {
@@ -4631,6 +4682,8 @@ struct HistoricalTerminalV2 {
     images: Option<Vec<CheckpointImage>>,
     #[serde(skip)]
     kitty: Option<CheckpointKittyState>,
+    #[serde(skip)]
+    protected_mode: Option<CheckpointProtectedMode>,
 }
 
 #[derive(Serialize)]
@@ -4874,6 +4927,7 @@ pub struct StagedHotCheckpoint {
     /// the alternate screen and Kitty state name entries of it.
     images: Option<CheckpointImageRegistry>,
     kitty: Option<CheckpointKittyState>,
+    protected_mode: Option<CheckpointProtectedMode>,
 }
 
 /// Immutable hot state bound to the actual external parser boundary before
@@ -5021,6 +5075,7 @@ impl StagedHotCheckpoint {
             bidi_hint: self.bidi_hint,
             images: None,
             kitty: self.kitty,
+            protected_mode: self.protected_mode,
         };
         if let Some(registry) = images {
             // Number the images as they are first named, then copy exactly
@@ -5073,6 +5128,10 @@ impl TerminalCheckpointV3 {
     ) -> Result<(), TerminalCheckpointError> {
         if attributes.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
+        }
+        // A protected pen would come back unprotected.
+        if !limits.capture_protection && attributes.protected() {
+            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
         }
         for color in [
             attributes.foreground(),
@@ -5524,11 +5583,15 @@ impl TerminalCheckpointV3 {
         validate_custom_cell_width_maps(&custom_cell_width_maps, limits, &mut screen_usage)?;
         replay_config.validate(limits, custom_cell_width_maps.len(), &mut screen_usage)?;
         Self::preflight_terminal_fields(terminal, limits, &mut screen_usage, true)?;
-        // Restore starts with protection off; any other mode decides which
-        // erases keep protected cells, possibly in cold scrollback.
-        if terminal.protected_mode != ProtectedMode::Off {
+        // The mode decides which erases keep protected cells, possibly in
+        // cold scrollback; without protection, restore starts with it off.
+        let protected_mode = if limits.capture_protection {
+            Some(CheckpointProtectedMode::capture(terminal.protected_mode))
+        } else if terminal.protected_mode != ProtectedMode::Off {
             return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
-        }
+        } else {
+            None
+        };
         let mut images = None;
         let mut kitty = None;
         let kitty_max_image_id = if limits.capture_graphics {
@@ -5712,6 +5775,7 @@ impl TerminalCheckpointV3 {
             limits,
             images,
             kitty,
+            protected_mode,
         })
     }
 
@@ -5775,6 +5839,21 @@ impl TerminalCheckpointV3 {
                     .iter()
                     .flat_map(|kitty| kitty.images.iter().map(|(_, image)| *image)),
             )
+    }
+
+    /// Whether a cell or pen it holds is protected.
+    fn holds_protected_attributes(&self) -> bool {
+        let saved_pens = self
+            .primary_screen
+            .saved_cursor
+            .iter()
+            .chain(self.alternate_screen.saved_cursor.iter())
+            .map(|saved| &saved.pen);
+        std::iter::once(&self.pen)
+            .chain(saved_pens)
+            .chain(self.primary_screen.attribute_sets())
+            .chain(self.alternate_screen.attribute_sets())
+            .any(|attributes| attributes.protected)
     }
 
     /// Every one of the `images` table entries is named, and first named in
@@ -5988,6 +6067,12 @@ impl TerminalCheckpointV3 {
         self.alternate_screen
             .validate(false, limits, &mut usage, self.seqno, encoding, images)?;
         self.validate_image_order(images)?;
+        if self.protected_mode.is_none() && self.holds_protected_attributes() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "protected_mode",
+                reason: "a checkpoint holding protected cells holds the protection mode",
+            });
+        }
 
         let rows = self.primary_screen.physical_rows;
         let cols = self.primary_screen.physical_cols;
@@ -6483,6 +6568,7 @@ impl TerminalCheckpointV3 {
         let limits = TerminalCheckpointLimits {
             line_encoding: encoding,
             capture_graphics: checkpoint.replay_config.admits_graphics(),
+            capture_protection: checkpoint.protected_mode.is_some(),
             ..limits
         };
         Ok(ValidatedTerminalCheckpointV3 { checkpoint, limits })
@@ -6665,6 +6751,13 @@ impl ValidatedTerminalCheckpointV3 {
     #[must_use]
     pub const fn captures_graphics(&self) -> bool {
         self.limits.capture_graphics
+    }
+
+    /// Whether the checkpoint holds character protection, so that a terminal
+    /// restored from it, which replays protected output, captures it again.
+    #[must_use]
+    pub const fn captures_protection(&self) -> bool {
+        self.limits.capture_protection
     }
 
     /// Consume the wrapper and return the validated `TerminalCheckpointV3`.
@@ -6882,6 +6975,7 @@ impl TerminalState {
             bidi_hint,
             images,
             kitty,
+            protected_mode,
         } = checkpoint;
 
         // Each entry becomes one object, which every cell and Kitty id
@@ -7012,8 +7106,9 @@ impl TerminalState {
             batch_config,
             screen: screens,
             pen: restored_pen,
-            // Capture refuses any other mode.
-            protected_mode: ProtectedMode::Off,
+            // Without protection, capture refused any other mode.
+            protected_mode: protected_mode
+                .map_or(ProtectedMode::Off, CheckpointProtectedMode::into_live),
             cursor: restored_cursor,
             wrap_next,
             clear_semantic_attribute_on_newline,
@@ -7158,6 +7253,9 @@ impl From<crate::screen::ScreenCheckpointCaptureError> for TerminalCheckpointErr
             }
             crate::screen::ScreenCheckpointCaptureError::UnsupportedGraphicsState => {
                 Self::UnsupportedGraphicsState
+            }
+            crate::screen::ScreenCheckpointCaptureError::UnsupportedCharacterProtection => {
+                Self::UnsupportedCharacterProtection
             }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
                 Self::ColdScrollbackMetadataInconsistent
@@ -7628,6 +7726,135 @@ mod tests {
         assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
         terminal.advance_bytes(b"\x1b[2J");
         assert!(TerminalCheckpointV3::capture(&terminal).is_ok());
+    }
+
+    fn protection_limits(
+        line_encoding: TerminalCheckpointLineEncoding,
+    ) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            line_encoding,
+            capture_protection: true,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// With protection admitted, protected cells, a protected pen and saved
+    /// pen, and each protection mode restore exactly in either encoding, and
+    /// erases after the restore keep what they keep live.
+    #[test]
+    fn character_protection_restores_exactly_when_admitted() {
+        for (setup, erase) in [
+            // DECSCA: protected cells and pen, DEC mode; DECSED keeps them.
+            (
+                &b"\x1b[1\"qkept\x1b[0\"q gone\r\n\x1b[1\"q\x1b7"[..],
+                &b"\x1b[?2J"[..],
+            ),
+            // SPA: ISO mode outlasts EPA; ED keeps protected cells too.
+            (&b"\x1bVkept\x1bW gone\r\n"[..], &b"\x1b[2J"[..]),
+        ] {
+            let mut live = terminal();
+            live.advance_bytes(setup);
+            for encoding in [
+                TerminalCheckpointLineEncoding::Cells,
+                TerminalCheckpointLineEncoding::Runs,
+            ] {
+                let limits = protection_limits(encoding);
+                assert_eq!(
+                    TerminalCheckpointV3::capture_with_limits(
+                        &live,
+                        TerminalCheckpointLimits {
+                            capture_protection: false,
+                            ..limits
+                        }
+                    )
+                    .err(),
+                    Some(TerminalCheckpointError::UnsupportedCharacterProtection)
+                );
+                let payload = TerminalCheckpointV3::capture_with_limits(&live, limits)
+                    .unwrap()
+                    .to_canonical_json(limits)
+                    .unwrap();
+                let decoded = TerminalCheckpointV3::decode_canonical_json(
+                    &payload,
+                    TerminalCheckpointLimits::default(),
+                )
+                .unwrap();
+                assert!(decoded.captures_protection());
+                let mut restored = decoded
+                    .restore_inert(Arc::new(CheckpointTestConfig))
+                    .unwrap();
+                assert_eq!(
+                    restored
+                        .checkpoint()
+                        .unwrap()
+                        .to_canonical_json(limits)
+                        .unwrap(),
+                    payload
+                );
+                let mut erased = terminal();
+                erased.advance_bytes(setup);
+                erased.advance_bytes(erase);
+                restored.replay_bytes(erase).unwrap();
+                let expected = TerminalCheckpointV3::capture_with_limits(&erased, limits)
+                    .unwrap()
+                    .to_canonical_json(limits)
+                    .unwrap();
+                assert_eq!(
+                    restored
+                        .checkpoint()
+                        .unwrap()
+                        .to_canonical_json(limits)
+                        .unwrap(),
+                    expected
+                );
+                let text = std::str::from_utf8(&expected).unwrap();
+                assert!(text.contains("\"protected\":true"));
+            }
+        }
+        // A protection-capable capture of an unprotected terminal holds only
+        // the mode, off; without protection its bytes are as before.
+        let plain = terminal();
+        let text = String::from_utf8(
+            TerminalCheckpointV3::capture_with_limits(
+                &plain,
+                protection_limits(TerminalCheckpointLineEncoding::Runs),
+            )
+            .unwrap()
+            .to_canonical_json(protection_limits(TerminalCheckpointLineEncoding::Runs))
+            .unwrap()
+            .to_vec(),
+        )
+        .unwrap();
+        assert!(text.ends_with(",\"protected_mode\":\"off\"}"));
+        assert!(!text.contains("\"protected\":"));
+        let text = String::from_utf8(
+            TerminalCheckpointV3::capture(&plain)
+                .unwrap()
+                .to_canonical_json(TerminalCheckpointLimits::default())
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!text.contains("protected"));
+    }
+
+    /// A protected cell needs the mode beside it: without, the checkpoint
+    /// would restore a terminal that cannot capture what it holds.
+    #[test]
+    fn protected_cells_without_the_mode_fail_validation() {
+        let mut live = terminal();
+        live.advance_bytes(b"\x1b[1\"qkept\x1b[0\"q");
+        let limits = protection_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert!(checkpoint.validate(limits).is_ok());
+        checkpoint.protected_mode = None;
+        assert!(matches!(
+            checkpoint.validate(limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "protected_mode",
+                ..
+            })
+        ));
     }
 
     #[test]

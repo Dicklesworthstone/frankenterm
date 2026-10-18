@@ -2974,6 +2974,8 @@ pub(crate) struct ScreenCheckpointLimits {
     pub max_retained_capture_bytes: usize,
     /// Whether a line may show images: the capture holds graphics state.
     pub allow_images: bool,
+    /// Whether a cell may be protected: the capture holds protection.
+    pub allow_protection: bool,
     pub estimated_bytes_per_line: usize,
     pub estimated_bytes_per_cell: usize,
 }
@@ -3002,6 +3004,7 @@ pub(crate) enum ScreenCheckpointCaptureError {
     ResourceAllocation(&'static str),
     InvalidLineGeometry,
     UnsupportedGraphicsState,
+    UnsupportedCharacterProtection,
     ColdScrollbackMetadataInconsistent,
     ColdScrollbackSnapshot(ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
@@ -4215,6 +4218,10 @@ fn inspect_checkpoint_line(
         let width = cell.width();
         if !(1..=2).contains(&width) {
             return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
+        }
+        // A protected cell would come back unprotected.
+        if !limits.allow_protection && cell.attrs().protected() {
+            return Err(ScreenCheckpointCaptureError::UnsupportedCharacterProtection);
         }
         semantic_cells = semantic_cells.checked_add(width).ok_or(
             ScreenCheckpointCaptureError::ArithmeticOverflow("semantic_line_cells"),

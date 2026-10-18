@@ -179,6 +179,22 @@ pub fn guardian_admits_graphics_checkpoints(socket: &Path, token: &Path) -> bool
     admitted
 }
 
+/// Whether the guardian at `socket` validates terminal checkpoints holding
+/// character protection, for `Mux::set_guardian_protection_checkpoints`; a
+/// probe like `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_protection_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_protection_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "character protection held (DECSCA, SPA)"
+        } else {
+            "no character protection (the guardian, or this build, predates it); a pane holding protected cells refuses capture"
+        }
+    );
+    admitted
+}
+
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
 /// transaction; an unadopted birth fences further spawning in this domain.
@@ -401,10 +417,12 @@ impl Domain for GuardianDomain {
         };
         validate_pty_size(pty_size)?;
         // The birth model holds the graphics configuration, so that replay
-        // applies the child's first image output, exactly when this mux's
-        // guardian admits graphics state.
+        // applies the child's first image output, and captures protection,
+        // exactly when this mux's guardian admits each.
+        let mux_limits = mux.guardian_checkpoint_limits();
         let birth_limits = TerminalCheckpointLimits {
-            capture_graphics: mux.guardian_checkpoint_limits().capture_graphics,
+            capture_graphics: mux_limits.capture_graphics,
+            capture_protection: mux_limits.capture_protection,
             ..TerminalCheckpointLimits::default()
         };
         let socket = self.socket_path.clone();

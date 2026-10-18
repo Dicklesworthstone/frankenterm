@@ -4945,12 +4945,13 @@ impl GuardianRestoredTerminal {
             (validated.pixel_width(), validated.pixel_height()) == expected_pixel_size,
             "checkpoint pixel geometry does not match the claimed topology manifest"
         );
-        // A checkpoint holding graphics state restores a terminal that may
-        // show images, and replay may add more: every capture of the restored
-        // model (activation, its validation) holds them, whatever the caller's
-        // limits say.
+        // A checkpoint holding graphics state or protection restores a
+        // terminal that may show images or protect cells, and replay may add
+        // more: every capture of the restored model (activation, its
+        // validation) holds them, whatever the caller's limits say.
         let limits = TerminalCheckpointLimits {
             capture_graphics: limits.capture_graphics || validated.captures_graphics(),
+            capture_protection: limits.capture_protection || validated.captures_protection(),
             ..limits
         };
         Ok(Self {
