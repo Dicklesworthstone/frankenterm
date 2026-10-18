@@ -1958,6 +1958,7 @@ impl CheckpointCellAttributes {
         self.foreground.validate()?;
         self.background.validate()?;
         self.underline_color.validate()?;
+        usage.protected_attributes |= self.protected;
         if let Some(cells) = self.images.as_ref() {
             // `CellAttributes::attach_image` keeps a cell's images in
             // z-index order and binary-searches that order.
@@ -3309,10 +3310,11 @@ impl PendingReplayConfigV2 {
             && expected_unicode == self.unicode_version
             && checkpoint.normalize_output_to_unicode_nfc == self.normalize_output_to_unicode_nfc
             && checkpoint.bidi_enabled == self.bidi_enabled
-            && checkpoint.bidi_hint == self.bidi_hint
-            && checkpoint
-                .graphics
-                .is_none_or(|graphics| graphics == self.graphics))
+            && checkpoint.bidi_hint == self.bidi_hint)
+        // The graphics configuration need not match: replay applies image
+        // output under the checkpoint's own, and once activated the terminal
+        // takes the live one, as a configuration reload would. Requiring it
+        // would fail every restore after a release changed a Kitty default.
     }
 }
 
@@ -3424,6 +3426,13 @@ impl CheckpointReplayConfigV2 {
     /// configuration the live terminal applied it with.
     pub(crate) fn admits_graphics(&self) -> bool {
         self.graphics.is_some()
+    }
+
+    /// Whether replay applies Kitty graphics commands; under a graphics
+    /// configuration with them disabled, the live terminal ignored them.
+    pub(crate) fn replays_kitty_graphics(&self) -> bool {
+        self.graphics
+            .is_some_and(|graphics| graphics.enable_kitty_graphics)
     }
 
     pub(crate) fn matches_stable(
@@ -5457,6 +5466,13 @@ impl TerminalCheckpointV3 {
         limits: TerminalCheckpointLimits,
     ) -> Result<(), TerminalCheckpointError> {
         limits.validate_policy()?;
+        // This checks resources, which protection holds none of: whether a
+        // protected cell or mode can be captured is decided at capture, and
+        // replayed protection an erase clears again never needs to be.
+        let limits = TerminalCheckpointLimits {
+            capture_protection: true,
+            ..limits
+        };
         let mut usage = crate::screen::ScreenCheckpointUsage::default();
         validate_live_custom_cell_width_maps(custom_cell_width_maps, limits, &mut usage)?;
         let table_count = custom_cell_width_maps.len();
@@ -5841,21 +5857,6 @@ impl TerminalCheckpointV3 {
             )
     }
 
-    /// Whether a cell or pen it holds is protected.
-    fn holds_protected_attributes(&self) -> bool {
-        let saved_pens = self
-            .primary_screen
-            .saved_cursor
-            .iter()
-            .chain(self.alternate_screen.saved_cursor.iter())
-            .map(|saved| &saved.pen);
-        std::iter::once(&self.pen)
-            .chain(saved_pens)
-            .chain(self.primary_screen.attribute_sets())
-            .chain(self.alternate_screen.attribute_sets())
-            .any(|attributes| attributes.protected)
-    }
-
     /// Every one of the `images` table entries is named, and first named in
     /// table order.
     fn validate_image_order(&self, images: usize) -> Result<(), TerminalCheckpointError> {
@@ -6067,7 +6068,8 @@ impl TerminalCheckpointV3 {
         self.alternate_screen
             .validate(false, limits, &mut usage, self.seqno, encoding, images)?;
         self.validate_image_order(images)?;
-        if self.protected_mode.is_none() && self.holds_protected_attributes() {
+        // Every cell and pen was validated above, the pens included.
+        if self.protected_mode.is_none() && usage.protected_attributes {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "protected_mode",
                 reason: "a checkpoint holding protected cells holds the protection mode",
@@ -9961,6 +9963,145 @@ mod tests {
                 "{medium}"
             );
         }
+    }
+
+    /// A query changes nothing replay keeps, so replay drops it instead of
+    /// reading the file it names; with Kitty graphics disabled the live
+    /// terminal ignored every Kitty command, and replay ignores even one
+    /// that names a file.
+    #[test]
+    fn replay_drops_kitty_queries_and_ignores_kitty_when_disabled() {
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut terminal = graphics_terminal();
+        terminal.advance_bytes(b"text\r\n");
+        let payload = graphics_payload(&terminal, limits);
+        let mut restored = restore_graphics(&payload, limits);
+        let query = kitty_command(
+            "a=q,t=f,i=5",
+            Some(b"/tmp/frankenterm-checkpoint-query.png"),
+        );
+        restored
+            .replay_bytes(&query)
+            .expect("a query replays as nothing");
+        terminal.advance_bytes(&query);
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            graphics_payload(&terminal, limits)
+        );
+
+        #[derive(Debug)]
+        struct KittyDisabledConfig;
+        impl TerminalConfiguration for KittyDisabledConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+        }
+        let mut disabled = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(KittyDisabledConfig),
+            "FrankenTerm",
+            "checkpoint-kitty-disabled-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let payload = graphics_payload(&disabled, limits);
+        let mut restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(KittyDisabledConfig))
+            .unwrap();
+        let file = kitty_command(
+            "a=T,f=100,t=f,i=5,q=2",
+            Some(b"/tmp/frankenterm-checkpoint-image.png"),
+        );
+        restored
+            .replay_bytes(&file)
+            .expect("disabled Kitty graphics ignore the command");
+        disabled.advance_bytes(&file);
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            graphics_payload(&disabled, limits)
+        );
+    }
+
+    /// Replay applies image output under the checkpoint's own graphics
+    /// configuration, so a restoring configuration with other Kitty limits,
+    /// as after a release changed a default, still restores.
+    #[test]
+    fn restore_admits_a_different_graphics_configuration() {
+        #[derive(Debug)]
+        struct SmallerKittyBudget;
+        impl TerminalConfiguration for SmallerKittyBudget {
+            fn scrollback_size(&self) -> usize {
+                64
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn enable_kitty_graphics(&self) -> bool {
+                true
+            }
+            fn kitty_image_budget_bytes(&self) -> usize {
+                1024 * 1024
+            }
+        }
+        let mut terminal = graphics_terminal();
+        feed_graphics(&mut terminal);
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let payload = graphics_payload(&terminal, limits);
+        let restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(SmallerKittyBudget))
+            .expect("restore under another Kitty budget");
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            payload
+        );
+    }
+
+    /// Replay checks resources, not protection: protection replayed output
+    /// sets and clears again restores from a checkpoint without protection,
+    /// as it did before protection checkpoints.
+    #[test]
+    fn replayed_protection_cleared_again_restores_without_protection() {
+        let limits = TerminalCheckpointLimits::default();
+        let payload = TerminalCheckpointV3::capture(&terminal())
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(CheckpointTestConfig))
+            .unwrap();
+        restored
+            .replay_bytes(b"\x1b[1\"qkept\x1b[0\"q")
+            .expect("replay protected output");
+        assert_eq!(
+            restored.checkpoint().err(),
+            Some(crate::InertTerminalError::Checkpoint(
+                TerminalCheckpointError::UnsupportedCharacterProtection
+            ))
+        );
+        restored
+            .replay_bytes(b"\x1b[!p\x1b[2J")
+            .expect("replay the erase that clears it");
+        restored.checkpoint().expect("nothing protected remains");
     }
 
     #[test]

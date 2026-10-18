@@ -978,11 +978,26 @@ impl InertTerminal {
         // Image output replays only under the graphics configuration the
         // live terminal applied it with (a checkpoint holding graphics
         // state), and never from a file or shared memory: restore reads
-        // nothing but the journal.
+        // nothing but the journal. A Kitty query changes nothing but its
+        // reply, which replay discards, so replay drops it rather than read
+        // what it names; with Kitty graphics disabled, the live terminal
+        // ignored every Kitty command, and replay does too.
         let graphics = self.replay_projection.admits_graphics();
+        let kitty = self.replay_projection.replays_kitty_graphics();
+        if graphics {
+            actions.retain(|action| {
+                !matches!(
+                    action,
+                    Action::KittyImage(image)
+                        if matches!(**image, frankenterm_escape_parser::apc::KittyImage::Query { .. })
+                )
+            });
+        }
         let unsupported = actions.iter().any(|action| match action {
             Action::Sixel(_) => !graphics,
-            Action::KittyImage(image) => !graphics || kitty_image_reads_outside_journal(image),
+            Action::KittyImage(image) => {
+                !graphics || (kitty && kitty_image_reads_outside_journal(image))
+            }
             Action::OperatingSystemCommand(command) => {
                 !graphics
                     && matches!(

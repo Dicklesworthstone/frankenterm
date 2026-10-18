@@ -421,8 +421,18 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     }
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
-    // Version 4 lines when the mux's guardian admits them.
-    let limits = mux.guardian_checkpoint_limits();
+    // Version 4 lines, graphics and protection when the mux's guardian admits
+    // them. A pane's checkpoint must also fit the recovery image's per-pane
+    // ceiling: capture trims the oldest history to it, as it does to its own
+    // encoding ceiling, instead of publication refusing the whole image (a
+    // pane showing tens of megabytes of images exceeds it).
+    let guardian_limits = mux.guardian_checkpoint_limits();
+    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+        max_encoded_bytes: guardian_limits.max_encoded_bytes.min(
+            crate::session_restore::WholeMuxRecoveryLimits::default().max_per_pane_checkpoint_bytes,
+        ),
+        ..guardian_limits
+    };
     let mut timing = CaptureTiming {
         started,
         panes: captured.pane_bindings.len(),

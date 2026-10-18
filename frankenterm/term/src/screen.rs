@@ -2990,6 +2990,8 @@ pub(crate) struct ScreenCheckpointUsage {
     pub hyperlink_bytes: usize,
     pub hyperlink_params: usize,
     pub retained_capture_bytes: usize,
+    /// A validated cell or pen is protected (DECSCA, SPA).
+    pub protected_attributes: bool,
 }
 
 #[cfg(feature = "use_serde")]
