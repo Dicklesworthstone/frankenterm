@@ -23544,7 +23544,7 @@ mod tests {
             for (left, right) in left.iter().flatten().zip(right.iter().flatten()) {
                 assert_eq!(left.z_index(), right.z_index());
                 assert_eq!(left.top_left(), right.top_left());
-                assert!(*left.image_data().data() == *right.image_data().data());
+                assert_eq!(*left.image_data().data(), *right.image_data().data());
                 assert_eq!(
                     left.image_data().current_content_hash(),
                     right.image_data().current_content_hash()
