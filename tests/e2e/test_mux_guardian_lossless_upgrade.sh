@@ -34,6 +34,11 @@
 # before graphics checkpoints), and each restore after the upgrade and
 # after the rollback must report the images it restored.
 #
+# E2E_PROTECTED=1 (with E2E_PANES > 2) makes every even pane from 2 up print
+# a DECSCA-protected word before it ticks, which leaves the DEC protection
+# mode on: recovery must still publish, as a pane holding protection refused
+# capture before protection checkpoints.
+#
 # POST_UPGRADE_SOAK_SECONDS=N (default 0) keeps the upgraded mux running N
 # seconds before the rollback; it must publish a recovery generation in
 # that time, as a successor whose restore pinned the guardian's catalog
@@ -91,11 +96,14 @@ images() {  # -> shell commands showing and storing the images
   echo "printf '\\033_Ga=T,f=32,s=2,v=2,i=31,q=2;%s\\033\\\\\\n' $RGBA; "
   echo "printf '\\033_Ga=t,f=32,s=2,v=2,i=32,q=2;%s\\033\\\\' $RGBA; "
 }
+PROTECTED=${E2E_PROTECTED:-0}
 prog() {  # <pane index> -> its shell program
   local tag="" burst="" shown=""
   [ "$1" -gt 0 ] && tag="p$1 "
   [ "$1" = 0 ] && burst=$BURST
   [ "$IMAGES" = 1 ] && [ $(( $1 % 2 )) = 1 ] && shown=$(images | tr -d '\n')
+  [ "$PROTECTED" = 1 ] && [ "$1" -ge 2 ] && [ $(( $1 % 2 )) = 0 ] \
+    && shown="printf '\\033[1\"qprotected\\033[0\"q\\n'; "
   echo "${burst}${shown}i=0; while :; do echo \"$MARK ${tag}tick \$i\"; i=\$((i+1)); sleep 1; done"
 }
 if [ "$PANES" -gt 1 ]; then
