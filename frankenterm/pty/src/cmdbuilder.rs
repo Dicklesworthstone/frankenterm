@@ -264,7 +264,7 @@ fn pathext_suffix(ext: &OsStr) -> Option<&str> {
 
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
 /// The interface is intentionally similar to that of `std::process::Command`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct CommandBuilder {
     #[cfg_attr(feature = "serde_support", serde(with = "os_string_vec_serde"))]
@@ -1004,6 +1004,30 @@ impl PreparedCommand {
     }
 }
 
+/// Names each environment variable, never its value. A command inherits
+/// every secret of its environment (API keys, session tokens), and a spawn
+/// failure's error context formats the command, which put them in the mux
+/// log.
+impl std::fmt::Debug for CommandBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys: Vec<&OsString> = self
+            .envs
+            .values()
+            .map(|entry| &entry.preferred_key)
+            .collect();
+        let mut debug = formatter.debug_struct("CommandBuilder");
+        debug
+            .field("args", &self.args)
+            .field("env_keys", &env_keys)
+            .field("cwd", &self.cwd);
+        #[cfg(unix)]
+        debug.field("umask", &self.umask);
+        debug
+            .field("controlling_tty", &self.controlling_tty)
+            .finish()
+    }
+}
+
 #[cfg(unix)]
 impl std::fmt::Debug for PreparedCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1227,6 +1251,18 @@ mod tests {
         assert!(is_cwd_relative_path("../foo"));
         assert!(!is_cwd_relative_path("foo"));
         assert!(!is_cwd_relative_path("/foo"));
+    }
+
+    #[test]
+    fn debug_names_environment_variables_but_not_their_values() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env("FT_TEST_API_KEY", "sk_never_logged");
+        cmd.cwd("/somewhere");
+        let rendered = format!("{:?}", cmd);
+        assert!(rendered.contains("FT_TEST_API_KEY"));
+        assert!(rendered.contains("bash"));
+        assert!(rendered.contains("/somewhere"));
+        assert!(!rendered.contains("sk_never_logged"));
     }
 
     #[test]
