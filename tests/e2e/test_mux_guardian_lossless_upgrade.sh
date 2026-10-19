@@ -62,6 +62,10 @@ export TMPDIR=$S/h/tmp FTG_INSTANCE=e2e FTG_RECOVERY_INTERVAL=2
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 chmod 700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 unset WEZTERM_UNIX_SOCKET WEZTERM_PANE FRANKENTERM_UNIX_SOCKET FT_WORKSPACE FT_GRID_ENGINE
+# Services started directly inherit this shell's environment. An RCH
+# worker's RUST_LOG hid the mux's capture-failure warnings, so the
+# services log at their own default (info).
+unset RUST_LOG
 cd "$HOME" || exit 1
 
 FAILS=0
