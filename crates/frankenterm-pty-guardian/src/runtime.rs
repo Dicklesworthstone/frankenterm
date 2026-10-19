@@ -867,11 +867,20 @@ fn checkpoint_worker(
 ) {
     while let Ok(mut job) = jobs.recv() {
         let operation = job.request.header().operation;
+        let started = std::time::Instant::now();
         let authority_valid_before = job.token_effect_authority.validate();
         let execution = authority_valid_before.then(|| {
             catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job))
         });
         let authority_valid_after = job.token_effect_authority.validate();
+        // One worker serves every pane's replay opens and checkpoint stages,
+        // so a recovery capture waits behind them (ft-4wrv7). Enable with
+        // RUST_LOG=frankenterm_pty_guardian::checkpoint_timing=debug.
+        log::debug!(
+            target: "frankenterm_pty_guardian::checkpoint_timing",
+            "{operation:?} ran {} us",
+            started.elapsed().as_micros()
+        );
         let token_authority_failed = !authority_valid_before || !authority_valid_after;
         // Response correlation validates against the authenticated request, so
         // build it first. Then wipe plaintext before publishing any completion.
