@@ -14110,7 +14110,6 @@ fn serialize_image_semantic_scrollback_line_into(
         && serialize_semantic_scrollback_payload_into(&sidecar, out)
 }
 
-/// Attach schema 4's images to the cells of its decoded row.
 /// Live images decoded rows may share, by content hash: at most this many.
 const ROW_IMAGE_INTERN_ENTRIES: usize = 64;
 
@@ -14144,6 +14143,7 @@ fn intern_row_image(image: termwiz::image::ImageData) -> Arc<termwiz::image::Ima
     })
 }
 
+/// Attach schema 4's images to the cells of its decoded row.
 fn attach_exact_scrollback_row_images(
     line: &mut wezterm_term::Line,
     sidecar: ExactScrollbackRowImagesV1,
