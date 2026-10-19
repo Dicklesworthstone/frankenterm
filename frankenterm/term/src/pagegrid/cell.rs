@@ -211,6 +211,56 @@ impl<'a> Glyph<'a> {
     }
 }
 
+/// One cell of a printed run ([`super::Page::append_graphemes`]): its text,
+/// its width (1 or 2) and its first scalar, which the print path's
+/// segmentation decoded already. Storing the run classifies each cell from
+/// that scalar instead of decoding its text again, which was a tenth of a
+/// mixed-script ingest (ft-yccm0.3.2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunGrapheme<'a> {
+    pub text: &'a str,
+    pub width: u8,
+    first: char,
+    cluster: bool,
+}
+
+impl<'a> RunGrapheme<'a> {
+    /// `text` as one cell `width` columns wide.
+    #[inline]
+    pub fn new(text: &'a str, width: u8) -> Self {
+        let first = text.chars().next();
+        Self {
+            text,
+            width,
+            first: first.unwrap_or(' '),
+            cluster: first.is_some_and(|first| text.len() != first.len_utf8()),
+        }
+    }
+
+    /// `text`, the single scalar `c`, as one cell `width` columns wide.
+    #[inline]
+    pub fn scalar(text: &'a str, c: char, width: u8) -> Self {
+        debug_assert_eq!(text.len(), c.len_utf8());
+        debug_assert!(text.starts_with(c));
+        Self {
+            text,
+            width,
+            first: c,
+            cluster: false,
+        }
+    }
+
+    /// [`Glyph::from_text`] of the text.
+    #[inline]
+    pub fn glyph(self) -> Glyph<'a> {
+        match self.first {
+            _ if self.cluster => Glyph::Cluster(self.text),
+            ' ' => Glyph::Blank,
+            first => Glyph::Char(first),
+        }
+    }
+}
+
 /// The style a cell stores: inline, or an id into the page's rich table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CellStyle {

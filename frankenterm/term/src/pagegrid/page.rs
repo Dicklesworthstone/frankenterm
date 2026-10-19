@@ -15,7 +15,7 @@
 #![allow(clippy::vec_box)]
 
 use super::cell::{
-    classify, style_attributes, CellStyle, Glyph, InlineStyle, PackedCell, StyleClass,
+    classify, style_attributes, CellStyle, Glyph, InlineStyle, PackedCell, RunGrapheme, StyleClass,
 };
 use super::grapheme::GraphemeArena;
 use super::links::{attach_image, ImageMap, LinkTable};
@@ -1251,15 +1251,15 @@ impl Page {
         &mut self,
         row: u32,
         x: usize,
-        cells: &[(&str, u8)],
+        cells: &[RunGrapheme<'_>],
         mut cell: CellWrite<'_>,
         seqno: SequenceNo,
     ) -> bool {
-        debug_assert!(cells.iter().all(|&(_, width)| matches!(width, 1 | 2)));
+        debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
         let header = self.header(row);
         let slot = header.slot();
         let old_len = header.len();
-        let stored: usize = cells.iter().map(|&(_, width)| usize::from(width)).sum();
+        let stored: usize = cells.iter().map(|run| usize::from(run.width)).sum();
         let end = x.saturating_add(stored);
         if cells.is_empty()
             || x < old_len
@@ -1288,8 +1288,8 @@ impl Page {
         // so the padding stays default blanks and only spacers are hidden.
         let mut col = x;
         let mut any_cluster = false;
-        for &(text, width) in cells {
-            let glyph = Glyph::from_text(text);
+        for &run in cells {
+            let (glyph, width) = (run.glyph(), run.width);
             let wide = width == 2;
             let off = self.offset(slot, col);
             let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
@@ -1333,15 +1333,15 @@ impl Page {
         &mut self,
         row: u32,
         x: usize,
-        cells: &[(&str, u8)],
+        cells: &[RunGrapheme<'_>],
         mut cell: CellWrite<'_>,
         seqno: SequenceNo,
     ) -> bool {
-        debug_assert!(cells.iter().all(|&(_, width)| matches!(width, 1 | 2)));
+        debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
         let header = self.header(row);
         let slot = header.slot();
         let old_len = header.len();
-        let stored: usize = cells.iter().map(|&(_, width)| usize::from(width)).sum();
+        let stored: usize = cells.iter().map(|run| usize::from(run.width)).sum();
         let end = x.saturating_add(stored);
         if cells.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
             return false;
@@ -1377,8 +1377,8 @@ impl Page {
             .with_hyperlink(cell.hyperlink.is_some());
         let mut col = x;
         let mut any_cluster = false;
-        for &(text, width) in cells {
-            let glyph = Glyph::from_text(text);
+        for &run in cells {
+            let (glyph, width) = (run.glyph(), run.width);
             let wide = width == 2;
             let off = self.offset(slot, col);
             let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);

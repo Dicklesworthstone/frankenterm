@@ -13,7 +13,7 @@
 //! A function that returns `false` has written nothing. The caller then
 //! applies the legacy method to the row's `Line` view instead.
 
-use super::cell::{classify, Glyph, PackedCell, StyleClass};
+use super::cell::{classify, Glyph, PackedCell, RunGrapheme, StyleClass};
 use super::grapheme::MAX_GRAPHEME_BYTES;
 use super::page::{CellWrite, Page, StyleSpec};
 use super::row::RowHeader;
@@ -250,7 +250,7 @@ pub fn set_grapheme_run(
     page: &mut Page,
     row: u32,
     x: usize,
-    cells: &[(&str, u8)],
+    cells: &[RunGrapheme<'_>],
     attr: &CellAttributes,
     seqno: SequenceNo,
 ) -> bool {
@@ -272,7 +272,7 @@ pub fn set_grapheme_run(
         }
     };
     if (clustered && x > len)
-        || !cells.iter().all(|&(text, _)| kept_whole(text))
+        || !cells.iter().all(|run| kept_whole(run.text))
         || attr.images().is_some_and(|images| !images.is_empty())
     {
         return false;
@@ -285,8 +285,8 @@ pub fn set_grapheme_run(
     let mut vector = clustered && overwrite;
     if clustered && !overwrite {
         let mut prev = last_char(page, row);
-        for &(text, _) in cells {
-            let mut chars = text.chars();
+        for run in cells {
+            let mut chars = run.text.chars();
             let first = chars.next().unwrap_or(' ');
             if !clustered_append_breaks(prev, first) {
                 vector = true;
@@ -322,7 +322,7 @@ pub fn set_grapheme_run(
     if attr.protected() {
         let end = x + cells
             .iter()
-            .map(|&(_, width)| usize::from(width))
+            .map(|run| usize::from(run.width))
             .sum::<usize>();
         page.protect_cells(row, x..end);
     }
