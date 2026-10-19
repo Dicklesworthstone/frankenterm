@@ -373,6 +373,8 @@ pub struct ScreenLineRead {
     cold_context: Option<Range<StableRowIndex>>,
     rendered: Option<Vec<Line>>,
     hot_top: StableRowIndex,
+    /// The first visible row when captured: rows above it were history.
+    visible_top: StableRowIndex,
     known_resident_history_start: Option<StableRowIndex>,
     wrap_policy: ResizeWrapPolicy,
     layout: Option<Arc<ColdVisualLayout>>,
@@ -4821,6 +4823,8 @@ impl Screen {
             cold_context: None,
             rendered: None,
             hot_top,
+            visible_top: self
+                .phys_to_stable_row_index(self.lines.len().saturating_sub(self.physical_rows)),
             known_resident_history_start: (oldest_is_known && oldest == hot_top).then_some(hot_top),
             wrap_policy: self.resize_wrap_policy,
             layout,
@@ -5164,23 +5168,58 @@ impl Screen {
             }
         }
         if !read.resident.is_empty() {
-            let Some(start) = self.stable_row_to_phys(read.resident_first) else {
-                return Ok(false);
-            };
-            if start
-                .checked_add(read.resident.len())
-                .is_none_or(|end| end > self.lines.len())
-            {
-                return Ok(false);
+            // While the coordinate witness holds, history rows never change:
+            // only a resize, rewrap, clear or region scroll rewrites them,
+            // and each replaces the witness. A busy pane does spill its
+            // oldest hot rows to cold storage as it prints, and those rows
+            // are still the ones this read took. Requiring them to stay
+            // resident refused every multi-chunk read of a pane printing
+            // faster than a chunk could hydrate (ft-ukqe3). A spilled row
+            // must have been history when read, and still be retained; rows
+            // still resident must be unchanged.
+            let resident_now = self.phys_to_stable_row_index(0);
+            let spilled = usize::try_from(resident_now.saturating_sub(read.resident_first).max(0))
+                .unwrap_or(usize::MAX)
+                .min(read.resident.len());
+            if spilled != 0 {
+                let spilled_end = read.resident_first + spilled as StableRowIndex;
+                if spilled_end > read.visible_top {
+                    return Ok(false);
+                }
+                let Some(sink) = self.config.scrollback_spill_sink() else {
+                    return Ok(false);
+                };
+                match sink.try_capture_scrollback_interval() {
+                    ScrollbackIntervalCapture::Ready(now)
+                        if now.rows().is_some_and(|rows| {
+                            rows.start <= read.resident_first && rows.end >= spilled_end
+                        }) => {}
+                    ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+                    _ => return Ok(false),
+                }
             }
-            if !self
-                .lines
-                .iter()
-                .skip(start)
-                .zip(&read.resident)
-                .all(|(now, before)| now == before)
-            {
-                return Ok(false);
+            let unspilled = &read.resident[spilled..];
+            if !unspilled.is_empty() {
+                let Some(start) =
+                    self.stable_row_to_phys(read.resident_first + spilled as StableRowIndex)
+                else {
+                    return Ok(false);
+                };
+                if start
+                    .checked_add(unspilled.len())
+                    .is_none_or(|end| end > self.lines.len())
+                {
+                    return Ok(false);
+                }
+                if !self
+                    .lines
+                    .iter()
+                    .skip(start)
+                    .zip(unspilled)
+                    .all(|(now, before)| now == before)
+                {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -14405,6 +14444,73 @@ pub(crate) mod tests {
             read.hydrate(|| false).is_err(),
             "a read cannot amplify its retained rows by hydrating twice"
         );
+    }
+
+    /// A read of history rows stays publishable when a busy pane spills them
+    /// to cold storage before it publishes: they are still the rows read. A
+    /// row that was visible when read must stay resident (ft-ukqe3).
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn line_read_survives_its_history_rows_spilling_but_not_its_visible_rows() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            scrollback: 64,
+            scrollback_tier: crate::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 4,
+                warm_max_bytes: 0,
+            },
+            cold_sink: Some(sink.clone()),
+            ..TestTermConfig::default()
+        });
+        let mut terminal = crate::Terminal::new(
+            test_size(3, 20, 96),
+            config,
+            "FrankenTerm",
+            "spilled-read-test",
+            Box::new(std::io::sink()),
+        );
+        for index in 0..12 {
+            terminal.advance_bytes(format!("row {index}\r\n").as_bytes());
+        }
+        let screen = terminal.screen();
+        let hot_top = screen.phys_to_stable_row_index(0);
+        let visible_top =
+            screen.phys_to_stable_row_index(screen.lines.len() - screen.physical_rows);
+        assert!(
+            visible_top - hot_top >= 2,
+            "the fixture keeps history rows resident"
+        );
+        let history = screen
+            .capture_line_read(hot_top..hot_top + 2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let visible = screen
+            .capture_line_read(visible_top..visible_top + 1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&history));
+        assert!(screen.validates_line_read(&visible));
+
+        // Two more lines spill the two oldest hot rows to cold storage.
+        terminal.advance_bytes(b"row 12\r\nrow 13\r\n");
+        assert!(
+            terminal.screen().phys_to_stable_row_index(0) >= hot_top + 2,
+            "the history rows spilled"
+        );
+        assert!(
+            terminal.screen().validates_line_read(&history),
+            "spilled history rows are still the rows read"
+        );
+
+        // Spill the once-visible row as well: it was not history when read.
+        for index in 14..24 {
+            terminal.advance_bytes(format!("row {index}\r\n").as_bytes());
+        }
+        assert!(terminal.screen().phys_to_stable_row_index(0) > visible_top);
+        assert!(!terminal.screen().validates_line_read(&visible));
     }
 
     #[cfg(feature = "use_serde")]
