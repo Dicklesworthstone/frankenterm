@@ -7368,13 +7368,9 @@ fn checkpoint_stage_census(
         let raw = name.as_bytes();
         if raw.starts_with(b"recovery-claim-v1-") {
             let path = inner.directory_path.join(&name);
-            let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
-            let metadata = file.metadata().map_err(|error| {
-                GuardianCheckpointStageStoreError::io("recovery-intent-census", error)
-            })?;
-            validate_private_file_metadata(&metadata, None)?;
+            let (bytes, _) = stat_private_file_at(&inner.directory, &inner.directory_path, &path)?;
             total_bytes = total_bytes
-                .checked_add(metadata.len())
+                .checked_add(bytes)
                 .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
             recovery_files += 1;
             if recovery_files + entries.len() > inner.policy.max_stage_files
@@ -7403,13 +7399,10 @@ fn checkpoint_stage_census(
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
         let path = inner.directory_path.join(&name);
-        let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
-        let metadata = file.metadata().map_err(|error| {
-            GuardianCheckpointStageStoreError::io("checkpoint-census-metadata", error)
-        })?;
-        validate_private_file_metadata(&metadata, None)?;
+        let (bytes, modified) =
+            stat_private_file_at(&inner.directory, &inner.directory_path, &path)?;
         total_bytes = total_bytes
-            .checked_add(metadata.len())
+            .checked_add(bytes)
             .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
         if recovery_files + entries.len() >= inner.policy.max_stage_files
             || total_bytes > inner.policy.max_stage_bytes
@@ -7423,8 +7416,8 @@ fn checkpoint_stage_census(
             key,
             role,
             path,
-            bytes: metadata.len(),
-            modified: metadata.modified().ok(),
+            bytes,
+            modified,
         });
         uploads.insert(key);
         if uploads.len() > inner.policy.max_retained_uploads {
@@ -7451,17 +7444,13 @@ fn checkpoint_stage_census_entry(
     role: CheckpointStageFileRole,
     path: PathBuf,
 ) -> Result<CheckpointStageCensusEntry, GuardianCheckpointStageStoreError> {
-    let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
-    let metadata = file.metadata().map_err(|error| {
-        GuardianCheckpointStageStoreError::io("checkpoint-census-metadata", error)
-    })?;
-    validate_private_file_metadata(&metadata, None)?;
+    let (bytes, modified) = stat_private_file_at(&inner.directory, &inner.directory_path, &path)?;
     Ok(CheckpointStageCensusEntry {
         key,
         role,
         path,
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
+        bytes,
+        modified,
     })
 }
 
@@ -12168,6 +12157,79 @@ fn validate_private_directory_metadata(metadata: &Metadata) -> Result<(), Guardi
         ));
     }
     Ok(())
+}
+
+/// The length and modification time of the file `path` names in
+/// `directory`, read with one `statat` instead of opening it, after the
+/// checks [`validate_private_file_metadata`] makes of an opened file: a
+/// current-user, mode-0600, single-link regular file. A Stage census opened
+/// every Stage file for these, and every Stage request takes a census: the
+/// opens were two fifths of a Stage request (ft-4wrv7).
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+#[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+fn stat_private_file_at(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+) -> Result<(u64, Option<std::time::SystemTime>), GuardianOutputError> {
+    let name = output_child_name(directory_path, path)?;
+    let stat = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).map_err(
+        |error| GuardianOutputError::io("output-private-file-stat-at", std::io::Error::from(error)),
+    )?;
+    let bytes = u64::try_from(stat.st_size).ok();
+    let (Some(bytes), true) = (
+        bytes,
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::RegularFile
+            && stat.st_uid == geteuid().as_raw()
+            && u32::from(stat.st_mode) & 0o777 == 0o600
+            && u64::from(stat.st_nlink) == 1,
+    ) else {
+        return Err(GuardianOutputError::FilesystemAuthority(
+            "output files must be current-user mode-0600 single-link regular files with the exact expected length",
+        ));
+    };
+    // `Metadata::modified` of the same file: seconds and nanoseconds since
+    // the epoch, the seconds possibly negative.
+    let modified = i64::try_from(stat.st_mtime)
+        .ok()
+        .zip(u32::try_from(stat.st_mtime_nsec).ok())
+        .and_then(|(seconds, nanos)| {
+            let whole = std::time::Duration::from_secs(seconds.unsigned_abs());
+            if seconds >= 0 {
+                std::time::UNIX_EPOCH.checked_add(whole)
+            } else {
+                std::time::UNIX_EPOCH.checked_sub(whole)
+            }?
+            .checked_add(std::time::Duration::from_nanos(u64::from(nanos)))
+        });
+    Ok((bytes, modified))
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn stat_private_file_at(
+    _directory: &File,
+    _directory_path: &Path,
+    _path: &Path,
+) -> Result<(u64, Option<std::time::SystemTime>), GuardianOutputError> {
+    Err(GuardianOutputError::FilesystemAuthority(
+        "descriptor-relative guardian output file access is unsupported on this Unix target",
+    ))
 }
 
 fn validate_private_file_metadata(
