@@ -5985,12 +5985,18 @@ impl LocalPane {
         expected_dimensions: RenderableDimensions,
         publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        // Which check refused a fenced read (the screen's own checks log
+        // under the same target): RUST_LOG=frankenterm_term::line_read=debug.
+        let refused = |reason: &str| {
+            log::debug!(target: "frankenterm_term::line_read", "line read refused: {reason}");
+            Ok(false)
+        };
         let Some(floor) = Self::refresh_line_layout_floor(&self.line_layout_observation, term)?
         else {
-            return Ok(false);
+            return refused("line layout floor unavailable");
         };
         let Some(dimensions) = terminal_try_get_dimensions(term) else {
-            return Ok(false);
+            return refused("dimensions unavailable");
         };
         if expected_seqno == SequenceNo::MAX
             || expected_seqno < floor
@@ -5998,7 +6004,11 @@ impl LocalPane {
             || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
         {
             record_metadata_refusal(MetadataRefusalStage::PublicationGeometry);
-            return Ok(false);
+            return refused(if expected_seqno < floor {
+                "line layout changed after the fence"
+            } else {
+                "fence geometry or seqno no longer current"
+            });
         }
         for read in reads {
             if !term
@@ -6024,7 +6034,7 @@ impl LocalPane {
             // before accepting coordinates from a refreshed client request.
             // The CurrentPane caller sends notify_lines_ready after this
             // false result; do not reacquire registration authority here.
-            return Ok(false);
+            return refused("the read installed a new cold layout");
         }
         publish();
         Ok(true)
