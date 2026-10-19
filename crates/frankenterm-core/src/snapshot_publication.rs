@@ -1050,6 +1050,9 @@ pub struct SnapshotPublicationStore {
     #[allow(dead_code)]
     generations_dir: Dir,
     limits: PublicationLimits,
+    /// The size of each published object an admission scan validated, by
+    /// name (see [`Self::admit_store_growth`]).
+    validated_object_sizes: std::sync::Mutex<std::collections::HashMap<std::ffi::OsString, u64>>,
 }
 
 impl SnapshotPublicationStore {
@@ -1125,6 +1128,7 @@ impl SnapshotPublicationStore {
             roots_dir,
             generations_dir,
             limits,
+            validated_object_sizes: Default::default(),
         })
     }
 
@@ -1250,6 +1254,7 @@ impl SnapshotPublicationStore {
             roots_dir: root_slots_dir,
             generations_dir,
             limits,
+            validated_object_sizes: Default::default(),
         })
     }
 
@@ -1269,9 +1274,23 @@ impl SnapshotPublicationStore {
     /// abandoned stages and orphan objects are charged exactly like live files.
     /// This is a logical-byte quota; filesystem block/metadata allocation and
     /// unrelated writers outside the protected store are not covered.
+    ///
+    /// A published object never changes: no-clobber publication refuses to
+    /// replace a name, and a staging file is renamed into place whole. So an
+    /// object this store validated keeps the size it had, and the count
+    /// validates only object names it has not seen, plus every staging file.
+    /// Reopening and revalidating every object on every admission, once per
+    /// object published, made a 24-pane capture spend a third of its time
+    /// here and grow with each generation (ft-bzm2p). Each object is still
+    /// validated when first counted and whenever it is read.
     fn admit_store_growth(&self, bytes: u64, entries: usize) -> Result<(), PublicationError> {
         let mut used_bytes = 0_u64;
         let mut used_entries = 0_usize;
+        let mut validated_objects = self
+            .validated_object_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut objects_present = std::collections::HashMap::new();
         for (directory, name) in [
             (&self.root_dir, ""),
             (&self.objects_dir, OBJECTS_DIR_NAME),
@@ -1299,6 +1318,19 @@ impl SnapshotPublicationStore {
                 }
                 let entry = entry.map_err(|error| PublicationError::io(&path, error))?;
                 let leaf = entry.file_name();
+                let published_object = name == OBJECTS_DIR_NAME
+                    && !leaf.as_encoded_bytes().starts_with(STAGE_PREFIX.as_bytes());
+                if let Some(size) = validated_objects
+                    .get(&leaf)
+                    .copied()
+                    .filter(|_| published_object)
+                {
+                    used_bytes = used_bytes
+                        .checked_add(size)
+                        .ok_or(PublicationError::StoreQuotaPolicy)?;
+                    objects_present.insert(leaf, size);
+                    continue;
+                }
                 let entry_path = path.join(&leaf);
                 let metadata = directory
                     .symlink_metadata(&leaf)
@@ -1348,8 +1380,14 @@ impl SnapshotPublicationStore {
                 used_bytes = used_bytes
                     .checked_add(size)
                     .ok_or(PublicationError::StoreQuotaPolicy)?;
+                if published_object {
+                    objects_present.insert(leaf, size);
+                }
             }
         }
+        // Only names present now: a reclaimed or renamed object is forgotten.
+        *validated_objects = objects_present;
+        drop(validated_objects);
         if used_bytes
             .checked_add(bytes)
             .is_none_or(|total| total > self.limits.max_store_bytes)
@@ -3323,6 +3361,68 @@ mod tests {
             reopened.publish_object(&quota_object("zero-byte-entry", b"")),
             Err(PublicationError::StoreCapacity { .. })
         ));
+    }
+
+    /// Admission counts a validated object by its remembered size, and still
+    /// validates every staging file and every object it has not seen, so its
+    /// count never differs from a full rescan (ft-bzm2p).
+    #[cfg(unix)]
+    #[test]
+    fn store_quota_admission_remembers_validated_objects_but_counts_exactly() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let usage = |store: &SnapshotPublicationStore| match store.admit_store_growth(u64::MAX, 0) {
+            Err(PublicationError::StoreCapacity {
+                used_bytes,
+                used_entries,
+                ..
+            }) => (used_bytes, used_entries),
+            other => panic!("an impossible request reports the store's usage: {other:?}"),
+        };
+        for (index, bytes) in [&b"first"[..], b"second object", b"3"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .publish_object(&quota_object(&format!("object-{index}"), bytes))
+                .unwrap();
+        }
+        let scanned = usage(&store);
+        assert_eq!(store.validated_object_sizes.lock().unwrap().len(), 3);
+        assert_eq!(
+            usage(&store),
+            scanned,
+            "a remembered count is an exact count"
+        );
+        let fresh =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        assert_eq!(
+            usage(&fresh),
+            scanned,
+            "and equals a store that remembers nothing"
+        );
+
+        // A staging file is counted at its size now, every time.
+        let stage = temp
+            .path()
+            .join(OBJECTS_DIR_NAME)
+            .join(format!("{STAGE_PREFIX}test.tmp"));
+        std::fs::write(&stage, b"partial").unwrap();
+        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(usage(&store), (scanned.0 + 7, scanned.1 + 1));
+        std::fs::write(&stage, b"partial and longer").unwrap();
+        assert_eq!(usage(&store), (scanned.0 + 18, scanned.1 + 1));
+        assert_eq!(store.validated_object_sizes.lock().unwrap().len(), 3);
+
+        // A new object is validated and counted.
+        store
+            .publish_object(&quota_object("object-3", b"fourth"))
+            .unwrap();
+        assert_eq!(usage(&store), (scanned.0 + 18 + 6, scanned.1 + 2));
+        assert_eq!(usage(&store), usage(&fresh));
     }
 
     #[test]
