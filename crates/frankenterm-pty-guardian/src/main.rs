@@ -72,8 +72,11 @@ struct ServeArgs {
     #[command(flatten)]
     endpoint: EndpointArgs,
 
-    /// Maximum simultaneously connected clients.
-    #[arg(long, default_value_t = 64)]
+    /// Maximum simultaneously connected clients. A mux holds three per pane
+    /// (lease, replay, checkpoint publisher) and a few more for its census
+    /// and spawns, so the transport's maximum serves about 340 panes; at 64
+    /// a mux's 21st pane could not connect (ft-bxeig).
+    #[arg(long, default_value_t = 1024)]
     max_connections: usize,
 
     /// Maximum PTYs owned by this guardian process.
@@ -147,6 +150,7 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Serve(args) => {
+            raise_open_file_limit();
             let mut config = GuardianServiceConfig::new(
                 args.endpoint.socket_path,
                 args.endpoint.token_path,
@@ -190,6 +194,7 @@ fn main() -> anyhow::Result<()> {
             println!("guardian-stop-accepted");
         }
         Command::BrokerServe(args) => {
+            raise_open_file_limit();
             let config = BrokerControlServiceConfigV1::new(
                 args.endpoint.socket_path,
                 args.endpoint.token_path,
@@ -207,6 +212,30 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The soft open-file limit the guardian and the broker run with: the mux's
+/// own `ulimit_nofile` default, so a guardian pane's child inherits what a
+/// plain pane's child does.
+#[cfg(unix)]
+const OPEN_FILE_SOFT_LIMIT: nix::sys::resource::rlim_t = 2048;
+
+/// Raise the soft open-file limit to [`OPEN_FILE_SOFT_LIMIT`], within the
+/// hard limit (ft-bxeig). Every pane holds descriptors in both processes (the
+/// guardian its connections and journals, the broker its PTY and journals),
+/// and a launchd agent starts with a soft limit of 256. Never lowers it.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return;
+    };
+    let wanted = OPEN_FILE_SOFT_LIMIT.min(hard);
+    if soft < wanted
+        && let Err(error) = setrlimit(Resource::RLIMIT_NOFILE, wanted, hard)
+    {
+        log::warn!("could not raise the open-file limit from {soft} to {wanted}: {error}");
+    }
 }
 
 fn retain_guardian_atomic_component_identity() -> anyhow::Result<()> {
@@ -300,6 +329,34 @@ mod tests {
         assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
         assert!(!rendered.contains("--socket-path"));
         assert!(!rendered.contains("--token-path"));
+    }
+
+    #[test]
+    fn serve_defaults_admit_a_fleet_host_of_panes() {
+        let cli = Cli::try_parse_from([
+            "frankenterm-pty-guardian",
+            "serve",
+            "--socket-path",
+            "/private/tmp/guardian/socket",
+            "--token-path",
+            "/private/tmp/guardian/token",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("serve parses as serve");
+        };
+        // Three connections per mux pane, a mux census and a few spawns, for
+        // a fleet host's 40 panes and a successor mux holding them as well.
+        assert!(args.max_connections >= 2 * (3 * 40 + 8));
+
+        // The limit is only ever raised, and stays within the hard limit.
+        use nix::sys::resource::{Resource, getrlimit};
+        let (before, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        raise_open_file_limit();
+        let (after, after_hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        assert_eq!(after_hard, hard);
+        assert!(after >= before);
+        assert!(after >= OPEN_FILE_SOFT_LIMIT.min(hard));
     }
 
     #[test]

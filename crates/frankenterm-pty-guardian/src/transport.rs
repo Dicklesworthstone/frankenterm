@@ -50,6 +50,8 @@ const MAX_OUTPUT_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
+/// A connection refused for want of a slot is logged at most this often.
+const CAPACITY_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// A checkpoint Stage step can make the guardian authenticate and publish a
 /// whole checkpoint before it replies. A missed I/O deadline on a pane's own
@@ -1005,6 +1007,8 @@ pub struct GuardianService {
     free_connection_tokens: Vec<usize>,
     poll_interval: Duration,
     transport_failures: u64,
+    /// When a connection refused for want of a slot was last logged.
+    capacity_refusal_logged_at: Option<Instant>,
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
     next_connection_generation: u64,
@@ -1128,6 +1132,7 @@ impl GuardianService {
             free_connection_tokens,
             poll_interval: config.poll_interval,
             transport_failures: 0,
+            capacity_refusal_logged_at: None,
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
             next_connection_generation: 1,
@@ -1322,7 +1327,7 @@ impl GuardianService {
                 continue;
             }
             let Some(raw_token) = self.free_connection_tokens.pop() else {
-                self.transport_failures = self.transport_failures.saturating_add(1);
+                self.refuse_for_capacity();
                 continue;
             };
             let generation = self.next_connection_generation;
@@ -1343,10 +1348,14 @@ impl GuardianService {
                 self.transport_failures = self.transport_failures.saturating_add(1);
                 continue;
             }
-            if self.mux_connections.observe_accept(identity).is_err() {
+            if let Err(error) = self.mux_connections.observe_accept(identity) {
                 let _ = self.poll.registry().deregister(&mut stream);
                 self.free_connection_tokens.push(raw_token);
-                self.transport_failures = self.transport_failures.saturating_add(1);
+                if error == MuxConnectionTrackingError::CapacityExhausted {
+                    self.refuse_for_capacity();
+                } else {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                }
                 continue;
             }
             self.next_connection_generation = next_generation;
@@ -1354,6 +1363,25 @@ impl GuardianService {
                 .insert(token, Connection::new(stream, generation));
         }
         Ok(())
+    }
+
+    /// A connection accepted with every slot in use is closed at once: its
+    /// client reads end of file. A mux spawn then fails mid-claim and leaves
+    /// a fenced birth (ft-bxeig), so say why in the service log.
+    fn refuse_for_capacity(&mut self) {
+        self.transport_failures = self.transport_failures.saturating_add(1);
+        let now = Instant::now();
+        if self
+            .capacity_refusal_logged_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= CAPACITY_REFUSAL_LOG_INTERVAL)
+        {
+            self.capacity_refusal_logged_at = Some(now);
+            log::warn!(
+                "guardian closed a new connection: all {} connection slots are in use \
+                 (a mux holds three per pane; see --max-connections)",
+                self.mux_connections.max_connections
+            );
+        }
     }
 
     fn drive_connection(&mut self, event: ReadyEvent) {
