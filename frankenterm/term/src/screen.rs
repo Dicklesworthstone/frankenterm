@@ -6651,6 +6651,14 @@ impl Screen {
     /// recovered resident row. Every fallible calculation and sink operation
     /// precedes the in-memory split, so an error leaves the complete model
     /// available for retry.
+    ///
+    /// Recovered rows stay resident while a replay runs, so a model can hold
+    /// more scrollback than the live configuration retains: a child that
+    /// printed thousands of lines during its guardian birth, or a busy pane
+    /// replaying what it printed during an upgrade. Those oldest rows are the
+    /// ones the live terminal would have dropped as they scrolled, so they
+    /// are dropped here and never published. Refusing them instead failed the
+    /// pane's spawn or restore outright (ft-gufg7).
     #[cfg(feature = "use_serde")]
     pub(crate) fn activate_recovered_scrollback(
         &mut self,
@@ -6661,12 +6669,15 @@ impl Screen {
             return Err(ScrollbackActivationError::InvalidRecoveryBoundary);
         }
 
-        let resident_scrollback = self.lines.len().saturating_sub(self.physical_rows);
+        let recovered_scrollback = self.lines.len().saturating_sub(self.physical_rows);
         let live_policy = ScrollbackPolicy::capture(live_config.as_ref());
         let configured_scrollback = live_policy.size;
-        if resident_scrollback > configured_scrollback {
-            return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
-        }
+        let evicted = recovered_scrollback.saturating_sub(configured_scrollback);
+        let resident_scrollback = recovered_scrollback - evicted;
+        let retained_offset = self
+            .stable_row_index_offset
+            .checked_add(evicted)
+            .ok_or(ScrollbackActivationError::InvalidRecoveryBoundary)?;
 
         let tier = live_policy.tier;
         let desired_hot_rows = if tier.enabled {
@@ -6684,8 +6695,7 @@ impl Screen {
             return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
         }
 
-        let new_resident_oldest = self
-            .stable_row_index_offset
+        let new_resident_oldest = retained_offset
             .checked_add(cold_prefix_line_count)
             .ok_or(ScrollbackActivationError::InvalidRecoveryBoundary)?;
         let newest_stable_row_exclusive = StableRowIndex::try_from(new_resident_oldest)
@@ -6694,7 +6704,7 @@ impl Screen {
             None
         } else {
             Some(
-                StableRowIndex::try_from(self.stable_row_index_offset)
+                StableRowIndex::try_from(retained_offset)
                     .map_err(|_| ScrollbackActivationError::InvalidRecoveryBoundary)?,
             )
         };
@@ -6710,14 +6720,15 @@ impl Screen {
 
         let next_coordinate_identity = ScreenCoordinateIdentity::default();
         if let Some(sink) = sink {
+            // The prefix is the recovered rows after the evicted ones.
             let (first, second) = self.lines.legacy_mut().as_slices();
-            let first_count = first.len().min(cold_prefix_line_count);
-            let second_count = cold_prefix_line_count.saturating_sub(first_count);
+            let prefix_end = evicted + cold_prefix_line_count;
             let prefix = ScrollbackPrefix::from_slices(
                 oldest_stable_row,
                 newest_stable_row_exclusive,
-                &first[..first_count],
-                &second[..second_count],
+                &first[evicted.min(first.len())..prefix_end.min(first.len())],
+                &second
+                    [evicted.saturating_sub(first.len())..prefix_end.saturating_sub(first.len())],
             )
             .map_err(ScrollbackActivationError::Spill)?;
             let ancestry = recovery
@@ -6760,8 +6771,14 @@ impl Screen {
         // The sink receipt is now verified. These operations are allocation
         // free and infallible: publish-before-remove is the activation commit
         // order, and no later step may strand the only copy of a row.
+        if evicted != 0 {
+            warn!(
+                "recovered scrollback held {recovered_scrollback} rows; the configured \
+                 {configured_scrollback} retains the newest, as the live terminal would have"
+            );
+        }
         self.coordinate_identity = next_coordinate_identity;
-        self.lines.drain(..cold_prefix_line_count);
+        self.lines.drain(..evicted + cold_prefix_line_count);
         self.stable_row_index_offset = new_resident_oldest;
         self.scrollback_tiering.reset();
         self.recovery_scrollback = None;

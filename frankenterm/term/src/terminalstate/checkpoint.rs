@@ -8370,6 +8370,112 @@ mod tests {
         assert_eq!(restored.primary_screen.lines, model.primary_screen.lines);
     }
 
+    /// A model that replayed more scrollback than the live configuration
+    /// retains (a child printing thousands of lines during its guardian
+    /// birth) activates with exactly the rows a live terminal fed the same
+    /// bytes keeps; it used to fail ConfiguredRetentionInsufficient, and the
+    /// spawn with it (ft-gufg7).
+    #[test]
+    fn activation_keeps_what_a_live_terminal_keeps_after_an_overflowing_replay() {
+        let limits = TerminalCheckpointLimits::default();
+        let config = Arc::new(ReplacementActivationConfig {
+            tier_enabled: false,
+            sink: Arc::new(MalformedReplacementReceiptSink::default()),
+        });
+        let terminal = |name: &str| {
+            Terminal::new(
+                TerminalSize::default(),
+                Arc::clone(&config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+                "FrankenTerm",
+                name,
+                Box::new(Vec::<u8>::new()),
+            )
+        };
+        let born = terminal("overflowing-replay-birth");
+        let canonical = TerminalCheckpointV3::capture_with_limits(&born, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(Arc::clone(&config) as Arc<dyn TerminalConfiguration>)
+            .unwrap();
+        let mut oracle = terminal("overflowing-replay-oracle");
+        // 300 lines against a retention of 128, in records as a journal holds
+        // them.
+        let output: Vec<u8> = (0..300)
+            .flat_map(|index| format!("row-{index}\r\n").into_bytes())
+            .collect();
+        for record in output.chunks(1024) {
+            inert.replay_bytes(record).unwrap();
+        }
+        oracle.advance_bytes(&output);
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("an overflowing replay must activate: {:?}", failure.error()),
+        };
+        let texts = |terminal: &Terminal| {
+            let screen = terminal.screen();
+            screen
+                .lines_in_phys_range(0..screen.scrollback_rows())
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let kept = texts(&activated);
+        assert_eq!(kept, texts(&oracle));
+        assert_eq!(kept.len(), activated.screen().physical_rows + 128);
+        assert_eq!(kept[0], "row-149");
+        assert_eq!(
+            activated.screen().phys_to_stable_row_index(0),
+            oracle.screen().phys_to_stable_row_index(0)
+        );
+    }
+
+    /// The same with a cold tier: the sink receives only retained rows, the
+    /// newest ones, and nothing older survives activation (ft-gufg7).
+    #[test]
+    fn tiered_activation_publishes_only_the_retained_rows_of_an_overflowing_replay() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        // 100 rows against a retention of 32.
+        let output: Vec<u8> = (0..100)
+            .flat_map(|index| format!("r{index}\r\n").into_bytes())
+            .collect();
+        inert.replay_bytes(&output).unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("an overflowing replay must activate: {:?}", failure.error()),
+        };
+        let screen = activated.screen();
+        let resident_scrollback = screen.scrollback_rows() - screen.physical_rows;
+        assert_eq!(sink.retained_scrollback_rows() + resident_scrollback, 32);
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        assert_eq!(oldest, screen.phys_to_stable_row_index(0) - 31);
+        let newest_cold = sink.load_scrollback_line(oldest + 30).unwrap();
+        let oldest_cold = sink.load_scrollback_line(oldest).unwrap();
+        assert!(oldest_cold.as_str().starts_with('r'));
+        assert!(newest_cold.as_str().starts_with('r'));
+        let last = screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .rfind(|text| !text.trim().is_empty());
+        assert_eq!(last.as_deref(), Some("r99"));
+    }
+
     #[test]
     fn scrollback_ancestry_admits_only_its_lineage() {
         use crate::config::{ScrollbackAncestry, ScrollbackSnapshotGeneration};
