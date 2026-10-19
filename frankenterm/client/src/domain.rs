@@ -268,6 +268,59 @@ fn layout_session(
     }
 }
 
+/// What one attempt to publish an attachment's layout receipt achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPublication {
+    Published,
+    /// The domain has no durable layout binding, so there is nothing to
+    /// restore and input is never fenced on it.
+    NoDurableBinding,
+    /// No receipt can be published in the attachment's current state.
+    Unavailable(&'static str),
+}
+
+/// Ends a topology resync's layout restore attempt if the resync exits after
+/// withdrawing the layout receipt but before republishing it, so typed input
+/// is never fenced on a restore that can no longer land (GitHub #132).
+struct LayoutRestoreSettlement<'a> {
+    domain: &'a ClientDomain,
+    inner: &'a ClientInner,
+    receipt_withdrawn: AtomicBool,
+}
+
+impl<'a> LayoutRestoreSettlement<'a> {
+    fn new(domain: &'a ClientDomain, inner: &'a ClientInner) -> Self {
+        Self {
+            domain,
+            inner,
+            receipt_withdrawn: AtomicBool::new(false),
+        }
+    }
+
+    /// Record that the layout receipt is about to be withdrawn.
+    fn receipt_withdrawn(&self) {
+        self.receipt_withdrawn.store(true, Ordering::Release);
+    }
+
+    /// The caller republishes the receipt itself. Consumes the guard, which
+    /// also releases its borrow of the attachment.
+    fn disarm(self) {
+        self.receipt_withdrawn.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for LayoutRestoreSettlement<'_> {
+    fn drop(&mut self) {
+        if self.receipt_withdrawn.load(Ordering::Acquire) {
+            self.domain.end_layout_restore(
+                self.inner,
+                &"the topology resync ended before the layout was restored",
+                true,
+            );
+        }
+    }
+}
+
 /// Focus changes this client advised (SetFocusedPane) whose `PaneFocused`
 /// echo has not arrived yet, oldest first.
 ///
@@ -3079,19 +3132,23 @@ impl ClientDomain {
         &self,
         mux: &Arc<Mux>,
         inner: &Arc<ClientInner>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<LayoutPublication> {
         let Some(binding) = self.durable_layout_binding() else {
-            return Ok(());
+            return Ok(LayoutPublication::NoDurableBinding);
         };
         let Some(session) = layout_session(
             &lock_or_recover(&inner.topology_session, "topology_session"),
             binding,
         ) else {
-            return Ok(());
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment has no current topology session",
+            ));
         };
         let rpc = inner.client.rpc_scope();
         if !rpc.is_available() {
-            return Ok(());
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment's mux RPC is unavailable",
+            ));
         }
         rpc.commit_sync(
             RpcConsumerKind::TopologySnapshot,
@@ -3134,17 +3191,50 @@ impl ClientDomain {
             },
         )
         .map_err(anyhow::Error::new)??;
-        Ok(())
+        Ok(LayoutPublication::Published)
     }
 
+    /// Publish this attachment's layout receipt, or record that it cannot be
+    /// published. Either way the restore attempt is over, so typed input stops
+    /// being fenced on it (GitHub #132).
     fn refresh_layout_snapshot(&self, mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
-        if let Err(error) = self.publish_layout_snapshot(mux, inner) {
-            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
-            inner.layout_failed.store(true, Ordering::Release);
-            log::warn!("remote layout publication unavailable: {error:#}");
-        } else {
-            inner.layout_failed.store(false, Ordering::Release);
+        match self.publish_layout_snapshot(mux, inner) {
+            Ok(LayoutPublication::Published | LayoutPublication::NoDurableBinding) => {
+                inner.layout_failed.store(false, Ordering::Release);
+                self.notify_layout_ready();
+            }
+            // Nothing could be published now. A receipt published earlier
+            // stays usable; without one, no restore lands until a later
+            // refresh, so the fence must end here.
+            Ok(LayoutPublication::Unavailable(reason)) => {
+                self.end_layout_restore(inner, &reason, false);
+            }
+            Err(error) => self.end_layout_restore(inner, &format!("{error:#}"), true),
         }
+    }
+
+    /// End this attachment's layout restore attempt without a new receipt,
+    /// withdrawing the current receipt when `withdraw_receipt` is set.
+    /// `layout_restore_pending` reports `false` until a later refresh
+    /// publishes a receipt.
+    fn end_layout_restore(
+        &self,
+        inner: &ClientInner,
+        reason: &dyn std::fmt::Display,
+        withdraw_receipt: bool,
+    ) {
+        if withdraw_receipt {
+            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+        }
+        inner.layout_failed.store(true, Ordering::Release);
+        log::warn!(
+            "remote layout publication unavailable for domain {}: {reason}",
+            self.local_domain_id
+        );
+        self.notify_layout_ready();
+    }
+
+    fn notify_layout_ready(&self) {
         if let Some(observer) = LAYOUT_READY_OBSERVER.get() {
             observer(self.local_domain_id);
         }
@@ -3711,12 +3801,17 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
+        // Applying the topology withdraws the layout receipt, which fences
+        // typed input until `refresh_layout_snapshot` below republishes it.
+        // Every earlier exit after the withdrawal ends the restore instead.
+        let layout_settlement = LayoutRestoreSettlement::new(domain, &inner);
         let topology_current = rpc
             .with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
                 if !incarnation_is_current() {
                     bail!("client attachment retired before coherent topology application");
                 }
                 let _remote_application = inner.begin_remote_metadata_application()?;
+                layout_settlement.receipt_withdrawn();
                 Self::process_topology_snapshot(
                     &mux,
                     Arc::clone(&inner),
@@ -3745,6 +3840,7 @@ impl ClientDomain {
                 Ok(true)
             })
             .map_err(anyhow::Error::new)??;
+        layout_settlement.disarm();
         domain.refresh_layout_snapshot(&mux, &inner);
         if prepared && rpc.is_ready() {
             Self::request_user_var_hydration(mux, inner, rpc.clone())?;
@@ -6944,6 +7040,72 @@ mod tests {
         assert!(!user_var_snapshot_may_retry(&anyhow!(
             "unclassified transport failure"
         )));
+    }
+
+    /// A registered domain with a durable layout binding whose attachment has
+    /// published no layout receipt, so typed input is fenced on its restore.
+    fn layout_fenced_test_domain(
+        mux: &Arc<Mux>,
+        local_domain_id: DomainId,
+    ) -> (Arc<ClientInner>, Arc<ClientDomain>) {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x45; 16])) })
+        }
+        let inner = test_client_inner(local_domain_id);
+        let domain = register_test_client_domain(mux, &inner);
+        asupersync_block_on(domain.resolve_layout_binding_with(ready))
+            .expect("durable layout binding");
+        assert!(
+            domain.layout_restore_pending(),
+            "an unpublished restore fences typed input"
+        );
+        (inner, domain)
+    }
+
+    /// GitHub #132: a refresh that could not publish a layout receipt (here the
+    /// attachment has no topology session) left the restore pending for good,
+    /// so the GUI dropped every key typed into the domain's panes.
+    #[test]
+    fn layout_refresh_that_cannot_publish_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_101);
+
+        assert!(matches!(
+            domain.publish_layout_snapshot(&mux, &inner),
+            Ok(LayoutPublication::Unavailable(_))
+        ));
+        assert!(domain.layout_restore_pending());
+        domain.refresh_layout_snapshot(&mux, &inner);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
+    }
+
+    /// GitHub #132: a topology resync withdraws the layout receipt before it
+    /// applies the topology, and used to republish it only on full success. Any
+    /// exit in between must end the restore instead of fencing input forever.
+    #[test]
+    fn topology_resync_that_exits_before_republishing_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_102);
+
+        // An exit before the withdrawal, or after the caller republished,
+        // leaves the restore state alone.
+        drop(LayoutRestoreSettlement::new(&domain, &inner));
+        let republished = LayoutRestoreSettlement::new(&domain, &inner);
+        republished.receipt_withdrawn();
+        republished.disarm();
+        assert!(!inner.layout_failed.load(Ordering::Acquire));
+        assert!(domain.layout_restore_pending());
+
+        let interrupted = LayoutRestoreSettlement::new(&domain, &inner);
+        interrupted.receipt_withdrawn();
+        drop(interrupted);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
