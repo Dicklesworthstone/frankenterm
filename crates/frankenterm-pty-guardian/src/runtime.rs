@@ -2777,7 +2777,9 @@ impl GuardianRuntime {
                 read_retry_at: None,
                 read_backoff: Duration::ZERO,
                 last_output_at: None,
-                active_at: None,
+                // A new child is about to print (a prompt): keep its reads on
+                // the active backoff for a while.
+                active_at: Some(Instant::now()),
                 status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
