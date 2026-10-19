@@ -3086,7 +3086,15 @@ impl DirectMuxClient {
             let mut visible_chunks = 0usize;
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
-                let chunk_end = start.saturating_add(chunk_rows).min(end);
+                let mut chunk_end = start.saturating_add(chunk_rows).min(end);
+                if start < visible_top
+                    && visible_top < chunk_end
+                    && chunk_end < end
+                    && end - visible_top <= chunk_rows
+                {
+                    // Leave the visible rows whole to the last chunk.
+                    chunk_end = visible_top;
+                }
                 let phase_started = diagnostics.start_phase();
                 let response = self
                     .send_request_with_cx(
@@ -3232,11 +3240,19 @@ impl DirectMuxClient {
             }
             // One reply is one capture under the pane's terminal lock, which
             // the server published only after re-validating this fence's
-            // layout: it cannot tear, so it needs no final fence. Stitched
-            // chunks, and an empty read, must still prove the source stood
-            // still. A pane under continuous output never does, so a tail of
-            // it failed all three attempts even at 100 KB/s (ft-wpgjw).
-            if replies == 1 {
+            // layout: it cannot tear, so it needs no final fence. A pane
+            // under continuous output never stands still for one, so a tail
+            // of it failed all three attempts even at 100 KB/s (ft-wpgjw).
+            // Stitched chunks of which only the last reached the rows the
+            // fence saw as visible need none either. The others held
+            // history, which cannot change while the pane's line layout
+            // holds, and the server publishes a chunk only while it still
+            // holds for this fence: every later reply proves no earlier
+            // chunk's rows were rewritten, and the stitched rows are the
+            // pane's rows as of the last reply (ft-ukqe3). Visible rows
+            // stitched from several chunks, and an empty read, must still
+            // prove the source stood still.
+            if replies != 0 && visible_chunks <= 1 {
                 return Ok(Ok(finish_mux_text_read(
                     out,
                     tail,
@@ -3250,18 +3266,7 @@ impl DirectMuxClient {
             diagnostics.phase("final_fence", phase_started);
             let final_state = final_state?;
             checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
-            // A source that moved on after the chunks were served did not
-            // tear them when only the last chunk reached the rows the fence
-            // saw as visible. The others held history, which cannot change
-            // while the pane's line layout holds, and the server publishes
-            // a chunk only while it still holds for this fence: every later
-            // reply proves no earlier chunk's rows were rewritten. The
-            // stitched rows are the pane's rows as of the last reply. A busy
-            // pane never stands still for the final fence, so a multi-chunk
-            // tail of it failed all three attempts (ft-ukqe3).
-            if (final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions)
-                || (replies > 1 && visible_chunks <= 1)
-            {
+            if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
                 return Ok(Ok(finish_mux_text_read(
                     out,
                     tail,
@@ -9053,46 +9058,71 @@ mod tests {
     /// rows is the pane's rows as of its last reply, though a pane printing
     /// continuously never stands still for the final fence: the server served
     /// each chunk only while the fence's layout held, and the history above
-    /// the visible rows cannot change while it does.
+    /// the visible rows cannot change while it does. A chunk that would end
+    /// inside the visible rows ends at them instead.
     #[test]
     fn stitched_text_read_of_a_changing_pane_with_visible_rows_last_succeeds() {
-        run_async_test(async {
-            let cx = crate::cx::for_testing();
-            let counts = Arc::new(StdMutex::new((0usize, 0usize)));
-            let seen = Arc::clone(&counts);
-            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
-                Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
-                        let mut count = seen.lock().unwrap();
-                        count.0 += 1;
-                        text_read_state(count.0, 0, 600)
-                    }
-                    Pdu::GetLinesAtLayout(request) => {
-                        seen.lock().unwrap().1 += 1;
-                        text_read_reply(request, "streaming")
-                    }
-                    other => panic!("unexpected text request {other:?}"),
+        // 600 rows, the last 24 visible. A 500-row tail reads 524 rows from
+        // row 76, whose first 512-row chunk would end at visible row 588.
+        for (tail, chunks, expected) in [
+            (
+                None,
+                vec![0..512, 512..600],
+                MuxTextReadResult::Text(text_read_expected(0..600, "streaming")),
+            ),
+            (
+                Some(500),
+                vec![76..576, 576..600],
+                MuxTextReadResult::Bounded {
+                    text: text_read_expected(100..600, "streaming"),
+                    original_lines: 600,
+                    original_bytes: None,
+                    truncated: true,
+                },
+            ),
+        ] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let seen = Arc::new(StdMutex::new((0usize, Vec::new())));
+                let requests = Arc::clone(&seen);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            let mut seen = requests.lock().unwrap();
+                            seen.0 += 1;
+                            text_read_state(seen.0, 0, 600)
+                        }
+                        Pdu::GetLinesAtLayout(request) => {
+                            requests.lock().unwrap().1.push(request.lines[0].clone());
+                            text_read_reply(request, "streaming")
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
                 })
-            })
-            .await;
-            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
-                .await
-                .unwrap();
-            assert_eq!(
-                client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
-                MuxTextReadResult::Text(text_read_expected(0..600, "streaming"))
-            );
-            assert_eq!(
-                *counts.lock().unwrap(),
-                (2, 2),
-                "one attempt: its fence, two chunks and the final fence"
-            );
-            drop(client);
-            timeout(Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
-        });
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    client
+                        .get_text_tail_with_cx(&cx, 9, 100_000, tail)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    (1, chunks),
+                    "one attempt: its fence and two chunks, no final fence"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
     }
 
     #[test]
