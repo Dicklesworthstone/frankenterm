@@ -36,10 +36,11 @@ use mux::guardian_input_journal::{
     replay_guardian_input_without_writer,
 };
 use mux::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
-    GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalReader,
-    GuardianOutputJournalTail, GuardianOutputKey, GuardianOutputPredecessor,
-    GuardianOutputRecoveryBookmark, GuardianOutputRecoveryCursor, GuardianOutputSegmentIdentity,
+    GuardianOutputAppendReceipt, GuardianOutputAuthenticatedPrefix, GuardianOutputCipher,
+    GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalLimits,
+    GuardianOutputJournalReader, GuardianOutputJournalTail, GuardianOutputKey,
+    GuardianOutputPredecessor, GuardianOutputRecoveryBookmark, GuardianOutputRecoveryCursor,
+    GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
@@ -1714,6 +1715,10 @@ struct GuardianReplayOutputPin {
     terminal_sequence: u64,
     terminal_record_digest: [u8; 32],
     cumulative_plaintext_bytes: u64,
+    /// Receipts of pinned records an earlier snapshot authenticated from
+    /// the same files: the record a Resume continues after, which would
+    /// otherwise be found by walking its segment from the start.
+    known_receipts: Vec<GuardianOutputAppendReceipt>,
 }
 
 struct GuardianReplayOutputSegmentPin {
@@ -2309,7 +2314,76 @@ struct PaneJournalAuthority {
     /// them and the caps a live append checks look past them: one failed
     /// unlink on a full chain must not fail every later append of the pane.
     stranded_segments: Vec<SegmentPathAuthority>,
+    /// What the last replay snapshot authenticated of each segment, so the
+    /// next one authenticates only what was appended (ft-4wrv7).
+    replay_prefixes: Vec<ReplaySegmentPrefix>,
+    /// Receipts of records replay snapshots authenticated: the checkpoint
+    /// origin every snapshot of a checkpoint looks up again, and each
+    /// snapshot's terminal record, which the next live-tail Resume names.
+    replay_receipts: VecDeque<ReplayReceipt>,
     failed: bool,
+}
+
+/// A segment prefix a replay snapshot authenticated, with the device and
+/// inode of the file it read.
+struct ReplaySegmentPrefix {
+    device: u64,
+    inode: u64,
+    prefix: GuardianOutputAuthenticatedPrefix,
+}
+
+/// A record receipt a replay snapshot authenticated, with the device and
+/// inode of the segment file it read.
+struct ReplayReceipt {
+    device: u64,
+    inode: u64,
+    receipt: GuardianOutputAppendReceipt,
+}
+
+/// Receipts a pane's journal authority remembers for replay snapshots.
+const REPLAY_RECEIPTS_REMEMBERED: usize = 16;
+
+impl PaneJournalAuthority {
+    /// The receipt of record `sequence` of `segment` that a replay snapshot
+    /// authenticated from this same file.
+    fn known_replay_receipt(
+        &self,
+        segment: &SegmentPathAuthority,
+        sequence: u64,
+    ) -> Option<GuardianOutputAppendReceipt> {
+        self.replay_receipts
+            .iter()
+            .find(|known| {
+                known.device == segment.file_identity.device
+                    && known.inode == segment.file_identity.inode
+                    && known.receipt.segment_id() == segment.segment_identity.segment_id()
+                    && known.receipt.sequence() == sequence
+            })
+            .map(|known| known.receipt)
+    }
+
+    /// Remembers a receipt of `segment` that a replay snapshot authenticated.
+    fn remember_replay_receipt(
+        &mut self,
+        segment: &SegmentPathAuthority,
+        receipt: GuardianOutputAppendReceipt,
+    ) {
+        if receipt.segment_id() != segment.segment_identity.segment_id()
+            || self
+                .known_replay_receipt(segment, receipt.sequence())
+                .is_some()
+        {
+            return;
+        }
+        if self.replay_receipts.len() >= REPLAY_RECEIPTS_REMEMBERED {
+            self.replay_receipts.pop_front();
+        }
+        self.replay_receipts.push_back(ReplayReceipt {
+            device: segment.file_identity.device,
+            inode: segment.file_identity.inode,
+            receipt,
+        });
+    }
 }
 
 impl PaneJournalAuthority {
@@ -2662,6 +2736,7 @@ impl PaneJournalAuthority {
                     retained,
                     &self.cipher,
                     self.policy,
+                    &[],
                 )
                 .map(|(_, log_bytes, records)| (log_bytes, records))
                 .map_err(|_| OutputCommitError::SegmentManager)?,
@@ -3153,7 +3228,7 @@ impl GuardianPaneOutputJournal {
         &self,
         descriptor: &GuardianCheckpointArtifactDescriptorV1,
     ) -> Result<(), GuardianCheckpointStageStoreError> {
-        let authority = self
+        let mut authority = self
             .authority
             .lock()
             .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
@@ -3179,38 +3254,67 @@ impl GuardianPaneOutputJournal {
             &authority.segments,
             &authority.cipher,
             authority.policy,
+            &authority.replay_prefixes,
         )?;
         let segment = authority
             .segments
             .iter()
             .find(|segment| segment.segment_identity.segment_id() == segment_id)
-            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
-        let file = open_private_file_read_only_at_identity(
-            &authority.directory,
-            &authority.directory_path,
-            &segment.path,
-            segment.file_identity,
-        )?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.segment_identity,
-            authority.cipher.clone(),
-            authority.policy.journal_limits,
-        )?;
-        let mut cursor = journal.recovery_cursor(
-            output_sequence,
-            authority.policy.journal_limits.max_record_bytes,
-        )?;
-        let recovered = cursor
-            .next_record()?
-            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
-        let receipt = recovered.receipt();
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?
+            .clone();
+        // Every snapshot of a checkpoint looks its origin record up again:
+        // once a replay has authenticated it from this file, it is not
+        // walked to from the start of the segment again (ft-4wrv7).
+        let receipt = match authority.known_replay_receipt(&segment, output_sequence) {
+            Some(receipt) => receipt,
+            None => {
+                let file = open_private_file_read_only_at_identity(
+                    &authority.directory,
+                    &authority.directory_path,
+                    &segment.path,
+                    segment.file_identity,
+                )?;
+                let journal = GuardianOutputJournalReader::open_existing(
+                    file,
+                    segment.segment_identity,
+                    authority.cipher.clone(),
+                    authority.policy.journal_limits,
+                )?;
+                let mut cursor = journal.recovery_cursor(
+                    output_sequence,
+                    authority.policy.journal_limits.max_record_bytes,
+                )?;
+                let recovered = cursor
+                    .next_record()?
+                    .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+                let receipt = recovered.receipt();
+                drop(recovered);
+                receipt
+            }
+        };
         descriptor.validate_record_authority(segment.segment_identity, receipt)?;
-        drop(recovered);
+        authority.remember_replay_receipt(&segment, receipt);
         authority
             .validate_path_authority()
             .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
         Ok(())
+    }
+
+    /// The receipt of record `sequence` that a replay snapshot authenticated
+    /// from the segment of `output` holding it, if one did.
+    fn known_replay_receipt(
+        &self,
+        output: &GuardianReplayOutputPin,
+        sequence: u64,
+    ) -> Result<Option<GuardianOutputAppendReceipt>, GuardianCheckpointStageStoreError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        Ok(output
+            .segments
+            .iter()
+            .find_map(|pinned| authority.known_replay_receipt(&pinned.authority, sequence)))
     }
 }
 
@@ -4802,6 +4906,7 @@ impl GuardianCheckpointStageStore {
                 &authority.segments,
                 &authority.cipher,
                 authority.policy,
+                &authority.replay_prefixes,
             )?;
             let file = open_private_file_read_only_at_identity(
                 &authority.directory,
@@ -5669,7 +5774,7 @@ fn guardian_replay_open_snapshot(
     if catalog.genesis_origin.is_some() && journal.is_none() {
         return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
     }
-    let output = journal
+    let mut output = journal
         .map(|journal| {
             if catalog.genesis_origin.is_none() {
                 journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
@@ -5677,6 +5782,15 @@ fn guardian_replay_open_snapshot(
             guardian_replay_capture_output(journal, descriptor, catalog.genesis_origin.as_ref())
         })
         .transpose()?;
+    // A live tail resumes after the terminal record of its previous
+    // snapshot, which that snapshot authenticated (ft-4wrv7).
+    if let (Some(journal), Some(output), GuardianReplaySelectorV1::Resume { next_sequence, .. }) =
+        (journal, output.as_mut(), selector)
+        && let Some(previous) = next_sequence.checked_sub(1)
+        && let Some(receipt) = journal.known_replay_receipt(output, previous)?
+    {
+        output.known_receipts.push(receipt);
+    }
     let (initial_phase, initial_next_sequence, initial_previous_record_digest) = match selector {
         GuardianReplaySelectorV1::LatestCompatible
         | GuardianReplaySelectorV1::ExactCheckpoint { .. } => (
@@ -5807,7 +5921,7 @@ fn guardian_replay_capture_output(
     descriptor: GuardianCheckpointDescriptorV1,
     genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
 ) -> Result<GuardianReplayOutputPin, GuardianCheckpointStageStoreError> {
-    let authority = journal
+    let mut authority = journal
         .authority
         .lock()
         .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
@@ -5819,6 +5933,10 @@ fn guardian_replay_capture_output(
     }
     let mut segments = Vec::new();
     segments
+        .try_reserve_exact(authority.segments.len())
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut proven = Vec::new();
+    proven
         .try_reserve_exact(authority.segments.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     // A rebased chain's first segment names its reclaimed predecessor.
@@ -5838,14 +5956,39 @@ fn guardian_replay_capture_output(
             GuardianCheckpointStageStoreError::io("replay-capture-metadata", error)
         })?;
         let frozen_identity = FileIdentity::capture(&metadata, Some(metadata.len()));
-        let opened = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.segment_identity,
-            authority.cipher.clone(),
-            authority.policy.journal_limits,
-        )?;
+        // A live tail opens a snapshot for every burst of output. What the
+        // previous snapshot authenticated of this same file (device, inode)
+        // is not authenticated again; a segment is append-only, and every
+        // record served is still authenticated as it is read (ft-4wrv7).
+        let known = authority.replay_prefixes.iter().find(|known| {
+            known.device == metadata.dev()
+                && known.inode == metadata.ino()
+                && known.prefix.identity() == segment.segment_identity
+        });
+        let opened = match known {
+            Some(known) => GuardianOutputJournalReader::open_existing_after(
+                file,
+                segment.segment_identity,
+                authority.cipher.clone(),
+                authority.policy.journal_limits,
+                &known.prefix,
+            )?,
+            None => GuardianOutputJournalReader::open_existing(
+                file,
+                segment.segment_identity,
+                authority.cipher.clone(),
+                authority.policy.journal_limits,
+            )?,
+        };
         if opened.tail() != GuardianOutputJournalTail::Clean {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        if let Some(prefix) = opened.authenticated_prefix()? {
+            proven.push(ReplaySegmentPrefix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                prefix,
+            });
         }
         validate_file_identity_at(
             &authority.directory,
@@ -5880,6 +6023,14 @@ fn guardian_replay_capture_output(
             #[cfg(test)]
             read_work: Mutex::new(GuardianReplayReadWork::default()),
         });
+    }
+    // Only the segments the chain still holds.
+    authority.replay_prefixes = proven;
+    // A live tail's next snapshot resumes after this terminal record.
+    if let Some(current) = segments.last()
+        && let Some(receipt) = current.terminal_receipt
+    {
+        authority.remember_replay_receipt(&current.authority, receipt);
     }
     let terminal = segments
         .iter()
@@ -5964,6 +6115,7 @@ fn guardian_replay_capture_output(
         terminal_record_digest: terminal.map_or([0; 32], |receipt| receipt.record_digest()),
         cumulative_plaintext_bytes: terminal
             .map_or(0, |receipt| receipt.cumulative_plaintext_bytes()),
+        known_receipts: Vec::new(),
     })
 }
 
@@ -5985,6 +6137,12 @@ fn guardian_replay_validate_resume(
     }
     let expected = if next_sequence == suffix_first_sequence {
         suffix_previous_record_digest
+    } else if let Some(known) = output
+        .known_receipts
+        .iter()
+        .find(|known| known.sequence() == next_sequence - 1)
+    {
+        known.record_digest()
     } else {
         guardian_replay_recover_receipt(output, next_sequence - 1)?.record_digest()
     };
@@ -8263,6 +8421,17 @@ fn read_successor_custody_scope_locked(
     Ok((context, secret))
 }
 
+/// A custody record file this process has synced, with its directory entry:
+/// the file's device, inode and length, its modification and status-change
+/// times (nanoseconds), and its directory's device and inode.
+type DurableCustodyKey = [i128; 7];
+
+/// Custody records this process has made durable (see
+/// `read_synced_custody_bytes`); forgotten whole when full.
+static DURABLE_CUSTODY: std::sync::LazyLock<Mutex<std::collections::HashSet<DurableCustodyKey>>> =
+    std::sync::LazyLock::new(Default::default);
+const DURABLE_CUSTODY_REMEMBERED: usize = 4096;
+
 fn read_synced_custody_bytes<const N: usize>(
     inner: &GuardianCheckpointStageStoreInner,
     path: &Path,
@@ -8274,34 +8443,71 @@ fn read_synced_custody_bytes<const N: usize>(
         .map_err(|error| GuardianCheckpointStageStoreError::io("custody-metadata", error))?;
     validate_private_file_metadata(&metadata, Some(size))?;
     let identity = FileIdentity::capture(&metadata, Some(size));
-    #[cfg(test)]
-    if inner
-        .custody_sync_failure
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 1
-    {
-        return Err(GuardianCheckpointStageStoreError::io(
-            "custody-file-sync",
-            std::io::Error::other("injected sync failure"),
-        ));
-    }
-    file.sync_all()
-        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-file-sync", error))?;
-    #[cfg(test)]
-    if inner
-        .custody_sync_failure
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 2
-    {
-        return Err(GuardianCheckpointStageStoreError::io(
-            "custody-directory-sync",
-            std::io::Error::other("injected sync failure"),
-        ));
-    }
-    inner
+    // A custody record is never rewritten in place, so once this process
+    // has synced it and its directory entry they stay durable; a rewrite or
+    // rename changes its times. Syncing both again on every read held the
+    // store's exclusive lock through two full flushes per pane: the mux
+    // re-verified every pane's custody after each recovery capture that way,
+    // and the guardian's replay and Stage work waited behind it (ft-4wrv7).
+    let directory = inner
         .directory
-        .sync_all()
-        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-directory-sync", error))?;
+        .metadata()
+        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-directory", error))?;
+    let durable_key: DurableCustodyKey = [
+        i128::from(metadata.dev()),
+        i128::from(metadata.ino()),
+        i128::from(metadata.len()),
+        i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+        i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
+        i128::from(directory.dev()),
+        i128::from(directory.ino()),
+    ];
+    #[cfg(test)]
+    let injected = inner
+        .custody_sync_failure
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != 0;
+    #[cfg(not(test))]
+    let injected = false;
+    let known_durable = !injected
+        && DURABLE_CUSTODY
+            .lock()
+            .is_ok_and(|durable| durable.contains(&durable_key));
+    if !known_durable {
+        #[cfg(test)]
+        if inner
+            .custody_sync_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            return Err(GuardianCheckpointStageStoreError::io(
+                "custody-file-sync",
+                std::io::Error::other("injected sync failure"),
+            ));
+        }
+        file.sync_all()
+            .map_err(|error| GuardianCheckpointStageStoreError::io("custody-file-sync", error))?;
+        #[cfg(test)]
+        if inner
+            .custody_sync_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 2
+        {
+            return Err(GuardianCheckpointStageStoreError::io(
+                "custody-directory-sync",
+                std::io::Error::other("injected sync failure"),
+            ));
+        }
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("custody-directory-sync", error)
+        })?;
+        if let Ok(mut durable) = DURABLE_CUSTODY.lock() {
+            if durable.len() >= DURABLE_CUSTODY_REMEMBERED {
+                durable.clear();
+            }
+            durable.insert(durable_key);
+        }
+    }
     let mut bytes = [0; N];
     file.read_exact(&mut bytes)
         .map_err(|error| GuardianCheckpointStageStoreError::io("custody-read", error))?;
@@ -11043,6 +11249,8 @@ fn open_or_create_pane_segment_manager(
         physical_segment_files: 1,
         relevant_files: 3,
         stranded_segments: Vec::new(),
+        replay_prefixes: Vec::new(),
+        replay_receipts: VecDeque::new(),
         failed: false,
     };
     authority.validate_path_authority().map_err(|_| {
@@ -11186,6 +11394,8 @@ fn open_scanned_pane_segment_manager(
         physical_segment_files,
         relevant_files,
         stranded_segments: Vec::new(),
+        replay_prefixes: Vec::new(),
+        replay_receipts: VecDeque::new(),
         failed: false,
     };
     authority.validate_path_authority().map_err(|_| {
@@ -11241,12 +11451,15 @@ impl AuthenticatedOutputSegmentSnapshot {
     }
 }
 
+/// `known`: prefixes a replay already authenticated of these segments, which
+/// are not authenticated again (see `guardian_replay_capture_output`).
 fn authenticate_segment_chain_read_only(
     directory: &File,
     directory_path: &Path,
     segments: &[SegmentPathAuthority],
     cipher: &GuardianOutputCipher,
     policy: OutputSegmentPolicy,
+    known: &[ReplaySegmentPrefix],
 ) -> Result<(AuthenticatedOutputSegmentSnapshot, u64, u64), GuardianOutputError> {
     if segments.is_empty() || segments.len() > policy.max_segments {
         return Err(GuardianOutputError::FilesystemAuthority(
@@ -11277,12 +11490,25 @@ fn authenticate_segment_chain_read_only(
         let verification_file = file
             .try_clone()
             .map_err(|error| GuardianOutputError::io("output-read-only-segment-clone", error))?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.segment_identity,
-            cipher.clone(),
-            policy.journal_limits,
-        )?;
+        let journal = match known.iter().find(|known| {
+            known.device == metadata_before.dev()
+                && known.inode == metadata_before.ino()
+                && known.prefix.identity() == segment.segment_identity
+        }) {
+            Some(known) => GuardianOutputJournalReader::open_existing_after(
+                file,
+                segment.segment_identity,
+                cipher.clone(),
+                policy.journal_limits,
+                &known.prefix,
+            )?,
+            None => GuardianOutputJournalReader::open_existing(
+                file,
+                segment.segment_identity,
+                cipher.clone(),
+                policy.journal_limits,
+            )?,
+        };
         let descriptor_after = verification_file
             .metadata()
             .map(|metadata| FileIdentity::capture(&metadata, Some(metadata.len())))
@@ -11356,7 +11582,14 @@ fn open_and_validate_segment_chain(
     policy: OutputSegmentPolicy,
 ) -> Result<(GuardianOutputJournal, u64, u64), GuardianOutputError> {
     let (snapshot, total_committed_log_bytes, total_records) =
-        authenticate_segment_chain_read_only(directory, directory_path, segments, cipher, policy)?;
+        authenticate_segment_chain_read_only(
+            directory,
+            directory_path,
+            segments,
+            cipher,
+            policy,
+            &[],
+        )?;
     let current_segment = segments
         .last()
         .ok_or(GuardianOutputError::FilesystemAuthority(
@@ -11397,9 +11630,16 @@ fn validate_replayable_segment_chain(
     segments: &[SegmentPathAuthority],
     cipher: &GuardianOutputCipher,
     policy: OutputSegmentPolicy,
+    known: &[ReplaySegmentPrefix],
 ) -> Result<(), GuardianOutputError> {
-    let _ =
-        authenticate_segment_chain_read_only(directory, directory_path, segments, cipher, policy)?;
+    let _ = authenticate_segment_chain_read_only(
+        directory,
+        directory_path,
+        segments,
+        cipher,
+        policy,
+        known,
+    )?;
     Ok(())
 }
 
@@ -11413,6 +11653,7 @@ fn recover_all_segment_bytes(
         &authority.segments,
         &authority.cipher,
         authority.policy,
+        &[],
     )?;
     let mut recovered = Vec::new();
     for segment in &authority.segments {
@@ -19447,6 +19688,99 @@ mod tests {
             record.write_all_bounded(&mut text, 64)?;
         }
         assert_eq!(text, b"alphabeta");
+        Ok(())
+    }
+
+    /// A second replay snapshot authenticates only what the pane's journal
+    /// gained since the first, from the prefix the first proved, and pins
+    /// the same output as a snapshot that authenticates every segment whole
+    /// (ft-4wrv7).
+    #[test]
+    fn replay_snapshots_resume_from_the_prefix_the_last_one_authenticated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-replay-prefix-", OutputSegmentPolicy::production())?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let terminal = checkpoint_catalog_test_terminal(b"");
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal)?;
+        let mut reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        reservation.durable_pane_id = pane;
+        reservation.spawn_effect_id = effect;
+        reservation.checkpoint_identity_digest = descriptor.checkpoint_id().into_bytes();
+        reservation.boundary_identity_digest = descriptor.boundary_id().into_bytes();
+        let origin = {
+            let authority = journal.authority.lock().map_err(|_| "poisoned journal")?;
+            GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: [0x59; 32],
+                guardian_incarnation: guardian,
+                initial_segment: authority.current_journal.identity(),
+                persistence: Arc::clone(&authority.persistence),
+            }
+        };
+        let remembered = || -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+            Ok(journal
+                .authority
+                .lock()
+                .map_err(|_| "poisoned journal")?
+                .replay_prefixes
+                .iter()
+                .map(|known| known.prefix.committed_bytes())
+                .collect())
+        };
+
+        let alpha = durable_commit(&pipeline, pane, &journal, b"alpha")?;
+        let first = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(first.segments.len(), 1);
+        assert_eq!(remembered()?, [first.segments[0].committed_bytes]);
+
+        durable_commit(&pipeline, pane, &journal, b"beta")?;
+        let last = durable_commit(&pipeline, pane, &journal, b"gamma")?;
+        let mut resumed = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(remembered()?, [resumed.segments[0].committed_bytes]);
+        assert!(resumed.segments[0].committed_bytes > first.segments[0].committed_bytes);
+        // The first snapshot's terminal record, which a live tail resumes
+        // after, is known without walking the segment again; so is the
+        // second's.
+        assert_eq!(journal.known_replay_receipt(&resumed, 1)?, Some(alpha));
+        assert_eq!(journal.known_replay_receipt(&resumed, 3)?, Some(last));
+        assert_eq!(journal.known_replay_receipt(&resumed, 2)?, None);
+        resumed.known_receipts.push(alpha);
+        guardian_replay_validate_resume(&resumed, 1, [0; 32], 2, alpha.record_digest())?;
+        assert!(matches!(
+            guardian_replay_validate_resume(&resumed, 1, [0; 32], 2, [7; 32]),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        journal
+            .authority
+            .lock()
+            .map_err(|_| "poisoned journal")?
+            .replay_prefixes
+            .clear();
+        let whole = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        for pin in [&resumed, &whole] {
+            assert_eq!(pin.terminal_sequence, 3);
+            assert_eq!(pin.terminal_record_digest, last.record_digest());
+            assert_eq!(pin.cumulative_plaintext_bytes, 14);
+            let (records, receipt) = guardian_replay_output_page(pin, 1, [0; 32], 64, 8)?;
+            assert_eq!(receipt, last);
+            let mut text = Vec::new();
+            for record in records.into_records() {
+                record.write_all_bounded(&mut text, 64)?;
+            }
+            assert_eq!(text, b"alphabetagamma");
+        }
+        assert_eq!(
+            resumed.segments[0].committed_bytes,
+            whole.segments[0].committed_bytes
+        );
+        assert_eq!(
+            resumed.segments[0].reader.authenticated_prefix_digest(),
+            whole.segments[0].reader.authenticated_prefix_digest()
+        );
         Ok(())
     }
 

@@ -2725,6 +2725,34 @@ pub struct GuardianOutputRecoveryCursor {
     verified_record_count: u64,
 }
 
+/// What authenticating one segment file proved: its exact header and the
+/// chain state after its committed records. Opaque and plaintext-free;
+/// [`GuardianOutputJournalReader::open_existing_after`] takes it to
+/// authenticate only the records appended since.
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianOutputAuthenticatedPrefix {
+    identity: GuardianOutputSegmentIdentity,
+    key_id: [u8; KEY_ID_BYTES],
+    file_header_digest: [u8; 32],
+    scanned: JournalScanStart,
+}
+
+#[cfg(unix)]
+impl GuardianOutputAuthenticatedPrefix {
+    /// The segment the prefix was read from.
+    #[must_use]
+    pub const fn identity(&self) -> GuardianOutputSegmentIdentity {
+        self.identity
+    }
+
+    /// Committed bytes the prefix covers, header included.
+    #[must_use]
+    pub const fn committed_bytes(&self) -> u64 {
+        self.scanned.committed_bytes
+    }
+}
+
 /// Opaque, plaintext-free position issued only by an authenticated cursor.
 /// It owns no descriptor and can be resumed only against the same frozen view.
 #[cfg(unix)]
@@ -3792,6 +3820,70 @@ impl GuardianOutputJournal {
         })
     }
 
+    /// [`Self::authenticate_existing`] (read-only) of a file whose header and
+    /// record prefix `prefix` says were authenticated already: the header
+    /// must still be the one `prefix` names and the file at least as long as
+    /// its prefix, and only the records after it are authenticated.
+    #[cfg(unix)]
+    fn authenticate_existing_after(
+        mut file: File,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+        prefix: &GuardianOutputAuthenticatedPrefix,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        let limits = limits.validate()?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(GuardianOutputJournalError::NotRegularFile);
+        }
+        let physical_bytes = metadata.len();
+        if physical_bytes > limits.max_log_bytes {
+            return Err(GuardianOutputJournalError::LogByteLimit {
+                observed: physical_bytes,
+                maximum: limits.max_log_bytes,
+            });
+        }
+        if physical_bytes < prefix.scanned.committed_bytes {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: prefix.scanned.committed_bytes,
+                observed: physical_bytes,
+            });
+        }
+        let mut file_header = [0_u8; FILE_HEADER_BYTES];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut file_header)?;
+        validate_file_header(&file_header, identity, &cipher)?;
+        if initial_authenticated_prefix_digest(&file_header) != prefix.file_header_digest {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        let scan = scan_journal_from(
+            &mut file,
+            physical_bytes,
+            identity,
+            &cipher,
+            limits,
+            None,
+            prefix.scanned,
+        )?;
+        Ok(Self {
+            file,
+            identity,
+            cipher,
+            limits,
+            committed_bytes: scan.committed_bytes,
+            record_count: scan.record_count,
+            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
+            next_sequence: scan.next_sequence,
+            terminal_receipt: scan.terminal_receipt,
+            authenticated_prefix_digest: scan.authenticated_prefix_digest,
+            tail: scan.tail,
+            new_segment_publication: None,
+            poisoned: false,
+            writer_lease_held: false,
+        })
+    }
+
     #[must_use]
     pub const fn identity(&self) -> GuardianOutputSegmentIdentity {
         self.identity
@@ -4374,6 +4466,62 @@ impl GuardianOutputJournalReader {
         })
     }
 
+    /// What this reader authenticated (its header and complete committed
+    /// prefix), for [`Self::open_existing_after`]; none while a torn tail
+    /// follows it.
+    pub fn authenticated_prefix(
+        &self,
+    ) -> Result<Option<GuardianOutputAuthenticatedPrefix>, GuardianOutputJournalError> {
+        let journal = &self.authenticated;
+        if journal.tail != GuardianOutputJournalTail::Clean {
+            return Ok(None);
+        }
+        let mut file_header = [0_u8; FILE_HEADER_BYTES];
+        read_exact_file_at(&journal.file, &mut file_header, 0)?;
+        validate_file_header(&file_header, journal.identity, &journal.cipher)?;
+        Ok(Some(GuardianOutputAuthenticatedPrefix {
+            identity: journal.identity,
+            key_id: journal.cipher.key_id,
+            file_header_digest: initial_authenticated_prefix_digest(&file_header),
+            scanned: JournalScanStart {
+                committed_bytes: journal.committed_bytes,
+                record_count: journal.record_count,
+                cumulative_plaintext_bytes: journal.cumulative_plaintext_bytes,
+                next_sequence: journal.next_sequence,
+                terminal_receipt: journal.terminal_receipt,
+                authenticated_prefix_digest: journal.authenticated_prefix_digest,
+            },
+        }))
+    }
+
+    /// [`Self::open_existing`] of a segment whose header and record prefix
+    /// `prefix` says this process authenticated earlier: the header is read
+    /// and checked against it, and only the records appended after that
+    /// prefix are authenticated. The caller vouches that `file` is the same
+    /// file the prefix was read from (its device and inode); a segment is
+    /// append-only and never rewritten in place, and every record a replay
+    /// serves is still authenticated when it is read. A live tail reopens a
+    /// replay snapshot for each burst of output, and authenticating whole
+    /// segments each time saturated the guardian's checkpoint worker
+    /// (ft-4wrv7).
+    pub fn open_existing_after(
+        file: File,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+        prefix: &GuardianOutputAuthenticatedPrefix,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        require_guardian_output_read_only_descriptor(&file)?;
+        if prefix.identity != identity || prefix.key_id != cipher.key_id {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        Ok(Self {
+            authenticated: GuardianOutputJournal::authenticate_existing_after(
+                file, identity, cipher, limits, prefix,
+            )?,
+        })
+    }
+
     #[must_use]
     pub const fn identity(&self) -> GuardianOutputSegmentIdentity {
         self.authenticated.identity()
@@ -4740,21 +4888,63 @@ fn scan_journal_with_recovery<R: Read + Seek>(
     identity: GuardianOutputSegmentIdentity,
     cipher: &GuardianOutputCipher,
     limits: GuardianOutputJournalLimits,
-    mut recovery: Option<&mut RecoveryCollector>,
+    recovery: Option<&mut RecoveryCollector>,
 ) -> Result<JournalScan, GuardianOutputJournalError> {
     reader.seek(SeekFrom::Start(0))?;
     let mut file_header = [0_u8; FILE_HEADER_BYTES];
     reader.read_exact(&mut file_header)?;
     validate_file_header(&file_header, identity, cipher)?;
-    let mut authenticated_prefix_digest = initial_authenticated_prefix_digest(&file_header);
+    let start = JournalScanStart {
+        committed_bytes: FILE_HEADER_BYTES_U64,
+        record_count: 0,
+        cumulative_plaintext_bytes: identity
+            .predecessor
+            .map_or(0, |predecessor| predecessor.cumulative_plaintext_bytes),
+        next_sequence: Some(identity.first_sequence),
+        terminal_receipt: None,
+        authenticated_prefix_digest: initial_authenticated_prefix_digest(&file_header),
+    };
+    scan_journal_from(
+        reader,
+        physical_bytes,
+        identity,
+        cipher,
+        limits,
+        recovery,
+        start,
+    )
+}
 
-    let mut committed_bytes = FILE_HEADER_BYTES_U64;
-    let mut record_count = 0_u64;
-    let mut cumulative_plaintext_bytes = identity
-        .predecessor
-        .map_or(0, |predecessor| predecessor.cumulative_plaintext_bytes);
-    let mut next_sequence = Some(identity.first_sequence);
-    let mut terminal_receipt = None;
+/// The state a scan authenticates records from: just past the file header,
+/// or past a prefix this process authenticated earlier
+/// ([`GuardianOutputAuthenticatedPrefix`]).
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct JournalScanStart {
+    committed_bytes: u64,
+    record_count: u64,
+    cumulative_plaintext_bytes: u64,
+    next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    authenticated_prefix_digest: [u8; 32],
+}
+
+fn scan_journal_from<R: Read + Seek>(
+    reader: &mut R,
+    physical_bytes: u64,
+    identity: GuardianOutputSegmentIdentity,
+    cipher: &GuardianOutputCipher,
+    limits: GuardianOutputJournalLimits,
+    mut recovery: Option<&mut RecoveryCollector>,
+    start: JournalScanStart,
+) -> Result<JournalScan, GuardianOutputJournalError> {
+    let JournalScanStart {
+        mut committed_bytes,
+        mut record_count,
+        mut cumulative_plaintext_bytes,
+        mut next_sequence,
+        mut terminal_receipt,
+        mut authenticated_prefix_digest,
+    } = start;
     while committed_bytes < physical_bytes {
         let remaining = physical_bytes
             .checked_sub(committed_bytes)
@@ -7148,6 +7338,117 @@ mod tests {
         assert!(matches!(
             content_drifted.append_and_sync(b"must remain fenced after content drift"),
             Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+    }
+
+    /// A reader opened after an authenticated prefix of the same file ends
+    /// in the state a full scan reaches and serves every record; a prefix
+    /// of another segment, or one longer than the file, is refused.
+    #[cfg(unix)]
+    #[test]
+    fn reader_opened_after_an_authenticated_prefix_matches_a_full_scan() {
+        let directory = tempfile::tempdir().expect("create prefix directory");
+        let path = directory.path().join("prefix.ftgout");
+        let parent = File::open(directory.path()).expect("open prefix parent");
+        let limits = GuardianOutputJournalLimits::default();
+        let mut journal = create_new_test_journal(&parent, &path, identity(), cipher(), limits)
+            .expect("create prefix journal");
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate prefix journal");
+        journal.append_and_sync(b"first").expect("append first");
+        let open = || {
+            GuardianOutputJournalReader::open_existing(
+                open_read_only_journal_file(&path),
+                identity(),
+                cipher(),
+                limits,
+            )
+            .expect("authenticate the whole segment")
+        };
+        let early = open();
+        let prefix = early
+            .authenticated_prefix()
+            .expect("read the prefix header")
+            .expect("a clean tail has a prefix");
+        assert_eq!(prefix.identity(), identity());
+        assert_eq!(prefix.committed_bytes(), early.committed_bytes());
+
+        journal.append_and_sync(b"second").expect("append second");
+        let receipt = journal.append_and_sync(b"third").expect("append third");
+        let full = open();
+        let resumed = GuardianOutputJournalReader::open_existing_after(
+            open_read_only_journal_file(&path),
+            identity(),
+            cipher(),
+            limits,
+            &prefix,
+        )
+        .expect("authenticate only the appended records");
+        assert_eq!(resumed.committed_bytes(), full.committed_bytes());
+        assert_eq!(resumed.record_count(), 3);
+        assert_eq!(resumed.record_count(), full.record_count());
+        assert_eq!(
+            resumed.cumulative_plaintext_bytes(),
+            full.cumulative_plaintext_bytes()
+        );
+        assert_eq!(resumed.next_sequence(), full.next_sequence());
+        assert_eq!(resumed.terminal_receipt(), Some(receipt));
+        assert_eq!(
+            resumed.authenticated_prefix_digest(),
+            full.authenticated_prefix_digest()
+        );
+        assert_eq!(resumed.tail(), GuardianOutputJournalTail::Clean);
+        assert!(
+            resumed.authenticated_prefix().expect("resumed prefix")
+                == full.authenticated_prefix().expect("full prefix")
+        );
+        let page = resumed
+            .recover_committed_range(
+                1,
+                GuardianOutputRecoveryLimits::new(8, 1024).expect("valid recovery limits"),
+            )
+            .expect("recover every record through the resumed reader");
+        let served: Vec<&[u8]> = page
+            .records()
+            .iter()
+            .map(|record| record.plaintext())
+            .collect();
+        assert_eq!(served, [&b"first"[..], b"second", b"third"]);
+
+        let other =
+            GuardianOutputSegmentIdentity::new(pane(), Uuid::from_bytes([0x25; 16]), 1, None)
+                .expect("another segment identity");
+        assert!(matches!(
+            GuardianOutputJournalReader::open_existing_after(
+                open_read_only_journal_file(&path),
+                other,
+                cipher(),
+                limits,
+                &prefix,
+            ),
+            Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
+        ));
+        let latest = full
+            .authenticated_prefix()
+            .expect("latest prefix header")
+            .expect("latest prefix");
+        let shorter = directory.path().join("shorter.ftgout");
+        std::fs::copy(&path, &shorter).expect("copy the segment");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&shorter)
+            .and_then(|file| file.set_len(prefix.committed_bytes()))
+            .expect("cut the copy back to its first record");
+        assert!(matches!(
+            GuardianOutputJournalReader::open_existing_after(
+                open_read_only_journal_file(&shorter),
+                identity(),
+                cipher(),
+                limits,
+                &latest,
+            ),
+            Err(GuardianOutputJournalError::ExternalLengthChange { .. })
         ));
     }
 
