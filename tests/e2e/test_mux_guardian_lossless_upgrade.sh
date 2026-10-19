@@ -64,8 +64,10 @@ chmod 700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 unset WEZTERM_UNIX_SOCKET WEZTERM_PANE FRANKENTERM_UNIX_SOCKET FT_WORKSPACE FT_GRID_ENGINE
 # Services started directly inherit this shell's environment. An RCH
 # worker's RUST_LOG hid the mux's capture-failure warnings, so the
-# services log at their own default (info).
+# services log at their own default (info) unless E2E_RUST_LOG names a
+# filter (say info,frankenterm_term::line_read=debug).
 unset RUST_LOG
+[ -n "${E2E_RUST_LOG:-}" ] && export RUST_LOG=$E2E_RUST_LOG
 cd "$HOME" || exit 1
 
 FAILS=0

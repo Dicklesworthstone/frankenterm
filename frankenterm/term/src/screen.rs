@@ -5083,10 +5083,18 @@ impl Screen {
         read: &ScreenLineRead,
     ) -> Result<bool, ColdReadMetadataBusy> {
         use crate::config::ScrollbackIntervalCapture;
-        if !self.matches_coordinate_witness(&read.witness)
-            || !self.same_cold_fragments(&read.fragments)
-        {
-            return Ok(false);
+        // Which check refused a read: enable with
+        // RUST_LOG=frankenterm_term::line_read=debug (a refused chunk is
+        // what makes a text read restart, ft-ukqe3).
+        let refused = |reason: &str| {
+            log::debug!(target: "frankenterm_term::line_read", "line read refused: {reason}");
+            Ok(false)
+        };
+        if !self.matches_coordinate_witness(&read.witness) {
+            return refused("coordinate witness replaced");
+        }
+        if !self.same_cold_fragments(&read.fragments) {
+            return refused("cold row fragments changed");
         }
         if read.first < read.resident_first || read.layout.is_some() {
             if read.layout.as_ref().is_some_and(|layout| {
@@ -5096,7 +5104,7 @@ impl Screen {
                 // Canonical visual rows are anchored to the complete cold
                 // frontier. New source rows can have a different wrapped row
                 // count and shift even a closed prefix's visual origin.
-                return Ok(false);
+                return refused("canonical layout frontier moved");
             }
             if read.layout.as_ref().is_some_and(|layout| {
                 matches!(
@@ -5111,7 +5119,7 @@ impl Screen {
                 // The old bytes are retained, but this cached logical context
                 // ended at an open seam. Newly spilled rows may continue or
                 // close that same logical group; never certify its old end.
-                return Ok(false);
+                return refused("context ended at an open seam that has since spilled");
             }
             if read.layout_seqno != self.cold_visual_seqno {
                 // Another worker may have published while this read was in
@@ -5138,17 +5146,17 @@ impl Screen {
                             || now.extends(before)
                     });
                 if !compatible {
-                    return Ok(false);
+                    return refused("cold visual layout replaced incompatibly");
                 }
             }
             let Some((source, before)) = &read.cold else {
-                return Ok(false);
+                return refused("cold rows read without a cold source");
             };
             let Some(current) = self.config.scrollback_spill_sink() else {
-                return Ok(false);
+                return refused("cold sink removed");
             };
             if !Arc::ptr_eq(source, &current) {
-                return Ok(false);
+                return refused("cold sink replaced");
             }
             match current.try_capture_scrollback_interval() {
                 ScrollbackIntervalCapture::Ready(now)
@@ -5164,7 +5172,12 @@ impl Screen {
                             .unwrap_or(read.first..read.resident_first),
                     ) => {}
                 ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
-                _ => return Ok(false),
+                ScrollbackIntervalCapture::Ready(_) => {
+                    return refused("cold store moved its start or no longer retains the rows")
+                }
+                ScrollbackIntervalCapture::Unavailable => {
+                    return refused("cold store interval unavailable")
+                }
             }
         }
         if !read.resident.is_empty() {
@@ -5184,10 +5197,10 @@ impl Screen {
             if spilled != 0 {
                 let spilled_end = read.resident_first + spilled as StableRowIndex;
                 if spilled_end > read.visible_top {
-                    return Ok(false);
+                    return refused("rows visible when read have spilled");
                 }
                 let Some(sink) = self.config.scrollback_spill_sink() else {
-                    return Ok(false);
+                    return refused("spilled rows without a cold sink");
                 };
                 match sink.try_capture_scrollback_interval() {
                     ScrollbackIntervalCapture::Ready(now)
@@ -5195,7 +5208,7 @@ impl Screen {
                             rows.start <= read.resident_first && rows.end >= spilled_end
                         }) => {}
                     ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
-                    _ => return Ok(false),
+                    _ => return refused("spilled rows no longer retained"),
                 }
             }
             let unspilled = &read.resident[spilled..];
@@ -5203,13 +5216,13 @@ impl Screen {
                 let Some(start) =
                     self.stable_row_to_phys(read.resident_first + spilled as StableRowIndex)
                 else {
-                    return Ok(false);
+                    return refused("resident rows evicted");
                 };
                 if start
                     .checked_add(unspilled.len())
                     .is_none_or(|end| end > self.lines.len())
                 {
-                    return Ok(false);
+                    return refused("resident rows out of range");
                 }
                 if !self
                     .lines
@@ -5218,7 +5231,7 @@ impl Screen {
                     .zip(unspilled)
                     .all(|(now, before)| now == before)
                 {
-                    return Ok(false);
+                    return refused("resident rows changed");
                 }
             }
         }
