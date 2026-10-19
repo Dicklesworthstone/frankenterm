@@ -1,3 +1,4 @@
+use crate::pagegrid::RunGrapheme;
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::print_segments::{PrintCharTable, PrintSegments};
 use crate::terminalstate::{
@@ -220,7 +221,7 @@ pub(crate) struct Performer<'a> {
     /// together with it (see `merge_into_junction`).
     ascii_junction: Option<PrintedCell>,
     /// The buffer of [`PendingCells`], kept empty between `flush_print`s.
-    pending_cells: Vec<(&'static str, u8)>,
+    pending_cells: Vec<RunGrapheme<'static>>,
 }
 
 /// Cells `flush_print` has placed but not yet written: graphemes side by
@@ -234,11 +235,11 @@ struct PendingCells<'t> {
     x: usize,
     /// One past the last pending cell's columns.
     end: usize,
-    cells: Vec<(&'t str, u8)>,
+    cells: Vec<RunGrapheme<'t>>,
 }
 
 impl<'t> PendingCells<'t> {
-    fn new(cells: Vec<(&'t str, u8)>) -> Self {
+    fn new(cells: Vec<RunGrapheme<'t>>) -> Self {
         debug_assert!(cells.is_empty());
         Self {
             y: 0,
@@ -256,11 +257,11 @@ impl<'t> PendingCells<'t> {
     /// The emptied buffer, for the next `flush_print`. Collecting an
     /// emptied `vec::IntoIter` into a `Vec` of the same layout reuses its
     /// allocation, which frees the buffer from the text it borrowed.
-    fn into_buffer(mut self) -> Vec<(&'static str, u8)> {
+    fn into_buffer(mut self) -> Vec<RunGrapheme<'static>> {
         self.cells.clear();
         self.cells
             .into_iter()
-            .map(|_| -> (&'static str, u8) { unreachable!("the buffer is empty") })
+            .map(|_| -> RunGrapheme<'static> { unreachable!("the buffer is empty") })
             .collect()
     }
 }
@@ -388,7 +389,12 @@ impl<'a, 't> PrintGraphemeWidths<'a, 't> {
 
 impl<'a> PrintGraphemeWidths<'a, '_> {
     /// [`PrintSegments::plain_run`]; without the fast segmentation, none.
-    fn plain_run(&mut self, room: usize, multibyte: bool, cells: &mut Vec<(&'a str, u8)>) -> usize {
+    fn plain_run(
+        &mut self,
+        room: usize,
+        multibyte: bool,
+        cells: &mut Vec<RunGrapheme<'a>>,
+    ) -> usize {
         match self {
             Self::Fast(segments) => segments.plain_run(room, multibyte, cells),
             Self::Plain(_) => 0,
@@ -601,7 +607,7 @@ impl<'a> Performer<'a> {
         match pending.cells[..] {
             [] => return,
             // A lone cell (T0 prints one per SGR pair) takes the cell write.
-            [(text, width)] => {
+            [RunGrapheme { text, width, .. }] => {
                 let pen = self.pen.clone();
                 self.screen_mut()
                     .set_cell_grapheme(x, y, text, usize::from(width), pen, seqno);
@@ -1116,7 +1122,7 @@ impl<'a> Performer<'a> {
                             pending.y = y;
                             pending.x = x;
                         }
-                        pending.cells.push((g, width as u8));
+                        pending.cells.push(RunGrapheme::new(g, width as u8));
                         pending.end = next_x;
                         self.note_printed(y, x, width, false);
                         printed_cell = true;
@@ -1136,7 +1142,8 @@ impl<'a> Performer<'a> {
                             let taken =
                                 graphemes.plain_run(margin - next_x, multibyte, &mut pending.cells);
                             if taken > 0 {
-                                let last = usize::from(pending.cells[pending.cells.len() - 1].1);
+                                let last =
+                                    usize::from(pending.cells[pending.cells.len() - 1].width);
                                 debug_assert!(pending.cells.len() > run_from);
                                 let end = next_x + taken;
                                 pending.end = end;
@@ -1303,7 +1310,7 @@ impl<'a> Performer<'a> {
                     pending.y = y;
                     pending.x = x;
                 }
-                pending.cells.push((g, print_width as u8));
+                pending.cells.push(RunGrapheme::new(g, print_width as u8));
                 pending.end = next_x;
             } else {
                 self.write_pending_cells(&mut pending, seqno);

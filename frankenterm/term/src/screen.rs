@@ -9820,7 +9820,7 @@ impl Screen {
         &mut self,
         x: usize,
         y: VisibleRowIndex,
-        cells: &[(&str, u8)],
+        cells: &[crate::pagegrid::RunGrapheme<'_>],
         attr: &CellAttributes,
         seqno: SequenceNo,
     ) {
@@ -9832,9 +9832,9 @@ impl Screen {
         let mut col = x;
         if self.lines.page_mut().is_none() {
             let line = self.line_mut(line_idx);
-            for &(text, width) in cells {
-                let width = usize::from(width);
-                line.set_cell_grapheme(col, text, width, attr.clone(), seqno);
+            for run in cells {
+                let width = usize::from(run.width);
+                line.set_cell_grapheme(col, run.text, width, attr.clone(), seqno);
                 col += width;
             }
             return;
@@ -9847,9 +9847,9 @@ impl Screen {
         // Declined: cell by cell, as `set_cell_grapheme` writes each (a
         // cell the page declines goes through the row's `Line` view, and
         // the next one back to the page).
-        for &(text, width) in cells {
-            let width = usize::from(width);
-            self.set_cell_grapheme(col, y, text, width, attr.clone(), seqno);
+        for run in cells {
+            let width = usize::from(run.width);
+            self.set_cell_grapheme(col, y, run.text, width, attr.clone(), seqno);
             col += width;
         }
     }

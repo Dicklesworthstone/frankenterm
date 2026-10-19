@@ -22,6 +22,7 @@
 //! under the terminal's Unicode version, so the print path looks a lone
 //! character up once for both.
 
+use crate::pagegrid::RunGrapheme;
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::{grapheme_column_width, UnicodeVersion};
 use std::convert::TryFrom;
@@ -269,7 +270,7 @@ impl<'a> PrintSegments<'a, '_> {
         &mut self,
         room: usize,
         multibyte: bool,
-        cells: &mut Vec<(&'a str, u8)>,
+        cells: &mut Vec<RunGrapheme<'a>>,
     ) -> usize {
         let text = self.text;
         let Some(rest) = text.get(self.pos..) else {
@@ -298,7 +299,7 @@ impl<'a> PrintSegments<'a, '_> {
             {
                 break;
             }
-            cells.push((&text[pos..pos + len], width as u8));
+            cells.push(RunGrapheme::scalar(&text[pos..pos + len], c, width as u8));
             pos += len;
             used += width;
             match (next, next_entry) {
