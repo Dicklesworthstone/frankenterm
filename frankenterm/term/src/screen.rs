@@ -847,8 +847,11 @@ struct ColdReadCharge {
     used: usize,
     limit: usize,
     index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Image allocations already charged to this read.
-    images: std::collections::HashSet<usize>,
+    /// Image allocations already charged to this read, each held until the
+    /// read ends: a row dropped mid-read (the index pass keeps none) would
+    /// otherwise free its image, and a later image at the same address
+    /// would pass as charged.
+    images: HashMap<usize, Arc<frankenterm_cell::image::ImageData>>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -874,21 +877,26 @@ impl ColdReadCharge {
     /// so a durable image row (every cell of a 0.5 MB picture names it)
     /// charged ~100 MB a row and every read that touched one failed with
     /// `ColdReadPayloadLimit`. The image bytes a read holds are its distinct
-    /// allocations; the rows are charged without them.
+    /// allocations; the rows are charged without them, plus each cell's own
+    /// placement.
     fn serialize_line(&mut self, line: &Line) -> anyhow::Result<()> {
         if !line.has_image_attachments() {
             return self.serialize_plain_line(line);
         }
+        let limit = |error: std::io::Error| anyhow::Error::new(error).context(ColdReadPayloadLimit);
         let mut stripped = line.clone();
         for cell in stripped.cells_mut_for_attr_changes_only() {
             let Some(images) = cell.attrs().images() else {
                 continue;
             };
             for image in images {
+                self.charge(std::mem::size_of::<frankenterm_cell::image::ImageCell>())
+                    .map_err(limit)?;
                 let data = image.image_data();
-                if self.images.insert(Arc::as_ptr(data) as usize) {
-                    self.charge(data.len())
-                        .map_err(|error| anyhow::Error::new(error).context(ColdReadPayloadLimit))?;
+                let key = Arc::as_ptr(data) as usize;
+                if !self.images.contains_key(&key) {
+                    self.charge(data.len()).map_err(limit)?;
+                    self.images.insert(key, Arc::clone(data));
                 }
             }
             cell.attrs_mut().clear_images();
@@ -19540,15 +19548,20 @@ pub(crate) mod tests {
         plain_charge.serialize_line(&plain).unwrap();
         let row_bytes = plain_charge.used;
 
+        // Each cell's placement is charged, its picture once per read.
+        let row_bytes = row_bytes + 64 * std::mem::size_of::<ImageCell>();
         let mut read = charge(ScreenLineRead::MAX_PAYLOAD_BYTES);
         for _ in 0..16 {
             read.serialize_line(&row)
                 .expect("rows sharing one picture fit a read");
         }
         assert_eq!(read.used, shared.len() + 16 * row_bytes);
-        // A row decoded on its own holds its own copy, charged once more.
+        // A row decoded on its own holds its own copy, charged once more,
+        // even after that row is gone: the read holds what it charged.
         read.serialize_line(&image_row(&picture())).unwrap();
         assert_eq!(read.used, 2 * shared.len() + 17 * row_bytes);
+        read.serialize_line(&image_row(&picture())).unwrap();
+        assert_eq!(read.used, 3 * shared.len() + 18 * row_bytes);
 
         // The limit still holds, with its typed error.
         let mut tight = charge(shared.len());
