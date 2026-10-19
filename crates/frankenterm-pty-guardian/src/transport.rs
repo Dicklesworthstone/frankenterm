@@ -1230,7 +1230,12 @@ impl GuardianService {
         if self.lifecycle == GuardianLifecycle::ExitReady {
             return Ok(());
         }
-        self.token_authority.validate()?;
+        // The token authority is validated once per batch, after the poll
+        // and before any event in it is handled. Validating it before the
+        // poll too made every wakeup pay for two validations (each two
+        // descriptor-relative reopens, a material digest and a parent
+        // walk); with 24 panes printing, token validation was a quarter of
+        // the main thread.
         self.socket_authority.validate()?;
         let poll_timeout = self.next_poll_timeout(Instant::now());
         match self.poll.poll(&mut self.events, Some(poll_timeout)) {
