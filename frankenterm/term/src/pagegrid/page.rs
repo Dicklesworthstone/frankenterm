@@ -1286,12 +1286,15 @@ impl Page {
             .with_hyperlink(cell.hyperlink.is_some());
         // Cells past the end were zero (I2), and no cell before `x` is wide,
         // so the padding stays default blanks and only spacers are hidden.
-        let mut col = x;
+        // Every store is at the run's first cell plus its column, computed
+        // once: a grapheme insert between stores made each recompute it.
+        let (first_cell, first_offset) = (self.cell_index(slot, x), self.offset(slot, x));
+        let mut col = 0;
         let mut any_cluster = false;
         for &run in cells {
             let (glyph, width) = (run.glyph(), run.width);
             let wide = width == 2;
-            let off = self.offset(slot, col);
+            let off = first_offset + col as u32;
             let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
             if let Glyph::Cluster(text) = glyph {
                 self.graphemes.insert(off, text);
@@ -1301,12 +1304,12 @@ impl Page {
             if let Some(link) = cell.hyperlink {
                 self.links.attach(off, link);
             }
-            self.set_cell_at(slot, col, head);
+            self.buf[first_cell + col] = head.bits();
             if wide {
                 if let Some(link) = cell.hyperlink {
                     self.links.attach(off + 1, link);
                 }
-                self.set_cell_at(slot, col + 1, template.with_hidden(true));
+                self.buf[first_cell + col + 1] = template.with_hidden(true).bits();
             }
             col += usize::from(width);
         }
