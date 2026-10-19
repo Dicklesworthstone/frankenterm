@@ -162,7 +162,14 @@ TOML
 fi
 
 ft_text() {  # <family dir> [pane id] -> that pane's text, whole history
-  WEZTERM_UNIX_SOCKET=$RUN/mux.sock "$1/ft" robot get-text "${2:-0}" --tail 5000 2>/dev/null
+  # The read's own diagnostics (attempts, chunk-layout and final-source
+  # restarts) go to $S/get-text.err for a failure to quote.
+  RUST_LOG=frankenterm::mux_text_diagnostics=trace WEZTERM_UNIX_SOCKET=$RUN/mux.sock \
+    "$1/ft" robot get-text "${2:-0}" --tail 5000 2>"$S/get-text.err"
+}
+# The last text read's diagnostics summary, for a failure message.
+text_read_diagnostics() {
+  grep -h "text transaction ended" "$S/get-text.err" 2>/dev/null | tail -1 | cut -c1-500
 }
 pane_ids() {  # <family dir> -> the mux's pane ids, one per line
   WEZTERM_UNIX_SOCKET=$RUN/mux.sock "$1/ft" robot state 2>/dev/null | python3 -c 'import json,sys
@@ -180,7 +187,7 @@ check_other_panes() {
       # Pane 0 ticks untagged (check_history reads it); any other pane
       # without a tick row lost its history or could not be read.
       echo "$text" | grep -q "$MARK tick" && continue
-      fail "pane $id shows no tick rows after $1 (get-text: $(echo "$text" | head -c 240))"
+      fail "pane $id shows no tick rows after $1 (get-text: $(echo "$text" | head -c 900); read: $(text_read_diagnostics))"
       continue
     fi
     t=$(echo "$text" | grep -o "$MARK $tag tick [0-9]*" | awk '{print $4}' | sort -n)
@@ -207,7 +214,7 @@ check_history() {
   if [ "$first" = 0 ] && [ "$n" -ge 6 ] && [ "$n" = $((last + 1)) ] && [ "$dups" = 0 ]; then
     pass "history intact after $1: ticks 0..$last once each"
   else
-    fail "history after $1: first=$first last=$last rows=$n duplicated=$dups"
+    fail "history after $1: first=$first last=$last rows=$n duplicated=$dups (read: $(text_read_diagnostics))"
   fi
   [ "$SOAK" -gt 0 ] || return 0
   # get-text is JSON: rows are joined by escaped newlines, so match unanchored.
