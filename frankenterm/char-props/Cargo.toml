@@ -17,7 +17,9 @@ publish = false
 # PHF 0.14 changes string hashing; upgrade only with regenerated table state.
 # The table's state is 0.13's: a group bump to 0.14 (e73b0d7e4) made every
 # VARIATION_MAP lookup miss, so VS15/VS16 stopped setting presentation.
-phf = { version = "=0.14.0", default-features = false }
+# The dependabot group bump 70b0ee5ec (2026-10-19) did it again: any bump of
+# this pin must regenerate emoji_variation.rs in the same change.
+phf = { version = "=0.13.1", default-features = false }
 serde = {workspace=true, optional=true}
 ucd-trie.workspace = true
 
