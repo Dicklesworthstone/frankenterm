@@ -8308,29 +8308,27 @@ impl TermWindow {
         }
 
         let title = match config::run_immediate_with_lua_config(|lua| {
-            if let Some(lua) = lua {
-                let tabs = lua.create_sequence_from(tabs.clone().into_iter())?;
-                let panes = lua.create_sequence_from(panes.clone().into_iter())?;
-
-                let v = config::lua::emit_sync_callback(
-                    &*lua,
-                    (
-                        "format-window-title".to_string(),
-                        (
-                            active_tab.clone(),
-                            active_pane.clone(),
-                            tabs,
-                            panes,
-                            (*self.config).clone(),
-                        ),
-                    ),
-                )?;
-                match &v {
-                    mlua::Value::Nil => Ok(None),
-                    _ => Ok(Some(String::from_lua(v, &*lua)?)),
-                }
-            } else {
-                Ok(None)
+            let Some(lua) = lua else {
+                return Ok(None);
+            };
+            // Converting every tab, every pane and the whole configuration is
+            // the expensive part: skip it when nobody handles the event.
+            let Some(handler) = config::lua::registered_sync_callback(&lua, "format-window-title")?
+            else {
+                return Ok(None);
+            };
+            let tabs = lua.create_sequence_from(tabs.clone().into_iter())?;
+            let panes = lua.create_sequence_from(panes.clone().into_iter())?;
+            let v: mlua::Value = handler.call((
+                active_tab.clone(),
+                active_pane.clone(),
+                tabs,
+                panes,
+                (*self.config).clone(),
+            ))?;
+            match &v {
+                mlua::Value::Nil => Ok(None),
+                _ => Ok(Some(String::from_lua(v, &*lua)?)),
             }
         }) {
             Ok(s) => s,
