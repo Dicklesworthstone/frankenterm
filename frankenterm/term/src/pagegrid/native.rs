@@ -1550,19 +1550,19 @@ mod tests {
                     }
                     Op::GraphemeRun { x, glyphs, attrs: a } => {
                         let attr = attrs(*a);
-                        let cells: Vec<(&str, u8)> = glyphs
+                        let cells: Vec<RunGrapheme<'_>> = glyphs
                             .iter()
                             .map(|&glyph| {
                                 let (text, width) = GLYPHS[glyph];
-                                (text, width.clamp(1, 2) as u8)
+                                RunGrapheme::new(text, width.clamp(1, 2) as u8)
                             })
                             .collect();
                         // Legacy writes each cell where the one before ended.
                         let before = line.clone();
                         let mut col = *x;
-                        for &(text, width) in &cells {
-                            let width = usize::from(width);
-                            line.set_cell_grapheme(col, text, width, attr.clone(), seqno);
+                        for run in &cells {
+                            let width = usize::from(run.width);
+                            line.set_cell_grapheme(col, run.text, width, attr.clone(), seqno);
                             col += width;
                         }
                         if set_grapheme_run(&mut page, row, *x, &cells, &attr, seqno) {
