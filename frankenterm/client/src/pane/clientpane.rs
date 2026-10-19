@@ -868,6 +868,24 @@ fn reliable_input_retry_delay(base: Duration, consecutive_retries: u32) -> Durat
     base.saturating_mul(multiplier).min(ceiling)
 }
 
+/// Reliable-input lanes aborted with their queued input dropped.
+static RELIABLE_INPUT_LANE_ABORTS: AtomicU64 = AtomicU64::new(0);
+
+/// Report an aborted reliable-input lane. Every typed key can start a new
+/// lane after an abort, so the warning is logged on the first abort and on
+/// each power of two after it. Input contents are never logged.
+fn note_reliable_input_lane_aborted(outcome: &'static str, dropped: usize) {
+    let aborts = RELIABLE_INPUT_LANE_ABORTS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if aborts.is_power_of_two() {
+        log::warn!(
+            "reliable input lane aborted ({outcome}); dropped {dropped} queued input \
+             event(s) ({aborts} aborted lanes so far)"
+        );
+    }
+}
+
 async fn yield_reliable_input_worker_once() {
     let mut yielded = false;
     futures::future::poll_fn(move |context| {
@@ -1727,7 +1745,8 @@ impl ReliableInputQueue {
                         "outcome" => outcome
                     )
                     .increment(1);
-                    queue.retire(outcome);
+                    let dropped = queue.retire(outcome);
+                    note_reliable_input_lane_aborted(outcome, dropped);
                     return;
                 }
                 ReliableInputAttempt::BindPaneAuthority(pane_authority) => {
@@ -2753,17 +2772,28 @@ impl ReliableInputQueue {
         outcome: &'static str,
         failure: ReliablePaneWriteFailure,
     ) -> bool {
-        let Some(expected_delivery) = expected.write_delivery() else {
+        let mut state = self.state.lock();
+        let expected_delivery = expected.write_delivery().filter(|_| {
+            state
+                .pending
+                .front()
+                .is_some_and(|front| front.same_identity(expected))
+        });
+        let Some(expected_delivery) = expected_delivery else {
+            // The worker stops on a `false` return. Like `remove_front`, it
+            // must give up `worker_running`, or every later enqueue sees a
+            // running worker and none is started.
+            let domain_detached = state.domain_detached;
+            state.worker_running = false;
+            drop(state);
+            if !domain_detached {
+                log::error!(
+                    "reliable input FIFO authority changed while failing pane-write serial {}",
+                    expected.input_serial().get()
+                );
+            }
             return false;
         };
-        let mut state = self.state.lock();
-        if !state
-            .pending
-            .front()
-            .is_some_and(|front| front.same_identity(expected))
-        {
-            return false;
-        }
         let mut retained = VecDeque::with_capacity(state.pending.len());
         let mut removed = Vec::new();
         while let Some(queued) = state.pending.pop_front() {
@@ -2891,17 +2921,21 @@ impl ReliableInputQueue {
         true
     }
 
-    pub(crate) fn retire(&self, outcome: &'static str) {
+    /// Drop every queued input and stop the worker, returning how many queued
+    /// inputs were dropped.
+    pub(crate) fn retire(&self, outcome: &'static str) -> usize {
         let mut state = self.state.lock();
         let pending = std::mem::take(&mut state.pending);
         state.pending_bytes = 0;
         state.worker_running = false;
         drop(state);
+        let dropped = pending.len();
         let failure = pane_write_failure_for_outcome(outcome);
         for queued in pending {
             queued.finish_write(Some(failure));
         }
         metrics::counter!("mux.client.reliable_input_worker", "outcome" => outcome).increment(1);
+        dropped
     }
 
     pub(crate) fn detach_domain(&self, detached: &std::sync::atomic::AtomicBool) {
@@ -9967,7 +10001,21 @@ mod tests {
             delivery.sticky_failure(),
             Some(ReliablePaneWriteFailure::Indeterminate)
         );
-        inner.reliable_input_queue.retire("test_complete");
+        assert!(inner.reliable_input_queue.state.lock().worker_running);
+
+        // The settled chunk is no longer the FIFO front. A worker that stops
+        // on that stale front must release `worker_running`, or no later
+        // enqueue would start a worker and input would pile up unsent.
+        assert!(!inner.reliable_input_queue.fail_pane_write_stream(
+            &failed,
+            "outcome_indeterminate",
+            ReliablePaneWriteFailure::Indeterminate,
+        ));
+        let state = inner.reliable_input_queue.state.lock();
+        assert!(!state.worker_running);
+        assert_eq!(state.pending.len(), 1, "the queued key-up is kept");
+        drop(state);
+        assert_eq!(inner.reliable_input_queue.retire("test_complete"), 1);
     }
 
     #[test]
