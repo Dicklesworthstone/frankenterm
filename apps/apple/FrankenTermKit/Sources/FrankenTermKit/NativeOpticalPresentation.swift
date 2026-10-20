@@ -73,7 +73,15 @@ public actor NativeOpticalPresentation {
     public init() {}
 
     public func symbol(text: String) throws -> QRCodeSymbol {
-        let image = try raster(text: text, pixelSide: nil)
+        try symbol(image: raster(text: text, pixelSide: nil))
+    }
+    /// A public recipient request has a distinct parser and cannot be confused
+    /// with a ciphertext transfer frame or an arbitrary string to display.
+    public func recipientSymbol(text: String) throws -> QRCodeSymbol {
+        let request = try RecipientRequest(text: text)
+        return try symbol(image: image(raster: FixedQRCode(recipientRequest: request).raster()))
+    }
+    private func symbol(image: CGImage) throws -> QRCodeSymbol {
         let bytes = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(bytes, UTType.png.identifier as CFString, 1, nil) else { throw FTError.storage }
         CGImageDestinationAddImage(encoder, image, nil)
@@ -81,7 +89,9 @@ public actor NativeOpticalPresentation {
         return .init(png: bytes as Data, moduleSide: image.width)
     }
     private func raster(text: String, pixelSide: Int?) throws -> CGImage {
-        let raster = try FixedQRCode(text: text).raster(pixelSide: pixelSide)
+        try image(raster: FixedQRCode(text: text).raster(pixelSide: pixelSide))
+    }
+    private func image(raster: FixedQRCodeRaster) throws -> CGImage {
         guard let provider = CGDataProvider(data: raster.pixels as CFData),
               let image = CGImage(width: raster.pixelSide, height: raster.pixelSide, bitsPerComponent: 8,
                 bitsPerPixel: 8, bytesPerRow: raster.pixelSide, space: CGColorSpaceCreateDeviceGray(),

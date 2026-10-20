@@ -37,6 +37,17 @@ public struct FixedQRCode: Sendable {
     public init(text: String, profile: FixedQRCodeProfile = .ftqr1) throws {
         guard text.utf8.count <= profile.maximumTextBytes else { throw FTError.limit("qr.profile_capacity") }
         _ = try OpticalFrame(text: text)
+        try self.init(alphanumericText: text, profile: profile)
+    }
+
+    /// A parsed public request uses the same stable geometry as transfer frames.
+    /// Keeping this input typed does not permit arbitrary plaintext QR content.
+    public init(recipientRequest: RecipientRequest) throws {
+        try self.init(alphanumericText: recipientRequest.text, profile: .ftqr1)
+    }
+
+    private init(alphanumericText text: String, profile: FixedQRCodeProfile) throws {
+        guard text.utf8.count <= profile.maximumTextBytes else { throw FTError.limit("qr.profile_capacity") }
         // Reject byte-mode inputs, embedded NULs, and case changes instead of
         // silently changing the capacity assumptions behind this profile.
         guard text.withCString({ qrcodegen_isAlphanumeric($0) }), !text.utf8.contains(0) else {
