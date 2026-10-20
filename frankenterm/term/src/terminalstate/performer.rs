@@ -1843,13 +1843,13 @@ impl<'a> Performer<'a> {
             && self.print.is_empty()
             && self.left_and_right_margins.contains(&self.cursor.x);
         let Some(plan) = plan.filter(|_| applies) else {
-            self.flood_line_feed(bidi_mode, plan);
+            self.flood_line_feed_declined(bidi_mode, plan);
             return false;
         };
         let Some(flood_pen) =
             pen.get_or_insert_with(|| crate::pagegrid::native::FloodPen::new(&self.pen))
         else {
-            self.flood_line_feed(bidi_mode, Some(plan));
+            self.flood_line_feed_declined(bidi_mode, Some(plan));
             return false;
         };
         let seqno = self.seqno;
@@ -1859,7 +1859,7 @@ impl<'a> Performer<'a> {
             .flood_scroll_line_with_run(plan, seqno, bidi_mode, x, text, flood_pen)
         else {
             // Nothing changed: the general line feed scrolls.
-            self.flood_line_feed(bidi_mode, None);
+            self.flood_line_feed_declined(bidi_mode, None);
             return false;
         };
         // What `flood_line_feed` leaves, with an empty print buffer.
@@ -1872,6 +1872,19 @@ impl<'a> Performer<'a> {
             self.advance_past_flood_run(x + text.len());
         }
         written
+    }
+
+    /// [`Self::flood_line_feed`] where [`Self::flood_line_feed_with_run`]
+    /// declines, out of line: inline, its three copies made the frame of
+    /// every line that takes the fused step.
+    #[cold]
+    #[inline(never)]
+    fn flood_line_feed_declined(
+        &mut self,
+        bidi_mode: &crate::config::BidiMode,
+        plan: Option<&crate::screen::FloodScroll>,
+    ) {
+        self.flood_line_feed(bidi_mode, plan);
     }
 
     /// `control(LineFeed)` within a line-feed flood: on the bottom row of a
