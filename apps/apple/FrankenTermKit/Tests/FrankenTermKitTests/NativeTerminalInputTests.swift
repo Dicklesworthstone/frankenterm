@@ -117,6 +117,94 @@ final class NativeTerminalInputTests: XCTestCase {
         view.retire(); other.retire()
         await view.session.waitUntilSuspended(); await other.session.waitUntilSuspended()
     }
+    func testInvalidatedGeometryPreservesCompositionAndRequiresANewerMatchingProjection() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        let (_, _, foreign, other) = try await setup()
+        let rendered = CGRect(x: 40, y: 50, width: 2, height: 20)
+        try view.updateCaret(NativeTerminalCaret(source: source, revision: 4, rect: rendered))
+        let candidate = "🦀e\u{301}"
+        view.setMarkedText(candidate, selectedRange: NSRange(location: 4, length: 0))
+        await view.session.waitUntilSettled()
+        let range = try XCTUnwrap(view.textRange(from: view.beginningOfDocument, to: view.endOfDocument))
+        let delegate = NativeInputDelegate(); view.inputDelegate = delegate
+
+        XCTAssertThrowsError(try view.invalidateRenderedCaret(source: foreign))
+        XCTAssertTrue(view.isEditable); XCTAssertTrue(view.canBecomeFirstResponder)
+        try view.invalidateRenderedCaret(source: source)
+        try view.invalidateRenderedCaret(source: source)
+        XCTAssertEqual(delegate.calls, ["selectionWillChange", "selectionDidChange"])
+        XCTAssertFalse(view.isEditable); XCTAssertFalse(view.canBecomeFirstResponder)
+        XCTAssertTrue(view.session.acceptsInput, "temporary projection loss does not retire the focus")
+        XCTAssertTrue(view.session.document.isMarked); XCTAssertEqual(view.session.document.text, candidate)
+        XCTAssertNotNil(view.markedTextRange)
+        XCTAssertEqual(view.caretRect(for: view.beginningOfDocument), .zero)
+        XCTAssertEqual(view.firstRect(for: range), .zero)
+        XCTAssertTrue(view.selectionRects(for: range).isEmpty)
+        XCTAssertNil(view.closestPosition(to: CGPoint(x: 40, y: 50)))
+
+        // These may be delayed UIKit callbacks from the now-invalid projection.
+        // None may commit, replace, delete, select, or discard the pending IME candidate.
+        view.unmarkText(); view.insertText("late"); view.deleteBackward()
+        view.replace(range, withText: "replacement")
+        view.setMarkedText("late candidate", selectedRange: NSRange(location: 0, length: 0))
+        view.selectedTextRange = range
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let before = await transport.bytes(); XCTAssertTrue(before.isEmpty)
+        XCTAssertEqual(view.session.document.text, candidate)
+        XCTAssertEqual(view.session.document.selection, NSRange(location: 4, length: 0))
+        XCTAssertEqual(delegate.calls, ["selectionWillChange", "selectionDidChange"])
+
+        for revision: UInt64 in [1, 4] {
+            XCTAssertThrowsError(try view.updateCaret(NativeTerminalCaret(source: source, revision: revision,
+                                                                          rect: rendered))) {
+                XCTAssertEqual($0 as? TerminalInputError, .stale)
+            }
+        }
+        XCTAssertThrowsError(try view.updateCaret(NativeTerminalCaret(source: foreign, revision: 5, rect: rendered)))
+        XCTAssertFalse(view.isEditable); XCTAssertEqual(view.caretRect(for: view.beginningOfDocument), .zero)
+        try view.updateCaret(NativeTerminalCaret(source: source, revision: 5, rect: rendered.offsetBy(dx: 10, dy: 0)))
+        XCTAssertTrue(view.isEditable); XCTAssertTrue(view.canBecomeFirstResponder)
+        XCTAssertEqual(view.session.document.text, candidate)
+        XCTAssertGreaterThan(view.caretRect(for: view.beginningOfDocument).height, 0)
+        view.unmarkText(); view.unmarkText()
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let after = await transport.bytes(); XCTAssertEqual(after, Data(candidate.utf8))
+        XCTAssertNil(view.markedTextRange)
+        view.retire(); other.retire()
+        await view.session.waitUntilSuspended(); await other.session.waitUntilSuspended()
+    }
+    func testInvalidatedGeometryRevokesPasteReviewAndBlocksOutgoingInputUntilRestored() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        var offered: [TerminalPasteReview] = []
+        view.onPasteReview = { offered.append($0) }
+        view.requestPasteReview(text: "echo before")
+        let oldReview = try XCTUnwrap(offered.first)
+        XCTAssertNotNil(view.pendingPaste)
+        try view.invalidateRenderedCaret(source: source)
+        XCTAssertNil(view.pendingPaste)
+        XCTAssertFalse(view.canPerformAction(#selector(NativeTerminalInputView.paste(_:)), withSender: nil))
+        XCTAssertThrowsError(try view.confirmPaste(id: oldReview.id))
+        view.requestPasteReview(text: "blocked")
+        view.paste(nil) // The geometry guard must return before accessing the clipboard.
+        view.insertText("blocked"); view.insertText("\n"); view.deleteBackward()
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let before = await transport.bytes(); XCTAssertTrue(before.isEmpty)
+        XCTAssertEqual(offered.count, 1); XCTAssertNil(view.pendingPaste)
+
+        try view.updateCaret(NativeTerminalCaret(source: source, revision: 2,
+                                                  rect: CGRect(x: 30, y: 40, width: 2, height: 20)))
+        XCTAssertTrue(view.isEditable)
+        XCTAssertThrowsError(try view.confirmPaste(id: oldReview.id), "restoring geometry does not revive a cancelled review")
+        view.requestPasteReview(text: "echo after\npwd")
+        XCTAssertEqual(offered.count, 2)
+        let freshReview = try XCTUnwrap(offered.last)
+        XCTAssertNotEqual(freshReview.id, oldReview.id)
+        try view.confirmPaste(id: freshReview.id)
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let after = await transport.bytes()
+        XCTAssertEqual(after, Data("\u{1B}[200~echo after\npwd\u{1B}[201~".utf8))
+        view.retire(); await view.session.waitUntilSuspended()
+    }
     func testRetirementNotifiesDelegateAndLateUIKitCallbacksCannotCommit() async throws {
         let (coordinator, transport, source, view) = try await setup()
         let delegate = NativeInputDelegate(); view.inputDelegate = delegate

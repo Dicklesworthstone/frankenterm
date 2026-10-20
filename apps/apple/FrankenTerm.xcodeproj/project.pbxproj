@@ -9,20 +9,25 @@
         A10000000000000000000002 = {isa = PBXBuildFile; fileRef = A20000000000000000000002; };
         A10000000000000000000003 = {isa = PBXBuildFile; productRef = A90000000000000000000001; };
         A10000000000000000000004 = {isa = PBXBuildFile; productRef = A90000000000000000000002; };
+        A10000000000000000000005 = {isa = PBXBuildFile; fileRef = A20000000000000000000005; };
+        A10000000000000000000006 = {isa = PBXBuildFile; fileRef = A20000000000000000000006; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
         A20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermApp.swift; path = ../ios/FrankenTerm/FrankenTermApp.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermExportApp.swift; path = ../macos/FrankenTermExport/FrankenTermExportApp.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrankenTerm.app; sourceTree = BUILT_PRODUCTS_DIR; };
         A20000000000000000000004 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrankenTermExport.app; sourceTree = BUILT_PRODUCTS_DIR; };
+        A20000000000000000000005 = {isa = PBXFileReference; explicitFileType = text; name = background.metal; path = ../../crates/frankenterm-renderer-metal/src/shaders/background.metal; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000006 = {isa = PBXFileReference; explicitFileType = text; name = text.metal; path = ../../crates/frankenterm-renderer-metal/src/shaders/text.metal; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003,); runOnlyForDeploymentPostprocessing = 0; };
         A30000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
-        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004,); name = Products; sourceTree = "<group>"; };
+        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006,); name = "Shared Terminal Shaders"; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
         A50000000000000000000001 = {
@@ -64,7 +69,7 @@
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */

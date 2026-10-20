@@ -61,7 +61,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var markedTextStyle: [NSAttributedString.Key: Any]?
     public var selectionAffinity: UITextStorageDirection = .forward
     public var textInputView: UIView { self }
-    public var isEditable: Bool { session.acceptsInput }
+    public var isEditable: Bool { session.acceptsInput && hasGeometry && !retiring }
     public var autocapitalizationType: UITextAutocapitalizationType = .none
     public var autocorrectionType: UITextAutocorrectionType = .no
     public var spellCheckingType: UITextSpellCheckingType = .no
@@ -131,9 +131,24 @@ public final class NativeTerminalInputView: UIView, UITextInput {
               r.width > 0, r.width <= 4096, r.height > 0, r.height <= 4096 else {
             throw TerminalKeyboardError.invalidRange
         }
-        guard !hasGeometry || value.revision > geometryRevision || r == caret else { throw TerminalInputError.stale }
+        guard value.revision > geometryRevision || (hasGeometry && r == caret) else { throw TerminalInputError.stale }
+        let changed = !hasGeometry || caret != r
+        if changed { inputDelegate?.selectionWillChange(self) }
         caret = r; geometryRevision = value.revision; hasGeometry = true
-        setNeedsLayout()
+        updateAccessory(); setNeedsLayout(); setNeedsDisplay()
+        if changed { inputDelegate?.selectionDidChange(self) }
+    }
+    /// A resize, font change or viewport without the live cursor invalidates
+    /// the displayed projection. Preserve uncommitted composition, but stop
+    /// new input and hide candidate geometry until a matching frame completes.
+    /// Key-up cleanup remains available for keys admitted before invalidation.
+    public func invalidateRenderedCaret(source: TerminalSource) throws {
+        guard source == session.originalFocus.source else { throw TerminalInputError.stale }
+        guard hasGeometry else { return }
+        inputDelegate?.selectionWillChange(self)
+        hasGeometry = false; pendingPaste = nil; accessoryModifiers.clear()
+        updateAccessory(); setNeedsLayout(); setNeedsDisplay()
+        inputDelegate?.selectionDidChange(self)
     }
     public func updateAppearance(font: UIFont, foreground: UIColor) {
         guard font.pointSize.isFinite, (6...128).contains(font.pointSize) else { return }
@@ -217,7 +232,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// UIKit-originated mutations must NOT recursively notify its input delegate.
     /// Delegate notifications are used for external lifecycle/selection changes.
     private func mutate(_ operation: () throws -> Void) {
-        guard !retiring else { return }
+        guard !retiring, hasGeometry else { return }
         do { try operation(); refreshComposition() }
         catch { onFailure?(error) }
     }
@@ -330,7 +345,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         textContainer.size = CGSize(width: max(44, bounds.width - x), height: .greatestFiniteMagnitude)
     }
     public override func draw(_ rect: CGRect) {
-        guard session.document.isMarked, !session.document.text.isEmpty else { return }
+        guard hasGeometry, session.document.isMarked, !session.document.text.isEmpty else { return }
         layoutIfNeeded()
         let visible = rect.offsetBy(dx: -compositionOrigin.x, dy: -compositionOrigin.y)
         let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: textContainer)
@@ -366,6 +381,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         return caret
     }
     private func rectangles(_ range: NSRange) -> [CGRect] {
+        guard hasGeometry else { return [] }
         if range.length == 0 { return [caretRect(for: makePosition(range.location))] }
         layoutIfNeeded(); layoutManager.ensureLayout(for: textContainer)
         let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -387,7 +403,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         return rects.enumerated().map { TerminalSelectionRect($0.element, first: $0.offset == 0, last: $0.offset == rects.count - 1) }
     }
     public func closestPosition(to point: CGPoint) -> UITextPosition? {
-        guard point.x.isFinite, point.y.isFinite else { return nil }
+        guard hasGeometry, point.x.isFinite, point.y.isFinite else { return nil }
         guard !session.document.text.isEmpty else { return makePosition(0) }
         layoutIfNeeded(); layoutManager.ensureLayout(for: textContainer)
         let local = CGPoint(x: point.x - compositionOrigin.x, y: point.y - compositionOrigin.y)
@@ -468,14 +484,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
 
     public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) {
-            return !retiring && session.acceptsPaste && onPasteReview != nil && pendingPaste == nil && UIPasteboard.general.hasStrings
+            return !retiring && hasGeometry && session.acceptsPaste && onPasteReview != nil && pendingPaste == nil && UIPasteboard.general.hasStrings
         }
         // Terminal transcript selection/copy belongs to the semantic renderer,
         // not this deliberately empty local text document.
         return false
     }
     public override func paste(_ sender: Any?) {
-        guard !retiring, session.acceptsPaste, onPasteReview != nil, pendingPaste == nil,
+        guard !retiring, hasGeometry, session.acceptsPaste, onPasteReview != nil, pendingPaste == nil,
               UIPasteboard.general.numberOfItems == 1, UIPasteboard.general.hasStrings else { return }
         // UIPasteboard has no length-only text read. Inspect immediately after
         // this deliberate read; never copy/retain an oversized value locally.
@@ -483,14 +499,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         requestPasteReview(text: text)
     }
     public func requestPasteReview(text: String) {
-        guard !retiring, session.acceptsPaste, let onPasteReview, pendingPaste == nil else { return }
+        guard !retiring, hasGeometry, session.acceptsPaste, let onPasteReview, pendingPaste == nil else { return }
         do {
             let review = try TerminalPasteReview(text: text, keyboardID: session.id, focus: session.originalFocus)
             pendingPaste = review; onPasteReview(review)
         } catch { onFailure?(error) }
     }
     public func confirmPaste(id: UUID) throws {
-        guard !retiring, let review = pendingPaste, review.id == id,
+        guard !retiring, hasGeometry, let review = pendingPaste, review.id == id,
               review.keyboardID == session.id, review.focus == session.originalFocus else { throw TerminalInputError.stale }
         try session.paste(review); pendingPaste = nil
     }
@@ -525,11 +541,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
             row.addArrangedSubview(value); return value
         }
         controlButton = button("Ctrl", label: "Control modifier") { [weak self] in
-            guard let self, self.session.acceptsInput, !self.session.document.isMarked else { return }
+            guard let self, self.isEditable, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleControl(); self.updateAccessory()
         }
         altButton = button("Alt", label: "Alt modifier") { [weak self] in
-            guard let self, self.session.acceptsInput, !self.session.document.isMarked else { return }
+            guard let self, self.isEditable, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleAlt(); self.updateAccessory()
         }
         for (title, label, usage) in [("Esc", "Escape", UInt16(0x29)), ("Tab", "Tab", 0x2B),
@@ -547,7 +563,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         updateAccessory(); return view
     }
     private func updateAccessory() {
-        let enabled = !retiring && session.acceptsInput && !session.document.isMarked
+        let enabled = !retiring && hasGeometry && session.acceptsInput && !session.document.isMarked
         for button in terminalButtons { button.isEnabled = enabled }
         func update(_ button: UIButton?, _ state: TerminalAccessoryModifiers.State) {
             button?.isEnabled = enabled
@@ -654,4 +670,195 @@ public final class NativeTerminalInputContainer: UIView {
         return replacement
     }
 }
+
+#if canImport(MetalKit)
+/// A real terminal display and text responder for one authenticated source.
+/// The session driver feeds canonical FTSF snapshots through `submit`; this
+/// view neither opens a connection nor substitutes a local ANSI implementation.
+/// The displayed frame supplies the responder's caret, in the same coordinates.
+@MainActor
+public final class NativeTerminalView: UIView {
+    public let source: TerminalSource
+    public let renderer: NativeTerminalRenderView
+    public private(set) var input: NativeTerminalInputView
+    public var onFailure: (@MainActor (Error) -> Void)?
+    public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)? {
+        didSet { bindPasteReview() }
+    }
+    /// Resigning or OS deactivation retires the exact input generation. A
+    /// session owner can install a fresh focus on the SAME source once cleanup
+    /// settles. The display and its authenticated channel remain independent.
+    public var onInputRetired: (@MainActor () -> Void)?
+    /// The owner applies this measured geometry to the canonical terminal and
+    /// its SSH PTY, then submits the corresponding revised semantic frame.
+    public var onViewportChange: (@MainActor (NativeTerminalViewport) -> Void)?
+
+    private var lastCaret: NativeTerminalCaret?
+    private var lastAppearance: (font: UIFont, foreground: UIColor)?
+    private var retired = false
+    private var wantsKeyboard = false
+    private var hasActivated = false
+    private var sceneActive = false
+
+    public init(session: TerminalKeyboardSession, bundle: Bundle = .main,
+                configuration: NativeTerminalRenderConfiguration = .init()) async throws {
+        guard let source = session.originalFocus.source, session.acceptsInput else {
+            throw TerminalKeyboardError.unavailable
+        }
+        let renderer = try await NativeTerminalRenderView(source: source, bundle: bundle,
+                                                           configuration: configuration)
+        guard !Task.isCancelled, session.acceptsInput else {
+            renderer.retire()
+            throw TerminalKeyboardError.unavailable
+        }
+        let input: NativeTerminalInputView
+        do { input = try NativeTerminalInputView(session: session) }
+        catch { renderer.retire(); throw error }
+        self.source = source; self.renderer = renderer; self.input = input
+        super.init(frame: .zero)
+        clipsToBounds = true
+        renderer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        input.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(renderer); addSubview(input)
+        bindInput()
+        renderer.onFailure = { [weak self] error in
+            guard let self, !self.retired else { return }
+            self.onFailure?(error)
+        }
+        renderer.onAppearance = { [weak self] font, foreground in
+            guard let self, !self.retired, self.sceneActive else { return }
+            self.lastAppearance = (font, foreground)
+            self.input.updateAppearance(font: font, foreground: foreground)
+        }
+        renderer.onCaretUnavailable = { [weak self] in
+            guard let self, !self.retired else { return }
+            self.lastCaret = nil
+            do { try self.input.invalidateRenderedCaret(source: self.source) }
+            catch { self.onFailure?(error) }
+        }
+        renderer.onViewportChange = { [weak self] viewport in
+            guard let self, !self.retired, viewport.source == self.source else { return }
+            self.onViewportChange?(viewport)
+        }
+        renderer.onCaret = { [weak self] caret in
+            guard let self, !self.retired, caret.source == self.source else { return }
+            self.lastCaret = caret
+            guard self.sceneActive, self.input.session.acceptsInput else { return }
+            do {
+                try self.input.updateCaret(caret)
+                self.input.requestKeyboard(self.wantsKeyboard)
+            } catch { self.onFailure?(error) }
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(sceneStateChanged(_:)),
+                                               name: UIScene.didActivateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(sceneStateChanged(_:)),
+                                               name: UIScene.willDeactivateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationStateChanged(_:)),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationStateChanged(_:)),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
+    }
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) { fatalError("Use init(session:bundle:configuration:)") }
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    private func bindInput() {
+        input.onFailure = { [weak self] error in
+            guard let self, !self.retired else { return }
+            self.onFailure?(error)
+        }
+        bindPasteReview()
+        input.onRetired = { [weak self] in
+            guard let self, !self.retired else { return }
+            self.wantsKeyboard = false
+            self.onInputRetired?()
+        }
+    }
+    private func bindPasteReview() {
+        guard !retired, onPasteReview != nil else {
+            input.onPasteReview = nil
+            if let pending = input.pendingPaste { input.cancelPaste(id: pending.id) }
+            return
+        }
+        input.onPasteReview = { [weak self] review in
+            guard let self, !self.retired, review.keyboardID == self.input.session.id else { return }
+            self.onPasteReview?(review)
+        }
+    }
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        renderer.frame = bounds; input.frame = bounds
+    }
+    public override func didMoveToWindow() {
+        super.didMoveToWindow()
+        updateSceneActivity()
+    }
+    @objc private func sceneStateChanged(_ notification: Notification) {
+        guard let scene = notification.object as? UIScene, scene === window?.windowScene else { return }
+        // willDeactivate arrives before activationState necessarily changes.
+        if notification.name == UIScene.willDeactivateNotification { setSceneActive(false) }
+        else { updateSceneActivity() }
+    }
+    @objc private func applicationStateChanged(_ notification: Notification) {
+        if notification.name == UIApplication.willResignActiveNotification { setSceneActive(false) }
+        else { updateSceneActivity() }
+    }
+    private func updateSceneActivity() {
+        setSceneActive(window?.windowScene?.activationState == .foregroundActive
+                       && UIApplication.shared.applicationState == .active)
+    }
+    /// Inactivity stops frame submission and discards unsubmitted composition.
+    /// Resumption never revives an old keyboard focus or reconnects a transport.
+    public func setSceneActive(_ active: Bool) {
+        guard !retired else { return }
+        sceneActive = active
+        renderer.setSceneActive(active)
+        if active { hasActivated = true }
+        else if hasActivated { wantsKeyboard = false; input.retire() }
+    }
+    public func submit(_ bytes: Data, source: TerminalSource) throws {
+        guard !retired else { throw TerminalInputError.unavailable }
+        guard source == self.source else { throw TerminalInputError.stale }
+        try renderer.submit(bytes, source: source)
+    }
+    public func requestKeyboard(_ visible: Bool) {
+        guard !retired else { return }
+        wantsKeyboard = visible
+        if !visible || sceneActive { input.requestKeyboard(visible) }
+    }
+    /// The caller owns the coordinator and creates the replacement focus only
+    /// after the previous generation's asynchronous cleanup has settled.
+    public func replaceInputSession(_ session: TerminalKeyboardSession) throws {
+        guard !retired, session.acceptsInput else { throw TerminalKeyboardError.unavailable }
+        guard session.originalFocus.source == source else { throw TerminalInputError.stale }
+        guard input.session.phase == .retired else { throw TerminalKeyboardError.transitionInProgress }
+        let replacement = try NativeTerminalInputView(session: session)
+        if let appearance = lastAppearance {
+            replacement.updateAppearance(font: appearance.font, foreground: appearance.foreground)
+        }
+        do { if let lastCaret { try replacement.updateCaret(lastCaret) } }
+        catch { replacement.retire(); throw error }
+        replacement.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        replacement.frame = bounds
+        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil
+        input.removeFromSuperview(); input = replacement
+        bindInput(); addSubview(replacement)
+    }
+    public func confirmPaste(id: UUID) throws {
+        guard !retired else { throw TerminalInputError.unavailable }
+        try input.confirmPaste(id: id)
+    }
+    public func cancelPaste(id: UUID) { input.cancelPaste(id: id) }
+    /// Retains no authority to replay input on another transport. The session
+    /// owner separately closes its channel and settles admitted input receipts.
+    public func retire() {
+        guard !retired else { return }
+        retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
+        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil
+        renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil
+        renderer.onCaretUnavailable = nil; renderer.onViewportChange = nil; onViewportChange = nil
+        input.retire(); renderer.retire()
+    }
+}
+#endif
 #endif
