@@ -1789,30 +1789,32 @@ fn scan_csi(bytes: &[u8], esc: usize, params: &mut [CsiParam]) -> Option<(usize,
 /// other bytes, which take the scan and decode as before.
 #[inline]
 fn palette_sgr(body: &[u8]) -> Option<(Sgr, usize)> {
-    let foreground = match body.get(..5)? {
-        b"38;5;" => true,
-        b"48;5;" => false,
+    // Fixed-length patterns, each one length check and byte compares: the
+    // prefix as a slice compare and the digits as an iterator chain were a
+    // tenth of a 256-color flood.
+    let &[kind, b'8', b';', b'5', b';', first, ref rest @ ..] = body else {
+        return None;
+    };
+    let foreground = match kind {
+        b'3' => true,
+        b'4' => false,
         _ => return None,
     };
-    let digits = body.get(5..)?;
-    let count = digits
-        .iter()
-        .take(4)
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if !(1..=3).contains(&count) || digits.get(count) != Some(&b'm') {
-        return None;
-    }
-    let value = digits[..count]
-        .iter()
-        .fold(0_u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+    let digit = |byte: u8| Some(u16::from(byte.wrapping_sub(b'0'))).filter(|&value| value <= 9);
+    let first = digit(first)?;
+    let (value, len) = match *rest {
+        [b'm', ..] => (first, 7),
+        [second, b'm', ..] => (first * 10 + digit(second)?, 8),
+        [second, third, b'm', ..] => (first * 100 + digit(second)? * 10 + digit(third)?, 9),
+        _ => return None,
+    };
     let color = crate::color::ColorSpec::PaletteIndex(u8::try_from(value).ok()?);
     let sgr = if foreground {
         Sgr::Foreground(color)
     } else {
         Sgr::Background(color)
     };
-    Some((sgr, 5 + count + 1))
+    Some((sgr, len))
 }
 
 /// Hands `handler` the items of a dispatched CSI sequence: the D2 table
@@ -3223,6 +3225,9 @@ mod test {
             "\x1b[38;5;12;1m",
             "\x1b[48;5;12H",
             "\x1b[38;5;1x",
+            "\x1b[38;5;1;m",
+            "\x1b[48;5;12;m",
+            "\x1b[38;5;1x3m",
             "\x1b[038;5;9m",
             "\x1b[58;5;9m",
             "\x1b[38;2;1;2;3m",
