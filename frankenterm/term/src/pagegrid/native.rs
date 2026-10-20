@@ -478,6 +478,7 @@ pub fn append_ascii_run_to_fresh_row(
     seqno: SequenceNo,
 ) -> bool {
     debug_assert!(page.row_len(row) == 0 && is_clustered(page, row));
+    debug_assert!(text.iter().all(|byte| matches!(byte, 0x20..=0x7e)));
     if text.is_empty()
         || !fits(page, x, text.len())
         || (x > 0 && pen.default_blank && text.iter().all(|&byte| byte == b' '))

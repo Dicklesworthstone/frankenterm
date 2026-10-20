@@ -245,16 +245,6 @@ impl PageRows {
 
     /// [`Self::scroll_with_row_flags`] of one row with nothing held and
     /// every trimmed row admitted ([`PageList::scroll_line`]).
-    /// The row [`Self::scroll_line`] just appended, before anything built
-    /// its view: what [`Self::page_row`] of the last row returns then.
-    pub fn fresh_tail_row_mut(&mut self) -> Option<(&mut Page, u32)> {
-        debug_assert!(self
-            .views
-            .back()
-            .is_some_and(|view| !view.edited && view.line.get().is_none()));
-        self.list.tail_row_mut()
-    }
-
     pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
         let scrolled = self.list.scroll_line(seqno, flags);
         self.views.push_back(RowView::default());
@@ -263,6 +253,16 @@ impl PageRows {
         }
         debug_assert_eq!(self.views.len(), self.list.retained_rows());
         scrolled
+    }
+
+    /// The row [`Self::scroll_line`] just appended, before anything built
+    /// its view: what [`Self::page_row`] of the last row returns then.
+    pub fn fresh_tail_row_mut(&mut self) -> Option<(&mut Page, u32)> {
+        debug_assert!(self
+            .views
+            .back()
+            .is_some_and(|view| !view.edited && view.line.get().is_none()));
+        self.list.tail_row_mut()
     }
 
     /// Legacy's `physical_rows + hot_scrollback_size()`, which can change

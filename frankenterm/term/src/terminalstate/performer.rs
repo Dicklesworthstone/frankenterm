@@ -4685,10 +4685,12 @@ mod tests {
     /// flood line scrolls a row out through `PageList::scroll_line`'s trim,
     /// a flood leaves what the per-line path leaves: `seq`'s staircase of
     /// line feeds without carriage returns, which reaches the margin and
-    /// wraps now and then, CR LF lines, empty lines, and lines too long for
-    /// a row, in reads that split lines anywhere. (A batch that scrolled a
-    /// screenful of such lines at once and then wrote them cut seq's
-    /// instructions 8% but cost 6.6% more cycles: the bulk scroll still
+    /// wraps now and then, CR LF lines, empty lines, lines too long for a
+    /// row, and staircases of spaces, which a blank pen leaves unwritten past
+    /// a row's end and a colored one writes, in reads that split lines
+    /// anywhere. (A batch that scrolled a screenful of such lines at once
+    /// and then wrote them cut seq's instructions 8% but cost 6.6% more
+    /// cycles: the bulk scroll still
     /// trims, appends and rotates views row by row, every line was scanned
     /// twice and every row touched twice.)
     #[test]
@@ -4704,6 +4706,14 @@ mod tests {
         for n in 0..60 {
             bytes.extend_from_slice(format!("{}\r\n", "x".repeat(n % 23)).as_bytes());
         }
+        for pen in ["", "\x1b[31m"] {
+            bytes.extend_from_slice(pen.as_bytes());
+            for n in 0..40 {
+                bytes.extend_from_slice(format!("{}\n", " ".repeat(n % 7)).as_bytes());
+            }
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"\x1b[0m");
         let page = Some(crate::config::GridEngine::Page);
         for (rows, cols, scrollback, read) in [
             (5, 17, 0, 997),
