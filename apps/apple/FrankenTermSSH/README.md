@@ -83,3 +83,65 @@ selected libssh2 backend, not the test server library. These results do not cert
 an Apple SDK build, native Keychain prompts, the Rust bridge, Metal, a running
 remote shell process or a physical iPhone. SSH protocol interoperability and
 application/device qualification are separate evidence classes.
+
+## Swift session ownership
+
+The `FrankenTermSSH` product adds `NativeSSHSession`, an actor that consumes a
+connected descriptor and drives the actual native backend. Its mandatory
+`NativeSSHAuthentication` provider owns endpoint/revision/trust/algorithm policy
+and protected signing; there is no default trust acceptance. The provider gets
+actual negotiated methods and the verified exchange's host key before a public
+identity can be offered. A typed, exact-bound user-authentication challenge is
+supplied to the signer, then policy is rechecked before signature submission,
+authentication publication and explicit PTY/shell creation. It is suitable for an
+adapter to the existing workspace broker; that adapter and public-key discovery
+from protected storage are not wired into the offline application yet.
+
+Authentication and shell creation use finite ContinuousClock deadlines. A stale
+expiry callback cannot close a later operation. Cancellation or expiry invalidates
+the native handle before awaiting cleanup and signals the signing provider; an
+uncooperative late provider result is discarded, not used to reopen the source.
+The provider must still settle its own protected worker. The actor does not spawn
+one task per byte, implement an ANSI encoder, or expose arbitrary-message signing.
+
+`admit` reports whole-unit local acceptance or would-block. One caller drives
+`service` to flush that stable native slot, deliver at most 16 KiB to the canonical
+terminal, and complete a requested resize. Admission wakes an idle service call.
+A service readiness timeout reports `waitExpired` while preserving the exact
+connection and pending bytes; a quiet terminal is not disconnected automatically.
+Cancellation, native failure and explicit close remain separate from idle expiry.
+EOF does not fabricate process completion or remote command success.
+
+Socket waits use DispatchSource readiness and one timer, not periodic polling.
+Each registration owns a duplicated fd until every cancellation handler settles,
+preventing stale readiness callbacks from targeting a reused descriptor. One
+shared readiness queue serves all sessions. Concurrent close calls await the same
+cleanup. The application still owns DNS/TCP establishment, foreground policy,
+keepalive/reconnect decisions, durable uncertainty markers, and terminal binding.
+
+Ten Swift XCTest cases pass with warnings-as-errors, including 64 repeated
+concurrent-close cycles with fd accounting, stalled handshakes, cancellation,
+deadlines, phase/admission bounds, retained closed-session handle release and
+strict typed-challenge truncation checks.
+Five additional integration tests drive the production Swift actor and C adapter
+against the independent server: four signing families, exact Unicode/binary data,
+resize, wake-up, idle timeout followed by working input, rejected peer policy,
+late cancelled/expired signatures, and revocation before sign or shell creation.
+These are separate from the nine native-driver scenarios above.
+
+```sh
+swift test -j 2 -Xswiftc -warnings-as-errors
+swiftc -swift-version 6 -parse-as-library -warnings-as-errors \
+  -I .build/debug/Modules -I .build/debug/CFrankenTermSSH.build \
+  -Xcc -I"$PWD/Sources/CFrankenTermSSH/include" Tests/Interop/SessionProbe.swift \
+  .build/debug/FrankenTermSSH.build/NativeSSHSession.swift.o \
+  .build/debug/CFrankenTermSSH.build/FrankenTermSSH.c.o \
+  -lssh2 -o /tmp/frankenterm-ssh-session-probe
+python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so /tmp/frankenterm-ssh-session-probe
+```
+
+These native/test builds do not alter the main FrankenTermKit package or add
+runtime downloads. No Apple SDK typecheck, Keychain prompt or physical-device
+qualification is inferred from Linux execution. Supply platform-correct native
+artifacts and perform the remaining session-owner/terminal integration before
+enabling Connect in the app.

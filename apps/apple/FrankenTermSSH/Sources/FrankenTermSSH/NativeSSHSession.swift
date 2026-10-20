@@ -1,0 +1,499 @@
+import Foundation
+import Dispatch
+import CFrankenTermSSH
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+public enum NativeSSHError: Error, Equatable, Sendable {
+    case invalidInput, busy, closed, timedOut, invalidChallenge
+    case native(Int32)
+}
+
+/// Public evidence from this exact completed exchange, not a trust decision.
+public struct NativeSSHPeer: Sendable, Equatable {
+    public let transportID: UUID
+    public let hostKey: Data
+    public let keyExchange: String, hostSignature: String
+    public let outboundCipher: String, inboundCipher: String
+    public let outboundMAC: String, inboundMAC: String
+    public let outboundCompression: String, inboundCompression: String
+}
+
+public struct NativeSSHIdentity: Sendable, Equatable {
+    public let user: String, publicKey: Data
+    public init(user: String, publicKey: Data) throws {
+        guard !user.isEmpty, user.utf8.count <= 256,
+              !user.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              (1...512).contains(publicKey.count) else { throw NativeSSHError.invalidInput }
+        self.user = user; self.publicKey = publicKey
+    }
+}
+
+/// Constructed only from the driver's verified user-authentication preimage.
+/// The existing workspace signer should reconstruct its own typed challenge and
+/// require equality with signedData before returning its SSH signature blob.
+public struct NativeSSHChallenge: Sendable {
+    public let transportID: UUID, sessionIdentifier: Data
+    public let identity: NativeSSHIdentity, algorithm: String, signedData: Data
+
+    init(bytes: Data, transportID: UUID, identity: NativeSSHIdentity) throws {
+        guard bytes.count <= 1024 else { throw NativeSSHError.invalidChallenge }
+        var offset = 0
+        func field() throws -> Data {
+            guard bytes.count - offset >= 4 else { throw NativeSSHError.invalidChallenge }
+            let count = bytes[offset..<offset + 4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            offset += 4
+            guard count <= bytes.count - offset else { throw NativeSSHError.invalidChallenge }
+            let value = bytes.subdata(in: offset..<offset + Int(count)); offset += Int(count)
+            return value
+        }
+        let session = try field()
+        guard [32, 48, 64].contains(session.count), offset < bytes.count, bytes[offset] == 50 else {
+            throw NativeSSHError.invalidChallenge
+        }
+        offset += 1
+        guard try field() == Data(identity.user.utf8), try field() == Data("ssh-connection".utf8),
+              try field() == Data("publickey".utf8), offset < bytes.count, bytes[offset] == 1 else {
+            throw NativeSSHError.invalidChallenge
+        }
+        offset += 1
+        let algorithmBytes = try field()
+        guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
+              ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(algorithm),
+              try field() == identity.publicKey, offset == bytes.count else { throw NativeSSHError.invalidChallenge }
+        self.transportID = transportID; sessionIdentifier = session
+        self.identity = identity; self.algorithm = algorithm; signedData = bytes
+    }
+}
+
+/// The application supplies endpoint/revision/host-pin and algorithm policy and
+/// the protected signing broker. There is no default trust policy or key loader.
+/// Calls must cooperate with cancellation; cancel must interrupt a native prompt.
+/// A cancelled callback retains its owner until it settles, but cannot revive SSH.
+public protocol NativeSSHAuthentication: Sendable {
+    func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity
+    func signature(for challenge: NativeSSHChallenge, peer: NativeSSHPeer) async throws -> Data
+    func validate(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws
+    func cancel(transportID: UUID)
+}
+
+public struct NativeSSHGeometry: Sendable, Equatable {
+    public let columns: UInt32, rows: UInt32, pixelWidth: UInt32, pixelHeight: UInt32
+    public init(columns: UInt32, rows: UInt32, pixelWidth: UInt32 = 0, pixelHeight: UInt32 = 0) throws {
+        guard (1...512).contains(columns), (1...512).contains(rows), columns * rows <= 65536,
+              pixelWidth <= 65535, pixelHeight <= 65535 else { throw NativeSSHError.invalidInput }
+        self.columns = columns; self.rows = rows; self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight
+    }
+}
+
+public struct NativeSSHAccounting: Sendable, Equatable {
+    public let allocatedBytes: Int, peakAllocatedBytes: Int, pendingWriteBytes: Int
+    public let locallyAcceptedBytes: UInt64, channelAcceptedBytes: UInt64
+    public let terminalError: Int32
+}
+
+public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), wouldBlock }
+public struct NativeSSHServiceEvent: Sendable {
+    /// At most 16 KiB; consume through the canonical terminal before asking again.
+    public let output: Data
+    public let endOfOutput: Bool
+    /// A readiness interval expired without discarding channel state or queued
+    /// bytes. An idle terminal is not a dead connection. Keepalive/failure policy
+    /// belongs to the session owner, which can explicitly close the connection.
+    public let waitExpired: Bool
+    /// Local window-change completion only; ordinary SSH has no geometry ACK.
+    public let resized: NativeSSHGeometry?
+    public let accounting: NativeSSHAccounting
+}
+
+/// A single actor owns one libssh2 session/channel. Network progress uses dispatch
+/// readiness, not sleeps/poll loops or a thread per connection. No call returns a
+/// libssh2 pointer. Authentication, shell creation and each service request have
+/// finite monotonic deadlines. The app retains this owner while the pane is hidden.
+public actor NativeSSHSession {
+    public nonisolated let transportID: UUID
+    private enum Phase { case fresh, authenticating, authenticated, opening, live, closed }
+    private let native: NativeHandle
+    private var phase = Phase.fresh
+    private var operation: UUID?
+    private var waiter: SocketReadiness?
+    private var shutdown: Task<Void, Never>?
+    private var authentication: (any NativeSSHAuthentication)?
+    private var peer: NativeSSHPeer?
+    private var identity: NativeSSHIdentity?
+    private var requestedResize: NativeSSHGeometry?
+    private var outputEnded = false
+
+    /// On success consumes the already-connected descriptor. On failure the caller
+    /// must close it. DNS/connect are deliberately owned by the endpoint connector.
+    public init(connectedDescriptor: Int32, transportID: UUID = UUID(), maximumNativeBytes: Int = 2 * 1024 * 1024) throws {
+        var handle: OpaquePointer?
+        let result = ftssh_create(connectedDescriptor, maximumNativeBytes, &handle)
+        guard result == FTSSH_OK, let handle else { throw NativeSSHError.native(result) }
+        native = NativeHandle(handle); self.transportID = transportID
+    }
+
+    public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
+        let deadline = try deadline(timeout)
+        guard phase == .fresh, operation == nil else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token; phase = .authenticating; authentication = authority
+        let transportID = self.transportID
+        let timer = expiry(deadline, operation: token)
+        defer { timer.cancel(); if operation == token { operation = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_handshake(native.pointer)
+                    if result == FTSSH_OK { break }
+                    try requireAgain(result)
+                    try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                }
+                let found = try copyPeer()
+                let selected = try await authority.identity(for: found)
+                try current(token, deadline)
+                try requireOK(found.hostKey.withUnsafeBytes {
+                    ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
+                })
+                try requireOK(selected.user.withCString { user in selected.publicKey.withUnsafeBytes { key in
+                    ftssh_begin_authentication(native.pointer, user, selected.user.utf8.count,
+                                               key.bindMemory(to: UInt8.self).baseAddress, selected.publicKey.count)
+                } })
+                var signed = false
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_authentication_step(native.pointer)
+                    if result == FTSSH_OK { break }
+                    if result == FTSSH_SIGNATURE_NEEDED {
+                        guard !signed else { throw NativeSSHError.invalidChallenge }
+                        let bytes = try copyBytes(capacity: 1024, ftssh_copy_challenge)
+                        let challenge = try NativeSSHChallenge(bytes: bytes, transportID: transportID, identity: selected)
+                        let signature = try await authority.signature(for: challenge, peer: found)
+                        try current(token, deadline)
+                        try await authority.validate(peer: found, identity: selected)
+                        try current(token, deadline)
+                        guard (1...512).contains(signature.count) else { throw NativeSSHError.invalidChallenge }
+                        try requireOK(signature.withUnsafeBytes {
+                            ftssh_supply_signature(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, signature.count)
+                        })
+                        signed = true
+                    } else {
+                        try requireAgain(result)
+                        try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                    }
+                }
+                try await authority.validate(peer: found, identity: selected)
+                try current(token, deadline)
+                peer = found; identity = selected; phase = .authenticated
+                return found
+            } onCancel: { [weak self] in
+                authority.cancel(transportID: transportID)
+                Task { await self?.close() }
+            }
+        } catch {
+            await close()
+            if Task.isCancelled { throw CancellationError() }
+            if ContinuousClock.now >= deadline { throw NativeSSHError.timedOut }
+            throw error
+        }
+    }
+
+    /// Explicit remote side effect. Does not occur as part of authenticate/import.
+    public func openShell(geometry: NativeSSHGeometry, timeout: Duration = .seconds(15)) async throws {
+        let deadline = try deadline(timeout)
+        guard phase == .authenticated, operation == nil, let authority = authentication,
+              let peer, let identity else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token; phase = .opening
+        let timer = expiry(deadline, operation: token)
+        defer { timer.cancel(); if operation == token { operation = nil } }
+        do {
+            try await withTaskCancellationHandler {
+                try await authority.validate(peer: peer, identity: identity)
+                try current(token, deadline)
+                try requireOK(ftssh_begin_shell(native.pointer, geometry.columns, geometry.rows, geometry.pixelWidth, geometry.pixelHeight))
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_shell_step(native.pointer)
+                    if result == FTSSH_OK { break }
+                    try requireAgain(result)
+                    try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                }
+                try await authority.validate(peer: peer, identity: identity)
+                try current(token, deadline)
+                phase = .live
+            } onCancel: { [weak self] in Task { await self?.close() } }
+        } catch {
+            await close()
+            if Task.isCancelled { throw CancellationError() }
+            if ContinuousClock.now >= deadline { throw NativeSSHError.timedOut }
+            throw error
+        }
+    }
+
+    /// Copies one whole bounded unit or none. This is local adapter acceptance,
+    /// never remote execution. The session owner must drive service afterward.
+    public func admit(_ bytes: Data) throws -> NativeSSHWriteAdmission {
+        try Task.checkCancellation()
+        guard phase == .live else { throw NativeSSHError.closed }
+        guard !bytes.isEmpty, bytes.count <= Int(FTSSH_WRITE_CAPACITY) else { throw NativeSSHError.invalidInput }
+        if requestedResize != nil { return .wouldBlock }
+        let result = bytes.withUnsafeBytes {
+            ftssh_admit_write(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+        }
+        if result == FTSSH_AGAIN { return .wouldBlock }
+        try requireOK(result)
+        waiter?.wake()
+        return .accepted(bytes.count)
+    }
+
+    /// One pending immutable resize. Retry after its service completion, rather
+    /// than overwriting a request that libssh2 has partially transmitted.
+    public func requestResize(_ geometry: NativeSSHGeometry) throws {
+        try Task.checkCancellation()
+        guard phase == .live else { throw NativeSSHError.closed }
+        guard requestedResize == nil else { throw NativeSSHError.busy }
+        requestedResize = geometry; waiter?.wake()
+    }
+
+    /// One bounded receive/pump call at a time; admit and close remain available
+    /// during readiness waits. At EOF return final bytes first; no exit status is
+    /// invented. A readiness timeout preserves the connection and exact pending
+    /// writes; cancellation explicitly aborts this owner, not an unrelated pane.
+    public func service(timeout: Duration = .seconds(120)) async throws -> NativeSSHServiceEvent {
+        let deadline = try deadline(timeout)
+        guard phase == .live else { throw NativeSSHError.closed }
+        guard operation == nil else { throw NativeSSHError.busy }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token
+        defer { if operation == token { operation = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                while true {
+                    try current(token, deadline)
+                    let before = try accounting()
+                    let flush = ftssh_flush_write(native.pointer)
+                    guard flush == FTSSH_OK || flush == FTSSH_AGAIN else { throw NativeSSHError.native(flush) }
+                    var directions = flush == FTSSH_AGAIN ? ftssh_directions(native.pointer) : 0
+                    var resized: NativeSSHGeometry?
+                    if let requested = requestedResize, try accounting().pendingWriteBytes == 0 {
+                        let result = ftssh_resize(native.pointer, requested.columns, requested.rows, requested.pixelWidth, requested.pixelHeight)
+                        if result == FTSSH_OK { requestedResize = nil; resized = requested }
+                        else { try requireAgain(result); directions |= ftssh_directions(native.pointer) }
+                    }
+                    var output = Data(count: 16384), count = 0
+                    let result = outputEnded ? Int32(FTSSH_EOF) : output.withUnsafeMutableBytes {
+                        ftssh_read(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, 16384, &count)
+                    }
+                    guard result == FTSSH_OK || result == FTSSH_AGAIN || result == FTSSH_EOF else { throw NativeSSHError.native(result) }
+                    output.count = count
+                    if result == FTSSH_EOF { outputEnded = true }
+                    if result == FTSSH_AGAIN { directions |= ftssh_directions(native.pointer) }
+                    let after = try accounting()
+                    if count > 0 || outputEnded || resized != nil || before.pendingWriteBytes != after.pendingWriteBytes {
+                        return .init(output: output, endOfOutput: outputEnded, waitExpired: false, resized: resized, accounting: after)
+                    }
+                    try await ready(directions: directions, deadline: deadline)
+                }
+            } onCancel: { [weak self] in Task { await self?.close() } }
+        } catch NativeSSHError.timedOut {
+            guard phase == .live, operation == token, !Task.isCancelled else {
+                await close(); throw NativeSSHError.closed
+            }
+            return .init(output: Data(), endOfOutput: outputEnded, waitExpired: true, resized: nil, accounting: try accounting())
+        } catch { await close(); throw error }
+    }
+
+    public func accounting() throws -> NativeSSHAccounting {
+        let stats = try native.accounting()
+        return .init(allocatedBytes: stats.allocated_bytes, peakAllocatedBytes: stats.peak_allocated_bytes,
+                     pendingWriteBytes: stats.pending_write_bytes, locallyAcceptedBytes: stats.accepted_bytes,
+                     channelAcceptedBytes: stats.channel_accepted_bytes, terminalError: stats.terminal_error)
+    }
+
+    /// Immediate native invalidation precedes every suspension point. Concurrent
+    /// close calls await the same readiness teardown; delayed policy/signature
+    /// results cannot use the closed handle. Final stats remain readable.
+    public func close() async {
+        if let shutdown { await shutdown.value; return }
+        phase = .closed; operation = nil
+        authentication?.cancel(transportID: transportID)
+        authentication = nil; peer = nil; identity = nil; requestedResize = nil
+        native.close()
+        let old = waiter; waiter = nil
+        let task = Task<Void, Never> { await old?.stop() }
+        shutdown = task
+        await task.value
+    }
+
+    private func deadline(_ timeout: Duration) throws -> ContinuousClock.Instant {
+        guard timeout > .zero, timeout <= .seconds(120) else { throw NativeSSHError.invalidInput }
+        return .now + timeout
+    }
+    private func expiry(_ deadline: ContinuousClock.Instant, operation token: UUID) -> Task<Void, Never> {
+        Task { [weak self] in
+            do {
+                try await ContinuousClock().sleep(until: deadline)
+                try Task.checkCancellation()
+                await self?.expire(token, deadline: deadline)
+            }
+            catch { }
+        }
+    }
+    private func expire(_ token: UUID, deadline: ContinuousClock.Instant) async {
+        // A cancelled old timer may already be queued on the actor. It cannot
+        // close a subsequent operation or an idle authenticated connection.
+        guard operation == token, ContinuousClock.now >= deadline else { return }
+        await close()
+    }
+    private func current(_ token: UUID, _ deadline: ContinuousClock.Instant) throws {
+        try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else { throw NativeSSHError.timedOut }
+        guard phase != .closed, operation == token else { throw NativeSSHError.closed }
+    }
+    private func ready(directions: Int32, deadline: ContinuousClock.Instant) async throws {
+        let next = try SocketReadiness(descriptor: ftssh_descriptor(native.pointer), directions: directions, deadline: deadline)
+        waiter = next
+        defer { if waiter === next { waiter = nil } }
+        try await next.wait()
+    }
+    private func copyBytes(capacity: Int, _ copy: (OpaquePointer?, UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?) -> Int32) throws -> Data {
+        var bytes = Data(count: capacity), count = 0
+        let result = bytes.withUnsafeMutableBytes { copy(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, capacity, &count) }
+        try requireOK(result); bytes.count = count; return bytes
+    }
+    private func copyPeer() throws -> NativeSSHPeer {
+        let key = try copyBytes(capacity: 65536, ftssh_copy_host_key)
+        func method(_ id: Int32) throws -> String {
+            var bytes = [CChar](repeating: 0, count: 129)
+            try requireOK(ftssh_copy_method(native.pointer, id, &bytes, bytes.count))
+            return String(decoding: bytes.prefix(while: { $0 != 0 }).map(UInt8.init(bitPattern:)), as: UTF8.self)
+        }
+        return try .init(transportID: transportID, hostKey: key,
+            keyExchange: method(0), hostSignature: method(1), outboundCipher: method(2), inboundCipher: method(3),
+            outboundMAC: method(4), inboundMAC: method(5), outboundCompression: method(6), inboundCompression: method(7))
+    }
+    private func requireOK(_ code: Int32) throws { guard code == FTSSH_OK else { throw NativeSSHError.native(code) } }
+    private func requireAgain(_ code: Int32) throws { guard code == FTSSH_AGAIN else { throw NativeSSHError.native(code) } }
+}
+
+/// Access is actor-confined until deinit. The C destroy API retains ownership on
+/// an unexpected library teardown error instead of freeing still-owned memory.
+/// Native handle admission stays charged in that exceptional quarantine case.
+private final class NativeHandle: @unchecked Sendable {
+    private(set) var pointer: OpaquePointer?
+    private var finalAccounting: ftssh_stats?
+    init(_ pointer: OpaquePointer) { self.pointer = pointer }
+    func accounting() throws -> ftssh_stats {
+        if let finalAccounting { return finalAccounting }
+        var stats = ftssh_stats()
+        let result = ftssh_get_stats(pointer, &stats)
+        guard result == FTSSH_OK else { throw NativeSSHError.native(result) }
+        return stats
+    }
+    func close() {
+        guard pointer != nil else { return }
+        let result = ftssh_close(pointer)
+        var stats = ftssh_stats()
+        let copied = ftssh_get_stats(pointer, &stats)
+        if result == FTSSH_OK {
+            let destroyed = ftssh_destroy(&pointer)
+            if destroyed != FTSSH_OK { stats.terminal_error = destroyed }
+        } else { stats.terminal_error = result }
+        if copied != FTSSH_OK { stats.terminal_error = copied }
+        finalAccounting = stats
+        // Keeping a closed pane's metadata must not occupy a live native handle
+        // or its global admission slot. Unexpected teardown errors retain the
+        // pointer and explicit terminalError for quarantine instead of freeing it.
+    }
+    deinit { _ = ftssh_destroy(&pointer) }
+}
+
+/// One finite readiness registration owns a duplicated descriptor until *all*
+/// dispatch cancellation handlers have run. Closing the session cannot cause an
+/// event on a newly reused descriptor. State and callbacks are queue-confined.
+private final class SocketReadiness: @unchecked Sendable {
+    private static let queue = DispatchQueue(label: "org.frankenterm.ssh.readiness")
+    private let descriptor: Int32, directions: Int32, deadline: ContinuousClock.Instant
+    private var sources: [any DispatchSourceProtocol] = []
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var outcome: Result<Void, Error>?
+    private var cancelling = 0, installed = false, finished = false
+
+    init(descriptor: Int32, directions: Int32, deadline: ContinuousClock.Instant) throws {
+        guard descriptor >= 0 else { throw NativeSSHError.closed }
+        let copy = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard copy >= 0 else { throw NativeSSHError.native(Int32(FTSSH_IO)) }
+        self.descriptor = copy; self.directions = directions == 0 ? Int32(FTSSH_READ) : directions
+        self.deadline = deadline
+    }
+    func wake() { Self.queue.async { self.finish(.success(())) } }
+    func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                Self.queue.async { self.install(continuation) }
+            }
+        } onCancel: { Self.queue.async { self.finish(.failure(CancellationError())) } }
+    }
+    func stop() async {
+        await withCheckedContinuation { continuation in
+            Self.queue.async {
+                if self.finished { continuation.resume(); return }
+                self.stopContinuation = continuation
+                self.finish(.failure(NativeSSHError.closed))
+            }
+        }
+    }
+    private func install(_ continuation: CheckedContinuation<Void, Error>) {
+        self.continuation = continuation; installed = true
+        if outcome != nil { complete(); return }
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        guard remaining > .zero else { finish(.failure(NativeSSHError.timedOut)); return }
+        if directions & Int32(FTSSH_READ) != 0 {
+            let read = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: Self.queue)
+            read.setEventHandler { self.finish(.success(())) }; sources.append(read)
+        }
+        if directions & Int32(FTSSH_WRITE) != 0 {
+            let write = DispatchSource.makeWriteSource(fileDescriptor: descriptor, queue: Self.queue)
+            write.setEventHandler { self.finish(.success(())) }; sources.append(write)
+        }
+        let timer = DispatchSource.makeTimerSource(queue: Self.queue)
+        let parts = remaining.components
+        let nanos = parts.seconds * 1_000_000_000 + parts.attoseconds / 1_000_000_000
+        timer.schedule(deadline: .now() + .nanoseconds(Int(max(1, nanos))))
+        timer.setEventHandler { self.finish(.failure(NativeSSHError.timedOut)) }; sources.append(timer)
+        for source in sources { source.setCancelHandler { self.cancelled() }; source.resume() }
+    }
+    private func finish(_ result: Result<Void, Error>) {
+        guard outcome == nil else { return }
+        outcome = result
+        guard installed else { return }
+        cancelling = sources.count
+        if cancelling == 0 { complete() }
+        else { for source in sources { source.cancel() } }
+    }
+    private func cancelled() {
+        cancelling -= 1
+        if cancelling == 0 { sources.removeAll(); complete() }
+    }
+    private func complete() {
+        guard !finished, let outcome else { return }
+        finished = true
+        _ = systemClose(descriptor)
+        continuation?.resume(with: outcome); continuation = nil
+        stopContinuation?.resume(); stopContinuation = nil
+    }
+}
+
+private func systemClose(_ descriptor: Int32) -> Int32 {
+#if canImport(Darwin)
+    Darwin.close(descriptor)
+#else
+    Glibc.close(descriptor)
+#endif
+}
