@@ -30,6 +30,11 @@ public struct OfflineRestoreStatus: Sendable {
     public let source: OfflineRestoreSource?
     public let identity: OpticalFrame.Identity?
     public let comparison: String?
+    public let encryptionMode: FTAGMode?
+    /// Public request only. The private recipient key never leaves this actor.
+    public let recipientRequest: RecipientRequest?
+    public let requiresRecipientResume: Bool
+    public let canUnlockRecipient: Bool
     public let verifiedPages: Int, verifiedBytes: Int, independentParts: Int
     public let incompletePageIndices: [Int]
     public let review: OfflineRestoreReview?
@@ -49,6 +54,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
     private var receiver: OpticalReceiver?
     private var identity: OpticalFrame.Identity?
     private var envelope: Data?
+    private var encryptionMode: FTAGMode?
+    private var recipientSession: RecipientSession?
     private var source: OfflineRestoreSource?
     private var documentData: Data?
     private var documentDigest: Data?
@@ -68,11 +75,44 @@ public actor OfflineRestore<C: AirGapCryptography> {
             return stride(from: 0, to: chars.count, by: 4).map { String(chars[$0..<$0 + 4]) }.joined(separator: "-")
         }
         return .init(generation: generation, phase: phase, isSuspended: suspended, source: source, identity: identity,
-                     comparison: comparison, verifiedPages: receiver?.verifiedPages ?? (envelope == nil ? 0 : identity?.pageCount ?? 0),
+                     comparison: comparison, encryptionMode: encryptionMode, recipientRequest: recipientSession?.request,
+                     requiresRecipientResume: suspended && recipientSession != nil,
+                     canUnlockRecipient: !suspended && matchingRecipient(),
+                     verifiedPages: receiver?.verifiedPages ?? (envelope == nil ? 0 : identity?.pageCount ?? 0),
                      verifiedBytes: receiver?.verifiedBytes ?? envelope?.count ?? 0,
                      independentParts: receiver?.independentParts ?? 0,
                      incompletePageIndices: receiver?.incompletePageIndices ?? [],
                      review: suspended ? nil : review, receipt: suspended ? nil : receipt)
+    }
+
+    private func matchingRecipient() -> Bool {
+        guard let envelope, let recipientSession, let header = try? FTAGHeader(envelope: envelope),
+              header.mode == .recipient else { return false }
+        return header.modeHeader.prefix(16) == recipientSession.request.requestID
+            && header.modeHeader.dropFirst(16).prefix(32) == recipientSession.request.digest(using: crypto)
+    }
+
+    /// At most one ephemeral request exists. A replacement requires an explicit
+    /// reset, so a queued frame or view recreation cannot change the destination.
+    @discardableResult
+    public func createRecipientRequest(generation token: UUID) throws -> OfflineRestoreStatus where C: RecipientCryptography {
+        try check(token)
+        guard phase == .idle, recipientSession == nil else { throw WorkspaceStoreError.busy }
+        recipientSession = try RecipientSession(using: crypto)
+        generation = UUID()
+        return status()
+    }
+
+    /// The key stays in process memory across a temporary lock/background event.
+    /// Automatic foreground resume cannot reactivate it: this deliberate action
+    /// retires old callbacks and permits scanning/decryption again. Process death
+    /// loses the key, and reset/cancel drops this actor's owned session immediately.
+    @discardableResult
+    public func resumeRecipientRequest(generation token: UUID) throws -> OfflineRestoreStatus {
+        try Task.checkCancellation()
+        guard suspended, generation == token, recipientSession != nil else { throw FTError.stale }
+        suspended = false; generation = UUID()
+        return status()
     }
 
     /// First observation only offers a candidate. It does not allocate a fountain
@@ -93,6 +133,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
             receiver = active
             if active.isComplete {
                 envelope = try active.envelope(using: crypto)
+                encryptionMode = try envelope.map { try FTAGHeader(envelope: $0).mode }
                 receiver = nil; candidate = nil; phase = .locked
             }
         }
@@ -107,7 +148,9 @@ public actor OfflineRestore<C: AirGapCryptography> {
         try selected.receive(candidate, using: crypto)
         receiver = selected; self.candidate = nil; phase = .collecting
         if selected.isComplete {
-            envelope = try selected.envelope(using: crypto); receiver = nil; phase = .locked
+            envelope = try selected.envelope(using: crypto)
+            encryptionMode = try envelope.map { try FTAGHeader(envelope: $0).mode }
+            receiver = nil; phase = .locked
         }
         return status()
     }
@@ -119,7 +162,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
         guard phase == .idle else { throw WorkspaceStoreError.busy }
         let header = try FTAGHeader(envelope: data)
         identity = .init(transferID: header.transferID, envelopeDigest: crypto.sha256(data), envelopeLength: data.count)
-        envelope = data; source = .encryptedFile; phase = .locked
+        envelope = data; encryptionMode = header.mode; source = .encryptedFile; phase = .locked
         return status()
     }
 
@@ -128,7 +171,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
     @discardableResult
     public func acceptWorkspaceDocument(_ data: Data, generation token: UUID) async throws -> OfflineRestoreStatus {
         try check(token)
-        guard phase == .idle else { throw WorkspaceStoreError.busy }
+        guard phase == .idle, recipientSession == nil else { throw WorkspaceStoreError.busy }
         let document = try WorkspaceDocument(data: data)
         let decoded = try AirGapArchive(workspace: document, keys: [], using: crypto)
         documentData = document.raw
@@ -168,8 +211,17 @@ public actor OfflineRestore<C: AirGapCryptography> {
     public func unlock(enteredCode: String, generation token: UUID) async throws -> OfflineRestoreStatus {
         try check(token)
         guard phase == .locked, let envelope else { throw FTError.stale }
+        guard encryptionMode == .code, recipientSession == nil else { throw FTError.unsupported("envelope.requires_recipient_key") }
         let code = try TransferCode(entered: enteredCode, using: crypto)
         let decoded = try FTAG.open(envelope, code: code, using: crypto)
+        return try await prepareReview(decoded, generation: token)
+    }
+
+    @discardableResult
+    public func unlockRecipient(generation token: UUID) async throws -> OfflineRestoreStatus where C: RecipientCryptography {
+        try check(token)
+        guard phase == .locked, let envelope, let recipientSession else { throw FTError.stale }
+        let decoded = try FTAG.open(envelope, recipient: recipientSession, using: crypto)
         return try await prepareReview(decoded, generation: token)
     }
 
@@ -218,7 +270,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
                 expectedRevision: review.expectedRevision, sourceAndContentsConfirmed: true, allowMachineRemoval: allowMachineRemoval,
                 allowRollback: allowRollback, transferID: identity?.transferID)
             receipt = result; phase = .complete
-            envelope = nil; documentData = nil; receiver = nil; candidate = nil; pendingNamespace = nil
+            envelope = nil; documentData = nil; receiver = nil; candidate = nil; pendingNamespace = nil; recipientSession = nil
             return status()
         } catch {
             if let reason = error as? WorkspaceStoreError,
@@ -251,7 +303,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
             if let recovered = try await store.recoverImport(exporterID: pendingNamespace.exporter,
                 workspaceID: pendingNamespace.workspace, envelopeDigest: digest, transferID: identity?.transferID) {
                 receipt = recovered
-                phase = .complete; envelope = nil; documentData = nil; self.pendingNamespace = nil
+                phase = .complete; envelope = nil; documentData = nil; self.pendingNamespace = nil; recipientSession = nil
             } else { phase = reviewFallback; self.pendingNamespace = nil }
             return status()
         } catch { phase = .recoveryRequired; throw error }
@@ -260,14 +312,16 @@ public actor OfflineRestore<C: AirGapCryptography> {
     /// Keeps ciphertext progress, but clears decrypted review and retires every
     /// pre-suspension observation token. A commit already owned by storage settles.
     @discardableResult
-    public func suspend() -> OfflineRestoreStatus {
+    public func suspend(discardRecipientRequest: Bool = false) -> OfflineRestoreStatus {
         suspended = true; generation = UUID(); archive = nil; review = nil
+        if discardRecipientRequest { recipientSession = nil }
         if [.review, .preparingReview].contains(phase) { phase = reviewFallback }
         return status()
     }
     @discardableResult
     public func resume() -> OfflineRestoreStatus {
         guard suspended else { return status() }
+        guard recipientSession == nil else { return status() }
         suspended = false; generation = UUID()
         return status()
     }
@@ -276,7 +330,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
         guard phase != .committing, phase != .recoveryRequired else { throw WorkspaceStoreError.recoveryRequired }
         generation = UUID(); phase = .idle; suspended = false
         candidate = nil; receiver = nil; identity = nil; envelope = nil; archive = nil; review = nil; receipt = nil; pendingNamespace = nil
-        source = nil; documentData = nil; documentDigest = nil
+        source = nil; documentData = nil; documentDigest = nil; encryptionMode = nil; recipientSession = nil
         return status()
     }
     private func check(_ token: UUID) throws {

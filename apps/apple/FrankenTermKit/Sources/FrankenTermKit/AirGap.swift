@@ -44,7 +44,7 @@ public protocol AirGapCryptography: Sendable {
     /// A fixed-width big-endian private scalar to an uncompressed SEC1 point.
     /// The maintained primitive must reject zero and out-of-range scalars.
     func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
-    /// Bounded OpenSSH source-key work only; FTAG itself uses generated-code HKDF.
+    /// Bounded OpenSSH source-key work only; separate from FTAG's encryption.
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data
     /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
     /// and its derived public identity must validate before any key is accepted.
@@ -575,23 +575,30 @@ enum ZlibPacking {
     }
 }
 
+public enum FTAGMode: UInt8, Sendable {
+    case code = 1, recipient = 2
+    var modeHeaderLength: Int { self == .code ? 28 : 80 }
+    var headerLength: Int { 30 + modeHeaderLength }
+}
+
 public struct FTAGHeader: Sendable, Equatable {
+    public let mode: FTAGMode
     public let transferID: Data, header: Data, modeHeader: Data
     public let ciphertextLength: Int
     public init(envelope: Data) throws {
         guard envelope.count <= FTLimit.envelope else { throw FTError.limit("envelope.bytes") }
         var reader = ByteCursor(envelope)
         guard try reader.take(4) == Data("FTAG".utf8), try reader.uint(1) == 1 else { throw FTError.unsupported("envelope.version") }
-        let mode = try reader.uint(1)
-        guard mode == 1 else { throw FTError.unsupported("envelope.mode") }
+        guard let selected = FTAGMode(rawValue: UInt8(try reader.uint(1))) else { throw FTError.unsupported("envelope.mode") }
+        mode = selected
         guard try reader.uint(2) == 0 else { throw FTError.malformed("envelope.flags") }
         transferID = try reader.take(16)
         let count = try reader.uint(4), modeLength = try reader.uint(2)
-        guard modeLength == 28, count >= 4112, count <= FTLimit.envelope,
+        guard modeLength == mode.modeHeaderLength, count >= 4112, count <= FTLimit.envelope,
               (count - 16).isMultiple(of: 4096), UInt64(reader.remaining) == modeLength + count else { throw FTError.malformed("envelope.extent") }
         ciphertextLength = Int(count)
-        modeHeader = try reader.take(28)
-        header = envelope.prefix(58)
+        modeHeader = try reader.take(mode.modeHeaderLength)
+        header = envelope.prefix(mode.headerLength)
     }
     var aad: Data { Data("FrankenTerm/FTAG/v1/envelope\0".utf8) + header }
 }
@@ -614,13 +621,13 @@ public enum FTAG {
         let bytes = Array(crypto.sha256(envelope).ftHex.prefix(20).utf8)
         return stride(from: 0, to: bytes.count, by: 4).map { String(decoding: bytes[$0..<$0 + 4], as: UTF8.self) }.joined(separator: "-")
     }
-    static func pack(_ archive: Data, compress: Bool = true) throws -> Data {
+    static func pack(_ archive: Data, compress: Bool = true, mode: FTAGMode = .code) throws -> Data {
         guard !archive.isEmpty, archive.count <= FTLimit.archive else { throw FTError.limit("archive.bytes") }
         let compressed = compress ? try ZlibPacking.compress(archive) : archive
         let useCompressed = compressed.count < archive.count
         let payload = useCompressed ? compressed : archive
         let packedLength = ((9 + payload.count + 4095) / 4096) * 4096
-        guard packedLength + 74 <= FTLimit.envelope else { throw FTError.limit("envelope.bytes") }
+        guard packedLength + mode.headerLength + 16 <= FTLimit.envelope else { throw FTError.limit("envelope.bytes") }
         var data = Data([useCompressed ? 1 : 0])
         data.appendBE(UInt64(archive.count), bytes: 4); data.appendBE(UInt64(payload.count), bytes: 4)
         data += payload
@@ -658,6 +665,7 @@ public enum FTAG {
     }
     static func openArchiveBytes<C: AirGapCryptography>(_ envelope: Data, code: TransferCode, using crypto: C) throws -> Data {
         let header = try FTAGHeader(envelope: envelope)
+        guard header.mode == .code else { throw FTError.unsupported("envelope.requires_recipient_key") }
         let packed = try crypto.open(Data(envelope.suffix(header.ciphertextLength)), secret: code.secret,
                                      salt: Data(header.modeHeader.prefix(16)), nonce: Data(header.modeHeader.suffix(12)), aad: header.aad)
         return try unpackAuthenticated(packed)

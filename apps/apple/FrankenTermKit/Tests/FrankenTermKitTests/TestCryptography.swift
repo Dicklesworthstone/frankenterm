@@ -15,7 +15,7 @@ struct TestCryptography: AirGapCryptography {
         return result
     }
     func randomBytes(count: Int) throws -> Data { Data((0..<count).map { _ in UInt8.random(in: 0...255) }) }
-    private func hmac(_ key: Data, _ input: Data) -> Data {
+    func hmac(_ key: Data, _ input: Data) -> Data {
         var output = Data(count: 32), length: UInt32 = 32
         _ = output.withUnsafeMutableBytes { out in
             key.withUnsafeBytes { key in
@@ -31,9 +31,12 @@ struct TestCryptography: AirGapCryptography {
         hmac(hmac(salt, secret), Data("FrankenTerm/FTAG/v1/code-key".utf8) + Data([1]))
     }
     func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data {
+        try aeadSeal(plaintext, key: key(secret, salt), nonce: nonce, aad: aad)
+    }
+    func aeadSeal(_ plaintext: Data, key: Data, nonce: Data, aad: Data) throws -> Data {
+        guard key.count == 32, nonce.count == 12 else { throw FTError.authentication }
         guard let context = EVP_CIPHER_CTX_new() else { throw FTError.storage }
         defer { EVP_CIPHER_CTX_free(context) }
-        let key = key(secret, salt)
         guard key.withUnsafeBytes({ k in nonce.withUnsafeBytes({ n in
             EVP_EncryptInit_ex(context, EVP_chacha20_poly1305(), nil, k.bindMemory(to: UInt8.self).baseAddress, n.bindMemory(to: UInt8.self).baseAddress)
         }) }) == 1 else { throw FTError.authentication }
@@ -52,9 +55,13 @@ struct TestCryptography: AirGapCryptography {
         return output + tag
     }
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data {
+        try aeadOpen(ciphertextAndTag, key: key(secret, salt), nonce: nonce, aad: aad)
+    }
+    func aeadOpen(_ ciphertextAndTag: Data, key: Data, nonce: Data, aad: Data) throws -> Data {
+        guard key.count == 32, nonce.count == 12 else { throw FTError.authentication }
         guard ciphertextAndTag.count >= 16, let context = EVP_CIPHER_CTX_new() else { throw FTError.authentication }
         defer { EVP_CIPHER_CTX_free(context) }
-        let key = key(secret, salt), ciphertext = Data(ciphertextAndTag.dropLast(16))
+        let ciphertext = Data(ciphertextAndTag.dropLast(16))
         var tag = Data(ciphertextAndTag.suffix(16)), length: Int32 = 0
         guard key.withUnsafeBytes({ k in nonce.withUnsafeBytes({ n in
             EVP_DecryptInit_ex(context, EVP_chacha20_poly1305(), nil, k.bindMemory(to: UInt8.self).baseAddress, n.bindMemory(to: UInt8.self).baseAddress)
