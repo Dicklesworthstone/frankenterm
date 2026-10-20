@@ -150,7 +150,8 @@ public actor TerminalInputCoordinator {
     // alive during close/write preserves reservations while that work settles.
     private final class Connection {
         let source: TerminalSource, transport: any TerminalByteTransport
-        var active = true, closing = false, closed = false
+        var active = true, closed = false
+        var closeTask: Task<Void, Never>?
         var queue: [Operation] = []
         var outcomes: [TerminalInputOutcome] = []
         var inFlight: UInt64?
@@ -291,9 +292,14 @@ public actor TerminalInputCoordinator {
         guard !text.unicodeScalars.contains(where: {
             ($0.value < 32 && ![9, 10, 13].contains($0.value)) || (127...159).contains($0.value)
         }) else { throw TerminalInputError.unsafePaste }
+        let connection = try focusedConnection(focus)
+        // Check complete encoded size and the prepaid cancellation tail before
+        // making the UTF-8/framing copies. No actor suspension intervenes.
+        let encodedCount = text.utf8.count + (bracketed ? Self.pasteStart.count + Self.pasteEnd.count : 0)
+        try checkCapacity(connection, kind: .paste, byteCount: encodedCount)
         let payload = Data(text.utf8), start = bracketed ? Self.pasteStart.count : 0
         let bytes = (bracketed ? Self.pasteStart : Data()) + payload + (bracketed ? Self.pasteEnd : Data())
-        return try enqueue(focusedConnection(focus), kind: .paste, bytes: bytes,
+        return try enqueue(connection, kind: .paste, bytes: bytes,
                            pastePayload: start..<(start + payload.count), bracketed: bracketed)
     }
     /// Direct-SSH answerbacks remain active while their viewport is hidden.
@@ -306,12 +312,11 @@ public actor TerminalInputCoordinator {
             return .droppedWhole
         }
     }
-    private func enqueue(_ connection: Connection, kind: TerminalInputKind, bytes: Data,
-                         pastePayload: Range<Int>? = nil, bracketed: Bool = false) throws -> TerminalInputReceipt {
-        guard !bytes.isEmpty else { throw TerminalInputError.emptyInput }
+    private func checkCapacity(_ connection: Connection, kind: TerminalInputKind, byteCount: Int) throws {
+        guard byteCount > 0 else { throw TerminalInputError.emptyInput }
         let isCleanup = kind == .cleanup
-        let inputCharge = isCleanup ? 0 : bytes.count
-        let cleanupCharge = isCleanup ? bytes.count : (kind == .paste ? Self.pasteCleanupReservation : 0)
+        let inputCharge = isCleanup ? 0 : byteCount
+        let cleanupCharge = isCleanup ? byteCount : (kind == .paste ? Self.pasteCleanupReservation : 0)
         let totals = accounting()
         guard inputCharge <= limits.bytesPerConnection - connection.inputBytes,
               inputCharge <= limits.totalBytes - totals.retainedBytes,
@@ -325,6 +330,12 @@ public actor TerminalInputCoordinator {
             guard connection.records < limits.recordsPerConnection,
                   totals.retainedRecords < limits.totalRecords else { throw TerminalInputError.capacity }
         }
+    }
+    private func enqueue(_ connection: Connection, kind: TerminalInputKind, bytes: Data,
+                         pastePayload: Range<Int>? = nil, bracketed: Bool = false) throws -> TerminalInputReceipt {
+        try checkCapacity(connection, kind: kind, byteCount: bytes.count)
+        let inputCharge = kind == .cleanup ? 0 : bytes.count
+        let cleanupCharge = kind == .cleanup ? bytes.count : (kind == .paste ? Self.pasteCleanupReservation : 0)
         let receipt = TerminalInputReceipt(owner: owner, serial: try nextSerial(), source: connection.source)
         connection.queue.append(Operation(receipt, kind, Data(bytes), pastePayload: pastePayload,
                                           bracketed: bracketed, inputCharge: inputCharge, cleanupCharge: cleanupCharge))
@@ -369,12 +380,19 @@ public actor TerminalInputCoordinator {
         connection.outcomes.append(TerminalInputOutcome(receipt: operation.receipt, kind: operation.kind,
             originalBytes: operation.originalBytes, acceptedOriginalBytes: operation.acceptedOriginal,
             acceptedCleanupBytes: operation.acceptedCleanup, disposition: disposition))
+        // drainOne may still retain this object while awaiting transport close.
+        // Release our payload explicitly before freeing its accounted reservation.
+        // This is lifetime control, not a promise of forensic memory erasure.
+        operation.bytes = Data(); operation.inputCharge = 0; operation.cleanupCharge = 0
         connection.queue.removeAll { $0.receipt == operation.receipt }
     }
 
     /// At most one leased chunk per source. Another source or scene remains
     /// usable while this call awaits I/O. No Task-per-key or unbounded retry loop.
     public func drainOne(_ source: TerminalSource, maximumBytes: Int? = nil) async throws -> TerminalDrainResult {
+        // A driver cancelled before leasing bytes must not touch the transport.
+        // Already admitted operations remain owned by this queue for settlement.
+        try Task.checkCancellation()
         let maximum = maximumBytes ?? limits.maximumWriteBytes
         guard maximum > 0, maximum <= limits.maximumWriteBytes else { throw TerminalInputError.invalidWriteSize }
         let connection = try connection(source, active: false)
@@ -382,11 +400,12 @@ public actor TerminalInputCoordinator {
         guard connection.inFlight == nil else { return .busy }
         guard let operation = connection.queue.first else { return .idle }
         let count = min(maximum, operation.bytes.count - operation.cursor)
-        let bytes = operation.bytes.subdata(in: operation.cursor..<(operation.cursor + count))
+        var bytes = operation.bytes.subdata(in: operation.cursor..<(operation.cursor + count))
         connection.inFlight = operation.receipt.serial; connection.inFlightBytes = count
         let result: TerminalTransportWrite
         do { result = try await connection.transport.writeSome(bytes) }
         catch { result = .failed }
+        bytes = Data()
         connection.inFlight = nil; connection.inFlightBytes = 0
         if !connection.active {
             // A concurrent close does not erase a subsequently returned exact
@@ -435,10 +454,18 @@ public actor TerminalInputCoordinator {
         // Source-bound composition can be cancelled or explicitly suspended.
     }
     private func closeTransport(_ connection: Connection) async {
-        guard !connection.closing, !connection.closed else { return }
-        connection.closing = true
-        await connection.transport.close()
-        connection.closing = false; connection.closed = true
+        guard !connection.closed else { return }
+        // One retained close job per bounded connection, never one per caller.
+        // Every concurrent disconnect awaits the same actual settlement.
+        let task: Task<Void, Never>
+        if let existing = connection.closeTask { task = existing }
+        else {
+            let transport = connection.transport
+            task = Task { await transport.close() }
+            connection.closeTask = task
+        }
+        await task.value
+        connection.closed = true
     }
     public func disconnect(_ source: TerminalSource) async throws {
         let connection = try connection(source, active: false)
