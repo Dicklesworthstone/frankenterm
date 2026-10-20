@@ -28,7 +28,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var store: WorkspaceStore?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
-    @ObservationIgnored private var pendingImportURL: URL?
+    private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var observationTask: Task<Void, Never>?
@@ -36,9 +36,16 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var lastObservation: String?
     @ObservationIgnored private var lastObservationTime = ContinuousClock.now
     private struct CameraObservation: Sendable { let text: String, generation: UUID, epoch: UUID }
+    private struct PendingFileImport: Sendable {
+        let id = UUID()
+        let url: URL
+        var needsExplicitRetry = false
+    }
+    var hasPendingImport: Bool { pendingImport != nil }
+    var pendingImportNeedsRetry: Bool { pendingImport?.needsExplicitRetry == true }
 
     func requestCamera() {
-        guard active, !busy, !requestingCameraAccess else { return }
+        guard active, !busy, !requestingCameraAccess, state?.requiresRecipientResume != true else { return }
         if !showRestore { setRestoreVisible(true) }
         guard DataScannerViewController.isSupported else {
             message = "This device does not support the native scanner. Open a local encrypted file instead."
@@ -75,22 +82,49 @@ final class MobileWorkspaceModel {
             }.value
             store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
             try await refreshWorkspaces(using: created, epoch: epoch)
+            if active, pendingImport != nil { showRestore = true }
             updateLifecycle()
-            if active, let pendingImportURL { self.pendingImportURL = nil; importFile(pendingImportURL) }
         } catch { report(error); bootstrapStarted = false }
     }
     func setActive(_ value: Bool) {
         active = value
-        if !value { cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:] }
+        if !value {
+            cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
+            // A system permission sheet can interrupt a read. Do not turn its
+            // foreground callback into another automatic prompt/read attempt.
+            if busy { pendingImport?.needsExplicitRetry = true }
+        } else if pendingImport != nil { showRestore = true }
         updateLifecycle()
-        if value, restore != nil, let pendingImportURL { self.pendingImportURL = nil; importFile(pendingImportURL) }
     }
     func setRestoreVisible(_ value: Bool) {
         showRestore = value
-        if !value { cameraRequested = false }
-        updateLifecycle()
+        if !value { cameraRequested = false; pendingImport = nil }
+        updateLifecycle(discardRecipientRequest: !value)
     }
-    private func updateLifecycle() {
+    func requestRecipient() {
+        guard active, !busy else { return }
+        pendingImport = nil; cameraRequested = false; setRestoreVisible(true)
+        run { restore, state in
+            let current = state.phase == .complete ? try await restore.reset() : state
+            return try await restore.createRecipientRequest(generation: current.generation)
+        }
+    }
+    func resumeRecipientRequest() {
+        guard active, !busy else { return }
+        pendingImport?.needsExplicitRetry = false
+        run { restore, state in try await restore.resumeRecipientRequest(generation: state.generation) }
+    }
+    func resetRestore() {
+        guard active, !busy else { return }
+        pendingImport = nil; cameraRequested = false
+        run { restore, _ in try await restore.reset() }
+    }
+    func retryPendingImport() {
+        guard active, !busy, state?.isSuspended == false else { return }
+        pendingImport?.needsExplicitRetry = false
+        openPendingFileIfReady()
+    }
+    private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
         observations?.finish(); observations = nil
         observationTask?.cancel(); observationTask = nil; lastObservation = nil
@@ -98,7 +132,7 @@ final class MobileWorkspaceModel {
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
         lifecycle = Task { [weak self] in
             await prior?.value
-            let next = visible ? await restore.resume() : await restore.suspend()
+            let next = visible ? await restore.resume() : await restore.suspend(discardRecipientRequest: discardRecipientRequest)
             guard let self, self.epoch == ticket else { return }
             self.state = next
             if visible { self.startObservations(restore: restore) }
@@ -106,6 +140,8 @@ final class MobileWorkspaceModel {
                 do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
                 catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.localPolicies = [:]; self.report(error) } }
             }
+            guard self.epoch == ticket else { return }
+            self.openPendingFileIfReady()
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
@@ -150,7 +186,10 @@ final class MobileWorkspaceModel {
         Task { [weak self] in
             await pendingLifecycle?.value
             guard let self else { return }
-            defer { self.busy = false }
+            defer {
+                self.busy = false
+                self.openPendingFileIfReady()
+            }
             guard self.active, self.epoch == ticket else { return }
             do {
                 let current = await restore.status()
@@ -169,20 +208,81 @@ final class MobileWorkspaceModel {
     func importFile(_ url: URL) {
         guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
         guard !busy else { message = "Finish the current import before opening another workspace."; return }
+        pendingImport = PendingFileImport(url: url)
         guard active, restore != nil else {
-            pendingImportURL = url
             if !bootstrapStarted { Task { await bootstrap() } }
             return
         }
         cameraRequested = false; setRestoreVisible(true)
-        run { restore, state in
-            let state = state.phase == .complete ? try await restore.reset() : state
-            let bytes = try await Task.detached(priority: .userInitiated) { try SelectedLocalFile.read(url, limit: FTLimit.envelope) }.value
-            if bytes.starts(with: Data("FTAG".utf8)) {
-                return try await restore.acceptEncryptedFile(bytes, generation: state.generation)
+        // The serialized lifecycle calls openPendingFileIfReady after obtaining
+        // the actor's current status. A paused phone request keeps its selection.
+    }
+    private func openPendingFileIfReady() {
+        guard active, showRestore, !busy, let restore, let selected = pendingImport,
+              !selected.needsExplicitRetry, state?.isSuspended == false else { return }
+        busy = true; message = nil
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            await pendingLifecycle?.value
+            guard let self else { return }
+            defer { self.busy = false }
+            guard self.active, self.showRestore, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                self.markPendingImportInterrupted(selected.id)
+                return
             }
-            return try await restore.acceptWorkspaceDocument(bytes, generation: state.generation)
+            let current = await restore.status()
+            guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                self.markPendingImportInterrupted(selected.id)
+                return
+            }
+            self.state = current
+            guard !current.isSuspended else { return }
+            var submittedDocument = false
+            do {
+                let ready = current.phase == .complete ? try await restore.reset() : current
+                guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
+                guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                    self.markPendingImportInterrupted(selected.id)
+                    return
+                }
+                let bytes = try await Task.detached(priority: .userInitiated) {
+                    try SelectedLocalFile.read(selected.url, limit: FTLimit.envelope)
+                }.value
+                guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                    self.markPendingImportInterrupted(selected.id)
+                    return
+                }
+                let result: OfflineRestoreStatus
+                if bytes.starts(with: Data("FTAG".utf8)) {
+                    result = try await restore.acceptEncryptedFile(bytes, generation: ready.generation)
+                } else {
+                    submittedDocument = true
+                    result = try await restore.acceptWorkspaceDocument(bytes, generation: ready.generation)
+                }
+                // Acceptance owns the selected input even if a later suspension
+                // prevents publishing its result to this view. Never replay it.
+                if self.pendingImport?.id == selected.id { self.pendingImport = nil }
+                guard self.active, self.epoch == ticket else { return }
+                self.state = result
+            } catch {
+                let latest = await restore.status()
+                guard self.pendingImport?.id == selected.id else { return }
+                let interrupted = !self.active || self.epoch != ticket || latest.isSuspended
+                // A public document can be admitted before its awaited preview
+                // is suspended. The actor already owns it and offers fresh review.
+                let ownsDocument = submittedDocument && latest.source == .workspaceDocument
+                    && latest.phase != .idle && latest.phase != .complete
+                if ownsDocument || !interrupted { self.pendingImport = nil }
+                else { self.markPendingImportInterrupted(selected.id) }
+                guard self.active, self.epoch == ticket else { return }
+                self.state = latest
+                if !interrupted { self.report(error) }
+            }
         }
+    }
+    private func markPendingImportInterrupted(_ id: UUID) {
+        guard pendingImport?.id == id else { return }
+        pendingImport?.needsExplicitRetry = true
     }
     func report(_ error: Error) {
         if let error = error as? FTError { message = error.localizedDescription }
@@ -207,6 +307,9 @@ struct MobileWorkspaceRoot: View {
                         Button { model.requestCamera() } label: {
                             Label("Restore from Animated QR", systemImage: "qrcode.viewfinder")
                         }.disabled(model.state == nil)
+                        Button { model.requestRecipient() } label: {
+                            Label("Encrypt Only for This Phone", systemImage: "iphone.and.arrow.forward")
+                        }.disabled(model.state == nil || model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
                         Button { chooseFile = true } label: { Label("Open Workspace File", systemImage: "doc.badge.arrow.up") }
                             .disabled(model.state == nil || model.busy)
                     }
@@ -263,6 +366,7 @@ struct OfflineRestoreSheet: View {
     @State private var allowRemoval = false
     @State private var allowRollback = false
     @State private var repairPage = 0
+    @State private var chooseFile = false
     var body: some View {
         NavigationStack {
             Group {
@@ -283,6 +387,20 @@ struct OfflineRestoreSheet: View {
                                     Text(verbatim: comparison).font(.system(.headline, design: .monospaced)).minimumScaleFactor(0.6).lineLimit(1)
                                 }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
                             }
+                            if state.requiresRecipientResume {
+                                Label("Phone request paused", systemImage: "lock.shield").font(.headline)
+                                Text("Your request key is still held only in this running app. Resume this request deliberately before scanning or decrypting. Closing this restore or terminating the app loses the key.")
+                                if model.hasPendingImport {
+                                    Text("Your selected local file is waiting. It will open after you resume this phone request.")
+                                }
+                                Button("Resume This Phone Request") {
+                                    model.resumeRecipientRequest()
+                                }.buttonStyle(.borderedProminent)
+                            } else {
+                            if model.pendingImportNeedsRetry {
+                                Text("The selected file is still waiting after an interruption. Continue when you are ready; the app will not reopen it automatically.")
+                                Button("Continue Selected File") { model.retryPendingImport() }.buttonStyle(.borderedProminent)
+                            }
                             if [.idle, .collecting].contains(state.phase), model.cameraRequested, !state.isSuspended {
                                 if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
                                     OpticalCamera(onCode: model.observed, onError: model.report)
@@ -293,8 +411,18 @@ struct OfflineRestoreSheet: View {
                             }
                             switch state.phase {
                             case .idle:
-                                Text("Point at the Mac’s Offline QR Transfer. No network service is used.")
-                                Button("Open Camera") { model.requestCamera() }.disabled(model.requestingCameraAccess)
+                                if let request = state.recipientRequest {
+                                    RecipientRequestCard(request: request)
+                                    Text("On your Mac, choose Only This Phone and scan this QR. Compare the recipient value on both devices before exporting. Then point this phone at the Mac’s encrypted transfer.")
+                                    Button("Scan the Mac’s Encrypted Transfer") { model.requestCamera() }.disabled(model.requestingCameraAccess)
+                                } else {
+                                    Text("Point at the Mac’s Offline QR Transfer. No network service is used.")
+                                    Button("Open Camera") { model.requestCamera() }.disabled(model.requestingCameraAccess)
+                                    Button("Encrypt Only for This Phone") { model.requestRecipient() }
+                                }
+                                Button(state.recipientRequest == nil ? "Open Local Workspace File" : "Open Local Encrypted File") {
+                                    chooseFile = true
+                                }
                             case .candidate:
                                 Text("A transfer is in view. Confirm that this is the Mac you intend to use before collecting it.")
                                 Button("Use This Transfer") {
@@ -325,6 +453,19 @@ struct OfflineRestoreSheet: View {
                                     }
                                 }
                             case .locked:
+                                if state.encryptionMode == .recipient {
+                                    if state.canUnlockRecipient {
+                                        Text("The complete package is encrypted for this phone request. Decrypt it, then compare the envelope value on your Mac and review the source and contents.")
+                                        Button("Decrypt for This Phone and Review") {
+                                            confirmed = false; allowRemoval = false; allowRollback = false
+                                            model.run { restore, state in try await restore.unlockRecipient(generation: state.generation) }
+                                        }.buttonStyle(.borderedProminent)
+                                    } else {
+                                        Text("This package needs a matching private phone request that is not available in this session. Start a different transfer, create a fresh phone request, and have the Mac encrypt again. A transfer code cannot unlock this package.")
+                                    }
+                                } else if state.recipientRequest != nil {
+                                    Text("This package uses a transfer code, but you requested encryption only for this phone. Ask the Mac to use the confirmed phone request, or start a different transfer to choose code mode explicitly.")
+                                } else {
                                 Text("The complete encrypted package is collected. Reveal the transfer code separately on your Mac and enter it here.")
                                 SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
                                     .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
@@ -332,6 +473,7 @@ struct OfflineRestoreSheet: View {
                                     let entered = code; code = ""; confirmed = false; allowRemoval = false; allowRollback = false
                                     model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
                                 }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
+                                }
                             case .documentReady:
                                 Text("The public workspace is ready for a fresh source and settings review. It contains no private keys and needs no transfer code.")
                                 Button("Review Workspace") {
@@ -345,6 +487,9 @@ struct OfflineRestoreSheet: View {
                                     Text("\(review.document.machines.count) machines · \(review.includedFingerprints.count) private identities included")
                                     if state.source == .workspaceDocument {
                                         Text("This public document is not encrypted or authenticated. Review its source, endpoints, and host trust before accepting it. Existing matching device credentials can be reused.")
+                                            .font(.callout)
+                                    } else if state.encryptionMode == .recipient {
+                                        Text("Encryption to this phone does not identify the sender. Compare this envelope’s value with the trusted Mac before accepting host policy or private keys.")
                                             .font(.callout)
                                     }
                                     ForEach(review.document.machines) { machine in
@@ -421,10 +566,11 @@ struct OfflineRestoreSheet: View {
                                     model.run { restore, state in try await restore.reconcile(generation: state.generation) }
                                 }.buttonStyle(.borderedProminent)
                             }
+                            }
                             if ![.committing, .preparingReview, .recoveryRequired].contains(state.phase) {
                                 Button("Start a Different Transfer", role: .destructive) {
                                     code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
-                                    model.run { restore, _ in try await restore.reset() }
+                                    model.resetRestore()
                                 }
                             }
                             if model.busy { ProgressView() }
@@ -435,6 +581,12 @@ struct OfflineRestoreSheet: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
+        .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls): if let url = urls.first { model.importFile(url) }
+            case .failure(let error): model.report(error)
+            }
+        }
         .onChange(of: model.active) { _, active in if !active { code = ""; confirmed = false; allowRemoval = false; allowRollback = false } }
         .onChange(of: model.state?.review?.token) { _, _ in confirmed = false; allowRemoval = false; allowRollback = false }
         .onDisappear { code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false }
@@ -449,6 +601,40 @@ struct OfflineRestoreSheet: View {
         case .committing: "Restoring workspace"
         case .complete: "Your workspace is restored"
         case .recoveryRequired: "Check the save result"
+        }
+    }
+}
+
+@MainActor
+private struct RecipientRequestCard: View {
+    let request: RecipientRequest
+    @State private var image: UIImage?
+    @State private var failed = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Only this phone request").font(.headline)
+            if let image {
+                Image(uiImage: image).resizable().interpolation(.none)
+                    .frame(width: 226, height: 226).background(.white)
+                    .accessibilityLabel("Public recipient request QR. Compare the value below on your Mac.")
+            } else if failed {
+                Text("The phone request QR could not be rendered. Start a different transfer and create a new request.")
+            } else { ProgressView("Preparing public request…") }
+            Text("Recipient comparison").font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: request.comparison(using: AppleCryptography()))
+                .font(.system(.headline, design: .monospaced)).minimumScaleFactor(0.6).lineLimit(1)
+            Text("The request is public. Its private key stays in this app’s memory. Closing this restore or terminating the app loses that key; the Mac must then create a new export. A recording for this request is not a recoverable backup.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .task(id: request.encoded) {
+            image = nil; failed = false
+            do {
+                let symbol = try await NativeOpticalPresentation().recipientSymbol(text: request.text)
+                try Task.checkCancellation()
+                guard let decoded = UIImage(data: symbol.png) else { throw FTError.storage }
+                image = decoded
+            } catch is CancellationError { }
+            catch { failed = true }
         }
     }
 }

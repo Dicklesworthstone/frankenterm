@@ -3,6 +3,8 @@ import Observation
 import AppKit
 import UniformTypeIdentifiers
 import ImageIO
+import Vision
+@preconcurrency import AVFoundation
 import FrankenTermKit
 
 private typealias SourceKeyUnlockRequest = OpenSSHSourceKeyUnlocker<AppleCryptography>.Request
@@ -18,11 +20,16 @@ struct FrankenTermExportApp: App {
     }
 }
 
+private enum ExportProtection: Sendable, Hashable {
+    case code, recipient
+}
+
 /// File reads, parsing, key validation, compression and encryption remain off UI.
-/// Only a selected workspace and explicitly chosen key files are ever opened.
+/// Only explicitly chosen workspace, key, and recipient-image files are opened.
 private actor MacExportEngine {
     struct Prepared: Sendable {
         let comparison: String, pages: Int, bytes: Int
+        let protection: ExportProtection
     }
     struct SelectionState: Sendable {
         let source: WorkspaceDocument
@@ -47,7 +54,8 @@ private actor MacExportEngine {
     private var selection: WorkspaceExportSelection?
     private var decisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     private var keys: [PrivateKeyRecord] = []
-    private var exported: FTAG.Export?
+    private var exportedEnvelope: Data?
+    private var transferCode: TransferCode?
     private var sender: OpticalSender?
 
     private func fingerprint(_ key: PrivateKeyRecord) -> String {
@@ -59,7 +67,7 @@ private actor MacExportEngine {
         return .init(source: document, selection: selection, decisions: decisions, loadedFingerprints: loaded,
                      review: try selection.review(decisions: decisions, loadedFingerprints: loaded))
     }
-    private func invalidateExport() { exported = nil; sender = nil }
+    func invalidateExport() { exportedEnvelope = nil; transferCode = nil; sender = nil }
     private func retireKeyRequest() {
         if let pending = pendingKeyInstallation {
             keys = pending.previousKeys; decisions = pending.previousDecisions
@@ -148,7 +156,40 @@ private actor MacExportEngine {
         keys = next; decisions[selectedFingerprint] = .includePrivateKey; invalidateExport()
         return try state()
     }
-    func prepare() throws -> Prepared {
+    func scanRecipientImage(_ url: URL) throws -> RecipientRequest {
+        invalidateExport()
+        let bytes = try SelectedLocalFile.read(url, limit: 8 * 1024 * 1024)
+        return try autoreleasepool {
+            guard let source = CGImageSourceCreateWithData(bytes as CFData, [kCGImageSourceShouldCache as String: false] as CFDictionary),
+                  CGImageSourceGetCount(source) == 1,
+                  let type = CGImageSourceGetType(source),
+                  [UTType.png.identifier, UTType.jpeg.identifier, UTType.heic.identifier].contains(type as String),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+                  let width = properties[kCGImagePropertyPixelWidth as String] as? Int,
+                  let height = properties[kCGImagePropertyPixelHeight as String] as? Int,
+                  width > 0, height > 0, width <= 8192, height <= 8192,
+                  width <= 16_777_216 / height else { throw FTError.limit("recipient.image") }
+            // Downsample before Vision sees pixels; never decode an unbounded
+            // image or interpret a file/URL as a command or recipient request.
+            let options: [String: Any] = [kCGImageSourceCreateThumbnailFromImageAlways as String: true,
+                                          kCGImageSourceCreateThumbnailWithTransform as String: true,
+                                          kCGImageSourceThumbnailMaxPixelSize as String: 2048,
+                                          kCGImageSourceShouldCacheImmediately as String: false]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+                  image.width <= 2048, image.height <= 2048 else { throw FTError.malformed("recipient.image") }
+            try Task.checkCancellation()
+            let scan = VNDetectBarcodesRequest(); scan.symbologies = [.qr]
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([scan])
+            guard let observations = scan.results, observations.count == 1,
+                  let text = observations[0].payloadStringValue,
+                  text.hasPrefix("FTREQ1:"), text.utf8.count <= FTLimit.text else {
+                throw FTError.malformed("recipient.image_qr")
+            }
+            try Task.checkCancellation()
+            return try RecipientRequest(text: text)
+        }
+    }
+    func prepare(recipient: RecipientRequest?) throws -> Prepared {
         retireKeyRequest(); invalidateExport()
         try Task.checkCancellation()
         guard let selection else { throw FTError.stale }
@@ -156,11 +197,20 @@ private actor MacExportEngine {
         // changes selected keys or prepares the same source document again.
         // Playback and file/animation saves continue reusing this one envelope.
         let archive = try selection.archive(decisions: decisions, keys: keys, bundleID: UUID().uuidString, using: crypto)
-        let candidate = try FTAG.seal(archive, using: crypto)
+        let envelope: Data
+        let code: TransferCode?
+        if let recipient {
+            envelope = try FTAG.seal(archive, recipient: recipient, using: crypto)
+            code = nil
+        } else {
+            let candidate = try FTAG.seal(archive, using: crypto)
+            envelope = candidate.envelope; code = candidate.code
+        }
         try Task.checkCancellation()
-        let optical = try OpticalSender(envelope: candidate.envelope, using: crypto)
-        exported = candidate; sender = optical
-        return .init(comparison: FTAG.comparison(candidate.envelope, using: crypto), pages: optical.identity.pageCount, bytes: candidate.envelope.count)
+        let optical = try OpticalSender(envelope: envelope, using: crypto)
+        exportedEnvelope = envelope; transferCode = code; sender = optical
+        return .init(comparison: FTAG.comparison(envelope, using: crypto), pages: optical.identity.pageCount,
+                     bytes: envelope.count, protection: recipient == nil ? .code : .recipient)
     }
     func next(repairPage: Int?) throws -> String {
         guard var active = sender else { throw FTError.stale }
@@ -169,19 +219,19 @@ private actor MacExportEngine {
         return text
     }
     func code() throws -> String {
-        guard let exported else { throw FTError.stale }
-        return exported.code.reveal(using: crypto)
+        guard exportedEnvelope != nil, let transferCode else { throw FTError.stale }
+        return transferCode.reveal(using: crypto)
     }
     func encryptedEnvelope() throws -> Data {
-        guard let exported else { throw FTError.stale }
-        return exported.envelope
+        guard let exportedEnvelope else { throw FTError.stale }
+        return exportedEnvelope
     }
     func saveEncryptedFile(to url: URL) throws {
-        guard url.isFileURL, let exported else { throw FTError.stale }
+        guard url.isFileURL, let exportedEnvelope else { throw FTError.stale }
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         // Deliberate new-file save only. Never overwrite another backup silently.
-        try exported.envelope.write(to: url, options: .withoutOverwriting)
+        try exportedEnvelope.write(to: url, options: .withoutOverwriting)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         let handle = try FileHandle(forWritingTo: url)
         try handle.synchronize(); try handle.close()
@@ -207,6 +257,13 @@ private final class MacExportModel {
     var rate = 5
     var repairPage = -1
     var approveSelectedKeys = false
+    private(set) var protection = ExportProtection.code
+    private(set) var recipientRequest: RecipientRequest?
+    private(set) var recipientComparison: String?
+    private(set) var recipientConfirmed = false
+    private(set) var scanningRecipient = false
+    private(set) var requestingCameraAccess = false
+    private(set) var recipientScanID = UUID()
     var keyUnlockRequest: SourceKeyUnlockRequest?
     @ObservationIgnored private let engine = MacExportEngine()
     @ObservationIgnored private let renderer = NativeOpticalPresentation()
@@ -216,9 +273,13 @@ private final class MacExportModel {
     @ObservationIgnored private var generation = UUID()
     @ObservationIgnored private var awake: NSObjectProtocol?
     @ObservationIgnored private var foreground = true
+    @ObservationIgnored private var cameraPermission: Task<Void, Never>?
     @ObservationIgnored private var sourceKeyOperation: UUID?
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
+    var destinationReady: Bool {
+        protection == .code || (recipientRequest != nil && recipientConfirmed)
+    }
     private func apply(_ result: MacExportEngine.SelectionState) {
         document = result.source; selection = result.selection; identityDecisions = result.decisions
         includedFingerprints = result.loadedFingerprints; exportReview = result.review
@@ -231,12 +292,88 @@ private final class MacExportModel {
         sourceKeyOperation = nil; keyUnlockRequest = nil
     }
 
+    func selectProtection(_ value: ExportProtection) {
+        guard !busy, sourceKeyOperation == nil, value != protection else { return }
+        cancelRecipientScan(); invalidatePrepared()
+        protection = value; recipientRequest = nil; recipientComparison = nil; recipientConfirmed = false
+        perform { [self] in await engine.invalidateExport() }
+    }
+    func confirmRecipient(_ value: Bool) {
+        guard !busy, sourceKeyOperation == nil, protection == .recipient, recipientRequest != nil else { return }
+        // Approval belongs to this exact parsed request. Replacing it, changing
+        // modes, or withdrawing confirmation also invalidates the sealed export.
+        invalidatePrepared(); recipientConfirmed = value
+        perform { [self] in await engine.invalidateExport() }
+    }
+    private func resetRecipient() {
+        cancelRecipientScan(); invalidatePrepared()
+        recipientRequest = nil; recipientComparison = nil; recipientConfirmed = false
+    }
+    private func acceptRecipient(_ request: RecipientRequest) {
+        recipientRequest = request; recipientComparison = request.comparison(using: AppleCryptography())
+        recipientConfirmed = false; approveSelectedKeys = false
+        message = "Compare the recipient value directly with the iPhone before approving this destination."
+    }
+    func scanRecipientWithCamera() {
+        guard !busy, foreground, sourceKeyOperation == nil, protection == .recipient, !requestingCameraAccess else { return }
+        resetRecipient()
+        let token = recipientScanID
+        perform { [self] in
+            await engine.invalidateExport()
+            guard foreground, protection == .recipient, recipientScanID == token else { return }
+            let status = AVCaptureDevice.authorizationStatus(for: .video)
+            if status == .authorized { scanningRecipient = true; return }
+            guard status == .notDetermined else {
+                message = "Camera access is denied or restricted. Allow FrankenTerm Export in System Settings, or scan a local image of the phone’s recipient QR."
+                return
+            }
+            requestingCameraAccess = true
+            cameraPermission = Task { [weak self] in
+                let granted = await AVCaptureDevice.requestAccess(for: .video)
+                guard let self, self.recipientScanID == token else { return }
+                self.requestingCameraAccess = false; self.cameraPermission = nil
+                guard !Task.isCancelled, self.foreground, self.protection == .recipient else { return }
+                if granted { self.scanningRecipient = true }
+                else { self.message = "Camera access was not granted. You can scan a local image of the recipient QR, or use a generated transfer code." }
+            }
+        }
+    }
+    func cancelRecipientScan() {
+        recipientScanID = UUID(); scanningRecipient = false; requestingCameraAccess = false
+        cameraPermission?.cancel(); cameraPermission = nil
+    }
+    func receiveRecipient(_ text: String, scanID: UUID) {
+        guard foreground, !busy, protection == .recipient, scanningRecipient, recipientScanID == scanID else { return }
+        cancelRecipientScan()
+        do { acceptRecipient(try RecipientRequest(text: text)) }
+        catch { report(error) }
+    }
+    func recipientCameraFailed(_ error: FTError, scanID: UUID) {
+        guard scanningRecipient, recipientScanID == scanID else { return }
+        cancelRecipientScan(); report(error)
+    }
+    func scanRecipientImage() {
+        guard !busy, sourceKeyOperation == nil, protection == .recipient else { return }
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg, .heic]
+        panel.message = "Choose a local image containing only the iPhone’s FrankenTerm recipient-request QR. You must compare its recipient value with the phone before exporting."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        resetRecipient()
+        let token = recipientScanID
+        perform { [self] in
+            let request = try await engine.scanRecipientImage(url)
+            try Task.checkCancellation()
+            guard foreground, protection == .recipient, recipientScanID == token else { return }
+            acceptRecipient(request)
+        }
+    }
+
     func chooseWorkspace() {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json, .data]; panel.message = "Choose a local .ftworkspace JSON document. Executable Mac configuration is never evaluated."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        retireSourceKeyPrompt(); invalidatePrepared()
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         perform { [self] in
             apply(try await engine.loadWorkspace(url))
         }
@@ -246,12 +383,12 @@ private final class MacExportModel {
         var groups = selectedGroupIDs
         if included { groups.insert(id) } else { groups.remove(id) }
         guard !groups.isEmpty else { return }
-        retireSourceKeyPrompt(); invalidatePrepared()
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         perform { [self] in apply(try await engine.selectGroups(groups)) }
     }
     func decide(_ value: WorkspaceExportSelection.IdentityDecision, fingerprint: String) {
         guard !busy else { return }
-        retireSourceKeyPrompt(); invalidatePrepared()
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         perform { [self] in apply(try await engine.decide(value, fingerprint: fingerprint)) }
     }
     func chooseKey(_ credentialID: String) {
@@ -259,7 +396,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.message = "Choose the matching OpenSSH Ed25519 or ECDSA key (P-256, P-384, or P-521). Protected files using bcrypt and AES-CTR are unlocked locally after you enter their passphrase."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        retireSourceKeyPrompt(); invalidatePrepared()
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
         perform { [self] in
             do {
@@ -310,9 +447,15 @@ private final class MacExportModel {
         Task { await engine.cancelKeyUnlock(operationID: token, requestID: requestID) }
     }
     func prepare() {
-        guard !busy, approveSelectedKeys, exportReview?.canPrepare == true else { return }
+        guard !busy, foreground, sourceKeyOperation == nil, approveSelectedKeys,
+              exportReview?.canPrepare == true, destinationReady else { return }
+        let recipient = protection == .recipient ? recipientRequest : nil
         pause(); revealedCode = nil; prepared = nil; emitted = 0; repairPage = -1
-        perform { [self] in prepared = try await engine.prepare(); emitted = 0; repairPage = -1 }
+        perform { [self] in
+            let result = try await engine.prepare(recipient: recipient)
+            try Task.checkCancellation()
+            prepared = result; emitted = 0; repairPage = -1
+        }
     }
     private func perform(_ body: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }
@@ -346,7 +489,7 @@ private final class MacExportModel {
         if let awake { ProcessInfo.processInfo.endActivity(awake); self.awake = nil }
     }
     func revealCode() {
-        guard !busy, prepared != nil, foreground else { return }
+        guard !busy, prepared?.protection == .code, foreground else { return }
         // Remove the QR and invalidate in-flight raster work BEFORE requesting code.
         pause(); revealedCode = nil
         let token = generation
@@ -360,7 +503,7 @@ private final class MacExportModel {
     func setForeground(_ value: Bool) {
         foreground = value
         if !value {
-            pause(); revealedCode = nil
+            pause(); revealedCode = nil; cancelRecipientScan()
             if let token = sourceKeyOperation {
                 work?.cancel(); retireSourceKeyPrompt()
                 // A pending read or KDF checks cancellation before installing a
@@ -373,9 +516,17 @@ private final class MacExportModel {
         guard !busy, prepared != nil else { return }
         pause(); revealedCode = nil
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Workspace.ftairgap"
-        panel.message = "Save encrypted bytes only. Keep the separately revealed transfer code in a different place. Choose a new filename."
+        let recipientOnly = prepared?.protection == .recipient
+        panel.message = recipientOnly
+            ? "Save encrypted bytes for the confirmed iPhone. This file will not open after the phone loses its active request key. Choose a new filename."
+            : "Save encrypted bytes only. Keep the separately revealed transfer code in a different place. Choose a new filename."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        perform { [self] in try await engine.saveEncryptedFile(to: url); message = "Encrypted workspace saved. The transfer code is not included in this file." }
+        perform { [self] in
+            try await engine.saveEncryptedFile(to: url)
+            message = recipientOnly
+                ? "Encrypted workspace saved for the confirmed iPhone. Its active request key is required; this file is not an independent recovery backup."
+                : "Encrypted workspace saved. The transfer code is not included in this file."
+        }
     }
     func saveAnimation() {
         guard !busy, prepared != nil else { return }
@@ -384,11 +535,12 @@ private final class MacExportModel {
         panel.allowedContentTypes = [.png]; panel.allowsOtherFileTypes = true
         panel.message = "Save a lossless animated PNG. Every encoded frame is checked before the final file is published. Choose a new filename."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let speed = rate
+        let speed = rate, recipientOnly = prepared?.protection == .recipient
         perform { [self] in
             let bytes = try await engine.encryptedEnvelope()
             let count = try await renderer.saveAnimation(envelope: bytes, to: url, symbolsPerSecond: speed)
-            message = "Saved and verified \(count) encrypted QR symbols. Play the APNG without interpolation; keep its code separate."
+            message = "Saved and verified \(count) encrypted QR symbols. Play the APNG without interpolation. "
+                + (recipientOnly ? "Only the confirmed iPhone’s active request key can open this recording." : "Keep its transfer code separate.")
         }
     }
     func saveVideo() {
@@ -398,12 +550,13 @@ private final class MacExportModel {
         panel.allowedContentTypes = [.mpeg4Movie]
         panel.message = "Save an encrypted QR video. Every decoded frame and the reconstructed package must pass verification before the new file is published."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let speed = rate
+        let speed = rate, recipientOnly = prepared?.protection == .recipient
         perform { [self] in
             let source = try OpticalVideoSource(envelope: await engine.encryptedEnvelope())
             let receipt = try await videoRenderer.save(source: source, to: url, symbolsPerSecond: speed)
             let duration = String(format: "%.1f", receipt.durationSeconds)
-            message = "Saved and verified \(receipt.symbolCount) encrypted QR symbols in a \(duration)-second MP4 (\(receipt.frameCount) frames). Keep its transfer code separate."
+            message = "Saved and verified \(receipt.symbolCount) encrypted QR symbols in a \(duration)-second MP4 (\(receipt.frameCount) frames). "
+                + (recipientOnly ? "The confirmed iPhone must retain its active request key; this is not an independent recovery backup." : "Keep its transfer code separate.")
         }
     }
     func cancelWork() {
@@ -415,7 +568,8 @@ private final class MacExportModel {
     }
     func clear() {
         guard !busy else { return }
-        retireSourceKeyPrompt(); invalidatePrepared(); document = nil; selection = nil; identityDecisions = [:]; exportReview = nil
+        retireSourceKeyPrompt(); resetRecipient(); protection = .code
+        document = nil; selection = nil; identityDecisions = [:]; exportReview = nil
         includedFingerprints = []; prepared = nil; approveSelectedKeys = false; repairPage = -1
         perform { [self] in await engine.clear() }
     }
@@ -435,6 +589,20 @@ private final class MacExportModel {
                 message = "This package exceeds the bounded video duration or symbol count. Select fewer groups or identities, use live playback, or save the encrypted .ftairgap file. The package was not truncated."
             } else if error == .unsupported("video.published_durability_unconfirmed") {
                 message = "The MP4 was verified and saved. The filesystem could not confirm that the directory change would survive a sudden system failure. The completed movie is retained at the selected destination."
+            } else if error == .unsupported("recipient.camera") {
+                message = "A camera with QR scanning is unavailable. Choose a local image of the phone’s recipient-request QR, or use a generated transfer code."
+            } else if error == .unsupported("recipient.camera_interrupted") {
+                message = "The camera stopped. Start the recipient scanner again when the camera is available, or choose a local QR image."
+            } else if error == .malformed("recipient.multiple_qr") {
+                message = "More than one recipient request is visible. Show only the QR request on the intended iPhone and scan again."
+            } else if error == .limit("recipient.image") || error == .malformed("recipient.image") {
+                message = "Choose a single local PNG, JPEG, or HEIC image no larger than 8 MiB and 16 megapixels. A screenshot of the recipient request works well."
+            } else if error == .malformed("recipient.image_qr") {
+                message = "The image must contain exactly one readable FrankenTerm recipient-request QR. Choose another image or scan the phone with the camera."
+            } else if error == .limit("recipient.envelope_limit") {
+                message = "This export exceeds the size accepted by the iPhone’s request. Select fewer groups or private identities, or create and confirm a new request with a larger limit. Nothing was omitted automatically."
+            } else if error == .authentication, protection == .recipient {
+                message = "The recipient request could not be used for encryption. Create a new request on the iPhone, then scan and compare it again."
             } else { message = error.localizedDescription }
         }
         else if !(error is CancellationError) { message = "The operation could not finish. Check access, available storage, and choose a new filename. Existing source files were not changed." }
@@ -462,10 +630,15 @@ private struct MacExportView: View {
                 }
                 if let prepared = model.prepared {
                     HStack {
-                        Text(verbatim: prepared.comparison).font(.system(.title3, design: .monospaced).bold())
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Package comparison").font(.caption)
+                            Text(verbatim: prepared.comparison).font(.system(.title3, design: .monospaced).bold())
+                        }
                         Spacer()
                         Text("\(prepared.pages) pages · \(prepared.bytes) encrypted bytes").font(.caption)
                     }
+                    Text("Compare this package value with the completed transfer on the iPhone, then review its source and contents before activating the workspace.")
+                        .font(.caption).foregroundStyle(.secondary)
                     ZStack {
                         RoundedRectangle(cornerRadius: 20).fill(.white)
                         if let code = model.revealedCode {
@@ -488,7 +661,11 @@ private struct MacExportView: View {
                     HStack {
                         Button(model.playing ? "Pause" : "Play QR Animation") { if model.playing { model.pause() } else { model.play() } }
                             .buttonStyle(.borderedProminent).disabled(model.busy)
-                        Button("Reveal Code Separately") { model.revealCode() }.disabled(model.busy)
+                        if prepared.protection == .code {
+                            Button("Reveal Code Separately") { model.revealCode() }.disabled(model.busy)
+                        } else {
+                            Label("Only the confirmed iPhone", systemImage: "iphone.and.arrow.forward").font(.caption)
+                        }
                         Picker("Symbols/second", selection: $model.rate) { Text("3").tag(3); Text("5").tag(5); Text("10").tag(10) }.frame(width: 155)
                     }
                     HStack {
@@ -505,12 +682,29 @@ private struct MacExportView: View {
                         Button("Save Verified QR Animation…") { model.saveAnimation() }.disabled(model.busy)
                         if model.busy { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
                     }
-                    Text("MP4 video and lossless APNG animation reuse this package’s encrypted bytes. Each saved recording has a finite repair set; live playback can generate more. The transfer code is never included in exported media.")
+                    Text("MP4 video and lossless APNG animation reuse this package’s encrypted bytes. Each saved recording has a finite repair set; live playback can generate more. "
+                         + (prepared.protection == .recipient
+                            ? "No transfer code is generated. The iPhone must retain its active request key to open any saved file or recording."
+                            : "The transfer code is never included in exported media."))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
             }.padding(28)
         }.frame(minWidth: 760, minHeight: 680)
+            .sheet(isPresented: Binding(get: { model.scanningRecipient }, set: { if !$0 { model.cancelRecipientScan() } })) {
+                let scanID = model.recipientScanID
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Scan this iPhone’s request").font(.title2.bold())
+                    Text("On the iPhone, open the recipient-request QR in FrankenTerm. Hold it in front of this Mac’s camera. Only a FrankenTerm recipient request is accepted.")
+                        .font(.callout)
+                    RecipientRequestCamera(onRequest: { model.receiveRecipient($0, scanID: scanID) },
+                                           onError: { model.recipientCameraFailed($0, scanID: scanID) })
+                        .id(scanID).frame(width: 640, height: 360).clipShape(RoundedRectangle(cornerRadius: 12))
+                    Text("Camera frames stay on this Mac. Scanning stops after one candidate; you must still compare and confirm its recipient value.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack { Spacer(); Button("Cancel Scan", role: .cancel) { model.cancelRecipientScan() } }
+                }.padding(24).frame(width: 690)
+            }
             .sheet(item: Binding(get: { model.keyUnlockRequest }, set: { value in
                 if value == nil, let request = model.keyUnlockRequest { model.cancelKeyUnlock(requestID: request.id) }
             })) { request in
@@ -576,6 +770,7 @@ private struct MacExportView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
+            destinationChoice
             GroupBox("Review the export") {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("\(review.includedIdentityCount) private identities included · \(review.omittedIdentityCount) references kept without private material")
@@ -597,15 +792,54 @@ private struct MacExportView: View {
                     Text("The phone evaluates its existing identities, reviewed host trust, and transport support separately. Required policies remain enforced after restoring a narrower workspace.")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("I approve these selected groups, \(review.includedIdentityCount) private identities, and the omissions shown above.", isOn: $model.approveSelectedKeys)
-                        .disabled(model.busy || !review.canPrepare)
+                        .disabled(model.busy || !review.canPrepare || !model.destinationReady)
                     HStack {
                         Button("Prepare Encrypted Transfer") { model.prepare() }.buttonStyle(.borderedProminent)
-                            .disabled(model.busy || !model.approveSelectedKeys || !review.canPrepare)
+                            .disabled(model.busy || !model.approveSelectedKeys || !review.canPrepare || !model.destinationReady)
                         Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
                         if model.busy { ProgressView().controlSize(.small) }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
+        }
+    }
+
+    private var destinationChoice: some View {
+        GroupBox("Choose how to open the transfer") {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("Protection", selection: Binding(get: { model.protection }, set: { model.selectProtection($0) })) {
+                    Text("Generated Transfer Code").tag(ExportProtection.code)
+                    Text("Only This iPhone").tag(ExportProtection.recipient)
+                }.pickerStyle(.segmented).disabled(model.busy)
+                if model.protection == .code {
+                    Text("Open the package with a new private transfer code. Keep that code separately from the encrypted file or recording when saving a recovery backup.")
+                        .font(.callout)
+                } else {
+                    Text("Scan the public request displayed by FrankenTerm on the intended iPhone. Confirm the recipient value on both screens before any private material is exported.")
+                        .font(.callout)
+                    HStack {
+                        Button("Scan iPhone with Camera…") { model.scanRecipientWithCamera() }
+                            .disabled(model.busy || model.requestingCameraAccess)
+                        Button("Scan Local QR Image…") { model.scanRecipientImage() }
+                            .disabled(model.busy || model.requestingCameraAccess)
+                        if model.requestingCameraAccess {
+                            ProgressView().controlSize(.small)
+                            Button("Cancel") { model.cancelRecipientScan() }
+                        }
+                    }
+                    if let request = model.recipientRequest, let comparison = model.recipientComparison {
+                        Text("Recipient comparison").font(.caption.bold())
+                        Text(verbatim: comparison).font(.system(.title3, design: .monospaced).bold()).textSelection(.enabled)
+                        Text("The iPhone accepts at most \(request.maximumEnvelopeBytes) encrypted bytes for this request.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Toggle("I compared this recipient value directly with my iPhone and it matches.",
+                               isOn: Binding(get: { model.recipientConfirmed }, set: { model.confirmRecipient($0) }))
+                            .disabled(model.busy)
+                    }
+                    Text("Cancelling the iPhone’s receive session or losing its request key makes these encrypted files and videos unusable. For a recording that remains recoverable independently of this session, choose Generated Transfer Code.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
         }
     }
 
@@ -703,6 +937,138 @@ private struct MacExportView: View {
                      green: Double((value >> (alpha ? 16 : 8)) & 255) / 255,
                      blue: Double((value >> (alpha ? 8 : 0)) & 255) / 255,
                      opacity: alpha ? Double(value & 255) / 255 : 1)
+    }
+}
+
+/// The capture session and metadata delegate stay on one serial queue. Only a
+/// bounded request string crosses to the main actor; frames are never recorded.
+@MainActor
+private struct RecipientRequestCamera: NSViewRepresentable {
+    let onRequest: @MainActor @Sendable (String) -> Void
+    let onError: @MainActor @Sendable (FTError) -> Void
+
+    func makeCoordinator() -> Capture { Capture(onRequest: onRequest, onError: onError) }
+    func makeNSView(context: Context) -> Preview {
+        let view = Preview()
+        view.preview.session = context.coordinator.session
+        context.coordinator.start()
+        return view
+    }
+    func updateNSView(_ view: Preview, context: Context) {}
+    static func dismantleNSView(_ view: Preview, coordinator: Capture) {
+        coordinator.stop(); view.preview.session = nil
+    }
+
+    @MainActor
+    final class Preview: NSView {
+        let preview = AVCaptureVideoPreviewLayer()
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true; layer = preview; preview.videoGravity = .resizeAspectFill
+        }
+        required init?(coder: NSCoder) { return nil }
+        override func layout() { super.layout(); preview.frame = bounds }
+    }
+
+    /// AVFoundation's capture APIs predate Swift actor isolation. All mutable
+    /// session state below is queue-owned; the cancellation bit alone is locked
+    /// so dismantling a view invalidates a queued callback synchronously. The
+    /// preview layer is attached/detached only by the main-actor view above.
+    final class Capture: NSObject, AVCaptureMetadataOutputObjectsDelegate, @unchecked Sendable {
+        let session = AVCaptureSession()
+        private let queue = DispatchQueue(label: "org.frankenterm.recipient-camera", qos: .userInitiated)
+        private let cancellation = NSLock()
+        private var cancelled = false
+        private var ended = false
+        private var metadata: AVCaptureMetadataOutput?
+        private var observers: [NSObjectProtocol] = []
+        private let onRequest: @MainActor @Sendable (String) -> Void
+        private let onError: @MainActor @Sendable (FTError) -> Void
+
+        init(onRequest: @escaping @MainActor @Sendable (String) -> Void,
+             onError: @escaping @MainActor @Sendable (FTError) -> Void) {
+            self.onRequest = onRequest; self.onError = onError
+            super.init()
+        }
+        private var isCancelled: Bool { cancellation.withLock { cancelled } }
+        func start() {
+            queue.async { [self] in
+                guard !isCancelled, !ended else { return }
+                do {
+                    try configure()
+                    guard !isCancelled else { teardown(); return }
+                    for name in [AVCaptureSession.runtimeErrorNotification, AVCaptureSession.didStopRunningNotification] {
+                        observers.append(NotificationCenter.default.addObserver(forName: name, object: session, queue: nil) { [weak self] _ in
+                            self?.queue.async { [weak self] in self?.finish(.unsupported("recipient.camera_interrupted")) }
+                        })
+                    }
+                    session.startRunning()
+                    if isCancelled { teardown() }
+                    else if !session.isRunning { finish(.unsupported("recipient.camera")) }
+                } catch { finish(.unsupported("recipient.camera")) }
+            }
+        }
+        func stop() {
+            cancellation.withLock { cancelled = true }
+            queue.async { [self] in ended = true; teardown() }
+        }
+        private func configure() throws {
+            guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized,
+                  let camera = AVCaptureDevice.default(for: .video) else { throw FTError.unsupported("recipient.camera") }
+            let input = try AVCaptureDeviceInput(device: camera)
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
+            else if session.canSetSessionPreset(.vga640x480) { session.sessionPreset = .vga640x480 }
+            else { throw FTError.unsupported("recipient.camera") }
+            guard session.canAddInput(input) else { throw FTError.unsupported("recipient.camera") }
+            session.addInput(input)
+            let output = AVCaptureMetadataOutput()
+            guard session.canAddOutput(output) else { throw FTError.unsupported("recipient.camera") }
+            session.addOutput(output); metadata = output
+            guard output.availableMetadataObjectTypes.contains(.qr) else { throw FTError.unsupported("recipient.camera") }
+            output.setMetadataObjectsDelegate(self, queue: queue); output.metadataObjectTypes = [.qr]
+        }
+        private func teardown() {
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            observers.removeAll()
+            metadata?.setMetadataObjectsDelegate(nil, queue: nil); metadata = nil
+            if session.isRunning { session.stopRunning() }
+            session.beginConfiguration()
+            for output in session.outputs { session.removeOutput(output) }
+            for input in session.inputs { session.removeInput(input) }
+            session.commitConfiguration()
+        }
+        private func finish(_ error: FTError) {
+            guard !ended else { return }
+            ended = true
+            // Never block stopRunning inside the metadata delegate callback.
+            // Return the callback first, then stop on the same owning queue.
+            queue.async { [self] in
+                teardown()
+                guard !isCancelled else { return }
+                Task { @MainActor [onError] in onError(error) }
+            }
+        }
+        func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+            guard !ended, !isCancelled else { return }
+            guard metadataObjects.count <= 8 else { finish(.malformed("recipient.multiple_qr")); return }
+            let candidates = metadataObjects.compactMap { object -> String? in
+                guard let code = object as? AVMetadataMachineReadableCodeObject, code.type == .qr,
+                      let text = code.stringValue, text.hasPrefix("FTREQ1:") else { return nil }
+                return text
+            }
+            guard !candidates.isEmpty else { return }
+            guard candidates.count == 1 else { finish(.malformed("recipient.multiple_qr")); return }
+            let text = candidates[0]
+            guard text.utf8.count <= FTLimit.text else { finish(.limit("recipient.request")); return }
+            ended = true
+            queue.async { [self] in
+                teardown()
+                guard !isCancelled else { return }
+                Task { @MainActor [onRequest] in onRequest(text) }
+            }
+        }
     }
 }
 
