@@ -203,6 +203,7 @@ public struct WorkspaceDocument: Sendable {
     public let exporterID: String, id: String, bundleID: String, name: String
     public let groups: [Group], machines: [Machine], routes: [Route], credentials: [Credential], themes: [Theme]
     public let initialMachineID: String
+    public let initialGroupID: String
 
     public init(data: Data) throws {
         let root = try StrictJSON.decode(data).object()
@@ -305,10 +306,11 @@ public struct WorkspaceDocument: Sendable {
         }
         let preferences = try workspace.required("preferences").object()
         initialMachineID = try preferences.text("initial_machine_ref")
-        let initialGroupID = try preferences.text("initial_group_ref")
-        guard let group = groups.first(where: { $0.id == initialGroupID }), group.machineOrder.contains(initialMachineID) else {
+        let selectedGroupID = try preferences.text("initial_group_ref")
+        guard let group = groups.first(where: { $0.id == selectedGroupID }), group.machineOrder.contains(initialMachineID) else {
             throw FTError.malformed("workspace.initial_selection")
         }
+        initialGroupID = selectedGroupID
         raw = data
     }
     static func identifier(_ value: String) throws -> String {
