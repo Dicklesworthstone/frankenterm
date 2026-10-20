@@ -80,5 +80,33 @@ struct TestCryptography: AirGapCryptography {
               count == 32 else { throw FTError.malformed("test.ed25519") }
         return result
     }
+    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data {
+        let nid: Int32
+        switch curve {
+        case .nistp256: nid = NID_X9_62_prime256v1
+        case .nistp384: nid = NID_secp384r1
+        case .nistp521: nid = NID_secp521r1
+        }
+        guard scalar.count == curve.scalarBytes, let group = EC_GROUP_new_by_curve_name(nid) else { throw FTError.malformed("test.ecdsa") }
+        defer { EC_GROUP_free(group) }
+        guard let value = scalar.withUnsafeBytes({ BN_bin2bn($0.bindMemory(to: UInt8.self).baseAddress, Int32(scalar.count), nil) }) else {
+            throw FTError.malformed("test.ecdsa")
+        }
+        defer { BN_clear_free(value) }
+        guard let order = BN_new() else { throw FTError.storage }
+        defer { BN_free(order) }
+        // OpenSSL obtains the order independently, rather than reusing the
+        // application's table or accepting a silently reduced private scalar.
+        guard EC_GROUP_get_order(group, order, nil) == 1, BN_num_bits(value) > 0, BN_cmp(value, order) < 0,
+              let point = EC_POINT_new(group) else { throw FTError.malformed("test.ecdsa") }
+        defer { EC_POINT_free(point) }
+        guard EC_POINT_mul(group, point, value, nil, nil, nil) == 1 else { throw FTError.malformed("test.ecdsa") }
+        var output = Data(count: 1 + 2 * curve.scalarBytes)
+        let length = output.count
+        guard output.withUnsafeMutableBytes({
+            EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, $0.bindMemory(to: UInt8.self).baseAddress, length, nil)
+        }) == length else { throw FTError.malformed("test.ecdsa") }
+        return output
+    }
 }
 #endif
