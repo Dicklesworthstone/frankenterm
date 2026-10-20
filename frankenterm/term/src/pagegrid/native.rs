@@ -271,9 +271,15 @@ pub fn set_grapheme_run(
             Some(_) => bytes.len() <= MAX_GRAPHEME_BYTES,
         }
     };
-    if (clustered && x > len)
-        || !cells.iter().all(|run| kept_whole(run.text))
-        || attr.images().is_some_and(|images| !images.is_empty())
+    // The columns the run covers, summed in the same pass: storing it then
+    // walks the cells once more, not twice.
+    let mut stored = 0;
+    let mut all_kept = true;
+    for run in cells {
+        all_kept &= kept_whole(run.text);
+        stored += usize::from(run.width);
+    }
+    if (clustered && x > len) || !all_kept || attr.images().is_some_and(|images| !images.is_empty())
     {
         return false;
     }
@@ -308,23 +314,19 @@ pub fn set_grapheme_run(
     write.semantic = attr.semantic_type();
     write.wrapped = attr.wrapped();
     write.hyperlink = attr.hyperlink();
-    let stored = if overwrite {
-        page.put_graphemes(row, x, cells, write, seqno)
+    let written = if overwrite {
+        page.put_graphemes(row, x, cells, stored, write, seqno)
     } else {
-        page.append_graphemes(row, x, cells, write, seqno)
+        page.append_graphemes(row, x, cells, stored, write, seqno)
     };
-    if !stored {
+    if !written {
         return false;
     }
     if vector {
         set_vector(page, row);
     }
     if attr.protected() {
-        let end = x + cells
-            .iter()
-            .map(|run| usize::from(run.width))
-            .sum::<usize>();
-        page.protect_cells(row, x..end);
+        page.protect_cells(row, x..x + stored);
     }
     true
 }

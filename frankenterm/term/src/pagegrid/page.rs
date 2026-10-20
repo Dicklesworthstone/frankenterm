@@ -1242,24 +1242,32 @@ impl Page {
     /// `(text, width)` stored as [`Self::write`] stores a cell of that text
     /// and width (1 or 2) written there, one after the other: the style
     /// resolved once and one header update for the run (the non-ASCII
-    /// counterpart of [`Self::append_ascii`]). `cell`'s glyph and width are
-    /// ignored. Returns false, writing nothing, for an empty run, one that
-    /// starts before the row's end or passes the page's stride, one that
-    /// carries images, or a row whose last cell is wide (`write` blanks or
-    /// hides around it).
+    /// counterpart of [`Self::append_ascii`]). `stored` is the columns the
+    /// run covers, the sum of its widths, which the caller counted while
+    /// checking the cells. `cell`'s glyph and width are ignored. Returns
+    /// false, writing nothing, for an empty run, one that starts before the
+    /// row's end or passes the page's stride, one that carries images, or a
+    /// row whose last cell is wide (`write` blanks or hides around it).
     pub fn append_graphemes(
         &mut self,
         row: u32,
         x: usize,
         cells: &[RunGrapheme<'_>],
+        stored: usize,
         mut cell: CellWrite<'_>,
         seqno: SequenceNo,
     ) -> bool {
         debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
+        debug_assert_eq!(
+            stored,
+            cells
+                .iter()
+                .map(|run| usize::from(run.width))
+                .sum::<usize>()
+        );
         let header = self.header(row);
         let slot = header.slot();
         let old_len = header.len();
-        let stored: usize = cells.iter().map(|run| usize::from(run.width)).sum();
         let end = x.saturating_add(stored);
         if cells.is_empty()
             || x < old_len
@@ -1325,26 +1333,34 @@ impl Page {
 
     /// [`Self::append_graphemes`] for a run that starts within the row (or
     /// at its end) and may extend it: each old cell's side entries released
-    /// first, as [`Self::write`] releases them. Returns false, writing
-    /// nothing, for an empty run, one that starts past the end, passes the
-    /// page's stride or carries images, or one that meets a cell whose
-    /// overwrite `write` handles specially: a wide or hidden cell, or one
-    /// with images, among the cells it covers, or a wide cell just before
-    /// it. Every covered cell was then narrow and visible, so nothing past
-    /// the run was hidden by one of them, and none is by the run either.
+    /// first, as [`Self::write`] releases them. `stored` is the sum of the
+    /// run's widths. Returns false, writing nothing, for an empty run, one
+    /// that starts past the end, passes the page's stride or carries
+    /// images, or one that meets a cell whose overwrite `write` handles
+    /// specially: a wide or hidden cell, or one with images, among the cells
+    /// it covers, or a wide cell just before it. Every covered cell was then
+    /// narrow and visible, so nothing past the run was hidden by one of
+    /// them, and none is by the run either.
     pub fn put_graphemes(
         &mut self,
         row: u32,
         x: usize,
         cells: &[RunGrapheme<'_>],
+        stored: usize,
         mut cell: CellWrite<'_>,
         seqno: SequenceNo,
     ) -> bool {
         debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
+        debug_assert_eq!(
+            stored,
+            cells
+                .iter()
+                .map(|run| usize::from(run.width))
+                .sum::<usize>()
+        );
         let header = self.header(row);
         let slot = header.slot();
         let old_len = header.len();
-        let stored: usize = cells.iter().map(|run| usize::from(run.width)).sum();
         let end = x.saturating_add(stored);
         if cells.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
             return false;
