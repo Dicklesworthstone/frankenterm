@@ -517,11 +517,21 @@ impl<'a> Handler for Performer<'a> {
         self.perform(action);
     }
 
-    /// What `perform` does for `Action::Print`: only buffering, so the
-    /// `last_printed` shortcut stays valid.
+    /// What `perform` does for `Action::Print`. A printable ASCII character
+    /// is a run of one, which [`Handler::print_ascii_run`] writes straight
+    /// into the rows when nothing is pending, as it writes a longer run: the
+    /// parser hands over the character between two SGR sequences this way,
+    /// and buffering it only to flush it at the next SGR went through the
+    /// whole print loop for one cell. Anything else is only buffered, so
+    /// the `last_printed` shortcut stays valid.
     #[inline]
     fn print(&mut self, c: char) {
-        Performer::print(self, c);
+        if matches!(c, ' '..='~') {
+            let mut utf8 = [0; 1];
+            Handler::print_ascii_run(self, c.encode_utf8(&mut utf8));
+        } else {
+            Performer::print(self, c);
+        }
     }
 
     /// What `perform` does for `Action::PrintString`.
@@ -4468,6 +4478,87 @@ mod tests {
                 print_pieces(&pieces, cols, read, page, false),
                 print_pieces(&pieces, cols, read, page, true)
             );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(192))]
+
+        /// A printable ASCII character the parser hands over alone (between
+        /// two escape sequences, as a 256-color flood prints) is a run of one
+        /// that the fused path writes straight into the rows, where the
+        /// two-stage path buffers an `Action::Print` until the next flush.
+        /// Both leave the same terminal for any mix of such characters with
+        /// SGR, combining marks, ZWJ tails, emoji, pending wraps, autowrap
+        /// off, insert mode, DEC line drawing and titles, in narrow screens
+        /// on both engines, split into any reads.
+        #[test]
+        fn lone_ascii_characters_print_as_the_two_stage_path_prints_them(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "x", "y", " ", "~", "ab", "\x1b[31m", "\x1b[38;5;196m", "\x1b[m", "\u{301}",
+                "\u{200d}", "\u{1f600}", "\u{e9}", "\u{903}", "\x1b[?7l", "\x1b[?7h", "\x1b[4h",
+                "\x1b[4l", "\x1b(0", "\x1b(B", "\x1b]0;t\x07", "\x1b]0;", "\x07", "\r\n", "\x08",
+                "\t",
+            ]), 1..64),
+            cols in 2usize..9,
+            read in 1usize..16,
+            page in proptest::bool::ANY,
+        ) {
+            #[derive(Debug)]
+            struct EngineConfig(crate::config::GridEngine);
+            impl TerminalConfiguration for EngineConfig {
+                fn scrollback_size(&self) -> usize {
+                    16
+                }
+                fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                    ScrollbackTierConfig::default()
+                }
+                fn color_palette(&self) -> ColorPalette {
+                    ColorPalette::default()
+                }
+                fn grid_engine(&self) -> crate::config::GridEngine {
+                    self.0
+                }
+            }
+            let _switches = test_switches();
+            // The direct row write the fused path takes for a run of one.
+            let _bulk = BulkAsciiRowWriteOverride::set(true);
+            let engine = if page {
+                crate::config::GridEngine::Page
+            } else {
+                crate::config::GridEngine::Legacy
+            };
+            let stream = pieces.concat();
+            let size = TerminalSize {
+                rows: 4,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: 64,
+                dpi: 96,
+            };
+            let terminal = || {
+                let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                    Arc::new(EngineConfig(engine));
+                Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()))
+            };
+            let mut fused = terminal();
+            let mut two_stage = terminal();
+            let mut parser = Parser::new();
+            for chunk in stream.as_bytes().chunks(read).chain([b"Z".as_slice()]) {
+                fused.advance_bytes(chunk);
+                two_stage.perform_actions(parser.parse_as_vec(chunk));
+            }
+            // Every `advance_bytes` call moves the sequence number, and a
+            // read inside an escape sequence leaves the two-stage path no
+            // action to apply: rows' sequence numbers count calls here.
+            let snapshot = |terminal: &Terminal| {
+                let mut snapshot = snapshot_terminal(terminal);
+                for line in &mut snapshot.all_lines {
+                    line.seqno = 0;
+                }
+                snapshot
+            };
+            proptest::prop_assert_eq!(snapshot(&fused), snapshot(&two_stage), "{:?}", stream);
         }
     }
 
