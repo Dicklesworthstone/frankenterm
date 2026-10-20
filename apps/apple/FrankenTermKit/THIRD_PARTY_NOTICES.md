@@ -131,9 +131,52 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Recipient HPKE implementation and Linux validation dependencies
+
+`RecipientHPKE.swift` delegates the fixed RFC 9180 Base-mode
+X25519/HKDF-SHA256/ChaCha20-Poly1305 suite to system CryptoKit on Apple.
+On Linux, `Package.swift` selects the maintained `Crypto` product from
+Apple's Swift Crypto package; no HPKE key schedule is implemented in the
+production target. The independent deterministic OpenSSL test oracle remains
+confined to the test target.
+The adapter additionally enforces RFC 9180 section 7.1.4's all-zero X25519
+agreement rejection through the maintained key-agreement primitive.
+
+The exact Linux dependency graph is recorded in `Package.resolved`:
+
+| Package | Version | Git revision | License and upstream notices |
+| --- | --- | --- | --- |
+| apple/swift-crypto | 4.5.2 | `da9d28d69ebe3894b18376c8f2395c2f37b8448f` | [Apache-2.0](https://github.com/apple/swift-crypto/blob/da9d28d69ebe3894b18376c8f2395c2f37b8448f/LICENSE.txt), [NOTICE](https://github.com/apple/swift-crypto/blob/da9d28d69ebe3894b18376c8f2395c2f37b8448f/NOTICE.txt) |
+| apple/swift-asn1 (transitive) | 1.7.3 | `3b6410f7dee09eb33cdd26260c5fd47fda19b0e2` | [Apache-2.0](https://github.com/apple/swift-asn1/blob/3b6410f7dee09eb33cdd26260c5fd47fda19b0e2/LICENSE.txt), [NOTICE](https://github.com/apple/swift-asn1/blob/3b6410f7dee09eb33cdd26260c5fd47fda19b0e2/NOTICE.txt) |
+
+Copyright 2019 The SwiftCrypto Project.
+
+Copyright 2022 The SwiftASN1 Project.
+
+These projects are licensed under the Apache License, Version 2.0. The license
+is available at https://www.apache.org/licenses/LICENSE-2.0. Unless required
+by applicable law or agreed to in writing, the software is provided on an
+"AS IS" basis, without warranties or conditions of any kind, express or
+implied. See each linked license for its governing permissions and limitations.
+
+Swift Crypto carries its own BoringSSL/XKCP implementation and component
+copyright/license notices; its upstream NOTICE also identifies Wycheproof
+test vectors and SwiftNIO-derived files. Swift ASN.1's NOTICE identifies
+SwiftNIO- and Swift OpenAPI Generator-derived scripts. Linux distributions
+that include these dependencies must retain their full upstream LICENSE,
+NOTICE, and component notices. This repository does not vendor or alter
+those sources. Apple package resolution excludes both dependencies and their
+native backends; Apple products use system CryptoKit.
+
+The optional `Tests/validate_recipient_hpke.py` cross-check uses installed
+pyhpke with public synthetic fixtures. These independent test
+tools are not package or application dependencies and are not redistributed
+by FrankenTerm.
+
 ## Platform dependencies
 
 Apple products use system CryptoKit, CommonCrypto, Security, and zlib. Linux cryptographic
-oracles use system OpenSSL solely in the test target. No OpenSSL implementation
-is copied into or linked by the Apple product. Distribution must retain all
+oracles use system OpenSSL solely in the test target, while the recipient
+adapter uses the Linux-only Swift Crypto dependency described above. No OpenSSL
+implementation is copied into or linked by the Apple product. Distribution must retain all
 notices above in the native app's licenses surface and release materials.

@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
 
 /// One RFC 9180 Base-mode message. Its encapsulated key is public; the native
 /// sender context and ephemeral private key never leave the primitive boundary.
@@ -30,39 +27,27 @@ public protocol RecipientCryptography: AirGapCryptography {
                   encapsulatedKey: Data, info: Data, aad: Data) throws -> Data
 }
 
-#if canImport(CryptoKit)
-extension AppleCryptography: RecipientCryptography {
+/// The same bounded, one-shot maintained implementation is used by Apple and
+/// Linux callers. Independent deterministic test oracles remain test-only.
+extension RecipientCryptography {
     public func x25519PublicKey(privateKey: Data) throws -> Data {
-        guard privateKey.count == 32 else { throw FTError.malformed("recipient.private_key") }
-        do {
-            return try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey).publicKey.rawRepresentation
-        } catch { throw FTError.malformed("recipient.private_key") }
+        try RecipientHPKE.publicKey(forPrivateKey: privateKey)
     }
 
     public func hpkeSeal(_ plaintext: Data, recipientPublicKey: Data, info: Data,
                          aadPrefix: Data) throws -> HPKESealedMessage {
-        guard recipientPublicKey.count == 32 else { throw FTError.malformed("recipient.public_key") }
-        do {
-            let key = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientPublicKey)
-            var sender = try HPKE.Sender(recipientKey: key, ciphersuite: .Curve25519_SHA256_ChachaPoly, info: info)
-            let enc = sender.encapsulatedKey
-            guard enc.count == 32 else { throw FTError.authentication }
-            let ciphertext = try sender.seal(plaintext, authenticating: aadPrefix + enc)
-            guard ciphertext.count == plaintext.count + 16 else { throw FTError.authentication }
-            return HPKESealedMessage(encapsulatedKey: enc, ciphertext: ciphertext)
-        } catch { throw FTError.authentication }
+        guard aadPrefix.count <= 4096 - 32 else { throw FTError.limit("recipient.hpke_aad") }
+        let sealed = try RecipientHPKE.seal(plaintext, recipientPublicKey: recipientPublicKey, info: info) { aadPrefix + $0 }
+        return HPKESealedMessage(encapsulatedKey: sealed.encapsulatedKey, ciphertext: sealed.ciphertext)
     }
 
     public func hpkeOpen(_ ciphertextAndTag: Data, recipientPrivateKey: Data,
                          encapsulatedKey: Data, info: Data, aad: Data) throws -> Data {
-        guard recipientPrivateKey.count == 32, encapsulatedKey.count == 32,
-              ciphertextAndTag.count >= 16 else { throw FTError.authentication }
-        do {
-            let key = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: recipientPrivateKey)
-            var recipient = try HPKE.Recipient(privateKey: key, ciphersuite: .Curve25519_SHA256_ChachaPoly,
-                                               info: info, encapsulatedKey: encapsulatedKey)
-            return try recipient.open(ciphertextAndTag, authenticating: aad)
-        } catch { throw FTError.authentication }
+        try RecipientHPKE.open(ciphertextAndTag, privateKey: recipientPrivateKey,
+                               encapsulatedKey: encapsulatedKey, info: info, authenticating: aad)
     }
 }
+
+#if canImport(CryptoKit)
+extension AppleCryptography: RecipientCryptography {}
 #endif

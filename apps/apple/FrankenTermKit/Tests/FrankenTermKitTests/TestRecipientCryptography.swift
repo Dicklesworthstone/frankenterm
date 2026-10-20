@@ -3,15 +3,16 @@ import Foundation
 #if !canImport(CryptoKit)
 import CTestOpenSSL
 
-/// Independent RFC 9180 test oracle. Curve and AEAD operations are OpenSSL;
-/// this labeled HKDF/key schedule never enters the production target.
+/// Independent deterministic RFC 9180 test oracle. Curve and AEAD operations
+/// below are OpenSSL; this labeled HKDF/key schedule never enters production.
+/// Ordinary RecipientCryptography methods use the maintained production defaults.
 struct HPKETestKeySchedule {
     let sharedSecret: Data, context: Data, secret: Data
     let key: Data, baseNonce: Data, exporterSecret: Data
 }
 
 extension TestCryptography: RecipientCryptography {
-    func x25519PublicKey(privateKey: Data) throws -> Data {
+    private func oracleX25519PublicKey(privateKey: Data) throws -> Data {
         guard privateKey.count == 32, let key = privateKey.withUnsafeBytes({
             EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nil, $0.bindMemory(to: UInt8.self).baseAddress, privateKey.count)
         }) else { throw FTError.malformed("recipient.private_key") }
@@ -85,30 +86,12 @@ extension TestCryptography: RecipientCryptography {
     /// Raw AAD is intentional here: RFC vectors predate FTAG's header binding.
     func hpkeSealDeterministically(_ plaintext: Data, recipientPublicKey: Data,
                                   ephemeralPrivateKey: Data, info: Data, aad: Data) throws -> HPKESealedMessage {
-        let enc = try x25519PublicKey(privateKey: ephemeralPrivateKey)
+        let enc = try oracleX25519PublicKey(privateKey: ephemeralPrivateKey)
         let schedule = try hpkeKeySchedule(privateKey: ephemeralPrivateKey, peerPublicKey: recipientPublicKey,
                                            encapsulatedKey: enc, recipientPublicKey: recipientPublicKey, info: info)
         return try HPKESealedMessage(encapsulatedKey: enc,
                                      ciphertext: aeadSeal(plaintext, key: schedule.key, nonce: schedule.baseNonce, aad: aad))
     }
 
-    func hpkeSeal(_ plaintext: Data, recipientPublicKey: Data, info: Data,
-                  aadPrefix: Data) throws -> HPKESealedMessage {
-        guard recipientPublicKey.count == 32 else { throw FTError.malformed("recipient.public_key") }
-        let ephemeral = try randomBytes(count: 32)
-        let enc = try x25519PublicKey(privateKey: ephemeral)
-        return try hpkeSealDeterministically(plaintext, recipientPublicKey: recipientPublicKey,
-                                            ephemeralPrivateKey: ephemeral, info: info, aad: aadPrefix + enc)
-    }
-
-    func hpkeOpen(_ ciphertextAndTag: Data, recipientPrivateKey: Data,
-                  encapsulatedKey: Data, info: Data, aad: Data) throws -> Data {
-        guard recipientPrivateKey.count == 32, encapsulatedKey.count == 32,
-              ciphertextAndTag.count >= 16 else { throw FTError.authentication }
-        let publicKey = try x25519PublicKey(privateKey: recipientPrivateKey)
-        let schedule = try hpkeKeySchedule(privateKey: recipientPrivateKey, peerPublicKey: encapsulatedKey,
-                                           encapsulatedKey: encapsulatedKey, recipientPublicKey: publicKey, info: info)
-        return try aeadOpen(ciphertextAndTag, key: schedule.key, nonce: schedule.baseNonce, aad: aad)
-    }
 }
 #endif

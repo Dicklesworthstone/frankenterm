@@ -200,10 +200,14 @@ final class RecipientRestoreTests: XCTestCase {
         state = try await restore.reset()
         state = try await restore.createRecipientRequest(generation: state.generation)
         XCTAssertNotEqual(state.recipientRequest, request)
-        state = try await restore.acceptEncryptedFile(envelope, generation: state.generation)
+        let replacement = state.recipientRequest
+        do { _ = try await restore.acceptEncryptedFile(envelope, generation: state.generation); XCTFail("new request accepted old recording") }
+        catch { XCTAssertEqual(error as? FTError, .authentication) }
+        state = await restore.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertEqual(state.recipientRequest, replacement)
         XCTAssertFalse(state.canUnlockRecipient)
         do { _ = try await restore.unlockRecipient(generation: state.generation); XCTFail("new request unlocked old recording") }
-        catch { XCTAssertEqual(error as? FTError, .authentication) }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
         XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
     }
 
@@ -217,10 +221,57 @@ final class RecipientRestoreTests: XCTestCase {
         do { _ = try await restore.acceptWorkspaceDocument(sampleManifest(), generation: state.generation); XCTFail("public document replaced request") }
         catch { XCTAssertEqual(error as? WorkspaceStoreError, .busy) }
         let codeExport = try FTAG.seal(archive(), using: crypto)
-        state = try await restore.acceptEncryptedFile(codeExport.envelope, generation: state.generation)
-        XCTAssertEqual(state.recipientRequest, request)
-        do { _ = try await restore.unlock(enteredCode: codeExport.code.reveal(using: crypto), generation: state.generation); XCTFail("recipient mode silently downgraded") }
+        do { _ = try await restore.acceptEncryptedFile(codeExport.envelope, generation: state.generation); XCTFail("recipient mode accepted a generated-code package") }
         catch { XCTAssertEqual(error as? FTError, .unsupported("envelope.requires_recipient_key")) }
+        state = await restore.status()
+        XCTAssertEqual(state.recipientRequest, request); XCTAssertEqual(state.phase, .idle)
+        do { _ = try await restore.unlock(enteredCode: codeExport.code.reveal(using: crypto), generation: state.generation); XCTFail("recipient mode silently downgraded") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
         XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+    }
+
+    func testMalformedCompletedOpticalSourcePreservesRequestAndFencesLateFrames() async throws {
+        let (restore, _, persistence, vault) = environment()
+        var state = await restore.status()
+        state = try await restore.createRecipientRequest(generation: state.generation)
+        let request = try XCTUnwrap(state.recipientRequest)
+        let validEnvelope = try FTAG.seal(archive(), recipient: request, using: crypto)
+        let transferID = try FTAGHeader(envelope: validEnvelope).transferID
+        var malformedEnvelope = validEnvelope
+        malformedEnvelope[0] ^= 1
+        XCTAssertLessThanOrEqual(malformedEnvelope.count, FTLimit.page)
+
+        // A malicious source can provide correct page and envelope hashes for
+        // invalid FTAG bytes. Bypass the legitimate sender's admission checks to
+        // exercise the receiver's final header check, not a transport checksum.
+        let page = URPageEncoder(page: malformedEnvelope), digest = crypto.sha256(malformedEnvelope)
+        let prefix = "FTQR1/\(transferID.ftHex)/\(malformedEnvelope.count)/0-1/\(digest.ftHex)/\(digest.ftHex)/"
+        let first = try prefix + page.text(sequence: 1, using: crypto)
+        state = try await restore.observe(first, generation: state.generation)
+        state = try await restore.selectCandidate(generation: state.generation, digest: digest)
+        let rejectedGeneration = state.generation
+        var rejected = false
+        for sequence in 2...page.fragments.count {
+            do {
+                let frame = try prefix + page.text(sequence: UInt32(sequence), using: crypto)
+                state = try await restore.observe(frame, generation: rejectedGeneration)
+            } catch {
+                XCTAssertEqual(error as? FTError, .unsupported("envelope.version"))
+                rejected = true
+                break
+            }
+        }
+        XCTAssertTrue(rejected)
+        state = await restore.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertEqual(state.recipientRequest, request)
+        XCTAssertNil(state.identity); XCTAssertNil(state.source); XCTAssertNil(state.encryptionMode)
+        XCTAssertEqual(state.independentParts, 0); XCTAssertNotEqual(state.generation, rejectedGeneration)
+        do { _ = try await restore.observe(first, generation: rejectedGeneration); XCTFail("late malformed-source callback accepted") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
+
+        state = try await restore.acceptEncryptedFile(validEnvelope, generation: state.generation)
+        state = try await restore.unlockRecipient(generation: state.generation)
+        XCTAssertEqual(state.phase, .review)
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertNil(persistence.bytes(.journal)); XCTAssertEqual(vault.creates, 0)
     }
 }
