@@ -15,6 +15,7 @@ public struct OfflineRestoreReview: Sendable {
     public let removesMachines: Bool
     public let requiresRollbackApproval: Bool
     public let firstAcceptedRevision: UUID?
+    public let routeReadiness: [WorkspaceDocument.RouteReadiness]
 }
 
 public struct OfflineRestoreStatus: Sendable {
@@ -24,6 +25,9 @@ public struct OfflineRestoreStatus: Sendable {
     public let identity: OpticalFrame.Identity?
     public let comparison: String?
     public let verifiedPages: Int, verifiedBytes: Int, independentParts: Int
+    /// Zero-based wire page indices. Present each as index + 1 to match the
+    /// Mac's Repair menu; an empty list means no active unfinished scan pages.
+    public let incompletePageIndices: [Int]
     public let review: OfflineRestoreReview?
     public let receipt: WorkspaceImportReceipt?
 }
@@ -57,6 +61,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
                      comparison: comparison, verifiedPages: receiver?.verifiedPages ?? (envelope == nil ? 0 : identity?.pageCount ?? 0),
                      verifiedBytes: receiver?.verifiedBytes ?? envelope?.count ?? 0,
                      independentParts: receiver?.independentParts ?? 0,
+                     incompletePageIndices: receiver?.incompletePageIndices ?? [],
                      review: suspended ? nil : review, receipt: suspended ? nil : receipt)
     }
 
@@ -97,6 +102,18 @@ public actor OfflineRestore<C: AirGapCryptography> {
         return status()
     }
 
+    /// Explicit recovery from a stalled or poisoned unfinished page. Reset only
+    /// its ciphertext equations and expected digest; keep the selected identity
+    /// and every other page. Retire queued observations from before the restart.
+    @discardableResult
+    public func restartPage(_ page: Int, generation token: UUID) throws -> OfflineRestoreStatus {
+        try check(token)
+        guard phase == .collecting, var active = receiver, active.incompletePageIndices.contains(page) else { throw FTError.stale }
+        active.resetIncompletePage(page)
+        receiver = active; generation = UUID()
+        return status()
+    }
+
     /// An explicit file choice replaces no active scan. Reset first to change sources.
     @discardableResult
     public func acceptEncryptedFile(_ data: Data, generation token: UUID) throws -> OfflineRestoreStatus {
@@ -118,8 +135,9 @@ public actor OfflineRestore<C: AirGapCryptography> {
         let decoded = try FTAG.open(envelope, code: code, using: crypto)
         phase = .preparingReview
         do {
-            let assessment = try await store.assessImport(decoded.workspace, envelopeDigest: identity.envelopeDigest,
-                                                         transferID: identity.transferID)
+            let preview = try await store.previewImport(decoded, envelopeDigest: identity.envelopeDigest,
+                                                        transferID: identity.transferID)
+            let assessment = preview.assessment
             try check(token)
             let refs = Dictionary(uniqueKeysWithValues: decoded.workspace.credentials.map { ($0.id, $0.fingerprint) })
             archive = decoded
@@ -128,7 +146,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
                            findings: decoded.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                            inactiveSettingCount: decoded.annotations.count, expectedRevision: assessment.existingWorkspace?.revision,
                            removesMachines: assessment.removesMachines, requiresRollbackApproval: assessment.requiresRollbackApproval,
-                           firstAcceptedRevision: assessment.firstAcceptedRevision)
+                           firstAcceptedRevision: assessment.firstAcceptedRevision, routeReadiness: preview.routes)
             phase = .review
             return status()
         } catch {

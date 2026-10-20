@@ -17,6 +17,7 @@ struct FrankenTermMobileApp: App {
 final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
+    var routeReadiness: [UUID: [WorkspaceDocument.RouteReadiness]] = [:]
     var state: OfflineRestoreStatus?
     var message: String?
     var showRestore = false
@@ -78,7 +79,7 @@ final class MobileWorkspaceModel {
     }
     func setActive(_ value: Bool) {
         active = value
-        if !value { cameraRequested = false; state = nil; availableCredentials = [:] }
+        if !value { cameraRequested = false; state = nil; availableCredentials = [:]; routeReadiness = [:] }
         updateLifecycle()
     }
     func setRestoreVisible(_ value: Bool) {
@@ -100,15 +101,16 @@ final class MobileWorkspaceModel {
             if visible { self.startObservations(restore: restore) }
             if self.active, let store = self.store {
                 do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
-                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.report(error) } }
+                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.routeReadiness = [:]; self.report(error) } }
             }
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
-        let snapshot = try await store.loadWithCredentialAvailability()
+        let snapshot = try await store.loadWithReadiness()
         guard active, epoch == ticket else { return }
         workspaces = snapshot.map(\.workspace)
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
+        routeReadiness = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.routes) })
     }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
         let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
@@ -151,6 +153,8 @@ final class MobileWorkspaceModel {
                 let current = await restore.status()
                 let result = try await action(restore, current)
                 guard self.active, self.epoch == ticket else { return }
+                // A restarted scan may need the same QR that was last observed.
+                if result.generation != current.generation { self.lastObservation = nil }
                 self.state = result
                 if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
@@ -289,6 +293,26 @@ struct OfflineRestoreSheet: View {
                                 Text("\(state.verifiedPages) of \(state.identity?.pageCount ?? 0) pages verified · \(state.verifiedBytes) bytes")
                                 Text("\(state.independentParts) independent fragments in unfinished pages. Duplicate frames do not count as progress.")
                                     .font(.caption).foregroundStyle(.secondary)
+                                if !state.incompletePageIndices.isEmpty {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("Pages still needed").font(.headline)
+                                        Text(verbatim: state.incompletePageIndices.map { String($0 + 1) }.joined(separator: ", "))
+                                            .font(.system(.callout, design: .monospaced))
+                                        Text("On your Mac, choose Repair and select one of these pages to focus playback.")
+                                            .font(.callout)
+                                        DisclosureGroup("Restart a stalled page") {
+                                            Text("Restarting clears the collected fragments for that page so you can scan it again.")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                            ForEach(state.incompletePageIndices, id: \.self) { page in
+                                                Button("Restart Page \(page + 1)") {
+                                                    let generation = state.generation
+                                                    model.run { restore, _ in try await restore.restartPage(page, generation: generation) }
+                                                }.disabled(model.busy || state.isSuspended)
+                                            }
+                                        }
+                                    }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                                }
                                 Button(model.cameraRequested ? "Pause Camera" : "Resume Camera") {
                                     if model.cameraRequested { model.cameraRequested = false } else { model.requestCamera() }
                                 }.disabled(model.requestingCameraAccess)
@@ -336,6 +360,13 @@ struct OfflineRestoreSheet: View {
                                                     Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
                                                     Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes")
                                                         .font(.caption)
+                                                    Text(verbatim: "Allowed authentication: " + route.authenticationMethods.map(\.rawValue).joined(separator: ", "))
+                                                        .font(.caption)
+                                                    if let readiness = review.routeReadiness.first(where: { $0.routeID == route.id }) {
+                                                        ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
+                                                            Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }.padding(.top, 8)
@@ -496,8 +527,7 @@ private struct MachineWorkspaceView: View {
                                     if let available = model.availableCredentials[workspaceID] {
                                         Text("\(route.credentialIDs.filter(available.contains).count) of \(route.credentialIDs.count) permitted key references are available on this device.")
                                             .font(.caption)
-                                        if let readiness = try? document.readiness(forRouteID: id, availableCredentialIDs: available,
-                                                reviewedTrustIDs: Set(document.hostTrust.map(\.id))) {
+                                        if let readiness = model.routeReadiness[workspaceID]?.first(where: { $0.routeID == id }) {
                                             ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
                                                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
                                             }
