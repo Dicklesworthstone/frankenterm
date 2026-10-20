@@ -167,12 +167,17 @@ impl PageRows {
     /// (`Line::invalidate_implicit_hyperlinks`), which a page row cannot
     /// record, so the row stays a view until an edit through it has.
     pub fn page_row(&mut self, index: usize) -> Option<(&mut Page, u32)> {
-        let stable = self.stable(index);
         let view = &self.views[index];
         if view.edited || view.line.get().is_some() {
+            let stable = self.stable(index);
             return self.page_row_from_view(index, stable);
         }
-        self.list.row_mut(stable)
+        if index + 1 == self.views.len() {
+            // The newest row, where every flood writes, is the tail page's
+            // last: no need to locate it.
+            return self.list.tail_row_mut();
+        }
+        self.list.row_mut(self.stable(index))
     }
 
     /// [`Self::page_row`] of a row with a view, out of line: storing an
