@@ -209,7 +209,7 @@ async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), Dire
             .await
             .map_err(|error| cancelled_mux_error("text_snapshot_yield", error))
     } else {
-        // Repeated source churn still backs off within the same three-attempt
+        // Repeated source churn still backs off within the same attempt
         // budget. Quota refusals have their own unchanged backoff policy.
         crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
             .await
@@ -2967,7 +2967,13 @@ impl DirectMuxClient {
         max_output_bytes: usize,
         tail: Option<usize>,
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
-        const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+        // Three attempts failed robot reads of busy restored panes on loaded
+        // hosts (ft-ukqe3: hz3 at load 63, ovh-b): a full history read took
+        // ~450 ms, about half of them met a pane that had just spilled a row
+        // to cold storage (a new cold layout, or a moved canonical
+        // frontier), and 6 of 24 reads in one run lost all three. Each
+        // attempt is a fresh, whole read, so six only cost time on failure.
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 6;
         if self
             .peer_generation
             .as_ref()
@@ -8512,8 +8518,9 @@ mod tests {
                             count.0 += 1;
                             // The source advances again after each observation
                             // that rejected the previous attempt, then settles.
-                            // Reusing those pre-suspension observations spends
-                            // all three attempts before reaching source 5.
+                            // Reusing those pre-suspension observations reaches
+                            // source 5 only later, through fences the counts
+                            // below would show.
                             // Two chunks of visible rows: a single reply, or a
                             // last chunk holding the only visible rows, needs
                             // no final fence (ft-wpgjw, ft-ukqe3).
@@ -8631,20 +8638,20 @@ mod tests {
                         "three rows shrink directly to one, then stop"
                     );
                 } else {
-                    assert_eq!(summaries[0]["attempts"], 3);
+                    assert_eq!(summaries[0]["attempts"], 6);
                     assert_eq!(summaries[0]["quota_reductions"], 0);
-                    assert_eq!(summaries[0]["final_source_retries"], 2);
+                    assert_eq!(summaries[0]["final_source_retries"], 5);
                     assert!(matches!(
                         error,
                         DirectMuxError::TextSnapshotChanged {
                             phase: "final_source",
-                            attempts: 3,
+                            attempts: 6,
                         }
                     ));
                     assert_eq!(
                         *counts.lock().unwrap(),
-                        (6, 6),
-                        "three attempts each have independent initial and final fences"
+                        (12, 12),
+                        "six attempts each have independent initial and final fences"
                     );
                 }
                 drop(client);
@@ -8918,17 +8925,17 @@ mod tests {
                         Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
-                            // Three changing attempts, then one stable source
+                            // Six changing attempts, then one stable source
                             // for a separate caller-initiated transaction. Two
                             // chunks of visible rows: a single reply, or a last
                             // chunk holding the only visible rows, needs no
                             // final fence (ft-wpgjw, ft-ukqe3).
-                            text_read_visible_state(count.0.min(7), 0, 600)
+                            text_read_visible_state(count.0.min(13), 0, 600)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let mut count = seen.lock().unwrap();
                             count.1 += 1;
-                            if rejected_chunk && count.0 < 7 {
+                            if rejected_chunk && count.0 < 13 {
                                 Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
                                     GetLinesAtLayout::IDENT,
                                 ))
@@ -8948,39 +8955,38 @@ mod tests {
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
                 assert!(summaries[0]["connection_id"].as_u64().unwrap() > 0);
-                assert_eq!(summaries[0]["attempts"], 3);
+                assert_eq!(summaries[0]["attempts"], 6);
                 assert_eq!(summaries[0]["quota_reductions"], 0);
                 assert_eq!(
                     summaries[0]["chunk_layout_retries"],
-                    if rejected_chunk { 2 } else { 0 }
+                    if rejected_chunk { 5 } else { 0 }
                 );
                 assert_eq!(
                     summaries[0]["final_source_retries"],
-                    if rejected_chunk { 0 } else { 2 }
+                    if rejected_chunk { 0 } else { 5 }
                 );
                 let expected_phase = if rejected_chunk {
                     "chunk_layout"
                 } else {
                     "final_source"
                 };
+                let mut expected_phases = vec![format!("{expected_phase}_yield")];
+                expected_phases.extend((0..4).map(|_| format!("{expected_phase}_wait")));
                 assert_eq!(
                     diagnostic_log.retry_phases(),
-                    vec![
-                        format!("{expected_phase}_yield"),
-                        format!("{expected_phase}_wait"),
-                    ],
-                    "repeated churn must retain its second-retry backoff"
+                    expected_phases,
+                    "repeated churn must retain its later-retry backoff"
                 );
                 assert!(matches!(
                     error,
                     MuxPoolError::Mux(DirectMuxError::TextSnapshotChanged {
                         phase,
-                        attempts: 3,
+                        attempts: 6,
                     }) if phase == expected_phase
                 ));
                 assert_eq!(
                     *counts.lock().unwrap(),
-                    (6, if rejected_chunk { 3 } else { 6 })
+                    (12, if rejected_chunk { 6 } else { 12 })
                 );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.recovery_attempts, 0, "no second retry budget");
@@ -8993,7 +8999,7 @@ mod tests {
                 );
                 assert_eq!(
                     *counts.lock().unwrap(),
-                    (8, if rejected_chunk { 5 } else { 8 })
+                    (14, if rejected_chunk { 8 } else { 14 })
                 );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.connections_created, 1, "aligned stream stays usable");
