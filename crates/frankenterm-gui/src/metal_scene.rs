@@ -597,7 +597,7 @@ fn image_instances(
     let images = row.images();
     let mut start = 0;
     while let Some(first) = images.get(start) {
-        let col = usize::from(first.col);
+        let col = first.col;
         let end = start
             + images[start..]
                 .iter()
@@ -2025,7 +2025,7 @@ mod tests {
             &no_selection,
             &bar,
         );
-        let placed: Vec<(u16, i32)> = mirror.rows()[0]
+        let placed: Vec<(usize, i32)> = mirror.rows()[0]
             .images()
             .iter()
             .map(|image| (image.col, image.image.z_index()))

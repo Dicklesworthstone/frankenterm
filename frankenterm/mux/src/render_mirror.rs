@@ -37,431 +37,12 @@ use crate::renderable::{
     StableCursorPosition,
 };
 use frankenterm_term::screen::ScreenCoordinateWitness;
+pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorRow};
 use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::convert::TryFrom;
 use std::ops::Range;
-use std::sync::Arc;
-use termwiz::cell::{Blink, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
-use termwiz::cellcluster::CellCluster;
-use termwiz::color::{ColorAttribute, SrgbaTuple};
-use termwiz::hyperlink::{Hyperlink, Rule};
-use termwiz::image::ImageCell;
-use termwiz::surface::line::CellRef;
+use termwiz::hyperlink::Rule;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
-
-/// A cell color as the cell names it, before palette resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MirrorColor {
-    /// The palette's default foreground or background.
-    Default,
-    Palette(u8),
-    /// sRGB, straight alpha, 8 bits per channel.
-    Rgba([u8; 4]),
-}
-
-/// A color component as the 8-bit value an 8-bit target stores.
-// Clamped to 0.0..=255.0 before the cast.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn unorm8(component: f32) -> u8 {
-    (component.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-impl MirrorColor {
-    fn from_attribute(color: ColorAttribute) -> Self {
-        match color {
-            ColorAttribute::Default => Self::Default,
-            ColorAttribute::PaletteIndex(index) => Self::Palette(index),
-            ColorAttribute::TrueColorWithPaletteFallback(color, _)
-            | ColorAttribute::TrueColorWithDefaultFallback(color) => {
-                let SrgbaTuple(red, green, blue, alpha) = color;
-                Self::Rgba([unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)])
-            }
-        }
-    }
-
-    /// The color as a [`ColorAttribute`] a palette resolves. Resolving it
-    /// gives the cell's color to 8-bit precision.
-    pub fn to_attribute(self) -> ColorAttribute {
-        match self {
-            Self::Default => ColorAttribute::Default,
-            Self::Palette(index) => ColorAttribute::PaletteIndex(index),
-            Self::Rgba([red, green, blue, alpha]) => {
-                ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
-                    f32::from(red) / 255.0,
-                    f32::from(green) / 255.0,
-                    f32::from(blue) / 255.0,
-                    f32::from(alpha) / 255.0,
-                ))
-            }
-        }
-    }
-}
-
-// MirrorCell::flags layout.
-const INTENSITY_SHIFT: u32 = 0;
-const UNDERLINE_SHIFT: u32 = 2;
-const BLINK_SHIFT: u32 = 5;
-const ITALIC: u32 = 1 << 7;
-const REVERSE: u32 = 1 << 8;
-const STRIKETHROUGH: u32 = 1 << 9;
-const INVISIBLE: u32 = 1 << 10;
-const OVERLINE: u32 = 1 << 11;
-const VALIGN_SHIFT: u32 = 12;
-const IMAGE: u32 = 1 << 14;
-/// Two bits (ft-yccm0.4.7.3): a renderer clusters cells for shaping by their
-/// whole attributes, and the semantic type is one of them.
-const SEMANTIC_SHIFT: u32 = 15;
-
-/// One visible cell (a wide character is one cell of width 2; its spacer is
-/// not stored), in compact form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MirrorCell {
-    /// The cell's text: `text_len` bytes of its row's text from `text_start`.
-    text_start: u32,
-    text_len: u8,
-    col: u16,
-    width: u8,
-    flags: u32,
-    /// 0 for none, else one past an index into the row's hyperlinks.
-    link: u16,
-    fg: MirrorColor,
-    bg: MirrorColor,
-    underline_color: MirrorColor,
-}
-
-impl MirrorCell {
-    /// The cell's first column.
-    pub fn col(&self) -> usize {
-        usize::from(self.col)
-    }
-
-    pub fn width(&self) -> usize {
-        usize::from(self.width)
-    }
-
-    pub fn fg(&self) -> MirrorColor {
-        self.fg
-    }
-
-    pub fn bg(&self) -> MirrorColor {
-        self.bg
-    }
-
-    pub fn underline_color(&self) -> MirrorColor {
-        self.underline_color
-    }
-
-    pub fn intensity(&self) -> Intensity {
-        match (self.flags >> INTENSITY_SHIFT) & 0b11 {
-            1 => Intensity::Bold,
-            2 => Intensity::Half,
-            _ => Intensity::Normal,
-        }
-    }
-
-    pub fn underline(&self) -> Underline {
-        match (self.flags >> UNDERLINE_SHIFT) & 0b111 {
-            1 => Underline::Single,
-            2 => Underline::Double,
-            3 => Underline::Curly,
-            4 => Underline::Dotted,
-            5 => Underline::Dashed,
-            _ => Underline::None,
-        }
-    }
-
-    pub fn blink(&self) -> Blink {
-        match (self.flags >> BLINK_SHIFT) & 0b11 {
-            1 => Blink::Slow,
-            2 => Blink::Rapid,
-            _ => Blink::None,
-        }
-    }
-
-    pub fn italic(&self) -> bool {
-        self.flags & ITALIC != 0
-    }
-
-    pub fn reverse(&self) -> bool {
-        self.flags & REVERSE != 0
-    }
-
-    pub fn strikethrough(&self) -> bool {
-        self.flags & STRIKETHROUGH != 0
-    }
-
-    pub fn invisible(&self) -> bool {
-        self.flags & INVISIBLE != 0
-    }
-
-    pub fn overline(&self) -> bool {
-        self.flags & OVERLINE != 0
-    }
-
-    pub fn vertical_align(&self) -> VerticalAlign {
-        match (self.flags >> VALIGN_SHIFT) & 0b11 {
-            1 => VerticalAlign::SuperScript,
-            2 => VerticalAlign::SubScript,
-            _ => VerticalAlign::BaseLine,
-        }
-    }
-
-    /// Whether the cell has image attachments (drawn by an image pass, not
-    /// by the cell passes).
-    pub fn has_image(&self) -> bool {
-        self.flags & IMAGE != 0
-    }
-
-    pub fn semantic_type(&self) -> SemanticType {
-        match (self.flags >> SEMANTIC_SHIFT) & 0b11 {
-            1 => SemanticType::Input,
-            2 => SemanticType::Prompt,
-            _ => SemanticType::Output,
-        }
-    }
-
-    fn flags_of(attrs: &CellAttributes) -> u32 {
-        let mut flags = ((attrs.intensity() as u32) << INTENSITY_SHIFT)
-            | ((attrs.underline() as u32) << UNDERLINE_SHIFT)
-            | ((attrs.blink() as u32) << BLINK_SHIFT)
-            | ((attrs.vertical_align() as u32) << VALIGN_SHIFT)
-            | ((attrs.semantic_type() as u32) << SEMANTIC_SHIFT);
-        for (set, bit) in [
-            (attrs.italic(), ITALIC),
-            (attrs.reverse(), REVERSE),
-            (attrs.strikethrough(), STRIKETHROUGH),
-            (attrs.invisible(), INVISIBLE),
-            (attrs.overline(), OVERLINE),
-            (attrs.has_image_attachments(), IMAGE),
-        ] {
-            if set {
-                flags |= bit;
-            }
-        }
-        flags
-    }
-}
-
-/// An image attached to a cell: a kitty, iTerm2 or sixel image's slice for
-/// the cell, which a renderer draws over the cell's columns
-/// (ft-yccm0.4.7.2).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MirrorImage {
-    /// The column of the cell it is attached to.
-    pub col: u16,
-    pub image: ImageCell,
-}
-
-/// One captured row.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MirrorRow {
-    stable: StableRowIndex,
-    /// The line's sequence number when it was captured.
-    seqno: SequenceNo,
-    /// The capture that last copied this row (see [`RenderMirror::generation`]).
-    generation: u64,
-    cells: Vec<MirrorCell>,
-    /// Every cell's text, back to back.
-    text: String,
-    links: Vec<Arc<Hyperlink>>,
-    has_images: bool,
-    /// The cells' images, by column and then in each cell's z-index order.
-    images: Vec<MirrorImage>,
-}
-
-impl MirrorRow {
-    /// Compacts `line`, the row at `stable`.
-    pub fn from_line(stable: StableRowIndex, line: &Line, generation: u64) -> Self {
-        let mut row = Self {
-            stable,
-            seqno: line.current_seqno(),
-            generation,
-            cells: Vec::with_capacity(line.len()),
-            text: String::with_capacity(line.len()),
-            links: Vec::new(),
-            has_images: false,
-            images: Vec::new(),
-        };
-        for cell in line.visible_cells() {
-            let text = cell.str();
-            // A grapheme is at most a few dozen bytes; anything longer is cut
-            // at a char boundary rather than wrapping the length.
-            let mut len = text.len().min(usize::from(u8::MAX));
-            while !text.is_char_boundary(len) {
-                len -= 1;
-            }
-            let text_start = u32::try_from(row.text.len()).unwrap_or(u32::MAX);
-            row.text.push_str(&text[..len]);
-            let attrs = cell.attrs();
-            let link = match attrs.hyperlink() {
-                None => 0,
-                Some(link) => {
-                    let index = row
-                        .links
-                        .iter()
-                        .position(|known| Arc::ptr_eq(known, link) || **known == **link)
-                        .unwrap_or_else(|| {
-                            row.links.push(Arc::clone(link));
-                            row.links.len() - 1
-                        });
-                    u16::try_from(index + 1).unwrap_or(u16::MAX)
-                }
-            };
-            let flags = MirrorCell::flags_of(attrs);
-            row.has_images |= flags & IMAGE != 0;
-            let col = u16::try_from(cell.cell_index()).unwrap_or(u16::MAX);
-            if let Some(images) = attrs.images() {
-                row.images
-                    .extend(images.into_iter().map(|image| MirrorImage { col, image }));
-            }
-            row.cells.push(MirrorCell {
-                text_start,
-                text_len: u8::try_from(len).unwrap_or(u8::MAX),
-                col,
-                width: u8::try_from(cell.width()).unwrap_or(u8::MAX),
-                flags,
-                link,
-                fg: MirrorColor::from_attribute(attrs.foreground()),
-                bg: MirrorColor::from_attribute(attrs.background()),
-                underline_color: MirrorColor::from_attribute(attrs.underline_color()),
-            });
-        }
-        row
-    }
-
-    pub fn stable(&self) -> StableRowIndex {
-        self.stable
-    }
-
-    pub fn seqno(&self) -> SequenceNo {
-        self.seqno
-    }
-
-    /// The capture that last copied this row: a renderer rebuilds the rows
-    /// whose generation is newer than the frame it built last.
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn cells(&self) -> &[MirrorCell] {
-        &self.cells
-    }
-
-    /// The cell's text (its grapheme).
-    pub fn text(&self, cell: &MirrorCell) -> &str {
-        let start = cell.text_start as usize;
-        self.text
-            .get(start..start + usize::from(cell.text_len))
-            .unwrap_or("")
-    }
-
-    pub fn hyperlink(&self, cell: &MirrorCell) -> Option<&Arc<Hyperlink>> {
-        usize::from(cell.link)
-            .checked_sub(1)
-            .and_then(|index| self.links.get(index))
-    }
-
-    pub fn has_images(&self) -> bool {
-        self.has_images
-    }
-
-    /// The images attached to the row's cells, by column and then in each
-    /// cell's z-index order (the order a cell's attributes keep them).
-    pub fn images(&self) -> &[MirrorImage] {
-        &self.images
-    }
-
-    /// The cell's attributes rebuilt from the mirror (ft-yccm0.4.7.3), so a
-    /// renderer can cluster cells for shaping with
-    /// `CellCluster::make_cluster` as the WebGpu renderer clusters lines.
-    /// Equal to the captured attributes except for what the mirror does not
-    /// keep and drawing does not use:
-    /// - image payloads: a cell with images can cluster with equal neighbors
-    ///   here while its line keeps it apart (the image pass draws images,
-    ///   over cells that are mostly blank);
-    /// - true colors finer than 8 bits per channel, and which fallback a
-    ///   true color names.
-    ///
-    /// The wrapped flag is clear, as clustering normalizes it.
-    pub fn cell_attributes(&self, cell: &MirrorCell) -> CellAttributes {
-        let mut attrs = CellAttributes::default();
-        attrs
-            .set_intensity(cell.intensity())
-            .set_underline(cell.underline())
-            .set_blink(cell.blink())
-            .set_italic(cell.italic())
-            .set_reverse(cell.reverse())
-            .set_strikethrough(cell.strikethrough())
-            .set_invisible(cell.invisible())
-            .set_overline(cell.overline())
-            .set_semantic_type(cell.semantic_type())
-            .set_vertical_align(cell.vertical_align())
-            .set_foreground(cell.fg().to_attribute())
-            .set_background(cell.bg().to_attribute());
-        if cell.underline_color() != MirrorColor::Default {
-            attrs.set_underline_color(cell.underline_color().to_attribute());
-        }
-        if let Some(link) = self.hyperlink(cell) {
-            attrs.set_hyperlink(Some(Arc::clone(link)));
-        }
-        attrs
-    }
-
-    /// The row's shaping clusters as `Line::cluster` makes them for the line
-    /// it was captured from (ft-yccm0.4.7.3): runs of cells with equal
-    /// attributes ([`Self::cell_attributes`]) and presentation, broken at
-    /// whitespace runs, by the same `CellCluster::make_cluster`. Left to
-    /// right only: the mirror keeps no bidi state, and the WebGpu renderer
-    /// clusters left to right unless bidi is enabled.
-    pub fn clusters(&self) -> Vec<CellCluster> {
-        let attrs: Vec<CellAttributes> = self
-            .cells
-            .iter()
-            .map(|cell| self.cell_attributes(cell))
-            .collect();
-        let len = self
-            .cells
-            .last()
-            .map_or(0, |cell| cell.col() + cell.width());
-        CellCluster::make_cluster(
-            len,
-            self.cells
-                .iter()
-                .zip(&attrs)
-                .map(|(cell, attrs)| CellRef::ClusterRef {
-                    cell_index: cell.col(),
-                    text: self.text(cell),
-                    width: cell.width(),
-                    attrs,
-                }),
-            None,
-        )
-    }
-
-    /// The row as a `Line` again (ft-yccm0.4.7.3): every cell's text, width
-    /// and attributes ([`Self::cell_attributes`]) set where it was. It
-    /// clusters as [`Self::clusters`] does, and takes the edits the WebGpu
-    /// renderer makes to the captured line before clustering it, such as an
-    /// IME composition overlaid at the cursor.
-    pub fn to_line(&self) -> Line {
-        let mut line = Line::new(self.seqno);
-        for cell in &self.cells {
-            line.set_cell_grapheme(
-                cell.col(),
-                self.text(cell),
-                cell.width(),
-                self.cell_attributes(cell),
-                self.seqno,
-            );
-        }
-        line
-    }
-
-    /// Whether the row must be copied again although its seqno says clean.
-    fn always_recapture(&self) -> bool {
-        self.has_images
-    }
-}
 
 /// What a capture copied: the counters prove that a capture does work
 /// proportional to the rows that changed.
@@ -583,7 +164,7 @@ impl RenderMirror {
     /// The mirror's row at `stable`, if it holds one.
     fn row_index(&self, stable: StableRowIndex) -> Option<usize> {
         let offset = usize::try_from(stable.checked_sub(self.first)?).ok()?;
-        (self.rows.get(offset)?.stable == stable).then_some(offset)
+        (self.rows.get(offset)?.stable() == stable).then_some(offset)
     }
 }
 
@@ -655,7 +236,7 @@ fn capture_rows(
                     Some(index) => {
                         let held = &mirror.rows[index];
                         let current = line.current_seqno();
-                        current == SEQ_ZERO || current > held.seqno || held.always_recapture()
+                        current == SEQ_ZERO || current > held.seqno() || held.always_recapture()
                     }
                 };
             }
@@ -697,7 +278,7 @@ fn capture_rows(
             let stable = first + row as StableRowIndex;
             let offset = usize::try_from(stable.checked_sub(old_first)?).ok()?;
             let held = old.get_mut(offset)?;
-            (held.stable == stable).then(|| std::mem::replace(held, placeholder_row()))
+            (held.stable() == stable).then(|| std::mem::replace(held, placeholder_row()))
         })
         .collect();
     let mut stats = CaptureStats {
@@ -727,17 +308,14 @@ fn capture_rows(
                     let stale = usize::try_from(stable - old_first)
                         .ok()
                         .and_then(|offset| old.get_mut(offset))
-                        .filter(|held| held.stable == stable)
+                        .filter(|held| held.stable() == stable)
                         .map(|held| std::mem::replace(held, placeholder_row()));
-                    *slot = Some(stale.unwrap_or_else(|| MirrorRow {
-                        stable,
-                        ..placeholder_row()
-                    }));
+                    *slot = Some(stale.unwrap_or_else(|| MirrorRow::empty(stable, 0)));
                     continue;
                 }
                 let copied = MirrorRow::from_line(stable, line, generation);
                 stats.rows_captured += 1;
-                stats.cells_captured += copied.cells.len();
+                stats.cells_captured += copied.cells().len();
                 *slot = Some(copied);
             }
         });
@@ -748,11 +326,7 @@ fn capture_rows(
         .into_iter()
         .enumerate()
         .map(|(row, slot)| {
-            slot.unwrap_or_else(|| MirrorRow {
-                stable: first + row as StableRowIndex,
-                generation,
-                ..placeholder_row()
-            })
+            slot.unwrap_or_else(|| MirrorRow::empty(first + row as StableRowIndex, generation))
         })
         .collect();
     mirror.first = first;
@@ -917,16 +491,7 @@ fn logical_len_exceeds(current: usize, additional: usize) -> bool {
 }
 
 fn placeholder_row() -> MirrorRow {
-    MirrorRow {
-        stable: 0,
-        seqno: SEQ_ZERO,
-        generation: 0,
-        cells: Vec::new(),
-        text: String::new(),
-        links: Vec::new(),
-        has_images: false,
-        images: Vec::new(),
-    }
+    MirrorRow::empty(0, 0)
 }
 
 /// [`capture_terminal_rows`] for any pane, through its public row API: for a
@@ -984,7 +549,7 @@ pub fn capture_pane_rows(
             let stable = first + row as StableRowIndex;
             let offset = usize::try_from(stable.checked_sub(old_first)?).ok()?;
             let held = old.get_mut(offset)?;
-            (held.stable == stable).then(|| std::mem::replace(held, placeholder_row()))
+            (held.stable() == stable).then(|| std::mem::replace(held, placeholder_row()))
         })
         .collect();
     drop(old);
@@ -1018,7 +583,7 @@ pub fn capture_pane_rows(
             };
             let copied = MirrorRow::from_line(stable, line, generation);
             stats.rows_captured += 1;
-            stats.cells_captured += copied.cells.len();
+            stats.cells_captured += copied.cells().len();
             *slot = Some(copied);
         }
     }
@@ -1026,11 +591,7 @@ pub fn capture_pane_rows(
         .into_iter()
         .enumerate()
         .map(|(row, slot)| {
-            slot.unwrap_or_else(|| MirrorRow {
-                stable: first + row as StableRowIndex,
-                generation,
-                ..placeholder_row()
-            })
+            slot.unwrap_or_else(|| MirrorRow::empty(first + row as StableRowIndex, generation))
         })
         .collect();
     mirror.first = first;
@@ -1064,7 +625,16 @@ mod tests {
     use super::*;
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{TerminalConfiguration, TerminalSize};
-    use termwiz::cell::Cell;
+    use std::sync::Arc;
+    use termwiz::cell::{Blink, Cell, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
+    use termwiz::cellcluster::CellCluster;
+    use termwiz::color::{ColorAttribute, SrgbaTuple};
+    use termwiz::hyperlink::Hyperlink;
+    use termwiz::image::ImageCell;
+
+    fn unorm8(component: f32) -> u8 {
+        (component.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
 
     #[derive(Debug)]
     struct TestConfig;
@@ -1126,13 +696,13 @@ mod tests {
     /// What a row shows, without the capture bookkeeping (its generation).
     fn content(row: &MirrorRow) -> RowContent<'_> {
         (
-            row.stable,
-            row.seqno,
-            &row.cells,
-            &row.text,
-            &row.links,
-            row.has_images,
-            &row.images,
+            row.stable(),
+            row.seqno(),
+            row.cells(),
+            row.all_text(),
+            row.hyperlinks(),
+            row.has_images(),
+            row.images(),
         )
     }
 
@@ -1173,7 +743,7 @@ mod tests {
 
         let row = MirrorRow::from_line(0, &line, 1);
         assert!(row.has_images());
-        let images: Vec<(u16, i32, f32)> = row
+        let images: Vec<(usize, i32, f32)> = row
             .images()
             .iter()
             .map(|image| {

@@ -61,6 +61,9 @@ pub use frankenterm_surface::line::*;
 pub mod screen;
 pub use crate::screen::*;
 
+/// Canonical semantic row capture and bounded owned native render transactions.
+pub mod render;
+
 pub mod terminal;
 pub use crate::terminal::*;
 
