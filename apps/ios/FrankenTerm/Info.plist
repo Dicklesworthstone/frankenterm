@@ -12,6 +12,14 @@
  <key>LSRequiresIPhoneOS</key><true/>
  <key>NSCameraUsageDescription</key><string>Scan encrypted workspace QR frames from your Mac. Camera images are not saved or uploaded.</string>
  <key>NSFaceIDUsageDescription</key><string>Protect access to SSH identities stored on this iPhone.</string>
+ <key>CFBundleDocumentTypes</key><array>
+  <dict><key>CFBundleTypeName</key><string>FrankenTerm Workspace</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Owner</string><key>LSItemContentTypes</key><array><string>org.frankenterm.workspace</string><string>org.frankenterm.airgap</string></array></dict>
+ </array>
+ <key>UTExportedTypeDeclarations</key><array>
+  <dict><key>UTTypeIdentifier</key><string>org.frankenterm.workspace</string><key>UTTypeDescription</key><string>FrankenTerm Public Workspace</string><key>UTTypeConformsTo</key><array><string>public.json</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ftworkspace</string></array></dict></dict>
+  <dict><key>UTTypeIdentifier</key><string>org.frankenterm.airgap</string><key>UTTypeDescription</key><string>FrankenTerm Encrypted Workspace</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ftairgap</string></array></dict></dict>
+ </array>
+ <key>LSSupportsOpeningDocumentsInPlace</key><true/>
  <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
  <key>UILaunchScreen</key><dict/>
  <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>

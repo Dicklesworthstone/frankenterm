@@ -17,7 +17,7 @@ struct FrankenTermMobileApp: App {
 final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
-    var routeReadiness: [UUID: [WorkspaceDocument.RouteReadiness]] = [:]
+    var localPolicies: [UUID: WorkspaceLocalState] = [:]
     var state: OfflineRestoreStatus?
     var message: String?
     var showRestore = false
@@ -28,6 +28,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var store: WorkspaceStore?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
+    @ObservationIgnored private var pendingImportURL: URL?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var observationTask: Task<Void, Never>?
@@ -75,12 +76,14 @@ final class MobileWorkspaceModel {
             store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
             try await refreshWorkspaces(using: created, epoch: epoch)
             updateLifecycle()
+            if active, let pendingImportURL { self.pendingImportURL = nil; importFile(pendingImportURL) }
         } catch { report(error); bootstrapStarted = false }
     }
     func setActive(_ value: Bool) {
         active = value
-        if !value { cameraRequested = false; state = nil; availableCredentials = [:]; routeReadiness = [:] }
+        if !value { cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:] }
         updateLifecycle()
+        if value, restore != nil, let pendingImportURL { self.pendingImportURL = nil; importFile(pendingImportURL) }
     }
     func setRestoreVisible(_ value: Bool) {
         showRestore = value
@@ -101,16 +104,16 @@ final class MobileWorkspaceModel {
             if visible { self.startObservations(restore: restore) }
             if self.active, let store = self.store {
                 do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
-                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.routeReadiness = [:]; self.report(error) } }
+                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.localPolicies = [:]; self.report(error) } }
             }
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
-        let snapshot = try await store.loadWithReadiness()
+        let snapshot = try await store.loadWithLocalPolicy()
         guard active, epoch == ticket else { return }
         workspaces = snapshot.map(\.workspace)
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
-        routeReadiness = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.routes) })
+        localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
     }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
         let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
@@ -153,8 +156,7 @@ final class MobileWorkspaceModel {
                 let current = await restore.status()
                 let result = try await action(restore, current)
                 guard self.active, self.epoch == ticket else { return }
-                // A restarted scan may need the same QR that was last observed.
-                if result.generation != current.generation { self.lastObservation = nil }
+                if current.generation != result.generation { self.lastObservation = nil }
                 self.state = result
                 if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
@@ -165,12 +167,21 @@ final class MobileWorkspaceModel {
         }
     }
     func importFile(_ url: URL) {
-        guard !busy else { return }
+        guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
+        guard !busy else { message = "Finish the current import before opening another workspace."; return }
+        guard active, restore != nil else {
+            pendingImportURL = url
+            if !bootstrapStarted { Task { await bootstrap() } }
+            return
+        }
         cameraRequested = false; setRestoreVisible(true)
         run { restore, state in
             let state = state.phase == .complete ? try await restore.reset() : state
             let bytes = try await Task.detached(priority: .userInitiated) { try SelectedLocalFile.read(url, limit: FTLimit.envelope) }.value
-            return try await restore.acceptEncryptedFile(bytes, generation: state.generation)
+            if bytes.starts(with: Data("FTAG".utf8)) {
+                return try await restore.acceptEncryptedFile(bytes, generation: state.generation)
+            }
+            return try await restore.acceptWorkspaceDocument(bytes, generation: state.generation)
         }
     }
     func report(_ error: Error) {
@@ -191,19 +202,19 @@ struct MobileWorkspaceRoot: View {
                 List {
                     Section {
                         Label("Your machines. Your colors.", systemImage: "terminal.fill").font(.title2.bold()).padding(.vertical, 8)
-                        Text("Restore your encrypted Mac workspace without a network connection. Private keys go into this device’s protected Keychain.")
+                        Text("Restore your Mac workspace from an encrypted transfer or a public workspace file. Included private keys go into this device’s protected Keychain.")
                             .foregroundStyle(.secondary)
                         Button { model.requestCamera() } label: {
                             Label("Restore from Animated QR", systemImage: "qrcode.viewfinder")
                         }.disabled(model.state == nil)
-                        Button { chooseFile = true } label: { Label("Open Local Encrypted File", systemImage: "doc.badge.arrow.up") }
+                        Button { chooseFile = true } label: { Label("Open Workspace File", systemImage: "doc.badge.arrow.up") }
                             .disabled(model.state == nil || model.busy)
                     }
                     Section("Saved workspaces") {
                         if model.workspaces.isEmpty { Text("No workspace restored yet.").foregroundStyle(.secondary) }
                         ForEach(model.workspaces) { saved in
                             if let document = try? saved.document() {
-                                NavigationLink { MachineWorkspaceView(document: document, workspaceID: saved.id, model: model) } label: {
+                                NavigationLink { MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model) } label: {
                                     VStack(alignment: .leading, spacing: 5) {
                                         Text(verbatim: document.name).font(.headline).lineLimit(1)
                                         if let available = model.availableCredentials[saved.id] {
@@ -228,10 +239,11 @@ struct MobileWorkspaceRoot: View {
         }
         .task { model.setActive(scenePhase == .active); await model.bootstrap() }
         .onChange(of: scenePhase) { _, phase in model.setActive(phase == .active) }
+        .onOpenURL { model.importFile($0) }
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
             OfflineRestoreSheet(model: model)
         }
-        .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+        .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls): if let url = urls.first { model.importFile(url) }
             case .failure(let error): model.report(error)
@@ -250,6 +262,7 @@ struct OfflineRestoreSheet: View {
     @State private var confirmed = false
     @State private var allowRemoval = false
     @State private var allowRollback = false
+    @State private var repairPage = 0
     var body: some View {
         NavigationStack {
             Group {
@@ -266,7 +279,7 @@ struct OfflineRestoreSheet: View {
                             }
                             if let comparison = state.comparison {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text("Compare with your Mac").font(.caption).foregroundStyle(.secondary)
+                                    Text(state.source == .workspaceDocument ? "File comparison value" : "Compare with your Mac").font(.caption).foregroundStyle(.secondary)
                                     Text(verbatim: comparison).font(.system(.headline, design: .monospaced)).minimumScaleFactor(0.6).lineLimit(1)
                                 }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
                             }
@@ -293,29 +306,24 @@ struct OfflineRestoreSheet: View {
                                 Text("\(state.verifiedPages) of \(state.identity?.pageCount ?? 0) pages verified · \(state.verifiedBytes) bytes")
                                 Text("\(state.independentParts) independent fragments in unfinished pages. Duplicate frames do not count as progress.")
                                     .font(.caption).foregroundStyle(.secondary)
-                                if !state.incompletePageIndices.isEmpty {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        Text("Pages still needed").font(.headline)
-                                        Text(verbatim: state.incompletePageIndices.map { String($0 + 1) }.joined(separator: ", "))
-                                            .font(.system(.callout, design: .monospaced))
-                                        Text("On your Mac, choose Repair and select one of these pages to focus playback.")
-                                            .font(.callout)
-                                        DisclosureGroup("Restart a stalled page") {
-                                            Text("Restarting clears the collected fragments for that page so you can scan it again.")
-                                                .font(.caption).foregroundStyle(.secondary)
-                                            ForEach(state.incompletePageIndices, id: \.self) { page in
-                                                Button("Restart Page \(page + 1)") {
-                                                    let generation = state.generation
-                                                    model.run { restore, _ in try await restore.restartPage(page, generation: generation) }
-                                                }.disabled(model.busy || state.isSuspended)
-                                            }
-                                        }
-                                    }.padding().frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                                }
                                 Button(model.cameraRequested ? "Pause Camera" : "Resume Camera") {
                                     if model.cameraRequested { model.cameraRequested = false } else { model.requestCamera() }
                                 }.disabled(model.requestingCameraAccess)
+                                if !state.incompletePageIndices.isEmpty {
+                                    DisclosureGroup("Repair an unfinished page") {
+                                        Text("Select the same page in Repair Page on your Mac. Reset only if this page has stopped recovering; verified pages are kept.")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                        Picker("Page", selection: $repairPage) {
+                                            ForEach(state.incompletePageIndices, id: \.self) { index in
+                                                Text("Page \(index + 1)").tag(index)
+                                            }
+                                        }
+                                        Button("Reset This Unfinished Page") {
+                                            let page = state.incompletePageIndices.contains(repairPage) ? repairPage : (state.incompletePageIndices.first ?? 0)
+                                            model.run { restore, state in try await restore.resetIncompletePage(page, generation: state.generation) }
+                                        }
+                                    }
+                                }
                             case .locked:
                                 Text("The complete encrypted package is collected. Reveal the transfer code separately on your Mac and enter it here.")
                                 SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
@@ -324,53 +332,45 @@ struct OfflineRestoreSheet: View {
                                     let entered = code; code = ""; confirmed = false; allowRemoval = false; allowRollback = false
                                     model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
                                 }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
+                            case .documentReady:
+                                Text("The public workspace is ready for a fresh source and settings review. It contains no private keys and needs no transfer code.")
+                                Button("Review Workspace") {
+                                    model.run { restore, state in try await restore.reviewWorkspaceDocument(generation: state.generation) }
+                                }.buttonStyle(.borderedProminent)
                             case .preparingReview, .committing:
                                 ProgressView(state.phase == .committing ? "Saving protected workspace…" : "Preparing review…")
                             case .review:
                                 if let review = state.review {
                                     Text(verbatim: review.document.name).font(.headline)
                                     Text("\(review.document.machines.count) machines · \(review.includedFingerprints.count) private identities included")
+                                    if state.source == .workspaceDocument {
+                                        Text("This public document is not encrypted or authenticated. Review its source, endpoints, and host trust before accepting it. Existing matching device credentials can be reused.")
+                                            .font(.callout)
+                                    }
                                     ForEach(review.document.machines) { machine in
                                         let theme = review.document.themes.first { $0.id == machine.themeID }
                                         HStack {
                                             Circle().fill(Color(ftHex: theme?.accent ?? "#777777")).frame(width: 12, height: 12)
                                             Text(verbatim: machine.name).lineLimit(1)
                                         }
+                                        ForEach(review.document.routes.filter { machine.routeIDs.contains($0.id) }) { route in
+                                            VStack(alignment: .leading, spacing: 3) {
+                                                Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.caption, design: .monospaced))
+                                                Text("\(route.credentialIDs.count) permitted identities · \(route.authenticationMethods.map(\.rawValue).joined(separator: ", "))")
+                                                    .font(.caption).foregroundStyle(.secondary)
+                                                if let trust = review.document.hostTrust.first(where: { $0.id == route.trustID }) {
+                                                    ForEach(trust.pins, id: \.self) { key in
+                                                        Text(verbatim: "Host \(key.algorithm) \(key.fingerprint)").font(.system(.caption2, design: .monospaced))
+                                                    }
+                                                    if !trust.revokedKeys.isEmpty { Text("\(trust.revokedKeys.count) host-key revocations apply.").font(.caption) }
+                                                }
+                                            }
+                                        }
                                     }
                                     ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
                                         Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                                     }
-                                    DisclosureGroup("Host identities and connection policy") {
-                                        VStack(alignment: .leading, spacing: 16) {
-                                            ForEach(review.document.hostTrust) { trust in
-                                                VStack(alignment: .leading, spacing: 5) {
-                                                    Text(verbatim: "\(trust.host):\(trust.port)").font(.headline)
-                                                    if let alias = trust.hostKeyAlias { Text(verbatim: "Host-key alias: \(alias)").font(.caption) }
-                                                    ForEach(Array(trust.pins.enumerated()), id: \.offset) { _, pin in
-                                                        Text(verbatim: "\(pin.algorithm) · \(pin.fingerprint)")
-                                                            .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
-                                                    }
-                                                    if !trust.revokedKeys.isEmpty {
-                                                        Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
-                                                    }
-                                                }
-                                            }
-                                            ForEach(review.document.routes) { route in
-                                                VStack(alignment: .leading, spacing: 5) {
-                                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
-                                                    Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes")
-                                                        .font(.caption)
-                                                    Text(verbatim: "Allowed authentication: " + route.authenticationMethods.map(\.rawValue).joined(separator: ", "))
-                                                        .font(.caption)
-                                                    if let readiness = review.routeReadiness.first(where: { $0.routeID == route.id }) {
-                                                        ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
-                                                            Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }.padding(.top, 8)
-                                    }
+                                    ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
                                     if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
                                     ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
                                         VStack(alignment: .leading) {
@@ -378,12 +378,23 @@ struct OfflineRestoreSheet: View {
                                             Text(verbatim: finding.reason).font(.caption)
                                         }
                                     }
-                                    Toggle("I verified the comparison value on my Mac and approve these settings, trust records, and keys.", isOn: $confirmed)
+                                    if review.preservedHostRevocationCount > 0 {
+                                        Text("\(review.preservedHostRevocationCount) previously accepted host-key denials remain in force.").font(.caption)
+                                    }
+                                    if review.preservedHostRequirementCount > 0 {
+                                        Text("\(review.preservedHostRequirementCount) mandatory host-trust requirements remain in force, even if this export omits them.").font(.caption)
+                                    }
+                                    if !review.document.diagnostics.isEmpty {
+                                        Text("Unknown optional extensions were discarded. Only validated public settings will be saved.").font(.caption)
+                                    }
+                                    Toggle(state.source == .workspaceDocument
+                                           ? "I recognize this source and approve the reviewed settings and host trust."
+                                           : "I verified the comparison value on my Mac and approve these settings, trust records, and keys.", isOn: $confirmed)
                                     if review.removesMachines { Toggle("Replace this workspace even though some existing machines are removed.", isOn: $allowRemoval) }
-                                    if review.requiresRollbackApproval {
+                                    if review.isRollback {
                                         VStack(alignment: .leading, spacing: 8) {
                                             Label("Previously restored recording", systemImage: "clock.arrow.circlepath").font(.headline)
-                                            Text("This package was accepted before and differs from the workspace currently saved on this phone. Restoring it replaces the current settings. Local revocations stay in effect.")
+                                            Text("This package was accepted before and differs from the workspace currently saved on this phone. Restoring it replaces the current settings. Local revocations and mandatory host-trust policy stay in effect.")
                                                 .font(.callout)
                                             Toggle("I approve restoring this previously accepted workspace version.", isOn: $allowRollback)
                                         }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
@@ -393,11 +404,9 @@ struct OfflineRestoreSheet: View {
                                         let token = review.token, consent = confirmed, removal = allowRemoval, rollback = allowRollback
                                         model.run { restore, state in
                                             try await restore.commit(reviewToken: token, generation: state.generation,
-                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal,
-                                                                     allowHistoricalRollback: rollback)
+                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal, allowRollback: rollback)
                                         }
-                                    }.buttonStyle(.borderedProminent)
-                                        .disabled(!confirmed || (review.removesMachines && !allowRemoval) || (review.requiresRollbackApproval && !allowRollback))
+                                    }.buttonStyle(.borderedProminent).disabled(!confirmed || (review.removesMachines && !allowRemoval) || (review.isRollback && !allowRollback))
                                 }
                             case .complete:
                                 Label("Restored offline — Connect later", systemImage: "checkmark.shield.fill").font(.headline)
@@ -426,8 +435,8 @@ struct OfflineRestoreSheet: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
-        .onChange(of: model.state?.review?.token) { _, _ in confirmed = false; allowRemoval = false; allowRollback = false }
         .onChange(of: model.active) { _, active in if !active { code = ""; confirmed = false; allowRemoval = false; allowRollback = false } }
+        .onChange(of: model.state?.review?.token) { _, _ in confirmed = false; allowRemoval = false; allowRollback = false }
         .onDisappear { code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false }
     }
     private func title(_ phase: OfflineRestorePhase) -> String {
@@ -436,10 +445,51 @@ struct OfflineRestoreSheet: View {
         case .candidate: "Choose this source"
         case .collecting: "Collecting encrypted pages"
         case .locked: "Unlock the package"
-        case .preparingReview, .review: "Review your workspace"
+        case .documentReady, .preparingReview, .review: "Review your workspace"
         case .committing: "Restoring workspace"
         case .complete: "Your workspace is restored"
         case .recoveryRequired: "Check the save result"
+        }
+    }
+}
+
+@MainActor
+private struct ImportHostPolicyReview: View {
+    let document: WorkspaceDocument
+    let routeReadiness: [WorkspaceDocument.RouteReadiness]
+    var body: some View {
+        DisclosureGroup("All host identities and jump-route policy") {
+            VStack(alignment: .leading, spacing: 16) {
+                ForEach(document.hostTrust) { trust in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(verbatim: "\(trust.host):\(trust.port)").font(.headline)
+                        if let alias = trust.hostKeyAlias { Text(verbatim: "Host-key alias: \(alias)").font(.caption) }
+                        ForEach(trust.pins, id: \.self) { pin in
+                            Text(verbatim: "\(pin.algorithm) · \(pin.fingerprint)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
+                        if !trust.revokedKeys.isEmpty {
+                            Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
+                        }
+                        ForEach(trust.requiredPolicyRequirements.sorted(), id: \.self) { requirement in
+                            Text(verbatim: "Required policy: \(requirement)").font(.caption)
+                        }
+                    }
+                }
+                ForEach(document.routes) { route in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
+                        Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes").font(.caption)
+                        if let state = routeReadiness.first(where: { $0.routeID == route.id }) {
+                            ForEach(Array(state.issues.enumerated()), id: \.offset) { _, issue in
+                                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+                            }
+                        } else {
+                            Label("Local requirements could not be validated.", systemImage: "exclamationmark.shield").font(.caption)
+                        }
+                    }
+                }
+            }.padding(.top, 8)
         }
     }
 }
@@ -492,11 +542,14 @@ private struct OpticalCamera: UIViewControllerRepresentable {
 
 @MainActor
 private struct MachineWorkspaceView: View {
-    let document: WorkspaceDocument
+    let initialDocument: WorkspaceDocument
     let workspaceID: UUID
     @Bindable var model: MobileWorkspaceModel
     @State private var selection = ""
     @State private var groupID = ""
+    private var document: WorkspaceDocument {
+        (try? model.workspaces.first(where: { $0.id == workspaceID })?.document()) ?? initialDocument
+    }
     private var machines: [WorkspaceDocument.Machine] {
         let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
         let ids = document.groups.first(where: { $0.id == selectedGroup })?.machineOrder ?? []
@@ -512,8 +565,7 @@ private struct MachineWorkspaceView: View {
                         HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
                         HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
                         Label("Restored offline", systemImage: "checkmark.shield")
-                        Text("Inspect the saved routes and their local requirements below. This build has no live terminal transport, and no remote session has been started.")
-                            .font(.callout)
+                        Text("Inspect the saved routes and their local requirements below. This build has no live terminal transport, and no remote session has been started.").font(.callout)
                         ForEach(machine.routeIDs, id: \.self) { id in
                             if let route = document.routes.first(where: { $0.id == id }) {
                                 VStack(alignment: .leading, spacing: 10) {
@@ -524,10 +576,10 @@ private struct MachineWorkspaceView: View {
                                     }
                                     Text(verbatim: "\(route.user)@\(route.host):\(route.port)")
                                         .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                                    if let available = model.availableCredentials[workspaceID] {
-                                        Text("\(route.credentialIDs.filter(available.contains).count) of \(route.credentialIDs.count) permitted key references are available on this device.")
+                                    if let local = model.localPolicies[workspaceID] {
+                                        Text("\(route.credentialIDs.filter(local.credentialIDs.contains).count) of \(route.credentialIDs.count) permitted key references are available on this device.")
                                             .font(.caption)
-                                        if let readiness = model.routeReadiness[workspaceID]?.first(where: { $0.routeID == id }) {
+                                        if let readiness = local.routes.first(where: { $0.routeID == id }) {
                                             ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
                                                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
                                             }
@@ -550,8 +602,7 @@ private struct MachineWorkspaceView: View {
                                     ForEach(Array(saved.findings.enumerated()), id: \.offset) { _, finding in
                                         VStack(alignment: .leading, spacing: 5) {
                                             Label(finding.disposition == 1 ? "Required condition" : "Preserved but inactive",
-                                                  systemImage: finding.disposition == 1 ? "exclamationmark.shield" : "archivebox")
-                                                .font(.caption.bold())
+                                                  systemImage: finding.disposition == 1 ? "exclamationmark.shield" : "archivebox").font(.caption.bold())
                                             Text(verbatim: "\(finding.entityID) · \(finding.setting)").font(.caption)
                                             Text(verbatim: finding.reason).font(.caption)
                                         }
@@ -560,8 +611,7 @@ private struct MachineWorkspaceView: View {
                             }
                         }
                         Text("Swipe to inspect another machine. These are saved configurations, not live panes.").font(.caption)
-                    }
-                    .padding(28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
+                    }.padding(28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
                     .background(Color(ftHex: theme?.background ?? "#10223C"))
@@ -570,6 +620,10 @@ private struct MachineWorkspaceView: View {
         }.tabViewStyle(.page(indexDisplayMode: .always))
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
             .onAppear { if selection.isEmpty { selection = document.initialMachineID } }
+            .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in
+                if !document.groups.contains(where: { $0.id == groupID }) { groupID = document.initialGroupID }
+                if !machines.contains(where: { $0.id == selection }) { selection = machines.first?.id ?? document.initialMachineID }
+            }
             .toolbar {
                 Menu("Groups", systemImage: "rectangle.3.group") {
                     ForEach(document.groups) { group in

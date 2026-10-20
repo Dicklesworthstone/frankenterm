@@ -13,35 +13,15 @@ func sampleManifest(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     let theme: [String: Any] = ["id": "theme", "name": "Cobalt", "foreground": "#FFFFFF", "background": "#10223C", "accent": "#3B82F6", "ansi": palette,
                                 "cursor_foreground": "#000000", "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF", "selection_background": "#345D91"]
     let workspace: [String: Any] = [
-        "id": "work", "name": "Machines", "groups": [["id": "group", "name": "Agents", "machine_order": ["build", "gpu"]]],
+        "id": "work", "name": "Machines", "groups": [["id": "group", "name": "Agents", "machine_order": ["build", "gpu"], "auto_connect": true]],
         "machines": ["build", "gpu"].map { ["id": $0, "name": $0, "theme_ref": "theme", "route_refs": ["route"], "preferred_route_ref": "route", "auto_connect": true] as [String: Any] },
-        "routes": [["id": "route", "mode": "direct_ssh", "host": "host.example.invalid", "port": 22, "user": "operator", "credential_refs": ["key"],
-                    "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": [], "session_creation": "on_select"]],
-        "credentials": [["id": "key", "algorithm": "ssh-ed25519", "public_fingerprint": fingerprint, "private_material": "not_included"]],
-        "host_trust": [["id": "trust", "host": "host.example.invalid", "port": 22, "revoked_keys": [],
-                        "pins": [["algorithm": "ssh-ed25519", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]]],
+        "routes": [["id": "route", "mode": "direct_ssh", "session_creation": "on_select", "host": "host.example.invalid", "port": 22, "user": "operator", "credential_refs": ["key"], "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": []]],
+        "credentials": [["id": "key", "algorithm": "ssh-ed25519", "public_fingerprint": fingerprint, "requirement": "matching_private_key", "private_material": "not_included"]],
+        "host_trust": [["id": "trust", "host": "host.example.invalid", "port": 22, "revoked_keys": [], "pins": [["algorithm": "ssh-ed25519", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]]],
         "themes": [theme], "preferences": ["initial_machine_ref": "build", "initial_group_ref": "group", "connect_on_open": true]
     ]
     return try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": bundleID, "source": ["exporter_id": "mac"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
 }
-
-private func changedWorkspace(_ change: (inout [String: Any]) -> Void) throws -> Data {
-    var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
-    var workspace = root["workspace"] as! [String: Any]
-    change(&workspace)
-    root["workspace"] = workspace
-    return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
-}
-
-private func changedRoute(_ change: (inout [String: Any]) -> Void) throws -> Data {
-    try changedWorkspace { workspace in
-        var routes = workspace["routes"] as! [[String: Any]]
-        change(&routes[0]); workspace["routes"] = routes
-    }
-}
-
-private let qualifiedTestTransport = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh", "frankenterm_mux"],
-    authenticationMethods: [.publicKey, .password, .keyboardInteractive], credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
 
 func sampleKey(using crypto: TestCryptography) throws -> (PrivateKeyRecord, String) {
     let seed = Data(0..<32), key = try crypto.ed25519PublicKey(seed: seed), blob = publicBlob(key)
@@ -55,6 +35,129 @@ func sampleKey(using crypto: TestCryptography) throws -> (PrivateKeyRecord, Stri
 
 final class CoreTests: XCTestCase {
     let crypto = TestCryptography()
+    func testLocalHostRevocationPrecedesAlgorithmReadinessForEachJump() throws {
+        let document = try WorkspaceDocument(data: changedWorkspace { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            var pins = trusts[0]["pins"] as! [[String: Any]]
+            pins.append(["algorithm": "ssh-rsa", "fingerprint": "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"])
+            trusts[0]["pins"] = pins
+            var hopTrust = trusts[0]; hopTrust["id"] = "hop-trust"; hopTrust["host"] = "jump.example.invalid"
+            trusts.append(hopTrust); workspace["host_trust"] = trusts
+            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
+            hop["id"] = "jump"; hop["host"] = "jump.example.invalid"; hop["host_trust_ref"] = "hop-trust"
+            routes[0]["jump_routes"] = ["jump"]; routes.append(hop); workspace["routes"] = routes
+        })
+        let ed25519 = try XCTUnwrap(document.hostTrust[0].pins.first)
+        let reviewed: Set<String> = ["trust", "hop-trust"]
+        XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            support: qualifiedTestTransport).isLocallyReady)
+        let targetRevoked = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: ["trust": [ed25519]], support: qualifiedTestTransport)
+        XCTAssertEqual(targetRevoked.issues, [.hostAlgorithmUnavailable], "An unrevoked unsupported pin cannot replace a revoked supported pin.")
+        let hopRevocations: [String: Set<WorkspaceDocument.HostKey>] = ["hop-trust": [ed25519]]
+        XCTAssertEqual(try document.readiness(forRouteID: "jump", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.hostAlgorithmUnavailable])
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.blockedJumpRoute("jump")])
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: ["trust": Set(document.hostTrust[0].pins)], support: qualifiedTestTransport).issues, [.hostIdentityRevoked])
+    }
+
+    func testEveryCoreRecordRejectsHiddenPrivateMaterial() throws {
+        for collection in ["groups", "machines", "routes", "credentials", "host_trust", "themes"] {
+            XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
+                var records = workspace[collection] as! [[String: Any]]
+                records[0]["private_key"] = "synthetic-secret-must-not-persist"; workspace[collection] = records
+            }), collection)
+        }
+        for scope in ["root", "source", "workspace", "preferences", "pin"] {
+            var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
+            var workspace = root["workspace"] as! [String: Any]
+            switch scope {
+            case "root": root["private_key"] = "secret"
+            case "source": var source = root["source"] as! [String: Any]; source["private_key"] = "secret"; root["source"] = source
+            case "workspace": workspace["private_key"] = "secret"
+            case "preferences": var preferences = workspace["preferences"] as! [String: Any]; preferences["private_key"] = "secret"; workspace["preferences"] = preferences
+            default:
+                var trusts = workspace["host_trust"] as! [[String: Any]], pins = trusts[0]["pins"] as! [[String: Any]]
+                pins[0]["private_key"] = "secret"; trusts[0]["pins"] = pins; workspace["host_trust"] = trusts
+            }
+            root["workspace"] = workspace
+            XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), scope)
+        }
+    }
+
+    func testHostNormalizationBindsTrustToCanonicalEndpoint() throws {
+        for (routeHost, trustHost, expected) in [("HOST.Example.Invalid.", "host.example.invalid", "host.example.invalid"),
+                                                ("[2001:db8:0:0:0:0:0:1]", "2001:db8::1", "2001:db8::1"),
+                                                ("bücher.example", "xn--bcher-kva.example", "xn--bcher-kva.example")] {
+            let document = try WorkspaceDocument(data: changedWorkspace { workspace in
+                var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
+                routes[0]["host"] = routeHost; trusts[0]["host"] = trustHost; workspace["routes"] = routes; workspace["host_trust"] = trusts
+            })
+            XCTAssertEqual(document.routes[0].host, expected); XCTAssertEqual(document.hostTrust[0].host, expected)
+        }
+        for invalid in ["host/path", "host#fragment", "-bad.example", "bad..example", "fe80::1%en0", "1.2.3.999", "01.2.3.4", "2001:db8::xyz"] {
+            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
+        }
+    }
+
+    func testPersistedHostIdentityDecodingCannotSkipValidation() throws {
+        let key = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        XCTAssertEqual(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONEncoder().encode(key)), key)
+        for fields in [
+            ["algorithm": "ssh-ed25519", "fingerprint": "invalid"],
+            ["algorithm": "", "fingerprint": key.fingerprint],
+            ["algorithm": "ssh-ed25519\n", "fingerprint": key.fingerprint],
+            ["algorithm": key.algorithm, "fingerprint": key.fingerprint + "="]
+        ] {
+            XCTAssertThrowsError(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONSerialization.data(withJSONObject: fields)))
+        }
+    }
+
+    func testMappedIPv4CannotAcquireASecondTrustIdentity() throws {
+        for spelling in ["::FFFF:C000:0201", "::ffff:192.0.2.1", "[::ffff:192.0.2.1]"] {
+            XCTAssertEqual(try WorkspaceDocument.host(spelling), "192.0.2.1")
+            let raw = try changedWorkspace { workspace in
+                var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
+                routes[0]["host"] = spelling; trusts[0]["host"] = "192.0.2.1"
+                workspace["routes"] = routes; workspace["host_trust"] = trusts
+            }
+            let document = try WorkspaceDocument(data: raw)
+            XCTAssertEqual(document.routes[0].host, document.hostTrust[0].host)
+            XCTAssertEqual(document.raw, raw, "Canonical trust identity must preserve the imported display/export bytes.")
+        }
+    }
+
+    func testEndpointCanonicalFormIsStableAcrossIDNAAndIPv6Variants() throws {
+        for (spelling, canonical) in [
+            ("BÜCHER.example.", "xn--bcher-kva.example"),
+            ("bu\u{0308}cher.example", "xn--bcher-kva.example"),
+            ("ＢＵＩＬＤ。ＥＸＡＭＰＬＥ", "build.example"),
+            ("host.example。", "host.example"),
+            ("192.0.2.1。", "192.0.2.1"),
+            ("2001:0:0:1:0:0:1:1", "2001::1:0:0:1:1"),
+            ("1:2:3:4:5:6:0:8", "1:2:3:4:5:6:0:8"),
+            ("0:0:0:0:0:0:0:0", "::")
+        ] {
+            XCTAssertEqual(try WorkspaceDocument.host(spelling), canonical, spelling)
+            XCTAssertEqual(try WorkspaceDocument.host(canonical), canonical, "Endpoint normalization must be idempotent.")
+        }
+    }
+
+    func testEndpointAdmissionRefusesResolverAliasesAndEncodedAuthorityDelimiters() throws {
+        for invalid in [
+            "127.1", "2130706433", "0x7f000001", "0x7f.0.0.1", "0177.0.0.1", "127.00.0.1",
+            "ssh://host.example", "user@host.example", "host.example:22", "host%2eexample", "host.example?next=other",
+            "host／example", "user＠host.example", "host.example：22", "host.example？next", "host.example＃other",
+            "host.example＼path", "host％2eexample", "host\u{00A0}example", "host\0.example",
+            "[::1]:22", "[127.0.0.1]", "[::1", "::1]",
+            String(repeating: "a", count: 64) + ".example",
+            Array(repeating: String(repeating: "a", count: 63), count: 4).joined(separator: ".")
+        ] {
+            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
+        }
+    }
     func testStrictJSONRejectsDuplicateEscapedKeysAndMalformedUnicode() throws {
         for text in [#"{"a":1,"\u0061":2}"#, #"{"a":1,"a":2}"#, #""\ud800""#, "{\"a\":01}", "[true,]", "{}{}", "NaN", "[1e]", "[+1]", #""\q""#] {
             XCTAssertThrowsError(try StrictJSON.decode(Data(text.utf8)), text)
@@ -83,10 +186,293 @@ final class CoreTests: XCTestCase {
             XCTAssertThrowsError(try WorkspaceDocument(data: Data(bad.utf8)))
         }
     }
+    func testCurrentPlanFixtureImportsBothModesAndEveryPaletteComponent() throws {
+        let repository = (0..<6).reduce(URL(fileURLWithPath: #filePath)) { result, _ in result.deletingLastPathComponent() }
+        let bytes = try Data(contentsOf: repository.appendingPathComponent("fixtures/ios-airgap/workspace-v1-native-plan.ftworkspace"))
+        let workspace = try WorkspaceDocument(data: bytes)
+        XCTAssertEqual(workspace.raw, bytes)
+        XCTAssertEqual(workspace.groups[0].machineOrder, ["machine-build", "machine-gpu"])
+        XCTAssertTrue(workspace.groups[0].autoConnect)
+        XCTAssertTrue(workspace.connectOnOpen)
+        XCTAssertEqual(workspace.exportSequence, 7)
+        XCTAssertEqual(workspace.machines[1].shortLabel, "GPU")
+        XCTAssertEqual(workspace.routes[0].credentialIDs, ["credential-main"])
+        XCTAssertEqual(workspace.routes[0].authenticationMethods, [.publicKey])
+        XCTAssertEqual(workspace.routes[0].sessionCreation, "on_select")
+        XCTAssertEqual(workspace.routes[1].mode, "frankenterm_mux")
+        XCTAssertEqual(workspace.routes[1].attachPolicy, "existing_only")
+        XCTAssertEqual(workspace.themes[0].cursorForeground, "#10223C")
+        XCTAssertEqual(workspace.themes[1].selectionBackground, "#66457D")
+        XCTAssertEqual(workspace.themes[0].ansi[8], "#657B99")
+        XCTAssertTrue(workspace.hostTrust.allSatisfy { $0.revokedKeys.isEmpty })
+        let archive = try AirGapArchive(workspace: workspace, keys: [], using: crypto)
+        let encrypted = try FTAG.seal(archive, using: crypto)
+        XCTAssertEqual(try FTAG.open(encrypted.envelope, code: encrypted.code, using: crypto).workspace.raw, bytes)
+    }
+
+    func testCredentialCandidatesAndPermittedMethodsRemainOrderedAndExplicit() throws {
+        var root = try manifestObject()
+        var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
+        var credentials = try XCTUnwrap(workspace["credentials"] as? [[String: Any]])
+        var alias = credentials[0]; alias["id"] = "second-key"; credentials.append(alias)
+        workspace["credentials"] = credentials
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        routes[0]["credential_refs"] = ["second-key", "key"]
+        routes[0]["authentication_methods"] = ["publickey", "keyboard-interactive"]
+        workspace["routes"] = routes; root["workspace"] = workspace
+        let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        let ready = try readiness(document, available: ["key", "second-key"])
+        XCTAssertTrue(ready.canAttemptConnection)
+        XCTAssertEqual(ready.usableCredentialIDs, ["second-key", "key"])
+        XCTAssertEqual(ready.authenticationMethods, [.publicKey, .keyboardInteractive])
+        let laterCandidate = try readiness(document, available: ["key"])
+        XCTAssertEqual(laterCandidate.usableCredentialIDs, ["key"])
+        let missingKeys = try readiness(document, available: [])
+        XCTAssertTrue(missingKeys.canAttemptConnection, "a separately permitted interactive method remains available")
+        XCTAssertEqual(missingKeys.authenticationMethods, [.keyboardInteractive])
+
+        let original = try WorkspaceDocument(data: sampleManifest())
+        let noKey = try readiness(original, available: [])
+        XCTAssertFalse(noKey.canAttemptConnection)
+        XCTAssertEqual(noKey.issues.map(\.code), [.credentialRequired])
+        XCTAssertTrue(noKey.authenticationMethods.isEmpty, "backend password defaults cannot enlarge imported policy")
+        let unsupported = try original.readiness(for: "route", availableCredentialIDs: ["key"], acceptedTrustIDs: ["trust"],
+            supportedAuthenticationMethods: [.password], supportedCredentialAlgorithms: ["ssh-ed25519"], supportedHostKeyAlgorithms: ["ssh-ed25519"])
+        XCTAssertEqual(unsupported.issues.map(\.code), [.authenticationMethodUnsupported])
+    }
+
+    func testCredentialAndMethodListsRejectDuplicatesDanglingAndUnboundedPolicies() throws {
+        for (field, values) in [
+            ("credential_refs", ["key", "key"]), ("credential_refs", ["missing"]),
+            ("credential_refs", (0..<9).map { "key\($0)" }),
+            ("authentication_methods", []), ("authentication_methods", ["publickey", "publickey"]),
+            ("authentication_methods", ["gssapi-with-mic"])
+        ] {
+            var root = try manifestObject(), workspace = try workspaceObject(root)
+            var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+            routes[0][field] = values; workspace["routes"] = routes; root["workspace"] = workspace
+            XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), field)
+        }
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        routes[0]["credential_ref"] = "key"
+        workspace["routes"] = routes; root["workspace"] = workspace
+        XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), "no ambiguous singular compatibility field")
+    }
+
+    func testNegativeHostTrustWinsAndUnsupportedPolicyStaysWithItsRoute() throws {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var trusts = try XCTUnwrap(workspace["host_trust"] as? [[String: Any]])
+        trusts[0]["revoked_keys"] = trusts[0]["pins"]
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        let revokedDocument = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        let trust = revokedDocument.hostTrust[0], pin = try XCTUnwrap(trust.pins.first)
+        XCTAssertEqual(trust.evaluate(pin, locallyAccepted: true), .revoked)
+        XCTAssertEqual(trust.evaluate(pin, locallyAccepted: false), .revoked)
+        XCTAssertEqual(try readiness(revokedDocument).issues.map(\.code), [.hostIdentityRevoked])
+
+        let ordinary = try WorkspaceDocument(data: sampleManifest())
+        XCTAssertEqual(ordinary.hostTrust[0].evaluate(pin, locallyAccepted: false), .reviewRequired)
+        XCTAssertEqual(ordinary.hostTrust[0].evaluate(pin, locallyAccepted: true), .trusted)
+        XCTAssertEqual(ordinary.hostTrust[0].evaluate(pin, locallyAccepted: true, additionalRevocations: [pin]), .revoked)
+        let locallyRevoked = try ordinary.readiness(for: "route", availableCredentialIDs: ["key"], acceptedTrustIDs: ["trust"],
+            supportedAuthenticationMethods: [.publicKey], supportedCredentialAlgorithms: ["ssh-ed25519"], supportedHostKeyAlgorithms: ["ssh-ed25519"],
+            revokedHostKeysByTrustScope: [ordinary.hostTrust[0].canonicalTrustScope: [pin]])
+        XCTAssertEqual(locallyRevoked.issues.map(\.code), [.hostIdentityRevoked])
+
+        root = try manifestObject(); workspace = try workspaceObject(root)
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        var unavailable = routes[0]; unavailable["id"] = "blocked-route"; unavailable["required_capabilities"] = ["mandatory-krl"]
+        routes.append(unavailable); workspace["routes"] = routes; root["workspace"] = workspace
+        let partial = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        XCTAssertTrue(try readiness(partial).canAttemptConnection)
+        XCTAssertEqual(try readiness(partial, route: "blocked-route").issues.map(\.code), [.requiredCapabilityUnavailable])
+        routes[0]["jump_routes"] = ["blocked-route"]; workspace["routes"] = routes; root["workspace"] = workspace
+        let dependent = try readiness(WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)))
+        XCTAssertFalse(dependent.canAttemptConnection)
+        XCTAssertEqual(dependent.issues.first?.routeID, "blocked-route")
+    }
+
+    func testTrustAliasesCannotBypassNegativeTrustOrRequiredPolicy() throws {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var trusts = try XCTUnwrap(workspace["host_trust"] as? [[String: Any]])
+        var restriction = trusts[0]
+        restriction["id"] = "same-host-restriction"
+        restriction["host"] = "HOST.Example.Invalid."
+        restriction["revoked_keys"] = restriction["pins"]
+        trusts.append(restriction); workspace["host_trust"] = trusts; root["workspace"] = workspace
+        var document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        let pin = try XCTUnwrap(document.hostTrust[0].pins.first)
+        XCTAssertEqual(try document.evaluateHostKey(pin, trustID: "trust", locallyAccepted: true), .revoked)
+        XCTAssertEqual(try readiness(document).issues.map(\.code), [.hostIdentityRevoked])
+
+        trusts[1]["revoked_keys"] = []
+        trusts[1]["required_capabilities"] = ["mandatory-krl"]
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        XCTAssertEqual(try document.evaluateHostKey(pin, trustID: "trust", locallyAccepted: true), .requiredPolicyUnavailable)
+        XCTAssertEqual(try readiness(document).issues.map(\.code), [.requiredCapabilityUnavailable])
+    }
+
+    func testFingerprintAliasesRequireOneCanonicalPublicKeyAlgorithm() throws {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var credentials = try XCTUnwrap(workspace["credentials"] as? [[String: Any]])
+        var alias = credentials[0]; alias["id"] = "alias"; credentials.append(alias)
+        workspace["credentials"] = credentials; root["workspace"] = workspace
+        XCTAssertNoThrow(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)))
+        credentials[1]["algorithm"] = "ecdsa-sha2-nistp256"
+        workspace["credentials"] = credentials; root["workspace"] = workspace
+        XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))) { error in
+            XCTAssertEqual(error as? FTError, .malformed("identity.algorithm_conflict"))
+        }
+    }
+
+    func testNegativeFingerprintCannotBeWeakenedByItsAlgorithmLabel() throws {
+        let document = try WorkspaceDocument(data: changedWorkspace { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts[0]["revoked_keys"] = [["algorithm": "ssh-rsa", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]
+            workspace["host_trust"] = trusts
+        })
+        let pin = try XCTUnwrap(document.hostTrust[0].pins.first)
+        XCTAssertEqual(document.hostTrust[0].evaluate(pin, locallyAccepted: true), .revoked)
+        XCTAssertEqual(try document.evaluateHostKey(pin, trustID: "trust", locallyAccepted: true), .revoked)
+        XCTAssertEqual(try readiness(document).issues.map(\.code), [.hostIdentityRevoked])
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.hostIdentityRevoked])
+        let selection = try WorkspaceExportSelection(workspace: document, groupIDs: ["group"])
+        let choices = Dictionary(uniqueKeysWithValues: selection.identities.map { ($0.fingerprint, WorkspaceExportSelection.IdentityDecision.keepReferenceOnly) })
+        XCTAssertEqual(try selection.review(decisions: choices, loadedFingerprints: []).blockedRouteIDs, ["route"])
+    }
+
+    func testTrustKeyCapsIncludeRevocationsAndMissingPinsStayUnavailable() throws {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var trusts = try XCTUnwrap(workspace["host_trust"] as? [[String: Any]])
+        trusts[0]["pins"] = []
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        let missing = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        XCTAssertEqual(try readiness(missing).issues.map(\.code), [.hostTrustMissing])
+        let keys: [[String: Any]] = (0..<513).map { index in
+            var bytes = Data(repeating: 0, count: 32)
+            bytes[0] = UInt8(index & 255); bytes[1] = UInt8(index >> 8)
+            return ["algorithm": "ssh-ed25519", "fingerprint": "SHA256:" + bytes.base64EncodedString().replacingOccurrences(of: "=", with: "")]
+        }
+        trusts[0]["revoked_keys"] = Array(keys.prefix(512))
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        XCTAssertNoThrow(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)))
+        trusts[0]["revoked_keys"] = keys
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))) { error in
+            XCTAssertEqual(error as? FTError, .limit("trust.keys"))
+        }
+    }
+
+    func testPublicManifestRejectsExtraSecretFieldsAtEveryCoreBoundary() throws {
+        let marker = "PRIVATE-MATERIAL-MUST-NOT-PERSIST"
+        for target in ["root", "source", "workspace", "groups", "machines", "routes", "credentials", "host_trust", "themes", "preferences", "pin"] {
+            var root = try manifestObject(), workspace = try workspaceObject(root)
+            switch target {
+            case "root": root["private_key"] = marker
+            case "source":
+                var source = try XCTUnwrap(root["source"] as? [String: Any]); source["private_key"] = marker; root["source"] = source
+            case "workspace": workspace["private_key"] = marker
+            case "preferences":
+                var preferences = try XCTUnwrap(workspace["preferences"] as? [String: Any]); preferences["private_key"] = marker; workspace["preferences"] = preferences
+            case "pin":
+                var trusts = try XCTUnwrap(workspace["host_trust"] as? [[String: Any]])
+                var pins = try XCTUnwrap(trusts[0]["pins"] as? [[String: Any]]); pins[0]["private_key"] = marker
+                trusts[0]["pins"] = pins; workspace["host_trust"] = trusts
+            default:
+                var values = try XCTUnwrap(workspace[target] as? [[String: Any]]); values[0]["private_key"] = marker; workspace[target] = values
+            }
+            root["workspace"] = workspace
+            XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), target) { error in
+                XCTAssertEqual(error as? FTError, .malformed("manifest.unexpected_field"))
+                XCTAssertFalse(error.localizedDescription.contains(marker))
+            }
+        }
+    }
+
+    func testUnknownOptionalPayloadsAreDiscardedBeforeStorageAndReexport() throws {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        let marker = "UNKNOWN-PRIVATE-PAYLOAD"
+        root["extensions"] = ["org.example.opaque": ["private_key": marker]]
+        workspace["extensions"] = ["org.example.future": ["payload": marker]]
+        root["workspace"] = workspace
+        let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        XCTAssertNil(document.raw.range(of: Data(marker.utf8)))
+        XCTAssertEqual(document.diagnostics.map(\.code), ["workspace.unknown_optional_extensions_discarded"])
+        XCTAssertEqual(document.diagnostics.first?.count, 2)
+        XCTAssertEqual(try WorkspaceDocument(data: document.raw).groups[0].machineOrder, ["build", "gpu"])
+        let archive = try AirGapArchive(workspace: document, keys: [], using: crypto)
+        XCTAssertNil(try archive.encoded().range(of: Data(marker.utf8)))
+        root["required_capabilities"] = ["org.example.opaque"]
+        XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), "discarding payload does not satisfy its required capability")
+    }
+
+    func testCanonicalEndpointAndTrustScopeAgreeWithoutRewritingDisplayValues() throws {
+        for (input, expected) in [("BUILD.Example.Invalid.", "build.example.invalid"),
+                                  ("[2001:0DB8:0:0:0:0:0:1]", "2001:db8::1"),
+                                  ("2001:db8::1", "2001:db8::1"), ("bücher.example", "xn--bcher-kva.example")] {
+            XCTAssertEqual(try WorkspaceDocument.host(input), expected)
+        }
+        for invalid in ["host;touch", "host:22", "host/path", "user@host", "host\n", "-option", "host%20name", "[127.0.0.1]",
+                        "[2001:db8::1]:22", "fe80::1%en0", "127.1", "127.000.0.1", "bad..host", "host?query", "host#fragment"] {
+            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
+        }
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        var trusts = try XCTUnwrap(workspace["host_trust"] as? [[String: Any]])
+        routes[0]["host"] = "HOST.Example.Invalid."
+        routes[0]["host_key_alias"] = "My-Host-Identity"
+        trusts[0]["host_key_alias"] = "My-Host-Identity"
+        workspace["routes"] = routes; workspace["host_trust"] = trusts; root["workspace"] = workspace
+        let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        XCTAssertEqual(document.routes[0].displayHost, "HOST.Example.Invalid.")
+        XCTAssertEqual(document.routes[0].host, "host.example.invalid")
+        XCTAssertEqual(document.hostTrust[0].hostKeyAlias, "my-host-identity")
+        XCTAssertEqual(document.hostTrust[0].canonicalTrustScope, "22:16:my-host-identity")
+    }
+
+    func testReissuingBundleChangesOnlyItsIdentity() throws {
+        let document = try WorkspaceDocument(data: sampleManifest())
+        let issued = try document.reissuingBundle(id: "new-export")
+        XCTAssertEqual(issued.bundleID, "new-export")
+        XCTAssertEqual(issued.id, document.id)
+        XCTAssertEqual(issued.exporterID, document.exporterID)
+        var original = try StrictJSON.decode(document.raw).object(), changed = try StrictJSON.decode(issued.raw).object()
+        original.removeValue(forKey: "bundle_id"); changed.removeValue(forKey: "bundle_id")
+        XCTAssertEqual(original, changed)
+        XCTAssertThrowsError(try document.reissuingBundle(id: "bad/path"))
+    }
+
+    private func manifestObject() throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: sampleManifest()) as? [String: Any])
+    }
+    private func workspaceObject(_ root: [String: Any]) throws -> [String: Any] {
+        try XCTUnwrap(root["workspace"] as? [String: Any])
+    }
+    private func readiness(_ document: WorkspaceDocument, route: String = "route", available: Set<String> = ["key"]) throws -> WorkspaceDocument.RouteReadinessDetail {
+        try document.readiness(for: route, availableCredentialIDs: available, acceptedTrustIDs: ["trust"],
+            supportedAuthenticationMethods: [.publicKey, .keyboardInteractive, .password],
+            supportedCredentialAlgorithms: ["ssh-ed25519"], supportedHostKeyAlgorithms: ["ssh-ed25519"])
+    }
+    private func changedWorkspace(_ change: (inout [String: Any]) -> Void) throws -> Data {
+        var root = try manifestObject(), workspace = try workspaceObject(root)
+        change(&workspace); root["workspace"] = workspace
+        return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+    }
+    private func changedRoute(_ change: (inout [String: Any]) -> Void) throws -> Data {
+        try changedWorkspace { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            change(&routes[0]); workspace["routes"] = routes
+        }
+    }
+    private var qualifiedTestTransport: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
+    }
+
     func testLatestNativePlanFixtureParsesWithoutRewritingItsPolicy() throws {
-        // This fixture is independent of the encoder and was supplied by the
-        // product plan. A private older singular credential_ref schema cannot
-        // silently replace the actual format the Mac and phone must share.
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }
         let plan = try String(contentsOf: root.appendingPathComponent("COMPREHENSIVE_PLAN_FOR_NATIVE_IOS_FRANKENTERM_APP.md"), encoding: .utf8)
@@ -105,6 +491,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(document.themes[1].cursorBorder, "#FFFFFF")
         XCTAssertTrue(document.groups[0].autoConnect)
     }
+
     func testOrderedAuthenticationTriesOnlyPermittedAvailableCandidates() throws {
         let data = try changedWorkspace { workspace in
             var keys = workspace["credentials"] as! [[String: Any]]
@@ -117,11 +504,8 @@ final class CoreTests: XCTestCase {
             workspace["routes"] = routes
         }
         let document = try WorkspaceDocument(data: data)
-        XCTAssertEqual(document.routes[0].credentialIDs, ["other", "key"])
-        XCTAssertEqual(document.routes[0].authenticationMethods, [.publicKey, .keyboardInteractive])
-        let readiness = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key", "unlisted-key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport)
-        XCTAssertEqual(readiness.usableCredentialIDs, ["key"])
-        XCTAssertTrue(readiness.isLocallyReady)
+        let ready = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key", "unlisted-key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport)
+        XCTAssertEqual(ready.usableCredentialIDs, ["key"]); XCTAssertTrue(ready.isLocallyReady)
         let revoked = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key", "other"], reviewedTrustIDs: ["trust"],
             revokedCredentialFingerprints: ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"], support: qualifiedTestTransport)
         XCTAssertEqual(revoked.usableCredentialIDs, ["other"])
@@ -129,41 +513,34 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(try password.readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).isLocallyReady)
         let publicKeyOnly = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey], credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
         XCTAssertEqual(try password.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: publicKeyOnly).issues, [.authenticationUnavailable])
-        let noKeys = try WorkspaceDocument(data: sampleManifest()).readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport)
-        XCTAssertEqual(noKeys.issues, [.credentialUnavailable])
+        XCTAssertEqual(try WorkspaceDocument(data: sampleManifest()).readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.credentialUnavailable])
     }
+
     func testAuthenticationCannotDefaultOrIgnoreUnknownAndDuplicatePolicy() throws {
         let changes: [(inout [String: Any]) -> Void] = [
             { $0.removeValue(forKey: "authentication_methods") }, { $0["authentication_methods"] = [] },
             { $0["authentication_methods"] = ["publickey", "publickey"] }, { $0["authentication_methods"] = ["publickey", "unknown"] },
             { $0["credential_refs"] = ["key", "key"] }, { $0["credential_refs"] = ["missing"] },
-            { $0["credential_ref"] = "key" }, { $0["user"] = "" }, { $0["user"] = "operator\ncommand" }
+            { $0["credential_ref"] = "key" }, { $0["user"] = "" }, { $0["user"] = "operator\ncommand" }, { $0["user"] = "two users" }
         ]
         for change in changes { XCTAssertThrowsError(try WorkspaceDocument(data: changedRoute(change))) }
         let offline = try WorkspaceDocument(data: sampleManifest()).readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"])
-        XCTAssertTrue(offline.issues.contains(.transportUnavailable))
-        XCTAssertFalse(offline.isLocallyReady)
+        XCTAssertTrue(offline.issues.contains(.transportUnavailable)); XCTAssertFalse(offline.isLocallyReady)
         XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
-            var keys = workspace["credentials"] as! [[String: Any]], alias = keys[0]
-            alias["id"] = "alias"; alias["algorithm"] = "ssh-rsa"; keys.append(alias); workspace["credentials"] = keys
-        }))
-        XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
-            // A group's ID must not ambiguously refer to a machine as well.
             var groups = workspace["groups"] as! [[String: Any]], preferences = workspace["preferences"] as! [String: Any]
             groups[0]["id"] = "build"; preferences["initial_group_ref"] = "build"
             workspace["groups"] = groups; workspace["preferences"] = preferences
         }))
     }
+
     func testNegativeHostTrustWinsBeforePinReviewOrUnsupportedPolicy() throws {
         let pin = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         let other = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: "SHA256:ERERERERERERERERERERERERERERERERERERERERERE")
         let document = try WorkspaceDocument(data: changedWorkspace { workspace in
             var trust = workspace["host_trust"] as! [[String: Any]]
-            trust[0]["revoked_keys"] = trust[0]["pins"]
-            trust[0]["required_capabilities"] = ["required.krl"]
+            trust[0]["revoked_keys"] = trust[0]["pins"]; trust[0]["required_capabilities"] = ["required.krl"]
             workspace["host_trust"] = trust
         })
-        XCTAssertEqual(document.hostTrust[0].revokedKeys, [pin])
         XCTAssertEqual(try document.verifyHostKey(forRouteID: "route", presented: pin, reviewedTrustIDs: []), .revoked)
         XCTAssertEqual(try document.verifyHostKey(forRouteID: "route", presented: other, certificateAuthority: pin, reviewedTrustIDs: ["trust"], support: qualifiedTestTransport), .revoked)
         XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues.contains(.hostIdentityRevoked))
@@ -175,40 +552,13 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try ordinary.verifyHostKey(forRouteID: "route", presented: pin, reviewedTrustIDs: ["trust"], locallyRejectedTrustIDs: ["trust"], support: qualifiedTestTransport), .locallyRejected)
         XCTAssertEqual(try ordinary.verifyHostKey(forRouteID: "route", presented: pin, certificateAuthority: other, reviewedTrustIDs: ["trust"], support: qualifiedTestTransport), .unsupportedCertificate)
     }
-    func testLocalHostRevocationPrecedesAlgorithmReadinessForEachJump() throws {
-        let document = try WorkspaceDocument(data: changedWorkspace { workspace in
-            var trusts = workspace["host_trust"] as! [[String: Any]]
-            var pins = trusts[0]["pins"] as! [[String: Any]]
-            pins.append(["algorithm": "ssh-rsa", "fingerprint": "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"])
-            trusts[0]["pins"] = pins
-            var hopTrust = trusts[0]; hopTrust["id"] = "hop-trust"; hopTrust["host"] = "jump.example.invalid"
-            trusts.append(hopTrust); workspace["host_trust"] = trusts
-            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
-            hop["id"] = "jump"; hop["host"] = "jump.example.invalid"; hop["host_trust_ref"] = "hop-trust"
-            routes[0]["jump_routes"] = ["jump"]; routes.append(hop); workspace["routes"] = routes
-        })
-        let ed25519 = try XCTUnwrap(document.hostTrust[0].pins.first)
-        let reviewed: Set<String> = ["trust", "hop-trust"]
-        XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
-            support: qualifiedTestTransport).isLocallyReady)
-        let targetRevoked = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
-            locallyRevokedHostKeys: ["trust": [ed25519]], support: qualifiedTestTransport)
-        XCTAssertEqual(targetRevoked.issues, [.hostAlgorithmUnavailable], "An unrevoked unsupported pin cannot replace a revoked supported pin.")
-        let hopRevocations: [String: Set<WorkspaceDocument.HostKey>] = ["hop-trust": [ed25519]]
-        XCTAssertEqual(try document.readiness(forRouteID: "jump", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
-            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.hostAlgorithmUnavailable])
-        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
-            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.blockedJumpRoute("jump")])
-        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
-            locallyRevokedHostKeys: ["trust": Set(document.hostTrust[0].pins)], support: qualifiedTestTransport).issues, [.hostIdentityRevoked])
-    }
+
     func testIncompleteTrustAndUnsupportedRouteRemainVisibleWithoutDowngrade() throws {
-        let data = try changedWorkspace { workspace in
-            var routes = workspace["routes"] as! [[String: Any]]
-            var blocked = routes[0]; blocked["id"] = "blocked"; blocked["required_capabilities"] = ["ssh.revocation_krl"]
+        let document = try WorkspaceDocument(data: changedWorkspace { workspace in
+            var routes = workspace["routes"] as! [[String: Any]], blocked = routes[0]
+            blocked["id"] = "blocked"; blocked["required_capabilities"] = ["ssh.revocation_krl"]
             routes.append(blocked); workspace["routes"] = routes
-        }
-        let document = try WorkspaceDocument(data: data)
+        })
         XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).isLocallyReady)
         XCTAssertEqual(try document.readiness(forRouteID: "blocked", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.unsupportedRequirement])
         let pin = try XCTUnwrap(document.hostTrust.first?.pins.first)
@@ -218,40 +568,18 @@ final class CoreTests: XCTestCase {
         })
         XCTAssertEqual(try noPins.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.hostTrustMissing])
     }
+
     func testJumpReadinessUsesTransportWithoutExecutingHopSessionPreference() throws {
         let document = try WorkspaceDocument(data: changedWorkspace { workspace in
-            var routes = workspace["routes"] as! [[String: Any]]
-            var hop = routes[0]; hop["id"] = "jump"; hop["mode"] = "frankenterm_mux"; hop.removeValue(forKey: "session_creation")
+            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
+            hop["id"] = "jump"; hop["mode"] = "frankenterm_mux"; hop.removeValue(forKey: "session_creation")
             routes[0]["jump_routes"] = ["jump"]; routes.append(hop); workspace["routes"] = routes
         })
         XCTAssertEqual(try document.readiness(forRouteID: "jump", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.sessionPolicyMissing])
         XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).isLocallyReady)
-        let blocked = try document.readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport)
-        XCTAssertTrue(blocked.issues.contains(.blockedJumpRoute("jump")))
+        XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues.contains(.blockedJumpRoute("jump")))
     }
-    func testEveryCoreRecordRejectsHiddenPrivateMaterial() throws {
-        for collection in ["groups", "machines", "routes", "credentials", "host_trust", "themes"] {
-            XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
-                var records = workspace[collection] as! [[String: Any]]
-                records[0]["private_key"] = "synthetic-secret-must-not-persist"; workspace[collection] = records
-            }), collection)
-        }
-        for scope in ["root", "source", "workspace", "preferences", "pin"] {
-            var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
-            var workspace = root["workspace"] as! [String: Any]
-            switch scope {
-            case "root": root["private_key"] = "secret"
-            case "source": var source = root["source"] as! [String: Any]; source["private_key"] = "secret"; root["source"] = source
-            case "workspace": workspace["private_key"] = "secret"
-            case "preferences": var preferences = workspace["preferences"] as! [String: Any]; preferences["private_key"] = "secret"; workspace["preferences"] = preferences
-            default:
-                var trusts = workspace["host_trust"] as! [[String: Any]], pins = trusts[0]["pins"] as! [[String: Any]]
-                pins[0]["private_key"] = "secret"; trusts[0]["pins"] = pins; workspace["host_trust"] = trusts
-            }
-            root["workspace"] = workspace
-            XCTAssertThrowsError(try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), scope)
-        }
-    }
+
     func testUnknownExtensionsCannotSmuggleSecretsOrActivateRequirements() throws {
         let secret = "synthetic-private-container-not-for-catalog"
         let optional = try WorkspaceDocument(data: changedRoute { $0["extensions"] = ["org.example.optional": ["private_key": secret]] })
@@ -265,9 +593,9 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try WorkspaceDocument(data: required.raw).routes[0].requiredExtensions, ["org.example.required"])
         XCTAssertTrue(try required.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues.contains(.unsupportedRequirement))
         XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { $0["extensions"] = ["org.example.required": ["required": true]] }))
-        let archive = try AirGapArchive(workspace: optional, keys: [], using: crypto)
-        XCTAssertNil(try archive.encoded().range(of: Data(secret.utf8)))
+        XCTAssertNil(try AirGapArchive(workspace: optional, keys: [], using: crypto).encoded().range(of: Data(secret.utf8)))
     }
+
     func testThemePreservesCompletePaletteAndBoundedPortableFont() throws {
         let document = try WorkspaceDocument(data: changedWorkspace { workspace in
             var themes = workspace["themes"] as! [[String: Any]]
@@ -288,88 +616,40 @@ final class CoreTests: XCTestCase {
                 var themes = workspace["themes"] as! [[String: Any]]; themes[0]["indexed"] = [invalid: "#FFFFFF"]; workspace["themes"] = themes
             }))
         }
+        XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
+            var themes = workspace["themes"] as! [[String: Any]]
+            themes[0]["font"] = ["family": "Example Mono", "private_key": "secret"]; workspace["themes"] = themes
+        }))
     }
-    func testHostNormalizationBindsTrustToCanonicalEndpoint() throws {
-        for (routeHost, trustHost, expected) in [("HOST.Example.Invalid.", "host.example.invalid", "host.example.invalid"),
-                                                ("[2001:db8:0:0:0:0:0:1]", "2001:db8::1", "2001:db8::1"),
-                                                ("bücher.example", "xn--bcher-kva.example", "xn--bcher-kva.example")] {
-            let document = try WorkspaceDocument(data: changedWorkspace { workspace in
-                var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
-                routes[0]["host"] = routeHost; trusts[0]["host"] = trustHost; workspace["routes"] = routes; workspace["host_trust"] = trusts
-            })
-            XCTAssertEqual(document.routes[0].host, expected); XCTAssertEqual(document.hostTrust[0].host, expected)
-        }
-        for invalid in ["host/path", "host#fragment", "-bad.example", "bad..example", "fe80::1%en0", "1.2.3.999", "01.2.3.4", "2001:db8::xyz"] {
-            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
-        }
-    }
-    func testPersistedHostIdentityDecodingCannotSkipValidation() throws {
-        let key = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        XCTAssertEqual(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONEncoder().encode(key)), key)
-        for fields in [
-            ["algorithm": "ssh-ed25519", "fingerprint": "invalid"],
-            ["algorithm": "", "fingerprint": key.fingerprint],
-            ["algorithm": "ssh-ed25519\n", "fingerprint": key.fingerprint],
-            ["algorithm": key.algorithm, "fingerprint": key.fingerprint + "="]
-        ] {
-            XCTAssertThrowsError(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONSerialization.data(withJSONObject: fields)))
-        }
-    }
-    func testMappedIPv4CannotAcquireASecondTrustIdentity() throws {
-        for spelling in ["::FFFF:C000:0201", "::ffff:192.0.2.1", "[::ffff:192.0.2.1]"] {
-            XCTAssertEqual(try WorkspaceDocument.host(spelling), "192.0.2.1")
-            let raw = try changedWorkspace { workspace in
-                var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
-                routes[0]["host"] = spelling; trusts[0]["host"] = "192.0.2.1"
-                workspace["routes"] = routes; workspace["host_trust"] = trusts
-            }
-            let document = try WorkspaceDocument(data: raw)
-            XCTAssertEqual(document.routes[0].host, document.hostTrust[0].host)
-            XCTAssertEqual(document.raw, raw, "Canonical trust identity must preserve the imported display/export bytes.")
-        }
-    }
-    func testEndpointCanonicalFormIsStableAcrossIDNAAndIPv6Variants() throws {
-        for (spelling, canonical) in [
-            ("BÜCHER.example.", "xn--bcher-kva.example"),
-            ("bu\u{0308}cher.example", "xn--bcher-kva.example"),
-            ("ＢＵＩＬＤ。ＥＸＡＭＰＬＥ", "build.example"),
-            ("host.example。", "host.example"),
-            ("192.0.2.1。", "192.0.2.1"),
-            ("2001:0:0:1:0:0:1:1", "2001::1:0:0:1:1"),
-            ("1:2:3:4:5:6:0:8", "1:2:3:4:5:6:0:8"),
-            ("0:0:0:0:0:0:0:0", "::")
-        ] {
-            XCTAssertEqual(try WorkspaceDocument.host(spelling), canonical, spelling)
-            XCTAssertEqual(try WorkspaceDocument.host(canonical), canonical, "Endpoint normalization must be idempotent.")
-        }
-    }
-    func testEndpointAdmissionRefusesResolverAliasesAndEncodedAuthorityDelimiters() throws {
-        for invalid in [
-            "127.1", "2130706433", "0x7f000001", "0x7f.0.0.1", "0177.0.0.1", "127.00.0.1",
-            "ssh://host.example", "user@host.example", "host.example:22", "host%2eexample", "host.example?next=other",
-            "host／example", "user＠host.example", "host.example：22", "host.example？next", "host.example＃other",
-            "host.example＼path", "host％2eexample", "host\u{00A0}example", "host\0.example",
-            "[::1]:22", "[127.0.0.1]", "[::1", "::1]",
-            String(repeating: "a", count: 64) + ".example",
-            Array(repeating: String(repeating: "a", count: 63), count: 4).joined(separator: ".")
-        ] {
-            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
-        }
-    }
+
     func testCombinedHostTrustBudgetAndStrictEncoder() throws {
-        let data = try changedWorkspace { workspace in
-            var trusts = workspace["host_trust"] as! [[String: Any]]
-            let keys = (0..<513).map { index -> [String: String] in
-                var bytes = Data(repeating: 0, count: 32); bytes[30] = UInt8(index / 256); bytes[31] = UInt8(index % 256)
-                return ["algorithm": "ssh-ed25519", "fingerprint": "SHA256:" + bytes.base64EncodedString().replacingOccurrences(of: "=", with: "")]
-            }
-            trusts[0]["pins"] = Array(keys.prefix(256)); trusts[0]["revoked_keys"] = Array(keys.dropFirst(256)); workspace["host_trust"] = trusts
-        }
-        XCTAssertThrowsError(try WorkspaceDocument(data: data))
         XCTAssertThrowsError(try StrictJSON.encode(.number("0,1")))
         XCTAssertThrowsError(try StrictJSON.encode(.number("null")))
         XCTAssertThrowsError(try StrictJSON.encode(.object(["text": .string(String(repeating: "x", count: FTLimit.text + 1))])))
         XCTAssertEqual(String(decoding: try StrictJSON.encode(.object(["z": .number("1e2"), "a": .array([.boolean(true), .null])])), as: UTF8.self), #"{"a":[true,null],"z":1e2}"#)
+    }
+
+    func testRetainedTrustRequirementsBlockBothReadinessAndLiveVerification() throws {
+        let document = try WorkspaceDocument(data: sampleManifest())
+        let trust = document.hostTrust[0], pin = try XCTUnwrap(trust.pins.first)
+        let retained: [String: Set<String>] = [trust.canonicalTrustScope: ["mandatory.krl"]]
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport,
+            requiredHostCapabilitiesByTrustScope: retained).issues, [.unsupportedRequirement])
+        XCTAssertEqual(try document.verifyHostKey(forRouteID: "route", presented: pin, reviewedTrustIDs: ["trust"], support: qualifiedTestTransport,
+            requiredHostCapabilitiesByTrustScope: retained), .unsupportedPolicy)
+        XCTAssertEqual(try document.evaluateHostKey(pin, trustID: "trust", locallyAccepted: true, requiredHostCapabilitiesByTrustScope: retained), .requiredPolicyUnavailable)
+        let requirement = "extension:org.example.mandatory"
+        let claimsExtension = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], capabilities: [requirement])
+        XCTAssertEqual(try document.verifyHostKey(forRouteID: "route", presented: pin, reviewedTrustIDs: ["trust"], support: claimsExtension,
+            requiredHostCapabilitiesByTrustScope: [trust.canonicalTrustScope: [requirement]]), .unsupportedPolicy)
+        let marked = try WorkspaceDocument(data: changedWorkspace { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts[0]["extensions"] = ["org.example.mandatory": ["required": true, "private_key": "secret"]]
+            workspace["host_trust"] = trusts
+        })
+        XCTAssertEqual(marked.hostTrust[0].requiredPolicyRequirements, [requirement])
+        XCTAssertNil(marked.raw.range(of: Data("secret".utf8)))
     }
     func testCodesMatchCommittedBoundaryVectors() throws {
         for (hex, code) in [

@@ -38,6 +38,21 @@ final class WorkspaceHostTrustTests: XCTestCase {
         workspace["host_trust"] = trusts
     }
 
+    /// The already-published v3 catalog has global endpoint denials. It has no
+    /// workspace-scoped denial or mandatory-policy fields introduced by v4.
+    private func publishedVersionThreeCatalog(_ persistence: StoreTestPersistence,
+                                              host: String) throws -> Data {
+        let current = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
+        return try JSONSerialization.data(withJSONObject: [
+            "version": 3,
+            "workspaces": try XCTUnwrap(current["workspaces"]),
+            "revokedFingerprints": try XCTUnwrap(current["revokedFingerprints"]),
+            "acceptedImports": try XCTUnwrap(current["acceptedImports"]),
+            "hostRevocations": [["host": host, "port": 22,
+                                  "key": ["algorithm": "ssh-ed25519", "fingerprint": hostFingerprint]]]
+        ], options: [.sortedKeys])
+    }
+
     func testImportedRevocationSurvivesReplacementRenamingRelaunchAndApprovedRollback() async throws {
         let persistence = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: persistence, vault: vault)
@@ -192,18 +207,103 @@ final class WorkspaceHostTrustTests: XCTestCase {
         let first = try await install(archive("old-negative", mutate: addRevocation), in: store, identity: 1)
         var oldCatalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
         oldCatalog["version"] = 2; oldCatalog.removeValue(forKey: "hostRevocations")
+        oldCatalog.removeValue(forKey: "scopedHostRevocations"); oldCatalog.removeValue(forKey: "hostRequirements")
         persistence.seed(try JSONSerialization.data(withJSONObject: oldCatalog, options: [.sortedKeys]), slot: .catalog)
 
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let loaded = try await reopened.load()
         XCTAssertEqual(loaded.first?.revision, first.revision)
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 3)
+        XCTAssertEqual(migrated["version"] as? Int, 4)
         XCTAssertEqual((migrated["hostRevocations"] as? [Any])?.count, 1)
         let next = try await install(archive("new-positive", trustID: "renamed"), in: reopened, identity: 2, replacing: first)
         let pin = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: hostFingerprint)
         let decision = try await reopened.verifyHostKey(workspaceID: next.id, routeID: "route", presented: pin, support: support)
         XCTAssertEqual(decision, .revoked)
         XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testPublishedVersionThreeGlobalDenialSurvivesMigrationAndAppliesToAnotherWorkspace() async throws {
+        let persistence = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: persistence, vault: vault)
+        let original = try archive("first")
+        let first = try await install(original, in: store, identity: 1)
+        let second = try await install(archive("second"), in: store, identity: 2, replacing: first)
+        let legacyBytes = try publishedVersionThreeCatalog(persistence, host: "rejected.example.invalid")
+        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyBytes) as? [String: Any])
+        persistence.seed(legacyBytes, slot: .catalog)
+
+        let reopened = WorkspaceStore(persistence: persistence, vault: vault)
+        let loaded = try await reopened.load()
+        XCTAssertEqual(loaded.first?.id, second.id)
+        XCTAssertEqual(loaded.first?.revision, second.revision)
+        XCTAssertEqual(loaded.first?.bindings, second.bindings)
+        XCTAssertEqual(loaded.first?.envelopeDigest, second.envelopeDigest)
+        let migratedBytes = try XCTUnwrap(persistence.bytes(.catalog))
+        let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: migratedBytes) as? [String: Any])
+        XCTAssertEqual(migrated["version"] as? Int, 4)
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]),
+                       try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys]))
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["hostRevocations"]), options: [.sortedKeys]),
+                       try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["hostRevocations"]), options: [.sortedKeys]))
+        let history = try await reopened.assessImport(original.workspace, envelopeDigest: Data(repeating: 1, count: 32),
+                                                     transferID: Data(repeating: 1, count: 16))
+        XCTAssertTrue(history.requiresRollbackApproval)
+        XCTAssertEqual(history.firstAcceptedRevision, first.revision)
+        let pin = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: hostFingerprint)
+        let existingDecision = try await reopened.verifyHostKey(workspaceID: second.id, routeID: "route", presented: pin, support: support)
+        XCTAssertEqual(existingDecision, .trustedPin)
+        let relaunched = WorkspaceStore(persistence: persistence, vault: vault)
+        _ = try await relaunched.load()
+        XCTAssertEqual(persistence.bytes(.catalog), migratedBytes, "a completed v3 migration is stable on relaunch")
+
+        // The rejected endpoint was absent from every saved workspace at the
+        // time of migration. A newly imported workspace still inherits it.
+        let another = try archive("third", host: "REJECTED.EXAMPLE.INVALID.") { $0["id"] = "another-workspace" }
+        let installed = try await install(another, in: relaunched, identity: 3)
+        XCTAssertNotEqual(installed.id, second.id)
+        let decision = try await relaunched.verifyHostKey(workspaceID: installed.id, routeID: "route", presented: pin, support: support)
+        XCTAssertEqual(decision, .revoked)
+        let readiness = try await relaunched.routeReadiness(workspaceID: installed.id, support: support)
+        XCTAssertEqual(readiness.first?.issues, [.hostIdentityRevoked])
+        XCTAssertEqual(vault.creates, 2, "a separate workspace owns its own staged private-key account")
+    }
+
+    func testPublishedVersionThreeMigrationFaultKeepsGlobalDenialsAndEveryOwnedKeyUntilRecovery() async throws {
+        for fault in [StoreTestPersistence.Fault.before(.catalog), .after(.catalog)] {
+            let persistence = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: persistence, vault: vault)
+            let first = try await install(archive("current"), in: store, identity: 1)
+            persistence.seed(try publishedVersionThreeCatalog(persistence, host: "host.example.invalid"), slot: .catalog)
+            let transaction = UUID(), pending = "ft-import:\(transaction.uuidString):0"
+            let retained = try XCTUnwrap(first.bindings.first)
+            try vault.create(account: pending, privateContainer: Data([91]), fingerprint: "owned-pending-key")
+            persistence.seed(try JSONSerialization.data(withJSONObject: [
+                "version": 1, "transaction": transaction.uuidString, "targetRevision": UUID().uuidString,
+                "newAccounts": [pending], "retiredAccounts": [retained.account]
+            ]), slot: .journal)
+            persistence.configure(fault)
+            let reopened = WorkspaceStore(persistence: persistence, vault: vault)
+            do { _ = try await reopened.load(); XCTFail("v3 migration publication fault was not exercised") }
+            catch { XCTAssertEqual(error as? FTError, .storage) }
+            XCTAssertEqual(vault.count, 2)
+            XCTAssertEqual(try vault.fingerprint(account: retained.account), retained.fingerprint)
+            XCTAssertEqual(try vault.fingerprint(account: pending), "owned-pending-key")
+            XCTAssertNotNil(persistence.bytes(.journal))
+
+            let recovered = WorkspaceStore(persistence: persistence, vault: vault)
+            let loaded = try await recovered.load()
+            XCTAssertEqual(loaded.first?.revision, first.revision)
+            let pin = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: hostFingerprint)
+            let decision = try await recovered.verifyHostKey(workspaceID: first.id, routeID: "route", presented: pin, support: support)
+            XCTAssertEqual(decision, .revoked)
+            let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
+            XCTAssertEqual(catalog["version"] as? Int, 4)
+            XCTAssertEqual((catalog["hostRevocations"] as? [Any])?.count, 1)
+            XCTAssertEqual(vault.count, 1)
+            XCTAssertEqual(try vault.fingerprint(account: retained.account), retained.fingerprint)
+            XCTAssertNil(try vault.fingerprint(account: pending))
+            XCTAssertNil(persistence.bytes(.journal))
+        }
     }
 }

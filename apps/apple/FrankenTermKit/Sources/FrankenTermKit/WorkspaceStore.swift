@@ -29,14 +29,15 @@ public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
     case reviewRequired, staleReview, removalNeedsApproval, revokedIdentity
     case conflictingExport, rollbackNeedsApproval, importHistoryFull
     case corruptStore, busy, recoveryRequired
+    public static var immutableExportConflict: Self { .conflictingExport }
     public var errorDescription: String? {
         switch self {
         case .reviewRequired: return "Confirm the source, comparison value, and import contents first."
         case .staleReview: return "The saved workspace changed. Review the import again."
         case .removalNeedsApproval: return "This import removes machines. Explicit replacement approval is required."
         case .revokedIdentity: return "This import includes a locally revoked identity."
-        case .conflictingExport: return "This export reuses a previously accepted bundle or transfer identity with different contents. Create a new export on the source device."
-        case .rollbackNeedsApproval: return "This recording restores a previously accepted workspace version. Review and approve that replacement explicitly."
+        case .conflictingExport: return "This export reuses a previously accepted bundle or transfer ID with different contents. Create a new export on the source."
+        case .rollbackNeedsApproval: return "This is an earlier accepted export. Review and approve restoring its older settings."
         case .importHistoryFull: return "The protected import history is full. New exports cannot be accepted without forgetting replay protection. Existing accepted recordings remain available."
         case .corruptStore: return "Workspace storage could not be validated. No credentials were removed."
         case .busy: return "Another workspace transaction is active."
@@ -73,61 +74,150 @@ public struct WorkspaceImportReceipt: Sendable {
     public let cleanupPending: Bool
 }
 
-/// Computed from locally accepted envelopes, never from a claimed export date or
-/// sequence. A previous recording is not necessarily older than an unseen export.
+public struct WorkspaceReimportReview: Sendable {
+    public let expectedRevision: UUID?
+    public let removesMachines: Bool
+    public let isRollback: Bool
+    public let preservedHostRevocationCount: Int
+    public let preservedHostRequirementCount: Int
+    public let firstAcceptedRevision: UUID?
+}
+
 public struct WorkspaceImportAssessment: Sendable {
     public let existingWorkspace: InstalledWorkspace?
     public let firstAcceptedRevision: UUID?
     public let requiresRollbackApproval: Bool
     public let removesMachines: Bool
+    public let preservedHostRevocationCount: Int
+    public let preservedHostRequirementCount: Int
+}
+
+/// One revision-consistent snapshot of actual protected-key availability and
+/// mandatory local trust policy for the native browser and future transports.
+public struct WorkspaceLocalState: Sendable {
+    public let workspace: InstalledWorkspace
+    public let credentialIDs: Set<String>
+    public let revokedHostKeysByTrustScope: [String: Set<WorkspaceDocument.HostKey>]
+    public let requiredHostCapabilitiesByTrustScope: [String: Set<String>]
+    public let routes: [WorkspaceDocument.RouteReadiness]
 }
 
 /// One app-owned actor shared by every scene. There are no suspension points
 /// inside a transaction, and the persistence lease also fences other instances.
 public actor WorkspaceStore {
+    private struct AcceptedImport: Codable {
+        let exporterID: String
+        let workspaceID: String
+        let bundleID: String
+        var transferID: Data?
+        let envelopeDigest: Data
+        let firstAcceptedRevision: UUID
+    }
     private struct HostRevocation: Codable, Hashable {
         let host: String
         let port: UInt16
         let key: WorkspaceDocument.HostKey
     }
-    private struct AcceptedImport: Codable {
-        let exporterID: String
-        let workspaceID: String
-        let bundleID: String
-        // Version-one catalogs did not retain transfer IDs. Migration preserves
-        // their known bundle/digest bindings, then learns an ID only from an
-        // authenticated rescan with the exact already accepted envelope digest.
-        var transferID: Data?
-        let envelopeDigest: Data
-        let firstAcceptedRevision: UUID
+    private struct ScopedHostRevocation: Codable, Hashable {
+        let workspaceID: UUID
+        let scope: String
+        let key: WorkspaceDocument.HostKey
+    }
+    private struct HostRequirement: Codable, Hashable {
+        let workspaceID: UUID
+        let scope: String
+        let capability: String
     }
     private struct Catalog: Codable {
-        var version = 3
+        var version = 4
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
         var acceptedImports: [AcceptedImport] = []
         var hostRevocations: Set<HostRevocation> = []
-        // Only an in-memory migration flag; never an imported policy field.
-        var needsPublication = false
+        var scopedHostRevocations: Set<ScopedHostRevocation> = []
+        var hostRequirements: Set<HostRequirement> = []
+        var needsSanitizedPublication = false
 
         init() {}
         private enum CodingKeys: String, CodingKey {
-            case version, workspaces, revokedFingerprints, acceptedImports, hostRevocations
+            case version, workspaces, revokedFingerprints, acceptedImports, hostRevocations, scopedHostRevocations, hostRequirements
         }
-        init(from decoder: any Decoder) throws {
+        init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
-            version = try fields.decode(Int.self, forKey: .version)
+            let storedVersion = try fields.decode(Int.self, forKey: .version)
+            guard (1...4).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
             workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
             revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
-            if version == 1 {
-                guard !fields.contains(.acceptedImports) else { throw WorkspaceStoreError.corruptStore }
-                acceptedImports = []
+            guard workspaces.count <= 32, revokedFingerprints.count <= 4096 else { throw WorkspaceStoreError.corruptStore }
+            if storedVersion == 1 {
+                guard !fields.contains(.acceptedImports), !fields.contains(.hostRevocations),
+                      !fields.contains(.scopedHostRevocations), !fields.contains(.hostRequirements) else { throw WorkspaceStoreError.corruptStore }
+                // A versioned storage migration, never a permissive document
+                // import path. Earlier catalogs used a single public-key candidate.
+                workspaces = try workspaces.map(WorkspaceStore.migrateVersionOneWorkspace)
+                for workspace in workspaces {
+                    let document = try workspace.document()
+                    acceptedImports.append(.init(exporterID: document.exporterID, workspaceID: document.id,
+                        bundleID: document.bundleID, transferID: nil, envelopeDigest: workspace.envelopeDigest,
+                        firstAcceptedRevision: workspace.revision))
+                }
             } else {
+                // Version two is already published. Preserve every historical
+                // identity and its original accepted revision during migration.
                 acceptedImports = try fields.decode([AcceptedImport].self, forKey: .acceptedImports)
             }
-            if version == 3 {
+            guard acceptedImports.count <= WorkspaceStore.importHistoryLimit else { throw WorkspaceStoreError.corruptStore }
+            // Version three already published endpoint-wide negative trust.
+            // Keep its exact representation and decisions; the new fields add
+            // alias-scoped denials and mandatory policy without narrowing it.
+            if storedVersion >= 3 {
                 hostRevocations = try fields.decode(Set<HostRevocation>.self, forKey: .hostRevocations)
             } else if fields.contains(.hostRevocations) { throw WorkspaceStoreError.corruptStore }
+            if storedVersion == 4 {
+                scopedHostRevocations = try fields.decode(Set<ScopedHostRevocation>.self, forKey: .scopedHostRevocations)
+                hostRequirements = try fields.decode(Set<HostRequirement>.self, forKey: .hostRequirements)
+            } else {
+                guard !fields.contains(.scopedHostRevocations), !fields.contains(.hostRequirements) else { throw WorkspaceStoreError.corruptStore }
+                for workspace in workspaces {
+                    for trust in try workspace.document().hostTrust {
+                        for key in trust.revokedKeys {
+                            if storedVersion < 3 { hostRevocations.insert(.init(host: trust.host, port: trust.port, key: key)) }
+                            scopedHostRevocations.insert(.init(workspaceID: workspace.id, scope: trust.canonicalTrustScope, key: key))
+                            guard hostRevocations.count <= WorkspaceStore.hostRevocationLimit,
+                                  scopedHostRevocations.count <= WorkspaceStore.scopedHostRevocationLimit else { throw WorkspaceStoreError.corruptStore }
+                        }
+                        for capability in trust.requiredPolicyRequirements {
+                            hostRequirements.insert(.init(workspaceID: workspace.id, scope: trust.canonicalTrustScope, capability: capability))
+                            guard hostRequirements.count <= WorkspaceStore.hostRequirementLimit else { throw WorkspaceStoreError.corruptStore }
+                        }
+                    }
+                }
+            }
+            guard hostRevocations.count <= WorkspaceStore.hostRevocationLimit,
+                  scopedHostRevocations.count <= WorkspaceStore.scopedHostRevocationLimit,
+                  hostRequirements.count <= WorkspaceStore.hostRequirementLimit else { throw WorkspaceStoreError.corruptStore }
+            needsSanitizedPublication = storedVersion != 4
+            // Older catalogs could retain opaque desktop annotations. Reuse the
+            // wire validator so neither migration nor re-export can preserve an
+            // untyped private value in this public configuration store.
+            for index in workspaces.indices {
+                let saved = workspaces[index], document = try saved.document()
+                let portability = saved.findings.map {
+                    AirGapArchive.Portability(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason)
+                }
+                let annotations = saved.inactiveSettings.map {
+                    AirGapArchive.Annotation(entityID: $0.entityID, setting: $0.setting, original: $0.original)
+                }
+                let metadata = try AirGapArchive.validatedMetadata(workspace: document, portability: portability, annotations: annotations)
+                if saved.manifest != document.raw || metadata.portability != portability || metadata.annotations != annotations {
+                    needsSanitizedPublication = true
+                    workspaces[index] = .init(id: saved.id, revision: saved.revision, manifest: document.raw,
+                        envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
+                        inactiveSettings: metadata.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
+                        findings: metadata.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
+                        connectLater: saved.connectLater)
+                }
+            }
         }
     }
     private struct Journal: Codable {
@@ -141,10 +231,10 @@ public actor WorkspaceStore {
     private let vault: any WorkspaceCredentialVault
     private static let catalogLimit = 16 * 1024 * 1024
     private static let journalLimit = 128 * 1024
-    // This is an admission bound, not an eviction policy. Never silently discard
-    // an accepted identity to make a new import fit.
     static let importHistoryLimit = 4096
     static let hostRevocationLimit = 4096
+    private static let scopedHostRevocationLimit = 16384
+    private static let hostRequirementLimit = 16384
 
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
@@ -158,19 +248,32 @@ public actor WorkspaceStore {
         }
     }
 
-    /// A UI snapshot binds credential availability to the same saved revisions
-    /// under one lease. Counting saved bindings alone would show a revoked or
-    /// removed Keychain identity as available after lock, relaunch, or key loss.
     public func loadWithCredentialAvailability() throws -> [(workspace: InstalledWorkspace, credentialIDs: Set<String>)] {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
+            return try catalog.workspaces.map { ($0, try availableCredentials($0, catalog: catalog)) }
+        }
+    }
+
+    public func loadWithLocalPolicy() throws -> [WorkspaceLocalState] {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
             return try catalog.workspaces.map { workspace in
-                (workspace, try availableCredentials(workspace, catalog: catalog))
+                let document = try workspace.document()
+                let available = try availableCredentials(workspace, catalog: catalog)
+                return .init(workspace: workspace, credentialIDs: available,
+                      revokedHostKeysByTrustScope: hostRevocations(workspace.id, document: document, catalog: catalog),
+                      requiredHostCapabilitiesByTrustScope: hostRequirements(workspace.id, catalog: catalog),
+                      routes: try readiness(document: document, workspaceID: workspace.id, available: available,
+                          findings: workspace.findings, catalog: catalog, support: .offlineOnly))
             }
         }
     }
 
+    /// All readiness decisions describe the same durable revision and actual
+    /// protected-key availability, including persisted negative trust.
     public func loadWithReadiness(support: WorkspaceDocument.RouteSupport = .offlineOnly) throws
         -> [(workspace: InstalledWorkspace, credentialIDs: Set<String>, routes: [WorkspaceDocument.RouteReadiness])] {
         try persistence.withExclusiveAccess {
@@ -178,18 +281,18 @@ public actor WorkspaceStore {
             try recover(catalog: &catalog)
             return try catalog.workspaces.map { saved in
                 let available = try availableCredentials(saved, catalog: catalog)
-                return (saved, available, try readiness(document: saved.document(), available: available,
-                    findings: saved.findings, catalog: catalog, support: support))
+                return (saved, available, try readiness(document: saved.document(), workspaceID: saved.id,
+                    available: available, findings: saved.findings, catalog: catalog, support: support))
             }
         }
     }
 
-    /// Review the candidate's included keys together with reusable local keys,
-    /// under the same lease as its revision and historical-rollback assessment.
-    public func previewImport(_ archive: AirGapArchive, envelopeDigest: Data, transferID: Data,
-                               support: WorkspaceDocument.RouteSupport = .offlineOnly) throws
+    /// Evaluate included and reusable local identities with the replacement
+    /// decision under one lease. A public document has no transfer ID or keys.
+    public func previewImport(_ archive: AirGapArchive, envelopeDigest: Data, transferID: Data? = nil,
+                              support: WorkspaceDocument.RouteSupport = .offlineOnly) throws
         -> (assessment: WorkspaceImportAssessment, routes: [WorkspaceDocument.RouteReadiness]) {
-        guard envelopeDigest.count == 32, transferID.count == 16 else { throw WorkspaceStoreError.reviewRequired }
+        try validateIdentity(envelopeDigest, transferID: transferID)
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
@@ -203,18 +306,16 @@ public actor WorkspaceStore {
             let included = Set(archive.keys.map(\.credentialID))
             fingerprints.formUnion(document.credentials.filter { included.contains($0.id) }.map(\.fingerprint))
             let available = Set(document.credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id))
-            return (review, try readiness(document: document, available: available,
+            return (review, try readiness(document: document, workspaceID: review.existingWorkspace?.id,
+                available: available,
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                 catalog: catalog, support: support))
         }
     }
 
-    /// Authentication precedes this call. Assessment and the saved revision are
-    /// obtained under the same persistence lease; install rechecks both before
-    /// staging any new credential so a stale UI cannot grant replacement rights.
     public func assessImport(_ document: WorkspaceDocument, envelopeDigest: Data,
                              transferID: Data) throws -> WorkspaceImportAssessment {
-        guard envelopeDigest.count == 32, transferID.count == 16 else { throw WorkspaceStoreError.reviewRequired }
+        try validateIdentity(envelopeDigest, transferID: transferID)
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
@@ -222,25 +323,58 @@ public actor WorkspaceStore {
         }
     }
 
-    /// The approval is a local UI decision, never a flag decoded from a package.
-    /// expectedRevision is captured when previewing this exact exporter/workspace.
+    /// Review uses the same durable history checked again by install. An old
+    /// recording cannot become a new export merely because another one replaced it.
+    public func preview(_ document: WorkspaceDocument, envelopeDigest: Data, transferID: Data? = nil) throws -> WorkspaceReimportReview {
+        try validateIdentity(envelopeDigest, transferID: transferID)
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
+            return .init(expectedRevision: review.existingWorkspace?.revision, removesMachines: review.removesMachines,
+                         isRollback: review.requiresRollbackApproval,
+                         preservedHostRevocationCount: review.preservedHostRevocationCount,
+                         preservedHostRequirementCount: review.preservedHostRequirementCount,
+                         firstAcceptedRevision: review.firstAcceptedRevision)
+        }
+    }
+
     public func install(_ archive: AirGapArchive, envelopeDigest: Data, transferID: Data,
                         expectedRevision: UUID?, sourceAndContentsConfirmed: Bool,
                         allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool = false) throws -> WorkspaceImportReceipt {
-        guard sourceAndContentsConfirmed, envelopeDigest.count == 32, transferID.count == 16 else { throw WorkspaceStoreError.reviewRequired }
+        try install(archive, envelopeDigest: envelopeDigest, expectedRevision: expectedRevision,
+                    sourceAndContentsConfirmed: sourceAndContentsConfirmed, allowMachineRemoval: allowMachineRemoval,
+                    allowRollback: allowHistoricalRollback, transferID: transferID)
+    }
+
+    /// The approval is a local UI decision, never a flag decoded from a package.
+    /// expectedRevision is captured when previewing this exact exporter/workspace.
+    public func install(_ archive: AirGapArchive, envelopeDigest: Data,
+                        expectedRevision: UUID?, sourceAndContentsConfirmed: Bool,
+                        allowMachineRemoval: Bool = false, allowRollback: Bool = false,
+                        transferID: Data? = nil) throws -> WorkspaceImportReceipt {
+        guard sourceAndContentsConfirmed, envelopeDigest.count == 32 else { throw WorkspaceStoreError.reviewRequired }
+        try validateIdentity(envelopeDigest, transferID: transferID)
         try Task.checkCancellation()
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             let document = archive.workspace
-            let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
             let index = try catalog.workspaces.firstIndex {
                 let prior = try $0.document()
                 return prior.exporterID == document.exporterID && prior.id == document.id
             }
             let old = index.map { catalog.workspaces[$0] }
             guard old?.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
-            guard !review.requiresRollbackApproval || allowHistoricalRollback else { throw WorkspaceStoreError.rollbackNeedsApproval }
+            let rollback = try checkHistory(document, digest: envelopeDigest, transferID: transferID, old: old, catalog: catalog)
+            guard !rollback || allowRollback else { throw WorkspaceStoreError.rollbackNeedsApproval }
+            var historyUpdated = false
+            if let transferID, let historyIndex = catalog.acceptedImports.firstIndex(where: {
+                $0.exporterID == document.exporterID && $0.bundleID == document.bundleID && $0.transferID == nil
+            }) {
+                catalog.acceptedImports[historyIndex].transferID = transferID
+                historyUpdated = true
+            }
             guard !document.credentials.contains(where: { catalog.revokedFingerprints.contains($0.fingerprint) }) else {
                 throw WorkspaceStoreError.revokedIdentity
             }
@@ -254,25 +388,12 @@ public actor WorkspaceStore {
                     let available = try old.bindings.filter { try vault.fingerprint(account: $0.account) == $0.fingerprint }
                     let fingerprints = Set(available.map(\.fingerprint))
                     let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0.fingerprint) })
-                    if archive.keys.allSatisfy({ references[$0.credentialID].map(fingerprints.contains) == true }) {
-                        // Finish a legacy catalog's migration even for a fully
-                        // idempotent rescan; do not lose the newly verified ID.
-                        if let accepted = acceptanceIndex(document, catalog: catalog), catalog.acceptedImports[accepted].transferID == nil {
-                            catalog.acceptedImports[accepted].transferID = transferID
-                            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
-                        }
+                    if !historyUpdated, archive.keys.allSatisfy({ references[$0.credentialID].map(fingerprints.contains) == true }) {
                         return receipt(old, requested: document.credentials.map(\.id),
                                        available: Set(document.credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id)), cleanupPending: false)
                     }
                 }
             } else if catalog.workspaces.count >= 32 { throw FTError.limit("store.workspaces") }
-
-            // An accepted negative decision outlives the importing document.
-            // Old recordings and renamed trust records cannot undo it.
-            for trust in document.hostTrust {
-                for key in trust.revokedKeys { catalog.hostRevocations.insert(.init(host: trust.host, port: trust.port, key: key)) }
-            }
-            guard catalog.hostRevocations.count <= Self.hostRevocationLimit else { throw FTError.limit("store.host_revocations") }
 
             let transaction = UUID(), revision = UUID()
             let prefix = "ft-import:\(transaction.uuidString):"
@@ -301,13 +422,27 @@ public actor WorkspaceStore {
                 inactiveSettings: archive.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                 connectLater: true)
-            if let index { catalog.workspaces[index] = installed } else { catalog.workspaces.append(installed) }
-            if let accepted = acceptanceIndex(document, catalog: catalog) {
-                catalog.acceptedImports[accepted].transferID = transferID
-            } else {
-                catalog.acceptedImports.append(AcceptedImport(exporterID: document.exporterID, workspaceID: document.id,
+            if acceptedImport(document, catalog: catalog) == nil {
+                guard catalog.acceptedImports.count < Self.importHistoryLimit else { throw WorkspaceStoreError.importHistoryFull }
+                catalog.acceptedImports.append(.init(exporterID: document.exporterID, workspaceID: document.id,
                     bundleID: document.bundleID, transferID: transferID, envelopeDigest: envelopeDigest, firstAcceptedRevision: revision))
             }
+            // Preserve endpoint-wide negative decisions as well as mandatory
+            // policy tied to this workspace's effective trust aliases. Neither
+            // renamed routes nor older recordings can erase accepted denials.
+            for trust in document.hostTrust {
+                for key in trust.revokedKeys {
+                    catalog.hostRevocations.insert(.init(host: trust.host, port: trust.port, key: key))
+                    catalog.scopedHostRevocations.insert(.init(workspaceID: installed.id, scope: trust.canonicalTrustScope, key: key))
+                    guard catalog.hostRevocations.count <= Self.hostRevocationLimit,
+                          catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit else { throw FTError.limit("store.host_revocations") }
+                }
+                for capability in trust.requiredPolicyRequirements {
+                    catalog.hostRequirements.insert(.init(workspaceID: installed.id, scope: trust.canonicalTrustScope, capability: capability))
+                    guard catalog.hostRequirements.count <= Self.hostRequirementLimit else { throw FTError.limit("store.host_requirements") }
+                }
+            }
+            if let index { catalog.workspaces[index] = installed } else { catalog.workspaces.append(installed) }
             let next = try encode(catalog, limit: Self.catalogLimit)
             let retained = Set(bindings.map(\.account))
             let retired = Set(old?.bindings.map(\.account) ?? []).subtracting(retained).sorted()
@@ -350,8 +485,8 @@ public actor WorkspaceStore {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
-            guard (try? WorkspaceDocument.fingerprint(fingerprint, at: "store.revocations")) != nil,
-                  catalog.revokedFingerprints.count < 4096 || catalog.revokedFingerprints.contains(fingerprint)
+            _ = try WorkspaceDocument.fingerprint(fingerprint)
+            guard catalog.revokedFingerprints.count < 4096 || catalog.revokedFingerprints.contains(fingerprint)
             else { throw FTError.limit("store.revocations") }
             catalog.revokedFingerprints.insert(fingerprint)
             try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
@@ -367,8 +502,54 @@ public actor WorkspaceStore {
         }
     }
 
-    /// Endpoint-scoped negative trust is local durable policy. Imported names,
-    /// IDs, positive pins, or earlier recordings cannot erase that decision.
+    private func availableCredentials(_ workspace: InstalledWorkspace, catalog: Catalog) throws -> Set<String> {
+        let fingerprints = Set(try workspace.bindings.filter {
+            if catalog.revokedFingerprints.contains($0.fingerprint) { return false }
+            return try vault.fingerprint(account: $0.account) == $0.fingerprint
+        }.map(\.fingerprint))
+        return Set(try workspace.document().credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id))
+    }
+
+    /// Reconcile the complete accepted identity under the storage lease. Matching
+    /// old workspace bytes alone cannot prove a migrated transfer-ID binding was
+    /// published; the history and its durable journal must agree as well.
+    public func recoverImport(exporterID: String, workspaceID: String, envelopeDigest: Data,
+                              transferID: Data? = nil) throws -> WorkspaceImportReceipt? {
+        try validateIdentity(envelopeDigest, transferID: transferID)
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let workspace = try catalog.workspaces.first(where: {
+                let document = try $0.document()
+                return document.exporterID == exporterID && document.id == workspaceID && $0.envelopeDigest == envelopeDigest
+            }) else { return nil }
+            let document = try workspace.document()
+            guard catalog.acceptedImports.contains(where: {
+                $0.exporterID == document.exporterID && $0.workspaceID == document.id && $0.bundleID == document.bundleID && $0.envelopeDigest == envelopeDigest
+                    && (transferID == nil || $0.transferID == transferID)
+            }) else { return nil }
+            let available = try availableCredentials(workspace, catalog: catalog)
+            return receipt(workspace, requested: document.credentials.map(\.id), available: available, cleanupPending: false)
+        }
+    }
+
+    /// Durable local denial is independent of incoming pins and bundle freshness.
+    /// Future transport owners must also retire attempts using this trust scope.
+    public func revokeHostLocally(workspaceID: UUID, trustID: String, key: WorkspaceDocument.HostKey) throws {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let workspace = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  let trust = try workspace.document().hostTrust.first(where: { $0.id == trustID }) else { throw FTError.stale }
+            catalog.hostRevocations.insert(.init(host: trust.host, port: trust.port, key: key))
+            catalog.scopedHostRevocations.insert(.init(workspaceID: workspaceID, scope: trust.canonicalTrustScope, key: key))
+            guard catalog.hostRevocations.count <= Self.hostRevocationLimit,
+                  catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit else { throw FTError.limit("store.host_revocations") }
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+        }
+    }
+
+    /// Imported positive pins cannot erase an endpoint-wide local rejection.
     public func revokeHostKeyLocally(host: String, port: UInt16, algorithm: String, fingerprint: String) throws {
         let entry = HostRevocation(host: try WorkspaceDocument.host(host), port: try WorkspaceDocument.port(UInt64(port)),
                                   key: try WorkspaceDocument.HostKey(algorithm: algorithm, fingerprint: fingerprint))
@@ -383,9 +564,9 @@ public actor WorkspaceStore {
         }
     }
 
-    /// A transport must consult this store-backed decision, so a document alone
-    /// cannot bypass the phone's accepted negative trust. The caller still owns
-    /// actual SSH certificate/signature checks and its qualified support profile.
+    /// A transport must consult durable local policy before using imported trust.
+    /// It still owns cryptographic certificate/signature checks and qualification
+    /// of its supported algorithms and capabilities.
     public func verifyHostKey(workspaceID: UUID, routeID: String, presented: WorkspaceDocument.HostKey,
                               certificateAuthority: WorkspaceDocument.HostKey? = nil,
                               support: WorkspaceDocument.RouteSupport = .offlineOnly) throws -> WorkspaceDocument.HostVerificationDecision {
@@ -396,8 +577,9 @@ public actor WorkspaceStore {
             let document = try saved.document()
             guard let route = document.routes.first(where: { $0.id == routeID }),
                   let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else { throw FTError.stale }
-            let rejected = Set(catalog.hostRevocations.filter { $0.host == trust.host && $0.port == trust.port }.map { $0.key.fingerprint })
-            if rejected.contains(presented.fingerprint) || certificateAuthority.map({ rejected.contains($0.fingerprint) }) == true {
+            let rejected = hostRevocations(workspaceID, document: document, catalog: catalog)
+            let fingerprints = Set((rejected[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
+            if fingerprints.contains(presented.fingerprint) || certificateAuthority.map({ fingerprints.contains($0.fingerprint) }) == true {
                 return .revoked
             }
             if WorkspacePortabilityPolicy.blockedRouteIDs(in: document,
@@ -405,97 +587,177 @@ public actor WorkspaceStore {
                 return .unsupportedPolicy
             }
             return try document.verifyHostKey(forRouteID: routeID, presented: presented,
-                certificateAuthority: certificateAuthority, reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support)
+                certificateAuthority: certificateAuthority, reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
+                support: support, revokedHostKeysByTrustScope: rejected,
+                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
         }
     }
 
-    /// Returns local prerequisites with persisted negative trust and required
-    /// portability conditions applied. This never starts or proves a connection.
     public func routeReadiness(workspaceID: UUID,
                                support: WorkspaceDocument.RouteSupport = .offlineOnly) throws -> [WorkspaceDocument.RouteReadiness] {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }) else { throw FTError.stale }
-            let document = try saved.document()
-            let available = try availableCredentials(saved, catalog: catalog)
-            return try readiness(document: document, available: available, findings: saved.findings, catalog: catalog, support: support)
+            return try readiness(document: saved.document(), workspaceID: workspaceID,
+                available: availableCredentials(saved, catalog: catalog), findings: saved.findings, catalog: catalog, support: support)
         }
     }
 
-    private func readiness(document: WorkspaceDocument, available: Set<String>, findings: [InstalledWorkspace.PortabilityFinding],
-                           catalog: Catalog, support: WorkspaceDocument.RouteSupport) throws -> [WorkspaceDocument.RouteReadiness] {
+    private func readiness(document: WorkspaceDocument, workspaceID: UUID?, available: Set<String>,
+                           findings: [InstalledWorkspace.PortabilityFinding], catalog: Catalog,
+                           support: WorkspaceDocument.RouteSupport) throws -> [WorkspaceDocument.RouteReadiness] {
         let blocked = WorkspacePortabilityPolicy.blockedRouteIDs(in: document,
             requiredEntityIDs: Set(findings.filter { $0.disposition == 1 }.map(\.entityID)))
+        let rejected = hostRevocations(workspaceID, document: document, catalog: catalog)
+        let required = workspaceID.map { hostRequirements($0, catalog: catalog) } ?? [:]
         let trustIDs = Set(document.hostTrust.map(\.id))
-        let rejected = Dictionary(uniqueKeysWithValues: document.hostTrust.map { trust in
-            (trust.id, Set(catalog.hostRevocations.filter { $0.host == trust.host && $0.port == trust.port }.map(\.key)))
-        })
         return try document.routes.map { route in
             let state = try document.readiness(forRouteID: route.id, availableCredentialIDs: available,
-                reviewedTrustIDs: trustIDs, locallyRevokedHostKeys: rejected, support: support)
+                reviewedTrustIDs: trustIDs, revokedCredentialFingerprints: catalog.revokedFingerprints,
+                support: support, revokedHostKeysByTrustScope: rejected, requiredHostCapabilitiesByTrustScope: required)
             var issues = state.issues
             if blocked.contains(route.id), !issues.contains(.unsupportedRequirement) { issues.append(.unsupportedRequirement) }
             return .init(routeID: route.id, usableCredentialIDs: state.usableCredentialIDs, issues: issues)
         }
     }
 
-    private func availableCredentials(_ workspace: InstalledWorkspace, catalog: Catalog) throws -> Set<String> {
-        let fingerprints = Set(try workspace.bindings.filter {
-            if catalog.revokedFingerprints.contains($0.fingerprint) { return false }
-            return try vault.fingerprint(account: $0.account) == $0.fingerprint
-        }.map(\.fingerprint))
-        return Set(try workspace.document().credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id))
+    public func revokedHostKeys(workspaceID: UUID) throws -> [String: Set<WorkspaceDocument.HostKey>] {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }) else { throw FTError.stale }
+            return hostRevocations(workspaceID, document: try saved.document(), catalog: catalog)
+        }
     }
 
-    private func acceptanceIndex(_ document: WorkspaceDocument, catalog: Catalog) -> Int? {
-        // Bundle identities belong to their exporter, independent of the current
-        // workspace placement. A bundle cannot later be rebound to another one.
-        catalog.acceptedImports.firstIndex { $0.exporterID == document.exporterID && $0.bundleID == document.bundleID }
+    public func requiredHostCapabilities(workspaceID: UUID) throws -> [String: Set<String>] {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard catalog.workspaces.contains(where: { $0.id == workspaceID }) else { throw FTError.stale }
+            return hostRequirements(workspaceID, catalog: catalog)
+        }
     }
 
-    private func assessment(_ document: WorkspaceDocument, envelopeDigest: Data, transferID: Data,
+    private func hostRevocations(_ workspaceID: UUID?, document: WorkspaceDocument,
+                                 catalog: Catalog) -> [String: Set<WorkspaceDocument.HostKey>] {
+        var result: [String: Set<WorkspaceDocument.HostKey>] = [:]
+        for revocation in catalog.scopedHostRevocations where revocation.workspaceID == workspaceID {
+            result[revocation.scope, default: []].insert(revocation.key)
+        }
+        for trust in document.hostTrust {
+            result[trust.canonicalTrustScope, default: []].formUnion(catalog.hostRevocations.filter {
+                $0.host == trust.host && $0.port == trust.port
+            }.map(\.key))
+        }
+        return result
+    }
+
+    private func hostRequirements(_ workspaceID: UUID, catalog: Catalog) -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for requirement in catalog.hostRequirements where requirement.workspaceID == workspaceID {
+            result[requirement.scope, default: []].insert(requirement.capability)
+        }
+        return result
+    }
+
+    private static func validHostRequirement(_ value: String) -> Bool {
+        let identifier = value.hasPrefix("extension:") ? String(value.dropFirst(10)) : value
+        return (try? WorkspaceDocument.identifier(identifier)) != nil
+    }
+
+    private func validateIdentity(_ digest: Data, transferID: Data?) throws {
+        guard digest.count == 32, transferID == nil || transferID?.count == 16 else { throw WorkspaceStoreError.reviewRequired }
+    }
+
+    private func matchingWorkspace(_ document: WorkspaceDocument, in catalog: Catalog) throws -> InstalledWorkspace? {
+        try catalog.workspaces.first {
+            let saved = try $0.document()
+            return saved.exporterID == document.exporterID && saved.id == document.id
+        }
+    }
+
+    private func acceptedImport(_ document: WorkspaceDocument, catalog: Catalog) -> AcceptedImport? {
+        catalog.acceptedImports.first { $0.exporterID == document.exporterID && $0.bundleID == document.bundleID }
+    }
+
+    private func assessment(_ document: WorkspaceDocument, envelopeDigest: Data, transferID: Data?,
                             catalog: Catalog) throws -> WorkspaceImportAssessment {
+        let old = try matchingWorkspace(document, in: catalog)
+        let rollback = try checkHistory(document, digest: envelopeDigest, transferID: transferID, old: old, catalog: catalog)
+        let oldIDs = try old.map { Set(try $0.document().machines.map(\.id)) } ?? []
+        let revoked = hostRevocations(old?.id, document: document, catalog: catalog)
+        return .init(existingWorkspace: old, firstAcceptedRevision: acceptedImport(document, catalog: catalog)?.firstAcceptedRevision,
+                     requiresRollbackApproval: rollback, removesMachines: !oldIDs.isSubset(of: Set(document.machines.map(\.id))),
+                     preservedHostRevocationCount: revoked.values.reduce(0) { $0 + $1.count },
+                     preservedHostRequirementCount: catalog.hostRequirements.filter { $0.workspaceID == old?.id }.count)
+    }
+
+    private func checkHistory(_ document: WorkspaceDocument, digest: Data, transferID: Data?,
+                              old: InstalledWorkspace?, catalog: Catalog) throws -> Bool {
         guard !document.credentials.contains(where: { catalog.revokedFingerprints.contains($0.fingerprint) }) else {
             throw WorkspaceStoreError.revokedIdentity
         }
-        // A fingerprint hashes a canonical public blob, including its algorithm.
-        // Reusing a Keychain item must not bypass the archive's key/algorithm
-        // binding check merely because this package omits private material.
-        let incoming = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0) })
+        // Reusing an existing protected identity must enforce the same binding
+        // as an included private key, even when this archive carries only refs.
+        let incoming = Dictionary(grouping: document.credentials, by: \.fingerprint)
         for saved in catalog.workspaces {
             let prior = try saved.document()
             let credentials = Dictionary(uniqueKeysWithValues: prior.credentials.map { ($0.id, $0) })
             for binding in saved.bindings {
                 guard let previous = credentials[binding.credentialID] else { throw WorkspaceStoreError.corruptStore }
-                for candidate in incoming.values where candidate.fingerprint == binding.fingerprint {
+                for candidate in incoming[binding.fingerprint] ?? [] {
                     guard candidate.algorithm == previous.algorithm else { throw FTError.malformed("store.credential_identity") }
                 }
             }
         }
-        let acceptedIndex = acceptanceIndex(document, catalog: catalog)
-        let accepted = acceptedIndex.map { catalog.acceptedImports[$0] }
+        let accepted = acceptedImport(document, catalog: catalog)
         if let accepted {
-            guard accepted.workspaceID == document.id, accepted.envelopeDigest == envelopeDigest,
-                  accepted.transferID == nil || accepted.transferID == transferID else { throw WorkspaceStoreError.conflictingExport }
+            guard accepted.workspaceID == document.id, accepted.envelopeDigest == digest,
+                  accepted.transferID == nil || transferID == nil || accepted.transferID == transferID else {
+                throw WorkspaceStoreError.immutableExportConflict
+            }
         }
-        // FTAG transfer IDs and envelope digests bind the whole package, even if
-        // a conflicting document claims a different exporter or workspace name.
-        for previous in catalog.acceptedImports where previous.transferID == transferID || previous.envelopeDigest == envelopeDigest {
-            guard previous.exporterID == document.exporterID, previous.workspaceID == document.id,
-                  previous.bundleID == document.bundleID, previous.envelopeDigest == envelopeDigest,
-                  previous.transferID == nil || previous.transferID == transferID else { throw WorkspaceStoreError.conflictingExport }
+        for prior in catalog.acceptedImports where prior.envelopeDigest == digest || (transferID != nil && prior.transferID == transferID) {
+            guard prior.envelopeDigest == digest, prior.exporterID == document.exporterID,
+                  prior.workspaceID == document.id, prior.bundleID == document.bundleID,
+                  prior.transferID == nil || transferID == nil || prior.transferID == transferID else {
+                throw WorkspaceStoreError.immutableExportConflict
+            }
         }
         guard accepted != nil || catalog.acceptedImports.count < Self.importHistoryLimit else { throw WorkspaceStoreError.importHistoryFull }
-        let old = try catalog.workspaces.first {
-            let prior = try $0.document()
-            return prior.exporterID == document.exporterID && prior.id == document.id
+        return accepted != nil && old?.envelopeDigest != digest
+    }
+
+    private static func migrateVersionOneWorkspace(_ saved: InstalledWorkspace) throws -> InstalledWorkspace {
+        var root = try StrictJSON.decode(saved.manifest).object()
+        var workspace = try root.required("workspace").object()
+        var changed = false
+        let routes = try workspace.required("routes").array().map { value -> JSONValue in
+            var route = try value.object()
+            if let singular = route.removeValue(forKey: "credential_ref") {
+                guard route["credential_refs"] == nil, route["authentication_methods"] == nil else { throw WorkspaceStoreError.corruptStore }
+                _ = try WorkspaceDocument.identifier(singular.string())
+                route["credential_refs"] = .array([singular])
+                route["authentication_methods"] = .array([.string("publickey")])
+                changed = true
+            }
+            return .object(route)
         }
-        let oldIDs = try old.map { Set(try $0.document().machines.map(\.id)) } ?? []
-        let newIDs = Set(document.machines.map(\.id))
-        return .init(existingWorkspace: old, firstAcceptedRevision: accepted?.firstAcceptedRevision,
-                     requiresRollbackApproval: accepted != nil && old?.envelopeDigest != envelopeDigest,
-                     removesMachines: !oldIDs.isSubset(of: newIDs))
+        let trusts = try workspace.required("host_trust").array().map { value -> JSONValue in
+            var trust = try value.object()
+            if trust["revoked_keys"] == nil { trust["revoked_keys"] = .array([]); changed = true }
+            return .object(trust)
+        }
+        let manifest: Data
+        if changed {
+            workspace["routes"] = .array(routes); workspace["host_trust"] = .array(trusts)
+            root["workspace"] = .object(workspace)
+            manifest = try WorkspaceDocument(data: StrictJSON.encode(.object(root))).raw
+        } else { manifest = try WorkspaceDocument(data: saved.manifest).raw }
+        return .init(id: saved.id, revision: saved.revision, manifest: manifest, envelopeDigest: saved.envelopeDigest,
+                     bindings: saved.bindings, inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater)
     }
 
     private func receipt(_ workspace: InstalledWorkspace, requested: [String], available: Set<String>, cleanupPending: Bool) -> WorkspaceImportReceipt {
@@ -511,37 +773,60 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard var catalog = try? JSONDecoder().decode(Catalog.self, from: data), [1, 2, 3].contains(catalog.version),
+        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 4,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
-              catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0, at: "store.revocations")) != nil }),
-              catalog.acceptedImports.count <= Self.importHistoryLimit,
-              catalog.hostRevocations.count <= Self.hostRevocationLimit,
+              catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
+              catalog.acceptedImports.count <= Self.importHistoryLimit, catalog.hostRevocations.count <= Self.hostRevocationLimit,
+              catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit,
+              catalog.hostRequirements.count <= Self.hostRequirementLimit,
               Set(catalog.workspaces.map(\.id)).count == catalog.workspaces.count,
               Set(catalog.workspaces.map(\.revision)).count == catalog.workspaces.count else { throw WorkspaceStoreError.corruptStore }
-        let previousVersion = catalog.version
         var namespaces = Set<[String]>()
         var accountIdentities: [String: [String]] = [:]
-        for index in catalog.workspaces.indices {
-            let workspace = catalog.workspaces[index]
-            let migrated = try previousVersion == 1 ? Self.migrateLegacyManifest(workspace.manifest) : workspace.manifest
-            guard let document = try? WorkspaceDocument(data: migrated) else { throw WorkspaceStoreError.corruptStore }
-            let originalFindings = workspace.findings.map { AirGapArchive.Portability(entityID: $0.entityID,
-                setting: $0.setting, disposition: $0.disposition, reason: $0.reason) }
-            let originalAnnotations = workspace.inactiveSettings.map { AirGapArchive.Annotation(entityID: $0.entityID,
-                setting: $0.setting, original: $0.original) }
-            guard let metadata = try? AirGapArchive.validatedMetadata(workspace: document,
-                portability: originalFindings, annotations: originalAnnotations) else { throw WorkspaceStoreError.corruptStore }
-            if document.raw != workspace.manifest || metadata.portability != originalFindings || metadata.annotations != originalAnnotations {
-                catalog.workspaces[index] = InstalledWorkspace(id: workspace.id, revision: workspace.revision,
-                    manifest: document.raw, envelopeDigest: workspace.envelopeDigest, bindings: workspace.bindings,
-                    inactiveSettings: metadata.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
-                    findings: metadata.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
-                    connectLater: workspace.connectLater)
-                catalog.needsPublication = true
+        let workspaceIDs = Set(catalog.workspaces.map(\.id))
+        var bundleIDs = Set<[String]>(), transferIDs = Set<Data>(), digests = Set<Data>()
+        for export in catalog.acceptedImports {
+            guard (try? WorkspaceDocument.identifier(export.exporterID)) != nil,
+                  (try? WorkspaceDocument.identifier(export.workspaceID)) != nil,
+                  (try? WorkspaceDocument.identifier(export.bundleID)) != nil,
+                  export.envelopeDigest.count == 32, digests.insert(export.envelopeDigest).inserted,
+                  export.transferID == nil || export.transferID?.count == 16,
+                  bundleIDs.insert([export.exporterID, export.bundleID]).inserted else { throw WorkspaceStoreError.corruptStore }
+            if let transferID = export.transferID, !transferIDs.insert(transferID).inserted { throw WorkspaceStoreError.corruptStore }
+        }
+        for revocation in catalog.hostRevocations {
+            guard revocation.port > 0, (try? WorkspaceDocument.host(revocation.host)) == revocation.host else {
+                throw WorkspaceStoreError.corruptStore
             }
+        }
+        for revocation in catalog.scopedHostRevocations {
+            guard workspaceIDs.contains(revocation.workspaceID), !revocation.scope.isEmpty,
+                  revocation.scope.utf8.count <= FTLimit.text + 64 else { throw WorkspaceStoreError.corruptStore }
+        }
+        for requirement in catalog.hostRequirements {
+            guard workspaceIDs.contains(requirement.workspaceID), !requirement.scope.isEmpty,
+                  requirement.scope.utf8.count <= FTLimit.text + 64,
+                  Self.validHostRequirement(requirement.capability) else { throw WorkspaceStoreError.corruptStore }
+        }
+        for workspace in catalog.workspaces {
+            let document = try workspace.document()
             guard workspace.connectLater, workspace.envelopeDigest.count == 32, workspace.bindings.count <= 256,
                   workspace.inactiveSettings.count <= 1024, workspace.findings.count <= 1024,
                   namespaces.insert([document.exporterID, document.id]).inserted else { throw WorkspaceStoreError.corruptStore }
+            guard catalog.acceptedImports.contains(where: {
+                $0.exporterID == document.exporterID && $0.workspaceID == document.id && $0.bundleID == document.bundleID && $0.envelopeDigest == workspace.envelopeDigest
+            }) else { throw WorkspaceStoreError.corruptStore }
+            for trust in document.hostTrust {
+                guard trust.revokedKeys.allSatisfy({
+                    catalog.hostRevocations.contains(.init(host: trust.host, port: trust.port, key: $0)) &&
+                    catalog.scopedHostRevocations.contains(.init(workspaceID: workspace.id, scope: trust.canonicalTrustScope, key: $0))
+                }) else {
+                    throw WorkspaceStoreError.corruptStore
+                }
+                guard trust.requiredPolicyRequirements.allSatisfy({ catalog.hostRequirements.contains(.init(workspaceID: workspace.id, scope: trust.canonicalTrustScope, capability: $0)) }) else {
+                    throw WorkspaceStoreError.corruptStore
+                }
+            }
             let refs = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0.fingerprint) })
             guard Set(workspace.bindings.map(\.credentialID)).count == workspace.bindings.count else { throw WorkspaceStoreError.corruptStore }
             for binding in workspace.bindings {
@@ -553,75 +838,13 @@ public actor WorkspaceStore {
                 if let previous = accountIdentities[binding.account], previous != identity { throw WorkspaceStoreError.corruptStore }
                 accountIdentities[binding.account] = identity
             }
-            for trust in document.hostTrust {
-                for key in trust.revokedKeys {
-                    let entry = HostRevocation(host: trust.host, port: trust.port, key: key)
-                    if previousVersion < 3 { catalog.hostRevocations.insert(entry) }
-                    else if !catalog.hostRevocations.contains(entry) { throw WorkspaceStoreError.corruptStore }
-                }
-            }
-            if previousVersion == 1 {
-                catalog.acceptedImports.append(AcceptedImport(exporterID: document.exporterID, workspaceID: document.id,
-                    bundleID: document.bundleID, transferID: nil, envelopeDigest: workspace.envelopeDigest,
-                    firstAcceptedRevision: workspace.revision))
-            }
         }
-        catalog.version = 3
-        catalog.needsPublication = catalog.needsPublication || previousVersion != 3
-        guard catalog.hostRevocations.count <= Self.hostRevocationLimit else { throw WorkspaceStoreError.corruptStore }
-        for entry in catalog.hostRevocations {
-            guard entry.port > 0, (try? WorkspaceDocument.host(entry.host)) == entry.host else { throw WorkspaceStoreError.corruptStore }
-        }
-        var bundles = Set<[String]>(), transfers = Set<Data>(), digests = Set<Data>()
-        for accepted in catalog.acceptedImports {
-            guard (try? WorkspaceDocument.identifier(accepted.exporterID)) != nil,
-                  (try? WorkspaceDocument.identifier(accepted.workspaceID)) != nil,
-                  (try? WorkspaceDocument.identifier(accepted.bundleID)) != nil,
-                  accepted.envelopeDigest.count == 32,
-                  bundles.insert([accepted.exporterID, accepted.bundleID]).inserted,
-                  digests.insert(accepted.envelopeDigest).inserted else { throw WorkspaceStoreError.corruptStore }
-            if let transfer = accepted.transferID {
-                guard transfer.count == 16, transfers.insert(transfer).inserted else { throw WorkspaceStoreError.corruptStore }
-            }
-        }
-        for workspace in catalog.workspaces {
-            let document = try workspace.document()
-            guard let index = acceptanceIndex(document, catalog: catalog),
-                  catalog.acceptedImports[index].workspaceID == document.id,
-                  catalog.acceptedImports[index].envelopeDigest == workspace.envelopeDigest else { throw WorkspaceStoreError.corruptStore }
+        // Publish only after all history, ownership and policy invariants above
+        // pass. Failure never authorizes deleting journal-owned credentials.
+        if catalog.needsSanitizedPublication {
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
         }
         return catalog
-    }
-
-    /// Only version-one local catalogs used the superseded singular-key schema.
-    /// Translate that persisted format without making network imports permissive
-    /// or inventing a password fallback/session-creation preference.
-    private static func migrateLegacyManifest(_ data: Data) throws -> Data {
-        do {
-            var root = try StrictJSON.decode(data).object()
-            var workspace = try root.required("workspace").object()
-            var changed = false
-            let routes = try workspace.required("routes").array().map { value -> JSONValue in
-                var route = try value.object()
-                if let singular = route.removeValue(forKey: "credential_ref") {
-                    guard route["credential_refs"] == nil, route["authentication_methods"] == nil else { throw WorkspaceStoreError.corruptStore }
-                    _ = try WorkspaceDocument.identifier(singular.string())
-                    route["credential_refs"] = .array([singular])
-                    route["authentication_methods"] = .array([.string("publickey")])
-                    changed = true
-                }
-                return .object(route)
-            }
-            let trusts = try workspace.required("host_trust").array().map { value -> JSONValue in
-                var trust = try value.object()
-                if trust["revoked_keys"] == nil { trust["revoked_keys"] = .array([]); changed = true }
-                return .object(trust)
-            }
-            guard changed else { return data }
-            workspace["routes"] = .array(routes); workspace["host_trust"] = .array(trusts)
-            root["workspace"] = .object(workspace)
-            return try StrictJSON.encode(.object(root))
-        } catch { throw WorkspaceStoreError.corruptStore }
     }
     private static func validAccount(_ account: String, transaction: UUID? = nil) -> Bool {
         let parts = account.split(separator: ":", omittingEmptySubsequences: false)
@@ -631,13 +854,7 @@ public actor WorkspaceStore {
         return transaction == nil || transaction == id
     }
     private func recover(catalog: inout Catalog) throws {
-        guard let data = try persistence.read(.journal, limit: Self.journalLimit) else {
-            if catalog.needsPublication {
-                try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
-                catalog.needsPublication = false
-            }
-            return
-        }
+        guard let data = try persistence.read(.journal, limit: Self.journalLimit) else { return }
         guard let journal = try? JSONDecoder().decode(Journal.self, from: data), journal.version == 1,
               journal.newAccounts.count <= 256, Set(journal.newAccounts).count == journal.newAccounts.count,
               journal.retiredAccounts.count <= 256, Set(journal.retiredAccounts).count == journal.retiredAccounts.count,

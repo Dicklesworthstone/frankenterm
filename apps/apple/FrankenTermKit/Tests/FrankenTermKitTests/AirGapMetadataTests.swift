@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 @testable import FrankenTermKit
 
+@MainActor
 final class AirGapMetadataTests: XCTestCase {
     private let crypto = TestCryptography()
     private let omittedSetting = "frankenterm.discarded_annotations"
@@ -28,7 +29,7 @@ final class AirGapMetadataTests: XCTestCase {
         return data
     }
 
-    func testEveryEntityKindCanOwnAnInertAnnotationAndARequiredFinding() throws {
+    func testEveryEntityKindCanOwnAnInertAnnotationAndARequiredFinding() async throws {
         let ids = ["work", "group", "build", "gpu", "route", "key", "trust", "theme"]
         let findings = ids.map { AirGapArchive.Portability(entityID: $0, setting: "desktop.policy", disposition: 1, reason: "Review this required desktop policy.") }
         let annotations = ids.map { AirGapArchive.Annotation(entityID: $0, setting: "enable_tab_bar", original: Data("true".utf8)) }
@@ -38,7 +39,7 @@ final class AirGapMetadataTests: XCTestCase {
         XCTAssertEqual(try archive(portability: findings, annotations: annotations).encoded(), try restored.encoded())
     }
 
-    func testDanglingOrInvalidReferencesAndDuplicateMetadataRejectOnBothEntryPaths() throws {
+    func testDanglingOrInvalidReferencesAndDuplicateMetadataRejectOnBothEntryPaths() async throws {
         for id in ["missing", "", "work/route", String(repeating: "x", count: 129)] {
             let finding = AirGapArchive.Portability(entityID: id, setting: "desktop.policy", disposition: 1, reason: "Required policy.")
             let annotation = AirGapArchive.Annotation(entityID: id, setting: "enable_tab_bar", original: Data("true".utf8))
@@ -55,7 +56,7 @@ final class AirGapMetadataTests: XCTestCase {
         XCTAssertThrowsError(try AirGapArchive(data: wireArchive(annotations: [annotation, annotation]), using: crypto))
     }
 
-    func testSettingsReasonsAndDispositionsAreBoundedAndValidated() throws {
+    func testSettingsReasonsAndDispositionsAreBoundedAndValidated() async throws {
         for setting in ["", "desktop\npolicy", "window opacity", "private/setting", "é", String(repeating: "x", count: 129)] {
             let finding = AirGapArchive.Portability(entityID: "route", setting: setting, disposition: 0, reason: "Inactive on this platform.")
             let annotation = AirGapArchive.Annotation(entityID: "theme", setting: setting, original: Data("true".utf8))
@@ -80,7 +81,7 @@ final class AirGapMetadataTests: XCTestCase {
         }
     }
 
-    func testRegisteredAppearanceValuesRemainInertAndRoundTripWithCanonicalPublicValues() throws {
+    func testRegisteredAppearanceValuesRemainInertAndRoundTripWithCanonicalPublicValues() async throws {
         let annotations = [
             AirGapArchive.Annotation(entityID: "work", setting: "enable_tab_bar", original: Data(" \ntrue\t".utf8)),
             .init(entityID: "work", setting: "hide_tab_bar_if_only_one_tab", original: Data("false".utf8)),
@@ -99,7 +100,7 @@ final class AirGapMetadataTests: XCTestCase {
         XCTAssertEqual(restored.workspace.raw, try sampleManifest())
     }
 
-    func testRegisteredSettingsRejectOpaqueNestedOrWrongTypedValues() throws {
+    func testRegisteredSettingsRejectOpaqueNestedOrWrongTypedValues() async throws {
         for original in [#""true""#, "1", "null", #"{"private_key":"synthetic-private-sentinel"}"#, "[]", "true false"] {
             let annotation = AirGapArchive.Annotation(entityID: "work", setting: "enable_tab_bar", original: Data(original.utf8))
             XCTAssertThrowsError(try archive(annotations: [annotation]))
@@ -112,7 +113,6 @@ final class AirGapMetadataTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testOpaqueOptionalAnnotationNeverEntersReexportOrPublicCatalog() async throws {
         let syntheticSecret = Data("-----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETIC_PRIVATE_SENTINEL_FOR_REJECTION\n-----END OPENSSH PRIVATE KEY-----".utf8)
         let annotation = AirGapArchive.Annotation(entityID: "work", setting: "opaque_private_setting", original: syntheticSecret)
@@ -144,7 +144,7 @@ final class AirGapMetadataTests: XCTestCase {
         XCTAssertEqual(vault.creates, 0)
     }
 
-    func testRequiredOpaqueAnnotationsRejectWithoutErasingUnresolvedBehavior() throws {
+    func testRequiredOpaqueAnnotationsRejectWithoutErasingUnresolvedBehavior() async throws {
         let required = AirGapArchive.Portability(entityID: "route", setting: "desktop.policy", disposition: 1, reason: "This policy must be satisfied before connecting.")
         let annotation = AirGapArchive.Annotation(entityID: "route", setting: "desktop.policy", original: Data("unrecognized policy payload".utf8))
         XCTAssertThrowsError(try archive(portability: [required], annotations: [annotation])) {
@@ -161,7 +161,7 @@ final class AirGapMetadataTests: XCTestCase {
         XCTAssertEqual(restored.portability.count, 2)
     }
 
-    func testMetadataCountsAndReservedOmissionFindingCannotBypassLimits() throws {
+    func testMetadataCountsAndReservedOmissionFindingCannotBypassLimits() async throws {
         let records = (0..<1024).map { AirGapArchive.Portability(entityID: "work", setting: "desktop.setting.\($0)", disposition: 0, reason: "Inactive.") }
         let unknown = AirGapArchive.Annotation(entityID: "work", setting: "unknown.setting", original: Data("opaque".utf8))
         XCTAssertEqual(try archive(portability: records).portability.count, 1024)

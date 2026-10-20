@@ -50,6 +50,42 @@ final class OpticalPresentationTests: XCTestCase {
         XCTAssertEqual(parsed.initialGroupID, "group")
         XCTAssertEqual(parsed.groups.first(where: { $0.id == parsed.initialGroupID })?.machineOrder, ["build", "gpu"])
     }
+    func testExporterPreservesReviewedInactiveSettingsAndRequiredOmissions() throws {
+        let workspace = try WorkspaceDocument(data: sampleManifest())
+        let findings: [AirGapArchive.Portability] = [
+            .init(entityID: "theme", setting: "window_background_opacity", disposition: 0, reason: "The desktop window opacity remains inactive on the phone."),
+            .init(entityID: "route", setting: "required_revocation_check", disposition: 1, reason: "This check cannot run while offline.")
+        ]
+        let annotation = AirGapArchive.Annotation(entityID: "theme", setting: "window_background_opacity", original: Data("0.75".utf8))
+        let archive = try AirGapArchive(workspace: workspace, keys: [], portability: findings, annotations: [annotation], using: crypto)
+        let encrypted = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(encrypted.envelope, code: encrypted.code, using: crypto)
+        XCTAssertEqual(restored.portability.map(\.disposition), [0, 1])
+        XCTAssertEqual(restored.portability.map(\.entityID), ["theme", "route"])
+        XCTAssertEqual(restored.annotations[0].original, annotation.original)
+        XCTAssertEqual(restored.workspace.raw, workspace.raw)
+        XCTAssertThrowsError(try AirGapArchive(workspace: workspace, keys: [], portability: findings + [findings[0]], using: crypto))
+        XCTAssertThrowsError(try AirGapArchive(workspace: workspace, keys: [], portability: findings, annotations: [annotation, annotation], using: crypto))
+        let opaque = AirGapArchive.Annotation(entityID: "theme", setting: "font", original: Data("Desktop Mono".utf8))
+        let sanitized = try AirGapArchive(workspace: workspace, keys: [], annotations: [opaque], using: crypto)
+        XCTAssertTrue(sanitized.annotations.isEmpty)
+        XCTAssertEqual(sanitized.portability.map(\.setting), ["frankenterm.discarded_annotations"], "unknown values leave a content-free explanation")
+        XCTAssertNil(try sanitized.encoded().range(of: opaque.original))
+        for invalid in [
+            AirGapArchive.Portability(entityID: "missing", setting: "font", disposition: 0, reason: "Not available"),
+            .init(entityID: "theme", setting: "font", disposition: 2, reason: "Invalid disposition"),
+            .init(entityID: "theme", setting: "font", disposition: 0, reason: ""),
+            .init(entityID: "theme", setting: String(repeating: "x", count: FTLimit.text + 1), disposition: 0, reason: "Too large")
+        ] {
+            XCTAssertThrowsError(try AirGapArchive(workspace: workspace, keys: [], portability: [invalid], using: crypto))
+        }
+        // Decoder applies the same source-independent entity validation. These
+        // bytes are syntactically canonical CBOR but carry a nonexistent target.
+        var invalidCBOR = CBORWriter.array(5) + CBORWriter.uint(1) + CBORWriter.bytes(workspace.raw) + CBORWriter.array(0)
+        invalidCBOR += CBORWriter.array(1) + CBORWriter.array(4) + CBORWriter.text("missing") + CBORWriter.text("font")
+        invalidCBOR += CBORWriter.uint(0) + CBORWriter.text("Not available") + CBORWriter.array(0)
+        XCTAssertThrowsError(try AirGapArchive(data: invalidCBOR, using: crypto))
+    }
 }
 
 #if canImport(CoreImage) && canImport(Vision) && canImport(CryptoKit)

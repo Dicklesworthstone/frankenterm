@@ -60,6 +60,7 @@ final class WorkspaceIdentityTests: XCTestCase {
         let bindings = try XCTUnwrap(saved[0]["bindings"] as? [[String: Any]])
         saved[0]["bindings"] = bindings.filter { $0["credentialID"] as? String == "key" }
         catalog["workspaces"] = saved; catalog["version"] = 2; catalog.removeValue(forKey: "hostRevocations")
+        catalog.removeValue(forKey: "scopedHostRevocations"); catalog.removeValue(forKey: "hostRequirements")
         disk.seed(try JSONSerialization.data(withJSONObject: catalog), slot: .catalog)
         let reopened = WorkspaceStore(persistence: disk, vault: vault)
         let available = try await reopened.availableCredentialIDs(workspaceID: first.workspace.id)

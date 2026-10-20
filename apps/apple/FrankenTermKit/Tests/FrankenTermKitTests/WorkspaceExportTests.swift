@@ -185,3 +185,245 @@ final class WorkspaceExportTests: XCTestCase {
         XCTAssertEqual(restored.keys.map(\.credentialID), ["key-alias"])
     }
 }
+
+@MainActor
+final class WorkspaceMultiGroupExportTests: XCTestCase {
+    private let crypto = TestCryptography()
+    private var support: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
+    }
+
+    private func fixture(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                         change: ((inout [String: Any]) -> Void)? = nil) throws -> WorkspaceDocument {
+        var root = try JSONSerialization.jsonObject(with: sampleManifest(fingerprint: fingerprint)) as! [String: Any]
+        root["source"] = ["exporter_id": "mac", "kind": "mac_snapshot", "configuration_revision": "frozen-7", "export_sequence": 7]
+        var workspace = root["workspace"] as! [String: Any]
+        workspace["groups"] = [
+            ["id": "gpu-group", "name": "GPU", "machine_order": ["gpu"], "auto_connect": false],
+            ["id": "build-group", "name": "Build", "machine_order": ["build"], "auto_connect": true],
+            ["id": "both-group", "name": "Both", "machine_order": ["gpu", "build"], "auto_connect": true],
+            ["id": "empty-group", "name": "Empty", "machine_order": [], "auto_connect": false]
+        ]
+        var machines = workspace["machines"] as! [[String: Any]]
+        machines[0]["route_refs"] = ["route", "alternate"]
+        machines[1]["route_refs"] = ["unused-route"]; machines[1]["preferred_route_ref"] = "unused-route"
+        machines[1]["theme_ref"] = "unused-theme"
+        workspace["machines"] = machines
+        var route = (workspace["routes"] as! [[String: Any]])[0]
+        route["credential_refs"] = ["hop-key", "selected-key"]; route["jump_routes"] = ["hop-one"]
+        var alternate = route; alternate["id"] = "alternate"; alternate["jump_routes"] = []
+        alternate["credential_refs"] = ["selected-key"]
+        var first = route; first["id"] = "hop-one"; first["host"] = "bastion-one.invalid"
+        first["host_trust_ref"] = "trust-one"; first["jump_routes"] = ["hop-two"]; first["credential_refs"] = ["hop-key"]
+        var second = first; second["id"] = "hop-two"; second["host"] = "bastion-two.invalid"
+        second["host_trust_ref"] = "trust-two"; second["jump_routes"] = []; second["credential_refs"] = ["selected-key"]
+        var unused = alternate; unused["id"] = "unused-route"; unused["host"] = "unused.invalid"
+        unused["host_trust_ref"] = "unused-trust"; unused["credential_refs"] = ["unused-key"]
+        workspace["routes"] = [unused, second, route, first, alternate]
+        let key = (workspace["credentials"] as! [[String: Any]])[0]
+        var selected = key; selected["id"] = "selected-key"
+        var hop = key; hop["id"] = "hop-key"
+        var unusedKey = key; unusedKey["id"] = "unused-key"
+        unusedKey["public_fingerprint"] = "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"
+        workspace["credentials"] = [unusedKey, selected, key, hop]
+        let trust = (workspace["host_trust"] as! [[String: Any]])[0]
+        var firstTrust = trust; firstTrust["id"] = "trust-one"; firstTrust["host"] = "bastion-one.invalid"
+        var secondTrust = trust; secondTrust["id"] = "trust-two"; secondTrust["host"] = "bastion-two.invalid"
+        var unusedTrust = trust; unusedTrust["id"] = "unused-trust"; unusedTrust["host"] = "unused.invalid"
+        workspace["host_trust"] = [unusedTrust, secondTrust, trust, firstTrust]
+        let theme = (workspace["themes"] as! [[String: Any]])[0]
+        var unusedTheme = theme; unusedTheme["id"] = "unused-theme"; unusedTheme["name"] = "Unused"
+        workspace["themes"] = [unusedTheme, theme]
+        workspace["preferences"] = ["initial_machine_ref": "gpu", "initial_group_ref": "gpu-group", "connect_on_open": true]
+        change?(&workspace); root["workspace"] = workspace
+        return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+    }
+
+    func testSelectedGroupKeepsEveryRouteAndTransitiveHopInSourceOrder() async throws {
+        let source = try fixture(), selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"])
+        let document = selection.workspace
+        XCTAssertEqual(document.id, source.id); XCTAssertEqual(document.exporterID, source.exporterID)
+        XCTAssertEqual(document.configurationRevision, "frozen-7"); XCTAssertEqual(document.exportSequence, 7)
+        XCTAssertEqual(document.groups.map(\.id), ["build-group"])
+        XCTAssertEqual(document.groups[0].machineOrder, ["build"]); XCTAssertTrue(document.groups[0].autoConnect)
+        XCTAssertEqual(document.machines.map(\.id), ["build"])
+        XCTAssertEqual(document.machines[0].routeIDs, ["route", "alternate"])
+        XCTAssertEqual(document.routes.map(\.id), ["hop-two", "route", "hop-one", "alternate"])
+        XCTAssertEqual(document.routes.first(where: { $0.id == "route" })?.credentialIDs, ["hop-key", "selected-key"])
+        XCTAssertEqual(document.credentials.map(\.id), ["selected-key", "hop-key"])
+        XCTAssertEqual(document.hostTrust.map(\.id), ["trust-two", "trust", "trust-one"])
+        XCTAssertEqual(document.themes.map(\.id), ["theme"])
+        XCTAssertEqual(document.initialGroupID, "build-group"); XCTAssertEqual(document.initialMachineID, "build")
+        XCTAssertTrue(document.connectOnOpen, "connection intent stays inert public data")
+        XCTAssertEqual(selection.identities.count, 1)
+        XCTAssertEqual(selection.identities[0].credentialIDs, ["selected-key", "hop-key"])
+        XCTAssertNil(document.raw.range(of: Data("unused.invalid".utf8)))
+    }
+
+    func testMultipleGroupsPreserveOrderAndExistingInitialSelection() async throws {
+        let source = try fixture()
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["both-group", "gpu-group"])
+        XCTAssertEqual(selection.workspace.groups.map(\.id), ["gpu-group", "both-group"])
+        XCTAssertEqual(selection.workspace.groups[1].machineOrder, ["gpu", "build"])
+        XCTAssertEqual(selection.workspace.initialGroupID, "gpu-group"); XCTAssertEqual(selection.workspace.initialMachineID, "gpu")
+        XCTAssertEqual(selection.workspace.raw, try WorkspaceExportSelection(workspace: source, groupIDs: ["gpu-group", "both-group"]).workspace.raw)
+        XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: []))
+        XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: ["unknown"]))
+        XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: ["empty-group"]))
+    }
+
+    func testPruningCannotEraseSameScopeNegativeTrustOrMandatoryExtension() async throws {
+        let source = try fixture { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]], detached = trusts[2]
+            detached["id"] = "detached-negative"; detached["revoked_keys"] = detached["pins"]
+            detached["extensions"] = ["org.example.krl": ["required": true, "opaque_private": "removed"]]
+            trusts.append(detached); workspace["host_trust"] = trusts
+        }
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"])
+        let document = selection.workspace, fingerprint = selection.identities[0].fingerprint
+        XCTAssertTrue(document.hostTrust.contains(where: { $0.id == "detached-negative" }))
+        let readiness = try document.readiness(forRouteID: "route", availableCredentialIDs: Set(document.credentials.map(\.id)),
+            reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support)
+        XCTAssertTrue(readiness.issues.contains(.hostIdentityRevoked)); XCTAssertTrue(readiness.issues.contains(.unsupportedRequirement))
+        let reviewed = try selection.review(decisions: [fingerprint: .keepReferenceOnly], loadedFingerprints: [])
+        XCTAssertTrue(reviewed.blockedRouteIDs.contains("route"))
+        let archive = try selection.archive(decisions: [fingerprint: .keepReferenceOnly], keys: [], bundleID: "narrower-export", using: crypto)
+        XCTAssertTrue(archive.portability.contains(where: { $0.entityID == "route" && $0.disposition == 1 }))
+        XCTAssertNil(archive.workspace.raw.range(of: Data("opaque_private".utf8)))
+        XCTAssertEqual(archive.workspace.hostTrust.last?.requiredPolicyRequirements, ["extension:org.example.krl"])
+    }
+
+    func testCanonicalIdentityConsentDeduplicatesAndRebindsAnUnselectedSourceAlias() async throws {
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let source = try fixture(fingerprint: fingerprint), selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"])
+        XCTAssertFalse(selection.workspace.credentials.contains(where: { $0.id == key.credentialID }))
+        let archive = try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [key], bundleID: "selected-export", using: crypto)
+        XCTAssertEqual(archive.keys.count, 1); XCTAssertEqual(archive.keys[0].credentialID, "selected-key")
+        XCTAssertEqual(archive.keys[0].publicBlob, key.publicBlob)
+        XCTAssertEqual(archive.workspace.bundleID, "selected-export")
+        XCTAssertEqual(archive.workspace.id, source.id)
+        XCTAssertNil(archive.workspace.raw.range(of: key.container))
+        XCTAssertTrue(archive.portability.isEmpty)
+        let sealed = try FTAG.seal(archive, using: crypto), decoded = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(decoded.workspace.raw, archive.workspace.raw)
+        XCTAssertEqual(decoded.keys[0].container, key.container)
+        XCTAssertEqual(decoded.workspace.routes.first(where: { $0.id == "route" })?.credentialIDs, ["hop-key", "selected-key"])
+    }
+
+    func testEveryIdentityNeedsExplicitDecisionAndActualApprovedKeyMaterial() async throws {
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let selection = try WorkspaceExportSelection(workspace: fixture(fingerprint: fingerprint), groupIDs: ["build-group"])
+        XCTAssertFalse(try selection.review(decisions: [:], loadedFingerprints: []).canPrepare)
+        XCTAssertEqual(try selection.review(decisions: [fingerprint: .includePrivateKey], loadedFingerprints: []).missingApprovedKeyCount, 1)
+        XCTAssertThrowsError(try selection.archive(decisions: [:], keys: [], bundleID: "candidate", using: crypto))
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [], bundleID: "candidate", using: crypto))
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .keepReferenceOnly], keys: [key], bundleID: "candidate", using: crypto))
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [key, key], bundleID: "candidate", using: crypto))
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [key], bundleID: selection.workspace.bundleID, using: crypto))
+        XCTAssertThrowsError(try selection.review(decisions: ["unselected": .keepReferenceOnly], loadedFingerprints: []))
+        let forged = PrivateKeyRecord(credentialID: key.credentialID, container: key.container, publicBlob: Data(repeating: 0, count: key.publicBlob.count))
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [forged], bundleID: "candidate", using: crypto))
+    }
+
+    func testOmittedIdentitiesHaveConcreteFindingsAndCanUseExistingPhoneKeys() async throws {
+        let selection = try WorkspaceExportSelection(workspace: fixture(), groupIDs: ["build-group"])
+        let fingerprint = selection.identities[0].fingerprint
+        let review = try selection.review(decisions: [fingerprint: .keepReferenceOnly], loadedFingerprints: [])
+        XCTAssertTrue(review.canPrepare); XCTAssertEqual(review.omittedIdentityCount, 1)
+        XCTAssertEqual(Set(review.missingIdentityRouteIDs), Set(selection.workspace.routes.map(\.id)))
+        let archive = try selection.archive(decisions: [fingerprint: .keepReferenceOnly], keys: [], bundleID: "reference-only", using: crypto)
+        XCTAssertTrue(archive.keys.isEmpty)
+        XCTAssertEqual(archive.portability.filter { $0.setting == "private_identity" }.map(\.entityID), ["selected-key", "hop-key"])
+        XCTAssertTrue(archive.portability.allSatisfy { $0.disposition == 0 })
+        let document = archive.workspace
+        XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: Set(document.credentials.map(\.id)),
+            reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support).isLocallyReady)
+        let persisted = try AirGapArchive(data: archive.encoded(), using: crypto)
+        XCTAssertEqual(persisted.portability.map(\.reason), archive.portability.map(\.reason))
+    }
+
+    func testInteractivePolicyDoesNotBecomeAFalseMissingKeyBlocker() async throws {
+        var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
+        var workspace = root["workspace"] as! [String: Any], routes = workspace["routes"] as! [[String: Any]]
+        routes[0]["authentication_methods"] = ["publickey", "keyboard-interactive"]
+        workspace["routes"] = routes; root["workspace"] = workspace
+        let selection = try WorkspaceExportSelection(workspace: WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), groupIDs: ["group"])
+        let reviewed = try selection.review(decisions: [selection.identities[0].fingerprint: .keepReferenceOnly], loadedFingerprints: [])
+        XCTAssertTrue(reviewed.missingIdentityRouteIDs.isEmpty)
+        XCTAssertTrue(reviewed.blockedRouteIDs.isEmpty)
+        XCTAssertEqual(reviewed.findings.map(\.setting), ["private_identity"])
+    }
+
+    func testOmittedCredentialPolicyStaysVisibleWithoutBlockingAUsableAlternative() async throws {
+        var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
+        var workspace = root["workspace"] as! [String: Any]
+        var credentials = workspace["credentials"] as! [[String: Any]], routes = workspace["routes"] as! [[String: Any]]
+        credentials[0]["required_capabilities"] = ["ssh.user_certificate"]
+        workspace["credentials"] = credentials; root["workspace"] = workspace
+        let source = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        var selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["group"])
+        var choices = Dictionary(uniqueKeysWithValues: selection.identities.map { ($0.fingerprint, WorkspaceExportSelection.IdentityDecision.keepReferenceOnly) })
+        let blocked = try selection.review(decisions: choices, loadedFingerprints: [])
+        XCTAssertEqual(blocked.blockedRouteIDs, ["route"])
+        XCTAssertTrue(blocked.findings.contains(where: { $0.entityID == "key" && $0.setting == "credential_policy" && $0.disposition == 0 }))
+
+        var alternative = credentials[0]; alternative["id"] = "alternative"
+        alternative.removeValue(forKey: "required_capabilities")
+        alternative["public_fingerprint"] = "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"
+        credentials.append(alternative); routes[0]["credential_refs"] = ["key", "alternative"]
+        workspace["credentials"] = credentials; workspace["routes"] = routes; root["workspace"] = workspace
+        selection = try WorkspaceExportSelection(workspace: WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), groupIDs: ["group"])
+        choices = Dictionary(uniqueKeysWithValues: selection.identities.map { ($0.fingerprint, .keepReferenceOnly) })
+        let alternativeReview = try selection.review(decisions: choices, loadedFingerprints: [])
+        XCTAssertTrue(alternativeReview.blockedRouteIDs.isEmpty)
+        XCTAssertEqual(alternativeReview.missingIdentityRouteIDs, ["route"])
+    }
+
+    func testPhonePreviewAndInstalledReadinessAllowAPermittedAlternativeCandidate() async throws {
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]
+        var content = root["workspace"] as! [String: Any]
+        var credentials = content["credentials"] as! [[String: Any]], routes = content["routes"] as! [[String: Any]]
+        credentials[0]["required_capabilities"] = ["ssh.user_certificate"]
+        var alternative = credentials[0]
+        alternative["id"] = "permitted"; alternative["public_fingerprint"] = fingerprint
+        alternative.removeValue(forKey: "required_capabilities")
+        credentials.append(alternative); routes[0]["credential_refs"] = ["key", "permitted"]
+        content["credentials"] = credentials; content["routes"] = routes; root["workspace"] = content
+        let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        let selection = try WorkspaceExportSelection(workspace: document, groupIDs: ["group"])
+        let choices = Dictionary(uniqueKeysWithValues: selection.identities.map {
+            ($0.fingerprint, $0.fingerprint == fingerprint
+                ? WorkspaceExportSelection.IdentityDecision.includePrivateKey : .keepReferenceOnly)
+        })
+        let included = PrivateKeyRecord(credentialID: "permitted", container: key.container, publicBlob: key.publicBlob)
+        let archive = try selection.archive(decisions: choices, keys: [included], bundleID: "permitted-export", using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let transferred = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(transferred.workspace.credentials.first?.requiredCapabilities, ["ssh.user_certificate"])
+        XCTAssertTrue(transferred.portability.contains(where: { $0.entityID == "key" && $0.setting == "credential_policy" && $0.disposition == 0 }))
+        let store = WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault())
+        let digest = crypto.sha256(sealed.envelope)
+        let preview = try await store.previewImport(transferred, envelopeDigest: digest, support: support)
+        XCTAssertTrue(try XCTUnwrap(preview.routes.first).isLocallyReady)
+        XCTAssertEqual(preview.routes.first?.usableCredentialIDs, ["permitted"])
+        let installed = try await store.install(transferred, envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true)
+        let readiness = try await store.routeReadiness(workspaceID: installed.workspace.id, support: support)
+        XCTAssertTrue(try XCTUnwrap(readiness.first).isLocallyReady)
+        XCTAssertEqual(readiness.first?.usableCredentialIDs, ["permitted"])
+
+        // Losing the policy-free alternative still blocks the whole route, and
+        // the exported finding reaches the phone with that required disposition.
+        credentials[1]["required_capabilities"] = ["ssh.user_certificate"]
+        content["credentials"] = credentials; root["workspace"] = content
+        let blockedSelection = try WorkspaceExportSelection(
+            workspace: WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root)), groupIDs: ["group"])
+        let blockedArchive = try blockedSelection.archive(decisions: choices, keys: [included],
+            bundleID: "all-candidates-blocked", using: crypto)
+        XCTAssertTrue(blockedArchive.portability.contains(where: { $0.entityID == "route" && $0.setting == "route_readiness" && $0.disposition == 1 }))
+        let blockedPreview = try await store.previewImport(blockedArchive, envelopeDigest: Data(repeating: 9, count: 32), support: support)
+        XCTAssertTrue(try XCTUnwrap(blockedPreview.routes.first).issues.contains(.unsupportedRequirement))
+    }
+}

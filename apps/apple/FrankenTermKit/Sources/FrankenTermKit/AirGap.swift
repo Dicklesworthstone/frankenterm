@@ -5,31 +5,19 @@ import CryptoKit
 import Security
 #endif
 
-/// Trusted platform primitive boundary; no algorithm selection comes from JSON.
-/// Apple products use AppleCryptography. Linux tests use an independent oracle.
-public protocol AirGapCryptography: Sendable {
-    func sha256(_ bytes: Data) -> Data
-    func randomBytes(count: Int) throws -> Data
-    func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
-    func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
-    func ed25519PublicKey(seed: Data) throws -> Data
-    /// The scalar is a fixed-width unsigned big-endian integer. The returned
-    /// point is the canonical uncompressed SEC1/X9.63 representation.
-    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
-}
-
-/// Exact SSH curve/algorithm binding. No untrusted parameter set reaches a
-/// cryptographic implementation, and no imported scalar is reduced modulo n.
-public enum SSHECDSACurve: String, CaseIterable, Sendable {
+/// Fixed SSH curve profiles. The protocol never accepts an arbitrary curve name
+/// or asks a native primitive to infer the algorithm from untrusted key bytes.
+public enum SSHECDSACurve: String, Sendable, CaseIterable {
     case nistp256, nistp384, nistp521
-
     public var algorithm: String { "ecdsa-sha2-" + rawValue }
     public var scalarBytes: Int {
         switch self { case .nistp256: return 32; case .nistp384: return 48; case .nistp521: return 66 }
     }
+    var publicByteCount: Int { scalarBytes * 2 + 1 }
     var order: Data {
         get throws {
-            // NIST SP 800-186 group orders, represented at the exact scalar width.
+            // NIST SP 800-186 group orders, at the exact scalar width. These
+            // bounds prevent a primitive from silently reducing an input mod n.
             let hex: String
             switch self {
             case .nistp256: hex = "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"
@@ -43,6 +31,19 @@ public enum SSHECDSACurve: String, CaseIterable, Sendable {
         guard scalar.count == scalarBytes, scalar.contains(where: { $0 != 0 }),
               try scalar.lexicographicallyPrecedes(order) else { throw FTError.malformed("key.ecdsa_scalar") }
     }
+}
+
+/// Trusted platform primitive boundary; no algorithm selection comes from JSON.
+/// Apple products use AppleCryptography. Linux tests use an independent oracle.
+public protocol AirGapCryptography: Sendable {
+    func sha256(_ bytes: Data) -> Data
+    func randomBytes(count: Int) throws -> Data
+    func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
+    func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
+    func ed25519PublicKey(seed: Data) throws -> Data
+    /// A fixed-width big-endian private scalar to an uncompressed SEC1 point.
+    /// The maintained primitive must reject zero and out-of-range scalars.
+    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
 }
 
 #if canImport(CryptoKit)
@@ -85,7 +86,7 @@ public struct AppleCryptography: AirGapCryptography {
             case .nistp384: return try P384.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
             case .nistp521: return try P521.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
             }
-        } catch { throw FTError.malformed("key.ecdsa") }
+        } catch { throw FTError.malformed("key.ecdsa_scalar") }
     }
 }
 #endif
@@ -135,18 +136,19 @@ struct ByteCursor {
         guard count <= UInt64(cap) else { throw FTError.limit("ssh.string") }
         return try take(Int(count))
     }
-    /// RFC 4251 mpint, restricted to positive, minimally encoded private
-    /// scalars. Only a necessary sign octet may precede the unsigned value.
+    /// RFC 4251 positive mpint, normalized only after checking its canonical
+    /// signed representation. Validate the exact curve order before crypto too.
     mutating func sshScalar(curve: SSHECDSACurve) throws -> Data {
-        let encoded = try sshString(cap: curve.scalarBytes + 1)
-        guard let first = encoded.first, first & 0x80 == 0 else { throw FTError.malformed("key.ecdsa_scalar") }
+        let width = curve.scalarBytes
+        let encoded = try sshString(cap: width + 1)
+        guard let first = encoded.first, first & 0x80 == 0 else { throw FTError.malformed("key.scalar_sign") }
         let magnitude: Data
         if first == 0 {
-            guard encoded.count > 1, encoded[1] & 0x80 != 0 else { throw FTError.malformed("key.ecdsa_scalar") }
+            guard encoded.count > 1, encoded[1] & 0x80 != 0 else { throw FTError.malformed("key.scalar_noncanonical") }
             magnitude = Data(encoded.dropFirst())
         } else { magnitude = encoded }
-        guard magnitude.count <= curve.scalarBytes else { throw FTError.malformed("key.ecdsa_scalar") }
-        let scalar = Data(repeating: 0, count: curve.scalarBytes - magnitude.count) + magnitude
+        guard magnitude.count <= width else { throw FTError.limit("key.scalar_width") }
+        let scalar = Data(repeating: 0, count: width - magnitude.count) + magnitude
         try curve.validateScalar(scalar)
         return scalar
     }
@@ -296,29 +298,31 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         let privatePart = try reader.sshString()
         guard reader.remaining == 0, !privatePart.isEmpty, privatePart.count.isMultiple(of: 8) else { throw FTError.malformed("key.extent") }
         var publicReader = ByteCursor(publicBlob), privateReader = ByteCursor(privatePart)
-        let algorithm = try publicReader.sshString(cap: 64)
-        guard try privateReader.uint(4) == privateReader.uint(4), try privateReader.sshString(cap: 64) == algorithm else {
-            throw FTError.malformed("key.private_header")
+        let algorithmBytes = try publicReader.sshString(cap: 64)
+        guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
+              algorithm == "ssh-ed25519" || SSHECDSACurve.allCases.contains(where: { $0.algorithm == algorithm }) else {
+            throw FTError.unsupported("key.family")
         }
-        if algorithm == Data("ssh-ed25519".utf8) {
+        guard try privateReader.uint(4) == privateReader.uint(4),
+              try privateReader.sshString(cap: 64) == algorithmBytes else { throw FTError.malformed("key.private_header") }
+        if algorithm == "ssh-ed25519" {
             let publicKey = try publicReader.sshString(cap: 32)
             guard publicKey.count == 32, publicReader.remaining == 0 else { throw FTError.malformed("key.public") }
             guard try privateReader.sshString(cap: 32) == publicKey else { throw FTError.malformed("key.private_header") }
             let privateKey = try privateReader.sshString(cap: 64)
             guard privateKey.count == 64, privateKey.suffix(32) == publicKey,
                   try crypto.ed25519PublicKey(seed: Data(privateKey.prefix(32))) == publicKey else { throw FTError.malformed("key.identity") }
-        } else if let curve = SSHECDSACurve.allCases.first(where: { algorithm == Data($0.algorithm.utf8) }) {
-            let name = Data(curve.rawValue.utf8), pointLength = 1 + 2 * curve.scalarBytes
-            guard try publicReader.sshString(cap: 16) == name else { throw FTError.malformed("key.ecdsa_curve") }
-            let publicPoint = try publicReader.sshString(cap: pointLength)
-            guard publicPoint.count == pointLength, publicPoint.first == 4, publicReader.remaining == 0 else {
-                throw FTError.malformed("key.ecdsa_point")
-            }
-            guard try privateReader.sshString(cap: 16) == name,
-                  try privateReader.sshString(cap: pointLength) == publicPoint else { throw FTError.malformed("key.private_header") }
+        } else {
+            guard let curve = SSHECDSACurve.allCases.first(where: { $0.algorithm == algorithm }) else { throw FTError.unsupported("key.family") }
+            let curveName = Data(curve.rawValue.utf8)
+            guard try publicReader.sshString(cap: 16) == curveName,
+                  try privateReader.sshString(cap: 16) == curveName else { throw FTError.malformed("key.ecdsa_curve") }
+            let publicKey = try publicReader.sshString(cap: curve.publicByteCount)
+            guard publicKey.count == curve.publicByteCount, publicKey.first == 4, publicReader.remaining == 0,
+                  try privateReader.sshString(cap: curve.publicByteCount) == publicKey else { throw FTError.malformed("key.public") }
             let scalar = try privateReader.sshScalar(curve: curve)
-            guard try crypto.ecdsaPublicKey(scalar: scalar, curve: curve) == publicPoint else { throw FTError.malformed("key.identity") }
-        } else { throw FTError.unsupported("key.family") }
+            guard try crypto.ecdsaPublicKey(scalar: scalar, curve: curve) == publicKey else { throw FTError.malformed("key.identity") }
+        }
         _ = try privateReader.sshString(cap: FTLimit.text)
         guard privateReader.remaining < 8 else { throw FTError.malformed("key.padding") }
         let padding = try privateReader.take(privateReader.remaining)
@@ -348,7 +352,7 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
     public var debugDescription: String { "AirGapArchive([redacted])" }
 
     public init<C: AirGapCryptography>(workspace: WorkspaceDocument, keys: [PrivateKeyRecord],
-        portability: [Portability] = [], annotations: [Annotation] = [], using crypto: C) throws {
+                                      portability: [Portability] = [], annotations: [Annotation] = [], using crypto: C) throws {
         let metadata = try Self.validatedMetadata(workspace: workspace, portability: portability, annotations: annotations)
         self.workspace = workspace; self.keys = keys
         self.portability = metadata.portability; self.annotations = metadata.annotations
@@ -402,8 +406,7 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
     static func validatedMetadata(workspace: WorkspaceDocument, portability: [Portability], annotations: [Annotation]) throws
         -> (portability: [Portability], annotations: [Annotation]) {
         guard portability.count <= 1024, annotations.count <= 1024 else { throw FTError.limit("archive.metadata") }
-        let entityIDs = Set([workspace.id] + workspace.groups.map(\.id) + workspace.machines.map(\.id)
-            + workspace.routes.map(\.id) + workspace.credentials.map(\.id) + workspace.hostTrust.map(\.id) + workspace.themes.map(\.id))
+        let entityIDs = workspace.entityIDs
         struct Reference: Hashable { let entityID: String, setting: String }
         func reference(_ entityID: String, _ setting: String) throws -> Reference {
             _ = try WorkspaceDocument.identifier(entityID)
@@ -446,8 +449,8 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
             case "window_background_opacity", "text_background_opacity":
                 guard case .number(let text) = try StrictJSON.decode(item.original), let value = Double(text),
                       value.isFinite, (0...1).contains(value) else { throw FTError.malformed("annotation.opacity") }
-                // Do not preserve arbitrary whitespace or numeric spellings as
-                // a covert opaque payload in the public catalog.
+                // Arbitrary whitespace and numeric spellings do not become an
+                // opaque payload in the public catalog.
                 canonical = try JSONEncoder().encode(value)
             default:
                 guard conditions[key] != 1 else { throw FTError.unsupported("annotation.required_setting") }
@@ -489,9 +492,13 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
         for item in portability {
             data += CBORWriter.array(4) + CBORWriter.text(item.entityID) + CBORWriter.text(item.setting)
                 + CBORWriter.uint(item.disposition) + CBORWriter.text(item.reason)
+            guard data.count <= FTLimit.archive else { throw FTError.limit("archive.bytes") }
         }
         data += CBORWriter.array(annotations.count)
-        for item in annotations { data += CBORWriter.array(3) + CBORWriter.text(item.entityID) + CBORWriter.text(item.setting) + CBORWriter.bytes(item.original) }
+        for item in annotations {
+            data += CBORWriter.array(3) + CBORWriter.text(item.entityID) + CBORWriter.text(item.setting) + CBORWriter.bytes(item.original)
+            guard data.count <= FTLimit.archive else { throw FTError.limit("archive.bytes") }
+        }
         guard data.count <= FTLimit.archive else { throw FTError.limit("archive.bytes") }
         return data
     }
