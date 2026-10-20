@@ -1,0 +1,152 @@
+{
+  "format": "frankenterm-ftag-v1-code-conformance",
+  "fixture_version": 1,
+  "test_material_only": true,
+  "scope": "Code-mode envelope and transport-boundary vectors, not a production key backup or an activation-ready workspace.",
+  "parent_plan": "COMPREHENSIVE_PLAN_FOR_AIR_GAPPED_QR_WORKSPACE_TRANSFER.md",
+  "notes": [
+    "All secrets, salts, nonces, and transfer IDs are PUBLIC TEST INPUTS. Production must generate fresh random values.",
+    "Ciphertext bytes are checked by their full SHA-256 plus exact length and tag; reconstruct using the exact chosen payload and padding.",
+    "The compressed fixture fixes one valid zlib stream. Other valid compressor outputs need not produce identical ciphertext.",
+    "Successful decryption is followed by expected workspace-schema rejection. These fixtures must never publish configuration or stage a key.",
+    "Transport-boundary cases are arithmetic tests; some lengths are deliberately not valid FTAG envelope lengths.",
+    "No HPKE, fountain-algorithm, native-camera, Keychain, or full-app qualification is asserted by this fixture."
+  ],
+  "domain_separation": {
+    "code_check_ascii_with_nul": "FrankenTerm/FTAG/v1/code-check\u0000",
+    "hkdf_info_ascii": "FrankenTerm/FTAG/v1/code-key",
+    "aad_prefix_ascii_with_nul": "FrankenTerm/FTAG/v1/envelope\u0000"
+  },
+  "vectors": [
+    {
+      "name": "code-v1-codec-0",
+      "secret_hex": "000102030405060708090a0b0c0d0e0f",
+      "transfer_code": "0004-1061-050R-3GG2-8A1C-60T3-GFCM",
+      "transfer_id_hex": "303132333435363738393a3b3c3d3e3f",
+      "salt_hex": "101112131415161718191a1b1c1d1e1f",
+      "nonce_hex": "202122232425262728292a2b",
+      "archive_hex": "8501427b7d808080",
+      "codec": 0,
+      "chosen_payload_hex": "8501427b7d808080",
+      "archive_length": 8,
+      "chosen_payload_length": 8,
+      "plaintext_length": 4096,
+      "padding_length": 4079,
+      "derived_key_hex": "0b26950d986d5561d417e62b2ff5f35f86d6584c8473dbefdc7da0d6efe28936",
+      "header_hex": "4654414701010000303132333435363738393a3b3c3d3e3f00001010001c101112131415161718191a1b1c1d1e1f202122232425262728292a2b",
+      "aad_hex": "4672616e6b656e5465726d2f465441472f76312f656e76656c6f7065004654414701010000303132333435363738393a3b3c3d3e3f00001010001c101112131415161718191a1b1c1d1e1f202122232425262728292a2b",
+      "ciphertext_length_including_tag": 4112,
+      "ciphertext_sha256": "d759f276942d4ae36e7ef51ec75ed365c60d4a66fae34cb52edfb1e51b4a77a1",
+      "tag_hex": "df289a74d156fd13bd3750fcd9bc15cf",
+      "envelope_length": 4170,
+      "envelope_sha256": "67479d4af8f3ee221300eb16adc5ad2442eadaeccc562004c733c6247072fd34",
+      "comparison_value": "6747-9D4A-F8F3-EE22-1300",
+      "expected_archive_validation": "reject_not_an_activation_ready_workspace"
+    },
+    {
+      "name": "code-v1-codec-1",
+      "secret_hex": "404142434445464748494a4b4c4d4e4f",
+      "transfer_code": "2085-146H-258S-3MGJ-AA9D-64TK-JFAJ",
+      "transfer_id_hex": "707172737475767778797a7b7c7d7e7f",
+      "salt_hex": "505152535455565758595a5b5c5d5e5f",
+      "nonce_hex": "606162636465666768696a6b",
+      "archive_hex": "850159010e7b2266697874757265223a2241414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141227d808080",
+      "codec": 1,
+      "chosen_payload_hex": "78da6b658c64e4ab564acbac28292d4a55b252721ce140a9b6a1a1010044084830",
+      "archive_length": 278,
+      "chosen_payload_length": 33,
+      "plaintext_length": 4096,
+      "padding_length": 4054,
+      "derived_key_hex": "86212057bb8abf5ee9218d001a0698a077f284c3a2856089f78eb49521b1876b",
+      "header_hex": "4654414701010000707172737475767778797a7b7c7d7e7f00001010001c505152535455565758595a5b5c5d5e5f606162636465666768696a6b",
+      "aad_hex": "4672616e6b656e5465726d2f465441472f76312f656e76656c6f7065004654414701010000707172737475767778797a7b7c7d7e7f00001010001c505152535455565758595a5b5c5d5e5f606162636465666768696a6b",
+      "ciphertext_length_including_tag": 4112,
+      "ciphertext_sha256": "9d0e2608e6a9c8b477021f7e767aa0a28796f7fa503e9fc650478369793c60a8",
+      "tag_hex": "e26ce37ad28972e37051c778fe015993",
+      "envelope_length": 4170,
+      "envelope_sha256": "7666f3a5e35309598f07201154f70821a4c7a6be55a4104414c0218901131bf9",
+      "comparison_value": "7666-F3A5-E353-0959-8F07",
+      "expected_archive_validation": "reject_not_an_activation_ready_workspace"
+    }
+  ],
+  "code_boundaries": [
+    {
+      "secret_hex": "00000000000000000000000000000000",
+      "canonical_code": "0000-0000-0000-0000-0000-0000-00PR"
+    },
+    {
+      "secret_hex": "00000000000000000000000000000001",
+      "canonical_code": "0000-0000-0000-0000-0000-0000-013Y"
+    },
+    {
+      "secret_hex": "80000000000000000000000000000000",
+      "canonical_code": "4000-0000-0000-0000-0000-0000-001E"
+    },
+    {
+      "secret_hex": "ffffffffffffffffffffffffffffffff",
+      "canonical_code": "7ZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZH7"
+    }
+  ],
+  "page_boundaries": [
+    {
+      "transport_only_envelope_length": 1,
+      "page_count": 1,
+      "last_page_bytes": 1,
+      "last_page_cbor_bytes": 2,
+      "minimum_fragment_count_at_max256": 1
+    },
+    {
+      "transport_only_envelope_length": 32767,
+      "page_count": 1,
+      "last_page_bytes": 32767,
+      "last_page_cbor_bytes": 32770,
+      "minimum_fragment_count_at_max256": 129
+    },
+    {
+      "transport_only_envelope_length": 32768,
+      "page_count": 1,
+      "last_page_bytes": 32768,
+      "last_page_cbor_bytes": 32771,
+      "minimum_fragment_count_at_max256": 129
+    },
+    {
+      "transport_only_envelope_length": 32769,
+      "page_count": 2,
+      "last_page_bytes": 1,
+      "last_page_cbor_bytes": 2,
+      "minimum_fragment_count_at_max256": 1
+    },
+    {
+      "transport_only_envelope_length": 65536,
+      "page_count": 2,
+      "last_page_bytes": 32768,
+      "last_page_cbor_bytes": 32771,
+      "minimum_fragment_count_at_max256": 129
+    },
+    {
+      "transport_only_envelope_length": 65537,
+      "page_count": 3,
+      "last_page_bytes": 1,
+      "last_page_cbor_bytes": 2,
+      "minimum_fragment_count_at_max256": 1
+    },
+    {
+      "transport_only_envelope_length": 4194304,
+      "page_count": 128,
+      "last_page_bytes": 32768,
+      "last_page_cbor_bytes": 32771,
+      "minimum_fragment_count_at_max256": 129
+    }
+  ],
+  "verification": {
+    "primitive_controls": [
+      "RFC 5869 appendix A.1",
+      "RFC 8439 section 2.8.2"
+    ],
+    "envelope_roundtrips": 2,
+    "single_byte_xor1_mutations_rejected": 8340,
+    "rejected_extent_mutations": 6,
+    "wrong_secrets_rejected": 2,
+    "limitations": "Reference envelope checks only. No claim that the repository has implemented FTAG or run native tests."
+  }
+}
