@@ -31,6 +31,13 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         return try input.export(aliases: aliases ?? input.aliases, workspaceName: "Selected machines", defaultUser: "local-user",
                                 publicKeys: keys, knownHosts: known, registry: &registry, using: crypto)
     }
+    private func destination(_ alias: String, in document: WorkspaceDocument) throws -> WorkspaceDocument.Route {
+        let machine = try XCTUnwrap(document.machines.first { $0.name == alias })
+        return try XCTUnwrap(document.routes.first { $0.id == machine.preferredRouteID })
+    }
+    private func hops(_ route: WorkspaceDocument.Route, in document: WorkspaceDocument) throws -> [WorkspaceDocument.Route] {
+        try route.jumpRoutes.map { id in try XCTUnwrap(document.routes.first { $0.id == id }) }
+    }
 
     func testConcreteInventoryFirstValueWildcardNegationAndIdentityOrder() throws {
         let input = try source("""
@@ -478,6 +485,244 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         let corrupt = Data(#"{"exporterID":"same","workspaceID":"same","groupID":"group","themeID":"theme","entities":{}}"#.utf8)
         registry = try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: corrupt)
         XCTAssertThrowsError(try input.export(aliases: ["build"], workspaceName: "Fleet", defaultUser: "operator", registry: &registry, using: crypto))
+    }
+
+    func testSharedProxyJumpIncludesHopIdentityAndTrustWithoutAddingAMachine() throws {
+        let input = try source("""
+        Host build gpu
+          User target-user
+          Port 2222
+          IdentityFile ~/.ssh/fleet
+          PreferredAuthentications publickey
+          ProxyJump gate
+        Host gate
+          HostName gate.example.invalid
+          User bastion-user
+          Port 2200
+          IdentityFile ~/.ssh/gate
+          PreferredAuthentications publickey
+        """)
+        XCTAssertEqual(try input.identityFileReferences(for: ["build", "gpu"]), ["~/.ssh/fleet", "~/.ssh/gate"])
+        let known = try hashedLine("[build]:2222", seed: 8) + hashedLine("[gpu]:2222", seed: 16)
+            + hashedLine("[gate.example.invalid]:2200", seed: 24)
+        var registry = SSHWorkspaceRegistry()
+        let result = try input.export(aliases: ["build", "gpu"], workspaceName: "Fleet", defaultUser: "local-user",
+            publicKeys: ["~/.ssh/fleet": try publicFile(), "~/.ssh/gate": try publicFile(32)],
+            knownHosts: Data(known.utf8), registry: &registry, using: crypto)
+        let document = result.workspace
+        XCTAssertEqual(document.machines.map(\.name), ["build", "gpu"])
+        XCTAssertEqual(document.routes.count, 3)
+        XCTAssertEqual(document.hostTrust.count, 3)
+        XCTAssertEqual(document.credentials.count, 2)
+        let build = try destination("build", in: document), gpu = try destination("gpu", in: document)
+        XCTAssertEqual(build.jumpRoutes, gpu.jumpRoutes)
+        let gate = try XCTUnwrap(hops(build, in: document).first)
+        XCTAssertEqual(gate.host, "gate.example.invalid")
+        XCTAssertEqual(gate.user, "bastion-user")
+        XCTAssertEqual(gate.port, 2200)
+        XCTAssertNil(gate.sessionCreation)
+        XCTAssertTrue(gate.jumpRoutes.isEmpty)
+        XCTAssertNotEqual(build.credentialIDs, gate.credentialIDs)
+        XCTAssertTrue(document.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+        XCTAssertTrue(document.hostTrust.allSatisfy { $0.pins.count == 1 })
+
+        let original = try sampleKey(using: crypto).0
+        let key = PrivateKeyRecord(credentialID: try XCTUnwrap(build.credentialIDs.first), container: original.container, publicBlob: original.publicBlob)
+        let selection = try WorkspaceExportSelection(workspace: document, groupIDs: [document.initialGroupID], findings: result.portability)
+        let archive = try selection.archive(including: [key], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.routes.map(\.id), document.routes.map(\.id))
+        XCTAssertEqual(try destination("build", in: restored.workspace).jumpRoutes, build.jumpRoutes)
+        XCTAssertEqual(restored.keys.count, 1)
+        XCTAssertEqual(restored.keys[0].container, original.container)
+        XCTAssertEqual(restored.workspace.machines.map(\.name), ["build", "gpu"])
+    }
+
+    func testProxyJumpOrderExpandsFirstHopAndOverridesLaterConfiguredChains() throws {
+        // OpenSSH ssh.c passes earlier comma entries via -J to the last entry.
+        // Thus edge inherits outer, while inner's configured decoy is overridden:
+        // outer -> edge -> inner -> target. Destination options do not leak to hops.
+        let input = try source("""
+        IdentityFile none
+        Host target
+          HostName target.example.invalid
+          User target-user
+          Port 443
+          ProxyJump edge,inner
+        Host edge
+          HostName edge.example.invalid
+          User edge-user
+          ProxyJump outer
+        Host outer
+          HostName outer.example.invalid
+          Port 10022
+        Host inner
+          HostName inner.example.invalid
+          User inner-user
+          Port 2200
+          ProxyJump decoy
+        Host decoy
+          IdentityFile /not-a-dependency/decoy
+        """)
+        XCTAssertTrue(try input.identityFileReferences(for: ["target"]).isEmpty)
+        var registry = SSHWorkspaceRegistry()
+        let result = try input.export(aliases: ["target"], workspaceName: "Fleet", defaultUser: "local-user", registry: &registry, using: crypto)
+        let route = try destination("target", in: result.workspace)
+        let chain = try hops(route, in: result.workspace)
+        XCTAssertEqual(chain.map(\.host), ["outer.example.invalid", "edge.example.invalid", "inner.example.invalid"])
+        XCTAssertEqual(chain.map(\.user), ["local-user", "edge-user", "inner-user"])
+        XCTAssertEqual(chain.map(\.port), [10022, 22, 2200])
+        XCTAssertTrue(chain.allSatisfy { $0.jumpRoutes.isEmpty && $0.sessionCreation == nil })
+        XCTAssertEqual(route.sessionCreation, "on_select")
+        XCTAssertEqual(result.workspace.routes.count, 4)
+        XCTAssertEqual(result.workspace.machines.map(\.name), ["target"])
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+        XCTAssertFalse(String(decoding: result.workspace.raw, as: UTF8.self).contains("decoy"))
+    }
+
+    func testProxyCommandOverrideIsBoundToTransitContextAndNeverExecuted() throws {
+        let marker = "/tmp/frankenterm-proxy-must-not-run-" + UUID().uuidString
+        let result = try exported("""
+        IdentityFile none
+        Host target
+          ProxyJump outer,inner
+        Host direct-through-inner
+          ProxyJump inner
+        Host outer
+        Host inner
+          ProxyCommand sh -c "echo PRIVATE_COMMAND_TEXT > \(marker)"
+        """, aliases: ["target", "direct-through-inner", "inner"])
+        let target = try destination("target", in: result.workspace)
+        let viaOuter = try XCTUnwrap(hops(target, in: result.workspace).last)
+        let ordinaryInner = try destination("inner", in: result.workspace)
+        let direct = try destination("direct-through-inner", in: result.workspace)
+        let firstHop = try XCTUnwrap(hops(direct, in: result.workspace).first)
+        XCTAssertNotEqual(viaOuter.id, ordinaryInner.id)
+        XCTAssertNotEqual(viaOuter.id, firstHop.id)
+        XCTAssertEqual(viaOuter.trustID, firstHop.trustID)
+        XCTAssertEqual(viaOuter.trustID, ordinaryInner.trustID)
+        XCTAssertTrue(viaOuter.requiredCapabilities.isEmpty)
+        XCTAssertFalse(firstHop.requiredCapabilities.isEmpty)
+        XCTAssertFalse(ordinaryInner.requiredCapabilities.isEmpty)
+        let selection = try WorkspaceExportSelection(workspace: result.workspace, groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertFalse(review.blockedRouteIDs.contains(target.id))
+        XCTAssertTrue(review.blockedRouteIDs.contains(direct.id))
+        XCTAssertTrue(review.blockedRouteIDs.contains(ordinaryInner.id))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker))
+        XCTAssertFalse(String(decoding: result.workspace.raw, as: UTF8.self).contains("PRIVATE_COMMAND_TEXT"))
+        XCTAssertFalse(result.portability.contains { $0.reason.contains(marker) || $0.reason.contains("PRIVATE_COMMAND_TEXT") })
+    }
+
+    func testHopRestrictionsAndRevocationsSurviveProjectionAndBothExportFormats() throws {
+        let known = try hashedLine("gate.example.invalid", seed: 8)
+            + hashedLine("gate.example.invalid", seed: 8, marker: "@revoked") + hashedLine("target", seed: 16)
+        let result = try exported("""
+        IdentityFile none
+        Host target
+          ProxyJump gate
+        Host gate
+          HostName gate.example.invalid
+          Ciphers aes256-gcm@openssh.com
+          RevokedHostKeys /unread/required-revocations
+        """, aliases: ["target"], known: Data(known.utf8))
+        let route = try destination("target", in: result.workspace)
+        let gate = try XCTUnwrap(hops(route, in: result.workspace).first)
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first { $0.id == gate.trustID })
+        XCTAssertEqual(trust.pins, trust.revokedKeys)
+        XCTAssertEqual(trust.evaluate(try XCTUnwrap(trust.pins.first), locallyAccepted: true), .revoked)
+        for setting in ["ciphers", "revokedhostkeys"] {
+            XCTAssertTrue(result.portability.contains { $0.entityID == gate.id && $0.setting == "ssh_config." + setting && $0.disposition == 1 })
+        }
+        let selection = try WorkspaceExportSelection(workspace: result.workspace, groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        XCTAssertEqual(Set(try selection.review(decisions: [:], loadedFingerprints: []).blockedRouteIDs), Set([route.id, gate.id]))
+        let archive = try selection.archive(including: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.hostTrust.first { $0.id == gate.trustID }?.revokedKeys, trust.revokedKeys)
+        XCTAssertTrue(restored.portability.contains { $0.entityID == gate.id && $0.disposition == 1 })
+        let publicDocument = try selection.publicDocument(bundleID: "proxyjump-public")
+        for id in [route.id, gate.id] {
+            XCTAssertTrue(try XCTUnwrap(publicDocument.routes.first { $0.id == id }).requiredCapabilities.contains("source.unresolved_required_policy"))
+        }
+        XCTAssertEqual(publicDocument.machines.map(\.name), ["target"])
+    }
+
+    func testProxyJumpCyclesRepeatedAliasesAndExpandedDepthNeverPublishAUsablePrefix() throws {
+        let invalid = [
+            "ProxyJump target\n",
+            "ProxyJump a\nHost a\nProxyJump target\n",
+            "ProxyJump a,a\nHost a\n",
+            "ProxyJump a,b\nHost a\nProxyJump b\nHost b\n",
+            "ProxyJump a,b,c,d\nHost a b c d\n",
+            "ProxyJump a,b,c\nHost a\nProxyJump outer\nHost b c outer\n"
+        ]
+        for suffix in invalid {
+            let input = try source("Host target\nIdentityFile /selected/target\n" + suffix)
+            XCTAssertEqual(try input.identityFileReferences(for: ["target"]), ["/selected/target"])
+            var registry = SSHWorkspaceRegistry()
+            let result = try input.export(aliases: ["target"], workspaceName: "Fleet", defaultUser: "operator", registry: &registry, using: crypto)
+            XCTAssertEqual(result.workspace.routes.count, 1, suffix)
+            XCTAssertTrue(result.workspace.routes[0].jumpRoutes.isEmpty, suffix)
+            XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, suffix)
+            XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.proxyjump" && $0.disposition == 1 }, suffix)
+        }
+    }
+
+    func testUnsupportedProxyJumpFormsRemainExplicitBlockersAndNonePreservesPrecedence() throws {
+        for value in ["user@hop", "hop:2200", "ssh://hop", "%h", "missing", "hop,,other", "\"hop, other\"", "none,hop", "-option"] {
+            let result = try exported("Host target\nIdentityFile none\nProxyJump " + value + "\nHost hop other\nIdentityFile none\n", aliases: ["target"])
+            XCTAssertEqual(result.workspace.routes.count, 1, value)
+            XCTAssertTrue(result.workspace.routes[0].jumpRoutes.isEmpty, value)
+            XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, value)
+        }
+        let result = try exported("""
+        IdentityFile none
+        Host disabled
+          ProxyJump NONE
+          ProxyCommand must-not-execute
+        Host command-disabled
+          ProxyCommand none
+          ProxyJump unknown
+        """)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.jumpRoutes.isEmpty && $0.requiredCapabilities.isEmpty })
+    }
+
+    func testTransitIdentitiesStayStableWhenAHopBecomesASelectedMachine() throws {
+        let input = try source("IdentityFile none\nHost target\nProxyJump outer,inner\nHost outer inner\n")
+        var registry = SSHWorkspaceRegistry()
+        let first = try input.export(aliases: ["target"], workspaceName: "Fleet", defaultUser: "operator", registry: &registry, using: crypto)
+        registry = try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: JSONEncoder().encode(registry))
+        let second = try input.export(aliases: ["inner", "target"], workspaceName: "Fleet", defaultUser: "operator", registry: &registry, using: crypto)
+        let a = try destination("target", in: first.workspace), b = try destination("target", in: second.workspace)
+        XCTAssertEqual(a.id, b.id)
+        XCTAssertEqual(a.jumpRoutes, b.jumpRoutes)
+        XCTAssertEqual(try hops(a, in: first.workspace).map(\.trustID), try hops(b, in: second.workspace).map(\.trustID))
+        let inner = try destination("inner", in: second.workspace)
+        XCTAssertFalse(b.jumpRoutes.contains(inner.id))
+        XCTAssertEqual(inner.sessionCreation, "on_select")
+        XCTAssertEqual(second.workspace.hostTrust.count, first.workspace.hostTrust.count)
+        XCTAssertEqual(second.workspace.machines.map(\.name), ["inner", "target"])
+    }
+
+    func testExpandedDependencyAdmissionCannotPublishAnOversizedPartialWorkspace() throws {
+        var text = "IdentityFile none\n"
+        let selected = (0..<128).map { "target-\($0)" }
+        for name in selected {
+            text += "Host " + name + "\nProxyJump " + name + "-a," + name + "-b\nHost " + name + "-a " + name + "-b\n"
+        }
+        let input = try source(text)
+        XCTAssertThrowsError(try input.identityFileReferences(for: selected)) { error in
+            XCTAssertEqual(error as? FTError, .limit("ssh.routes"))
+        }
+        var registry = SSHWorkspaceRegistry()
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let original = try encoder.encode(registry)
+        XCTAssertThrowsError(try input.export(aliases: selected, workspaceName: "Fleet", defaultUser: "operator", registry: &registry, using: crypto)) { error in
+            XCTAssertEqual(error as? FTError, .limit("ssh.routes"))
+        }
+        XCTAssertEqual(try encoder.encode(registry), original)
     }
 
     func testSourceAdmissionBoundsMalformedSyntaxAndSelection() throws {

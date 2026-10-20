@@ -55,6 +55,7 @@ public struct SSHWorkspaceSource: Sendable {
     public static let maximumSourceBytes = 2 * 1024 * 1024
     public static let maximumLines = 16384
     public static let maximumAliases = 512
+    public static let maximumExpandedJumpHosts = 3
     public static let maximumKnownHostHashComparisons = 131_072
     public let aliases: [String]
     private let configuration: Data
@@ -76,6 +77,32 @@ public struct SSHWorkspaceSource: Sendable {
         let options: [String: [String]]
         let identities: [String]
         var problems: [Problem]
+    }
+    private enum RouteContext: String {
+        case destination = "route", firstHop = "transit_route", followingHop = "transit_via_route"
+    }
+    private struct RouteKey: Hashable {
+        let alias: String, context: RouteContext
+    }
+    private struct PlannedRoute {
+        let key: RouteKey, resolution: Resolution, jumps: [RouteKey]
+    }
+    private enum JumpFailure: Error {
+        case unsupported, unknownAlias, cycle, depth
+        var problem: Problem {
+            let reason: String
+            switch self {
+            case .unsupported:
+                reason = "ProxyJump requires a comma-separated list of bare configured aliases. User/port overrides, URIs, expansions, and ambiguous forms remain unresolved; no partial hop chain was exported."
+            case .unknownAlias:
+                reason = "A jump host has no concrete alias in the selected configuration. Its endpoint, authentication, and host policy cannot be reconstructed; no partial hop chain was exported."
+            case .cycle:
+                reason = "The expanded ProxyJump chain repeats a host alias or returns to its destination. The route remains inactive; no partial hop chain was exported."
+            case .depth:
+                reason = "The expanded ProxyJump chain exceeds the three-hop limit. The route remains inactive; no partial hop chain was exported."
+            }
+            return Problem("proxyjump", reason)
+        }
     }
     private struct PublicKey {
         let algorithm: String, blob: Data
@@ -143,14 +170,15 @@ public struct SSHWorkspaceSource: Sendable {
         self.directives = directives; globalProblems = problems
     }
 
-    /// Returns only references from the selected concrete aliases. The caller may
-    /// read matching .pub files after explicit source selection; do not enumerate
-    /// the user's .ssh directory or treat these strings as shell instructions.
+    /// Returns references from the selected concrete aliases and their complete
+    /// supported jump chains. The caller may read matching .pub files after
+    /// explicit source selection; do not enumerate the user's .ssh directory or
+    /// treat these strings as shell instructions.
     public func identityFileReferences(for selectedAliases: [String]) throws -> [String] {
         try validateSelection(selectedAliases)
         var seen = Set<String>(), result: [String] = [], budget = MatchBudget()
-        for alias in selectedAliases {
-            for reference in try resolve(alias, budget: &budget).identities where Self.localReference(reference) {
+        for route in try plan(selectedAliases, budget: &budget) {
+            for reference in route.resolution.identities where Self.localReference(reference) {
                 if seen.insert(reference).inserted { result.append(reference) }
             }
         }
@@ -186,17 +214,20 @@ public struct SSHWorkspaceSource: Sendable {
         let revision = crypto.sha256(sourceBytes).ftHex.lowercased()
         let known = try Self.knownHosts(knownHosts)
         var workingRegistry = registry, budget = MatchBudget()
+        let planned = try plan(selectedAliases, budget: &budget)
+        var routeIDs: [RouteKey: String] = [:]
+        for item in planned { routeIDs[item.key] = try workingRegistry.id(item.key.context.rawValue, item.key.alias) }
         var routes: [JSONValue] = [], machines: [JSONValue] = [], trusts: [JSONValue] = []
         var credentials: [JSONValue] = [], order: [JSONValue] = []
-        var emittedCredentials = Set<String>(), references: [String: String] = [:]
+        var emittedCredentials = Set<String>(), emittedTrusts = Set<String>(), references: [String: String] = [:]
         var portability = [AirGapArchive.Portability(entityID: registry.workspaceID, setting: "ssh_config.source_scope", disposition: 0,
             reason: "Created from the selected SSH configuration and supplied public keys/known-hosts data. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
 
-        for alias in selectedAliases {
-            let machineID = try workingRegistry.id("machine", alias)
-            let routeID = try workingRegistry.id("route", alias)
+        for item in planned {
+            let alias = item.key.alias
+            guard let routeID = routeIDs[item.key] else { throw FTError.stale }
             let trustID = try workingRegistry.id("trust", alias)
-            var resolved = try resolve(alias, budget: &budget)
+            var resolved = item.resolution
             let requestedHost = resolved.options["hostname"]?.first ?? alias
             let host: String
             let sourceHost: String
@@ -291,20 +322,28 @@ public struct SSHWorkspaceSource: Sendable {
                     disposition: problem.required ? 1 : 0, reason: problem.reason))
             }
             guard portability.count <= 1024 else { throw FTError.limit("ssh.portability") }
-            var route: [String: JSONValue] = ["id": .string(routeID), "mode": .string("direct_ssh"), "session_creation": .string("on_select"),
+            let jumps = try item.jumps.map { key -> JSONValue in
+                guard let id = routeIDs[key] else { throw FTError.stale }
+                return .string(id)
+            }
+            var route: [String: JSONValue] = ["id": .string(routeID), "mode": .string("direct_ssh"),
                 "host": .string(host), "port": .number(String(port)), "user": .string(user), "credential_refs": .array(credentialIDs),
-                "authentication_methods": .array(methods.map(JSONValue.string)), "host_trust_ref": .string(trustID), "jump_routes": .array([])]
+                "authentication_methods": .array(methods.map(JSONValue.string)), "host_trust_ref": .string(trustID), "jump_routes": .array(jumps)]
+            if item.key.context == .destination { route["session_creation"] = .string("on_select") }
             if problems.contains(where: \.required) { route["required_capabilities"] = .array([.string("ssh_config.unresolved_policy")]) }
             if let hostKeyAlias { route["host_key_alias"] = .string(hostKeyAlias) }
             routes.append(.object(route))
             var trust: [String: JSONValue] = ["id": .string(trustID), "host": .string(host), "port": .number(String(port)),
                 "claimed_source": .string("selected_known_hosts"), "pins": .array(pins), "revoked_keys": .array(revoked)]
             if let hostKeyAlias { trust["host_key_alias"] = .string(hostKeyAlias) }
-            trusts.append(.object(trust))
-            machines.append(.object(["id": .string(machineID), "name": .string(alias), "theme_ref": .string(registry.themeID),
-                "route_refs": .array([.string(routeID)]), "preferred_route_ref": .string(routeID), "auto_connect": .boolean(false),
-                "pane_selection": .string("last_surviving")]))
-            order.append(.string(machineID))
+            if emittedTrusts.insert(trustID).inserted { trusts.append(.object(trust)) }
+            if item.key.context == .destination {
+                let machineID = try workingRegistry.id("machine", alias)
+                machines.append(.object(["id": .string(machineID), "name": .string(alias), "theme_ref": .string(registry.themeID),
+                    "route_refs": .array([.string(routeID)]), "preferred_route_ref": .string(routeID), "auto_connect": .boolean(false),
+                    "pane_selection": .string("last_surviving")]))
+                order.append(.string(machineID))
+            }
         }
         guard let first = order.first else { throw FTError.malformed("ssh.selection") }
         let root = JSONValue.object(["format": .string("ftworkspace"), "version": .number("1"), "bundle_id": .string(UUID().uuidString),
@@ -326,6 +365,65 @@ public struct SSHWorkspaceSource: Sendable {
     private func validateSelection(_ selected: [String]) throws {
         guard !selected.isEmpty, selected.count <= 128, Set(selected).count == selected.count,
               selected.allSatisfy(Set(aliases).contains) else { throw FTError.malformed("ssh.selection") }
+    }
+
+    /// Resolve OpenSSH's ordered ProxyJump semantics without invoking ssh or a
+    /// shell. In ssh.c, the last listed jump is passed the preceding list with
+    /// `-J`, overriding that jump's configured proxy. Only the first listed jump
+    /// inherits its own configured ProxyJump, which may add an earlier prefix.
+    /// Flatten before publishing so every transit record supplies only endpoint,
+    /// authentication and trust, with no shell or independent nested-hop action.
+    private func plan(_ selected: [String], budget: inout MatchBudget) throws -> [PlannedRoute] {
+        let inventory = Set(aliases)
+        var cache: [String: Resolution] = [:]
+        func resolved(_ alias: String) throws -> Resolution {
+            if let value = cache[alias] { return value }
+            let value = try resolve(alias, budget: &budget)
+            cache[alias] = value
+            return value
+        }
+        func expand(_ alias: String, path: Set<String>, remaining: Int) throws -> [String] {
+            guard !path.contains(alias) else { throw JumpFailure.cycle }
+            guard let values = try resolved(alias).options["proxyjump"] else { return [] }
+            if values.count == 1, values[0].lowercased() == "none" { return [] }
+            guard values.count == 1 else { throw JumpFailure.unsupported }
+            let hops = values[0].split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+            guard hops.allSatisfy({ name in
+                !name.isEmpty && !name.hasPrefix("-") && name.lowercased() != "none" && name.utf8.allSatisfy {
+                    (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0)
+                }
+            }) else { throw JumpFailure.unsupported }
+            guard hops.allSatisfy(inventory.contains) else { throw JumpFailure.unknownAlias }
+            guard Set(hops).count == hops.count, !hops.contains(alias), !hops.contains(where: path.contains) else { throw JumpFailure.cycle }
+            guard hops.count <= remaining, let first = hops.first else { throw JumpFailure.depth }
+            let prefix = try expand(first, path: path.union([alias]), remaining: remaining - hops.count)
+            let chain = prefix + hops
+            guard Set(chain).count == chain.count else { throw JumpFailure.cycle }
+            return chain
+        }
+        var destinations: [PlannedRoute] = [], transit: [PlannedRoute] = [], retained = Set<RouteKey>()
+        for alias in selected {
+            var root = try resolved(alias)
+            let chain: [String]
+            do { chain = try expand(alias, path: [], remaining: Self.maximumExpandedJumpHosts) }
+            catch let failure as JumpFailure { root.problems.append(failure.problem); chain = [] }
+            var jumps: [RouteKey] = []
+            for (index, hop) in chain.enumerated() {
+                let key = RouteKey(alias: hop, context: index == 0 ? .firstHop : .followingHop)
+                jumps.append(key)
+                guard retained.insert(key).inserted else { continue }
+                var policy = try resolved(hop)
+                if index > 0 {
+                    // The explicit earlier prefix replaces this otherwise
+                    // configured ProxyCommand; no command is executed.
+                    policy.problems.removeAll { $0.setting == "proxycommand" }
+                }
+                transit.append(PlannedRoute(key: key, resolution: policy, jumps: []))
+                guard selected.count + transit.count <= 256 else { throw FTError.limit("ssh.routes") }
+            }
+            destinations.append(PlannedRoute(key: RouteKey(alias: alias, context: .destination), resolution: root, jumps: jumps))
+        }
+        return destinations + transit
     }
 
     private func resolve(_ alias: String, budget: inout MatchBudget) throws -> Resolution {
@@ -357,7 +455,11 @@ public struct SSHWorkspaceSource: Sendable {
             switch key {
             case "hostname", "port", "user", "hostkeyalias", "preferredauthentications", "pubkeyauthentication", "passwordauthentication", "kbdinteractiveauthentication", "identitiesonly":
                 if arguments.count != 1 { problems.append(Problem(key, "This SSH setting requires exactly one value; its semantics remain unresolved.")) }
-            case "proxycommand", "proxyjump", "identityagent", "pkcs11provider", "securitykeyprovider", "remotecommand":
+            case "proxyjump":
+                // The complete ordered dependency planner validates this value
+                // in its actual destination/transit context before publication.
+                break
+            case "proxycommand", "identityagent", "pkcs11provider", "securitykeyprovider", "remotecommand":
                 if arguments != ["none"] { problems.append(Problem(key, "This route depends on an unsupported proxy, agent, external key provider, or command. No executable value was exported.")) }
             case "canonicalizehostname", "checkhostip", "forwardagent", "forwardx11", "forwardx11trusted", "gssapiauthentication", "hostbasedauthentication", "permitlocalcommand", "batchmode":
                 if arguments != ["no"] { problems.append(Problem(key, "This enabled SSH behavior is not represented by the mobile route and must be resolved explicitly.")) }
