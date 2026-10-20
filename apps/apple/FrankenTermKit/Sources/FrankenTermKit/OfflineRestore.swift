@@ -6,6 +6,22 @@ public enum OfflineRestorePhase: String, Sendable {
 
 public enum OfflineRestoreSource: String, Sendable { case optical, encryptedFile, workspaceDocument }
 
+/// Both public-file export and import compare the exact saved bytes. This is a
+/// domain-separated checksum, not authentication of a self-asserted exporter.
+public enum PublicWorkspaceIdentity {
+    public static func digest<C: AirGapCryptography>(data: Data, using crypto: C) throws -> Data {
+        guard !data.isEmpty, data.count <= FTLimit.manifest else { throw FTError.limit("workspace.identity_bytes") }
+        return crypto.sha256(Data("FrankenTerm/ftworkspace/v1/document\0".utf8) + data)
+    }
+    public static func comparison<C: AirGapCryptography>(data: Data, using crypto: C) throws -> String {
+        comparison(digest: try digest(data: data, using: crypto))
+    }
+    fileprivate static func comparison(digest: Data) -> String {
+        let chars = Array(digest.ftHex.prefix(20))
+        return stride(from: 0, to: chars.count, by: 4).map { String(chars[$0..<min($0 + 4, chars.count)]) }.joined(separator: "-")
+    }
+}
+
 /// Public preview deliberately carries no private containers or transfer code.
 public struct OfflineRestoreReview: Sendable {
     public let token: UUID
@@ -70,10 +86,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
     private var reviewFallback: OfflineRestorePhase { source == .workspaceDocument ? .documentReady : .locked }
 
     public func status() -> OfflineRestoreStatus {
-        let comparison = importDigest.map { digest in
-            let chars = Array(digest.ftHex.prefix(20))
-            return stride(from: 0, to: chars.count, by: 4).map { String(chars[$0..<$0 + 4]) }.joined(separator: "-")
-        }
+        let comparison = importDigest.map { PublicWorkspaceIdentity.comparison(digest: $0) }
         return .init(generation: generation, phase: phase, isSuspended: suspended, source: source, identity: identity,
                      comparison: comparison, encryptionMode: encryptionMode, recipientRequest: recipientSession?.request,
                      requiresRecipientResume: suspended && recipientSession != nil,
@@ -175,7 +188,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
         let document = try WorkspaceDocument(data: data)
         let decoded = try AirGapArchive(workspace: document, keys: [], using: crypto)
         documentData = document.raw
-        documentDigest = crypto.sha256(Data("FrankenTerm/ftworkspace/v1/document\0".utf8) + data)
+        documentDigest = try PublicWorkspaceIdentity.digest(data: data, using: crypto)
         source = .workspaceDocument
         return try await prepareReview(decoded, generation: token)
     }

@@ -153,6 +153,14 @@ final class OfflineRestoreTests: XCTestCase {
         let ready = try await restore.acceptWorkspaceDocument(document, generation: initial.generation)
         XCTAssertEqual(ready.phase, .review); XCTAssertEqual(ready.source, .workspaceDocument)
         XCTAssertNil(ready.identity); XCTAssertEqual(ready.verifiedPages, 0); XCTAssertEqual(ready.verifiedBytes, 0)
+        XCTAssertEqual(ready.comparison, try PublicWorkspaceIdentity.comparison(data: document, using: crypto))
+        let expectedDigest = crypto.sha256(Data("FrankenTerm/ftworkspace/v1/document\0".utf8) + document)
+        XCTAssertEqual(try PublicWorkspaceIdentity.digest(data: document, using: crypto), expectedDigest)
+        XCTAssertNotEqual(expectedDigest, crypto.sha256(document), "public imports keep their established domain-separated history identity")
+        let equivalentBytes = document + Data("\n".utf8)
+        XCTAssertEqual(try WorkspaceDocument(data: equivalentBytes).id, try WorkspaceDocument(data: document).id)
+        XCTAssertNotEqual(try PublicWorkspaceIdentity.comparison(data: equivalentBytes, using: crypto), ready.comparison,
+                          "comparison covers exact file bytes, including whitespace")
         let review = try XCTUnwrap(ready.review)
         XCTAssertEqual(review.document.groups[0].machineOrder, ["build", "gpu"])
         XCTAssertTrue(review.includedFingerprints.isEmpty)
@@ -164,6 +172,7 @@ final class OfflineRestoreTests: XCTestCase {
         } catch { XCTAssertEqual(error as? WorkspaceStoreError, .reviewRequired) }
         let committed = try await restore.commit(reviewToken: review.token, generation: ready.generation, sourceAndContentsConfirmed: true)
         let receipt = try XCTUnwrap(committed.receipt)
+        XCTAssertEqual(receipt.workspace.envelopeDigest, expectedDigest)
         XCTAssertEqual(committed.phase, .complete)
         XCTAssertEqual(receipt.missingCredentialIDs, ["key"])
         XCTAssertTrue(receipt.workspace.connectLater)

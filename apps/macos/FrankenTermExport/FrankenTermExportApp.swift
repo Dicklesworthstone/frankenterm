@@ -9,6 +9,21 @@ import FrankenTermKit
 
 private typealias SourceKeyUnlockRequest = OpenSSHSourceKeyUnlocker<AppleCryptography>.Request
 
+private enum ExportSourceSheet: Identifiable {
+    case sshHosts(UUID), keyUnlock(SourceKeyUnlockRequest), recipientCamera(UUID)
+    var id: UUID {
+        switch self {
+        case let .sshHosts(id): return id
+        case let .keyUnlock(request): return request.id
+        case let .recipientCamera(id): return id
+        }
+    }
+}
+
+private enum ExportProtection: Sendable, Hashable {
+    case code, recipient
+}
+
 @main
 @MainActor
 struct FrankenTermExportApp: App {
@@ -20,12 +35,9 @@ struct FrankenTermExportApp: App {
     }
 }
 
-private enum ExportProtection: Sendable, Hashable {
-    case code, recipient
-}
-
 /// File reads, parsing, key validation, compression and encryption remain off UI.
-/// Only explicitly chosen workspace, key, and recipient-image files are opened.
+/// SSH source selection reads only the chosen config, its referenced public
+/// identities, and the user's known_hosts. Private files require a separate pick.
 private actor MacExportEngine {
     struct Prepared: Sendable {
         let comparison: String, pages: Int, bytes: Int
@@ -37,6 +49,7 @@ private actor MacExportEngine {
         let decisions: [String: WorkspaceExportSelection.IdentityDecision]
         let loadedFingerprints: Set<String>
         let review: WorkspaceExportSelection.Review
+        let identityReferences: [String: String]
     }
     enum KeyLoadResult: Sendable {
         case loaded(SelectionState), passphraseRequired(SourceKeyUnlockRequest)
@@ -52,6 +65,9 @@ private actor MacExportEngine {
     private var pendingKeyInstallation: PendingKeyInstallation?
     private var document: WorkspaceDocument?
     private var selection: WorkspaceExportSelection?
+    private var sourceFindings: [AirGapArchive.Portability] = []
+    private var identityReferences: [String: String] = [:]
+    private var sshSource: (source: SSHWorkspaceSource, url: URL)?
     private var decisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     private var keys: [PrivateKeyRecord] = []
     private var exportedEnvelope: Data?
@@ -65,7 +81,8 @@ private actor MacExportEngine {
         guard let document, let selection else { throw FTError.stale }
         let loaded = Set(keys.map(fingerprint))
         return .init(source: document, selection: selection, decisions: decisions, loadedFingerprints: loaded,
-                     review: try selection.review(decisions: decisions, loadedFingerprints: loaded))
+                     review: try selection.review(decisions: decisions, loadedFingerprints: loaded),
+                     identityReferences: identityReferences)
     }
     func invalidateExport() { exportedEnvelope = nil; transferCode = nil; sender = nil }
     private func retireKeyRequest() {
@@ -80,12 +97,82 @@ private actor MacExportEngine {
         let candidate = try WorkspaceDocument(data: SelectedLocalFile.read(url, limit: FTLimit.manifest))
         let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: [candidate.initialGroupID])
         document = candidate; selection = selected; decisions = [:]; keys = []; invalidateExport()
+        sourceFindings = []; identityReferences = [:]; sshSource = nil
+        return try state()
+    }
+    func inspectSSHConfiguration(_ url: URL) throws -> [String] {
+        retireKeyRequest(); invalidateExport()
+        sshSource = nil
+        let source = try SSHWorkspaceSource(configuration: SelectedLocalFile.read(url, limit: SSHWorkspaceSource.maximumSourceBytes))
+        guard !source.aliases.isEmpty else { throw FTError.unsupported("ssh.no_concrete_hosts") }
+        try Task.checkCancellation()
+        sshSource = (source, url)
+        return source.aliases
+    }
+    func cancelSSHSelection() { retireKeyRequest(); sshSource = nil }
+    static func identityURL(_ reference: String) -> URL? {
+        guard !reference.contains("%"), !reference.contains("$"), !reference.contains("\0") else { return nil }
+        if reference.hasPrefix("~/") {
+            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(String(reference.dropFirst(2)))
+        }
+        guard reference.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: reference)
+    }
+    func loadSSHSelection(_ aliases: [String]) throws -> SelectionState {
+        retireKeyRequest(); invalidateExport()
+        guard let pending = sshSource else { throw FTError.stale }
+        var publicKeys: [String: Data] = [:]
+        for reference in try pending.source.identityFileReferences(for: aliases) {
+            try Task.checkCancellation()
+            guard let identity = Self.identityURL(reference) else { continue }
+            let url = identity.pathExtension == "pub" ? identity : identity.appendingPathExtension("pub")
+            do { publicKeys[reference] = try SelectedLocalFile.read(url, limit: FTLimit.key) }
+            catch is CancellationError { throw CancellationError() }
+            catch { /* The source reports missing public identities explicitly. */ }
+        }
+        let knownHostsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/known_hosts")
+        let knownHosts: Data?
+        do { knownHosts = try SelectedLocalFile.read(knownHostsURL, limit: SSHWorkspaceSource.maximumSourceBytes) }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            let code = (error as? CocoaError)?.code
+            if code == .fileNoSuchFile || code == .fileReadNoSuchFile || (error as? POSIXError)?.code == .ENOENT {
+                knownHosts = nil
+            } else {
+                // An unreadable revocation source is not equivalent to no file.
+                throw FTError.unsupported("ssh.known_hosts_unreadable")
+            }
+        }
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                  appropriateFor: nil, create: true)
+        let sourceID = crypto.sha256(Data(pending.url.standardizedFileURL.path.utf8)).map { String(format: "%02x", $0) }.joined()
+        let storage = try FileWorkspacePersistence(directory: support.appendingPathComponent("FrankenTermExport/ssh-" + sourceID))
+        let (candidate, selected): (SSHWorkspaceExport, WorkspaceExportSelection) = try storage.withExclusiveAccess {
+            var registry = try storage.read(.catalog, limit: FTLimit.manifest).map {
+                try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: $0)
+            } ?? SSHWorkspaceRegistry()
+            let result = try pending.source.export(aliases: aliases, workspaceName: "SSH Machines", defaultUser: NSUserName(),
+                publicKeys: publicKeys, knownHosts: knownHosts, registry: &registry, using: crypto)
+            let selected = try WorkspaceExportSelection(workspace: result.workspace,
+                groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+            _ = try selected.review(decisions: [:], loadedFingerprints: [])
+            let bytes = try JSONEncoder().encode(registry)
+            guard bytes.count <= FTLimit.manifest else { throw FTError.limit("ssh.registry") }
+            try Task.checkCancellation()
+            // Publish stable IDs durably before exposing the reviewed snapshot.
+            try storage.write(bytes, to: .catalog)
+            return (result, selected)
+        }
+        try Task.checkCancellation()
+        document = candidate.workspace; selection = selected; sourceFindings = candidate.portability
+        identityReferences = candidate.identityReferences; sshSource = nil
+        decisions = [:]; keys = []; invalidateExport()
         return try state()
     }
     func selectGroups(_ ids: Set<String>) throws -> SelectionState {
         retireKeyRequest(); invalidateExport()
         guard let document else { throw FTError.stale }
-        let selected = try WorkspaceExportSelection(workspace: document, groupIDs: ids)
+        let selected = try WorkspaceExportSelection(workspace: document, groupIDs: ids, findings: sourceFindings)
         let retained = Set(selected.identities.map(\.fingerprint))
         // A group change removes private material no longer referenced anywhere
         // in the selected dependency graph. It also invalidates the sealed export.
@@ -150,8 +237,7 @@ private actor MacExportEngine {
         _ = try AirGapArchive(workspace: document, keys: next, using: crypto)
         try Task.checkCancellation()
         // Keep the old state until the foreground UI accepts this exact result.
-        // Cancellation after the KDF returns but before that handoff rolls back
-        // only this operation's installation, including a replaced identity.
+        // Cancellation before that handoff restores only this operation's keys.
         pendingKeyInstallation = .init(requestID: requestID, previousKeys: keys, previousDecisions: decisions)
         keys = next; decisions[selectedFingerprint] = .includePrivateKey; invalidateExport()
         return try state()
@@ -227,16 +313,30 @@ private actor MacExportEngine {
         return exportedEnvelope
     }
     func saveEncryptedFile(to url: URL) throws {
-        guard url.isFileURL, let exportedEnvelope else { throw FTError.stale }
+        guard let exportedEnvelope else { throw FTError.stale }
+        try save(exportedEnvelope, to: url)
+    }
+    func savePublicWorkspace(to url: URL) throws -> String {
+        guard let selection else { throw FTError.stale }
+        let publicDocument = try selection.publicDocument(bundleID: UUID().uuidString)
+        try Task.checkCancellation()
+        try save(publicDocument.raw, to: url)
+        return try PublicWorkspaceIdentity.comparison(data: publicDocument.raw, using: crypto)
+    }
+    private func save(_ bytes: Data, to url: URL) throws {
+        guard url.isFileURL else { throw FTError.stale }
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         // Deliberate new-file save only. Never overwrite another backup silently.
-        try exportedEnvelope.write(to: url, options: .withoutOverwriting)
+        try bytes.write(to: url, options: .withoutOverwriting)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         let handle = try FileHandle(forWritingTo: url)
         try handle.synchronize(); try handle.close()
     }
-    func clear() { retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []; invalidateExport() }
+    func clear() {
+        retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []
+        sourceFindings = []; identityReferences = [:]; sshSource = nil; invalidateExport()
+    }
 }
 
 @MainActor
@@ -247,6 +347,12 @@ private final class MacExportModel {
     var identityDecisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     var exportReview: WorkspaceExportSelection.Review?
     var includedFingerprints = Set<String>()
+    var identityReferences: [String: String] = [:]
+    var sshAliases: [String] = []
+    var selectedSSHAliases = Set<String>()
+    var sshSearch = ""
+    var sourceSheet: ExportSourceSheet?
+    var keyUnlockRequest: SourceKeyUnlockRequest?
     var prepared: MacExportEngine.Prepared?
     var symbol: QRCodeSymbol?
     var revealedCode: String?
@@ -264,7 +370,6 @@ private final class MacExportModel {
     private(set) var scanningRecipient = false
     private(set) var requestingCameraAccess = false
     private(set) var recipientScanID = UUID()
-    var keyUnlockRequest: SourceKeyUnlockRequest?
     @ObservationIgnored private let engine = MacExportEngine()
     @ObservationIgnored private let renderer = NativeOpticalPresentation()
     @ObservationIgnored private let videoRenderer = NativeOpticalVideo()
@@ -275,14 +380,19 @@ private final class MacExportModel {
     @ObservationIgnored private var foreground = true
     @ObservationIgnored private var cameraPermission: Task<Void, Never>?
     @ObservationIgnored private var sourceKeyOperation: UUID?
+    @ObservationIgnored private var sshSelectionID: UUID?
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
     var destinationReady: Bool {
         protection == .code || (recipientRequest != nil && recipientConfirmed)
     }
+    var filteredSSHAliases: [String] {
+        sshSearch.isEmpty ? sshAliases : sshAliases.filter { $0.localizedCaseInsensitiveContains(sshSearch) }
+    }
     private func apply(_ result: MacExportEngine.SelectionState) {
         document = result.source; selection = result.selection; identityDecisions = result.decisions
         includedFingerprints = result.loadedFingerprints; exportReview = result.review
+        identityReferences = result.identityReferences
         prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
     }
     private func invalidatePrepared() {
@@ -290,16 +400,30 @@ private final class MacExportModel {
     }
     private func retireSourceKeyPrompt() {
         sourceKeyOperation = nil; keyUnlockRequest = nil
+        if case .some(.keyUnlock(_)) = sourceSheet { sourceSheet = nil }
+    }
+    private func retireSSHSelection() {
+        sshSelectionID = nil; sshAliases = []; selectedSSHAliases = []; sshSearch = ""
+        if case .some(.sshHosts(_)) = sourceSheet { sourceSheet = nil }
+    }
+    func sourceSheetDismissed(_ sheet: ExportSourceSheet) {
+        // The content retains its own ID after SwiftUI clears the presentation.
+        // A late dismissal cannot cancel a newly selected file or source.
+        switch sheet {
+        case let .sshHosts(id): dismissSSHSelection(id: id)
+        case let .keyUnlock(request): cancelKeyUnlock(requestID: request.id)
+        case let .recipientCamera(id): cancelRecipientScan(scanID: id)
+        }
     }
 
     func selectProtection(_ value: ExportProtection) {
-        guard !busy, sourceKeyOperation == nil, value != protection else { return }
+        guard !busy, sourceSheet == nil, sourceKeyOperation == nil, value != protection else { return }
         cancelRecipientScan(); invalidatePrepared()
         protection = value; recipientRequest = nil; recipientComparison = nil; recipientConfirmed = false
         perform { [self] in await engine.invalidateExport() }
     }
     func confirmRecipient(_ value: Bool) {
-        guard !busy, sourceKeyOperation == nil, protection == .recipient, recipientRequest != nil else { return }
+        guard !busy, sourceSheet == nil, sourceKeyOperation == nil, protection == .recipient, recipientRequest != nil else { return }
         // Approval belongs to this exact parsed request. Replacing it, changing
         // modes, or withdrawing confirmation also invalidates the sealed export.
         invalidatePrepared(); recipientConfirmed = value
@@ -314,15 +438,21 @@ private final class MacExportModel {
         recipientConfirmed = false; approveSelectedKeys = false
         message = "Compare the recipient value directly with the iPhone before approving this destination."
     }
+    private func presentRecipientCamera(scanID: UUID) {
+        guard foreground, protection == .recipient, recipientScanID == scanID,
+              sourceSheet == nil, sourceKeyOperation == nil, sshSelectionID == nil else { return }
+        scanningRecipient = true; sourceSheet = .recipientCamera(scanID)
+    }
     func scanRecipientWithCamera() {
-        guard !busy, foreground, sourceKeyOperation == nil, protection == .recipient, !requestingCameraAccess else { return }
+        guard !busy, foreground, sourceSheet == nil, sourceKeyOperation == nil,
+              protection == .recipient, !requestingCameraAccess else { return }
         resetRecipient()
         let token = recipientScanID
         perform { [self] in
             await engine.invalidateExport()
             guard foreground, protection == .recipient, recipientScanID == token else { return }
             let status = AVCaptureDevice.authorizationStatus(for: .video)
-            if status == .authorized { scanningRecipient = true; return }
+            if status == .authorized { presentRecipientCamera(scanID: token); return }
             guard status == .notDetermined else {
                 message = "Camera access is denied or restricted. Allow FrankenTerm Export in System Settings, or scan a local image of the phone’s recipient QR."
                 return
@@ -333,27 +463,32 @@ private final class MacExportModel {
                 guard let self, self.recipientScanID == token else { return }
                 self.requestingCameraAccess = false; self.cameraPermission = nil
                 guard !Task.isCancelled, self.foreground, self.protection == .recipient else { return }
-                if granted { self.scanningRecipient = true }
+                if granted { self.presentRecipientCamera(scanID: token) }
                 else { self.message = "Camera access was not granted. You can scan a local image of the recipient QR, or use a generated transfer code." }
             }
         }
     }
-    func cancelRecipientScan() {
+    func cancelRecipientScan(scanID: UUID? = nil) {
+        if let scanID, scanID != recipientScanID { return }
         recipientScanID = UUID(); scanningRecipient = false; requestingCameraAccess = false
         cameraPermission?.cancel(); cameraPermission = nil
+        if case .some(.recipientCamera(_)) = sourceSheet { sourceSheet = nil }
     }
     func receiveRecipient(_ text: String, scanID: UUID) {
-        guard foreground, !busy, protection == .recipient, scanningRecipient, recipientScanID == scanID else { return }
-        cancelRecipientScan()
+        guard foreground, !busy, protection == .recipient, scanningRecipient,
+              sourceSheet?.id == scanID, recipientScanID == scanID else { return }
+        cancelRecipientScan(scanID: scanID)
         do { acceptRecipient(try RecipientRequest(text: text)) }
         catch { report(error) }
     }
     func recipientCameraFailed(_ error: FTError, scanID: UUID) {
-        guard scanningRecipient, recipientScanID == scanID else { return }
-        cancelRecipientScan(); report(error)
+        guard scanningRecipient, sourceSheet?.id == scanID, recipientScanID == scanID else { return }
+        cancelRecipientScan(scanID: scanID); report(error)
     }
     func scanRecipientImage() {
-        guard !busy, sourceKeyOperation == nil, protection == .recipient else { return }
+        guard !busy, sourceSheet == nil, sourceKeyOperation == nil, protection == .recipient else { return }
+        // A delayed camera-permission callback must not present over a file panel.
+        cancelRecipientScan()
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.png, .jpeg, .heic]
         panel.message = "Choose a local image containing only the iPhone’s FrankenTerm recipient-request QR. You must compare its recipient value with the phone before exporting."
@@ -369,17 +504,56 @@ private final class MacExportModel {
     }
 
     func chooseWorkspace() {
-        guard !busy else { return }
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan()
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json, .data]; panel.message = "Choose a local .ftworkspace JSON document. Executable Mac configuration is never evaluated."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
+        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] in
             apply(try await engine.loadWorkspace(url))
         }
     }
-    func selectGroup(_ id: String, included: Bool) {
+    func chooseSSHConfiguration() {
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan()
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+        panel.message = "Choose an SSH config, then select its hosts. This reads matching public .pub files and ~/.ssh/known_hosts. Private keys are chosen separately; commands and Include files are not evaluated."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
+        perform { [self] in
+            let aliases = try await engine.inspectSSHConfiguration(url)
+            do { try Task.checkCancellation() }
+            catch { await engine.cancelSSHSelection(); throw error }
+            guard foreground else { await engine.cancelSSHSelection(); throw CancellationError() }
+            sshAliases = aliases
+            selectedSSHAliases = sshAliases.count <= 128 ? Set(sshAliases) : []
+            let id = UUID(); sshSelectionID = id; sshSearch = ""; sourceSheet = .sshHosts(id)
+        }
+    }
+    func selectSSHAlias(_ alias: String, included: Bool) {
         guard !busy else { return }
+        if included, selectedSSHAliases.count < 128 { selectedSSHAliases.insert(alias) }
+        else if !included { selectedSSHAliases.remove(alias) }
+    }
+    func importSelectedSSHHosts() {
+        guard !busy, sshSelectionID != nil, !selectedSSHAliases.isEmpty, selectedSSHAliases.count <= 128 else { return }
+        let aliases = sshAliases.filter { selectedSSHAliases.contains($0) }
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
+        perform { [self] in
+            apply(try await engine.loadSSHSelection(aliases))
+            retireSSHSelection()
+        }
+    }
+    func dismissSSHSelection(id: UUID? = nil) {
+        guard !busy, let current = sshSelectionID, id == nil || id == current else { return }
+        cancelRecipientScan(); retireSourceKeyPrompt(); retireSSHSelection()
+        perform { [self] in await engine.cancelSSHSelection() }
+    }
+    func selectGroup(_ id: String, included: Bool) {
+        guard !busy, sourceSheet == nil else { return }
         var groups = selectedGroupIDs
         if included { groups.insert(id) } else { groups.remove(id) }
         guard !groups.isEmpty else { return }
@@ -387,16 +561,23 @@ private final class MacExportModel {
         perform { [self] in apply(try await engine.selectGroups(groups)) }
     }
     func decide(_ value: WorkspaceExportSelection.IdentityDecision, fingerprint: String) {
-        guard !busy else { return }
+        guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         perform { [self] in apply(try await engine.decide(value, fingerprint: fingerprint)) }
     }
     func chooseKey(_ credentialID: String) {
-        guard !busy else { return }
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan()
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        if let reference = identityReferences[credentialID], let hint = MacExportEngine.identityURL(reference) {
+            let privateHint = hint.pathExtension == "pub" ? hint.deletingPathExtension() : hint
+            panel.directoryURL = privateHint.deletingLastPathComponent()
+            panel.nameFieldStringValue = privateHint.lastPathComponent
+        }
         panel.message = "Choose the matching OpenSSH Ed25519 or ECDSA key (P-256, P-384, or P-521). Protected files using bcrypt and AES-CTR are unlocked locally after you enter their passphrase."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
+        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
         perform { [self] in
             do {
@@ -407,7 +588,8 @@ private final class MacExportModel {
                 case let .loaded(state):
                     retireSourceKeyPrompt(); apply(state)
                     await engine.acknowledgeKey(operationID: token)
-                case let .passphraseRequired(request): keyUnlockRequest = request
+                case let .passphraseRequired(request):
+                    keyUnlockRequest = request; sourceSheet = .keyUnlock(request)
                 }
             } catch {
                 await engine.cancelKeyUnlock(operationID: token)
@@ -417,23 +599,27 @@ private final class MacExportModel {
         }
     }
     func unlockSourceKey(requestID: UUID, passphrase: Data) {
-        guard !busy, foreground, keyUnlockRequest?.id == requestID, let token = sourceKeyOperation else { return }
+        guard !busy, foreground, sourceSheet?.id == requestID, keyUnlockRequest?.id == requestID,
+              let token = sourceKeyOperation else { return }
         perform { [self] in
             var secret = passphrase
             defer { secret.resetBytes(in: 0..<secret.count) }
             do {
                 let result = try await engine.unlockKey(operationID: token, requestID: requestID, passphrase: secret)
                 try Task.checkCancellation()
-                guard foreground, sourceKeyOperation == token, keyUnlockRequest?.id == requestID else { throw CancellationError() }
+                guard foreground, sourceSheet?.id == requestID, sourceKeyOperation == token,
+                      keyUnlockRequest?.id == requestID else { throw CancellationError() }
                 retireSourceKeyPrompt(); apply(result)
                 await engine.acknowledgeKey(operationID: token)
             } catch {
                 let remaining = await engine.pendingKeyRequest(operationID: token)
-                if !Task.isCancelled, foreground, sourceKeyOperation == token, keyUnlockRequest?.id == requestID {
-                    keyUnlockRequest = remaining
-                    if remaining == nil { sourceKeyOperation = nil }
+                if !Task.isCancelled, foreground, sourceSheet?.id == requestID,
+                   sourceKeyOperation == token, keyUnlockRequest?.id == requestID,
+                   let remaining {
+                    keyUnlockRequest = remaining; sourceSheet = .keyUnlock(remaining)
                 } else {
                     await engine.cancelKeyUnlock(operationID: token, requestID: requestID)
+                    if sourceKeyOperation == token { retireSourceKeyPrompt() }
                 }
                 throw error
             }
@@ -442,14 +628,14 @@ private final class MacExportModel {
     func cancelKeyUnlock(requestID: UUID) {
         guard keyUnlockRequest?.id == requestID, let token = sourceKeyOperation else { return }
         work?.cancel(); retireSourceKeyPrompt()
-        // Bound to the dismissed request: a late sheet callback cannot discard
-        // the next file selected by the user.
+        // Bind cancellation to the dismissed request rather than the next file.
         Task { await engine.cancelKeyUnlock(operationID: token, requestID: requestID) }
     }
     func prepare() {
-        guard !busy, foreground, sourceKeyOperation == nil, approveSelectedKeys,
-              exportReview?.canPrepare == true, destinationReady else { return }
+        guard !busy, foreground, sourceSheet == nil, sourceKeyOperation == nil,
+              approveSelectedKeys, exportReview?.canPrepare == true, destinationReady else { return }
         let recipient = protection == .recipient ? recipientRequest : nil
+        retireSourceKeyPrompt()
         pause(); revealedCode = nil; prepared = nil; emitted = 0; repairPage = -1
         perform { [self] in
             let result = try await engine.prepare(recipient: recipient)
@@ -506,8 +692,8 @@ private final class MacExportModel {
             pause(); revealedCode = nil; cancelRecipientScan()
             if let token = sourceKeyOperation {
                 work?.cancel(); retireSourceKeyPrompt()
-                // A pending read or KDF checks cancellation before installing a
-                // result. Retire its encrypted source after the bounded worker.
+                // The bounded worker checks cancellation before installing its
+                // result; retire the selected source once that worker returns.
                 Task { await engine.cancelKeyUnlock(operationID: token) }
             }
         }
@@ -526,6 +712,18 @@ private final class MacExportModel {
             message = recipientOnly
                 ? "Encrypted workspace saved for the confirmed iPhone. Its active request key is required; this file is not an independent recovery backup."
                 : "Encrypted workspace saved. The transfer code is not included in this file."
+        }
+    }
+    func savePublicWorkspace() {
+        guard !busy, sourceSheet == nil, selection != nil else { return }
+        cancelRecipientScan()
+        pause(); revealedCode = nil
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Workspace.ftworkspace"
+        panel.message = "Save selected hosts, groups, public identities, and trust policy without private keys. The document is unencrypted. Check its file comparison value on your phone before importing. Choose a new filename."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        perform { [self] in
+            let comparison = try await engine.savePublicWorkspace(to: url)
+            message = "Public workspace saved without private keys. Compare this exact value on your phone through a trusted separate channel: " + comparison
         }
     }
     func saveAnimation() {
@@ -568,9 +766,10 @@ private final class MacExportModel {
     }
     func clear() {
         guard !busy else { return }
-        retireSourceKeyPrompt(); resetRecipient(); protection = .code
+        retireSourceKeyPrompt(); retireSSHSelection(); resetRecipient(); protection = .code
         document = nil; selection = nil; identityDecisions = [:]; exportReview = nil
         includedFingerprints = []; prepared = nil; approveSelectedKeys = false; repairPage = -1
+        identityReferences = [:]
         perform { [self] in await engine.clear() }
     }
     private func report(_ error: Error) {
@@ -589,6 +788,10 @@ private final class MacExportModel {
                 message = "This package exceeds the bounded video duration or symbol count. Select fewer groups or identities, use live playback, or save the encrypted .ftairgap file. The package was not truncated."
             } else if error == .unsupported("video.published_durability_unconfirmed") {
                 message = "The MP4 was verified and saved. The filesystem could not confirm that the directory change would survive a sudden system failure. The completed movie is retained at the selected destination."
+            } else if error == .unsupported("ssh.no_concrete_hosts") {
+                message = "This config has no concrete Host aliases to select. Wildcard-only definitions need named hosts in the selected file; included files are not evaluated."
+            } else if error == .unsupported("ssh.known_hosts_unreadable") {
+                message = "The public ~/.ssh/known_hosts file could not be read safely. Check its access and size before exporting so host revocations are not silently lost."
             } else if error == .unsupported("recipient.camera") {
                 message = "A camera with QR scanning is unavailable. Choose a local image of the phone’s recipient-request QR, or use a generated transfer code."
             } else if error == .unsupported("recipient.camera_interrupted") {
@@ -619,6 +822,7 @@ private struct MacExportView: View {
                 HStack {
                     Label("FrankenTerm", systemImage: "terminal.fill").font(.largeTitle.bold())
                     Spacer()
+                    Button("Import SSH Config…") { model.chooseSSHConfiguration() }.disabled(model.busy)
                     Button("Open Workspace…") { model.chooseWorkspace() }.disabled(model.busy)
                 }
                 Text("Offline workspace transfer").font(.title2).foregroundStyle(.secondary)
@@ -626,7 +830,7 @@ private struct MacExportView: View {
                     exportChoices(document)
                 } else {
                     ContentUnavailableView("Choose a workspace", systemImage: "rectangle.3.group",
-                        description: Text("Open a local .ftworkspace document, then explicitly select its matching private keys. Nothing is read from your SSH folder automatically."))
+                        description: Text("Open a local .ftworkspace document, or import selected hosts from an SSH config with their public identities and known_hosts policy. Private keys always require a separate choice."))
                 }
                 if let prepared = model.prepared {
                     HStack {
@@ -691,27 +895,61 @@ private struct MacExportView: View {
                 if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
             }.padding(28)
         }.frame(minWidth: 760, minHeight: 680)
-            .sheet(isPresented: Binding(get: { model.scanningRecipient }, set: { if !$0 { model.cancelRecipientScan() } })) {
-                let scanID = model.recipientScanID
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Scan this iPhone’s request").font(.title2.bold())
-                    Text("On the iPhone, open the recipient-request QR in FrankenTerm. Hold it in front of this Mac’s camera. Only a FrankenTerm recipient request is accepted.")
-                        .font(.callout)
-                    RecipientRequestCamera(onRequest: { model.receiveRecipient($0, scanID: scanID) },
-                                           onError: { model.recipientCameraFailed($0, scanID: scanID) })
-                        .id(scanID).frame(width: 640, height: 360).clipShape(RoundedRectangle(cornerRadius: 12))
-                    Text("Camera frames stay on this Mac. Scanning stops after one candidate; you must still compare and confirm its recipient value.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    HStack { Spacer(); Button("Cancel Scan", role: .cancel) { model.cancelRecipientScan() } }
-                }.padding(24).frame(width: 690)
+            .sheet(item: $model.sourceSheet) { sheet in
+                Group {
+                    switch sheet {
+                    case .sshHosts(_): sshSelection
+                    case let .keyUnlock(request): SourceKeyUnlockSheet(model: model, request: request).id(request.id)
+                    case let .recipientCamera(scanID): recipientCamera(scanID: scanID)
+                    }
+                }.onDisappear { model.sourceSheetDismissed(sheet) }
             }
-            .sheet(item: Binding(get: { model.keyUnlockRequest }, set: { value in
-                if value == nil, let request = model.keyUnlockRequest { model.cancelKeyUnlock(requestID: request.id) }
-            })) { request in
-                SourceKeyUnlockSheet(model: model, request: request).id(request.id)
-            }
-            .onChange(of: scenePhase) { _, phase in model.setForeground(phase == .active) }
+            .onChange(of: scenePhase, initial: true) { _, phase in model.setForeground(phase == .active) }
             .onDisappear { model.setForeground(false) }
+    }
+
+    private func recipientCamera(scanID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Scan this iPhone’s request").font(.title2.bold())
+            Text("On the iPhone, open the recipient-request QR in FrankenTerm. Hold it in front of this Mac’s camera. Only a FrankenTerm recipient request is accepted.")
+                .font(.callout)
+            RecipientRequestCamera(onRequest: { model.receiveRecipient($0, scanID: scanID) },
+                                   onError: { model.recipientCameraFailed($0, scanID: scanID) })
+                .id(scanID).frame(width: 640, height: 360).clipShape(RoundedRectangle(cornerRadius: 12))
+            Text("Camera frames stay on this Mac. Scanning stops after one candidate; you must still compare and confirm its recipient value.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack { Spacer(); Button("Cancel Scan", role: .cancel) { model.cancelRecipientScan(scanID: scanID) } }
+        }.padding(24).frame(width: 690)
+    }
+
+    private var sshSelection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Choose SSH hosts").font(.title2.bold())
+            Text("Select up to 128 named hosts. Matching public .pub files and ~/.ssh/known_hosts supply public identities and host policy. Commands, Include files, and Match conditions remain unresolved and are reported before export.")
+                .font(.callout).foregroundStyle(.secondary)
+            TextField("Filter host aliases", text: $model.sshSearch).textFieldStyle(.roundedBorder)
+            List(model.filteredSSHAliases, id: \.self) { alias in
+                Toggle(isOn: Binding(get: { model.selectedSSHAliases.contains(alias) },
+                    set: { model.selectSSHAlias(alias, included: $0) })) {
+                    Text(verbatim: alias).font(.system(.body, design: .monospaced))
+                }.disabled(model.busy || (model.selectedSSHAliases.count >= 128 && !model.selectedSSHAliases.contains(alias)))
+            }.frame(minHeight: 260)
+            HStack {
+                Text("\(model.selectedSSHAliases.count) of \(model.sshAliases.count) hosts selected").font(.caption)
+                Spacer()
+                Button("Clear Selection") { model.selectedSSHAliases = [] }.disabled(model.busy)
+                Button("Select All") { model.selectedSSHAliases = Set(model.sshAliases) }
+                    .disabled(model.busy || model.sshAliases.count > 128)
+            }
+            if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
+            HStack {
+                Button("Cancel") { model.dismissSSHSelection() }.disabled(model.busy)
+                Spacer()
+                if model.busy { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
+                Button("Review Selected Hosts") { model.importSelectedSSHHosts() }
+                    .buttonStyle(.borderedProminent).disabled(model.busy || model.selectedSSHAliases.isEmpty)
+            }
+        }.padding(24).frame(width: 620, height: 580).interactiveDismissDisabled(model.busy)
     }
 
     @ViewBuilder
@@ -734,6 +972,9 @@ private struct MacExportView: View {
                     Text("\(selected.groups.count) groups · \(selected.machines.count) machines · \(selected.routes.count) routes including jump hosts")
                         .font(.callout)
                     Text("Every selected machine’s route order, jump dependencies, host policy, palette, and connection preferences travel together.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Save Selected Public Workspace…") { model.savePublicWorkspace() }.disabled(model.busy)
+                    Text("A public .ftworkspace file contains no private keys and needs no transfer code. Hostnames and public trust are visible; verify the displayed file comparison value on the phone. Required source restrictions remain enforced.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if source.discardedExtensionCount > 0 {
@@ -783,7 +1024,8 @@ private struct MacExportView: View {
                     ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
                         VStack(alignment: .leading, spacing: 3) {
                             Label(finding.disposition == 1 ? "Required policy unavailable"
-                                  : finding.setting == "credential_policy" ? "Credential policy preserved" : "Preserved with an omission",
+                                  : finding.setting == "credential_policy" ? "Credential policy preserved"
+                                  : finding.setting == "ssh_config.source_scope" ? "Source scope" : "Preserved with an omission",
                                   systemImage: finding.disposition == 1 ? "lock.trianglebadge.exclamationmark" : "info.circle")
                                 .font(.caption.bold())
                             Text(verbatim: finding.entityID + ": " + finding.reason).font(.caption)
@@ -1042,8 +1284,7 @@ private struct RecipientRequestCamera: NSViewRepresentable {
         private func finish(_ error: FTError) {
             guard !ended else { return }
             ended = true
-            // Never block stopRunning inside the metadata delegate callback.
-            // Return the callback first, then stop on the same owning queue.
+            // Return the metadata callback before stopping on its owning queue.
             queue.async { [self] in
                 teardown()
                 guard !isCancelled else { return }
@@ -1080,7 +1321,7 @@ private struct SourceKeyUnlockSheet: View {
     @Environment(\.scenePhase) private var scenePhase
 
     private var canUnlock: Bool {
-        !model.busy && model.keyUnlockRequest?.id == request.id &&
+        !model.busy && model.sourceSheet?.id == request.id && model.keyUnlockRequest?.id == request.id &&
             (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.utf8.count)
     }
     private func submit() {
@@ -1116,7 +1357,7 @@ private struct SourceKeyUnlockSheet: View {
             }
         }.padding(24).frame(width: 510)
             .onDisappear { passphrase = "" }
-            .onChange(of: scenePhase) { _, phase in
+            .onChange(of: scenePhase, initial: true) { _, phase in
                 if phase != .active { passphrase = ""; model.cancelKeyUnlock(requestID: request.id) }
             }
     }
