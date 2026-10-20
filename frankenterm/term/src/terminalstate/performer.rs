@@ -1574,8 +1574,6 @@ impl<'a> Performer<'a> {
         // `bytes[at]` is the next line feed.
         let mut at = 0;
         loop {
-            self.flood_line_feed(&bidi_mode, plan.as_ref());
-            at += 1;
             // The line is plain if its first byte that is neither printable
             // ASCII nor a tab or carriage return (a PTY ends every line in
             // CR LF) is a line feed. A line that is not, or that `bytes` does
@@ -1583,7 +1581,24 @@ impl<'a> Performer<'a> {
             // written once its end is known. (Validating the whole flood as
             // UTF-8 once instead cost a second scan: 1% fewer instructions
             // on `seq`, 1% more on long lines.)
-            let end = at + scan.printable_len(&bytes[at..]);
+            let next = at + 1;
+            let end = next + scan.printable_len(&bytes[next..]);
+            let written = if bytes.get(end) == Some(&b'\n') {
+                self.flood_line_feed_with_run(
+                    &bytes[next..end],
+                    &mut flood_pen,
+                    plan.as_ref(),
+                    &bidi_mode,
+                )
+            } else {
+                self.flood_line_feed(&bidi_mode, plan.as_ref());
+                false
+            };
+            at = next;
+            if written {
+                at = end;
+                continue;
+            }
             match bytes.get(end) {
                 Some(b'\n') => {
                     self.flood_text(
@@ -1785,8 +1800,15 @@ impl<'a> Performer<'a> {
         {
             return false;
         }
-        let next_x = x + text.len();
-        if next_x < right_margin {
+        self.advance_past_flood_run(x + text.len());
+        true
+    }
+
+    /// The cursor after [`Self::flood_write`] wrote a run ending before
+    /// `next_x`.
+    #[inline]
+    fn advance_past_flood_run(&mut self, next_x: usize) {
+        if next_x < self.left_and_right_margins.end {
             self.cursor.x = next_x;
             self.wrap_next = false;
         } else {
@@ -1795,7 +1817,61 @@ impl<'a> Performer<'a> {
             self.cursor.x = next_x - 1;
             self.wrap_next = self.dec_auto_wrap;
         }
-        true
+    }
+
+    /// [`Self::flood_line_feed`] and then [`Self::flood_text`] of `text`, a
+    /// whole flood line, in one step where the line fits the rest of the
+    /// new bottom row: the scroll's new row takes the run directly
+    /// ([`crate::screen::Screen::flood_scroll_line_with_run`]). Always
+    /// performs the line feed; returns whether it wrote `text` too.
+    #[inline]
+    fn flood_line_feed_with_run(
+        &mut self,
+        text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) -> bool {
+        // Where the cursor is after the line feed, which clears any
+        // pending wrap, and where `flood_write` would write the run.
+        let x = self
+            .cursor
+            .x
+            .min(self.screen().physical_cols.saturating_sub(1));
+        let applies = !text.is_empty()
+            && text.len() <= self.left_and_right_margins.end.saturating_sub(x)
+            && self.print.is_empty()
+            && self.left_and_right_margins.contains(&self.cursor.x);
+        let Some(plan) = plan.filter(|_| applies) else {
+            self.flood_line_feed(bidi_mode, plan);
+            return false;
+        };
+        let Some(flood_pen) =
+            pen.get_or_insert_with(|| crate::pagegrid::native::FloodPen::new(&self.pen))
+        else {
+            self.flood_line_feed(bidi_mode, Some(plan));
+            return false;
+        };
+        let seqno = self.seqno;
+        let Some(written) = self
+            .state
+            .screen
+            .flood_scroll_line_with_run(plan, seqno, bidi_mode, x, text, flood_pen)
+        else {
+            // Nothing changed: the general line feed scrolls.
+            self.flood_line_feed(bidi_mode, None);
+            return false;
+        };
+        // What `flood_line_feed` leaves, with an empty print buffer.
+        self.ascii_junction = None;
+        self.cursor.x = x;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+        self.last_printed = None;
+        if written {
+            self.advance_past_flood_run(x + text.len());
+        }
+        written
     }
 
     /// `control(LineFeed)` within a line-feed flood: on the bottom row of a

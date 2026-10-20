@@ -462,6 +462,41 @@ pub fn append_ascii_run(
     if !appends {
         return false;
     }
+    append_flood_run(page, row, x, text, pen, seqno)
+}
+
+/// [`append_ascii_run`] on a row a scroll just appended under the default
+/// blank: empty and clustered. Printable ASCII is cluster-inert, so the
+/// clustered check passes there for every run but spaces past the row's
+/// end under a blank pen; what is left to check is whether it fits.
+pub fn append_ascii_run_to_fresh_row(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    text: &[u8],
+    pen: &FloodPen,
+    seqno: SequenceNo,
+) -> bool {
+    debug_assert!(page.row_len(row) == 0 && is_clustered(page, row));
+    if text.is_empty()
+        || !fits(page, x, text.len())
+        || (x > 0 && pen.default_blank && text.iter().all(|&byte| byte == b' '))
+    {
+        return false;
+    }
+    append_flood_run(page, row, x, text, pen, seqno)
+}
+
+/// The run as [`append_ascii_run`] stores it, under the flood's pen.
+#[inline]
+fn append_flood_run(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    text: &[u8],
+    pen: &FloodPen,
+    seqno: SequenceNo,
+) -> bool {
     let mut write = CellWrite::new(Glyph::Blank, StyleSpec::Inline(pen.inline));
     write.semantic = pen.semantic;
     write.wrapped = pen.wrapped;

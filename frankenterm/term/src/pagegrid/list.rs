@@ -482,6 +482,15 @@ impl PageList {
         Some((self.page_mut(index), row))
     }
 
+    /// The newest retained row, writable: the tail page's last row, the
+    /// one [`Self::scroll_line`] appended last.
+    pub fn tail_row_mut(&mut self) -> Option<(&mut Page, u32)> {
+        let tail = self.pages.len().checked_sub(1)?;
+        let page = self.page_mut(tail);
+        let row = page.used().checked_sub(1)?;
+        Some((page, row))
+    }
+
     /// The page at `index`, writable. Active pages are owned outright. A
     /// sealed page is written in place while no reader holds it, and
     /// otherwise forked under a fresh serial, leaving readers their copy.

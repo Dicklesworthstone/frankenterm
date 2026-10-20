@@ -10176,6 +10176,48 @@ impl Screen {
         self.page_scroll_up_line_within(seqno, None, bidi_mode, plan.max_allowed, plan.compress)
     }
 
+    /// [`Self::flood_scroll_line`], then [`Self::flood_ascii_cell_run`] of
+    /// `text` at `x` on the bottom row, which is the row the scroll added.
+    /// Where the list appended that row itself (a row left the hot cap), it
+    /// is empty, clustered and has no view, so the run goes straight into
+    /// it, without finding it again or checking it against a previous cell.
+    /// `None`: the scroll declined, and nothing changed. `Some(written)`:
+    /// it scrolled; when the run was not written, the caller writes it as
+    /// it would have.
+    pub(crate) fn flood_scroll_line_with_run(
+        &mut self,
+        plan: &FloodScroll,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+        x: usize,
+        text: &[u8],
+        pen: &native::FloodPen,
+    ) -> Option<bool> {
+        let rows_before = self.lines.len();
+        if !self.flood_scroll_line(plan, seqno, bidi_mode) {
+            return None;
+        }
+        // `page_scroll_up_line_within` built the row itself below the cap.
+        if rows_before + 1 <= plan.max_allowed {
+            return Some(false);
+        }
+        debug_assert_eq!(
+            self.phys_row(self.physical_rows as VisibleRowIndex - 1),
+            self.lines.len() - 1
+        );
+        let written = self
+            .lines
+            .page_mut()
+            .and_then(PageRows::fresh_tail_row_mut)
+            .is_some_and(|(page, row)| {
+                native::append_ascii_run_to_fresh_row(page, row, x, text, pen, seqno)
+            });
+        if written {
+            self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        }
+        Some(written)
+    }
+
     pub fn scroll_up_within_margins(
         &mut self,
         scroll_region: &Range<VisibleRowIndex>,
