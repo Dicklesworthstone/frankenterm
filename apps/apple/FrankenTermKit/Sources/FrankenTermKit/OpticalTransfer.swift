@@ -252,6 +252,7 @@ public struct OpticalSender: Sendable {
     public let identity: OpticalFrame.Identity
     private let pages: [URPageEncoder], pageDigests: [Data]
     private var sequences: [UInt32]
+    private var repairPartsSinceReplay: [Int], nextSystematicReplay: [Int]
     private var emitted = 0
     public init<C: AirGapCryptography>(envelope: Data, using crypto: C) throws {
         let header = try FTAGHeader(envelope: envelope)
@@ -259,6 +260,8 @@ public struct OpticalSender: Sendable {
         let chunks = stride(from: 0, to: envelope.count, by: FTLimit.page).map { envelope.subdata(in: $0..<min($0 + FTLimit.page, envelope.count)) }
         pages = chunks.map(URPageEncoder.init); pageDigests = chunks.map(crypto.sha256)
         sequences = Array(repeating: 0, count: chunks.count)
+        repairPartsSinceReplay = Array(repeating: 0, count: chunks.count)
+        nextSystematicReplay = Array(repeating: 1, count: chunks.count)
     }
     public func sourcePartCount(page: Int) throws -> Int {
         guard pages.indices.contains(page) else { throw FTError.malformed("qr.page") }
@@ -273,9 +276,29 @@ public struct OpticalSender: Sendable {
     }
     public mutating func next<C: AirGapCryptography>(repairPage: Int? = nil, using crypto: C) throws -> String {
         let page = repairPage ?? ((emitted / 8) % pages.count)
-        guard pages.indices.contains(page), sequences[page] < UInt32.max, emitted < Int.max else { throw FTError.limit("qr.sequence") }
-        sequences[page] += 1; emitted += 1
-        return try frame(page: page, sequence: sequences[page], using: crypto)
+        guard pages.indices.contains(page), emitted < Int.max else { throw FTError.limit("qr.sequence") }
+        let sourceCount = pages[page].fragments.count
+        // After the first systematic pass, one in nine emissions revisits a
+        // source fragment. Repair sequence numbers continue monotonically; source
+        // replay never reseals the envelope or changes the fragment geometry.
+        // The cadence is per page, including when targeted repair is selected.
+        let replay = sourceCount == 1 || repairPartsSinceReplay[page] == 8
+        let sequence: UInt32
+        if replay { sequence = UInt32(nextSystematicReplay[page]) }
+        else {
+            guard sequences[page] < UInt32.max else { throw FTError.limit("qr.sequence") }
+            sequence = sequences[page] + 1
+        }
+        let text = try frame(page: page, sequence: sequence, using: crypto)
+        if replay {
+            repairPartsSinceReplay[page] = 0
+            nextSystematicReplay[page] = nextSystematicReplay[page] % sourceCount + 1
+        } else {
+            sequences[page] = sequence
+            if sequence > sourceCount { repairPartsSinceReplay[page] += 1 }
+        }
+        emitted += 1
+        return text
     }
 }
 
@@ -289,6 +312,7 @@ public struct OpticalReceiver: Sendable {
     public var verifiedBytes: Int { verified.values.reduce(0) { $0 + $1.count } }
     public var verifiedPages: Int { verified.count }
     public var isComplete: Bool { verified.count == identity.pageCount }
+    public var incompletePageIndices: [Int] { (0..<identity.pageCount).filter { verified[$0] == nil } }
     public var independentParts: Int { decoders.values.reduce(0) { $0 + $1.rank } }
     public init(selecting frame: OpticalFrame) { identity = frame.identity }
     public mutating func resetIncompletePage(_ page: Int) {

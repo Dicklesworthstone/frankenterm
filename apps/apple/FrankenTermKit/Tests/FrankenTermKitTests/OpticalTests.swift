@@ -137,4 +137,33 @@ final class OpticalTests: XCTestCase {
         XCTAssertThrowsError(try sender.frame(page: 0, sequence: 0, using: crypto))
         XCTAssertThrowsError(try OpticalSender(envelope: Data(repeating: 0, count: FTLimit.envelope + 1), using: crypto))
     }
+    func testLateReceiverCanRecoverFromRepeatedSystematicPartsWhileFreshRepairsContinue() throws {
+        let envelope = try makeEnvelope(size: 100)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        let count = try sender.sourcePartCount(page: 0)
+        // This camera arrives after the entire original systematic pass and is
+        // assumed to lose every mixed repair frame. Replayed source information
+        // must still deliver the exact complete encrypted envelope.
+        for _ in 0..<count { _ = try sender.next(using: crypto) }
+        var receiver: OpticalReceiver?
+        var lastRepair = UInt32(count), repairCount = 0
+        var replayed = Set<UInt32>()
+        for _ in 0..<(count * 10) {
+            let frame = try OpticalFrame(text: sender.next(using: crypto))
+            let components = frame.ur.split(separator: "/")
+            let sequence = try XCTUnwrap(UInt32(components[1].split(separator: "-")[0]))
+            if sequence > count {
+                XCTAssertGreaterThan(sequence, lastRepair, "systematic replay must not reset the independent repair sequence")
+                lastRepair = sequence; repairCount += 1
+                continue
+            }
+            replayed.insert(sequence)
+            if receiver == nil { receiver = OpticalReceiver(selecting: frame) }
+            try receiver?.receive(frame, using: crypto)
+            if receiver?.isComplete == true { break }
+        }
+        XCTAssertEqual(replayed, Set((1...count).map(UInt32.init)))
+        XCTAssertGreaterThan(repairCount, count)
+        XCTAssertEqual(try receiver?.envelope(using: crypto), envelope)
+    }
 }
