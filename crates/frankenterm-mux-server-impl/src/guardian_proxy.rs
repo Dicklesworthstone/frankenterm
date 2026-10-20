@@ -96,6 +96,42 @@ fn wait_for_genesis_retry(started: Instant, attempts: usize) -> bool {
     started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET
 }
 
+/// Closes the child a guardian birth left running unclaimed when it failed
+/// before its claim: its Spawn's reply lost, its custody or its claim
+/// refused (ft-hn80q). The birth's own spawn custody claims the child at
+/// generation 0, and the staging's rollback, a birth's, closes it on drop
+/// (an unconfirmed close retains cleanup authority, as any rollback does).
+/// An error means nothing was claimed: there is no such child (the guardian
+/// never started it, or it has exited), another claim holds it, or the
+/// guardian could not be reached.
+fn close_unclaimed_birth(
+    socket: &Path,
+    token: &Path,
+    size: PtySize,
+    census: Arc<GuardianCensusCoordinator>,
+    mux_incarnation: Uuid,
+    (pane, effect): (Uuid, Uuid),
+) -> anyhow::Result<()> {
+    let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+        token,
+        census.guardian_incarnation(),
+        mux_incarnation,
+        pane,
+        effect,
+        frankenterm_pty_guardian::guardian_runtime_build_identity()
+            .context("guardian birth requires the compiled mux build")?
+            .into_bytes(),
+    )
+    .context("authenticate the unclaimed birth's custody")?;
+    let staging = GuardianProxyLeasePlan::prepare(socket, token, size, census)
+        .context("prepare the unclaimed birth's lease")?
+        .with_spawn_custody(custody)?
+        .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+        .context("claim the unclaimed birth")?;
+    drop(staging);
+    Ok(())
+}
+
 fn reconcile_genesis_birth(
     mut client: GuardianClient,
     birth: (Uuid, Uuid, Uuid),
@@ -234,7 +270,19 @@ struct GuardianDomainState {
     census: Option<Arc<GuardianCensusCoordinator>>,
     unadopted_birth: Option<(Uuid, Uuid, Uuid)>,
     publication: Option<GuardianPanePublicationReceipt>,
+    /// (pane, effect) of births that failed before their claim and whose
+    /// child could not be closed right away: the next spawn tries once more.
+    orphaned_births: Vec<(Uuid, Uuid)>,
 }
+
+/// Births whose unclaimed child the domain still tries to close at the next
+/// spawn; past this, the oldest is given up with a warning.
+const GUARDIAN_MAX_ORPHANED_BIRTHS: usize = 8;
+
+/// Fails the next birth after its custody opens and before its claim, as a
+/// lost claim connection does, once its child has had time to start.
+#[cfg(test)]
+static FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM: AtomicBool = AtomicBool::new(false);
 
 /// What the birth fence still asks of a spawn or a recovery capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -538,6 +586,28 @@ impl Domain for GuardianDomain {
                     census
                 }
             };
+            // Children that earlier births left running unclaimed get one more
+            // close before this birth starts another (ft-hn80q).
+            let orphans = std::mem::take(&mut state.lock().orphaned_births);
+            for orphan in orphans {
+                match close_unclaimed_birth(
+                    &socket,
+                    &token,
+                    pty_size,
+                    Arc::clone(&census),
+                    mux_incarnation,
+                    orphan,
+                ) {
+                    Ok(()) => log::info!(
+                        "closed the child that guardian birth pane={} left running unclaimed",
+                        orphan.0
+                    ),
+                    Err(error) => log::warn!(
+                        "guardian birth pane={} has no unclaimed child this mux could close; giving up on it: {error:#}",
+                        orphan.0
+                    ),
+                }
+            }
             let checkpoint = Terminal::new(
                 size,
                 Arc::clone(&config),
@@ -595,6 +665,8 @@ impl Domain for GuardianDomain {
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
+            let reap_census = Arc::clone(&census);
+            let mut claimed = false;
             let born = (|| -> anyhow::Result<UnpublishedPane> {
                 let (client, reply) = reconcile_genesis_birth(
                     client,
@@ -627,14 +699,21 @@ impl Domain for GuardianDomain {
                         .into_bytes(),
                 )
                 .context("authenticate existing guardian birth custody")?;
+                #[cfg(test)]
+                if FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM.swap(false, Ordering::AcqRel) {
+                    thread::sleep(Duration::from_millis(200));
+                    anyhow::bail!("injected guardian birth failure before its claim");
+                }
                 // From the claim on, a failure's lease rollback closes the
                 // child (a birth's), and so does abandoning the unpublished
                 // pane.
-                let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
+                let staging = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
                     .context("prepare guardian birth lease")?
                     .with_spawn_custody(custody)?
                     .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
-                    .context("claim guardian birth lease")?
+                    .context("claim guardian birth lease")?;
+                claimed = true;
+                let activated = staging
                     .restore_and_activate(config, birth_limits)
                     .context("restore and activate guardian birth")?;
                 UnpublishedPane::from_guardian_birth(activated.into_local_pane(
@@ -643,22 +722,54 @@ impl Domain for GuardianDomain {
                     description,
                 ))
             })();
-            let mut state = state.lock();
             match born {
                 Ok(unpublished) => {
                     // The read-only receipt can become true only after actual
                     // mux publication. Cancellation keeps it false; successful
                     // publication remains remembered even after a short-lived
                     // pane is pruned.
-                    state.publication = unpublished.guardian_publication_receipt();
+                    state.lock().publication = unpublished.guardian_publication_receipt();
                     Ok(unpublished)
                 }
                 Err(error) => {
+                    // Once claimed, the failure's lease rollback closed the
+                    // child. Before its claim, a child the guardian started
+                    // runs unclaimed: close it now, or at the next spawn.
+                    let unclosed = if claimed {
+                        None
+                    } else {
+                        close_unclaimed_birth(
+                            &socket,
+                            &token,
+                            pty_size,
+                            reap_census,
+                            mux_incarnation,
+                            (pane, effect),
+                        )
+                        .err()
+                    };
+                    let mut state = state.lock();
+                    let child = match &unclosed {
+                        None if claimed => "its child was closed with its lease".to_string(),
+                        None => "its unclaimed child was closed".to_string(),
+                        Some(reason) => {
+                            if state.orphaned_births.len() >= GUARDIAN_MAX_ORPHANED_BIRTHS {
+                                let (given_up, _) = state.orphaned_births.remove(0);
+                                log::warn!(
+                                    "giving up closing the unclaimed child of guardian birth pane={given_up}"
+                                );
+                            }
+                            state.orphaned_births.push((pane, effect));
+                            format!(
+                                "no unclaimed child closed yet, the next spawn tries again ({reason:#})"
+                            )
+                        }
+                    };
                     // A failed birth releases the fence: keeping it refused
                     // every later spawn and recovery capture for the mux's
                     // lifetime (ft-hn80q).
                     log::warn!(
-                        "guardian birth pane={pane} request={request} effect={effect} failed after it sent its Spawn; releasing its spawn fence: {error:#}"
+                        "guardian birth pane={pane} request={request} effect={effect} failed after it sent its Spawn; releasing its spawn fence, {child}: {error:#}"
                     );
                     state.unadopted_birth = None;
                     state.publication = None;
@@ -8029,13 +8140,38 @@ mod tests {
             }
             drop(third);
             signals(b"SS", "the second abandoned birth's child was not closed");
+            // A birth that fails after its Spawn but before its claim (a lost
+            // claim connection) closes the child it started, under its own
+            // custody, and releases the fence too.
+            FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM.store(true, Ordering::Release);
+            assert!(
+                promise::spawn::block_on(domain.spawn_unpublished_pane(
+                    &mux,
+                    size,
+                    Some(command()),
+                    None,
+                ))
+                .is_err(),
+                "the injected failure before the claim did not fail the birth"
+            );
+            assert_eq!(std::fs::read(&births).unwrap(), b"BBBB");
+            signals(
+                b"SSS",
+                "the child of a birth that failed before its claim was not closed",
+            );
+            assert!(domain.state.lock().unadopted_birth.is_none());
+            assert!(domain.state.lock().orphaned_births.is_empty());
+            assert!(!domain.admission.load(Ordering::Acquire));
+            domain
+                .recovery_policy(&config::configuration())
+                .expect("a birth that failed before its claim must not disable recovery");
             std::fs::write(&release, b"release").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 while executor.try_tick().unwrap() {}
                 let rows = snapshot(deadline);
-                if rows.len() == 3 && rows.iter().all(|row| row.exit_status == Some(0)) {
-                    assert_eq!(closed(&rows), 2);
+                if rows.len() == 4 && rows.iter().all(|row| row.exit_status == Some(0)) {
+                    assert_eq!(closed(&rows), 3);
                     break;
                 }
                 assert!(
@@ -8047,7 +8183,7 @@ mod tests {
             // Only the published child ran to its release; the closed ones
             // exited from the HUP.
             assert_eq!(std::fs::read(&finished).unwrap(), b"D");
-            assert_eq!(std::fs::read(&signaled).unwrap(), b"SS");
+            assert_eq!(std::fs::read(&signaled).unwrap(), b"SSS");
             let deadline = Instant::now() + Duration::from_secs(5);
             while !pane.is_dead() {
                 assert!(
