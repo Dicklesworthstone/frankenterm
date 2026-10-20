@@ -37,6 +37,9 @@ public enum SSHECDSACurve: String, Sendable, CaseIterable {
 /// Apple products use AppleCryptography. Linux tests use an independent oracle.
 public protocol AirGapCryptography: Sendable {
     func sha256(_ bytes: Data) -> Data
+    /// OpenSSH known_hosts compatibility only: a 20-byte salt and a bounded
+    /// exact lookup name. FTAG authentication continues to use its modern suite.
+    func hmacSHA1(key: Data, message: Data) throws -> Data
     func randomBytes(count: Int) throws -> Data
     func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
@@ -55,6 +58,12 @@ public protocol AirGapCryptography: Sendable {
 public struct AppleCryptography: AirGapCryptography {
     public init() {}
     public func sha256(_ bytes: Data) -> Data { Data(SHA256.hash(data: bytes)) }
+    public func hmacSHA1(key: Data, message: Data) throws -> Data {
+        guard key.count == 20, !message.isEmpty, message.count <= FTLimit.text else {
+            throw FTError.limit("known_hosts.hmac_input")
+        }
+        return Data(HMAC<Insecure.SHA1>.authenticationCode(for: message, using: SymmetricKey(data: key)))
+    }
     public func randomBytes(count: Int) throws -> Data {
         guard (1...64).contains(count) else { throw FTError.limit("random.length") }
         var bytes = Data(count: count)

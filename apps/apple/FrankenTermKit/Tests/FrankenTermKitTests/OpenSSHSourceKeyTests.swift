@@ -383,6 +383,7 @@ private enum SourceProbeError: Error { case unexpectedNativeWork }
 private struct DeniedSourceCryptography: AirGapCryptography {
     let base = TestCryptography()
     func sha256(_ bytes: Data) -> Data { base.sha256(bytes) }
+    func hmacSHA1(key: Data, message: Data) throws -> Data { try base.hmacSHA1(key: key, message: message) }
     func randomBytes(count: Int) throws -> Data { try base.randomBytes(count: count) }
     func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data { try base.seal(plaintext, secret: secret, salt: salt, nonce: nonce, aad: aad) }
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data { try base.open(ciphertextAndTag, secret: secret, salt: salt, nonce: nonce, aad: aad) }

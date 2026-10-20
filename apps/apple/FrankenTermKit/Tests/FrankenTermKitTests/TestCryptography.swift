@@ -14,6 +14,22 @@ struct TestCryptography: AirGapCryptography {
         }
         return result
     }
+    func hmacSHA1(key: Data, message: Data) throws -> Data {
+        guard key.count == 20, !message.isEmpty, message.count <= FTLimit.text else {
+            throw FTError.limit("known_hosts.hmac_input")
+        }
+        var result = Data(count: 20), length: UInt32 = 20
+        let succeeded = result.withUnsafeMutableBytes { output in
+            key.withUnsafeBytes { salt in
+                message.withUnsafeBytes { input in
+                    HMAC(EVP_sha1(), salt.baseAddress, Int32(key.count), input.bindMemory(to: UInt8.self).baseAddress,
+                         message.count, output.bindMemory(to: UInt8.self).baseAddress, &length) != nil
+                }
+            }
+        }
+        guard succeeded, length == 20 else { throw FTError.storage }
+        return result
+    }
     func randomBytes(count: Int) throws -> Data { Data((0..<count).map { _ in UInt8.random(in: 0...255) }) }
     func hmac(_ key: Data, _ input: Data) -> Data {
         var output = Data(count: 32), length: UInt32 = 32

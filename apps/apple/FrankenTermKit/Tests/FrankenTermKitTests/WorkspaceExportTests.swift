@@ -380,6 +380,77 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertEqual(alternativeReview.missingIdentityRouteIDs, ["route"])
     }
 
+    func testSourceFindingsSurviveSelectedEncryptedAndPublicExports() throws {
+        let source = try fixture()
+        let findings: [AirGapArchive.Portability] = [
+            .init(entityID: "hop-one", setting: "ssh_config.proxy", disposition: 1, reason: "The source proxy requires a supported adapter."),
+            .init(entityID: "unused-route", setting: "ssh_config.omission", disposition: 0, reason: "This route is outside the selected group."),
+            .init(entityID: source.id, setting: "ssh_config.source_scope", disposition: 0, reason: "A passive configuration snapshot.")
+        ]
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"], findings: findings)
+        let choices = Dictionary(uniqueKeysWithValues: selection.identities.map {
+            ($0.fingerprint, WorkspaceExportSelection.IdentityDecision.keepReferenceOnly)
+        })
+        let review = try selection.review(decisions: choices, loadedFingerprints: [])
+        XCTAssertTrue(review.blockedRouteIDs.contains("hop-one"))
+        XCTAssertTrue(review.blockedRouteIDs.contains("route"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("hop-two"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("alternate"))
+        XCTAssertFalse(review.findings.contains { $0.entityID == "unused-route" })
+        let archive = try selection.archive(decisions: choices, keys: [], bundleID: "source-encrypted", using: crypto)
+        let export = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(export.envelope, code: export.code, using: crypto)
+        XCTAssertTrue(restored.portability.contains(findings[0]))
+        XCTAssertTrue(restored.portability.contains(findings[2]))
+        let publicDocument = try selection.publicDocument(bundleID: "source-public")
+        XCTAssertEqual(publicDocument.id, source.id)
+        XCTAssertNotEqual(publicDocument.bundleID, archive.workspace.bundleID)
+        for id in ["hop-one", "route"] {
+            XCTAssertTrue(try XCTUnwrap(publicDocument.routes.first { $0.id == id }).requiredCapabilities.contains("source.unresolved_required_policy"))
+        }
+        for id in ["hop-two", "alternate"] {
+            XCTAssertFalse(try XCTUnwrap(publicDocument.routes.first { $0.id == id }).requiredCapabilities.contains("source.unresolved_required_policy"))
+        }
+        XCTAssertThrowsError(try selection.publicDocument(bundleID: source.bundleID))
+    }
+
+    func testSourceReportsAreValidatedBeforeFilteringAndCannotDemoteBlockers() throws {
+        let source = try fixture { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            let index = routes.firstIndex { $0["id"] as? String == "alternate" }!
+            routes[index]["required_capabilities"] = ["ssh.test_required_policy"]
+            workspace["routes"] = routes
+        }
+        let unknown = AirGapArchive.Portability(entityID: "missing", setting: "source.policy", disposition: 1, reason: "Unresolved policy.")
+        XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"], findings: [unknown]))
+        let advisory = AirGapArchive.Portability(entityID: "alternate", setting: "route_readiness", disposition: 0, reason: "Claimed informational only.")
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"], findings: [advisory])
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertTrue(review.blockedRouteIDs.contains("alternate"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("route"))
+        let derived = try XCTUnwrap(review.findings.first { $0.entityID == advisory.entityID && $0.setting == advisory.setting })
+        XCTAssertEqual(derived.disposition, 1)
+        XCTAssertNotEqual(derived.reason, advisory.reason)
+        XCTAssertEqual(review.findings.filter { $0.entityID == advisory.entityID && $0.setting == advisory.setting }.count, 1)
+    }
+
+    func testMissingDestinationSessionPolicyDoesNotDemandAPTYForTransitHops() throws {
+        var root = try StrictJSON.decode(fixture().raw).object()
+        var content = try root.required("workspace").object()
+        content["routes"] = .array(try content.required("routes").array().map { value in
+            var route = try value.object()
+            if try ["route", "hop-one", "hop-two"].contains(route.text("id")) { route.removeValue(forKey: "session_creation") }
+            return .object(route)
+        })
+        root["workspace"] = .object(content)
+        let selection = try WorkspaceExportSelection(workspace: WorkspaceDocument(data: StrictJSON.encode(.object(root))), groupIDs: ["build-group"])
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertTrue(review.blockedRouteIDs.contains("route"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("hop-one"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("hop-two"))
+        XCTAssertFalse(review.blockedRouteIDs.contains("alternate"))
+    }
+
     func testPhonePreviewAndInstalledReadinessAllowAPermittedAlternativeCandidate() async throws {
         let (key, fingerprint) = try sampleKey(using: crypto)
         var root = try JSONSerialization.jsonObject(with: sampleManifest()) as! [String: Any]

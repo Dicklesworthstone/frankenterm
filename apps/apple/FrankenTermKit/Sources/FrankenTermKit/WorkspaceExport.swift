@@ -23,6 +23,7 @@ public struct WorkspaceExportSelection: Sendable {
     }
 
     private let source: WorkspaceDocument
+    private let sourceFindings: [AirGapArchive.Portability]
     public let workspace: WorkspaceDocument
     public let identities: [Identity]
     /// The original single-group API and multi-group preview expose the same
@@ -37,21 +38,30 @@ public struct WorkspaceExportSelection: Sendable {
         }
     }
 
-    public init(workspace source: WorkspaceDocument, groupIDs: Set<String>) throws {
-        try self.init(source: source, groupIDs: groupIDs, projectionBundleID: nil)
+    public init(workspace source: WorkspaceDocument, groupIDs: Set<String>,
+                findings: [AirGapArchive.Portability] = []) throws {
+        try self.init(source: source, groupIDs: groupIDs, projectionBundleID: nil, findings: findings)
     }
 
     /// A single reviewed group retains its existing public API, including a new
     /// projection identity. Preparing its archive always issues another identity.
-    public init(workspace source: WorkspaceDocument, groupID: String) throws {
-        try self.init(source: source, groupIDs: [groupID], projectionBundleID: UUID().uuidString)
+    public init(workspace source: WorkspaceDocument, groupID: String,
+                findings: [AirGapArchive.Portability] = []) throws {
+        try self.init(source: source, groupIDs: [groupID], projectionBundleID: UUID().uuidString, findings: findings)
     }
 
-    private init(source: WorkspaceDocument, groupIDs: Set<String>, projectionBundleID: String?) throws {
+    private init(source: WorkspaceDocument, groupIDs: Set<String>, projectionBundleID: String?,
+                 findings: [AirGapArchive.Portability]) throws {
         self.source = source
+        // Validate before filtering so an invalid source report cannot become
+        // acceptable merely by selecting a group that hides its reference.
+        let metadata = try AirGapArchive.validatedMetadata(workspace: source, portability: findings, annotations: [])
         let selection = try Self.project(source, groupIDs: groupIDs)
         let projected = try projectionBundleID.map { try selection.reissuingBundle(id: $0) } ?? selection
         workspace = projected
+        let retainedEntities = Set([projected.id] + projected.groups.map(\.id) + projected.machines.map(\.id)
+            + projected.routes.map(\.id) + projected.credentials.map(\.id) + projected.hostTrust.map(\.id) + projected.themes.map(\.id))
+        sourceFindings = metadata.portability.filter { retainedEntities.contains($0.entityID) }
         var orderedFingerprints: [String] = [], references: [String: [String]] = [:]
         var algorithms: [String: String] = [:]
         for credential in projected.credentials {
@@ -80,11 +90,20 @@ public struct WorkspaceExportSelection: Sendable {
         let included = Set(identities.filter {
             decisions[$0.fingerprint] == .includePrivateKey && loadedFingerprints.contains($0.fingerprint)
         }.map(\.fingerprint))
-        var findings: [AirGapArchive.Portability] = []
+        var findings = sourceFindings
+        var positions = Dictionary(uniqueKeysWithValues: findings.enumerated().map {
+            ([$0.element.entityID, $0.element.setting], $0.offset)
+        })
+        func add(_ finding: AirGapArchive.Portability) {
+            let key = [finding.entityID, finding.setting]
+            if let index = positions[key] {
+                if finding.disposition > findings[index].disposition { findings[index] = finding }
+            } else { positions[key] = findings.count; findings.append(finding) }
+        }
         let omitted = identities.filter { decisions[$0.fingerprint] == .keepReferenceOnly }
         for identity in omitted {
             for credentialID in identity.credentialIDs {
-                findings.append(.init(entityID: credentialID, setting: "private_identity", disposition: 0,
+                add(.init(entityID: credentialID, setting: "private_identity", disposition: 0,
                     reason: "Private material was deliberately omitted. This public reference is preserved; use a matching identity already on the phone or import it separately."))
             }
         }
@@ -92,12 +111,15 @@ public struct WorkspaceExportSelection: Sendable {
             // This candidate's restriction stays mandatory in the manifest.
             // The annotation is informational: another ordered candidate or a
             // permitted interactive method may still satisfy the route.
-            findings.append(.init(entityID: credential.id, setting: "credential_policy", disposition: 0,
+            add(.init(entityID: credential.id, setting: "credential_policy", disposition: 0,
                 reason: "This credential reference has a required capability or extension that is unavailable in this build. Transferring or finding its private key does not satisfy that policy."))
         }
         let routeMap = Dictionary(uniqueKeysWithValues: workspace.routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: workspace.hostTrust.map { ($0.id, $0) })
         let credentials = Dictionary(uniqueKeysWithValues: workspace.credentials.map { ($0.id, $0) })
+        let destinations = Set(workspace.machines.flatMap(\.routeIDs))
+        let sourceBlocked = WorkspacePortabilityPolicy.blockedRouteIDs(in: workspace,
+            requiredEntityIDs: Set(sourceFindings.filter { $0.disposition == 1 }.map(\.entityID)))
         var revocations: [String: Set<String>] = [:]
         var requirements: [String: Set<String>] = [:]
         for trust in workspace.hostTrust {
@@ -129,6 +151,11 @@ public struct WorkspaceExportSelection: Sendable {
             }
             inspect(route)
             var reasons: [String] = []
+            let lacksSessionPolicy = destinations.contains(route.id)
+                && ((route.mode == "direct_ssh" && route.sessionCreation == nil)
+                    || (route.mode == "frankenterm_mux" && route.attachPolicy == nil))
+            if lacksSessionPolicy { reasons.append("Choose an explicit session creation or attachment policy before opening this destination.") }
+            if sourceBlocked.contains(route.id) { reasons.append("A required source setting remains unresolved for this route or a dependency.") }
             if !required.isEmpty {
                 let names = required.sorted(), sample = names.prefix(8).joined(separator: ", ")
                 let remainder = names.count > 8 ? " and \(names.count - 8) more" : ""
@@ -140,19 +167,43 @@ public struct WorkspaceExportSelection: Sendable {
                 missingIdentity.append(route.id)
                 reasons.append("Public-key authentication for this route or a jump host needs a matching identity already on the phone or a separate key import.")
             }
-            let requiredBlock = !required.isEmpty || deniesPins
+            let requiredBlock = !required.isEmpty || deniesPins || lacksSessionPolicy || sourceBlocked.contains(route.id)
             if requiredBlock { blocked.append(route.id) }
             if !reasons.isEmpty {
-                findings.append(.init(entityID: route.id, setting: "route_readiness", disposition: requiredBlock ? 1 : 0,
+                add(.init(entityID: route.id, setting: "route_readiness", disposition: requiredBlock ? 1 : 0,
                                       reason: reasons.joined(separator: " ")))
             }
         }
+        guard findings.count <= 1024 else { throw FTError.limit("archive.metadata") }
         return .init(pendingIdentityCount: identities.filter { decisions[$0.fingerprint, default: .pending] == .pending }.count,
                      missingApprovedKeyCount: identities.filter {
                          decisions[$0.fingerprint] == .includePrivateKey && !loadedFingerprints.contains($0.fingerprint)
                      }.count,
                      includedIdentityCount: included.count, omittedIdentityCount: omitted.count,
                      blockedRouteIDs: blocked, missingIdentityRouteIDs: missingIdentity, findings: findings)
+    }
+
+    /// An ordinary document cannot carry the archive's portability records.
+    /// Preserve every required source restriction as an inactive route marker,
+    /// and issue a separate identity from any encrypted export of this snapshot.
+    public func publicDocument(bundleID: String) throws -> WorkspaceDocument {
+        guard bundleID != source.bundleID, bundleID != workspace.bundleID else { throw FTError.malformed("export.bundle_identity") }
+        let blocked = WorkspacePortabilityPolicy.blockedRouteIDs(in: workspace,
+            requiredEntityIDs: Set(sourceFindings.filter { $0.disposition == 1 }.map(\.entityID)))
+        guard !blocked.isEmpty else { return try workspace.reissuingBundle(id: bundleID) }
+        var root = try StrictJSON.decode(workspace.raw).object()
+        var document = try root.required("workspace").object()
+        let routes = try document.required("routes").array().map { value -> JSONValue in
+            var route = try value.object()
+            if try blocked.contains(route.text("id")) {
+                let existing = try route["required_capabilities"]?.array().map { try $0.string() } ?? []
+                route["required_capabilities"] = .array(Set(existing).union(["source.unresolved_required_policy"]).sorted().map(JSONValue.string))
+            }
+            return .object(route)
+        }
+        document["routes"] = .array(routes); root["workspace"] = .object(document)
+        root["bundle_id"] = .string(bundleID)
+        return try WorkspaceDocument(data: StrictJSON.encode(.object(root)))
     }
 
     /// Revalidates the real private components and every explicit choice before
