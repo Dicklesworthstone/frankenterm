@@ -6504,8 +6504,9 @@ mod tests {
         };
         // A write that failed after one record and part of the next, a crash
         // between the set-aside renames, and a crash between creating the
-        // log and its journal.
-        let cases: [(u64, Option<&[u8]>, Option<&[u8]>, &[String]); 3] = [
+        // log and its journal: (slot, log bytes, journal bytes, records).
+        type Case<'a> = (u64, Option<&'a [u8]>, Option<&'a [u8]>, &'a [String]);
+        let cases: [Case<'_>; 3] = [
             (0x260, Some(b"first\nsec"), Some(b""), &records),
             (0x261, None, Some(b""), &records),
             (0x262, Some(b""), None, &[]),
