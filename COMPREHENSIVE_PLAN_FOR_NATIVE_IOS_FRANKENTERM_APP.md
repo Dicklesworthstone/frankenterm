@@ -16,6 +16,11 @@
 - [5. Architecture and ownership](#5-architecture-and-ownership)
 - [6. The portable core and Swift/Rust boundary](#6-the-portable-core-and-swiftrust-boundary)
 - [7. Connection modes and SSH transport](#7-connection-modes-and-ssh-transport)
+- [8. Mac export: preserve the workspace the user already knows](#8-mac-export-preserve-the-workspace-the-user-already-knows)
+- [9. Portable workspace format and transactional import](#9-portable-workspace-format-and-transactional-import)
+- [10. Credentials, pairing, and host identity](#10-credentials-pairing-and-host-identity)
+- [11. Mux attachment, effect certainty, and shared control](#11-mux-attachment-effect-certainty-and-shared-control)
+- [12. iOS lifecycle, reconnection, and recovery](#12-ios-lifecycle-reconnection-and-recovery)
 - [13. Native Metal frame pipeline](#13-native-metal-frame-pipeline)
 - [14. Typography, terminal fidelity, and images](#14-typography-terminal-fidelity-and-images)
 - [15. Input, composition, and delivery correctness](#15-input-composition-and-delivery-correctness)
@@ -430,6 +435,562 @@ Once imported and authorized, group connection should require no repeated setup.
 
 ---
 
+## 8. Mac export: preserve the workspace the user already knows
+
+### 8.1 Export a resolved workspace, not executable configuration
+
+The Mac application is the best source of the user's actual terminal setup. It already knows selected domains, effective configuration, resolved colors, and current pane inventory. Add **Export to iPhone** beside the workspace/group controls, with this proposed CLI family:
+
+```text
+ft mobile export --group agents --output agents.ftworkspace
+ft mobile export --group agents --check
+ft mobile inspect agents.ftworkspace
+ft mobile pair --group agents
+ft mobile enroll --device <paired-device-id> --group agents
+ft mobile doctor --group agents
+```
+
+These are proposed interfaces, not existing commands or setup instructions.
+
+Prefer a typed snapshot from the running Mac application through an authenticated local control channel. Retain the configuration revision used to collect it. Export a consistent revision or obtain another snapshot; never mix old group ordering with newly reloaded connection settings.
+
+Use a finite group of concrete machines. Wildcard SSH declarations describe matching rules, not a finite inventory. If no group exists, offer a picker populated from concrete domains and active sessions. The existing agent-role/session-profile model is not automatically a portable machine-group model.
+
+Export portable connection and presentation data. Include no executable Lua, desktop plugin code, automatic local commands, agent socket paths, or implicit dependencies on files that only exist on the Mac.
+
+### 8.2 Resolve SSH settings without hiding portability failures
+
+The [SSH resolver](frankenterm/ssh/src/config.rs) exposes `MatchExecPolicy::Deny` and match diagnostics. Use that explicit policy for preview and inspection. Its default permits execution, so an ostensibly passive export cannot rely on the default.
+
+A denied `Match exec` criterion evaluates false. This prevents execution but does not prove equivalence with the user's ordinary configuration. Distinguish a faithful snapshot already evaluated by the running Mac, complete declarative resolution, and partial resolution with unsupported or unevaluated conditions.
+
+`ssh -G` is not universally passive: `Match exec` can execute a local command during configuration evaluation. An advanced path may deliberately evaluate trusted Mac configuration with an explicit local operation, but the exported result remains data. See the [OpenSSH configuration reference](https://man.openbsd.org/ssh_config) and [ssh reference](https://man.openbsd.org/ssh).
+
+The baseline resolver also has direct ProxyJump and two-phase matching limitations. An unresolved `%j` that became empty cannot be labeled a verified equivalent route. Obtain an authoritative route from the live connection or report the missing direct-access requirement.
+
+| Source setting | Export rule and mobile behavior |
+|---|---|
+| HostName, Port, User | Typed endpoint/account fields; preserve display alias separately. |
+| IdentityFile | Resolve on the Mac; export public identity plus credential reference, never an unusable local path. |
+| IdentityAgent and agent-only identities | Report the identity's actual exportability; offer Via Mac or phone enrollment. |
+| Include | Resolve within bounded file/depth limits on the Mac; retain diagnostics, not include paths to execute on iOS. |
+| Match, canonical/final passes | Export verified resolved values or a clear incomplete-resolution result. |
+| ProxyJump | Explicit ordered hop graph, with separate endpoint, identity, and host verification at every hop. |
+| ProxyCommand or executable override | No arbitrary execution on iOS; map only a deliberately supported structured adapter or offer Via Mac. |
+| HostKeyAlias, known hosts, host CAs | Preserve the effective trust identity and qualification requirements; do not reduce trust to a display label. |
+| SetEnv and SendEnv | Export an explicit user-reviewed allowlist; do not copy the Mac environment wholesale. |
+| RemoteCommand and default program | Retain as a separate session-creation preference with typed supported behavior; never execute during import or discovery. |
+| LocalForward, RemoteForward, DynamicForward | Report unsupported in the first terminal slice unless a separately qualified forwarding feature exists; never silently open listeners. |
+| Agent/X11 forwarding and connection sharing | Do not imply portability of desktop sockets or forwarding authority; expose the limitation. |
+| Compression, keepalive, timeouts | Map only supported semantics into bounded mobile policy; report differences that change behavior. |
+
+### 8.3 Separate machine identity from connection routes
+
+A machine is a navigation destination; a route is one way to reach its terminals. `SSH:build` and `SSHMUX:build` may belong to one machine with two routes. Group them from explicit configuration identity or a reviewed mapping, never merely equal IP addresses, titles, or directories. Different accounts, containers, and bastions may legitimately remain separate.
+
+Maintain an exporter-side registry of stable opaque machine IDs so a rename or a repeated export does not create a new machine. Preserve a trusted display name, short label, theme reference, ordered route references, preferred route, and auto-connect policy. Changes to endpoint/account/trust are security-relevant changes even when the machine ID stays stable.
+
+Routes carry endpoint, account, credential and host-trust references, mode, and structured hops. Via Mac additionally names the paired Mac and selected permitted origin scope. The Mac's downstream connection remains a distinct dependency.
+
+Exported pane hints help recover the user's place after fresh discovery. They are preferences, not server authority. Titles and numeric pane IDs cannot carry control leases or prove survival.
+
+### 8.4 A useful portability report
+
+| Finding | Actionable result |
+|---|---|
+| Portable route and matching credential already present | Ready after the user accepts the group and connection policy. |
+| Portable route with an exportable key | Transfer the selected identity during authenticated pairing or import it deliberately later. |
+| Mac-bound agent/hardware identity | Use the paired Mac's existing sessions or enroll a new phone identity. |
+| Unsupported executable proxy or unresolved condition | Explain the direct-access gap and offer a supported route or Via Mac. |
+| Missing font or desktop-only effect | Preserve the palette and preview the mobile mapping. |
+| Missing or conflicting host trust | Import the machine as awaiting verification; do not authenticate yet. |
+| Remote mux endpoint absent/incompatible | Preserve the machine and identify setup/capability requirements separately from SSH failures. |
+
+Keep the group report scannable, with details attached to each affected machine. One unavailable host does not prevent exporting the rest.
+
+### 8.5 Faithful themes and connection intent
+
+Export resolved foreground/background, cursor foreground/background/border, selection foreground/background, and all sixteen ANSI entries, including explicit indexed-color overrides above 15 where configured. Map normal ANSI 0-7 and bright ANSI 8-15 explicitly from the existing [palette model](frankenterm/config/src/color.rs). Theme names alone cannot reproduce a custom palette. Specify the standard derivation for remaining indexed colors in the schema version.
+
+Distinguish configured base themes from transient terminal OSC palette changes. The workspace theme restores the machine's intended appearance; a live mux snapshot carries its actual current terminal colors. Preserve light/dark variants as explicit alternatives, and keep local phone overrides through reimport unless the user selects incoming values.
+
+Font preferences include a portable descriptor and a preview of substitutions. Version-one workspace JSON does not bundle arbitrary font files. Any later asset packaging needs licensed content, bounded decoding, and its own format/version contract.
+
+Auto-connect becomes convenient after one reviewed group import and credential/trust setup. An untrusted document cannot itself authorize connections, credential submission, key enrollment, or remote commands.
+
+---
+
+## 9. Portable workspace format and transactional import
+
+### 9.1 Version-one format
+
+Define `.ftworkspace` as a UTF-8 JSON document with a registered native document type. Version one contains portable configuration and public credential references. **It contains no private keys and defines no offline private-key envelope.** Selected private-key transfer uses authenticated live pairing. An offline encrypted-key format would require a separate, complete cryptographic design.
+
+Keep exporter, workspace, and bundle identities distinct:
+
+- Exporter ID identifies the source configuration namespace.
+- Workspace ID remains stable across exports.
+- Bundle ID identifies one immutable export.
+- Entity IDs are stable opaque references.
+- Export sequence detects rollback only when bound to an authenticated exporter.
+
+This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic fingerprints are nonoperational documentation data. Their claimed provenance grants no trust.
+
+```json
+{
+  "format": "ftworkspace",
+  "version": 1,
+  "bundle_id": "bundle-example-001",
+  "source": {
+    "exporter_id": "mac-example",
+    "kind": "mac_snapshot",
+    "configuration_revision": "config-example-007",
+    "export_sequence": 7
+  },
+  "required_capabilities": [],
+  "workspace": {
+    "id": "workspace-agents",
+    "name": "Agent Machines",
+    "groups": [
+      {
+        "id": "group-agents",
+        "name": "Agents",
+        "machine_order": ["machine-build", "machine-gpu"],
+        "auto_connect": true
+      }
+    ],
+    "machines": [
+      {
+        "id": "machine-build",
+        "name": "Build",
+        "short_label": "BLD",
+        "theme_ref": "theme-cobalt",
+        "route_refs": ["route-build"],
+        "preferred_route_ref": "route-build",
+        "auto_connect": true,
+        "pane_selection": "last_surviving"
+      },
+      {
+        "id": "machine-gpu",
+        "name": "GPU",
+        "short_label": "GPU",
+        "theme_ref": "theme-orchid",
+        "route_refs": ["route-gpu"],
+        "preferred_route_ref": "route-gpu",
+        "auto_connect": true,
+        "pane_selection": "last_surviving"
+      }
+    ],
+    "routes": [
+      {
+        "id": "route-build",
+        "mode": "direct_ssh",
+        "host": "build.example.invalid",
+        "port": 22,
+        "user": "operator",
+        "credential_ref": "credential-main",
+        "host_trust_ref": "trust-build",
+        "jump_routes": []
+      },
+      {
+        "id": "route-gpu",
+        "mode": "frankenterm_mux",
+        "host": "gpu.example.invalid",
+        "port": 22,
+        "user": "operator",
+        "credential_ref": "credential-main",
+        "host_trust_ref": "trust-gpu",
+        "jump_routes": [],
+        "attach_policy": "existing_only"
+      }
+    ],
+    "credentials": [
+      {
+        "id": "credential-main",
+        "algorithm": "ssh-ed25519",
+        "public_fingerprint": "SHA256:ERERERERERERERERERERERERERERERERERERERERERE",
+        "requirement": "matching_private_key",
+        "private_material": "not_included"
+      }
+    ],
+    "host_trust": [
+      {
+        "id": "trust-build",
+        "host": "build.example.invalid",
+        "port": 22,
+        "claimed_source": "mac_known_hosts",
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ]
+      },
+      {
+        "id": "trust-gpu",
+        "host": "gpu.example.invalid",
+        "port": 22,
+        "claimed_source": "mac_known_hosts",
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256://////////////////////////////////////////8"
+          }
+        ]
+      }
+    ],
+    "themes": [
+      {
+        "id": "theme-cobalt",
+        "name": "Cobalt",
+        "foreground": "#EAF2FF",
+        "background": "#10223C",
+        "cursor_foreground": "#10223C",
+        "cursor_background": "#FFFFFF",
+        "cursor_border": "#FFFFFF",
+        "selection_foreground": "#FFFFFF",
+        "selection_background": "#345D91",
+        "accent": "#3B82F6",
+        "ansi": [
+          "#14253D", "#FF6B7A", "#7BD88F", "#FFD166",
+          "#6DA9FF", "#C792EA", "#66D9E8", "#CEDAF0",
+          "#657B99", "#FF9AA5", "#A4E8B2", "#FFE29A",
+          "#9BC3FF", "#DDB4F5", "#98E8F1", "#FFFFFF"
+        ]
+      },
+      {
+        "id": "theme-orchid",
+        "name": "Orchid",
+        "foreground": "#F6EFFF",
+        "background": "#271B35",
+        "cursor_foreground": "#271B35",
+        "cursor_background": "#FFFFFF",
+        "cursor_border": "#FFFFFF",
+        "selection_foreground": "#FFFFFF",
+        "selection_background": "#66457D",
+        "accent": "#D946EF",
+        "ansi": [
+          "#30203E", "#FF718D", "#92D88D", "#F2CC75",
+          "#94A9FF", "#E397EE", "#7BDCD5", "#E2D6ED",
+          "#887496", "#FFA1B3", "#B8E8AE", "#FFE1A0",
+          "#BCC9FF", "#F2BCF8", "#AAF0E9", "#FFFFFF"
+        ]
+      }
+    ],
+    "preferences": {
+      "initial_group_ref": "group-agents",
+      "initial_machine_ref": "machine-build",
+      "connect_on_open": true
+    }
+  }
+}
+```
+
+Production IDs should be sufficiently random and stable, rather than derived from names or array offsets. The illustrative format admits these opaque fixture IDs so examples can be validated by the actual parser.
+
+### 9.2 Validation and references
+
+Proposed initial limits are 2 MiB per document, nesting depth twelve, 128 machines, 256 routes, 64 groups, 256 credential records, 512 pins, and 128 themes. Limit jump chains to three hops in the initial transport profile. These are admission caps, not allocations or launch-time connection counts.
+
+Reject duplicate JSON keys, duplicate entity IDs, dangling references, duplicate group-order entries, jump cycles, invalid ports, malformed fingerprints, overflowing numeric values, and excess strings. Every palette contains exactly sixteen ANSI colors. Define colors as sRGB hex RGB or RGBA values with explicit alpha semantics; validate and normalize before constructing the application object graph.
+
+Normalize endpoint syntax deliberately, including IPv6 and internationalized hostnames. Preserve display values separately from the canonical endpoint used for trust. Labels cannot become shell, path, or host substitutions.
+
+Define one schema and shared fixtures for exporter and importer, with explicit migration rules. The workspace schema, Swift/Rust ABI, terminal feature profile, and mux codec have independent versions.
+
+Unknown required capabilities prevent activation. Optional extensions live in a bounded namespaced object with an explicit preservation policy. Unknown major versions reject safely. A `claimed_source` field is descriptive data, not authentication of its own pins.
+
+### 9.3 Reimport, merge, and readiness
+
+Reimport of the same bundle is idempotent. A newer export from the same authenticated namespace produces a field-level change preview. Stable machine IDs preserve phone ordering, local theme/font overrides, and selected-pane preferences across renames.
+
+Resolve credentials by canonical public-key identity and compatible access policy, not filenames. Reuse does not replace a credential's Keychain protection. Two aliases may reference the same material while retaining different route restrictions.
+
+Do not silently remove machines absent from a later export or close their sessions. A differently paired or unsigned source cannot overwrite an existing trusted namespace by copying IDs; import separately or require an explicit reviewed association.
+
+Publish a structurally valid workspace atomically, while allowing reviewed machines to be in different readiness states. A missing credential or unreachable host can remain on its card without blocking every other machine. Pairing acceptance, structural validation, credential availability, trust approval, network reachability, and remote capability are separate checks.
+
+Automatic admission requires the accepted workspace policy, an opted-in active group, that machine's enabled preference, usable credentials/trust, and current device network policy. A device-local disable wins over incoming defaults. Membership in several groups must not create duplicate connection attempts; connect the union of deliberately active groups through one machine/route scheduler.
+
+### 9.4 Crash-safe publication across Keychain and storage
+
+Keychain and the workspace database are not participants in one shared transaction. Use a recoverable journal:
+
+1. Validate the complete candidate in bounded memory.
+2. Durably record a transaction ID, intended revision, and credential-reference changes without secrets.
+3. Stage newly transferred credentials under transaction-scoped Keychain identifiers; leave reused items untouched.
+4. Verify that every route marked ready resolves to actual material and locally accepted trust.
+5. Atomically publish an immutable workspace revision and its reference mapping.
+6. Mark the journal committed and retire owned staging metadata.
+
+Before publication, the existing workspace stays active. Recovery consults both the journal and published revision. It removes an abandoned transaction's newly created, unreferenced items only after ownership and reachability checks. It never removes a reused credential because another import failed.
+
+If publication succeeded but cleanup did not, finish cleanup without rolling back the active revision. If a required Keychain write failed, do not publish a false ready state. The old or new complete configuration survives; arbitrary partial activation does not.
+
+---
+
+## 10. Credentials, pairing, and host identity
+
+### 10.1 Three useful credential paths
+
+| Path | User experience | Availability and identity contract |
+|---|---|---|
+| Transfer selected exportable keys | Choose specific existing identities during authenticated pairing. | Same public identity, protected separately on the phone; not every Mac key is exportable. |
+| Enroll a phone identity | Generate a device key and authorize its public key through an already authenticated Mac workflow. | Independently revocable phone identity, with per-host results. |
+| Use existing Mac sessions | Attach through the paired Mac's permitted mux scope. | Agent/hardware identities remain on the Mac; its availability is an explicit dependency. |
+
+Enrollment is an explicit remote change. Preserve existing authorized identities, restrictions, comments, ownership, and file permissions. Add only the intended public-key entry idempotently, verify the resulting authorization, and retain an operation ID and per-host result. A lost acknowledgement requires readback/reconciliation before repeating the edit. Managed certificate environments may need an approved issuer flow instead.
+
+There is no atomic transaction across twenty hosts. Partial enrollment is a visible per-machine result, with safe continuation and deliberately scoped removal of entries this operation owns.
+
+Via Mac is not a general signing oracle. Attach to permitted sessions rather than exposing the Mac's agent to arbitrary phone requests or enabling forwarded agents by default.
+
+### 10.2 Qualify key capabilities explicitly
+
+The matrix is a release qualification requirement, not a claim that all existing desktop paths already work on iOS.
+
+| Identity or authentication case | Required proof or supported alternative |
+|---|---|
+| File-backed Ed25519 | Actual encrypted/unencrypted OpenSSH-file import, passphrase handling, signing, cancellation, and strict server verification. |
+| File-backed ECDSA | Each supported curve and key container, correct SSH signature representation, and server-policy compatibility. |
+| Existing RSA | Supported key sizes and containers, RSA-SHA2 negotiation where required; never infer permission for deprecated algorithms from the word RSA. |
+| Phone-generated software key | Secure generation, public-key export, Keychain storage, enrollment, and per-device revocation. |
+| Secure Enclave P-256 | Device generation, access-control policy, signing callback integration, and conversion to SSH's expected signature encoding. |
+| Mac agent, hardware token, security-key identity | Via Mac or independent phone enrollment unless a real native integration is separately qualified. |
+| User certificate | Public-key/credential binding, certificate expiry/principal policy, issuer workflow, and backend support. |
+| Host certificate | Independent CA/principal/time/critical-option validation, not merely parsing a certificate object. |
+| Password or keyboard-interactive MFA | Foreground prompts bound to the exact host/hop and attempt, bounded worker ownership, cancellation, no logging of responses. |
+
+A DER-encoded platform ECDSA signature is not automatically the SSH wire signature; encoding and algorithm binding belong in the audited signer adapter. SwiftNIO SSH remains a fallback subject to the same matrix, including encrypted OpenSSH import and keyboard-interactive coverage. Do not silently narrow supported credentials to make a demo connect.
+
+### 10.3 Keychain and Secure Enclave have different roles
+
+Store imported private material in Keychain under deliberate access controls. A proposed foreground default is `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`, with explicit user-presence/biometric policy. It requires a passcode, does not migrate, and loses its items if the passcode is disabled; restored configuration therefore may need credential re-enrollment. See [Apple's accessibility contract](https://developer.apple.com/documentation/security/ksecattraccessiblewhenpasscodesetthisdeviceonly).
+
+Imported OpenSSH keys cannot become Secure Enclave keys while preserving identity. Apple's documented Secure Enclave path generates device-bound P-256 keys and does not import preexisting plaintext keys. Use it for an appropriate new phone identity once backend and server support are proven. See [Protecting keys with the Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave).
+
+The native broker owns Keychain access, local authentication context, and bounded signing grants. Keep private bytes out of UserDefaults, manifests, clipboard, terminal state, logs, and crash metadata. Minimize copies and zero/release owned buffers where the actual runtime permits it; do not promise universal forensic erasure. User-selected source files remain under the user's file-management control.
+
+### 10.4 Preferred pairing transport
+
+Use a short-lived Mac pairing service with **TLS 1.3 and certificate or SPKI pinning conveyed by a QR code**. Discovery identifies a candidate endpoint; the authenticated pairing ceremony establishes authority.
+
+The QR includes a protocol version, session ID, endpoint policy, precisely encoded pin, high-entropy single-use challenge, and expiration. Start with a five-minute invitation lifetime. It contains no SSH private key. Verify the pin before sending the challenge, follow no redirects, and bind every accepted message to that pairing session.
+
+The Mac confirms the intended phone through its device identity and a comparison code or equivalent verification before authorizing selected credential transfer. A photographed QR alone cannot silently approve exporting private keys. Rate-limit attempts and atomically bind the redeemed invitation to one recipient.
+
+Separate invitation redemption from transfer completion. If a connection drops afterward, authenticated resumption may continue the same bounded transaction for that recipient; it must not redeem the invitation for another phone.
+
+Bind transfer records to protocol/session/source/recipient/workspace/credential IDs and payload digest inside the authenticated stream. A hash alone proves neither sender nor recipient. Version one transfers selected secrets only through this live authenticated channel. Do not invent an offline encryption format by adding an undocumented password field to JSON.
+
+### 10.5 Fit authentication to the actual library
+
+The underlying [libssh2 signing callback](https://libssh2.org/libssh2_userauth_publickey.html) does not imply that the current Rust wrapper already exposes a general native signer. Implement and qualify the narrow boundary described in section 7.
+
+Signing and keyboard-interactive callbacks are synchronous library contracts. Preauthorize where possible and use an isolated bounded authentication worker. Do not block MainActor, an asupersync executor, or a lock required by the prompt completion. Cancellation must release every waiter and retire the exact attempt.
+
+Coalesce unlock preparation only for the same identity when its real access policy permits. Twenty hosts must not launch twenty simultaneous biometric sheets, but the app cannot promise one prompt if selected policies require several.
+
+### 10.6 Host verification precedes user authentication
+
+Verify the server before offering credentials. Preserve endpoint, port, effective host-key alias, algorithm, pins, and supported CA policy. Verify each jump hop and the final host independently; trusting a bastion does not automatically trust every downstream destination.
+
+Accept imported pins through authenticated Mac pairing or explicit local review. A mismatch stops the affected connection and shows old/new fingerprints with the trusted machine and route. Discovery by `ssh-keyscan` is not independent identity verification.
+
+Host certificates require full CA, principal/hostname, validity, certificate-type, and critical-option handling. An API that parses certificate syntax has not necessarily performed those checks.
+
+Trust changes are separate from cosmetic merge policy. A rename, theme change, route reorder, or repeated import cannot clear a rejection, revive a revoked identity, or bypass an altered host key.
+
+### 10.7 Revocation has several scopes
+
+Revoking a Mac pairing stops that device's Via Mac authorization and future transfers. Removing a local Keychain item stops that phone's use of the item. Revoking a distinct enrolled phone public key or certificate stops its corresponding remote authentication.
+
+A copied Mac private key has the same public identity as the original. Servers cannot revoke only the phone's copy by fingerprint; rotating/removing that shared identity affects all copies. Prefer an independently enrolled identity when per-phone revocation matters.
+
+Removing a workspace is not remote credential revocation. Present these operations with their actual scope, preserve unrelated keys, and report per-host revocation results and uncertainty. No global success label may hide a host that has not confirmed the change.
+
+---
+
+## 11. Mux attachment, effect certainty, and shared control
+
+### 11.1 Extend the existing protocol contract
+
+At the evidence baseline, the [codec history](docs/codec-versions.md) identifies current version 70 and minimum supported dialect 61. Historical version 60 introduced reliable keys; it is not a currently supported standalone negotiation target.
+
+| Existing version | Relevant contract | Mobile consequence |
+|---|---|---|
+| 60 | Reliable key events with exact pane-registration authority and typed outcomes. | Reuse the no-effect authority probe and ordered input model. |
+| 61 | Typed content-free errors with effect certainty and retry/reconciliation authority. | Interpret validated authority, not error-message text. |
+| 62-63 | Sampled traced key/paste wrappers. | Preserve content-free observability without creating a second input path. |
+| 64 | Reliable arbitrary pane writes and exact applied prefixes. | Reuse bounded input, digest binding, deduplication, and ordered suffix handling. |
+| 65 | Rows fetched against an observed sequence/layout. | Reject asynchronous history results that no longer match their geometry. |
+| 66 | Bounded server-owned selection anchors. | Qualify nested forwarding before claiming reflow-stable mobile selection. |
+| 67 | Explicit warm-scrollback eviction. | Remote memory mutation remains separate from local cache eviction. |
+| 68 | Exact-pane domain information. | Resolve proxied origins without guessing from a title or directory. |
+| 69 | Correlated render-state request. | Obtain the correlated fence through the correct request, preserving older semantics. |
+| 70 | Bounded complete pane user-variable snapshots. | Hydrate optional metadata on demand after discovery. |
+
+The history also records exact-render-delivery PDUs in version 52 as reserved and deliberately unadvertised until remaining server retention, client admission/application, and convergence work is complete. Their wire definitions alone do not supply mobile snapshot recovery.
+
+Negotiate per connection generation and enforce the selected dialect for each PDU. A Via Mac route may cross several peers; the outer connection's capability does not prove that every inner source supports the operation.
+
+### 11.2 First-party attachment handshake
+
+The proposed `ft mobile attach --stdio --no-auto-start` endpoint must:
+
+1. Locate the explicitly selected existing mux without silently starting one.
+2. Establish the authenticated account and permitted session/origin scope.
+3. Negotiate codec overlap and application capabilities.
+4. Retain the dialect and capability set for this connection generation.
+5. Discover panes with authoritative topology, origin, and registration witnesses.
+6. Establish bounded subscriptions and obtain coherent selected-pane state.
+7. Obtain the required control authority before enabling interactive input.
+
+Protocol stdout is binary-clean; diagnostics go to stderr. Bound banners, handshake duration, compressed and expanded bodies, outstanding requests, and total receiver memory. Validate dialect, direction, role, and capability before allocating a serial or transmitting a PDU, and before accepting an inbound effect.
+
+Do not add fields to existing positional payloads and assume compatibility through a default-value annotation. Follow the actual assigned-PDU and minimum-dialect rules. New lease/endpoint capabilities receive IDs through the registry when implemented; this plan reserves no fictional wire numbers.
+
+The existing inherited proxy command discussed in section 7 remains a distinct interface. The mobile setup flow must inspect endpoint availability and give an accurate update/provisioning requirement, rather than recommend a nonexistent command.
+
+### 11.3 Source identity and ordering authority
+
+Direct SSH identity includes a local terminal/session UUID, route revision, transport generation, and SSH channel generation. It identifies a phone-owned terminal instance, not a remote persistent mux pane.
+
+Mux identity includes the authenticated route, server/session incarnation, exact server-issued pane registration, and origin binding. A numeric pane ID cannot authorize input by itself.
+
+Each scene/responder has an input stream and monotonic focus generation. If multiple streams share one protocol connection, allocate server-facing ordering serials through one documented authority; scenes cannot independently reuse serial numbers. Stream-local focus and server-side controller ownership remain separate concepts.
+
+A reconnect or route change establishes new transport authority. Equal titles, addresses, numeric IDs, or saved workspace entries do not prove that the original pane survived.
+
+### 11.4 Admission binds the destination
+
+At admission, capture immutable source identity, stream, focus generation, ordering serial, payload identity, and applicable control authority. The focus barrier closes the old stream to new admission but does not retarget or erase already admitted operations. They settle against the original source while another machine may be visible.
+
+| State | Meaning | Permitted automatic action |
+|---|---|---|
+| Local draft | Text not admitted as terminal input. | Edit or discard locally. |
+| Admitted | Destination/order fixed and operation owned by the input ledger. | Progress only against that destination. |
+| Pending outcome | Submitted or awaiting a qualified response. | Wait or reconcile within original deadlines and authority. |
+| Applied prefix | A qualified response proves an exact prefix. | Follow the existing reliable-write suffix contract. |
+| Definitely not sent | Transport proves the operation never crossed its send boundary. | Re-evaluate current intent and authority; do not retarget automatically. |
+| Rejected with no effect | A qualified response proves no application. | Explain; retry only under separately validated authority. |
+| Retry authorized with no effect | Typed bounded scheduling retry proves zero effect. | Retry within the original budget and destination. |
+| Outcome unknown | Available evidence cannot establish what happened. | No automatic replay. |
+
+A network timeout does not prove zero effect. A successful local socket write does not prove a remote command executed. Even a reliable acknowledgement establishes the specific accepted/applied protocol effect, not successful completion of the user's shell command.
+
+### 11.5 Keep the reliable-write ledger's real guarantees
+
+Version 64 retains outcomes within the mux process and reports exact applied prefixes. Reuse its ordering, digest binding, deduplication, queue bounds, and suffix semantics. A partial suffix stays ahead of later keys/writes under the prescribed fresh serial; it cannot move to another pane or be resent as the complete original payload.
+
+ACK-loss reconciliation is permitted only while the exact server, pane registration, retained ledger, and replay authority remain valid. This is not crash-durable replay. A remote restart invalidates the assumption that process-local records still exist.
+
+`OutcomeUnknown` remains unresolved until stronger evidence arrives. Unlocking a credential, selecting another route, or reconnecting does not manufacture that evidence. Keep the status attached to the original operation and offer a deliberate new action after inspection where appropriate.
+
+Direct SSH has weaker certainty. Once bytes enter the transport, connection failure may leave their remote effect unknowable. Record that uncertainty; do not manufacture mux-style acknowledgements.
+
+Do not persist raw keystrokes or paste payloads for automatic reconnect replay. A bounded local ledger may retain protected operation metadata and disposition needed to explain uncertainty. Its existence is not authority to execute the payload again.
+
+### 11.6 Viewing, input, geometry, and topology are separate capabilities
+
+A proposed server control capability distinguishes discovery/viewing, input, shared PTY geometry, and topology/memory mutations. Bind controller leases to exact pane registration, authenticated client/session, owner stream, scope, generation, and expiry. Enforce them where the mutation enters the mux and return typed stale/revoked outcomes.
+
+The native Mac client must participate in this authority model. A phone-only lock cannot prevent the Mac and phone from issuing competing writes or resizes.
+
+Viewing defaults to observer behavior. The phone can fit or pan the remote grid locally. Taking input control and controlling size are explicit actions with understandable conflict and revocation states.
+
+Retain enough source authority to settle admitted input across a local focus change. Do not revoke a lease first and silently abandon its pending ledger. If authority actually expires before server admission, retain the resulting no-effect rejection or uncertainty accurately.
+
+Closing a local view, disconnecting a client, terminating a remote PTY, and deleting a saved workspace are different operations. Only the deliberate remote mutation can terminate the remote pane.
+
+### 11.7 Synchronize state before enabling interaction
+
+A useful snapshot identifies source, terminal sequence, geometry, palette and modes, cursor, row versions, and relevant image state coherently. Apply a full replacement or a proven compatible delta as one model transaction.
+
+Version 69 correlation is useful but does not resolve every capture/coherence/retention gap. Complete the missing mobile snapshot contract, including the generic pane-capture limitation, before claiming exact resynchronization. Do not replay a plain-text capture through a new parser and call it the same terminal.
+
+When retained deltas have a gap, request a bounded authoritative replacement. When the source lacks the required contract, expose a narrower supported capability. Retained output may remain visible as stale, but new interactive input stays closed until source, state, and authority are valid.
+
+---
+
+## 12. iOS lifecycle, reconnection, and recovery
+
+### 12.1 Make suspension ordinary
+
+Model scene activity separately from application execution and transport health. The useful lifecycle is foreground live, quiescing, suspended/unavailable, reconnecting, resynchronizing, and live again. A scene becoming inactive does not necessarily mean every scene or transport has stopped.
+
+iOS has no general mechanism promising indefinitely running background SSH. Its background APIs serve specific purposes. Remote PTY survival must be owned by the remote mux, independent of whether the phone runs. See [Apple's background-execution guidance](https://developer.apple.com/forums/thread/685525).
+
+On process backgrounding:
+
+1. Close ordinary input admission for affected scenes.
+2. Apply section 15's OS-interruption policy to unsubmitted composition; do not wait indefinitely for an IME choice or synthesize a commit.
+3. Stop display scheduling and speculative preparation; complete the Metal submission/scheduling barrier.
+4. Persist navigation and any policy-permitted coherent local checkpoint.
+5. Cancel speculative connections and retire pending authentication UI.
+6. Settle what can be settled and retain honest metadata for outstanding effects.
+7. Reduce/release viewer subscriptions without terminating persistent remote panes.
+
+A finite UIKit background task may finish bounded transition work. Its expiration handler must release resources promptly; network success is never a precondition for expiration. See [Extending background execution time](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time).
+
+Correctness cannot require a final disconnect message reaching the server. Server leases and subscriptions need expiry and cleanup even if the app is killed before sending anything.
+
+### 12.2 Restore local intent before remote authority
+
+| State | Restoration rule |
+|---|---|
+| Group, machine names, order, theme preferences | Restore the last committed local revision immediately. |
+| Credentials | Check actual Keychain availability and access policy. |
+| Retained terminal content | Show as saved state only when retention policy permits. |
+| Transport | Establish a fresh authenticated generation. |
+| Mux pane | Verify the original server incarnation and exact surviving registration. |
+| Input/geometry authority | Acquire current authority; never restore a stale lease as live. |
+| Ambiguous prior input | Preserve uncertainty; do not replay. |
+
+Persist retained content with its resume witness atomically if persistent caching is enabled. After an incomplete checkpoint, discard unproven resume authority while allowing safe retained content to be shown as stale. Default memory-only caching does not promise a transcript after process termination.
+
+### 12.3 Bounded reconnect scheduling
+
+Reconnect the selected machine first, then navigation neighbors, then the opted-in group through the bounded queue in section 7. Promote existing work when focus changes rather than creating duplicate handshakes. Serialize interactive prompts and coalesce only compatible credential preparation.
+
+Network-path changes are hints, not evidence that an SSH transport migrated. When a new transport is needed, repeat host verification and establish new authentication authority. A user-selected alternate route must pass its own trust, origin, and continuity checks.
+
+For mux mode, apply compatible retained deltas only when the peer authorizes them. A retention gap requires a full bounded replacement. A new mux incarnation, vanished pane, or different origin requires a visible discontinuity. Do not bind input to a same-number successor.
+
+For direct SSH, explain when a new channel/session is necessary and obtain the intended session-creation action. Do not present a new shell as the old shell or rerun its startup commands as an invisible recovery step.
+
+### 12.4 Failure domains remain distinct
+
+| Failure | Required result |
+|---|---|
+| Phone suspends; remote mux survives | Reauthenticate/resynchronize and reattach to the exact surviving pane. |
+| Direct SSH connection dies | Report uncertain effects and the need for a distinct new session where applicable. |
+| Paired Mac becomes unavailable | Mark Via Mac dependency unavailable; do not silently move to a different direct session. |
+| Jump host fails | Invalidate dependent route generations and settle their child work. |
+| Remote host or mux restarts | Treat process continuity and old ledger authority as lost unless separately proven. |
+| Pane closes or numeric ID is reused | Mark the original pane closed; never redirect pending operations. |
+| Keychain identity is unavailable after device restore | Keep configuration and offer deliberate key import/enrollment. |
+| Local-network permission is denied | Explain the LAN-access requirement separately from SSH authentication. |
+| Retained render state expires | Request a bounded authoritative replacement or show the qualified capability limit. |
+
+The first continuity goal is the ordinary case of phone interruption while the remote mux survives. Guardian-backed process survival, lossless mux upgrades, full recovery images, and agent resume remain separately qualified server capabilities.
+
+### 12.5 Bound local and remote work independently
+
+A persistent mux must not make PTY capture depend on one slow phone. It owns bounded retention, subscription backpressure, and eviction policy. The phone owns its mirror, glyph/image caches, and local history.
+
+Release previews and reconstructible resources under pressure before selected source identity and input disposition. Local cache eviction never implicitly issues the server's warm-scrollback eviction mutation.
+
+Optional pushes carry minimal event references and require foreground refresh before interaction. They are not transcripts, command authority, or a workaround for continuous sockets. Newer finite continued-processing APIs do not change this persistence contract.
+
+### 12.6 Recovery acceptance
+
+Use physical devices with the debugger detached where it changes lifecycle behavior. Exercise lock/unlock during authentication, output, held modifiers, and IME; Wi-Fi/cellular changes and silent blackholes; termination across import publication; lost key/paste acknowledgements; focus changes during reconnection; two scenes controlling one source; mux restart and ID reuse; expired retention; Mac loss; missing device-bound keys; IPv6-only networks; and memory pressure during noisy-neighbor output.
+
+Each trace verifies the visible state, exact destination, effect certainty, bounded resources, and eventual settlement. A spinner disappearing is not evidence that the right terminal was recovered.
+
+---
+
 ## 13. Native Metal frame pipeline
 
 ### 13.1 One mobile rendering owner
@@ -621,7 +1182,7 @@ Capture the destination, source identity, input stream, and applicable mode witn
 
 Use bracketed paste when negotiated, but do not treat it as a sandbox. Embedded control bytes and bracketed-paste delimiters require explicit handling; ordinary text paste must not silently become raw terminal-control injection.
 
-Transmit through a bounded queue with an operation ID and ordered chunks. Cancellation stops further admission and reports the prefix already admitted or written under the transport's actual certainty model. It cannot retract bytes already sent. If a bracketed-paste closing marker is needed, send it only to the same valid source under the operation's cleanup contract; never replay the payload after reconnect.
+Transmit through a bounded queue with an operation ID and ordered chunks. For ordinary UTF-8 text, choose valid character boundaries and keep the bracket delimiters separate from payload data; parser state across admitted chunks remains ordered. Cancellation stops further admission and reports the prefix already admitted or written under the transport's actual certainty model. It cannot retract bytes already sent. If a bracketed-paste closing marker is needed, send it only to the same valid source under the operation's cleanup contract; never replay the payload after reconnect.
 
 While a paste is active, reserve that stream's ordering so helper keys or another paste cannot accidentally interleave inside its delimiters. A deliberate interrupt is a separate visible action with defined ordering. Source loss leaves the remaining text unsent and reports any uncertain prefix.
 
