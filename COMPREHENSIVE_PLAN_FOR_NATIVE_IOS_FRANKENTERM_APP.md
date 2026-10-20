@@ -16,6 +16,11 @@
 - [5. Architecture and ownership](#5-architecture-and-ownership)
 - [6. The portable core and Swift/Rust boundary](#6-the-portable-core-and-swiftrust-boundary)
 - [7. Connection modes and SSH transport](#7-connection-modes-and-ssh-transport)
+- [13. Native Metal frame pipeline](#13-native-metal-frame-pipeline)
+- [14. Typography, terminal fidelity, and images](#14-typography-terminal-fidelity-and-images)
+- [15. Input, composition, and delivery correctness](#15-input-composition-and-delivery-correctness)
+- [16. Selection, search, clipboard, and useful workflows](#16-selection-search-clipboard-and-useful-workflows)
+- [17. Viewports, keyboard geometry, and remote resize authority](#17-viewports-keyboard-geometry-and-remote-resize-authority)
 - [18. Resource, bandwidth, and battery design](#18-resource-bandwidth-and-battery-design)
 - [19. Accessibility, ergonomics, and international use](#19-accessibility-ergonomics-and-international-use)
 - [20. Features that make the fleet useful on a phone](#20-features-that-make-the-fleet-useful-on-a-phone)
@@ -23,6 +28,11 @@
 - [22. Build, packaging, and release architecture](#22-build-packaging-and-release-architecture)
 - [23. Performance targets and measurement](#23-performance-targets-and-measurement)
 - [24. Verification through complete user journeys](#24-verification-through-complete-user-journeys)
+- [25. Dependency-ordered implementation tracks and milestones](#25-dependency-ordered-implementation-tracks-and-milestones)
+- [26. Existing Beads crosswalk](#26-existing-beads-crosswalk)
+- [27. Decisions, risks, and falsifying experiments](#27-decisions-risks-and-falsifying-experiments)
+- [28. The first productive implementation session](#28-the-first-productive-implementation-session)
+- [29. Source map and maintenance notes](#29-source-map-and-maintenance-notes)
 
 ---
 
@@ -418,6 +428,308 @@ Use bounded exponential backoff with jitter and a per-route retry budget. A user
 
 Once imported and authorized, group connection should require no repeated setup. User-disabled machines stay disabled. Cellular, constrained-network, and background policies may reduce subscriptions while preserving the configured group and showing the reason.
 
+---
+
+## 13. Native Metal frame pipeline
+
+### 13.1 One mobile rendering owner
+
+Keep a persistent `MTKView` inside the UIKit terminal host, exposed to SwiftUI through [UIViewRepresentable](https://developer.apple.com/documentation/swiftui/uiviewrepresentable). SwiftUI changes the selected source and chrome without destroying the Metal device, pipelines, atlases, or responder arrangement. A machine swipe changes what that surface presents; it does not construct another rendering stack.
+
+The mobile pipeline has one native Swift render-preparation and atlas owner. Rust supplies owned semantic rows, cell occupancy, unresolved colors, attributes, image references, cursor state, and coordinate witnesses. Swift performs Core Text shaping, glyph rasterization scheduling, atlas placement, and final GPU instance preparation. Rust does not also assign mobile atlas coordinates.
+
+Reuse the portable representations and shader contracts in [cell_bg.rs](crates/frankenterm-renderer-metal/src/cell_bg.rs), [cell_text.rs](crates/frankenterm-renderer-metal/src/cell_text.rs), and [the existing shaders](crates/frankenterm-renderer-metal/src/shaders). The current `CellText` representation includes atlas-dependent fields; those fields are filled only after the mobile owner allocates the glyph. Shared packing helpers are acceptable, but two independent atlas allocators are not.
+
+Treat Rust, Swift, and Metal Shading Language layout agreement as an executable contract: byte size, stride, alignment, field offsets, endianness, flags, and reserved bytes. Do not assume similarly named Swift and Rust structs have identical memory layouts.
+
+### 13.2 From semantic transaction to presented frame
+
+Use this pipeline:
+
+1. Apply all admitted terminal bytes or mux state transactions in their authoritative order.
+2. Publish an owned semantic transaction with source identity, coordinate witness, row versions, and compatible base revision.
+3. Merge compatible pending changes into the newest coherent display state.
+4. Shape changed runs and prepare changed instances outside terminal locks and MainActor.
+5. Acquire an available frame slot without blocking the UI.
+6. Obtain a drawable through the view's documented lifecycle, encode bounded rendering work, and submit once.
+7. Retire referenced resources only when Metal completion permits it.
+
+[RenderMirror](frankenterm/mux/src/render_mirror.rs) already separates unresolved row capture from style resolution and GPU preparation. Preserve that boundary. A plain-text capture is not a substitute for these semantic rows.
+
+Skipping a presentation is permissible; dropping terminal bytes or losing an unapplied delta is not. When coalescing, retain each row's newest compatible state, including cursor, images, palette, and geometry. If the delta chain no longer matches the consumer's base, request a bounded replacement instead of guessing.
+
+The render owner serializes atlas mutation, instance preparation, and resource retirement. UIKit view operations stay on MainActor. Cross-executor draw tickets retain their resources and are single-use; their handoff is part of the native ownership contract, not an unchecked transfer of arbitrary UIKit objects. Measure drawable acquisition stalls explicitly and avoid scheduling redundant work while no drawable or safe frame slot is available.
+
+### 13.3 Passes and retained resources
+
+The initial frame uses a small, explicit set of passes:
+
+| Pass | Content | Reuse rule |
+|---|---|---|
+| Background | Resolved cell backgrounds and terminal base | Update changed rows and geometry-dependent uniforms. |
+| Text | Grayscale glyph coverage and color glyph instances | Reuse shaped runs and valid atlas slots. |
+| Decorations | Cursor, underlines, strikeout, overline, selection, search marks | Preserve terminal attribute and coordinate semantics. |
+| Images | Qualified inline-image placements | Enforce decode, texture, animation, and lifetime budgets. |
+| Transition | Source and candidate surfaces during navigation | Bound retained previews; release them after settling. |
+
+The frame may combine compatible passes where measurement justifies it. Correct blending, clipping, and cell occupancy precede draw-call reduction.
+
+Use persistent GPU buffers with bounded geometric growth. Count replacement buffers and old textures awaiting retirement against the resource budget; temporary duplication is still memory consumption. Reuse row-ring scrolling from the existing renderer where the transaction's coordinate witness proves that it is valid. Partial scroll regions, reflow, geometry changes, and alternate-screen transitions require their own invalidation rules; a cheap whole-viewport row rotation is not universally correct.
+
+A full-resolution preview is expensive. Retain only the active transition's necessary surfaces and a small, separately budgeted set of reduced-resolution overview previews. Prefer composing source and destination scenes with explicit transforms and scissors where that avoids duplicate full-screen textures. There is no full-resolution render target per configured pane.
+
+### 13.4 Frame slots, dirty generations, and atlas retirement
+
+The ownership model in [frame.rs](crates/frankenterm-renderer-metal/src/frame.rs) is the starting point: a slot is writable only when no GPU work references it. Maintain a small fixed pool, initially three slots, and avoid queuing additional obsolete frames simply because capacity exists.
+
+**Dirty state must be tracked per slot.** If row 12 changes while slot A is used, clearing one global dirty flag does not update slots B and C. Each slot records the row, palette, geometry, and instance generations it actually contains. Before reuse, upload every required difference from that slot's recorded state. An incompatible layout requires a full rebuild of that slot.
+
+The existing [atlas.rs](crates/frankenterm-renderer-metal/src/atlas.rs) supplies useful page epochs, frame fences, and retirement concepts. Mobile glyph-cache entries carry atlas identity, page/slot generation, and rasterization key. A frame pins every page and texture it samples. Eviction waits until those references retire; reusing the same rectangle does not preserve its old identity.
+
+A retirement watermark represents a completed contiguous prefix, or an equivalent proven reference-count condition. Taking the maximum completed frame ID is unsafe if an earlier frame remains in flight. Swift task cancellation is not GPU completion.
+
+When no safe slot or atlas space exists, defer preparation, discard reconstructible previews, or present the last coherent frame. Never overwrite a live resource. Handle command-buffer failure by settling ownership and invalidating affected cached assumptions before retrying. Apple's [CPU/GPU synchronization sample](https://developer.apple.com/documentation/metal/synchronizing-cpu-and-gpu-work) documents the underlying multiple-resource approach.
+
+### 13.5 One display scheduler
+
+Use one display scheduler per visible scene. The proposed first mobile scheduler is `CADisplayLink` driving a paused `MTKView`; disable MTKView's independent continuous loop and avoid a second timer-driven rendering loop.
+
+A display tick consumes the newest prepared work when presentation is necessary. Output, selection changes, gesture movement, cursor changes, and drawable-size changes request work. A quiet terminal with a steady cursor pauses the scheduler. Cursor blinking schedules discrete changes rather than hundreds of identical frames.
+
+Use display-link timestamps and supported frame-rate hints. Follow Apple's [ProMotion guidance](https://developer.apple.com/documentation/quartzcore/optimizing-iphone-and-ipad-apps-to-support-promotion-displays), including the documented Info.plist opt-in when using the relevant timing hints. The system controls the actual refresh rate. A 120 Hz interaction target is not a guarantee on every device or under every power condition.
+
+Do not transplant the macOS display-link implementation into iOS. Qualify the actual UIKit/MetalKit path on devices. If a different scheduling mechanism later wins, it replaces this scheduler rather than running beside it.
+
+### 13.6 Backgrounding, pressure, and thermal behavior
+
+Stop new GPU submissions as the app deactivates. Before completing the documented background transition, ensure previously committed command buffers have reached scheduled state, using `waitUntilScheduled()` where Apple requires it. This lifecycle requirement is distinct from blocking for GPU completion on every frame. Follow [Metal background preparation](https://developer.apple.com/documentation/metal/preparing-your-metal-app-to-run-in-the-background).
+
+A scene becoming hidden stops that scene's rendering; process backgrounding applies the submission barrier to every renderer. Delayed preparation results carry a scene generation and cannot restart rendering after deactivation.
+
+On memory pressure, evict overview previews, unused decoded images, and reconstructible glyph resources before active semantic state. Under thermal or power constraints, reduce animation rate, image animation, and speculative preparation. Preserve text correctness and input responsiveness. On return, validate drawable geometry and resource generations before presenting live content.
+
+---
+
+## 14. Typography, terminal fidelity, and images
+
+### 14.1 Share terminal meaning; adapt platform typography
+
+The iOS app uses the existing [terminal engine](frankenterm/term), [cell model](frankenterm/cell), [escape parser](frankenterm/escape-parser), and [input types](frankenterm/input-types). Swift does not implement another ANSI parser or infer terminal state from rendered strings.
+
+Core Text supplies native font selection, fallback, shaping, and glyph metrics. Apple documents its [threading constraints](https://developer.apple.com/documentation/coretext): font objects may be shared appropriately, while layout objects remain within their owning operation or queue. Keep shaping work off MainActor and publish immutable results.
+
+The imported font preference includes family, face, size, relevant variation settings, and fallback choices. Unavailable or nontransferable fonts receive a visible portability mapping. Bundled fonts must have suitable distribution rights; a desktop font filename is not an iOS font installation contract.
+
+### 14.2 Columns are authoritative
+
+Keep separate mappings for UTF-8 storage offsets, Unicode scalar boundaries, grapheme clusters, shaped glyphs, and terminal cells. None is interchangeable with the others.
+
+The terminal core determines cell occupancy. Core Text determines how a run looks within that occupancy. A fallback font's measured advance must not silently move subsequent terminal columns. Wide characters occupy their canonical span; combining marks attach to the intended cluster; spacer cells are not copied as extra characters.
+
+Shaping respects attribute, font, hyperlink, and semantic boundaries. Ligatures may improve appearance, but cursor positioning, selection, copy, and hit testing remain attached to the original cells. Italic overhangs and combining marks need deliberate clipping rules rather than accidental truncation at every cell edge.
+
+Maintain the engine's established bidi and width policies. Native typography must not reorder a terminal row independently of the terminal's cursor and input model.
+
+### 14.3 Rasterization and color contracts
+
+Cache glyphs using the actual font face and glyph identity, size, display scale, variations, rendering mode, and applicable styling. Reusing a glyph ID across unrelated fallback fonts is invalid. Keep shape-cache identity independent of transient atlas coordinates so atlas eviction does not pin every previously shaped run.
+
+Use separate grayscale and color paths, following the distinction already present in [atlas.rs](crates/frankenterm-renderer-metal/src/atlas.rs). Define conversion and blending once: source color space, texture interpretation, alpha convention, shader arithmetic, and drawable format. Apply premultiplication exactly where the contract requires it. Screenshot comparisons should reveal halos, incorrect alpha, and darkened emoji edges.
+
+Preserve default colors, indexed colors, explicit true color, reverse video, faint/bold behavior, invisible text, underline styles, and cursor modes according to the shared semantics. A machine theme changes its configured palette and identity treatment; it does not recolor arbitrary application-specified RGB content.
+
+Retain crisp text at the view's actual drawable scale. Pinch previews may temporarily transform a surface, but settled text is rerasterized at the committed size. Upscaled preview textures are not the final typography path.
+
+### 14.4 Images and pathological output
+
+Inline-image support is capability-gated. Share parser/protocol meaning with FrankenTerm, then qualify the mobile decode and texture path separately. Bound compressed bytes, decoded dimensions, total pixels, frame count, animation cadence, and aggregate retained texture memory before expensive allocation.
+
+An unsupported or rejected image becomes a stable placeholder with an explanation. It must not corrupt cell layout or block later text. Remote image references cannot trigger arbitrary local-file reads or unsolicited network fetches.
+
+The fidelity corpus includes CJK, combining sequences, emoji/ZWJ, powerline symbols, fallback fonts, ligatures, box drawing, alternate screens, palette changes, concealment, cursor shapes, and image updates during scrolling. Compare semantic outcomes as well as pixels; attractive screenshots alone cannot establish correct terminal behavior.
+
+
+### 14.5 Advertise only the terminal capabilities that work
+
+Choose and document the initial TERM value together with the actual terminal feature profile. A conservative compatible profile is preferable to advertising an extended keyboard or image protocol that the mobile parser, renderer, or input path has not qualified. Where a FrankenTerm-specific terminfo entry is required, remote setup must install or verify that entry deliberately; importing a workspace does not silently modify the remote machine.
+
+Keep terminal identity, negotiated keyboard/mouse modes, bracketed paste, image capabilities, and mux codec version separate. A remote program can change modes while the user is typing. Encode input under the appropriate current semantic witness and ordered admission contract; a stale mode snapshot must not produce a second interpretation of an admitted key.
+
+Export environment preferences through an explicit allowlist. Preserve TERM and locale policy intentionally, validate values, and report settings the remote SSH server refuses. Do not copy the Mac's entire environment or promise that a particular locale exists on every remote host. Shell integration can add semantic command boundaries when present, but it remains optional for ordinary terminal correctness.
+
+
+---
+
+## 15. Input, composition, and delivery correctness
+
+### 15.1 Native text input is a complete subsystem
+
+Implement a dedicated UIKit responder conforming to [UITextInput](https://developer.apple.com/documentation/uikit/uitextinput), not only `UIKeyInput`. Apple's [custom text-input guide](https://developer.apple.com/library/archive/documentation/StringsTextFonts/Conceptual/TextAndWebiPhoneOS/LowerLevelText-HandlingTechnologies/LowerLevelText-HandlingTechnologies.html) explains the multistage input responsibilities.
+
+The responder maintains a bounded local composition document, selected and marked ranges, tokenizer, caret/range geometry, and input-delegate notifications. Terminal output is not inserted into that document merely to provide keyboard context. Uncommitted composition is displayed locally and is not transmitted.
+
+Disable prose-oriented automatic substitutions by default: capitalization, smart quotes, smart dashes, and autocorrection must not change shell input unexpectedly. Preserve native language entry and candidate selection. Provide an explicit local command composer for users who want editable multiline drafting; it is separate from direct terminal typing.
+
+UIKit positions commonly operate in UTF-16-oriented text coordinates, while the shared terminal uses its own storage and cell indices. Perform checked conversions. Never use a UTF-16 offset as a Rust byte index or delete half a surrogate pair. Composition editing follows grapheme boundaries; terminal Backspace is an encoded terminal event, not an instruction to remove the last local Unicode scalar.
+
+### 15.2 Exact input identity
+
+Every input stream is scoped to a scene and responder context. Its route token includes workspace, machine, route, `scene_id`, `input_stream_id`, and that stream's `focus_generation`, plus a tagged source identity:
+
+| Source mode | Required source identity |
+|---|---|
+| Direct SSH | Local session UUID, transport generation, local channel generation. |
+| FrankenTerm mux | Server incarnation, exact pane registration, authoritative origin, and applicable route witnesses. |
+
+Raw SSH has no mux pane registration. Do not manufacture one. Opening a new SSH channel creates a new terminal session even when the host and command are unchanged.
+
+Controller-lease, mode, and layout witnesses accompany operations that require them. Held-key state belongs to the input stream that admitted the key-down.
+
+Distinguish admission from delivery. Admission validates the stream's current focus generation. Already admitted events remain bound to their original destination after a local focus change; delivery validates the original transport/session/pane and applicable authority. A later focus change alone does not retarget those events or erase their disposition.
+
+### 15.3 Deterministic IME and focus barrier
+
+The default user-initiated navigation policy is **finish composition on the original source before switching**:
+
+1. Freeze new ordinary input for the switching stream while allowing the current composition transaction to settle.
+2. Ask the input adapter to finish marked text without synthesizing Enter.
+3. Keep the retiring responder/composition context bound to its original route.
+4. Admit the final composed text exactly once while that source remains valid.
+5. Receive local composition-completion acknowledgement, then submit an ordered close-generation barrier to the Rust session owner.
+6. After barrier acknowledgement, publish the destination identity and new stream generation together.
+7. Open destination input only when that destination is ready and authorized.
+
+Requesting composition completion is not proof that every resulting callback has settled. In particular, an `unmarkText` call is not a substitute for implementing and proving the adapter's completion semantics. Late callbacks from a retiring context cannot consult the new current pane. The adapter preserves their original context until retirement and cannot synthesize a second `insertText` commit.
+
+If completion cannot be admitted because the source disconnected, disappeared, or lost authority, hold a user-initiated switch and offer explicit **Cancel composition and switch** or **Stay**. A deliberately retained draft is visibly unsent and stays associated with its source; it is never automatically submitted elsewhere.
+
+**OS deactivation is a different event.** The app cannot keep iOS foregrounded while waiting for an IME choice or remote acknowledgement. Close ordinary admission, retain bounded unsubmitted composition text as a source-bound local draft when permitted by privacy policy, retire the responder context, and proceed with quiescence. Do not synthesize a final network commit or persist sensitive draft text contrary to the retention policy. Already admitted operations retain their own settlement state.
+
+The barrier acknowledgement establishes runtime ordering, not remote execution. Already admitted source events may continue settling after the view changes, with their result attached to the source.
+
+### 15.4 Hardware keyboards and helper keys
+
+Use the [UIKit physical-keyboard APIs](https://developer.apple.com/documentation/uikit/handling-key-presses-made-on-a-physical-keyboard) and route terminal events through shared input encoding. Distinguish committed text from raw key presses to avoid sending one keystroke twice through `pressesBegan` and `insertText`.
+
+Support Esc, Tab, arrows, navigation keys, function keys, Ctrl/Alt combinations, repeat, and negotiated extended keyboard behavior. Respect system-reserved shortcuts and allow user remapping. The software accessory row exposes essential terminal keys immediately, with visible one-shot or locked modifier state.
+
+On focus change, release held keys on the original source when its protocol supports release events. Never send delayed releases to the destination. Clear local sticky modifiers deterministically. A scene losing activity also retires its held-key state.
+
+### 15.5 Paste is an ordered, cancellable operation
+
+Capture the destination, source identity, input stream, and applicable mode witnesses when the user accepts the paste. Show the trusted machine/pane identity and a preview for multiline or control-bearing content. Do not append a newline unless requested.
+
+Use bracketed paste when negotiated, but do not treat it as a sandbox. Embedded control bytes and bracketed-paste delimiters require explicit handling; ordinary text paste must not silently become raw terminal-control injection.
+
+Transmit through a bounded queue with an operation ID and ordered chunks. Cancellation stops further admission and reports the prefix already admitted or written under the transport's actual certainty model. It cannot retract bytes already sent. If a bracketed-paste closing marker is needed, send it only to the same valid source under the operation's cleanup contract; never replay the payload after reconnect.
+
+While a paste is active, reserve that stream's ordering so helper keys or another paste cannot accidentally interleave inside its delimiters. A deliberate interrupt is a separate visible action with defined ordering. Source loss leaves the remaining text unsent and reports any uncertain prefix.
+
+---
+
+## 16. Selection, search, clipboard, and useful workflows
+
+### 16.1 Selection anchors survive only proven transformations
+
+A selection is anchored to exact source identity, screen/coordinate witness, stable row or logical-line identity, and cell/cluster boundaries. Screen pixels and a mutable row number are insufficient.
+
+Output below the viewport does not move the user's selection. Reflow preserves it only when the core can map its anchors authoritatively. Scrollback eviction, alternate-screen changes, or lost coordinate continuity produce an explicit truncated or expired selection; the app must not copy unrelated replacement rows.
+
+Selection operates on semantic text. Copy joins soft-wrapped lines according to their actual wrap metadata and preserves hard line breaks. Offer an explicit rectangular selection mode where useful on iPad or hardware keyboards. Wide-cell spacers and glyph ligatures must not introduce duplicated or missing text.
+
+During handle dragging, the selection recognizer owns the gesture. Machine navigation remains available through the identity rail or explicit controls, subject to the input/composition barrier.
+
+### 16.2 Search with visible scope
+
+Provide two clearly distinguished scopes:
+
+- **Loaded content:** search the phone's retained semantic history immediately.
+- **Remote history:** search an authorized server capability with bounded requests and cancellable results.
+
+A local miss does not imply that remote history has no match. Show the retained range or remote coverage where relevant. Regex search requires bounded compilation and execution; literal search is the dependable default.
+
+Results carry exact source identity, coordinate/history anchors, match spans, and available context. Selecting a result navigates to that source and fetches the required bounded range. If the pane has closed or history expired, show that result's retained context and status. Do not resolve it by a matching title or reused numeric pane ID.
+
+Search highlights are local overlays. They do not modify the terminal or send text to the shell. Preserve the original viewport so the user can return from search to the prior position.
+
+### 16.3 Clipboard and links remain deliberate actions
+
+Read pasteboard content through user-initiated paste affordances, including [UIPasteControl](https://developer.apple.com/documentation/uikit/uipastecontrol) where appropriate. Do not poll clipboard contents on foregrounding or infer permission from a machine connection.
+
+Remote OSC clipboard requests are requests, not blanket access to the system clipboard. Apply a per-host policy, distinguish writes from reads, and require deliberate authorization for sensitive directions. A remote terminal must not obtain the phone's clipboard merely by emitting an escape sequence.
+
+For explicit copies, support device-local and expiring clipboard options through Apple's [pasteboard privacy options](https://developer.apple.com/documentation/uikit/uipasteboard/optionskey). The app must not later erase a clipboard value written by another application.
+
+Hyperlinks display their actual destination before consequential opening. Keep trusted host identity separate from remote-supplied labels. Permit supported URL schemes deliberately; local file, settings, application-control, and custom command schemes are not ordinary web links.
+
+### 16.4 Workflows that repay the native design
+
+| Intent | Workflow |
+|---|---|
+| Copy a failing command's output | Select an identified command block or anchored text range, preview, copy. |
+| Find an error on a busy host | Search loaded or authorized remote history, open the exact pane and match. |
+| Move a command between machines | Copy or draft it locally, select the destination, review its identity, explicitly send. |
+| Share a diagnostic excerpt | Export an explicit range with optional machine/pane/time context and a redaction preview. |
+| Return to live output | One action restores the live viewport without losing the prior inspection bookmark. |
+
+Shell-integration markers can improve command-block selection when present. Without them, use ordinary text selection; do not claim arbitrary output has been reliably parsed into commands. Sharing and diagnostic export use explicit user-selected content, not an automatic full transcript.
+
+---
+
+## 17. Viewports, keyboard geometry, and remote resize authority
+
+### 17.1 Three geometries
+
+Represent three geometries separately:
+
+1. **Remote terminal geometry:** the rows and columns governing the actual PTY and application layout.
+2. **Local viewport geometry:** the portion and scale visible in this scene.
+3. **Drawable geometry:** the pixel dimensions Metal presents.
+
+Phone rotation, local zoom, overview previews, and machine swipes initially change local geometry only. They do not automatically change a shared remote terminal.
+
+An observer can fit the remote grid, inspect it at readable scale with panning, or choose an explicit local presentation preference. A controller may request a different remote grid after acquiring the applicable authority. The UI makes **View only** and **Control size** understandable without exposing protocol jargon.
+
+Use the existing coordinate-witness and row metadata in [render_mirror.rs](frankenterm/mux/src/render_mirror.rs). A local viewport transformation does not authorize reinterpretation of remote row identities.
+
+### 17.2 Resize requires an owner and a generation
+
+For a phone-created direct SSH channel, its owning client determines PTY dimensions. For a shared mux pane, resize requires negotiated geometry authority, independently represented from local focus.
+
+A resize intent contains exact pane identity, owner/lease generation, expected geometry revision, requested rows/columns, and a monotonic request generation. Bound dimensions and reject zero-sized or overflowing products before allocation or transmission.
+
+Permit one in-flight resize per controlling view, with at most one coalesced successor containing the newest desired dimensions. Discard superseded unsent requests. Process responses against their request and source generations; a late acknowledgement from another pane or lease cannot update the current grid.
+
+Until an acknowledged authoritative layout arrives, retain coherent old terminal geometry and transform its presentation locally. Do not combine rows from one size with cursor coordinates from another. If the source cannot provide the required geometry contract, expose the limitation and use its qualified simpler behavior.
+
+### 17.3 Keyboard appearance is a layout transition
+
+Use [UIKeyboardLayoutGuide](https://developer.apple.com/documentation/uikit/adjusting-your-layout-with-keyboard-layout-guide) and actual scene geometry. Account for docked keyboards, floating/undocked keyboards, hardware-keyboard accessories, safe areas, and iPad windows. A global keyboard-height subtraction is insufficient.
+
+During keyboard animation, keep the cursor or active composition visible through local viewport adjustment. Coalesce any authorized PTY resize until layout settles; do not send a window-change request on every animation frame.
+
+A floating keyboard need not collapse the entire terminal to the keyboard's top edge. Use tracked occlusion and local panning where appropriate. Preserve manual scrollback inspection unless the user resumes direct input or explicitly returns to live output.
+
+Pinch zoom likewise commits a local font preference first. Only an authorized control-size policy converts the settled preference and available viewport into a remote resize request.
+
+### 17.4 Multiple scenes and split panes
+
+Each scene owns its viewport, focus generation, input streams, keyboard state, selection, and renderer. Scenes may share transport and semantic session resources through the bounded runtime, but they do not share a mutable global current pane.
+
+Two scenes observing the same remote pane may use different font sizes and viewport positions. At most the negotiated geometry owner changes the shared PTY. Merely opening another window cannot seize that role. Ownership transfer or lease loss invalidates pending resize intents from the previous generation.
+
+For iPad splits, render the visible panes through one scene renderer with independent clipping, viewport transforms, and source identities. Only the explicitly focused input stream receives keyboard input. Changing a local split divider resizes remote panes only under the selected control policy.
+
+Closing a scene releases its subscriptions and authority deliberately. Shared transport remains alive while another scene legitimately uses it. Late keyboard, rendering, search, and resize callbacks settle against the closed scene's generation and cannot attach themselves to a surviving window.
+
+### 17.5 Geometry acceptance cases
+
+Qualify keyboard show/hide, rotation, pinch, iPad divider changes, floating keyboards, multiwindow observation, lease transfer, and remote resize arriving during a swipe. Each case preserves source identity and produces either a coherent new frame or an explicit waiting state.
+
+The essential proof is behavioral: the phone remains readable, the cursor stays correctly located, and a Mac's shared terminal does not resize merely because the user opened a preview or changed the phone's viewing scale.
+
+---
+
 ## 18. Resource, bandwidth, and battery design
 
 ### 18.1 A fleet is an inventory, not two hundred active viewports
@@ -730,3 +1042,250 @@ Preserve a small, useful result set: source/build identity, device/OS, scenario 
 This document itself is a design deliverable. Its structural validation, source review, and commits do not constitute a native build, a security qualification, or a performance result.
 
 ---
+
+## 25. Dependency-ordered implementation tracks and milestones
+
+The implementation should produce a real terminal on a real iPhone before expanding into a large application shell. The first architectural question is whether the selected SSH stack, shared terminal semantics, Swift/Rust boundary, and Metal surface work together under iOS ownership rules. Answer that through one complete connection. Then add Mac export and navigation, followed by attachment to existing mux panes, control arbitration, and recovery.
+
+The `IOS-*` identifiers below are **planning labels for future implementation tasks**. They are not created Beads issues and must not be reported as completed merely because this document exists.
+
+### 25.1 Tracks and their first useful results
+
+| Track | First useful result | Dependencies and sequencing |
+|---|---|---|
+| **IOS-A: Native terminal foundation** | An iPhone authenticates to an owned SSH host, presents real output through Metal, and sends correct keyboard input. | Starts immediately. Qualifies portability, transport, native surface, and bridge ownership together. |
+| **IOS-B: Portable Mac workspace** | A selected Mac machine group imports with its order, resolved themes, routes, host trust, and usable identity mappings. | Schema and exporter can begin beside IOS-A. Real connection acceptance requires its transport and credential broker. |
+| **IOS-C: Machine and pane navigation** | The imported workspace supports the two gesture families, remembered focus, and exact input targeting. | Uses IOS-A's terminal surface and IOS-B's stable identities. Fixtures help development; acceptance uses actual terminals. |
+| **IOS-D: Existing mux sessions and continuity** | The phone attaches to surviving FrankenTerm panes, obtains explicit control, and reconciles after suspension or network loss. | Protocol analysis starts immediately. Live completion requires the bounded client boundary, an admitted remote endpoint, and shared effect authority. |
+| **IOS-E: Product completion and release** | The whole first-use and daily-use journey works with required devices, terminal applications, input methods, and failure states. | Begins as acceptance design, then closes against the integrated IOS-A through IOS-D artifact. |
+
+Do not make IOS-A depend on PageGrid, the complete desktop Metal performance campaign, the browser product, or guardian-backed mux crash survival. None is required to prove a working native SSH terminal. Conversely, do not call the complete FrankenTerm mobile experience delivered until IOS-D attaches to existing panes correctly.
+
+### 25.2 IOS-A: prove the architecture through one terminal
+
+Build the smallest production-shaped slice:
+
+1. Establish the mobile Rust dependency boundary and a SwiftUI application containing the native terminal surface.
+2. Adapt the existing renderer's portable frame, cell, atlas, and shader contracts to an iOS-owned Metal surface.
+3. Qualify the selected `frankenterm-ssh` backend against one owned host using a representative existing-key format and strict host verification.
+4. Feed received bytes into the shared terminal model; publish bounded render state; draw the resulting glyphs and cursor.
+5. Route native text and control input to that exact connection.
+6. Cancel and destroy the view, connection, and authentication work without leaving callbacks targeting retired objects.
+
+The slice must include a real full-screen terminal application and composed Unicode input. An ANSI-colored log viewer with a working TCP socket does not resolve the important architectural risks.
+
+Reuse actual macOS consumer code as well as the renderer crate. [metal_window.rs](crates/frankenterm-gui/src/termwindow/metal_window.rs) and [metal_render_thread.rs](crates/frankenterm-gui/src/termwindow/metal_render_thread.rs) already connect pane data to native rendering. Their AppKit ownership is not portable, but their existence prevents an unnecessary second terminal-to-Metal implementation.
+
+### 25.3 IOS-B and IOS-C: complete the Mac-to-phone experience
+
+The next slice should use a small representative group: one directly reachable machine, one machine reached through the intended jump route, and one temporarily unavailable machine. Give them visibly distinct palettes and more than one pane or session each.
+
+IOS-B implements the exporter, import transaction, portability report, host-trust projection, and identity mapping as one coherent feature. Reimport must update the intended workspace without duplicating machines, overwriting unrelated local preferences, or activating a changed route before the user can inspect it.
+
+IOS-C adds the stable machine and pane rings, overview, remembered focus, and native gesture arbitration. It must distinguish a visual preview from a committed input destination. A pane closing, an authentication prompt appearing, or a machine reconnecting during a swipe cannot change the destination of already admitted input.
+
+Ship this slice with ordinary SSH mode clearly identified. It is useful before mux attachment is complete, but newly opened SSH sessions must not be presented as the Mac's existing panes.
+
+### 25.4 IOS-D: attach to real mux state and preserve authority
+
+Implement the narrow mobile client boundary around existing codec and effect contracts. Do not independently recreate the wire format in Swift or use repeated `ft robot get-text` calls as the terminal transport.
+
+This track includes:
+
+- A supported bounded remote attachment endpoint.
+- Negotiated codec and feature authority.
+- Exact server, connection, domain, and pane-incarnation identities.
+- Authoritative topology reconciliation and local navigation overlays.
+- Input/control and resize arbitration with the native client.
+- Bounded state refresh after suspension or disconnection.
+- Explicit settlement of accepted, unsent, and uncertain input.
+
+The current SSH client does not provide an existing `ft cli proxy` endpoint. Its inherited command builder invokes the configured WezTerm-compatible executable, defaulting to `wezterm`; see [client.rs](frankenterm/client/src/client.rs). Any first-party headless proxy command introduced for mobile is new implementation work and needs its own live attachment proof.
+
+When a peer lacks required control or geometry authority, offer an accurately scoped viewing capability or a separate ordinary SSH session. Do not silently route writes through a weaker legacy path.
+
+### 25.5 Milestones that demonstrate progress
+
+| Milestone | Required demonstration |
+|---|---|
+| **M0: Real iPhone terminal** | Existing-key SSH authentication, Metal output, text/control input, resize, cancellation, and explicit creation of a new SSH session after connection loss on an owned device and host. |
+| **M1: My machines in my pocket** | Export a real Mac group, import it, connect eligible machines, preserve distinct themes, and switch machines/panes without losing position or misrouting input. |
+| **M2: My existing FrankenTerm sessions** | Attach to actual surviving mux panes, coexist with the Mac, transfer control explicitly, and return from suspension with correct state and honest input settlement. |
+| **M3: Qualified native app** | Complete required product and device acceptance scenarios using one identified build and the documented release process. |
+
+Each milestone should land through meaningful commits that contain an integrated capability or a resolved architectural boundary. Complete useful journeys as the work expands.
+
+---
+
+## 26. Existing Beads crosswalk
+
+The following statuses come from [.beads/issues.jsonl](.beads/issues.jsonl) at baseline **`fb570a9f536c151adda75f8f127005b2735b3162`**. They identify existing ownership and avoid parallel implementations of the same protocol, renderer, or recovery contract. This plan does not change their statuses.
+
+An open bead may already have substantial source implementation awaiting acceptance. A closed bead does not establish iOS portability or physical-device performance. Inspect both the current source and the bead's retained evidence when implementation begins.
+
+### 26.1 Renderer and snapshot work
+
+| Existing bead | Baseline status | Relationship to this plan |
+|---|---|---|
+| `ft-yccm0.4.1.1` | closed | Reuse native renderer structure and audited FFI discipline; add an iOS surface adapter. |
+| `ft-yccm0.4.1.2` | open | Share dedicated-render-thread ownership and existing implementation; qualify UIKit lifecycle separately. |
+| `ft-yccm0.4.1.3` | open | Reuse pacing and idle-work principles; adapt display scheduling and scene transitions to iOS. |
+| `ft-yccm0.4.2.1` | closed | Reuse bounded frame-slot ownership and protection of in-flight GPU resources. |
+| `ft-yccm0.4.2.2` | open | Reuse incremental background updates and row-ring behavior where coordinate continuity permits them. |
+| `ft-yccm0.4.2.3` | in_progress | Share glyph-instance representation, wide-cell behavior, emoji, and decorations. |
+| `ft-yccm0.4.2.4` | open | Reuse dirty-row and slot catch-up contracts rather than uploading every visible cell after each output event. |
+| `ft-yccm0.4.3.2` | closed | Reuse grayscale/color atlas separation and safe eviction; select mobile budgets independently. |
+| `ft-yccm0.4.3.4` | open | Keep shape identity independent of transient atlas handles and foreground-only paint changes. |
+| `ft-yccm0.4.4` | open | The legacy-grid snapshot adapter permits useful Metal rendering before PageGrid is complete. |
+| `ft-yccm0.4.5` | open | Later PageGrid optimization; not a prerequisite for M0 or M1. |
+| `ft-yccm0.4.6` | open | Share multi-pane composition and idle-pane accounting. |
+| `ft-yccm0.4.7.2` | open | Shared image semantics; mobile decoding and residency remain separately bounded. |
+| `ft-yccm0.4.7.3` | open | Shared text/cursor/IME presentation semantics; UIKit composition requires new acceptance. |
+| `ft-yccm0.1.7` | closed | Reuse GPU resource accounting and measurement infrastructure. |
+| `ft-yccm0.1.10` | in_progress | Reuse renderer parity fixtures while adding iOS-specific cases. |
+
+Two dependency relationships are especially useful. `ft-yccm0.4.2.3` depends on `ft-yccm0.4.2.1` and `ft-yccm0.4.3.2`; those shared primitives should precede mobile glyph submission. `ft-yccm0.4.5` depends on `ft-yccm0.3.3.4`, `ft-yccm0.4.2.4`, and `ft-yccm0.4.4`; the first mobile release should not unnecessarily wait for it.
+
+The snapshot work also overlaps `ft-interactive-systems-performance-4tenz.6.3` (**open**) and `ft-8aoi6` (**in_progress**). The mobile app should consume their strongest available coherent-state contract, not introduce a competing snapshot system.
+
+### 26.2 Input, geometry, and session ownership
+
+| Existing bead | Baseline status | Relationship to this plan |
+|---|---|---|
+| `ft-6vfeq.2` | closed | Reuse bounded composed-input ownership, byte caps, and truthful delivery outcomes. |
+| `ft-browser-frankenterm-7z4il.2.3` | open | Shared requirements for IME, helper keys, duplicate-event prevention, and uncertain-delivery presentation. |
+| `ft-browser-frankenterm-7z4il.2.5` | open | Shared distinction between local viewer layout and remote PTY geometry. |
+| `ft-xxfwy.55.9` | open | Reuse exact pane authority, controller fencing, and native/local takeover semantics. |
+| `ft-pdawh` | open | Domain classification still has a known consumer gap; do not infer machine ownership from titles or paths. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.3` | open | GUI/device recovery must preserve surviving remote PTYs. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.4` | open | Shared route-change, generation, backoff, resync, and input-settlement contracts. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.5` | open | Distinguish live reattach, layout recovery, replacement processes, and agent resume. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.10` | in_progress | Reuse authoritative ordering and stable local overlays across domains. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.11` | blocked | Cancellation retains ownership of native discovery work until it actually settles. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.12` | open | Guardian-backed mux crash survival is a separate capability, not implied by phone reconnect. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.13` | open | Lossless remote mux upgrade remains separate from shipping or updating the phone app. |
+| `ft-interactive-swarm-product-convergence-7xqz4.8.14` | open | Whole-mux recovery images do not alone prove surviving processes or crash-durable input effects. |
+
+`ft-browser-frankenterm-7z4il.2.3` depends on `ft-browser-frankenterm-7z4il.2.2` and `ft-xxfwy.55.9`; `ft-browser-frankenterm-7z4il.2.5` depends on `ft-browser-frankenterm-7z4il.2.2` and `ft-browser-frankenterm-7z4il.2.3`. These browser edges do not make the browser frontend a prerequisite for iOS. Extend shared server contracts under their existing ownership, then implement native adapters.
+
+`ft-xxfwy.55.9` records dependencies on `ft-xxfwy.55.17`, `ft-xxfwy.55.5`, `ft-xxfwy.55.6`, and `ft-xxfwy.55.7`. Control must be enforced where input and resize affect the mux, with an explicit rule for the native Mac client. A phone-only mutex cannot establish that guarantee.
+
+The codec history additionally names `ft-interactive-systems-performance-4tenz.5.5.3.5.8.2.1` as the version-52 exact-render-delivery wire owner. Its tracking status is not asserted here; the source contract explicitly leaves the capability unadvertised until remaining server retention, client admission/application, and convergence work is complete. IOS-D must integrate that work or specify a narrower honest capability.
+
+New Beads should be created when the corresponding IOS track is decomposed into concrete implementation work. Reference these existing owners, avoid duplicated acceptance obligations, and do not turn an epic's open status into a blanket dependency on every child closing.
+
+---
+
+## 27. Decisions, risks, and falsifying experiments
+
+The plan needs preferred choices and experiments capable of disproving them. Unbounded investigation is insufficient for decisions that determine whether the application can ship.
+
+| Decision | Preferred design | Experiment or failure that changes the decision |
+|---|---|---|
+| SSH implementation | Qualify one existing libssh2-based backend through `frankenterm-ssh`. | Real-device linking, key authentication, external signing, keyboard-interactive handling, nested hops, or cancellation cannot satisfy the contract without excessive or unsafe adaptation. |
+| SSH alternative | Evaluate a SwiftNIO SSH adapter after a concrete failure of the preferred path. | Its algorithm, key-import, prompt, certificate, signer, or event-loop support fails the same acceptance matrix. Do not accept a silent capability reduction. |
+| Shared core | Expose the smallest useful terminal/codec/client boundary. | Linking still drags desktop UI, local PTY ownership, Lua, or unrelated control-plane dependencies into the phone. Refactor the boundary rather than copying the protocol. |
+| Rendering | Adapt existing Metal data/shaders and shared semantic conversion. | An iOS lifecycle/resource constraint cannot be represented safely by current ownership. Add a platform adapter or narrow shared change. |
+| Existing Mac keys | Classify identities as exportable, locally available, or Mac-bound; present an explicit usable route. | A key cannot be exported or used by the selected signer. Keep the Mac route visible or enroll a distinct phone key. |
+| Machine identity | Stable workspace machine identity separate from alias, endpoint, and mode. | Aliases or changed routes create duplicates or attach preferences to the wrong machine. Resolve before import activates connections. |
+| Runtime ownership | Canonical `runtime_async`/asupersync for shared Rust; Swift ownership for native UI. | Cancellation, callbacks, or backpressure require unowned tasks or MainActor blocking. Redesign the bridge instead of adding another Rust runtime. |
+| Continuity | Reattach only to authenticated surviving sessions with exact generation authority. | Restart, stale IDs, or lost acknowledgement cannot be reconciled. Show discontinuity and uncertain effects; do not fabricate restoration or replay authority. |
+| Native boundary | Narrow audited FFI with explicit lifetime, thread, error, and cancellation contracts. | A pointer, callback, retained object, or buffer can outlive its owner or cross an unproved thread boundary. Fix the contract before broadening use. |
+
+### 27.1 Preserve the difficult distinctions
+
+Foreground execution and remote process survival are different. The phone may stop running while the remote mux continues. Recover from that normal condition without requiring an indefinite background socket.
+
+A configuration import is not permission to run arbitrary desktop shell logic. The current resolver has limitations around two-phase matching and ProxyJump; [ssh/src/config.rs](frankenterm/ssh/src/config.rs) must be inspected rather than treated as evidence of complete OpenSSH equivalence.
+
+The historical [PLAN.md](docs/planning/PLAN.md) is a useful structural model, but its transitional backend, runtime, and automation assumptions are not current authority. Human terminal input must work in full-screen programs. Automation restrictions remain attached to the corresponding automation operation and must not block ordinary Vim or other TUI use.
+
+### 27.2 Build and release policy is part of feasibility
+
+[AGENTS.md](AGENTS.md) keeps `frankenterm-core` permanent and requires canonical Rust runtime ownership and audited native exceptions. The requested SwiftUI shell fits that structure: native Swift handles native UI while the Rust core retains its own contracts.
+
+RCH remains the development-time Cargo proof mechanism. Xcode compilation and physical-device execution provide separate native evidence. DSR owns release, including a **newly implemented iOS build/sign/package lane**. Do not describe that lane as already existing or introduce GitHub Actions as a substitute.
+
+---
+
+## 28. The first productive implementation session
+
+The first implementation session should aim to end with visible, inspectable behavior on an iPhone. Its purpose is to resolve the largest uncertainties before investing in a large application shell.
+
+### 28.1 Execute one coherent slice
+
+1. **Inspect the immediate source baseline and ownership.** Read the renderer consumers, selected SSH backend, terminal dependencies, and native exception contracts. Identify actual build targets and an owned host/device.
+2. **Create the minimal mobile build boundary.** Produce the SwiftUI shell, native terminal surface, shared Rust artifact, and bridge for one connection. Keep unsupported capabilities explicit.
+3. **Render actual terminal state.** Start with a deterministic fixture to verify the bridge, then feed the real SSH byte stream into the same terminal and surface.
+4. **Authenticate with a representative key.** Exercise host verification and a usable credential path. A mismatched host key prevents authentication to that target.
+5. **Send real input and observe its effect.** Demonstrate printable text, Escape/Ctrl/Tab/arrows, composed Unicode, bracketed paste where negotiated, and a full-screen program.
+6. **Exercise lifecycle ownership.** Rotate, show/hide the keyboard, navigate away, cancel connection work, and return from background. Distinguish a surviving remote session from a newly created SSH session.
+7. **Commit the complete slice.** Include the native integration and enough retained evidence to establish what actually ran.
+
+If transport or linking fails, the useful outcome is a precise failed requirement and the next adapter experiment, while preserving completed terminal/rendering work. Do not hide the blocker behind a simulated connection screen.
+
+### 28.2 The closing demonstration
+
+Retain an identified physical-device trace showing:
+
+- Source/build and actual iPhone model.
+- Authentication to the owned host and negotiated connection mode.
+- Real terminal output rendered through the selected Metal path.
+- Correct Unicode and control-input effects.
+- Correct viewport behavior through keyboard and orientation changes.
+- Bounded disconnect/cancellation with no input redirected to another session.
+- A return to a truthful usable state, including any continuity limitation.
+
+Use content-free operational events and synthetic test content where possible. The decisive evidence is the working device journey and its host-side effects. Mac export and dual navigation can then build on a foundation whose hardest native assumptions have been exercised.
+
+---
+
+## 29. Source map and maintenance notes
+
+### 29.1 Repository sources
+
+Repository statements and Beads statuses in this document refer to commit `fb570a9f536c151adda75f8f127005b2735b3162`. Relative links intentionally lead to the working repository so implementers can inspect the current code; use the evidence commit when reproducing a historical claim.
+
+| Source | Why it matters |
+|---|---|
+| [AGENTS.md](AGENTS.md) | Current build, runtime, native-boundary, repository, and release constraints. |
+| [Historical comprehensive plan](docs/planning/PLAN.md) | Model for detailed user stories, architecture, and delivery sequencing; its historical notice limits obsolete implementation advice. |
+| [Mac rendering plan](PLAN_TO_MAKE_FRANKENTERM_MAC_RENDERING_SUPER_FAST.md) | Incremental rendering, memory ownership, measurements, and rejected premature optimizations. |
+| [Product journey contract](docs/design/product-journey-contract.md) | What product claims require and how partial capabilities remain honest. |
+| [Beads](.beads/issues.jsonl) | Existing work ownership and dependency evidence; section 26 is a dated crosswalk, not a second task database. |
+| [Metal renderer](crates/frankenterm-renderer-metal) and [GUI consumers](crates/frankenterm-gui/src/termwindow) | Actual current rendering primitives and their live terminal consumers. |
+| [Terminal](frankenterm/term), [cell model](frankenterm/cell), and [escape parser](frankenterm/escape-parser) | Canonical terminal interpretation and input/display fidelity. |
+| [Render mirror](frankenterm/mux/src/render_mirror.rs) | Row capture, coordinates, styles, and snapshot coherence boundaries. |
+| [SSH domains](frankenterm/config/src/ssh.rs) and [SSH resolver](frankenterm/ssh/src/config.rs) | Mac export input, existing identity/route behavior, and portability diagnostics. |
+| [SSH dependencies](frankenterm/ssh/Cargo.toml) and [client](frankenterm/client/src/client.rs) | Real native transport dependencies, proxy grammar, and current reconnect behavior. |
+| [Codec history](docs/codec-versions.md) and [codec](frankenterm/codec) | Assigned wire contracts, version boundaries, effect certainty, and capability limits. |
+| [Persistence architecture](docs/session-persistence-architecture.md) and [remote setup](docs/remote-setup-spec.md) | Separate attachment, snapshots, provisioning, and stronger remote recovery. |
+| [Core runtime surface](crates/frankenterm-core/src/runtime_async.rs) | Canonical shared Rust async ownership. |
+
+### 29.2 Primary platform and protocol references
+
+These references establish platform/API constraints. Proposed product policies, schema fields, memory ceilings, gestures, and performance targets are design choices in this document.
+
+| Reference | Constraint used here |
+|---|---|
+| [UIViewRepresentable](https://developer.apple.com/documentation/swiftui/uiviewrepresentable) and [MTKView](https://developer.apple.com/documentation/metalkit/mtkview) | Native UIKit/Metal presentation inside a SwiftUI shell. |
+| [CPU/GPU synchronization](https://developer.apple.com/documentation/metal/synchronizing-cpu-and-gpu-work) | Multiple resources and explicit protection of in-flight work. |
+| [Apple GPU storage modes](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus) | Explicit resource storage and shared-memory behavior. |
+| [ProMotion](https://developer.apple.com/documentation/quartzcore/optimizing-iphone-and-ipad-apps-to-support-promotion-displays) | Display timing hints, opt-in, and system-controlled refresh behavior. |
+| [Metal background preparation](https://developer.apple.com/documentation/metal/preparing-your-metal-app-to-run-in-the-background) | Submission shutdown and committed-buffer scheduling at lifecycle transitions. |
+| [Core Text](https://developer.apple.com/documentation/coretext) | Native shaping, fallback, metrics, and threading ownership. |
+| [UITextInput](https://developer.apple.com/documentation/uikit/uitextinput) and [custom text-input guide](https://developer.apple.com/library/archive/documentation/StringsTextFonts/Conceptual/TextAndWebiPhoneOS/LowerLevelText-HandlingTechnologies/LowerLevelText-HandlingTechnologies.html) | Marked text, composition, native text coordinates, and responder responsibilities. |
+| [Physical keyboard input](https://developer.apple.com/documentation/uikit/handling-key-presses-made-on-a-physical-keyboard) and [keyboard layout guide](https://developer.apple.com/documentation/uikit/adjusting-your-layout-with-keyboard-layout-guide) | Key events and actual keyboard/scene geometry. |
+| [Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave) and [passcode-bound Keychain accessibility](https://developer.apple.com/documentation/security/ksecattraccessiblewhenpasscodesetthisdeviceonly) | Device-generated identity and imported-key storage are distinct capabilities. |
+| [Local network privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy) and [background execution](https://developer.apple.com/forums/thread/685525) | Explicit LAN access and no general indefinite background SSH guarantee. |
+| [SSH connection protocol](https://www.rfc-editor.org/rfc/rfc4254) and [OpenSSH configuration](https://man.openbsd.org/ssh_config) | PTY/channel semantics, SSH options, and executable configuration conditions. |
+| [libssh2 API](https://libssh2.org/docs.html) and [public-key callback](https://libssh2.org/libssh2_userauth_publickey.html) | Existing backend qualification and the native signer boundary. |
+| [SwiftNIO SSH source](https://github.com/apple/swift-nio-ssh) | Contingency transport implementation; qualify its actual feature matrix before selection. |
+| [Rust iOS targets](https://doc.rust-lang.org/rustc/platform-support/apple-ios.html) | Device/simulator target and SDK requirements. |
+| [App submission](https://developer.apple.com/app-store/submitting/) and [review guidelines](https://developer.apple.com/app-store/review/guidelines/) | Release-time native packaging and distribution requirements. |
+
+### 29.3 Keep this plan useful as implementation lands
+
+Update an architectural claim when live source or a decisive experiment changes it. Record whether a capability is proposed, implemented, or qualified; those states are different. Keep implementation tasks in Beads and source contracts in code rather than creating a second parallel status system here.
+
+The first device spike should settle the transport/backend and native ownership decisions. The first real Mac import should settle schema and credential ergonomics. The first interrupted mux session should settle continuity and control claims. Subsequent revisions should incorporate that evidence while preserving the central experience: familiar machines, distinct gestures, correct input, and a fast native terminal.
