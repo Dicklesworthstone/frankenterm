@@ -33,20 +33,24 @@ public enum SSHECDSACurve: String, Sendable, CaseIterable {
     }
 }
 
+/// Identity validation is shared by offline import and the protected SSH signer.
+/// It does not grant either caller access to the other's encryption operations.
+public protocol SSHIdentityCryptography: Sendable {
+    func sha256(_ bytes: Data) -> Data
+    func ed25519PublicKey(seed: Data) throws -> Data
+    /// Fixed-width private scalar to an uncompressed SEC1 point.
+    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
+}
+
 /// Trusted platform primitive boundary; no algorithm selection comes from JSON.
 /// Apple products use AppleCryptography. Linux tests use an independent oracle.
-public protocol AirGapCryptography: Sendable {
-    func sha256(_ bytes: Data) -> Data
+public protocol AirGapCryptography: SSHIdentityCryptography {
     /// OpenSSH known_hosts compatibility only: a 20-byte salt and a bounded
     /// exact lookup name. FTAG authentication continues to use its modern suite.
     func hmacSHA1(key: Data, message: Data) throws -> Data
     func randomBytes(count: Int) throws -> Data
     func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
-    func ed25519PublicKey(seed: Data) throws -> Data
-    /// A fixed-width big-endian private scalar to an uncompressed SEC1 point.
-    /// The maintained primitive must reject zero and out-of-range scalars.
-    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
     /// Bounded OpenSSH source-key work only; separate from FTAG's encryption.
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data
     /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
@@ -300,7 +304,7 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         let blob = try validateContainer(container, using: crypto)
         return PrivateKeyRecord(credentialID: credentialID, container: container, publicBlob: blob)
     }
-    static func validateContainer<C: AirGapCryptography>(_ data: Data, using crypto: C) throws -> Data {
+    static func validateContainer<C: SSHIdentityCryptography>(_ data: Data, using crypto: C) throws -> Data {
         guard data.count <= FTLimit.key else { throw FTError.limit("key.container") }
         var reader = ByteCursor(data)
         guard try reader.take(15) == Data("openssh-key-v1\0".utf8) else { throw FTError.malformed("key.magic") }
@@ -336,7 +340,7 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         return .init(credentialID: credentialID, container: container, publicBlob: publicBlob)
     }
 
-    private static func validatePrivatePart<C: AirGapCryptography>(_ privatePart: Data, publicBlob: Data,
+    private static func validatePrivatePart<C: SSHIdentityCryptography>(_ privatePart: Data, publicBlob: Data,
         blockSize: Int, using crypto: C) throws -> Int {
         guard [8, 16].contains(blockSize), !privatePart.isEmpty, privatePart.count <= FTLimit.key,
               privatePart.count.isMultiple(of: blockSize) else { throw FTError.malformed("key.extent") }

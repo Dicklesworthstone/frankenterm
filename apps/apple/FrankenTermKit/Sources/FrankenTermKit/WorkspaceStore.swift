@@ -236,6 +236,7 @@ public actor WorkspaceStore {
     }
     private let persistence: any WorkspacePersistence
     private let vault: any WorkspaceCredentialVault
+    private let sshAuthorizationOwner = UUID()
     private static let catalogLimit = 16 * 1024 * 1024
     private static let journalLimit = 128 * 1024
     static let importHistoryLimit = 4096
@@ -637,6 +638,54 @@ public actor WorkspaceStore {
                 support: support, revokedHostKeysByTrustScope: rejected,
                 requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
         }
+    }
+
+    /// Issue no private material and perform no interactive Keychain read here.
+    /// The bounded signing worker uses this snapshot outside the persistence
+    /// lease, then revalidates it before exposing its result to the transport.
+    public func authorizeSSHAuthentication(workspaceID: UUID, expectedRevision: UUID,
+        routeID: String, credentialID: String, presentedHostKey: WorkspaceDocument.HostKey,
+        support: WorkspaceDocument.RouteSupport) throws -> WorkspaceSSHAuthorization {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  saved.revision == expectedRevision else { throw SSHAuthenticationError.stale }
+            let document = try saved.document()
+            guard let route = document.routes.first(where: { $0.id == routeID }),
+                  route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
+                  route.authenticationMethods.contains(.publicKey), route.credentialIDs.contains(credentialID),
+                  let credential = document.credentials.first(where: { $0.id == credentialID }),
+                  let binding = saved.bindings.first(where: { $0.credentialID == credentialID }),
+                  binding.fingerprint == credential.fingerprint,
+                  !catalog.revokedFingerprints.contains(credential.fingerprint) else { throw SSHAuthenticationError.denied }
+            let states = try readiness(document: document, workspaceID: workspaceID,
+                available: availableCredentials(saved, catalog: catalog), findings: saved.findings,
+                catalog: catalog, support: support)
+            guard let selected = states.first(where: { $0.routeID == routeID }), selected.isLocallyReady,
+                  selected.usableCredentialIDs.contains(credentialID) else { throw SSHAuthenticationError.denied }
+            let decision = try document.verifyHostKey(forRouteID: routeID, presented: presentedHostKey,
+                reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
+                revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
+                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
+            guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
+            return .init(storeOwner: sshAuthorizationOwner, account: binding.account,
+                workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
+                credentialID: credentialID, host: route.host, port: route.port, user: route.user,
+                algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey)
+        }
+    }
+
+    /// A revision match alone is insufficient: local identity/host revocations
+    /// can change without replacing the workspace. Repeat the complete policy
+    /// and protected metadata checks under the same catalog lease.
+    public func validateSSHAuthentication(_ authorization: WorkspaceSSHAuthorization,
+        support: WorkspaceDocument.RouteSupport) throws {
+        guard authorization.storeOwner == sshAuthorizationOwner else { throw SSHAuthenticationError.stale }
+        let current = try authorizeSSHAuthentication(workspaceID: authorization.workspaceID,
+            expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
+            credentialID: authorization.credentialID, presentedHostKey: authorization.presentedHostKey, support: support)
+        guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 
     public func routeReadiness(workspaceID: UUID,
