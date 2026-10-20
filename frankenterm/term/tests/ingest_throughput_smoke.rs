@@ -263,10 +263,12 @@ fn term_page_lane_stays_on_pages_for_the_hot_path_corpora() {
             corpus.name()
         );
     }
-    let legacy = lanes::run_lane(Lane::Term, &[], b"x", &geometry);
+    // The `term` lane takes the engine FT_GRID_ENGINE selects, legacy unless
+    // the environment says otherwise; a shell exporting page made this fail.
+    let term = lanes::run_lane(Lane::Term, &[], b"x", &geometry);
     assert_eq!(
-        legacy.terminal.expect("a terminal").screen().grid_engine(),
-        GridEngine::Legacy
+        term.terminal.expect("a terminal").screen().grid_engine(),
+        GridEngine::from_env()
     );
 }
 
