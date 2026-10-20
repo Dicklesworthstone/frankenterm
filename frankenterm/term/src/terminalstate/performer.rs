@@ -1583,20 +1583,34 @@ impl<'a> Performer<'a> {
             // on `seq`, 1% more on long lines.)
             let next = at + 1;
             let end = next + scan.printable_len(&bytes[next..]);
-            let written = if bytes.get(end) == Some(&b'\n') {
-                self.flood_line_feed_with_run(
+            // The line feed that ends a whole plain line, bare or after the
+            // carriage return a PTY puts before it.
+            let line_feed = match bytes.get(end) {
+                Some(b'\n') => Some(end),
+                Some(b'\r') if bytes.get(end + 1) == Some(&b'\n') => Some(end + 1),
+                _ => None,
+            };
+            let written = match line_feed {
+                Some(_) => self.flood_line_feed_with_run(
                     &bytes[next..end],
                     &mut flood_pen,
                     plan.as_ref(),
                     &bidi_mode,
-                )
-            } else {
-                self.flood_line_feed(&bidi_mode, plan.as_ref());
-                false
+                ),
+                None => {
+                    self.flood_line_feed(&bidi_mode, plan.as_ref());
+                    false
+                }
             };
             at = next;
-            if written {
-                at = end;
+            if let Some(line_feed) = line_feed.filter(|_| written) {
+                if line_feed != end {
+                    // What `flood_line_with_controls` does for the carriage
+                    // return after the line's text.
+                    Performer::control(self, ControlCode::CarriageReturn);
+                    self.last_printed = None;
+                }
+                at = line_feed;
                 continue;
             }
             match bytes.get(end) {
