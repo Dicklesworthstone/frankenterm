@@ -105,6 +105,7 @@
             GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
             INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
             INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
             LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
         }; };
         AB0000000000000000000006 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
@@ -113,6 +114,7 @@
             GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
             INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
             INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
             LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
         }; };
 /* End XCBuildConfiguration section */

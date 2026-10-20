@@ -3,6 +3,7 @@ import Observation
 import VisionKit
 import AVFoundation
 import UniformTypeIdentifiers
+import UIKit
 import FrankenTermKit
 
 @main
@@ -18,11 +19,11 @@ final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
     var localPolicies: [UUID: WorkspaceLocalState] = [:]
-    var state: OfflineRestoreStatus?
+    var state: OfflineRestoreStatus? { didSet { updateIdleTimer() } }
     var message: String?
-    var showRestore = false
-    var cameraRequested = false
-    var active = false
+    var showRestore = false { didSet { updateIdleTimer() } }
+    var cameraRequested = false { didSet { updateIdleTimer() } }
+    var active = false { didSet { updateIdleTimer() } }
     var busy = false
     var requestingCameraAccess = false
     @ObservationIgnored private var store: WorkspaceStore?
@@ -31,10 +32,12 @@ final class MobileWorkspaceModel {
     private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
+    @ObservationIgnored private var workspaceRefresh: Task<Void, Never>?
     @ObservationIgnored private var observationTask: Task<Void, Never>?
     @ObservationIgnored private var observations: AsyncStream<CameraObservation>.Continuation?
     @ObservationIgnored private var lastObservation: String?
     @ObservationIgnored private var lastObservationTime = ContinuousClock.now
+    @ObservationIgnored private var previousIdleTimerSetting: Bool?
     private struct CameraObservation: Sendable { let text: String, generation: UUID, epoch: UUID }
     private struct PendingFileImport: Sendable {
         let id = UUID()
@@ -43,6 +46,20 @@ final class MobileWorkspaceModel {
     }
     var hasPendingImport: Bool { pendingImport != nil }
     var pendingImportNeedsRetry: Bool { pendingImport?.needsExplicitRetry == true }
+
+    private func updateIdleTimer() {
+        let needsAwakeDisplay = active && showRestore && state?.isSuspended == false
+            && (cameraRequested || state?.recipientRequest != nil)
+        if needsAwakeDisplay {
+            if previousIdleTimerSetting == nil {
+                previousIdleTimerSetting = UIApplication.shared.isIdleTimerDisabled
+            }
+            UIApplication.shared.isIdleTimerDisabled = true
+        } else if let previousIdleTimerSetting {
+            UIApplication.shared.isIdleTimerDisabled = previousIdleTimerSetting
+            self.previousIdleTimerSetting = nil
+        }
+    }
 
     func requestCamera() {
         guard active, !busy, !requestingCameraAccess, state?.requiresRecipientResume != true else { return }
@@ -98,6 +115,9 @@ final class MobileWorkspaceModel {
     }
     func setRestoreVisible(_ value: Bool) {
         showRestore = value
+        // A just-dismissed request may already be retired. Re-present only the
+        // status returned by the serialized lifecycle transition.
+        state = nil
         if !value { cameraRequested = false; pendingImport = nil }
         updateLifecycle(discardRecipientRequest: !value)
     }
@@ -126,6 +146,7 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
+        workspaceRefresh?.cancel()
         observations?.finish(); observations = nil
         observationTask?.cancel(); observationTask = nil; lastObservation = nil
         guard let restore else { return }
@@ -137,11 +158,26 @@ final class MobileWorkspaceModel {
             self.state = next
             if visible { self.startObservations(restore: restore) }
             if self.active, let store = self.store {
-                do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
-                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.localPolicies = [:]; self.report(error) } }
+                self.scheduleWorkspaceRefresh(using: store, epoch: ticket)
             }
             guard self.epoch == ticket else { return }
             self.openPendingFileIfReady()
+        }
+    }
+    private func scheduleWorkspaceRefresh(using store: WorkspaceStore, epoch ticket: UUID) {
+        let prior = workspaceRefresh
+        prior?.cancel()
+        // Protected-storage reads must not hold the transition chain that
+        // suspends collection or retires a dismissed request. Serialize these
+        // refreshes separately and fence their eventual public UI results.
+        workspaceRefresh = Task { [weak self] in
+            await prior?.value
+            guard !Task.isCancelled, let self, self.active, self.epoch == ticket else { return }
+            do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
+            catch {
+                guard !Task.isCancelled, self.active, self.epoch == ticket else { return }
+                self.availableCredentials = [:]; self.localPolicies = [:]; self.report(error)
+            }
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
@@ -165,7 +201,14 @@ final class MobileWorkspaceModel {
                     if ![.idle, .candidate, .collecting].contains(next.phase) { self.cameraRequested = false }
                 } catch FTError.stale { continue }
                 catch is CancellationError { break }
-                catch { self.report(error) }
+                catch {
+                    let latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    if self.state?.generation != latest.generation { self.lastObservation = nil }
+                    self.state = latest
+                    if ![.idle, .candidate, .collecting].contains(latest.phase) { self.cameraRequested = false }
+                    self.report(error)
+                }
             }
         }
     }
@@ -199,8 +242,9 @@ final class MobileWorkspaceModel {
                 self.state = result
                 if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
+                let latest = await restore.status()
                 guard self.active, self.epoch == ticket else { return }
-                self.state = await restore.status()
+                self.state = latest
                 self.report(error)
             }
         }
@@ -285,7 +329,15 @@ final class MobileWorkspaceModel {
         pendingImport?.needsExplicitRetry = true
     }
     func report(_ error: Error) {
-        if let error = error as? FTError { message = error.localizedDescription }
+        if let error = error as? FTError {
+            if error == .authentication, state?.encryptionMode == .recipient || state?.recipientRequest != nil {
+                message = "This transfer could not be verified for the active phone request. Check the recipient value on both screens and create a new export on the Mac."
+            } else if error == .limit("recipient.envelope_limit") {
+                message = "This transfer exceeds the phone request's accepted size. Select fewer groups or identities on the Mac, then prepare a new transfer."
+            } else if error == .unsupported("envelope.requires_recipient_key"), state?.recipientRequest != nil {
+                message = "This receive session is waiting for an export encrypted to its phone request. Ask the Mac to use Only This Phone, or explicitly start a different transfer to use a code."
+            } else { message = error.localizedDescription }
+        }
         else if let error = error as? WorkspaceStoreError { message = error.localizedDescription }
         else if !(error is CancellationError) { message = "The operation could not finish. Your existing workspace was not replaced without a completed import. Check saved workspaces before retrying." }
     }
