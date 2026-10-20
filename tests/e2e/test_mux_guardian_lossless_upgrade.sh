@@ -55,6 +55,9 @@ TOOL=${3:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/mux-guardian-host.sh}
 [ -x "$TOOL" ] || { echo "FAIL: tool $TOOL not executable"; exit 1; }
 
 case $(uname -s) in Darwin) ROOT=/private/tmp ;; *) ROOT=/tmp ;; esac
+# E2E_ROOT=DIR puts the sandbox elsewhere: a shared tmpfs /tmp that fills
+# up mid-run fails stores for reasons outside the code under test.
+ROOT=${E2E_ROOT:-$ROOT}
 S=$ROOT/ftgx-$$
 mkdir -m 700 "$S" || { echo "FAIL: sandbox $S exists"; exit 1; }
 export HOME=$S/h XDG_CONFIG_HOME=$S/h/.config XDG_DATA_HOME=$S/h/.local/share XDG_RUNTIME_DIR=$S/r
