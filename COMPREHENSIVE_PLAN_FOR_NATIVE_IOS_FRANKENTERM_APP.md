@@ -213,7 +213,7 @@ For large groups, the overview offers name/tag search, favorites, recent machine
 
 Every admitted input event carries an immutable route token containing:
 
-`workspace_id, machine_id, route_id, scene_id, input_stream_id, transport_generation, source_identity, focus_generation`
+`workspace_id, machine_id, route_id, route_revision, scene_id, input_stream_id, transport_generation, source_identity, focus_generation`
 
 `source_identity` is a tagged union: direct SSH uses a local session UUID plus SSH channel generation; mux attachment uses the server incarnation, exact pane registration, and authoritative origin/route witness. A raw SSH server is not required to invent a mux pane identity.
 
@@ -724,7 +724,7 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
 
 Production IDs should be sufficiently random and stable, rather than derived from names or array offsets. The illustrative format admits these opaque fixture IDs so examples can be validated by the actual parser.
 
-A route's `credential_refs` is an ordered, duplicate-free candidate list, initially capped at eight; `authentication_methods` is the ordered allowlist drawn from `publickey`, `keyboard-interactive`, and `password`. The fixture deliberately permits only public-key authentication. Empty or unsupported authentication policies cannot become ready through backend defaults. A public-key policy requires a usable listed identity; password/MFA prompts require their separately allowed methods. Optional certificate bindings must name the same subject key and a qualified certificate policy. Listed candidates do not authorize trying unrelated Keychain or agent identities.
+A route's `credential_refs` is an ordered, duplicate-free candidate list, initially capped at eight; `authentication_methods` is the ordered allowlist drawn from `publickey`, `keyboard-interactive`, and `password`. The fixture deliberately permits only public-key authentication. Empty or unsupported authentication policies cannot become ready through backend defaults. Attempting public-key authentication requires a usable listed identity. Route readiness considers available permitted methods, while server-required additional factors may still prevent authentication from completing. Listing a method authorizes trying it; it does not assert that the server requires or accepts it. Password/MFA prompts require their separately allowed methods. Optional certificate bindings must name the same subject key and a qualified certificate policy. Listed candidates do not authorize trying unrelated Keychain or agent identities.
 
 Host-trust `revoked_keys` entries use the same algorithm/fingerprint representation as `pins`, but deny matching host or CA keys before positive trust is evaluated. The fixture has no revocations. This small exact-key representation does not claim to encode a general OpenSSH KRL or certificate-serial policy: an applicable mandatory policy outside the version's supported representation leaves that direct route unavailable, as specified in section 10.6.
 
@@ -975,6 +975,8 @@ Viewing defaults to observer behavior. The phone can fit or pan the remote grid 
 
 Retain enough source authority to settle admitted input across a local focus change. Do not revoke a lease first and silently abandon its pending ledger. If authority actually expires before server admission, retain the resulting no-effect rejection or uncertainty accurately.
 
+An active mux paste reservation belongs to the authoritative server egress, as specified in section 15.5. Control transfer first fences new effects from the former controller, then settles its already admitted prefix and server-owned paste cleanup before admitting unrelated bytes from the new controller. Expiry or emergency takeover must not erase an open-paste state. Cleanup never repeats payload or expands the old controller's authority; unresolved cleanup produces an explicit affected-pane input state without silently terminating its persistent PTY.
+
 For persistent mux sessions, closing a local view or detaching a client does not request remote PTY termination; only an explicitly authorized terminate operation does. Deleting a saved workspace is a separate local operation. Direct SSH has different close/disconnect semantics, including possible shell termination, as specified in section 20.2.
 
 ### 11.7 Synchronize state before enabling interaction
@@ -984,6 +986,16 @@ A useful snapshot identifies source, terminal sequence, geometry, palette and mo
 Version 69 correlation is useful but does not resolve every capture/coherence/retention gap. Complete the missing mobile snapshot contract, including the generic pane-capture limitation, before claiming exact resynchronization. Do not replay a plain-text capture through a new parser and call it the same terminal.
 
 When retained deltas have a gap, request a bounded authoritative replacement. When the source lacks the required contract, expose a narrower supported capability. Retained output may remain visible as stale, but new interactive input stays closed until source, state, and authority are valid.
+
+### 11.8 Preserve uncertainty when the phone process dies
+
+An in-memory ledger plus a best-effort background checkpoint cannot explain every crash between transmission and acknowledgement. Before opening ordinary input admission for an interactive session epoch, durably publish a small source-bound **unclean-input marker** in protected local storage. It identifies the prior session/route and epoch using opaque local references, not keystrokes, paste bytes, passwords, or their low-entropy hashes. Establish this boundary asynchronously during session readiness; a failed write cannot be reported as durable protection.
+
+The marker can remain set across the interactive epoch, avoiding a disk flush for every key. Clear it only at a sealed admission boundary after all owned input and cleanup have settled with known disposition, or after a separately recorded resolution. Another stream sharing the session cannot continue admitting input behind a clean marker. Keep unresolved metadata under a bounded retention policy with visible scope.
+
+On relaunch, an uncleared marker conservatively means that input from that previous session **may have an unknown outcome**. It does not prove that any particular command was sent, failed, or executed. Show that distinction before the user assumes the prior command should be repeated. Exact per-operation recovery requires separately durable metadata and still needs the original server ledger/authority; the coarse marker invents neither missing operation IDs nor crash-durable replay. Never restore payloads for automatic resubmission.
+
+Retained terminal content, reconnect capability, and this effect metadata have separate validity. A fresh live frame cannot erase uncertainty about an earlier input operation. Killing the phone before its background handler runs must preserve the same conservative behavior as an orderly interruption.
 
 ---
 
@@ -1019,7 +1031,7 @@ Correctness cannot require a final disconnect message reaching the server. Serve
 | Transport | Establish a fresh authenticated generation. |
 | Mux pane | Verify the original server incarnation and exact surviving registration. |
 | Input/geometry authority | Acquire current authority; never restore a stale lease as live. |
-| Ambiguous prior input | Preserve uncertainty; do not replay. |
+| Ambiguous prior input or uncleared interactive epoch | Restore known dispositions and section 11.8's conservative uncertainty marker; do not infer a specific effect or replay payload. |
 
 Persist retained content with its resume witness atomically if persistent caching is enabled. After an incomplete checkpoint, discard unproven resume authority while allowing safe retained content to be shown as stale. Default memory-only caching does not promise a transcript after process termination.
 
@@ -1215,7 +1227,7 @@ UIKit positions commonly operate in UTF-16-oriented text coordinates, while the 
 
 ### 15.2 Exact input identity
 
-Every input stream is scoped to a scene and responder context. Its route token includes workspace, machine, route, `scene_id`, `input_stream_id`, and that stream's `focus_generation`, plus a tagged source identity:
+Every input stream is scoped to a scene and responder context. Its route token includes workspace, machine, route and immutable route revision, `scene_id`, `input_stream_id`, and that stream's `focus_generation`, plus a tagged source identity:
 
 | Source mode | Required source identity |
 |---|---|
@@ -1264,7 +1276,11 @@ Use bracketed paste when negotiated, but do not treat it as a sandbox. Embedded 
 
 Transmit through a bounded queue with an operation ID and ordered chunks. For ordinary UTF-8 text, choose valid character boundaries and keep the bracket delimiters separate from payload data; parser state across admitted chunks remains ordered. Cancellation stops further admission and reports the prefix already admitted or written under the transport's actual certainty model. It cannot retract bytes already sent. If a bracketed-paste closing marker is needed, send it only to the same valid source under the operation's cleanup contract; never replay the payload after reconnect.
 
-While a paste is active, reserve the destination's single egress, including other local streams and generated terminal replies. Reserving only one scene's queue would allow another scene's key or a DA reply to become paste payload. Bound the reservation's bytes and lifetime, retain reserved space for its closing delimiter, and keep the parser running without waiting under its lock. Replies may wait in their bounded complete-unit queue; exhaustion follows section 6.5's explicit policy. A deliberate interrupt has defined ordering after paste closure where the original source and actual delivery state permit it. Source loss leaves remaining text unsent and reports any uncertain prefix.
+While a paste is active, reserve the destination's single egress, including other input streams and generated terminal replies. Reserving only one scene's queue would allow another scene's key or a DA reply to become paste payload. Bound the reservation's bytes and lifetime, retain reserved space for its closing delimiter, and keep the parser running without waiting under its lock. Replies may wait in their bounded complete-unit queue; exhaustion follows section 6.5's explicit policy.
+
+For direct SSH, the phone's session owner controls that egress. For mux mode, a multi-chunk reservation must be owned and enforced at the authoritative server egress, covering every accepted client stream and replies generated by the server terminal. Negotiate this capability explicitly; a mobile queue alone cannot establish it. Without it, use a single bounded framed write only after qualifying its indivisible server admission and downstream ordering, or reject an oversized paste before sending its opening delimiter. Do not infer a cross-RPC paste transaction from reliable-write deduplication alone.
+
+Expiration stops further paste admission; it does not reopen the destination to unrelated bytes. Order the closing delimiter after the admitted prefix only while the original source, authority, and actual delivery state permit cleanup. Reserved memory does not guarantee that a blocked peer can receive the marker. If closure remains unresolved, retain its disposition and apply the affected session's failure policy. The mux server owns expiry cleanup and the decision to resume input; client disappearance cannot discard open-paste state or implicitly terminate the persistent pane. A deliberate interrupt has defined ordering after qualified paste closure. Remaining payload stays unsent and any uncertain prefix remains visible.
 
 ### 15.6 Pointer events and effective terminal focus
 
@@ -1397,7 +1413,7 @@ Use the following as a proposed allocation ledger for a single foreground phone 
 
 | Account | Initial ceiling | Includes and eviction rule |
 |---|---:|---|
-| Terminal/parser/mirror working sets | 40 MiB | Visible and deliberately warm terminals; discard reconstructible mux mirrors before an active parser. |
+| Terminal/parser/mirror working sets | 40 MiB | Every live direct-SSH parser, including hidden sessions, plus resident mux mirrors; discard reconstructible mux mirrors first and admit new raw sessions only against a reserved budget. |
 | Resident scrollback/search pages | 16 MiB | Shared page cache, including line indices and search results; cold history is paged or explicitly unavailable. |
 | Glyph atlases and glyph bitmaps | 32 MiB | Alpha and color glyphs, pending uploads, old generations still referenced by the GPU. |
 | Decoded terminal images | 24 MiB | All decoded frames and pending decode reservations; do not charge only compressed input. |
@@ -1526,7 +1542,7 @@ Push payloads should carry opaque event references and a user-selected amount of
 
 ### 21.1 Persist preferences, not an imaginary running process
 
-Persist the workspace revision, machine and pane preferences, order overlays, local theme/font overrides, route readiness, and bounded navigation state. Credentials remain in Keychain under their own access controls. Runtime handles, live pointers, connection generations, controller leases, and “connected” booleans are not restorable authority.
+Persist the workspace revision, machine and pane preferences, order overlays, local theme/font overrides, route readiness, bounded navigation state, and section 11.8's content-free effect/unclean-epoch metadata. Credentials remain in Keychain under their own access controls. Runtime handles, live pointers, connection generations, controller leases, and “connected” booleans are not restorable authority.
 
 Terminal transcripts, recent previews, and command/search history are opt-in persistent content. Default to a minimal configuration store and memory-only terminal caches. If content retention is enabled, use protected storage, explicit retention limits, and a clear per-workspace erase control. The live terminal naturally displays the user's authorized remote content; privacy controls govern its retention and export, not arbitrary censorship of the visible session.
 
@@ -1685,6 +1701,8 @@ The highest-value tests target interactions that a happy-path demo will miss:
 16. **Positive pin plus revoked identity.** Applicable negative trust wins; a missing mandatory KRL source or unsupported algorithm policy cannot become a ready pin-only route. Reimport during a prompt invalidates the old attempt's configuration authority.
 17. **Authentication and key-import edge cases.** Wrong unencrypted keys, a correct later candidate, key-plus-MFA continuation, unsupported methods, excessive KDF parameters, mismatched private/public/certificate identity, and oversized transfer fail or continue under the documented bounded states without misleading prompts.
 18. **Return to Mac after the invitation expires.** The approved device proves possession of its durable key and receives only its current scope. A copied device name/manifest, replayed early-data operation, revoked certificate, or unverified rotated pin cannot obtain discovery or input authority.
+19. **Mux paste, server replies, and controller takeover.** Another client and the remote parser attempt writes between paste chunks; server admission preserves the paste boundary. Expiry or phone disappearance settles closure before unrelated input resumes, with no payload replay or implicit PTY termination. A peer without that contract rejects unsupported paste size before any delimiter is sent.
+20. **Process death before effect checkpoint.** Kill the phone after transmission and before acknowledgement/checkpoint, and at the clean-marker transition with another stream ready to write. Relaunch preserves conservative uncertainty without inventing a particular executed command, missing receipt, or replay permission.
 
 These traces should use synthetic content and controlled hosts, with host-side effect observation where needed. Tests that merely restate an implementation's current output cannot establish these properties.
 
@@ -1733,7 +1751,7 @@ Build the smallest production-shaped slice:
 3. Qualify the selected `frankenterm-ssh` backend against one owned host using a representative existing-key format and strict host verification.
 4. Feed received bytes in bounded work quanta into the shared terminal model; return its required query replies through the session egress; publish bounded render state and draw the glyphs and cursor.
 5. Route native text, control, pointer, and paste input to that exact connection, with one bounded egress and a focus barrier independent of downstream flush.
-6. Cancel and destroy the view, connection, and authentication work without leaving callbacks targeting retired objects.
+6. Cancel and destroy the view, connection, and authentication work without leaving callbacks targeting retired objects; exercise process death after input using the source-bound uncertainty marker.
 
 The slice must include a real full-screen terminal application and composed Unicode input. An ANSI-colored log viewer with a working TCP socket does not resolve the important architectural risks.
 
