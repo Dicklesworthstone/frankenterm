@@ -328,11 +328,18 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
 }
 
 public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
-    public struct Portability: Sendable {
+    public struct Portability: Sendable, Equatable {
         public let entityID: String, setting: String, disposition: UInt64, reason: String
+        public init(entityID: String, setting: String, disposition: UInt64, reason: String) {
+            self.entityID = entityID; self.setting = setting; self.disposition = disposition; self.reason = reason
+        }
     }
-    public struct Annotation: Sendable {
+    public struct Annotation: Sendable, Equatable, CustomDebugStringConvertible {
         public let entityID: String, setting: String, original: Data
+        public init(entityID: String, setting: String, original: Data) {
+            self.entityID = entityID; self.setting = setting; self.original = original
+        }
+        public var debugDescription: String { "AirGapArchive.Annotation([redacted])" }
     }
     public let workspace: WorkspaceDocument
     public let keys: [PrivateKeyRecord]
@@ -340,8 +347,11 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
     public let annotations: [Annotation]
     public var debugDescription: String { "AirGapArchive([redacted])" }
 
-    public init<C: AirGapCryptography>(workspace: WorkspaceDocument, keys: [PrivateKeyRecord], using crypto: C) throws {
-        self.workspace = workspace; self.keys = keys; portability = []; annotations = []
+    public init<C: AirGapCryptography>(workspace: WorkspaceDocument, keys: [PrivateKeyRecord],
+        portability: [Portability] = [], annotations: [Annotation] = [], using crypto: C) throws {
+        let metadata = try Self.validatedMetadata(workspace: workspace, portability: portability, annotations: annotations)
+        self.workspace = workspace; self.keys = keys
+        self.portability = metadata.portability; self.annotations = metadata.annotations
         try validateKeys(using: crypto)
     }
     public init<C: AirGapCryptography>(data: Data, using crypto: C) throws {
@@ -349,7 +359,7 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
         var reader = CBORReader(data)
         try reader.tuple(5)
         guard try reader.head(major: 0) == 1 else { throw FTError.unsupported("archive.version") }
-        workspace = try WorkspaceDocument(data: reader.bytes(cap: FTLimit.manifest))
+        let workspace = try WorkspaceDocument(data: reader.bytes(cap: FTLimit.manifest))
         let keyCount = try reader.array(cap: 256)
         var keys: [PrivateKeyRecord] = []
         var certificateCount = 0, certificateBytes = 0
@@ -375,19 +385,82 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
         for _ in 0..<portCount {
             try reader.tuple(4)
             let id = try reader.text(), setting = try reader.text(), disposition = try reader.head(major: 0), reason = try reader.text()
-            guard disposition <= 1 else { throw FTError.malformed("archive.disposition") }
             portability.append(Portability(entityID: id, setting: setting, disposition: disposition, reason: reason))
         }
         let annotationCount = try reader.array(cap: 1024)
         for _ in 0..<annotationCount {
             try reader.tuple(3)
             let id = try reader.text(), setting = try reader.text(), original = try reader.bytes(cap: FTLimit.text)
-            guard String(data: original, encoding: .utf8) != nil else { throw FTError.malformed("annotation.utf8") }
             annotations.append(Annotation(entityID: id, setting: setting, original: original))
         }
         try reader.finish()
-        self.keys = keys; self.portability = portability; self.annotations = annotations
-        try validateKeys(using: crypto)
+        try self.init(workspace: workspace, keys: keys, portability: portability, annotations: annotations, using: crypto)
+    }
+    /// Archive annotations eventually enter the public configuration catalog.
+    /// Only registered, typed public values may cross that boundary. Unknown
+    /// opaque bytes are never retained, even though the FTAG envelope was valid.
+    static func validatedMetadata(workspace: WorkspaceDocument, portability: [Portability], annotations: [Annotation]) throws
+        -> (portability: [Portability], annotations: [Annotation]) {
+        guard portability.count <= 1024, annotations.count <= 1024 else { throw FTError.limit("archive.metadata") }
+        let entityIDs = Set([workspace.id] + workspace.groups.map(\.id) + workspace.machines.map(\.id)
+            + workspace.routes.map(\.id) + workspace.credentials.map(\.id) + workspace.hostTrust.map(\.id) + workspace.themes.map(\.id))
+        struct Reference: Hashable { let entityID: String, setting: String }
+        func reference(_ entityID: String, _ setting: String) throws -> Reference {
+            _ = try WorkspaceDocument.identifier(entityID)
+            _ = try WorkspaceDocument.identifier(setting)
+            guard entityIDs.contains(entityID) else { throw FTError.malformed("archive.metadata_reference") }
+            return Reference(entityID: entityID, setting: setting)
+        }
+        // Reserved, content-free diagnostic remains stable across re-export.
+        let omittedSetting = "frankenterm.discarded_annotations"
+        let omittedReason = "Unsupported desktop annotations were omitted from public storage."
+        var records = portability, conditions: [Reference: UInt64] = [:]
+        var hasOmissionFinding = false
+        for item in portability {
+            let key = try reference(item.entityID, item.setting)
+            guard conditions.updateValue(item.disposition, forKey: key) == nil else { throw FTError.malformed("archive.duplicate_portability") }
+            guard item.disposition <= 1 else { throw FTError.malformed("archive.disposition") }
+            guard !item.reason.isEmpty, item.reason.utf8.count <= FTLimit.text,
+                  !item.reason.unicodeScalars.contains(where: { $0.value < 32 || (127...159).contains($0.value) })
+            else { throw FTError.malformed("archive.portability_reason") }
+            if item.setting == omittedSetting {
+                guard item.entityID == workspace.id, item.disposition == 0, item.reason == omittedReason else {
+                    throw FTError.malformed("archive.reserved_portability")
+                }
+                hasOmissionFinding = true
+            }
+        }
+        var retained: [Annotation] = [], seen = Set<Reference>(), omitted = false
+        for item in annotations {
+            let key = try reference(item.entityID, item.setting)
+            guard seen.insert(key).inserted else { throw FTError.malformed("archive.duplicate_annotation") }
+            guard item.original.count <= FTLimit.text else { throw FTError.limit("annotation.bytes") }
+            guard String(data: item.original, encoding: .utf8) != nil else { throw FTError.malformed("annotation.utf8") }
+            let canonical: Data
+            switch item.setting {
+            // Actual desktop configuration fields. These remain inert: importing
+            // a value never activates desktop configuration or executes code.
+            case "enable_tab_bar", "hide_tab_bar_if_only_one_tab", "use_fancy_tab_bar":
+                guard case .boolean(let value) = try StrictJSON.decode(item.original) else { throw FTError.malformed("annotation.boolean") }
+                canonical = Data((value ? "true" : "false").utf8)
+            case "window_background_opacity", "text_background_opacity":
+                guard case .number(let text) = try StrictJSON.decode(item.original), let value = Double(text),
+                      value.isFinite, (0...1).contains(value) else { throw FTError.malformed("annotation.opacity") }
+                // Do not preserve arbitrary whitespace or numeric spellings as
+                // a covert opaque payload in the public catalog.
+                canonical = try JSONEncoder().encode(value)
+            default:
+                guard conditions[key] != 1 else { throw FTError.unsupported("annotation.required_setting") }
+                omitted = true
+                continue
+            }
+            retained.append(Annotation(entityID: item.entityID, setting: item.setting, original: canonical))
+        }
+        if omitted && !hasOmissionFinding {
+            guard records.count < 1024 else { throw FTError.limit("archive.metadata") }
+            records.append(Portability(entityID: workspace.id, setting: omittedSetting, disposition: 0, reason: omittedReason))
+        }
+        return (records, retained)
     }
     private func validateKeys<C: AirGapCryptography>(using crypto: C) throws {
         guard keys.count <= 256 else { throw FTError.limit("archive.keys") }
