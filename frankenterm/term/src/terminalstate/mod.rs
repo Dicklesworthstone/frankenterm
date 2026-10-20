@@ -29,6 +29,12 @@ use url::Url;
 
 #[cfg(feature = "use_serde")]
 pub mod checkpoint;
+mod bounded_output;
+pub use bounded_output::{
+    BoundedOutputDrain, BoundedOutputLimits, BoundedOutputSettlement, BoundedOutputStatus,
+    BoundedWriteResult,
+};
+use bounded_output::BoundedOutputWriter;
 mod image;
 mod iterm;
 mod keyboard;
@@ -650,6 +656,9 @@ enum ThreadedWriter {
         /// the child whole or not at all.
         reply_unit_dropped: Option<bool>,
     },
+    /// Mobile/embedder path: a fixed ring drained by the caller. No thread,
+    /// channel, callback retention or implicit downstream writer exists.
+    Bounded(BoundedOutputWriter),
     #[cfg(feature = "use_serde")]
     Inert,
     Failed,
@@ -673,11 +682,13 @@ pub(crate) struct PreparedRecoveryConfiguration {
 /// input; they differ only under backpressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteClass {
-    /// Keystrokes, pastes, mouse and focus reports. Never dropped.
+    /// Keystrokes, pastes, mouse and focus reports. Admitted bytes are never
+    /// silently dropped; bounded output can refuse a whole unit at admission.
     UserInput,
     /// Answers to the child's own queries (DA, DSR/CPR, DECRQSS, DECRQM,
     /// XTVERSION, OSC color queries, kitty graphics acknowledgements). Dropped
-    /// whole, and counted, once [`REPLY_BACKLOG_LIMIT`] is reached.
+    /// whole, and counted, once the writer's reply budget is reached (the
+    /// desktop threaded writer uses [`REPLY_BACKLOG_LIMIT`]).
     Reply,
 }
 
@@ -877,6 +888,7 @@ impl ThreadedWriter {
     fn class(&self) -> WriteClass {
         match self {
             Self::Live { class, .. } => *class,
+            Self::Bounded(writer) => writer.class(),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriteClass::Reply,
             Self::Failed => WriteClass::Reply,
@@ -886,6 +898,10 @@ impl ThreadedWriter {
     /// Changes the class of subsequent writes. The caller flushes first, so
     /// no buffered byte changes class.
     fn set_class(&mut self, new_class: WriteClass) {
+        if let Self::Bounded(writer) = self {
+            writer.set_class(new_class);
+            return;
+        }
         if let Self::Live {
             class,
             reply_unit_dropped,
@@ -900,6 +916,7 @@ impl ThreadedWriter {
     fn backlog(&self) -> WriterBacklog {
         match self {
             Self::Live { counters, .. } => counters.snapshot(),
+            Self::Bounded(writer) => writer.backlog(),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriterBacklog::default(),
             Self::Failed => WriterBacklog::default(),
@@ -915,6 +932,9 @@ impl ThreadedWriter {
                     Err(_) => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
                 }
             }
+            // A bounded sink reports acceptance, not a child flush. Never
+            // manufacture the stronger desktop WriterBarrier evidence.
+            Self::Bounded(_) => WriterBarrierState::Unavailable(std::io::ErrorKind::Unsupported),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriterBarrierState::Complete,
             Self::Failed => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
@@ -926,6 +946,7 @@ impl ThreadedWriter {
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
+            Self::Bounded(writer) => writer.write(buf),
             Self::Live {
                 sender,
                 counters,
@@ -982,6 +1003,7 @@ impl std::io::Write for ThreadedWriter {
     /// thread; use [`TerminalState::writer_barrier`] to observe completion.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
+            Self::Bounded(writer) => writer.flush(),
             Self::Live {
                 sender,
                 reply_unit_dropped,
@@ -1024,6 +1046,24 @@ impl TerminalState {
         )
     }
 
+    pub(crate) fn new_bounded_output(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+    ) -> std::io::Result<Self> {
+        let writer = BoundedOutputWriter::new(limits)?;
+        Ok(Self::new_with_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            ThreadedWriter::Bounded(writer),
+            false,
+        ))
+    }
+
     fn new_with_writer(
         size: TerminalSize,
         config: Arc<dyn TerminalConfiguration>,
@@ -1057,7 +1097,14 @@ impl TerminalState {
         seqno: SequenceNo,
         screen: ScreenOrAlt,
     ) -> TerminalState {
-        let writer = BufWriter::new(writer);
+        // The bounded writer already stages complete units within its ring.
+        // Even a small hidden BufWriter would admit bytes before reservation
+        // and could retain a rejected unit until a later unrelated operation.
+        let writer = if matches!(&writer, ThreadedWriter::Bounded(_)) {
+            BufWriter::with_capacity(0, writer)
+        } else {
+            BufWriter::new(writer)
+        };
 
         let color_map = default_color_map();
 
@@ -1575,8 +1622,13 @@ impl TerminalState {
         self.focus_tracking
     }
 
-    /// Advise the terminal about a change in its focus state
+    /// Advise the terminal about a change in its focus state. Bounded embedders
+    /// should use [`Self::try_bounded_focus_change`] to observe refused cleanup.
     pub fn focus_changed(&mut self, focused: bool) {
+        if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            self.try_bounded_focus_change(focused).ok();
+            return;
+        }
         if focused == self.focused {
             return;
         }
@@ -1607,6 +1659,52 @@ impl TerminalState {
         }
     }
 
+    /// Admit all button-release cleanup and the focus report as one bounded
+    /// event. A failure preserves focus and logical mouse state; the embedder
+    /// can explicitly retry on this source or close it. No cleanup prefix was
+    /// admitted on an error. Local navigation itself need not wait for a sink.
+    pub fn try_bounded_focus_change(&mut self, focused: bool) -> Result<(), Error> {
+        if !matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into());
+        }
+        if focused == self.focused {
+            return Ok(());
+        }
+        let buttons = self.current_mouse_buttons.clone();
+        let last_move = self.last_mouse_move;
+        let result = self.with_user_input(|term| -> Result<(), Error> {
+            if !focused {
+                for button in buttons.iter().copied() {
+                    term.mouse_event(MouseEvent {
+                        kind: MouseEventKind::Release,
+                        button,
+                        modifiers: KeyModifiers::NONE,
+                        x: 0,
+                        y: 0,
+                        x_pixel_offset: 0,
+                        y_pixel_offset: 0,
+                    })?;
+                }
+            }
+            if term.focus_tracking {
+                let report = if focused { "\x1b[I" } else { "\x1b[O" };
+                term.write_user_input(report.as_bytes())?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.current_mouse_buttons = buttons;
+            self.last_mouse_move = last_move;
+            return result;
+        }
+        self.increment_seqno();
+        self.focused = focused;
+        if !focused {
+            self.lost_focus_seqno = self.seqno;
+        }
+        Ok(())
+    }
+
     /// Returns true if there is new output since the terminal
     /// lost focus
     pub fn has_unseen_output(&self) -> bool {
@@ -1635,11 +1733,23 @@ impl TerminalState {
     /// De-fang the text by removing any embedded bracketed paste
     /// sequence that may be present.
     ///
-    /// A paste larger than [`MAX_PASTE_BYTES`] is refused whole with
+    /// With the desktop writer, a paste larger than [`MAX_PASTE_BYTES`] is refused whole with
     /// [`PasteTooLarge`]; nothing is sent. Otherwise the paste is queued in
     /// full behind earlier input and never dropped, however slowly the child
-    /// reads it.
+    /// reads it. Caller-drained bounded output uses its configured smaller
+    /// limit and refuses capacity failure or non-text controls before sending
+    /// any byte, including the bracketed-paste opening delimiter.
     pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
+        if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            let bracketed = self.bracketed_paste;
+            let canon = self.config.canonicalize_pasted_newlines();
+            return self.with_user_input(|term| {
+                let ThreadedWriter::Bounded(writer) = term.writer.get_mut() else {
+                    unreachable!("bounded writer kind cannot change during paste")
+                };
+                writer.paste(text, bracketed, canon).map_err(Error::from)
+            });
+        }
         if text.len() > MAX_PASTE_BYTES {
             return Err(PasteTooLarge {
                 len: text.len(),
@@ -1670,27 +1780,51 @@ impl TerminalState {
         Ok(())
     }
 
-    /// Runs `f` with every write classed as user input (keys, pastes, mouse
-    /// and focus reports), which backpressure never drops. Bytes buffered
-    /// before the call go out first under their own class; nesting is safe.
-    pub(crate) fn with_user_input<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// Runs `f` with every write classed as user input. The bounded writer
+    /// reserves one complete outer input transaction even when nested key or
+    /// mouse encoders flush repeatedly. Rejection rolls back the whole event.
+    /// Bytes buffered before the call retain their class; nesting is safe.
+    pub(crate) fn with_user_input<R, E>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<std::io::Error>,
+    {
         let previous = self.writer.get_ref().class();
         if previous != WriteClass::UserInput {
             // Hand buffered replies over as replies before the class changes.
-            // A failure here means the writer is gone, which `f` reports.
-            self.writer.flush().ok();
+            let flush = self.writer.flush();
+            if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+                flush.map_err(E::from)?;
+            }
             self.writer.get_mut().set_class(WriteClass::UserInput);
+            if let ThreadedWriter::Bounded(writer) = self.writer.get_mut() {
+                writer.begin_input_batch();
+            }
         }
         let result = f(self);
         if previous != WriteClass::UserInput {
-            self.writer.flush().ok();
+            let flush = if let ThreadedWriter::Bounded(writer) = self.writer.get_mut() {
+                writer.finish_input_batch(result.is_ok())
+            } else {
+                // Preserve the threaded writer's existing explicit-flush
+                // contract; its input functions report their own I/O errors.
+                self.writer.flush().ok();
+                Ok(())
+            };
             self.writer.get_mut().set_class(previous);
+            if result.is_ok() {
+                flush.map_err(E::from)?;
+            }
         }
         result
     }
 
     /// Queues user input (keys, pastes, composed text) behind everything
-    /// already written. Never blocks and is never dropped under backpressure.
+    /// already written. Never blocks. Caller-drained bounded output returns
+    /// `WouldBlock` when it cannot reserve the complete unit; no prefix is
+    /// admitted and a later call cannot accidentally flush rejected bytes.
     pub fn write_user_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.with_user_input(|term| {
             term.writer.write_all(bytes)?;
@@ -1724,6 +1858,50 @@ impl TerminalState {
     /// The writer queue's current backlog and reply-drop counters.
     pub fn writer_backlog(&self) -> WriterBacklog {
         self.writer.get_ref().backlog()
+    }
+
+    /// Snapshot of the caller-drained egress owner, if this terminal was
+    /// constructed with [`Terminal::new_bounded_output`]. `accepted_through`
+    /// is a local downstream-acceptance watermark, not remote execution proof.
+    pub fn bounded_output_status(&self) -> Option<BoundedOutputStatus> {
+        match self.writer.get_ref() {
+            ThreadedWriter::Bounded(writer) => Some(writer.status()),
+            _ => None,
+        }
+    }
+
+    /// Offer at most `maximum` bytes of the oldest complete output unit.
+    ///
+    /// `sink` MUST return without blocking, retain no borrowed bytes, and copy
+    /// only into pre-reserved bounded storage or use a nonblocking transport.
+    /// The bytes remain reserved until its exact accepted-prefix result. No
+    /// subsequent unit can overtake a partially accepted one. Replies continue
+    /// to be queued independently of keyboard focus, including hidden panes.
+    ///
+    /// Failure (or a sink panic caught by the embedding boundary) permanently
+    /// closes this egress owner. Close the corresponding transport before
+    /// replacing it; never replay the uncertain input on a new connection.
+    pub fn drain_bounded_output<F>(
+        &mut self,
+        maximum: usize,
+        sink: F,
+    ) -> std::io::Result<BoundedOutputDrain>
+    where
+        F: FnOnce(WriteClass, &[u8]) -> BoundedWriteResult,
+    {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => writer.drain(maximum, sink),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    /// Permanently stop this output owner and settle its remaining bytes.
+    /// Idempotent; does not close the embedder's independently owned transport.
+    pub fn close_bounded_output(&mut self) -> std::io::Result<BoundedOutputSettlement> {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => Ok(writer.close()),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
     }
 
     /// Informs the terminal that the viewport of the window has resized to the
@@ -4692,13 +4870,15 @@ mod tests {
     fn user_input_class_nests_and_is_restored_after_every_input_path() {
         let (mut terminal, output) = terminal_state_with_capture(false);
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
-        terminal.with_user_input(|terminal| {
+        terminal.with_user_input(|terminal| -> std::io::Result<()> {
             assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            terminal.with_user_input(|terminal| {
+            terminal.with_user_input(|terminal| -> std::io::Result<()> {
                 assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            });
+                Ok(())
+            })?;
             assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-        });
+            Ok(())
+        }).unwrap();
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
 
         terminal

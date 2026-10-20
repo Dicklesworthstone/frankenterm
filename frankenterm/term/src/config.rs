@@ -132,28 +132,35 @@ impl NewlineCanon {
     }
 
     pub fn canonicalize(self, text: &str) -> String {
-        let target = self.target();
         let mut buf = String::new();
+        self.for_each_chunk(text, |chunk| buf.push_str(chunk));
+        buf
+    }
+
+    /// Visit the canonical bytes without allocating a second complete paste.
+    /// The bounded writer uses the same implementation for its size pass and
+    /// its reserved write pass; desktop paste keeps its existing String API.
+    pub(crate) fn for_each_chunk(self, text: &str, mut emit: impl FnMut(&str)) {
+        let target = self.target();
         let mut iter = text.chars().peekable();
         while let Some(c) = iter.next() {
             match target {
-                None => buf.push(c),
+                None => emit(c.encode_utf8(&mut [0; 4])),
                 Some(canon) => {
                     if c == '\n' {
-                        buf.push_str(canon);
+                        emit(canon);
                     } else if c == '\r' {
-                        buf.push_str(canon);
+                        emit(canon);
                         if let Some('\n') = iter.peek() {
                             // Paired with the \r, so consume this one
                             iter.next();
                         }
                     } else {
-                        buf.push(c);
+                        emit(c.encode_utf8(&mut [0; 4]));
                     }
                 }
             }
         }
-        buf
     }
 }
 

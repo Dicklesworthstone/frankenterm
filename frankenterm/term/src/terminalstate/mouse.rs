@@ -280,8 +280,13 @@ impl TerminalState {
         event.x = x;
         event.y = y;
 
-        // Mouse reports are user input: queued in order, never dropped.
-        self.with_user_input(|term| match event {
+        // The bounded writer admits all reports from this event together.
+        // If admission fails, preserve the logical button/motion state so a
+        // deliberate retry cannot lose a release or suppress an unsent move.
+        let previous = self.bounded_output_status().map(|_| {
+            (self.current_mouse_buttons.clone(), self.last_mouse_move)
+        });
+        let result = self.with_user_input(|term| match event {
             MouseEvent {
                 kind: MouseEventKind::Press,
                 button:
@@ -311,7 +316,14 @@ impl TerminalState {
                 kind: MouseEventKind::Move,
                 ..
             } => term.mouse_move(event),
-        })
+        });
+        if result.is_err() {
+            if let Some((buttons, last_move)) = previous {
+                self.current_mouse_buttons = buttons;
+                self.last_mouse_move = last_move;
+            }
+        }
+        result
     }
 }
 

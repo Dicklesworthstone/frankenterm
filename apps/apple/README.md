@@ -32,6 +32,20 @@ This is a credential component for the future SSH driver, not an enabled connect
 
 Nineteen focused signing/broker tests passed on Linux: an independent OpenSSL verifier checked all four real production signers, exact user-authentication fields, canonical ECDSA encodings and hash selection; actor tests exercised actual signatures completing after revocation, reimport, cancellation and suspension. Native Keychain and LocalAuthentication behavior still require an Apple SDK build and passcode-enabled device qualification.
 
+## Bounded shared terminal output
+
+The canonical Rust terminal now offers `Terminal::new_bounded_output`. It uses the existing parser, keyboard/mouse encoders, terminal modes and newline semantics with fixed preallocated byte and record rings. This mode creates no writer thread or unbounded channel and retains no extra `BufWriter` buffer. User input and terminal replies have independent budgets while sharing one ordered stream. The full outer input event is admitted or refused together, including mouse-wheel operations whose nested encoders flush repeatedly. A rejected mouse/focus event preserves logical button, motion and focus state. Bounded paste reserves its complete encoded size before adding either bracket delimiter and rejects executable control bytes.
+
+The caller drives `drain_bounded_output` with a synchronous nonblocking sink. An exact accepted prefix releases its charge; a stalled sink retains it. `bounded_output_status` exposes local acceptance watermarks and whole-reply drops. `try_bounded_focus_change` exposes refused cleanup explicitly. `close_bounded_output` returns idempotent, content-free settlement separating accepted prefixes, bytes never offered, and an uncertain offered prefix after failure. No uncertain bytes may be replayed on a replacement transport. `writer_barrier` returns unsupported in this mode because downstream acceptance is not a remote flush acknowledgment.
+
+This removes the hidden unbounded writer from the available embedding path; it does not establish bounds for parser, image, screen or scrollback storage, and is not yet connected to the Swift coordinator. The future bridge must budget both owners and their handoff without duplicating output. Sixteen focused Rust tests cover real parser replies, canonical keyboard/mouse encoding, transactional paste/focus behavior, saturation, partial/stalled sinks and failure uncertainty. They received independent source review but **were not compiled or executed**: the required RCH service/toolchain was unavailable. Required development proof is:
+
+```sh
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bounded-terminal-output cargo test --locked -p frankenterm-term --lib terminalstate::bounded_output::tests -- --nocapture
+```
+
+Run the full `frankenterm-term --lib` suite through RCH afterward for desktop regression coverage. This constructor does not claim an iOS-buildable artifact or a native terminal release.
+
 ## Implemented invariants
 
 - `WorkspaceStore` serializes the journal, Keychain ownership, and catalog publication under an exclusive persistence lease. Before deleting staged or retired identities, recovery reaffirms the selected catalog's **durability**. Reading renamed bytes after a failed fsync alone does not authorize deletion.

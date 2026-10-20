@@ -1315,6 +1315,36 @@ impl Terminal {
         }
     }
 
+    /// Construct the canonical terminal with caller-drained bounded egress.
+    /// No writer thread or unbounded queue is installed. Input and parser
+    /// replies share one ordered fixed-capacity ring, with independent budgets
+    /// so reply floods cannot consume the user-input reserve.
+    ///
+    /// Each user output unit fails whole with `WouldBlock`; full reply units are
+    /// dropped and counted. Paste additionally refuses non-text controls and
+    /// observes the smaller configured bound. The caller drives
+    /// [`TerminalState::drain_bounded_output`] and owns transport scheduling.
+    /// These bounds cover output only: configure parser, screen, image and
+    /// scrollback limits separately before using this in a mobile artifact.
+    pub fn new_bounded_output(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration + Send + Sync>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+    ) -> std::io::Result<Terminal> {
+        Ok(Terminal {
+            state: TerminalState::new_bounded_output(
+                size,
+                config,
+                term_program,
+                term_version,
+                limits,
+            )?,
+            parser: Parser::new(),
+        })
+    }
+
     /// Feed the terminal parser a slice of bytes from the output
     /// of the associated program.
     /// The slice is not required to be a complete sequence of escape
