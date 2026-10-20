@@ -408,7 +408,7 @@ The existing `TerminalState::writer_barrier` waits for downstream write/flush co
 |---|---|---|---|
 | Direct SSH | Phone authenticates to the selected host and opens one or more SSH PTY channels. | A terminal channel created for this client. | No guarantee of survival or exact reattachment after a broken SSH connection. |
 | Direct FrankenTerm mux | Phone authenticates to the host, then attaches to an existing persistent FrankenTerm mux through a verified endpoint. | The server's exact registered pane. | Reattach to surviving panes while that mux remains alive; stronger recovery requires separately advertised capabilities. |
-| Via Mac | Phone authenticates to the paired Mac's endpoint; the Mac exposes selected existing local/remote mux sessions. | A pane plus its authoritative origin/route within the Mac's session graph. | Depends on the Mac and every required downstream route remaining available. |
+| Via Mac | Phone authenticates with its enrolled device identity to the Mac's scoped TLS endpoint; the Mac exposes selected existing local/remote mux sessions. | A pane plus its authoritative origin/route within the Mac's session graph. | Depends on the Mac and every required downstream route remaining available; section 10.8 defines the new endpoint and durable device authority. |
 
 The [SSH connection protocol](https://www.rfc-editor.org/rfc/rfc4254) provides channels, PTY requests, window changes, and data transport. Persistent pane discovery and exact reattachment are higher-level mux semantics.
 
@@ -418,7 +418,7 @@ Do not silently fail over from Via Mac to direct access: that changes the creden
 
 Start by qualifying **one existing libssh2-based backend** behind an iOS feature of `frankenterm-ssh`. This has the strongest continuity with existing key/configuration behavior and avoids adding a second Rust async runtime. Build only the chosen native dependency stack into the mobile artifact, pin it, and document every added iOS/native boundary.
 
-The spike must establish: real-device linking, nonblocking socket operation, existing-key authentication, strict host verification, keyboard-interactive prompts, cancellation, bounded I/O, external signing, and the intended jump-host route. It must measure binary size and memory and identify the exact cryptographic backend. Passing a desktop SSH test does not establish these properties on iOS.
+The first integrated M0 slice must establish real-device linking, bounded nonblocking I/O, strict host verification, one representative existing-key authentication path, PTY creation/input/output/resize, and cancellation through the actual Swift/Rust/Metal app. Run early feasibility experiments for external signing, keyboard-interactive authentication, and nested-hop transport in parallel because their failure may change the backend decision. Qualify each before enabling its credential or route in IOS-B/M1; do not make every authentication family a prerequisite for displaying the first real terminal. Record binary size, memory, exact native dependencies, and backend features for each result. A desktop test does not qualify the device path.
 
 The underlying [libssh2 API](https://libssh2.org/docs.html) offers nonblocking operation, memory-key authentication, direct TCP channels, and public-key signing callbacks. The existing Rust wrapper must be audited for what it actually exposes. A general external-signing callback and a nested-channel transport adapter may require small audited additions; neither is assumed to exist already.
 
@@ -429,6 +429,8 @@ If this spike fails on a concrete requirement, evaluate an Apple SwiftNIO SSH ad
 Authentication prompts belong to the native credential broker. Preauthorize a selected credential where possible, then perform blocking library callbacks on an isolated, bounded authentication worker. A synchronous C signing or keyboard-interactive callback cannot become asynchronous merely by returning a retry code. Prove its reentry behavior or preserve the library's synchronous contract without blocking MainActor or an asupersync executor thread.
 
 For ProxyJump, an inner SSH session consumes the outer session's `direct-tcpip` channel as a byte transport. It must not use the outer TCP socket descriptor as though that socket were already the destination host. Specify bounded buffering, independent inner/outer host verification, cancellation propagation, and parent-route invalidation. Qualify one hop first; a proposed initial limit of three hops bounds prompt, buffer, and failure complexity.
+
+Resolve the complete hop chain before opening channels, counting the expanded chain against the three-hop cap and rejecting cycles or ambiguous expansion. A route used as a transit hop supplies only its transport/authentication policy: it must not execute its own terminal `session_creation` preference, request a PTY, or run a startup command. Sharing a parent transport requires matching immutable endpoint, account, trust, credential-policy, and route revisions; an equal hostname alone does not authorize reuse.
 
 Do not export arbitrary local `ProxyCommand` shell execution to the phone. The portability report offers a structured jump route, an explicitly supported transport adapter, or Via Mac.
 
@@ -448,7 +450,17 @@ Connect the selected machine first, then its immediate navigation neighbors, the
 
 Use bounded exponential backoff with jitter and a per-route retry budget. A user selecting a machine can promote its next attempt; repeated swipes must not spawn duplicate handshakes. Host-key mismatch, rejected credentials, unsupported algorithms, and revoked authority require explicit resolution rather than an endless retry loop.
 
+Each attempt captures an immutable resolved route revision, credential authorization generation, host-trust revision, and permitted authentication methods. A reimport, key revocation, or trust edit cannot change the destination or signer of an in-flight prompt by mutating a shared route object. Before consuming a delayed credential response or publishing a connected route, validate those generations again; retire stale work and require the applicable newly reviewed authority.
+
 Once imported and authorized, group connection should require no repeated setup. User-disabled machines stay disabled. Cellular, constrained-network, and background policies may reduce subscriptions while preserving the configured group and showing the reason.
+
+### 7.6 Normal completion, EOF, and signal results
+
+Preserve the origin of session-completion evidence: a remotely reported exit code or signal, channel closure without a reported status, transport loss, and local cancellation are distinct results. SSH EOF only ends one direction; it is not full channel closure or proof that the command completed. Exit-status reporting is optional, so teardown cannot wait indefinitely for it. Deliver buffered final output in order before retiring the model, within a bounded drain/settlement policy; mark truncation if a forced close prevents that. See [RFC 4254 sections 5.3 and 6.9-6.10](https://www.rfc-editor.org/rfc/rfc4254).
+
+The current [SSH child adapter](frankenterm/ssh/src/pty.rs) substitutes exit code 1 when its local status receiver closes, and the selected ssh2 branch of [ChannelWrap::send_signal](frankenterm/ssh/src/channelwrap.rs) returns success without sending a signal. The mobile adapter must expose truthful typed completion and unsupported-signal results rather than treating those convenience return values as remote evidence. Even a transmitted SSH signal is not proof that the remote process stopped. A terminal Ctrl-C byte, an SSH signal request, and channel closure have different semantics and must remain distinct actions.
+
+A clean exit keeps the final terminal inspectable and offers **New Session**. Auto-connect maintains an authorized connection policy; it does not automatically respawn a shell or repeat its startup command after normal exit. Hiding a direct-SSH viewport retains a live channel and parser if the user chooses to keep the session; ending that channel has the weaker survival semantics described in section 20.2.
 
 ---
 
@@ -488,13 +500,14 @@ The baseline resolver also has direct ProxyJump and two-phase matching limitatio
 | Source setting | Export rule and mobile behavior |
 |---|---|
 | HostName, Port, User | Typed endpoint/account fields; preserve display alias separately. |
-| IdentityFile | Resolve on the Mac; export public identity plus credential reference, never an unusable local path. |
+| IdentityFile, CertificateFile, IdentitiesOnly | Resolve ordered public identity/certificate candidates and the permitted method policy on the Mac; export typed references, never unusable local paths or every identity in an agent. |
 | IdentityAgent and agent-only identities | Report the identity's actual exportability; offer Via Mac or phone enrollment. |
 | Include | Resolve within bounded file/depth limits on the Mac; retain diagnostics, not include paths to execute on iOS. |
 | Match, canonical/final passes | Export verified resolved values or a clear incomplete-resolution result. |
 | ProxyJump | Explicit ordered hop graph, with separate endpoint, identity, and host verification at every hop. |
 | ProxyCommand or executable override | No arbitrary execution on iOS; map only a deliberately supported structured adapter or offer Via Mac. |
-| HostKeyAlias, known hosts, host CAs | Preserve the effective trust identity and qualification requirements; do not reduce trust to a display label. |
+| HostKeyAlias, known hosts, host CAs, revocation sources | Preserve effective matching context, positive trust, applicable revoked keys/CAs, and mandatory revocation requirements. An unavailable or unsupported required revocation source blocks direct access. |
+| HostKeyAlgorithms, PubkeyAcceptedAlgorithms, KexAlgorithms, Ciphers, MACs, minimum key sizes | Preserve explicit constraints through a qualified mobile policy or report them as unsupported. Library defaults cannot silently replace a stricter required policy. |
 | SetEnv and SendEnv | Export an explicit user-reviewed allowlist; do not copy the Mac environment wholesale. |
 | RemoteCommand and default program | Retain as a separate session-creation preference with typed supported behavior; never execute during import or discovery. |
 | LocalForward, RemoteForward, DynamicForward | Report unsupported in the first terminal slice unless a separately qualified forwarding feature exists; never silently open listeners. |
@@ -607,7 +620,8 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
         "host": "build.example.invalid",
         "port": 22,
         "user": "operator",
-        "credential_ref": "credential-main",
+        "credential_refs": ["credential-main"],
+        "authentication_methods": ["publickey"],
         "host_trust_ref": "trust-build",
         "jump_routes": []
       },
@@ -617,7 +631,8 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
         "host": "gpu.example.invalid",
         "port": 22,
         "user": "operator",
-        "credential_ref": "credential-main",
+        "credential_refs": ["credential-main"],
+        "authentication_methods": ["publickey"],
         "host_trust_ref": "trust-gpu",
         "jump_routes": [],
         "attach_policy": "existing_only"
@@ -638,6 +653,7 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
         "host": "build.example.invalid",
         "port": 22,
         "claimed_source": "mac_known_hosts",
+        "revoked_keys": [],
         "pins": [
           {
             "algorithm": "ssh-ed25519",
@@ -650,6 +666,7 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
         "host": "gpu.example.invalid",
         "port": 22,
         "claimed_source": "mac_known_hosts",
+        "revoked_keys": [],
         "pins": [
           {
             "algorithm": "ssh-ed25519",
@@ -707,9 +724,13 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
 
 Production IDs should be sufficiently random and stable, rather than derived from names or array offsets. The illustrative format admits these opaque fixture IDs so examples can be validated by the actual parser.
 
+A route's `credential_refs` is an ordered, duplicate-free candidate list, initially capped at eight; `authentication_methods` is the ordered allowlist drawn from `publickey`, `keyboard-interactive`, and `password`. The fixture deliberately permits only public-key authentication. Empty or unsupported authentication policies cannot become ready through backend defaults. A public-key policy requires a usable listed identity; password/MFA prompts require their separately allowed methods. Optional certificate bindings must name the same subject key and a qualified certificate policy. Listed candidates do not authorize trying unrelated Keychain or agent identities.
+
+Host-trust `revoked_keys` entries use the same algorithm/fingerprint representation as `pins`, but deny matching host or CA keys before positive trust is evaluated. The fixture has no revocations. This small exact-key representation does not claim to encode a general OpenSSH KRL or certificate-serial policy: an applicable mandatory policy outside the version's supported representation leaves that direct route unavailable, as specified in section 10.6.
+
 ### 9.2 Validation and references
 
-Proposed initial limits are 2 MiB per document, nesting depth twelve, 128 machines, 256 routes, 64 groups, 256 credential records, 512 pins, and 128 themes. Limit jump chains to three hops in the initial transport profile. These are admission caps, not allocations or launch-time connection counts.
+Proposed initial limits are 2 MiB per document, nesting depth twelve, 128 machines, 256 routes, 64 groups, 256 credential records, 512 total positive/revoked key entries, and 128 themes. Limit jump chains to three hops in the initial transport profile. These are admission caps, not allocations or launch-time connection counts.
 
 Reject duplicate JSON keys, duplicate entity IDs, dangling references, duplicate group-order entries, jump cycles, invalid ports, malformed fingerprints, overflowing numeric values, and excess strings. Every palette contains exactly sixteen ANSI colors. Define colors as sRGB hex RGB or RGBA values with explicit alpha semantics; validate and normalize before constructing the application object graph.
 
@@ -717,7 +738,9 @@ Normalize endpoint syntax deliberately, including IPv6 and internationalized hos
 
 Define one schema and shared fixtures for exporter and importer, with explicit migration rules. The workspace schema, Swift/Rust ABI, terminal feature profile, and mux codec have independent versions.
 
-Unknown required capabilities prevent activation. Optional extensions live in a bounded namespaced object with an explicit preservation policy. Unknown major versions reject safely. A `claimed_source` field is descriptive data, not authentication of its own pins.
+Unknown workspace-level required capabilities prevent workspace activation; an understood route's unmet required capability blocks that route while preserving the rest of the workspace. Unknown major versions reject safely. Core records have explicit allowed fields and reject unexpected or secret-bearing fields. `private_material: not_included` is a serializer/parser invariant, not permission to preserve an arbitrary private-key property elsewhere in the record.
+
+Optional extensions live in a bounded namespaced object. Preserve/re-export only registered, typed, validated public-data extensions; discard unknown optional payloads with a content-free diagnostic rather than copying opaque bytes into the configuration store. An unknown required extension remains unavailable. A `claimed_source` field is descriptive data, not authentication of its own pins.
 
 ### 9.3 Reimport, merge, and readiness
 
@@ -739,7 +762,7 @@ Keychain and the workspace database are not participants in one shared transacti
 
 1. Validate the complete candidate in bounded memory.
 2. Durably record a transaction ID, intended revision, and credential-reference changes without secrets.
-3. Stage newly transferred credentials under transaction-scoped Keychain identifiers; leave reused items untouched.
+3. Validate newly transferred material and derive its public identity against the selected credential/certificate binding, then stage it under transaction-scoped Keychain identifiers; leave reused items untouched.
 4. Verify that every route marked ready resolves to actual material and locally accepted trust.
 5. Atomically publish an immutable workspace revision and its reference mapping.
 6. Mark the journal committed and retire owned staging metadata.
@@ -792,15 +815,21 @@ Imported OpenSSH keys cannot become Secure Enclave keys while preserving identit
 
 The native broker owns Keychain access, local authentication context, and bounded signing grants. Keep private bytes out of UserDefaults, manifests, clipboard, terminal state, logs, and crash metadata. Minimize copies and zero/release owned buffers where the actual runtime permits it; do not promise universal forensic erasure. User-selected source files remain under the user's file-management control.
 
+Credential transfer/import has its own admission profile; the workspace's 2 MiB JSON cap does not bound it. Limit encrypted and decoded bytes, key count, public/private component sizes, RSA sizes, certificate bytes/count, and KDF salt/work parameters before expensive allocation or cryptography. Start with one key per transfer record and a bounded sequential transfer queue; qualify concrete byte and KDF ceilings on the minimum supported device before advertising a container. [OpenSSH's private-key format](https://github.com/openssh/openssh-portable/blob/26b1363c7cbf5d01c730f45fc0b4abc5686beaf7/PROTOCOL.key) carries its own bcrypt rounds parameter, so a small file can request expensive work. Reject an excessive factor before entering a noncancellable native KDF; a timer around that call cannot cancel it.
+
+After decryption, validate the complete container and component consistency, derive the canonical public identity from the actual private material, and compare it with the selected credential reference and any certificate's subject key. Reject mismatches before Keychain staging or route readiness. Public-key offer, private signing, and the recorded credential identity must agree; supplied public labels or fingerprints are not proof. Errors and progress events remain content-free.
+
 ### 10.4 Preferred pairing transport
 
 Use a short-lived Mac pairing service with **TLS 1.3 and certificate or SPKI pinning conveyed by a QR code**. Discovery identifies a candidate endpoint; the authenticated pairing ceremony establishes authority.
 
 The QR includes a protocol version, session ID, endpoint policy, precisely encoded pin, high-entropy single-use challenge, and expiration. Start with a five-minute invitation lifetime. It contains no SSH private key. Verify the pin before sending the challenge, follow no redirects, and bind every accepted message to that pairing session.
 
-The Mac confirms the intended phone through its device identity and a comparison code or equivalent verification before authorizing selected credential transfer. A photographed QR alone cannot silently approve exporting private keys. Rate-limit attempts and atomically bind the redeemed invitation to one recipient.
+The phone generates a device-bound client key and proves possession within the authenticated pairing session. The Mac confirms the intended phone using a comparison value bound to the actual session and canonical device public identity before authorizing selected credential transfer. A device name, claimed ID, or photographed QR cannot substitute for this proof and confirmation. Rate-limit attempts and atomically bind the redeemed invitation to one recipient; only then register its approved workspace/origin scope.
 
-Separate invitation redemption from transfer completion. If a connection drops afterward, authenticated resumption may continue the same bounded transaction for that recipient; it must not redeem the invitation for another phone.
+Separate invitation redemption from transfer completion. If a connection drops afterward, authenticated resumption may continue the same bounded transaction only after fresh proof of the bound recipient's identity and current authorization; a matching transaction ID is insufficient. It must not redeem the invitation for another phone.
+
+Disable TLS early data for pairing, secret transfer, enrollment, and terminal/control operations. Complete the authenticated handshake before accepting application messages. TLS client authentication and application authorization are explicit requirements; server authentication alone supplies neither. The [TLS 1.3 specification](https://www.rfc-editor.org/rfc/rfc9846) describes the separate client-authentication and early-data replay constraints. Application operation IDs and effect reconciliation remain necessary after the handshake.
 
 Bind transfer records to protocol/session/source/recipient/workspace/credential IDs and payload digest inside the authenticated stream. A hash alone proves neither sender nor recipient. Version one transfers selected secrets only through this live authenticated channel. Do not invent an offline encryption format by adding an undocumented password field to JSON.
 
@@ -809,6 +838,12 @@ Bind transfer records to protocol/session/source/recipient/workspace/credential 
 The underlying [libssh2 signing callback](https://libssh2.org/libssh2_userauth_publickey.html) does not imply that the current Rust wrapper already exposes a general native signer. Implement and qualify the narrow boundary described in section 7.
 
 Signing and keyboard-interactive callbacks are synchronous library contracts. Preauthorize where possible and use an isolated bounded authentication worker. Do not block MainActor, an asupersync executor, or a lock required by the prompt completion. Cancellation must release every waiter and retire the exact attempt.
+
+Implement a bounded mobile authentication controller over the selected backend. The baseline [ssh2 authentication path](frankenterm/ssh/src/auth.rs) asks for a passphrase after any initial file-key authentication error, retries its method loop without an explicit overall budget, and skips the agent wholesale for `IdentitiesOnly=yes`. These are adaptation requirements, not evidence of complete OpenSSH equivalence or a ready native prompt controller.
+
+Distinguish local container parsing/decryption, signing denial, unsupported algorithms, server rejection, partial authentication success, additional MFA, transport failure, and cancellation. A rejected unencrypted key must not produce a misleading passphrase prompt. A first factor accepted by the server is not a completed login; verify the backend's authenticated state and follow permitted server-indicated continuation, as described by [SSH authentication](https://www.rfc-editor.org/rfc/rfc4252).
+
+Bound key offers, repeated candidates, interactive rounds, prompt count/bytes, and total attempt lifetime. Display locally trusted machine/hop identity separately from bounded server-provided instructions. Do not enumerate the entire phone Keychain, repeat a failed key indefinitely, or fall back to password/MFA when the imported method policy disallows it. Preserve selected agent-backed identities and candidate order where qualified; a Mac-only agent path remains Via Mac or phone enrollment. A route whose required method/certificate policy cannot be represented stays unavailable until a reviewed usable mapping exists.
 
 Coalesce unlock preparation only for the same identity when its real access policy permits. Twenty hosts must not launch twenty simultaneous biometric sheets, but the app cannot promise one prompt if selected policies require several.
 
@@ -820,15 +855,33 @@ Accept imported pins through authenticated Mac pairing or explicit local review.
 
 Host certificates require full CA, principal/hostname, validity, certificate-type, and critical-option handling. An API that parses certificate syntax has not necessarily performed those checks.
 
-Trust changes are separate from cosmetic merge policy. A rename, theme change, route reorder, or repeated import cannot clear a rejection, revive a revoked identity, or bypass an altered host key.
+Export applicable negative trust as well as pins and CAs. OpenSSH's [known-hosts format](https://man.openbsd.org/sshd#SSH_KNOWN_HOSTS_FILE_FORMAT) rejects revoked host and CA keys, and [RevokedHostKeys](https://man.openbsd.org/ssh_config#RevokedHostKeys) can require a key list or KRL and refuses authentication if its configured file cannot be read. A matching positive pin cannot override a revocation. Resolve hashed entries and host-pattern/alias context for the concrete exported endpoint on the Mac; exporting only positive matches can reverse the Mac's decision.
+
+Carry supported revocation constraints with authenticated provenance and revision. If a mandatory revocation source or certificate policy is unavailable, unrepresentable, or unsupported by the mobile backend, preserve the machine as blocked for direct access and explain the requirement. Do not silently convert it to a pin-only route. The current [SSH host verifier](frankenterm/ssh/src/host.rs) is a source to adapt, not proof that all OpenSSH trust policies already work.
+
+Trust changes are separate from cosmetic merge policy. A rename, theme change, route reorder, or repeated import cannot clear a rejection, revive a revoked identity, or bypass an altered host key. Explicit algorithm restrictions remain part of the route's security policy; a connection succeeding under weaker library defaults is not faithful export.
 
 ### 10.7 Revocation has several scopes
 
-Revoking a Mac pairing stops that device's Via Mac authorization and future transfers. Removing a local Keychain item stops that phone's use of the item. Revoking a distinct enrolled phone public key or certificate stops its corresponding remote authentication.
+Distinguish future authentication from already established access. Removing a Keychain item prevents later retrieval but does not by itself erase unlocked material, retire a signer grant, or close an authenticated SSH transport. Local credential revocation advances its authorization generation, cancels pending authentication, retires owned unlock/signing grants, disables affected reconnect work, and closes affected live client transports under the selected scope. Previously submitted input keeps its real disposition.
+
+Revoking a Mac pairing removes that device's current registry authorization, rejects further operations, closes its active Via Mac connections, and prevents later transfers or TLS resumption from restoring the old scope. Other clients and persistent mux panes remain intact.
+
+Removing a distinct enrolled phone public key or revoking its certificate prevents future authentication where each host enforces the change. It does not itself terminate an established SSH connection or its remote processes. Report remote authentication revocation and any separately requested live-session termination as different results.
 
 A copied Mac private key has the same public identity as the original. Servers cannot revoke only the phone's copy by fingerprint; rotating/removing that shared identity affects all copies. Prefer an independently enrolled identity when per-phone revocation matters.
 
 Removing a workspace is not remote credential revocation. Present these operations with their actual scope, preserve unrelated keys, and report per-host revocation results and uncertainty. No global success label may hide a host that has not confirmed the change.
+
+### 10.8 Returning to the paired Mac
+
+The one-use invitation is a bootstrap mechanism, not tomorrow's terminal credential. Prefer a dedicated TLS 1.3 Via Mac endpoint with client-certificate authentication and a Mac-owned per-device authorization registry. During pairing, the Mac issues or pins a certificate for the phone-generated public key and binds that canonical identity to the approved workspace, origins, and operation scopes. This device identity is separate from any SSH key copied or enrolled for direct host access.
+
+This scoped gateway is new implementation work, distinct from the direct-mux SSH stdio endpoint. Reuse the bounded mux framing and exact-pane/effect contracts behind its authorization boundary. Filter discovery, history, images, events, and other read results before disclosure; enforce mutation scopes and controller fences where effects enter the mux. Reject generic signing, arbitrary destination tunneling, and unrestricted proxy access outside the granted scope.
+
+Check the current device-registry entry and authorization generation on connection/resumption and before each scoped operation. Certificate possession is insufficient after revocation. Bind renewals to the current approved device key and scope; bind planned server-pin rotation to authenticated existing authority with a bounded overlap. A lost device key, unexpected pin, or unverified endpoint identity requires deliberate re-pairing. Discovery may update an address candidate, but cannot replace its trust identity.
+
+Enable persistent Mac access through an explicit Mac setting with the listening interface/port and device list visible. The phone explains when the Mac must be awake and reachable. Pairing revocation tears down that device's gateway access while preserving the Mac's actual terminals. Qualify this endpoint and its scoped reconnect before advertising the Mac-bound-key journey; the M0 direct-SSH terminal does not depend on it.
 
 ---
 
@@ -922,7 +975,7 @@ Viewing defaults to observer behavior. The phone can fit or pan the remote grid 
 
 Retain enough source authority to settle admitted input across a local focus change. Do not revoke a lease first and silently abandon its pending ledger. If authority actually expires before server admission, retain the resulting no-effect rejection or uncertainty accurately.
 
-Closing a local view, disconnecting a client, terminating a remote PTY, and deleting a saved workspace are different operations. Only the deliberate remote mutation can terminate the remote pane.
+For persistent mux sessions, closing a local view or detaching a client does not request remote PTY termination; only an explicitly authorized terminate operation does. Deleting a saved workspace is a separate local operation. Direct SSH has different close/disconnect semantics, including possible shell termination, as specified in section 20.2.
 
 ### 11.7 Synchronize state before enabling interaction
 
@@ -1441,13 +1494,15 @@ A compact activity inbox can retain bounded references to significant events. Op
 
 The first release needs a focused set of actions: connect/reconnect, inspect route, open a shell where supported, select an existing pane, take/release control, search, copy, paste, rename locally, pin, and close the local view.
 
-Distinguish three operations in both terminology and implementation:
+Use mode-specific terminology and effects:
 
-| User intent | Operation |
-|---|---|
-| “Remove this from my phone's current layout” | Close the local view; preserve the remote process. |
-| “Disconnect my phone” | End this client's subscription/transport as appropriate; preserve remotely owned sessions. |
-| “Stop that process or close its PTY” | A separate, explicit remote mutation against the exact current pane with applicable authority. |
+| User intent | Persistent mux | Direct SSH |
+|---|---|---|
+| Remove a terminal from the visible layout | Close the local view/subscription; leave its remote PTY intact. | Hide the viewport while retaining the channel, parser, and bounded work, or explicitly end the SSH session. Hiding is not channel closure. |
+| Disconnect the phone | Detach this client without requesting remote PTY termination. | End the affected channels/transport and explain that attached remote shells or programs may end; there is no process-survival promise. |
+| Stop a remote program or close its PTY | Send an authorized mutation against the exact live registration and report its actual result. | Use a separately qualified signal/channel action against the exact session. Unsupported signals return unsupported; a local API return does not prove the program stopped. |
+
+Hidden direct-SSH sessions still require parser state, reply handling, and byte-stream processing. Count them against live-session and memory limits even without a viewport. Reject further session creation when that reservation cannot be made; never evict a live raw-SSH parser as though it were a reconstructible mux preview. The session list makes retained hidden sessions reachable and lets the user deliberately end them.
 
 A future command composer may prepare a command locally and show its target before submission. It must not silently turn arbitrary selected text into a shell command or append Enter to a paste. Multicast input is a later, opt-in feature with a visible target set, per-target readiness and authority, independent delivery results, and no claim of atomic execution across machines.
 
@@ -1625,6 +1680,11 @@ The highest-value tests target interactions that a happy-path demo will miss:
 11. **Stopped SSH reader, terminal queries, and paste.** All internal queues remain bounded, replies stay with their session, no other stream interleaves inside paste delimiters, and the local focus barrier permits navigation without waiting for downstream flush.
 12. **Uninterrupted output and unfinished control strings.** ASCII floods, split Unicode/graphemes, and long unterminated OSC/DCS preserve semantic equivalence while focused input, other routes, and rendering make measurable progress.
 13. **Two scenes, pointer capture, and feature probes.** A scene blur does not release another scene's mouse state; trackpad scrolling does not navigate panes; drag/resize retains correct coordinates; actual device/query responses match the direct-SSH feature profile.
+14. **Normal exit, EOF, and unsupported signals.** Preserve trailing output, distinguish missing status from a reported code, bound close settlement, and do not respawn on clean exit. The ssh2 signal stub cannot produce a false process-stopped result; hiding a raw session still consumes its parser reservation.
+15. **Revoke while already connected.** A live channel, an unlocked signer grant, a pending prompt, and a scheduled reconnect all retire under the selected local scope. Via Mac rejects the revoked device even on resumed TLS; persistent remote processes and independently verified remote revocation results remain distinct.
+16. **Positive pin plus revoked identity.** Applicable negative trust wins; a missing mandatory KRL source or unsupported algorithm policy cannot become a ready pin-only route. Reimport during a prompt invalidates the old attempt's configuration authority.
+17. **Authentication and key-import edge cases.** Wrong unencrypted keys, a correct later candidate, key-plus-MFA continuation, unsupported methods, excessive KDF parameters, mismatched private/public/certificate identity, and oversized transfer fail or continue under the documented bounded states without misleading prompts.
+18. **Return to Mac after the invitation expires.** The approved device proves possession of its durable key and receives only its current scope. A copied device name/manifest, replayed early-data operation, revoked certificate, or unverified rotated pin cannot obtain discovery or input authority.
 
 These traces should use synthetic content and controlled hosts, with host-side effect observation where needed. Tests that merely restate an implementation's current output cannot establish these properties.
 
@@ -1683,7 +1743,7 @@ Reuse actual macOS consumer code as well as the renderer crate. [metal_window.rs
 
 The next slice should use a small representative group: one directly reachable machine, one machine reached through the intended jump route, and one temporarily unavailable machine. Give them visibly distinct palettes and more than one pane or session each.
 
-IOS-B implements the exporter, import transaction, portability report, host-trust projection, and identity mapping as one coherent feature. Reimport must update the intended workspace without duplicating machines, overwriting unrelated local preferences, or activating a changed route before the user can inspect it.
+IOS-B implements the exporter, import transaction, portability report, positive/negative host-trust projection, ordered authentication policy, and identity mapping as one coherent feature. Reimport must update the intended workspace without duplicating machines, overwriting unrelated local preferences, or activating a changed route before the user can inspect it. Enable each key/route family only after its own transport qualification; the Mac-bound identity journey additionally requires section 10.8's durable device registry and scoped gateway, including a successful return after invitation expiry.
 
 IOS-C adds the stable machine and pane rings, overview, remembered focus, and native gesture arbitration. It must distinguish a visual preview from a committed input destination. A pane closing, an authentication prompt appearing, or a machine reconnecting during a swipe cannot change the destination of already admitted input.
 
@@ -1785,7 +1845,7 @@ The plan needs preferred choices and experiments capable of disproving them. Unb
 
 | Decision | Preferred design | Experiment or failure that changes the decision |
 |---|---|---|
-| SSH implementation | Qualify one existing libssh2-based backend through `frankenterm-ssh`. | Real-device linking, key authentication, external signing, keyboard-interactive handling, nested hops, or cancellation cannot satisfy the contract without excessive or unsafe adaptation. |
+| SSH implementation | Qualify one existing libssh2-based backend through `frankenterm-ssh`. | M0 proves one real direct terminal; early signer/MFA/hop experiments may change the backend or route decision. A failed advanced feature cannot be advertised, but does not erase an earlier valid one-host result. |
 | SSH alternative | Evaluate a SwiftNIO SSH adapter after a concrete failure of the preferred path. | Its algorithm, key-import, prompt, certificate, signer, or event-loop support fails the same acceptance matrix. Do not accept a silent capability reduction. |
 | Shared core | Expose the smallest useful terminal/codec/client boundary. | Linking still drags desktop UI, local PTY ownership, Lua, or unrelated control-plane dependencies into the phone. Refactor the boundary rather than copying the protocol. |
 | Rendering | Adapt existing Metal data/shaders and shared semantic conversion. | An iOS lifecycle/resource constraint cannot be represented safely by current ownership. Add a platform adapter or narrow shared change. |
@@ -1862,6 +1922,7 @@ Repository statements and Beads statuses in this document refer to commit `fb570
 | [Render mirror](frankenterm/mux/src/render_mirror.rs) | Row capture, coordinates, styles, and snapshot coherence boundaries. |
 | [SSH domains](frankenterm/config/src/ssh.rs) and [SSH resolver](frankenterm/ssh/src/config.rs) | Mac export input, existing identity/route behavior, and portability diagnostics. |
 | [SSH dependencies](frankenterm/ssh/Cargo.toml) and [client](frankenterm/client/src/client.rs) | Real native transport dependencies, proxy grammar, and current reconnect behavior. |
+| [SSH authentication](frankenterm/ssh/src/auth.rs), [host verification](frankenterm/ssh/src/host.rs), [channel operations](frankenterm/ssh/src/channelwrap.rs), and [child adapter](frankenterm/ssh/src/pty.rs) | Actual prompt/error behavior, host-policy coverage, signal support, and provenance of exit results. |
 | [Codec history](docs/codec-versions.md) and [codec](frankenterm/codec) | Assigned wire contracts, version boundaries, effect certainty, and capability limits. |
 | [Persistence architecture](docs/session-persistence-architecture.md) and [remote setup](docs/remote-setup-spec.md) | Separate attachment, snapshots, provisioning, and stronger remote recovery. |
 | [Core runtime surface](crates/frankenterm-core/src/runtime_async.rs) | Canonical shared Rust async ownership. |
@@ -1882,7 +1943,9 @@ These references establish platform/API constraints. Proposed product policies, 
 | [Physical keyboard input](https://developer.apple.com/documentation/uikit/handling-key-presses-made-on-a-physical-keyboard) and [keyboard layout guide](https://developer.apple.com/documentation/uikit/adjusting-your-layout-with-keyboard-layout-guide) | Key events and actual keyboard/scene geometry. |
 | [Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave) and [passcode-bound Keychain accessibility](https://developer.apple.com/documentation/security/ksecattraccessiblewhenpasscodesetthisdeviceonly) | Device-generated identity and imported-key storage are distinct capabilities. |
 | [Local network privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy) and [background execution](https://developer.apple.com/forums/thread/685525) | Explicit LAN access and no general indefinite background SSH guarantee. |
-| [SSH connection protocol](https://www.rfc-editor.org/rfc/rfc4254) and [OpenSSH configuration](https://man.openbsd.org/ssh_config) | PTY/channel semantics, SSH options, and executable configuration conditions. |
+| [SSH connection protocol](https://www.rfc-editor.org/rfc/rfc4254), [SSH authentication](https://www.rfc-editor.org/rfc/rfc4252), and [OpenSSH configuration](https://man.openbsd.org/ssh_config) | PTY/channel/exit semantics, authentication continuation, SSH options, and executable configuration conditions. |
+| [TLS 1.3](https://www.rfc-editor.org/rfc/rfc9846) | Explicit client authentication, completed handshakes, resumption, and early-data replay constraints for pairing and Via Mac. |
+| [OpenSSH known-hosts rules](https://man.openbsd.org/sshd#SSH_KNOWN_HOSTS_FILE_FORMAT) and [private-key format](https://github.com/openssh/openssh-portable/blob/26b1363c7cbf5d01c730f45fc0b4abc5686beaf7/PROTOCOL.key) | Revoked trust precedence and independent key-container/KDF admission limits. |
 | [libssh2 API](https://libssh2.org/docs.html) and [public-key callback](https://libssh2.org/libssh2_userauth_publickey.html) | Existing backend qualification and the native signer boundary. |
 | [SwiftNIO SSH source](https://github.com/apple/swift-nio-ssh) | Contingency transport implementation; qualify its actual feature matrix before selection. |
 | [Rust iOS targets](https://doc.rust-lang.org/rustc/platform-support/apple-ios.html) | Device/simulator target and SDK requirements. |
