@@ -10,11 +10,13 @@ import Glibc
 public enum NativeSSHError: Error, Equatable, Sendable {
     case invalidInput, busy, closed, timedOut, invalidChallenge
     case native(Int32)
+    case resolution(Int32), connection(Int32)
 }
 
 /// Public evidence from this exact completed exchange, not a trust decision.
 public struct NativeSSHPeer: Sendable, Equatable {
     public let transportID: UUID
+    public let endpoint: NativeSSHEndpoint?
     public let hostKey: Data
     public let keyExchange: String, hostSignature: String
     public let outboundCipher: String, inboundCipher: String
@@ -115,6 +117,7 @@ public struct NativeSSHServiceEvent: Sendable {
 /// finite monotonic deadlines. The app retains this owner while the pane is hidden.
 public actor NativeSSHSession {
     public nonisolated let transportID: UUID
+    public nonisolated let endpoint: NativeSSHEndpoint?
     private enum Phase { case fresh, authenticating, authenticated, opening, live, closed }
     private let native: NativeHandle
     private var phase = Phase.fresh
@@ -129,11 +132,12 @@ public actor NativeSSHSession {
 
     /// On success consumes the already-connected descriptor. On failure the caller
     /// must close it. DNS/connect are deliberately owned by the endpoint connector.
-    public init(connectedDescriptor: Int32, transportID: UUID = UUID(), maximumNativeBytes: Int = 2 * 1024 * 1024) throws {
+    public init(connectedDescriptor: Int32, transportID: UUID = UUID(), endpoint: NativeSSHEndpoint? = nil,
+                maximumNativeBytes: Int = 2 * 1024 * 1024) throws {
         var handle: OpaquePointer?
         let result = ftssh_create(connectedDescriptor, maximumNativeBytes, &handle)
         guard result == FTSSH_OK, let handle else { throw NativeSSHError.native(result) }
-        native = NativeHandle(handle); self.transportID = transportID
+        native = NativeHandle(handle); self.transportID = transportID; self.endpoint = endpoint
     }
 
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
@@ -373,7 +377,7 @@ public actor NativeSSHSession {
             try requireOK(ftssh_copy_method(native.pointer, id, &bytes, bytes.count))
             return String(decoding: bytes.prefix(while: { $0 != 0 }).map(UInt8.init(bitPattern:)), as: UTF8.self)
         }
-        return try .init(transportID: transportID, hostKey: key,
+        return try .init(transportID: transportID, endpoint: endpoint, hostKey: key,
             keyExchange: method(0), hostSignature: method(1), outboundCipher: method(2), inboundCipher: method(3),
             outboundMAC: method(4), inboundMAC: method(5), outboundCompression: method(6), inboundCompression: method(7))
     }
@@ -416,7 +420,7 @@ private final class NativeHandle: @unchecked Sendable {
 /// One finite readiness registration owns a duplicated descriptor until *all*
 /// dispatch cancellation handlers have run. Closing the session cannot cause an
 /// event on a newly reused descriptor. State and callbacks are queue-confined.
-private final class SocketReadiness: @unchecked Sendable {
+final class SocketReadiness: @unchecked Sendable {
     private static let queue = DispatchQueue(label: "org.frankenterm.ssh.readiness")
     private let descriptor: Int32, directions: Int32, deadline: ContinuousClock.Instant
     private var sources: [any DispatchSourceProtocol] = []

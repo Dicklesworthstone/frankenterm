@@ -19,8 +19,9 @@ artifacts remain subject to DSR and development Rust proof remains subject to RC
 
 A successful `ftssh_create` consumes exactly one already-connected stream socket;
 a failed creation leaves that descriptor with its caller. The caller serializes
-all handle calls and owns DNS, connection deadlines, readiness, cancellation and
-workspace authority. The driver never uses a filesystem key, an agent, a password,
+all handle calls. The Swift owners below provide DNS, TCP connection deadlines,
+readiness and cancellation; the application retains workspace authority. The
+driver never uses a filesystem key, an agent, a password,
 a remote exec command, or a global SIGPIPE handler. `ftssh_close` aborts this one
 owned connection without relying on a remote goodbye; it does not promise remote
 process survival. The C header and implementation document the native exception.
@@ -116,17 +117,56 @@ Socket waits use DispatchSource readiness and one timer, not periodic polling.
 Each registration owns a duplicated fd until every cancellation handler settles,
 preventing stale readiness callbacks from targeting a reused descriptor. One
 shared readiness queue serves all sessions. Concurrent close calls await the same
-cleanup. The application still owns DNS/TCP establishment, foreground policy,
+cleanup. The application still owns foreground/network permission, route policy,
 keepalive/reconnect decisions, durable uncertainty markers, and terminal binding.
+
+## Hostname and dual-stack connection establishment
+
+`NativeSSHConnector.connect(to:)` accepts a validated canonical ASCII hostname or
+unbracketed IPv4/IPv6 literal and a port, resolves it locally, and returns an
+unauthenticated `NativeSSHSession`. The original immutable endpoint accompanies
+the actual host key and negotiated methods; falling back to a different IP must
+not replace the host/alias identity used by the application's trust policy.
+Creating TCP does not offer a credential, start SSH or create a remote shell.
+The caller must explicitly authorize network use and respect Connect Later and
+strict offline restoration before invoking the connector.
+
+The resolver has four process-wide worker slots and no unbounded waiting queue.
+POSIX `getaddrinfo` cannot be cancelled. Cancellation/deadline resumes its caller
+promptly but retains the worker reservation until native work finishes; late
+results are freed and never used to connect. At most eight copied addresses are
+retained from at most 64 inspected results. These are application-state bounds,
+not a claim to bound allocations inside the OS resolver.
+
+IPv6/IPv4 candidates are interleaved while preserving resolver order within each
+family. At most two connection attempts race, with a 250 ms initial stagger,
+five-second per-address limit and one shared total deadline. Connecting sockets
+have a separate 32-slot process-wide cap. Every candidate owns its nonblocking,
+close-on-exec descriptor; success checks SO_ERROR rather than assuming writability
+means connection. Losers are cancelled and joined, and ownership transfers only
+after native session creation succeeds. Failure and cancellation leave no orphan
+socket and cannot start authentication through a stale result.
+
+The connector is deliberately not an SSH-config evaluator or a replacement for
+the workspace's IDNA/trust canonicalization. It does not implement proxy-command
+execution, jump hosts, automatic reconnect, permission UI or session routing.
+Those remain separate features with explicit authority and continuity contracts.
+
+## Combined Swift validation
 
 Ten Swift XCTest cases pass with warnings-as-errors, including 64 repeated
 concurrent-close cycles with fd accounting, stalled handshakes, cancellation,
 deadlines, phase/admission bounds, retained closed-session handle release and
-strict typed-challenge truncation checks.
-Five additional integration tests drive the production Swift actor and C adapter
+strict typed-challenge truncation checks. Nine connector tests additionally cover
+numeric IPv4, IPv6, hostname fallback, refused sockets, input/deadline validation,
+pre-cancelled and concurrent cancelled work, budget recovery and losing-descriptor
+cleanup. All nineteen tests pass under Swift 6.2.1 with warnings-as-errors.
+Six additional integration tests drive the production Swift actor and C adapter
 against the independent server: four signing families, exact Unicode/binary data,
 resize, wake-up, idle timeout followed by working input, rejected peer policy,
 late cancelled/expired signatures, and revocation before sign or shell creation.
+The hostname-path case resolves localhost, establishes TCP itself, then performs
+real authentication, PTY/shell protocol requests, resize and exact byte transfer.
 These are separate from the nine native-driver scenarios above.
 
 ```sh
@@ -135,6 +175,7 @@ swiftc -swift-version 6 -parse-as-library -warnings-as-errors \
   -I .build/debug/Modules -I .build/debug/CFrankenTermSSH.build \
   -Xcc -I"$PWD/Sources/CFrankenTermSSH/include" Tests/Interop/SessionProbe.swift \
   .build/debug/FrankenTermSSH.build/NativeSSHSession.swift.o \
+  .build/debug/FrankenTermSSH.build/NativeSSHConnector.swift.o \
   .build/debug/CFrankenTermSSH.build/FrankenTermSSH.c.o \
   -lssh2 -o /tmp/frankenterm-ssh-session-probe
 python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so /tmp/frankenterm-ssh-session-probe

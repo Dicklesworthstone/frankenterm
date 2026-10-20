@@ -22,6 +22,9 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
     func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity {
         guard peer.hostKey == host, peer.outboundCompression == "none", peer.inboundCompression == "none",
               peer.outboundMAC.hasSuffix("-etm@openssh.com"), peer.inboundMAC.hasSuffix("-etm@openssh.com") else { throw ProbeFailure.denied }
+        if mode == "connect" {
+            guard peer.endpoint?.host == "localhost", peer.endpoint?.port != nil else { throw ProbeFailure.invalid }
+        }
         if mode == "rejectHost" { throw ProbeFailure.denied }
         if mode == "cancelPeer" { await session?.close() }
         return identity
@@ -66,18 +69,22 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
     static func main() async {
         do {
             let args = CommandLine.arguments
-            guard args.count == 5, let fd = Int32(args[1]), let host = Data(base64Encoded: args[2]),
+            guard args.count == 5, let endpoint = Int32(args[1]), let host = Data(base64Encoded: args[2]),
                   let publicKey = Data(base64Encoded: args[3]) else { throw ProbeFailure.invalid }
             let mode = args[4]
-            let session = try NativeSSHSession(connectedDescriptor: fd)
+            let session: NativeSSHSession
+            if mode == "connect" {
+                guard endpoint > 0, endpoint <= 65535 else { throw ProbeFailure.invalid }
+                session = try await NativeSSHConnector.connect(to: NativeSSHEndpoint(host: "localhost", port: UInt16(endpoint)), timeout: .seconds(5))
+            } else { session = try NativeSSHSession(connectedDescriptor: endpoint) }
             let authority = try Authority(publicKey: publicKey, host: host, mode: mode)
             authority.session = session
             do {
                 _ = try await session.authenticate(using: authority, timeout: mode == "deadlineSigner" ? .seconds(1) : .seconds(5))
                 try await session.openShell(geometry: .init(columns: 80, rows: 24), timeout: .seconds(5))
-                guard mode == "io" || mode == "idle" else { throw ProbeFailure.unexpected }
+                guard mode == "io" || mode == "idle" || mode == "connect" else { throw ProbeFailure.unexpected }
             } catch {
-                if mode == "io" || mode == "idle" { throw error }
+                if mode == "io" || mode == "idle" || mode == "connect" { throw error }
                 if case ProbeFailure.unexpected = error { throw error }
                 let stats = try await session.accounting()
                 guard stats.allocatedBytes == 0, stats.locallyAcceptedBytes == 0 else { throw ProbeFailure.invalid }

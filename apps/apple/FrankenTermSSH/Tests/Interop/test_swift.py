@@ -26,12 +26,18 @@ class SwiftInteropTests(unittest.TestCase):
     def run_probe(self, mode, key=None):
         key = key or ed25519.Ed25519PrivateKey.generate()
         server = fixture.LoopbackServer(key)
-        sock = socket.socket()
-        sock.connect(server.address)
-        process = subprocess.Popen([PROBE, str(sock.fileno()), base64.b64encode(server.host_blob).decode(),
+        sock = None
+        if mode == "connect":
+            endpoint, inherited = server.address[1], []
+        else:
+            sock = socket.socket()
+            sock.connect(server.address)
+            endpoint, inherited = sock.fileno(), [sock.fileno()]
+        process = subprocess.Popen([PROBE, str(endpoint), base64.b64encode(server.host_blob).decode(),
                                     base64.b64encode(fixture.public_blob(key)).decode(), mode],
-                                   pass_fds=[sock.fileno()], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        sock.close()
+                                   pass_fds=inherited, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if sock:
+            sock.close()
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         completed, signs = None, 0
@@ -70,7 +76,7 @@ class SwiftInteropTests(unittest.TestCase):
                     self.fail(event)
             self.assertIsNotNone(completed, "Swift integration did not finish before its outer deadline")
             self.assertEqual(process.wait(timeout=3), 0, process.stderr.read(8192).decode(errors="replace"))
-            if mode in ["io", "idle"]:
+            if mode in ["io", "idle", "connect"]:
                 self.assertEqual(len(server.received), completed["bytes"])
                 self.assertIn(("resize", 132, 42), server.events)
                 self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
@@ -101,6 +107,9 @@ class SwiftInteropTests(unittest.TestCase):
 
     def test_idle_readiness_timeout_preserves_session_for_later_input(self):
         self.run_probe("idle")
+
+    def test_hostname_connector_drives_real_authentication_and_pty_io(self):
+        self.run_probe("connect")
 
     def test_cancelled_expired_or_revoked_signature_cannot_reach_peer(self):
         for mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign"]:
