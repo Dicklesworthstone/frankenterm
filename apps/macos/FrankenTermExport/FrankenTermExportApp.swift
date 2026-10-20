@@ -22,19 +22,36 @@ private actor MacExportEngine {
     struct Prepared: Sendable {
         let comparison: String, pages: Int, bytes: Int
     }
+    struct IncludedIdentity: Hashable, Sendable {
+        let algorithm: String, fingerprint: String
+    }
+    struct SelectionState: Sendable {
+        let source: WorkspaceDocument
+        let selection: WorkspaceExportSelection
+        let includedIdentities: Set<IncludedIdentity>
+    }
     private let crypto = AppleCryptography()
     private var document: WorkspaceDocument?
+    private var selection: WorkspaceExportSelection?
     private var keys: [PrivateKeyRecord] = []
     private var exported: FTAG.Export?
     private var sender: OpticalSender?
 
-    func loadWorkspace(_ url: URL) throws -> WorkspaceDocument {
+    func loadWorkspace(_ url: URL) throws -> SelectionState {
         let candidate = try WorkspaceDocument(data: SelectedLocalFile.read(url, limit: FTLimit.manifest))
-        document = candidate; keys = []; exported = nil; sender = nil
-        return candidate
+        let selected = try WorkspaceExportSelection(workspace: candidate, groupID: candidate.initialGroupID)
+        document = candidate; selection = selected; keys = []; exported = nil; sender = nil
+        return try selectionState()
     }
-    func loadKey(_ url: URL, credentialID: String) throws -> Set<String> {
-        guard let document, let reference = document.credentials.first(where: { $0.id == credentialID }) else { throw FTError.stale }
+    func selectGroup(_ groupID: String) throws -> SelectionState {
+        exported = nil; sender = nil
+        guard let document else { throw FTError.stale }
+        selection = try WorkspaceExportSelection(workspace: document, groupID: groupID)
+        return try selectionState()
+    }
+    func loadKey(_ url: URL, credentialID: String) throws -> SelectionState {
+        guard let document, let selection,
+              let reference = selection.document.credentials.first(where: { $0.id == credentialID }) else { throw FTError.stale }
         let key = try PrivateKeyRecord.fromPEM(SelectedLocalFile.read(url, limit: FTLimit.key), credentialID: credentialID, using: crypto)
         let fingerprint = "SHA256:" + crypto.sha256(key.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "")
         guard reference.fingerprint == fingerprint else { throw FTError.malformed("export.key_does_not_match") }
@@ -43,12 +60,33 @@ private actor MacExportEngine {
         if !next.contains(where: { $0.publicBlob == key.publicBlob }) { next.append(key) }
         _ = try AirGapArchive(workspace: document, keys: next, using: crypto)
         keys = next; exported = nil; sender = nil
-        return Set(next.map { "SHA256:" + crypto.sha256($0.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "") })
+        return try selectionState()
+    }
+    func excludeKey(_ credentialID: String) throws -> SelectionState {
+        guard let document, let selection,
+              let selected = selection.document.credentials.first(where: { $0.id == credentialID }) else { throw FTError.stale }
+        let aliases = Set(document.credentials.filter {
+            $0.algorithm == selected.algorithm && $0.fingerprint == selected.fingerprint
+        }.map(\.id))
+        keys.removeAll { aliases.contains($0.credentialID) }
+        exported = nil; sender = nil
+        return try selectionState()
+    }
+    private func selectionState() throws -> SelectionState {
+        guard let document, let selection else { throw FTError.stale }
+        let included = try selection.selectedKeys(from: keys, using: crypto)
+        let references = Dictionary(uniqueKeysWithValues: selection.document.credentials.map { ($0.id, $0) })
+        let identities = try Set(included.map { key -> IncludedIdentity in
+            guard let credential = references[key.credentialID] else { throw FTError.stale }
+            return .init(algorithm: credential.algorithm, fingerprint: credential.fingerprint)
+        })
+        return .init(source: document, selection: selection, includedIdentities: identities)
     }
     func prepare() throws -> Prepared {
         try Task.checkCancellation()
-        guard let document else { throw FTError.stale }
-        let archive = try AirGapArchive(workspace: document, keys: keys, using: crypto)
+        exported = nil; sender = nil
+        guard let selection else { throw FTError.stale }
+        let archive = try selection.archive(including: keys, using: crypto)
         let candidate = try FTAG.seal(archive, using: crypto)
         try Task.checkCancellation()
         let optical = try OpticalSender(envelope: candidate.envelope, using: crypto)
@@ -79,14 +117,16 @@ private actor MacExportEngine {
         let handle = try FileHandle(forWritingTo: url)
         try handle.synchronize(); try handle.close()
     }
-    func clear() { document = nil; keys = []; exported = nil; sender = nil }
+    func clear() { document = nil; selection = nil; keys = []; exported = nil; sender = nil }
 }
 
 @MainActor
 @Observable
 private final class MacExportModel {
     var document: WorkspaceDocument?
-    var includedFingerprints = Set<String>()
+    var selection: WorkspaceExportSelection?
+    var selectedGroupID = ""
+    var includedIdentities = Set<MacExportEngine.IncludedIdentity>()
     var prepared: MacExportEngine.Prepared?
     var symbol: QRCodeSymbol?
     var revealedCode: String?
@@ -110,26 +150,42 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json, .data]; panel.message = "Choose a local .ftworkspace JSON document. Executable Mac configuration is never evaluated."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        pause(); revealedCode = nil
+        invalidatePrepared()
         perform { [self] in
-            let result = try await engine.loadWorkspace(url)
-            document = result; includedFingerprints = []; prepared = nil; approveSelectedKeys = false; emitted = 0
+            apply(try await engine.loadWorkspace(url))
         }
+    }
+    func selectGroup(_ groupID: String) {
+        guard !busy, selectedGroupID != groupID else { return }
+        invalidatePrepared()
+        perform { [self] in apply(try await engine.selectGroup(groupID)) }
     }
     func chooseKey(_ credentialID: String) {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        panel.message = "Choose the matching unencrypted OpenSSH Ed25519 key. Other formats are explicitly unsupported in this build."
+        panel.message = "Choose the matching unencrypted OpenSSH Ed25519 or ECDSA P-256/P-384/P-521 private key. Encrypted files, RSA and certificates are not supported in this build."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        pause(); revealedCode = nil
+        invalidatePrepared()
         perform { [self] in
-            includedFingerprints = try await engine.loadKey(url, credentialID: credentialID)
-            prepared = nil; approveSelectedKeys = false
+            apply(try await engine.loadKey(url, credentialID: credentialID))
         }
     }
+    func excludeKey(_ credentialID: String) {
+        guard !busy else { return }
+        invalidatePrepared()
+        perform { [self] in apply(try await engine.excludeKey(credentialID)) }
+    }
+    private func apply(_ state: MacExportEngine.SelectionState) {
+        document = state.source; selection = state.selection
+        selectedGroupID = state.selection.document.initialGroupID
+        includedIdentities = state.includedIdentities
+    }
+    private func invalidatePrepared() {
+        pause(); revealedCode = nil; prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
+    }
     func prepare() {
-        guard !busy, approveSelectedKeys else { return }
-        pause(); revealedCode = nil
+        guard !busy, approveSelectedKeys, selection != nil else { return }
+        pause(); revealedCode = nil; prepared = nil; repairPage = -1
         perform { [self] in prepared = try await engine.prepare(); emitted = 0 }
     }
     private func perform(_ body: @escaping @MainActor () async throws -> Void) {
@@ -204,7 +260,7 @@ private final class MacExportModel {
     func cancelWork() { work?.cancel() }
     func clear() {
         guard !busy else { return }
-        pause(); revealedCode = nil; document = nil; includedFingerprints = []; prepared = nil; approveSelectedKeys = false
+        invalidatePrepared(); document = nil; selection = nil; selectedGroupID = ""; includedIdentities = []
         perform { [self] in await engine.clear() }
     }
     private func report(_ error: Error) {
@@ -230,32 +286,8 @@ private struct MacExportView: View {
                     Button("Open Workspace…") { model.chooseWorkspace() }.disabled(model.busy)
                 }
                 Text("Offline workspace transfer").font(.title2).foregroundStyle(.secondary)
-                if let document = model.document {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(verbatim: document.name).font(.headline)
-                            Text("\(document.machines.count) machines · \(document.credentials.count) credential references")
-                            ForEach(document.credentials) { credential in
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text(verbatim: credential.id).font(.headline)
-                                        Text(verbatim: credential.fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                                    }
-                                    Spacer()
-                                    if model.includedFingerprints.contains(credential.fingerprint) { Label("Included", systemImage: "checkmark.shield") }
-                                    Button("Choose Matching Key…") { model.chooseKey(credential.id) }.disabled(model.busy)
-                                }
-                            }
-                            Text("This build supports unencrypted OpenSSH Ed25519 files. Encrypted key files, RSA/ECDSA, certificates, hardware keys, and automatic capture of the running Mac workspace are not implemented yet.")
-                                .font(.caption).foregroundStyle(.secondary)
-                            Toggle("I approve exporting these settings and \(model.includedFingerprints.count) selected private identities.", isOn: $model.approveSelectedKeys)
-                            HStack {
-                                Button("Prepare Encrypted Transfer") { model.prepare() }.buttonStyle(.borderedProminent)
-                                    .disabled(model.busy || !model.approveSelectedKeys)
-                                Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
-                            }
-                        }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                    }
+                if let document = model.document, let selection = model.selection {
+                    workspacePreview(source: document, selection: selection)
                 } else {
                     ContentUnavailableView("Choose a workspace", systemImage: "rectangle.3.group",
                         description: Text("Open a local .ftworkspace document, then explicitly select its matching private keys. Nothing is read from your SSH folder automatically."))
@@ -302,16 +334,142 @@ private struct MacExportView: View {
                     HStack {
                         Button("Save Encrypted File…") { model.saveEncryptedFile() }.disabled(model.busy)
                         Button("Save Verified QR Animation…") { model.saveAnimation() }.disabled(model.busy)
-                        if model.busy { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
                     }
                     Text("Saved animation uses lossless APNG, not MP4. A recording repeats a finite repair set; live playback can generate more. The code is never included in exported media.")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                if model.busy {
+                    HStack { ProgressView().controlSize(.small); Text("Preparing your transfer…"); Button("Cancel Work") { model.cancelWork() } }
                 }
                 if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
             }.padding(28)
         }.frame(minWidth: 760, minHeight: 680)
             .onChange(of: scenePhase) { _, phase in model.setForeground(phase == .active) }
             .onDisappear { model.setForeground(false) }
+    }
+
+    private func workspacePreview(source: WorkspaceDocument, selection: WorkspaceExportSelection) -> some View {
+        let document = selection.document
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(verbatim: source.name).font(.headline)
+                Picker("Machine group", selection: Binding(get: { model.selectedGroupID }, set: { model.selectGroup($0) })) {
+                    ForEach(source.groups) { group in
+                        Text("\(group.name) · \(group.machineOrder.count) machines").tag(group.id).disabled(group.machineOrder.isEmpty)
+                    }
+                }.disabled(model.busy)
+                Text("\(document.machines.count) machines · \(document.routes.count) routes, including jump hosts · \(model.includedIdentities.count) selected private identities")
+                    .font(.callout).foregroundStyle(.secondary)
+                if source.discardedExtensionCount > 0 {
+                    Label("\(source.discardedExtensionCount) unrecognized optional extensions were excluded from this workspace.", systemImage: "info.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Machines in group order").font(.subheadline.bold())
+                    ForEach(selection.orderedMachines) { machine in machinePreview(machine, document: document) }
+                }
+                DisclosureGroup("Connection routes and host trust") {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(document.routes) { route in routePreview(route, document: document) }
+                    }.padding(.top, 8)
+                }
+                Divider()
+                Text("Choose private identities to include").font(.subheadline.bold())
+                if document.credentials.isEmpty {
+                    Text("This group has no private-key references. Its permitted interactive sign-in methods are preserved.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                ForEach(document.credentials) { credential in credentialRow(credential) }
+                Text("One selected key serves every matching alias. Unselected keys are never included. Ed25519 and ECDSA P-256/P-384/P-521 unencrypted OpenSSH files are supported. Encrypted key files, RSA, certificates, hardware keys, and automatic capture of the running Mac workspace are not available in this build.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Review the source and host trust on your phone before restoring. The restored group remains offline until you choose to connect.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("I approve exporting this group and \(model.includedIdentities.count) selected private identities.", isOn: $model.approveSelectedKeys)
+                    .disabled(model.busy)
+                HStack {
+                    Button("Prepare Encrypted Transfer") { model.prepare() }.buttonStyle(.borderedProminent)
+                        .disabled(model.busy || !model.approveSelectedKeys)
+                    Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
+        }
+    }
+
+    private func machinePreview(_ machine: WorkspaceDocument.Machine, document: WorkspaceDocument) -> some View {
+        let theme = document.themes.first(where: { $0.id == machine.themeID })
+        let preferred = document.routes.first(where: { $0.id == machine.preferredRouteID })
+        return HStack(spacing: 10) {
+            Circle().fill(theme.map { paletteColor($0.accent) } ?? Color.accentColor).frame(width: 12, height: 12).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(verbatim: machine.name).font(.subheadline.bold())
+                if let preferred {
+                    Text("\(preferred.user)@\(preferred.host):\(preferred.port)").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if let theme { Text(verbatim: theme.name).font(.caption).foregroundStyle(.secondary) }
+            if machine.id == document.initialMachineID { Label("Selected first", systemImage: "arrow.right.circle").font(.caption) }
+        }
+    }
+
+    private func routePreview(_ route: WorkspaceDocument.Route, document: WorkspaceDocument) -> some View {
+        let trust = document.hostTrust.first(where: { $0.id == route.trustID })
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("\(route.user)@\(route.host):\(route.port)").font(.subheadline.bold())
+            Text("\(route.mode == "direct_ssh" ? "Direct SSH" : "FrankenTerm mux") · \(route.jumpRoutes.count) configured jump routes · \(route.credentialIDs.count) credential candidates")
+                .font(.caption).foregroundStyle(.secondary)
+            if !route.requiredCapabilities.isEmpty {
+                Label("Required capabilities: \(route.requiredCapabilities.joined(separator: ", "))", systemImage: "exclamationmark.shield")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let trust {
+                if trust.pins.isEmpty { Label("Host verification required", systemImage: "questionmark.shield").font(.caption) }
+                ForEach(trust.pins, id: \.self) { key in
+                    Text("Pin · \(key.algorithm) · \(key.fingerprint)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                ForEach(trust.revokedKeys, id: \.self) { key in
+                    Text("Revoked · \(key.algorithm) · \(key.fingerprint)").font(.system(.caption, design: .monospaced)).foregroundStyle(.red).textSelection(.enabled)
+                }
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func credentialRow(_ credential: WorkspaceDocument.Credential) -> some View {
+        let included = model.includedIdentities.contains(.init(algorithm: credential.algorithm, fingerprint: credential.fingerprint))
+        let supported = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(credential.algorithm)
+        return HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(credential.id) · \(algorithmName(credential.algorithm))").font(.subheadline.bold())
+                Text(verbatim: credential.fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                if !included { Text(supported ? "Private key not selected" : "Private-key import is unavailable for this algorithm").font(.caption).foregroundStyle(.secondary) }
+            }
+            Spacer()
+            if included {
+                Label("Included", systemImage: "checkmark.shield").font(.caption)
+                Button("Exclude") { model.excludeKey(credential.id) }.disabled(model.busy)
+            } else {
+                Button("Choose Matching Key…") { model.chooseKey(credential.id) }.disabled(model.busy || !supported)
+            }
+        }
+    }
+
+    private func algorithmName(_ algorithm: String) -> String {
+        switch algorithm {
+        case "ssh-ed25519": return "Ed25519"
+        case "ecdsa-sha2-nistp256": return "ECDSA P-256"
+        case "ecdsa-sha2-nistp384": return "ECDSA P-384"
+        case "ecdsa-sha2-nistp521": return "ECDSA P-521"
+        default: return algorithm
+        }
+    }
+
+    private func paletteColor(_ hex: String) -> Color {
+        guard let value = UInt32(hex.dropFirst(), radix: 16) else { return .accentColor }
+        let alpha = hex.count == 9
+        return Color(red: Double((value >> (alpha ? 24 : 16)) & 255) / 255,
+                     green: Double((value >> (alpha ? 16 : 8)) & 255) / 255,
+                     blue: Double((value >> (alpha ? 8 : 0)) & 255) / 255,
+                     opacity: alpha ? Double(value & 255) / 255 : 1)
     }
 }
 
