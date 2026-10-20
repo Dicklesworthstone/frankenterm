@@ -230,6 +230,8 @@ When the user changes focus within a scene:
 
 Admission checks the current focus token. Subsequent delivery checks the admitted operation's original authority and connection identity, not whichever pane happens to be visible later. If that original authority is lost, report the original operation's effect state.
 
+The barrier is an acknowledgement from the local admission owner, with reserved control capacity; it must not wait for an SSH write, a terminal writer flush, or a remote reader to drain. Section 6.5 distinguishes this boundary from the existing terminal writer's completion barrier. A blocked source can remain pending while navigation to another machine succeeds.
+
 This is a core product invariant. Sending one password character to the next machine is more serious than dropping an animation frame.
 
 ---
@@ -298,6 +300,7 @@ The two data paths have different timing. Terminal data moves through bounded qu
 | Native credential broker | Keychain references, LocalAuthentication context, signing grants, foreground prompts | General terminal transcripts or a global queue of plaintext private keys. |
 | Shared Rust mobile session runtime | Exact pane references, protocol effects, ordered input, bounded transport/session tasks | SwiftUI object lifetimes or implicit access to the current view. |
 | Terminal/model owner | Parser state for direct SSH; authoritative mirror transactions for mux mode | Main-thread UI calls, disk I/O in parse-critical regions, GPU resources. |
+| Session egress owner | Bounded ordered user input, terminal replies, paste reservations, mouse/focus reports, cleanup and effect disposition | Current-view lookup, an unaccounted internal writer queue, or waiting under the parser lock. |
 | Native render preparation owner | CoreText shaping, glyph rasterization, atlas allocation decisions, cell-to-instance conversion, per-row versions | Long terminal locks, synchronous network reads, authentication. |
 | Native Metal owner per scene | Device/queue/pipelines, frame slots, drawables, atlas textures, presentation | Remote mutation or selecting input targets. |
 | Remote mux | Processes, PTYs, canonical pane identity, shared geometry and control authority | Reliance on a phone staying foregrounded. |
@@ -340,6 +343,8 @@ The first extraction should make the smallest useful vertical slice compile:
 
 Disable or isolate desktop process spawning, Lua execution, filesystem watching, Unix-socket assumptions, desktop font backends, optional image decoders, and large search/runtime integrations where they are not part of the mobile artifact. Reuse one canonical implementation behind features or adapters; do not fork terminal semantics.
 
+Establish the canonical runtime dependency closure as part of this first build. [runtime_async.rs](crates/frankenterm-core/src/runtime_async.rs) depends on the project's `Cx`, outcome, task-capability, and cancellation contracts; [the core manifest](crates/frankenterm-core/Cargo.toml) retains unconditional dependencies such as `rusqlite`, `procinfo`, and `termwiz`. Disabling default features alone does not establish a mobile-only artifact. First test whether feature-gating existing modules and dependency edges supplies the required slice. If dependency proof requires a shared runtime leaf, preserve one canonical implementation and the existing `runtime_async` surface through shared ownership/re-exports, with the permanent core intact. Do not copy wrappers into the bridge or bypass them with direct asupersync imports. Qualify task ownership, capability propagation, cancellation, and shutdown in the resulting device build.
+
 Apple device and simulator targets require the corresponding Xcode SDK. Rust documents `aarch64-apple-ios` and `aarch64-apple-ios-sim` as distinct targets; a simulator library cannot stand in for a device library. See the [Rust iOS target documentation](https://doc.rust-lang.org/rustc/platform-support/apple-ios.html).
 
 ### 6.2 Preferred bridge shape
@@ -380,6 +385,18 @@ The bridge protocol version, mobile workspace schema version, terminal semantic 
 A render transaction identifies its machine/route, tagged direct-SSH or mux source identity, transport generation, terminal sequence, geometry revision, viewport origin, palette revision, font revision, and row versions. It also states whether it is a full replacement, a compatible delta, or retained stale content.
 
 The consumer rejects an incompatible delta and requests a bounded replacement. It does not combine a new cursor with old dimensions or a new palette with an unrelated row generation. Snapshot production should reuse the existing short-lock dirty-row capture approach, then perform shaping and expansion outside the terminal lock.
+
+### 6.5 Bound the terminal's actual output path
+
+The [terminal constructor](frankenterm/term/src/terminal.rs) sends keyboard input, mouse input, and answerback replies through one writer. At the evidence baseline, [TerminalState](frankenterm/term/src/terminalstate/mod.rs) installs a dedicated `ThreadedWriter` backed by an unbounded user-input queue; `send_paste` can prepare a complete paste up to 64 MiB. Replies have separate accounting and a 64 KiB backlog threshold that suppresses complete reply units. These desktop behaviors are not the proposed mobile memory contract.
+
+Provide an explicitly bounded writer integration in the shared engine. Reserve capacity before ownership passes into any internal queue, and retain that reservation until the downstream owner accepts it or the operation settles. A bounded bridge in front of an unbounded writer only moves the leak. Account for encoded input, internal buffers, SSH reservations, pending replies, cleanup, and control messages under the destination and global budgets. Avoid retaining a dedicated waiting thread for every mobile terminal when a bounded shared driver can own the same work.
+
+One session egress owner orders user input, paste, mouse/focus reports, and terminal-generated replies. Direct-SSH DA/DSR/color-query replies remain tied to their original session and work while its viewport is hidden; they are not gated by a scene's current keyboard focus. Mux mirrors never emit these replies because the authoritative remote terminal already owns them. Snapshot replay and retained-content inspection use inert side-effect handlers, including clipboard, notifications, and terminal replies.
+
+Never silently drop admitted user input. Any reply suppression remains an explicit complete-unit policy with bounded counters and a documented effect on supported query behavior. Reserve a small finite cleanup/control allowance before opening ordinary admission. If the peer stops reading, reject further admission or fail the affected session under a typed resource policy; do not block the parser, MainActor, or every other route while waiting for room.
+
+The existing `TerminalState::writer_barrier` waits for downstream write/flush completion. It cannot implement the local focus barrier in section 3.5. The latter seals ownership and ordering independently of network progress, leaving prior effects attached to their original source. Prove this distinction with a stopped remote reader, query traffic, paste, and a switch to another machine in the same trace.
 
 ---
 
@@ -1011,7 +1028,7 @@ Treat Rust, Swift, and Metal Shading Language layout agreement as an executable 
 
 Use this pipeline:
 
-1. Apply all admitted terminal bytes or mux state transactions in their authoritative order.
+1. Apply a bounded byte/work quantum of admitted terminal output or complete mux transactions in authoritative order; retain the continuation and yield to input settlement, other routes, and publication without waiting for the receive queue to empty.
 2. Publish an owned semantic transaction with source identity, coordinate witness, row versions, and compatible base revision.
 3. Merge compatible pending changes into the newest coherent display state.
 4. Shape changed runs and prepare changed instances outside terminal locks and MainActor.
@@ -1091,7 +1108,9 @@ Keep separate mappings for UTF-8 storage offsets, Unicode scalar boundaries, gra
 
 The terminal core determines cell occupancy. Core Text determines how a run looks within that occupancy. A fallback font's measured advance must not silently move subsequent terminal columns. Wide characters occupy their canonical span; combining marks attach to the intended cluster; spacer cells are not copied as extra characters.
 
-Shaping respects attribute, font, hyperlink, and semantic boundaries. Ligatures may improve appearance, but cursor positioning, selection, copy, and hit testing remain attached to the original cells. Italic overhangs and combining marks need deliberate clipping rules rather than accidental truncation at every cell edge.
+Separate shaping boundaries from paint and interaction boundaries. The existing [shared line-shaping implementation](crates/frankenterm-gui/src/line_shaping.rs) preserves paragraph context and joins eligible paint-only clusters. A color, underline, or hyperlink change must not automatically remove neighboring text from shaping context. Carry cluster-to-string and cluster-to-cell maps into Core Text preparation, then map glyphs back to their authoritative cells and paint spans. Preserve qualified exceptions and fallbacks, including the existing ASCII-hyperlink context rule and cases where a glyph cannot be split safely across a paint boundary.
+
+Font, script, and direction remain explicit shaping inputs. Ligatures may improve appearance, but cursor positioning, selection, copy, and hit testing remain attached to the original cells. Italic overhangs and combining marks need deliberate clipping rules rather than accidental truncation at every cell edge. Qualify Arabic/Indic contextual forms, bidi rows, and changes of color or hyperlink inside a word alongside cell and selection parity.
 
 Maintain the engine's established bidi and width policies. Native typography must not reorder a terminal row independently of the terminal's cursor and input model.
 
@@ -1117,6 +1136,10 @@ The fidelity corpus includes CJK, combining sequences, emoji/ZWJ, powerline symb
 ### 14.5 Advertise only the terminal capabilities that work
 
 Choose and document the initial TERM value together with the actual terminal feature profile. A conservative compatible profile is preferable to advertising an extended keyboard or image protocol that the mobile parser, renderer, or input path has not qualified. Where a FrankenTerm-specific terminfo entry is required, remote setup must install or verify that entry deliberately; importing a workspace does not silently modify the remote machine.
+
+Implement or qualify one shared terminal feature profile governing TERM/terminfo, device attributes, XTGETTCAP and other query replies, keyboard/mouse negotiation, and image/clipboard handlers. At the baseline, `TerminalState::perform_device` directly advertises Sixel, windowing extensions, and clipboard access; changing TERM alone does not change those responses. Unsupported queries use their defined negative/unavailable response where one exists, otherwise the documented ignore behavior. Advertising a technically supported clipboard mechanism never grants access to the phone's clipboard.
+
+Apply the mobile profile to phone-owned direct-SSH terminals. In mux mode, the server's terminal profile remains authoritative; negotiated viewer capabilities determine whether the phone can present that state or needs an explicit unsupported placeholder. An observer cannot rewrite the running server's terminal identity.
 
 Keep terminal identity, negotiated keyboard/mouse modes, bracketed paste, image capabilities, and mux codec version separate. A remote program can change modes while the user is typing. Encode input under the appropriate current semantic witness and ordered admission contract; a stale mode snapshot must not produce a second interpretation of an admitted key.
 
@@ -1188,7 +1211,15 @@ Use bracketed paste when negotiated, but do not treat it as a sandbox. Embedded 
 
 Transmit through a bounded queue with an operation ID and ordered chunks. For ordinary UTF-8 text, choose valid character boundaries and keep the bracket delimiters separate from payload data; parser state across admitted chunks remains ordered. Cancellation stops further admission and reports the prefix already admitted or written under the transport's actual certainty model. It cannot retract bytes already sent. If a bracketed-paste closing marker is needed, send it only to the same valid source under the operation's cleanup contract; never replay the payload after reconnect.
 
-While a paste is active, reserve that stream's ordering so helper keys or another paste cannot accidentally interleave inside its delimiters. A deliberate interrupt is a separate visible action with defined ordering. Source loss leaves the remaining text unsent and reports any uncertain prefix.
+While a paste is active, reserve the destination's single egress, including other local streams and generated terminal replies. Reserving only one scene's queue would allow another scene's key or a DA reply to become paste payload. Bound the reservation's bytes and lifetime, retain reserved space for its closing delimiter, and keep the parser running without waiting under its lock. Replies may wait in their bounded complete-unit queue; exhaustion follows section 6.5's explicit policy. A deliberate interrupt has defined ordering after paste closure where the original source and actual delivery state permit it. Source loss leaves remaining text unsent and reports any uncertain prefix.
+
+### 15.6 Pointer events and effective terminal focus
+
+Mouse/touch press, drag, release, wheel, supported hover reports, and terminal focus reports use the same immutable source and authority contract as keys. Classify direct touches separately from mouse/trackpad scroll events. A hardware trackpad's two-finger scrolling is not a two-touch pane-navigation gesture; navigation recognizers exclude indirect scroll types that belong to scrollback or the remote TUI. Configure [UIKit's scroll-type mask](https://developer.apple.com/documentation/uikit/uipangesturerecognizer/allowedscrolltypesmask) explicitly.
+
+A drag captures its original source, button ownership, and geometry witness. Map positions through the scene's inverse viewport transform into terminal cells. Pixel mouse protocols additionally require the authoritative terminal pixel extent; UIKit points and drawable pixels are not interchangeable with it. On geometry change, remap only under a proven transformation or cancel/settle the original drag. Compatible motion samples may coalesce; button transitions, wheel effects, and release cleanup cannot disappear or change order.
+
+The shared engine's `TerminalState::focus_changed` maintains one terminal-wide focus flag and releases mouse buttons on blur. Aggregate effective terminal focus at the session owner before calling it. One scene's deactivation must not blur a session or release buttons still owned by another active input stream. Define one pointer-capture owner per destination, clear only the retiring stream's owned state, and gate mux mouse/focus effects on negotiated control authority. A view-only scene does not acquire terminal input focus merely by rendering.
 
 ---
 
@@ -1352,7 +1383,9 @@ Backpressure on a raw SSH channel can eventually slow the remote process writing
 
 Use a small number of priority classes: focused input and control settlement; focused terminal updates; destination warm-up; inventory/attention; bulk history, previews, and transfers. Apply per-host fairness within each class so one noisy connection cannot occupy the runtime indefinitely. Budget by bytes and CPU work, not message count alone.
 
-Coalesce consecutive model changes before frame preparation. The renderer may present the newest coherent state without drawing every intermediate state, while the terminal model still processes every required transition. This distinction permits smooth output under load without losing terminal meaning.
+Bound the outer read batch as well as the parser's nominal slice. The existing `SlicedFeed` in [terminal.rs](frankenterm/term/src/terminal.rs) seeks a later control-byte boundary and yields only at parser-ground boundaries; its nominal slice size is not a hard work bound for a huge control-free batch or incomplete string sequence. Keep parser and UTF-8/grapheme continuation owned by the same session across turns, and prove sliced-versus-unsliced semantic equivalence. Cap oversized string/image actions before expensive processing. A long unterminated OSC/DCS must not prevent other routes and input from making progress.
+
+Coalesce consecutive completed model changes before frame preparation. Publish the newest coherent display state while later input bytes remain pending; durable recovery checkpoints have their own parser-ground requirements. The renderer can skip intermediate presentations while the model retains every required transition. A fairness test must show input and first-frame progress while the producer is still flooding, not only after it stops.
 
 At idle, stop continuous rendering. Schedule discrete cursor-blink and attention updates, then return to sleep. Under Low Power Mode, serious thermal pressure, constrained network, or memory pressure, reduce refresh requests, cancel speculative warm-up, trim previews, stop image animation, and reduce background subscriptions. Input ordering, glyph legibility, host verification, and effect certainty do not degrade.
 
@@ -1589,6 +1622,9 @@ The highest-value tests target interactions that a happy-path demo will miss:
 8. **Route loss during authentication or nested-hop creation.** Cancellation owns all callbacks and child work to settlement; no late prompt or signer result reaches a retired connection.
 9. **Raw SSH flood during a two-finger pane transition.** The parser remains correct, queues remain bounded, focused input stays responsive, and background pressure is attributed to the responsible route.
 10. **Mux restart after ambiguous input.** A new server incarnation is recognized; an in-memory deduplication ledger from the old process is not treated as surviving proof.
+11. **Stopped SSH reader, terminal queries, and paste.** All internal queues remain bounded, replies stay with their session, no other stream interleaves inside paste delimiters, and the local focus barrier permits navigation without waiting for downstream flush.
+12. **Uninterrupted output and unfinished control strings.** ASCII floods, split Unicode/graphemes, and long unterminated OSC/DCS preserve semantic equivalence while focused input, other routes, and rendering make measurable progress.
+13. **Two scenes, pointer capture, and feature probes.** A scene blur does not release another scene's mouse state; trackpad scrolling does not navigate panes; drag/resize retains correct coordinates; actual device/query responses match the direct-SSH feature profile.
 
 These traces should use synthetic content and controlled hosts, with host-side effect observation where needed. Tests that merely restate an implementation's current output cannot establish these properties.
 
@@ -1632,11 +1668,11 @@ Do not make IOS-A depend on PageGrid, the complete desktop Metal performance cam
 
 Build the smallest production-shaped slice:
 
-1. Establish the mobile Rust dependency boundary and a SwiftUI application containing the native terminal surface.
+1. Establish the mobile Rust dependency boundary, including canonical runtime/Cx/outcome closure and the bounded shared-terminal writer integration, and a SwiftUI application containing the native terminal surface.
 2. Adapt the existing renderer's portable frame, cell, atlas, and shader contracts to an iOS-owned Metal surface.
 3. Qualify the selected `frankenterm-ssh` backend against one owned host using a representative existing-key format and strict host verification.
-4. Feed received bytes into the shared terminal model; publish bounded render state; draw the resulting glyphs and cursor.
-5. Route native text and control input to that exact connection.
+4. Feed received bytes in bounded work quanta into the shared terminal model; return its required query replies through the session egress; publish bounded render state and draw the glyphs and cursor.
+5. Route native text, control, pointer, and paste input to that exact connection, with one bounded egress and a focus barrier independent of downstream flush.
 6. Cancel and destroy the view, connection, and authentication work without leaving callbacks targeting retired objects.
 
 The slice must include a real full-screen terminal application and composed Unicode input. An ANSI-colored log viewer with a working TCP socket does not resolve the important architectural risks.
@@ -1822,6 +1858,7 @@ Repository statements and Beads statuses in this document refer to commit `fb570
 | [Beads](.beads/issues.jsonl) | Existing work ownership and dependency evidence; section 26 is a dated crosswalk, not a second task database. |
 | [Metal renderer](crates/frankenterm-renderer-metal) and [GUI consumers](crates/frankenterm-gui/src/termwindow) | Actual current rendering primitives and their live terminal consumers. |
 | [Terminal](frankenterm/term), [cell model](frankenterm/cell), and [escape parser](frankenterm/escape-parser) | Canonical terminal interpretation and input/display fidelity. |
+| [Terminal writer and query handlers](frankenterm/term/src/terminalstate/mod.rs), [sliced feed](frankenterm/term/src/terminal.rs), and [line shaping](crates/frankenterm-gui/src/line_shaping.rs) | Actual internal queues, completion barriers, answerback behavior, parser work boundaries, and paragraph-context rules that the mobile adaptation must preserve or bound. |
 | [Render mirror](frankenterm/mux/src/render_mirror.rs) | Row capture, coordinates, styles, and snapshot coherence boundaries. |
 | [SSH domains](frankenterm/config/src/ssh.rs) and [SSH resolver](frankenterm/ssh/src/config.rs) | Mac export input, existing identity/route behavior, and portability diagnostics. |
 | [SSH dependencies](frankenterm/ssh/Cargo.toml) and [client](frankenterm/client/src/client.rs) | Real native transport dependencies, proxy grammar, and current reconnect behavior. |
