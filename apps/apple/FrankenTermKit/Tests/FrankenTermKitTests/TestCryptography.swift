@@ -98,5 +98,35 @@ struct TestCryptography: AirGapCryptography {
         }) == 1 else { throw FTError.malformed("test.ecdsa") }
         return result
     }
+    func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data {
+        try OpenSSHSourcePrimitives.bcryptPBKDF(passphrase: passphrase, salt: salt, rounds: rounds,
+                                              outputByteCount: outputByteCount, sha512: { output, input, count in
+            _ = SHA512(input, count, output)
+        })
+    }
+    func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try OpenSSHSourcePrimitives.validateAESCTR(ciphertext: ciphertext, key: key, iv: iv)
+        var result = Data(count: ciphertext.count)
+        let status = result.withUnsafeMutableBytes { output in
+            ciphertext.withUnsafeBytes { input in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBytes { ivBytes in
+                        ft_test_aes_ctr(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
+                            keyBytes.bindMemory(to: UInt8.self).baseAddress, key.count,
+                            ivBytes.bindMemory(to: UInt8.self).baseAddress, iv.count,
+                            output.bindMemory(to: UInt8.self).baseAddress, ciphertext.count)
+                    }
+                }
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.authentication }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
 }
 #endif

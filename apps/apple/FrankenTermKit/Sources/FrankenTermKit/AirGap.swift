@@ -44,6 +44,11 @@ public protocol AirGapCryptography: Sendable {
     /// A fixed-width big-endian private scalar to an uncompressed SEC1 point.
     /// The maintained primitive must reject zero and out-of-range scalars.
     func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data
+    /// Bounded OpenSSH source-key work only; FTAG itself uses generated-code HKDF.
+    func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data
+    /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
+    /// and its derived public identity must validate before any key is accepted.
+    func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
 }
 
 #if canImport(CryptoKit)
@@ -296,7 +301,36 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         guard try reader.uint(4) == 1 else { throw FTError.unsupported("key.count") }
         let publicBlob = try reader.sshString()
         let privatePart = try reader.sshString()
-        guard reader.remaining == 0, !privatePart.isEmpty, privatePart.count.isMultiple(of: 8) else { throw FTError.malformed("key.extent") }
+        guard reader.remaining == 0 else { throw FTError.malformed("key.extent") }
+        _ = try validatePrivatePart(privatePart, publicBlob: publicBlob, blockSize: 8, using: crypto)
+        return publicBlob
+    }
+
+    /// Source-file unlocking changes only the outer protection and padding.
+    /// Validate the complete decrypted record against its real derived public
+    /// identity before constructing the clear inner container for an FTAG archive.
+    static func fromDecryptedOpenSSH<C: AirGapCryptography>(publicBlob: Data, privatePart: Data,
+        credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
+        let bodyLength = try validatePrivatePart(privatePart, publicBlob: publicBlob, blockSize: 16, using: crypto)
+        var body = Data(privatePart.prefix(bodyLength))
+        defer { body.resetBytes(in: 0..<body.count) }
+        var padding: UInt8 = 1
+        while !body.count.isMultiple(of: 8) { body.append(padding); padding += 1 }
+        var container = Data("openssh-key-v1\0".utf8)
+        func appendString(_ bytes: Data) {
+            container.appendBE(UInt64(bytes.count), bytes: 4); container += bytes
+        }
+        appendString(Data("none".utf8)); appendString(Data("none".utf8)); appendString(Data())
+        container.appendBE(1, bytes: 4)
+        appendString(publicBlob); appendString(body)
+        guard container.count <= FTLimit.key else { throw FTError.limit("key.container") }
+        return .init(credentialID: credentialID, container: container, publicBlob: publicBlob)
+    }
+
+    private static func validatePrivatePart<C: AirGapCryptography>(_ privatePart: Data, publicBlob: Data,
+        blockSize: Int, using crypto: C) throws -> Int {
+        guard [8, 16].contains(blockSize), !privatePart.isEmpty, privatePart.count <= FTLimit.key,
+              privatePart.count.isMultiple(of: blockSize) else { throw FTError.malformed("key.extent") }
         var publicReader = ByteCursor(publicBlob), privateReader = ByteCursor(privatePart)
         let algorithmBytes = try publicReader.sshString(cap: 64)
         guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
@@ -324,10 +358,11 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
             guard try crypto.ecdsaPublicKey(scalar: scalar, curve: curve) == publicKey else { throw FTError.malformed("key.identity") }
         }
         _ = try privateReader.sshString(cap: FTLimit.text)
-        guard privateReader.remaining < 8 else { throw FTError.malformed("key.padding") }
+        let bodyLength = privateReader.offset
+        guard privateReader.remaining < blockSize else { throw FTError.malformed("key.padding") }
         let padding = try privateReader.take(privateReader.remaining)
         guard padding.enumerated().allSatisfy({ $0.element == UInt8($0.offset + 1) }) else { throw FTError.malformed("key.padding") }
-        return publicBlob
+        return bodyLength
     }
 }
 
