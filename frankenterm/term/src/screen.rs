@@ -10198,7 +10198,7 @@ impl Screen {
             return None;
         }
         // `page_scroll_up_line_within` built the row itself below the cap.
-        if rows_before + 1 <= plan.max_allowed {
+        if rows_before < plan.max_allowed {
             return Some(false);
         }
         debug_assert_eq!(
