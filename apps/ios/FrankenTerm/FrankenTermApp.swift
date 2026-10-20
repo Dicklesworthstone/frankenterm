@@ -16,6 +16,7 @@ struct FrankenTermMobileApp: App {
 @Observable
 final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
+    var availableCredentials: [UUID: Set<String>] = [:]
     var state: OfflineRestoreStatus?
     var message: String?
     var showRestore = false
@@ -71,13 +72,13 @@ final class MobileWorkspaceModel {
                                       vault: AppleWorkspaceVault())
             }.value
             store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
-            workspaces = try await created.load()
+            try await refreshWorkspaces(using: created, epoch: epoch)
             updateLifecycle()
         } catch { report(error); bootstrapStarted = false }
     }
     func setActive(_ value: Bool) {
         active = value
-        if !value { cameraRequested = false; state = nil }
+        if !value { cameraRequested = false; state = nil; availableCredentials = [:] }
         updateLifecycle()
     }
     func setRestoreVisible(_ value: Bool) {
@@ -98,9 +99,16 @@ final class MobileWorkspaceModel {
             self.state = next
             if visible { self.startObservations(restore: restore) }
             if self.active, let store = self.store {
-                do { self.workspaces = try await store.load() } catch { self.report(error) }
+                do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
+                catch { if self.active, self.epoch == ticket { self.availableCredentials = [:]; self.report(error) } }
             }
         }
+    }
+    private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
+        let snapshot = try await store.loadWithCredentialAvailability()
+        guard active, epoch == ticket else { return }
+        workspaces = snapshot.map(\.workspace)
+        availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
     }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
         let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
@@ -144,7 +152,7 @@ final class MobileWorkspaceModel {
                 let result = try await action(restore, current)
                 guard self.active, self.epoch == ticket else { return }
                 self.state = result
-                if result.phase == .complete, let store = self.store { self.workspaces = try await store.load() }
+                if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
                 guard self.active, self.epoch == ticket else { return }
                 self.state = await restore.status()
@@ -191,11 +199,16 @@ struct MobileWorkspaceRoot: View {
                         if model.workspaces.isEmpty { Text("No workspace restored yet.").foregroundStyle(.secondary) }
                         ForEach(model.workspaces) { saved in
                             if let document = try? saved.document() {
-                                NavigationLink { MachineWorkspaceView(document: document) } label: {
+                                NavigationLink { MachineWorkspaceView(document: document, workspaceID: saved.id, model: model) } label: {
                                     VStack(alignment: .leading, spacing: 5) {
                                         Text(verbatim: document.name).font(.headline).lineLimit(1)
-                                        Text("\(document.machines.count) machines · \(saved.bindings.count) key references · Connect later")
-                                            .font(.caption).foregroundStyle(.secondary)
+                                        if let available = model.availableCredentials[saved.id] {
+                                            Text("\(document.machines.count) machines · \(available.count) available key references · Connect later")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        } else {
+                                            Text("\(document.machines.count) machines · Key availability needs protected storage")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
                                     }.padding(.vertical, 4)
                                 }
                             }
@@ -232,6 +245,7 @@ struct OfflineRestoreSheet: View {
     @State private var code = ""
     @State private var confirmed = false
     @State private var allowRemoval = false
+    @State private var allowRollback = false
     var body: some View {
         NavigationStack {
             Group {
@@ -283,7 +297,7 @@ struct OfflineRestoreSheet: View {
                                 SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
                                     .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
                                 Button("Decrypt and Review") {
-                                    let entered = code; code = ""; confirmed = false; allowRemoval = false
+                                    let entered = code; code = ""; confirmed = false; allowRemoval = false; allowRollback = false
                                     model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
                                 }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
                             case .preparingReview, .committing:
@@ -302,6 +316,30 @@ struct OfflineRestoreSheet: View {
                                     ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
                                         Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                                     }
+                                    DisclosureGroup("Host identities and connection policy") {
+                                        VStack(alignment: .leading, spacing: 16) {
+                                            ForEach(review.document.hostTrust) { trust in
+                                                VStack(alignment: .leading, spacing: 5) {
+                                                    Text(verbatim: "\(trust.host):\(trust.port)").font(.headline)
+                                                    if let alias = trust.hostKeyAlias { Text(verbatim: "Host-key alias: \(alias)").font(.caption) }
+                                                    ForEach(Array(trust.pins.enumerated()), id: \.offset) { _, pin in
+                                                        Text(verbatim: "\(pin.algorithm) · \(pin.fingerprint)")
+                                                            .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                                                    }
+                                                    if !trust.revokedKeys.isEmpty {
+                                                        Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
+                                                    }
+                                                }
+                                            }
+                                            ForEach(review.document.routes) { route in
+                                                VStack(alignment: .leading, spacing: 5) {
+                                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
+                                                    Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes")
+                                                        .font(.caption)
+                                                }
+                                            }
+                                        }.padding(.top, 8)
+                                    }
                                     if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
                                     ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
                                         VStack(alignment: .leading) {
@@ -311,14 +349,24 @@ struct OfflineRestoreSheet: View {
                                     }
                                     Toggle("I verified the comparison value on my Mac and approve these settings, trust records, and keys.", isOn: $confirmed)
                                     if review.removesMachines { Toggle("Replace this workspace even though some existing machines are removed.", isOn: $allowRemoval) }
+                                    if review.requiresRollbackApproval {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            Label("Previously restored recording", systemImage: "clock.arrow.circlepath").font(.headline)
+                                            Text("This package was accepted before and differs from the workspace currently saved on this phone. Restoring it replaces the current settings. Local revocations stay in effect.")
+                                                .font(.callout)
+                                            Toggle("I approve restoring this previously accepted workspace version.", isOn: $allowRollback)
+                                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                                    }
                                     Text("No connection or remote command will run. A device passcode is required for private-key storage.").font(.footnote).foregroundStyle(.secondary)
                                     Button("Restore Offline") {
-                                        let token = review.token, consent = confirmed, removal = allowRemoval
+                                        let token = review.token, consent = confirmed, removal = allowRemoval, rollback = allowRollback
                                         model.run { restore, state in
                                             try await restore.commit(reviewToken: token, generation: state.generation,
-                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal)
+                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal,
+                                                                     allowHistoricalRollback: rollback)
                                         }
-                                    }.buttonStyle(.borderedProminent).disabled(!confirmed || (review.removesMachines && !allowRemoval))
+                                    }.buttonStyle(.borderedProminent)
+                                        .disabled(!confirmed || (review.removesMachines && !allowRemoval) || (review.requiresRollbackApproval && !allowRollback))
                                 }
                             case .complete:
                                 Label("Restored offline — Connect later", systemImage: "checkmark.shield.fill").font(.headline)
@@ -335,7 +383,7 @@ struct OfflineRestoreSheet: View {
                             }
                             if ![.committing, .preparingReview, .recoveryRequired].contains(state.phase) {
                                 Button("Start a Different Transfer", role: .destructive) {
-                                    code = ""; confirmed = false; allowRemoval = false; model.cameraRequested = false
+                                    code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
                                     model.run { restore, _ in try await restore.reset() }
                                 }
                             }
@@ -347,8 +395,9 @@ struct OfflineRestoreSheet: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
-        .onChange(of: model.active) { _, active in if !active { code = ""; confirmed = false; allowRemoval = false } }
-        .onDisappear { code = ""; confirmed = false; model.cameraRequested = false }
+        .onChange(of: model.state?.review?.token) { _, _ in confirmed = false; allowRemoval = false; allowRollback = false }
+        .onChange(of: model.active) { _, active in if !active { code = ""; confirmed = false; allowRemoval = false; allowRollback = false } }
+        .onDisappear { code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false }
     }
     private func title(_ phase: OfflineRestorePhase) -> String {
         switch phase {
@@ -413,6 +462,8 @@ private struct OpticalCamera: UIViewControllerRepresentable {
 @MainActor
 private struct MachineWorkspaceView: View {
     let document: WorkspaceDocument
+    let workspaceID: UUID
+    @Bindable var model: MobileWorkspaceModel
     @State private var selection = ""
     @State private var groupID = ""
     private var machines: [WorkspaceDocument.Machine] {
@@ -425,20 +476,63 @@ private struct MachineWorkspaceView: View {
         TabView(selection: $selection) {
             ForEach(machines) { machine in
                 let theme = document.themes.first { $0.id == machine.themeID }
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
-                    if let route = document.routes.first(where: { $0.id == machine.preferredRouteID }) {
-                        Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        Label(route.mode == "frankenterm_mux" ? "Persistent mux route" : "Direct SSH route", systemImage: "point.3.connected.trianglepath.dotted")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
+                        HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
+                        Label("Restored offline", systemImage: "checkmark.shield")
+                        Text("Inspect the saved routes and their local requirements below. This build has no live terminal transport, and no remote session has been started.")
+                            .font(.callout)
+                        ForEach(machine.routeIDs, id: \.self) { id in
+                            if let route = document.routes.first(where: { $0.id == id }) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack {
+                                        Label(route.mode == "frankenterm_mux" ? "Persistent mux route" : "Direct SSH route", systemImage: "point.3.connected.trianglepath.dotted")
+                                            .font(.headline)
+                                        if id == machine.preferredRouteID { Text("Preferred").font(.caption.bold()) }
+                                    }
+                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)")
+                                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                    if let available = model.availableCredentials[workspaceID] {
+                                        Text("\(route.credentialIDs.filter(available.contains).count) of \(route.credentialIDs.count) permitted key references are available on this device.")
+                                            .font(.caption)
+                                        if let readiness = try? document.readiness(forRouteID: id, availableCredentialIDs: available,
+                                                reviewedTrustIDs: Set(document.hostTrust.map(\.id))) {
+                                            ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
+                                                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+                                            }
+                                        } else {
+                                            Label("Local requirements could not be validated.", systemImage: "exclamationmark.shield").font(.caption)
+                                        }
+                                    } else {
+                                        Label("Unlock protected storage to check credential availability.", systemImage: "lock.shield").font(.caption)
+                                    }
+                                    if !route.jumpRoutes.isEmpty {
+                                        Text("\(route.jumpRoutes.count) configured jump routes and their own dependencies must also be ready.").font(.caption)
+                                    }
+                                }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color(ftHex: theme?.accent ?? "#3B82F6").opacity(0.14), in: RoundedRectangle(cornerRadius: 16))
+                            }
+                        }
+                        if let saved = model.workspaces.first(where: { $0.id == workspaceID }), !saved.findings.isEmpty {
+                            DisclosureGroup("Preserved settings and unresolved requirements") {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    ForEach(Array(saved.findings.enumerated()), id: \.offset) { _, finding in
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Label(finding.disposition == 1 ? "Required condition" : "Preserved but inactive",
+                                                  systemImage: finding.disposition == 1 ? "exclamationmark.shield" : "archivebox")
+                                                .font(.caption.bold())
+                                            Text(verbatim: "\(finding.entityID) · \(finding.setting)").font(.caption)
+                                            Text(verbatim: finding.reason).font(.caption)
+                                        }
+                                    }
+                                }.padding(.top, 8)
+                            }
+                        }
+                        Text("Swipe to inspect another machine. These are saved configurations, not live panes.").font(.caption)
                     }
-                    HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
-                    Spacer()
-                    Label("Configuration restored", systemImage: "checkmark.shield")
-                    Text("This build does not connect yet. The SSH transport and Rust/Metal terminal are still being integrated. No remote session has been started.")
-                        .font(.callout)
-                    Spacer()
-                    Text("Swipe to inspect another machine. These are saved configurations, not live panes.").font(.caption)
-                }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .padding(28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
                     .background(Color(ftHex: theme?.background ?? "#10223C"))
                     .tag(machine.id)

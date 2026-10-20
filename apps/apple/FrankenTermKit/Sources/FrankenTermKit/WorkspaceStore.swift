@@ -27,6 +27,7 @@ public protocol WorkspaceCredentialVault: Sendable {
 
 public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
     case reviewRequired, staleReview, removalNeedsApproval, revokedIdentity
+    case conflictingExport, rollbackNeedsApproval, importHistoryFull
     case corruptStore, busy, recoveryRequired
     public var errorDescription: String? {
         switch self {
@@ -34,6 +35,9 @@ public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
         case .staleReview: return "The saved workspace changed. Review the import again."
         case .removalNeedsApproval: return "This import removes machines. Explicit replacement approval is required."
         case .revokedIdentity: return "This import includes a locally revoked identity."
+        case .conflictingExport: return "This export reuses a previously accepted bundle or transfer identity with different contents. Create a new export on the source device."
+        case .rollbackNeedsApproval: return "This recording restores a previously accepted workspace version. Review and approve that replacement explicitly."
+        case .importHistoryFull: return "The protected import history is full. New exports cannot be accepted without forgetting replay protection. Existing accepted recordings remain available."
         case .corruptStore: return "Workspace storage could not be validated. No credentials were removed."
         case .busy: return "Another workspace transaction is active."
         case .recoveryRequired: return "The import outcome needs storage recovery. Do not assume it was rolled back."
@@ -69,13 +73,51 @@ public struct WorkspaceImportReceipt: Sendable {
     public let cleanupPending: Bool
 }
 
+/// Computed from locally accepted envelopes, never from a claimed export date or
+/// sequence. A previous recording is not necessarily older than an unseen export.
+public struct WorkspaceImportAssessment: Sendable {
+    public let existingWorkspace: InstalledWorkspace?
+    public let firstAcceptedRevision: UUID?
+    public let requiresRollbackApproval: Bool
+    public let removesMachines: Bool
+}
+
 /// One app-owned actor shared by every scene. There are no suspension points
 /// inside a transaction, and the persistence lease also fences other instances.
 public actor WorkspaceStore {
+    private struct AcceptedImport: Codable {
+        let exporterID: String
+        let workspaceID: String
+        let bundleID: String
+        // Version-one catalogs did not retain transfer IDs. Migration preserves
+        // their known bundle/digest bindings, then learns an ID only from an
+        // authenticated rescan with the exact already accepted envelope digest.
+        var transferID: Data?
+        let envelopeDigest: Data
+        let firstAcceptedRevision: UUID
+    }
     private struct Catalog: Codable {
-        var version = 1
+        var version = 2
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
+        var acceptedImports: [AcceptedImport] = []
+
+        init() {}
+        private enum CodingKeys: String, CodingKey {
+            case version, workspaces, revokedFingerprints, acceptedImports
+        }
+        init(from decoder: any Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            version = try fields.decode(Int.self, forKey: .version)
+            workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
+            revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
+            if version == 1 {
+                guard !fields.contains(.acceptedImports) else { throw WorkspaceStoreError.corruptStore }
+                acceptedImports = []
+            } else {
+                acceptedImports = try fields.decode([AcceptedImport].self, forKey: .acceptedImports)
+            }
+        }
     }
     private struct Journal: Codable {
         var version = 1
@@ -88,6 +130,9 @@ public actor WorkspaceStore {
     private let vault: any WorkspaceCredentialVault
     private static let catalogLimit = 16 * 1024 * 1024
     private static let journalLimit = 128 * 1024
+    // This is an admission bound, not an eviction policy. Never silently discard
+    // an accepted identity to make a new import fit.
+    static let importHistoryLimit = 4096
 
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
@@ -101,23 +146,51 @@ public actor WorkspaceStore {
         }
     }
 
+    /// A UI snapshot binds credential availability to the same saved revisions
+    /// under one lease. Counting saved bindings alone would show a revoked or
+    /// removed Keychain identity as available after lock, relaunch, or key loss.
+    public func loadWithCredentialAvailability() throws -> [(workspace: InstalledWorkspace, credentialIDs: Set<String>)] {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            return try catalog.workspaces.map { workspace in
+                (workspace, try availableCredentials(workspace, catalog: catalog))
+            }
+        }
+    }
+
+    /// Authentication precedes this call. Assessment and the saved revision are
+    /// obtained under the same persistence lease; install rechecks both before
+    /// staging any new credential so a stale UI cannot grant replacement rights.
+    public func assessImport(_ document: WorkspaceDocument, envelopeDigest: Data,
+                             transferID: Data) throws -> WorkspaceImportAssessment {
+        guard envelopeDigest.count == 32, transferID.count == 16 else { throw WorkspaceStoreError.reviewRequired }
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            return try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
+        }
+    }
+
     /// The approval is a local UI decision, never a flag decoded from a package.
     /// expectedRevision is captured when previewing this exact exporter/workspace.
-    public func install(_ archive: AirGapArchive, envelopeDigest: Data,
+    public func install(_ archive: AirGapArchive, envelopeDigest: Data, transferID: Data,
                         expectedRevision: UUID?, sourceAndContentsConfirmed: Bool,
-                        allowMachineRemoval: Bool = false) throws -> WorkspaceImportReceipt {
-        guard sourceAndContentsConfirmed, envelopeDigest.count == 32 else { throw WorkspaceStoreError.reviewRequired }
+                        allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool = false) throws -> WorkspaceImportReceipt {
+        guard sourceAndContentsConfirmed, envelopeDigest.count == 32, transferID.count == 16 else { throw WorkspaceStoreError.reviewRequired }
         try Task.checkCancellation()
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             let document = archive.workspace
+            let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
             let index = try catalog.workspaces.firstIndex {
                 let prior = try $0.document()
                 return prior.exporterID == document.exporterID && prior.id == document.id
             }
             let old = index.map { catalog.workspaces[$0] }
             guard old?.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
+            guard !review.requiresRollbackApproval || allowHistoricalRollback else { throw WorkspaceStoreError.rollbackNeedsApproval }
             guard !document.credentials.contains(where: { catalog.revokedFingerprints.contains($0.fingerprint) }) else {
                 throw WorkspaceStoreError.revokedIdentity
             }
@@ -132,6 +205,12 @@ public actor WorkspaceStore {
                     let fingerprints = Set(available.map(\.fingerprint))
                     let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0.fingerprint) })
                     if archive.keys.allSatisfy({ references[$0.credentialID].map(fingerprints.contains) == true }) {
+                        // Finish a legacy catalog's migration even for a fully
+                        // idempotent rescan; do not lose the newly verified ID.
+                        if let accepted = acceptanceIndex(document, catalog: catalog), catalog.acceptedImports[accepted].transferID == nil {
+                            catalog.acceptedImports[accepted].transferID = transferID
+                            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+                        }
                         return receipt(old, requested: document.credentials.map(\.id),
                                        available: Set(available.map(\.credentialID)), cleanupPending: false)
                     }
@@ -166,6 +245,12 @@ public actor WorkspaceStore {
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                 connectLater: true)
             if let index { catalog.workspaces[index] = installed } else { catalog.workspaces.append(installed) }
+            if let accepted = acceptanceIndex(document, catalog: catalog) {
+                catalog.acceptedImports[accepted].transferID = transferID
+            } else {
+                catalog.acceptedImports.append(AcceptedImport(exporterID: document.exporterID, workspaceID: document.id,
+                    bundleID: document.bundleID, transferID: transferID, envelopeDigest: envelopeDigest, firstAcceptedRevision: revision))
+            }
             let next = try encode(catalog, limit: Self.catalogLimit)
             let retained = Set(bindings.map(\.account))
             let retired = Set(old?.bindings.map(\.account) ?? []).subtracting(retained).sorted()
@@ -221,11 +306,48 @@ public actor WorkspaceStore {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             guard let workspace = catalog.workspaces.first(where: { $0.id == workspaceID }) else { throw FTError.stale }
-            return Set(try workspace.bindings.filter {
-                if catalog.revokedFingerprints.contains($0.fingerprint) { return false }
-                return try vault.fingerprint(account: $0.account) == $0.fingerprint
-            }.map(\.credentialID))
+            return try availableCredentials(workspace, catalog: catalog)
         }
+    }
+
+    private func availableCredentials(_ workspace: InstalledWorkspace, catalog: Catalog) throws -> Set<String> {
+        Set(try workspace.bindings.filter {
+            if catalog.revokedFingerprints.contains($0.fingerprint) { return false }
+            return try vault.fingerprint(account: $0.account) == $0.fingerprint
+        }.map(\.credentialID))
+    }
+
+    private func acceptanceIndex(_ document: WorkspaceDocument, catalog: Catalog) -> Int? {
+        // Bundle identities belong to their exporter, independent of the current
+        // workspace placement. A bundle cannot later be rebound to another one.
+        catalog.acceptedImports.firstIndex { $0.exporterID == document.exporterID && $0.bundleID == document.bundleID }
+    }
+
+    private func assessment(_ document: WorkspaceDocument, envelopeDigest: Data, transferID: Data,
+                            catalog: Catalog) throws -> WorkspaceImportAssessment {
+        let acceptedIndex = acceptanceIndex(document, catalog: catalog)
+        let accepted = acceptedIndex.map { catalog.acceptedImports[$0] }
+        if let accepted {
+            guard accepted.workspaceID == document.id, accepted.envelopeDigest == envelopeDigest,
+                  accepted.transferID == nil || accepted.transferID == transferID else { throw WorkspaceStoreError.conflictingExport }
+        }
+        // FTAG transfer IDs and envelope digests bind the whole package, even if
+        // a conflicting document claims a different exporter or workspace name.
+        for previous in catalog.acceptedImports where previous.transferID == transferID || previous.envelopeDigest == envelopeDigest {
+            guard previous.exporterID == document.exporterID, previous.workspaceID == document.id,
+                  previous.bundleID == document.bundleID, previous.envelopeDigest == envelopeDigest,
+                  previous.transferID == nil || previous.transferID == transferID else { throw WorkspaceStoreError.conflictingExport }
+        }
+        guard accepted != nil || catalog.acceptedImports.count < Self.importHistoryLimit else { throw WorkspaceStoreError.importHistoryFull }
+        let old = try catalog.workspaces.first {
+            let prior = try $0.document()
+            return prior.exporterID == document.exporterID && prior.id == document.id
+        }
+        let oldIDs = try old.map { Set(try $0.document().machines.map(\.id)) } ?? []
+        let newIDs = Set(document.machines.map(\.id))
+        return .init(existingWorkspace: old, firstAcceptedRevision: accepted?.firstAcceptedRevision,
+                     requiresRollbackApproval: accepted != nil && old?.envelopeDigest != envelopeDigest,
+                     removesMachines: !oldIDs.isSubset(of: newIDs))
     }
 
     private func receipt(_ workspace: InstalledWorkspace, requested: [String], available: Set<String>, cleanupPending: Bool) -> WorkspaceImportReceipt {
@@ -241,8 +363,9 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 1,
+        guard var catalog = try? JSONDecoder().decode(Catalog.self, from: data), [1, 2].contains(catalog.version),
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
+              catalog.acceptedImports.count <= Self.importHistoryLimit,
               Set(catalog.workspaces.map(\.id)).count == catalog.workspaces.count,
               Set(catalog.workspaces.map(\.revision)).count == catalog.workspaces.count else { throw WorkspaceStoreError.corruptStore }
         var namespaces = Set<[String]>()
@@ -258,6 +381,30 @@ public actor WorkspaceStore {
                     throw WorkspaceStoreError.corruptStore
                 }
             }
+            if catalog.version == 1 {
+                catalog.acceptedImports.append(AcceptedImport(exporterID: document.exporterID, workspaceID: document.id,
+                    bundleID: document.bundleID, transferID: nil, envelopeDigest: workspace.envelopeDigest,
+                    firstAcceptedRevision: workspace.revision))
+            }
+        }
+        catalog.version = 2
+        var bundles = Set<[String]>(), transfers = Set<Data>(), digests = Set<Data>()
+        for accepted in catalog.acceptedImports {
+            guard (try? WorkspaceDocument.identifier(accepted.exporterID)) != nil,
+                  (try? WorkspaceDocument.identifier(accepted.workspaceID)) != nil,
+                  (try? WorkspaceDocument.identifier(accepted.bundleID)) != nil,
+                  accepted.envelopeDigest.count == 32,
+                  bundles.insert([accepted.exporterID, accepted.bundleID]).inserted,
+                  digests.insert(accepted.envelopeDigest).inserted else { throw WorkspaceStoreError.corruptStore }
+            if let transfer = accepted.transferID {
+                guard transfer.count == 16, transfers.insert(transfer).inserted else { throw WorkspaceStoreError.corruptStore }
+            }
+        }
+        for workspace in catalog.workspaces {
+            let document = try workspace.document()
+            guard let index = acceptanceIndex(document, catalog: catalog),
+                  catalog.acceptedImports[index].workspaceID == document.id,
+                  catalog.acceptedImports[index].envelopeDigest == workspace.envelopeDigest else { throw WorkspaceStoreError.corruptStore }
         }
         return catalog
     }

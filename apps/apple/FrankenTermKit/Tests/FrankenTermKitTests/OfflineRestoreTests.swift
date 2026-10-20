@@ -5,9 +5,11 @@ import XCTest
 @MainActor
 final class OfflineRestoreTests: XCTestCase {
     let crypto = TestCryptography()
-    func export(keys: Bool = true) throws -> FTAG.Export {
+    func export(keys: Bool = true, bundleID: String = "bundle") throws -> FTAG.Export {
         let (key, fingerprint) = try sampleKey(using: crypto)
-        return try FTAG.seal(AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest(fingerprint: fingerprint)),
+        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: sampleManifest(fingerprint: fingerprint)) as? [String: Any])
+        manifest["bundle_id"] = bundleID
+        return try FTAG.seal(AirGapArchive(workspace: WorkspaceDocument(data: JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])),
                                           keys: keys ? [key] : [], using: crypto), using: crypto)
     }
     func environment() -> (OfflineRestore<TestCryptography>, WorkspaceStore, StoreTestPersistence, StoreTestVault) {
@@ -145,5 +147,92 @@ final class OfflineRestoreTests: XCTestCase {
             state = try await restore.observe(sender.frame(page: 0, sequence: sequence, using: crypto), generation: state.generation)
         }
         XCTAssertEqual(state.phase, .locked)
+    }
+
+    func review(_ exported: FTAG.Export, using restore: OfflineRestore<TestCryptography>) async throws -> OfflineRestoreStatus {
+        let reset = try await restore.reset()
+        _ = try await restore.acceptEncryptedFile(exported.envelope, generation: reset.generation)
+        return try await restore.unlock(enteredCode: exported.code.reveal(using: crypto), generation: reset.generation)
+    }
+
+    func testHistoricalEncryptedRecordingRequiresReviewBoundRollbackApproval() async throws {
+        let (restore, store, persistence, vault) = environment()
+        let original = try export(bundleID: "original"), replacement = try export(bundleID: "replacement")
+        var ready = try await review(original, using: restore)
+        let first = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
+                                             sourceAndContentsConfirmed: true)
+        let firstRevision = try XCTUnwrap(first.receipt).workspace.revision
+        ready = try await review(replacement, using: restore)
+        XCTAssertFalse(try XCTUnwrap(ready.review).requiresRollbackApproval)
+        let second = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
+                                              sourceAndContentsConfirmed: true)
+        let secondRevision = try XCTUnwrap(second.receipt).workspace.revision
+        ready = try await review(original, using: restore)
+        let rollback = try XCTUnwrap(ready.review)
+        XCTAssertTrue(rollback.requiresRollbackApproval)
+        XCTAssertEqual(rollback.firstAcceptedRevision, firstRevision)
+        XCTAssertEqual(rollback.expectedRevision, secondRevision)
+        let before = persistence.bytes(.catalog)
+        do {
+            _ = try await restore.commit(reviewToken: rollback.token, generation: ready.generation,
+                sourceAndContentsConfirmed: true, allowMachineRemoval: true)
+            XCTFail("generic source/removal review silently rolled back an accepted version")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .rollbackNeedsApproval) }
+        let unchanged = await restore.status()
+        XCTAssertEqual(unchanged.phase, .review)
+        XCTAssertEqual(unchanged.review?.token, rollback.token)
+        XCTAssertEqual(persistence.bytes(.catalog), before)
+        let restored = try await restore.commit(reviewToken: rollback.token, generation: ready.generation,
+            sourceAndContentsConfirmed: true, allowHistoricalRollback: true)
+        let restoredRevision = try XCTUnwrap(restored.receipt).workspace.revision
+        XCTAssertNotEqual(restoredRevision, secondRevision)
+        XCTAssertNotEqual(restoredRevision, firstRevision)
+        ready = try await review(original, using: restore)
+        XCTAssertFalse(try XCTUnwrap(ready.review).requiresRollbackApproval)
+        let repeated = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
+                                                sourceAndContentsConfirmed: true)
+        XCTAssertEqual(repeated.receipt?.workspace.revision, restoredRevision)
+        XCTAssertEqual(vault.creates, 1)
+        let saved = try await store.load()
+        XCTAssertEqual(try saved[0].document().bundleID, "original")
+    }
+
+    func testAuthenticatedResealCannotReuseAcceptedBundleIdentity() async throws {
+        let (restore, _, persistence, vault) = environment()
+        let first = try export(), resealed = try export()
+        let ready = try await review(first, using: restore)
+        _ = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
+                                     sourceAndContentsConfirmed: true)
+        let before = persistence.bytes(.catalog)
+        do { _ = try await review(resealed, using: restore); XCTFail("same bundle resealed to different authenticated bytes") }
+        catch { XCTAssertEqual(error as? WorkspaceStoreError, .conflictingExport) }
+        let state = await restore.status()
+        XCTAssertEqual(state.phase, .locked)
+        XCTAssertNil(state.review)
+        XCTAssertEqual(state.verifiedBytes, resealed.envelope.count)
+        XCTAssertEqual(persistence.bytes(.catalog), before)
+        XCTAssertEqual(vault.creates, 1)
+        XCTAssertNil(persistence.bytes(.journal))
+    }
+
+    func testAuthenticatedNewBundleCannotReuseAcceptedTransferIdentity() async throws {
+        let (restore, _, persistence, vault) = environment()
+        let first = try export(bundleID: "first"), second = try export(bundleID: "second")
+        let ready = try await review(first, using: restore)
+        _ = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
+                                     sourceAndContentsConfirmed: true)
+        let secondArchive = try FTAG.open(second.envelope, code: second.code, using: crypto)
+        let rebound = try FTAG.sealArchiveBytes(secondArchive.encoded(), code: second.code,
+            transferID: FTAGHeader(envelope: first.envelope).transferID,
+            salt: Data(repeating: 3, count: 16), nonce: Data(repeating: 4, count: 12), using: crypto)
+        let reset = try await restore.reset()
+        _ = try await restore.acceptEncryptedFile(rebound, generation: reset.generation)
+        let before = persistence.bytes(.catalog)
+        do {
+            _ = try await restore.unlock(enteredCode: second.code.reveal(using: crypto), generation: reset.generation)
+            XCTFail("authenticated transfer identifier rebinding")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .conflictingExport) }
+        XCTAssertEqual(persistence.bytes(.catalog), before)
+        XCTAssertEqual(vault.creates, 1)
     }
 }

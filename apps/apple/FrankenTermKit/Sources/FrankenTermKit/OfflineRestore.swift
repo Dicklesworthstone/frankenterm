@@ -13,6 +13,8 @@ public struct OfflineRestoreReview: Sendable {
     public let inactiveSettingCount: Int
     public let expectedRevision: UUID?
     public let removesMachines: Bool
+    public let requiresRollbackApproval: Bool
+    public let firstAcceptedRevision: UUID?
 }
 
 public struct OfflineRestoreStatus: Sendable {
@@ -111,26 +113,22 @@ public actor OfflineRestore<C: AirGapCryptography> {
     @discardableResult
     public func unlock(enteredCode: String, generation token: UUID) async throws -> OfflineRestoreStatus {
         try check(token)
-        guard phase == .locked, let envelope else { throw FTError.stale }
+        guard phase == .locked, let envelope, let identity else { throw FTError.stale }
         let code = try TransferCode(entered: enteredCode, using: crypto)
         let decoded = try FTAG.open(envelope, code: code, using: crypto)
         phase = .preparingReview
         do {
-            let installed = try await store.load()
+            let assessment = try await store.assessImport(decoded.workspace, envelopeDigest: identity.envelopeDigest,
+                                                         transferID: identity.transferID)
             try check(token)
-            let old = try installed.first {
-                let document = try $0.document()
-                return document.id == decoded.workspace.id && document.exporterID == decoded.workspace.exporterID
-            }
-            let oldIDs = try old.map { Set(try $0.document().machines.map(\.id)) } ?? []
-            let newIDs = Set(decoded.workspace.machines.map(\.id))
             let refs = Dictionary(uniqueKeysWithValues: decoded.workspace.credentials.map { ($0.id, $0.fingerprint) })
             archive = decoded
             review = .init(token: UUID(), document: decoded.workspace,
                            includedFingerprints: decoded.keys.compactMap { refs[$0.credentialID] },
                            findings: decoded.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
-                           inactiveSettingCount: decoded.annotations.count, expectedRevision: old?.revision,
-                           removesMachines: !oldIDs.isSubset(of: newIDs))
+                           inactiveSettingCount: decoded.annotations.count, expectedRevision: assessment.existingWorkspace?.revision,
+                           removesMachines: assessment.removesMachines, requiresRollbackApproval: assessment.requiresRollbackApproval,
+                           firstAcceptedRevision: assessment.firstAcceptedRevision)
             phase = .review
             return status()
         } catch {
@@ -144,20 +142,31 @@ public actor OfflineRestore<C: AirGapCryptography> {
     /// expected saved revision. No approval can be decoded out of a QR payload.
     @discardableResult
     public func commit(reviewToken: UUID, generation token: UUID, sourceAndContentsConfirmed: Bool,
-                       allowMachineRemoval: Bool = false) async throws -> OfflineRestoreStatus {
+                       allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool = false) async throws -> OfflineRestoreStatus {
         try check(token)
         guard sourceAndContentsConfirmed else { throw WorkspaceStoreError.reviewRequired }
         guard phase == .review, let review, review.token == reviewToken, let archive, let identity else { throw FTError.stale }
+        guard !review.removesMachines || allowMachineRemoval else { throw WorkspaceStoreError.removalNeedsApproval }
+        guard !review.requiresRollbackApproval || allowHistoricalRollback else { throw WorkspaceStoreError.rollbackNeedsApproval }
         phase = .committing
         pendingNamespace = (archive.workspace.exporterID, archive.workspace.id)
         self.archive = nil; self.review = nil
         do {
-            let result = try await store.install(archive, envelopeDigest: identity.envelopeDigest,
-                expectedRevision: review.expectedRevision, sourceAndContentsConfirmed: true, allowMachineRemoval: allowMachineRemoval)
+            let result = try await store.install(archive, envelopeDigest: identity.envelopeDigest, transferID: identity.transferID,
+                expectedRevision: review.expectedRevision, sourceAndContentsConfirmed: true, allowMachineRemoval: allowMachineRemoval,
+                allowHistoricalRollback: allowHistoricalRollback)
             receipt = result; phase = .complete
             envelope = nil; receiver = nil; candidate = nil; pendingNamespace = nil
             return status()
         } catch {
+            if let reason = error as? WorkspaceStoreError,
+               [.reviewRequired, .staleReview, .removalNeedsApproval, .rollbackNeedsApproval,
+                .conflictingExport, .importHistoryFull, .revokedIdentity].contains(reason) {
+                // These decisions precede this import's first side effect. A
+                // changed catalog needs fresh review, not an ambiguous-save UI.
+                pendingNamespace = nil; phase = .locked
+                throw error
+            }
             // A storage error may follow publication. Require readback before the
             // UI offers another attempt, rather than claiming a failed import.
             phase = .recoveryRequired
