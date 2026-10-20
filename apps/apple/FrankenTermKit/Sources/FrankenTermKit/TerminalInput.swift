@@ -282,6 +282,15 @@ public actor TerminalInputCoordinator {
         guard try stream(focus).composition == nil else { throw TerminalInputError.compositionPending }
         return try enqueue(focusedConnection(focus), kind: .encodedInput, bytes: encodedBytes)
     }
+    /// Source-owned key/button release uses the reserved cleanup lane. It does
+    /// not finish/cancel a composition or advance focus, and never targets a new
+    /// responder merely because the original source is still connected.
+    public func cleanup(_ focus: TerminalFocus, encodedBytes: Data) throws -> TerminalInputReceipt? {
+        let connection = try focusedConnection(focus)
+        guard encodedBytes.count <= limits.maximumCleanupBytes else { throw TerminalInputError.capacity }
+        guard !encodedBytes.isEmpty else { return nil }
+        return try enqueue(connection, kind: .cleanup, bytes: encodedBytes)
+    }
     /// Text has already passed the shared core's newline/mode policy. This last
     /// admission boundary refuses ESC/C1 and non-text controls instead of silently
     /// rewriting them. Raw controls use the explicit shared input encoder, not paste.

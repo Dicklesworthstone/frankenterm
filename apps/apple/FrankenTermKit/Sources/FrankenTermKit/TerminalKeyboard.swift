@@ -99,6 +99,23 @@ public enum TerminalKeyboardIntent: Sendable, CustomDebugStringConvertible {
 /// with cancellation. No fallback ANSI encoder is supplied by the Swift UI.
 public protocol TerminalKeyboardEncoding: Sendable {
     func encode(_ intent: TerminalKeyboardIntent, source: TerminalSource, maximumBytes: Int) async throws -> Data
+    var supportsPaste: Bool { get }
+    /// The canonical source owner applies its newline policy and samples its
+    /// current bracketed-paste mode in the same ordering domain as encode.
+    /// The UI must never choose a bracket flag or implement an ANSI fallback.
+    func preparePaste(_ text: String, source: TerminalSource, maximumBytes: Int) async throws -> TerminalPreparedPaste
+}
+public struct TerminalPreparedPaste: Sendable, CustomDebugStringConvertible {
+    public let text: String
+    public let bracketed: Bool
+    public var debugDescription: String { "TerminalPreparedPaste([redacted])" }
+    public init(text: String, bracketed: Bool) { self.text = text; self.bracketed = bracketed }
+}
+public extension TerminalKeyboardEncoding {
+    var supportsPaste: Bool { false }
+    func preparePaste(_ text: String, source: TerminalSource, maximumBytes: Int) async throws -> TerminalPreparedPaste {
+        throw TerminalKeyboardError.unavailable
+    }
 }
 
 public enum TerminalKeyboardPhase: Equatable, Sendable { case active, handingOff, blocked, suspending, retired }
@@ -123,14 +140,17 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     public var onAdmission: (@MainActor (TerminalInputReceipt) -> Void)?
     public var onStateChange: (@MainActor () -> Void)?
     public var acceptsInput: Bool { phase == .active }
+    public var acceptsPaste: Bool { acceptsInput && !document.isMarked && encoder.supportsPaste }
 
     private enum Event {
         case beginComposition, commitComposition(String), text(String), key(TerminalHardwareKey, TerminalKeyPhase)
+        case paste(TerminalPasteReview)
         var charge: Int {
             switch self {
             case .beginComposition: 0
             case .commitComposition(let text), .text(let text): text.utf8.count
             case .key(let key, _): key.characters.utf8.count + 16
+            case .paste(let review): review.utf8Bytes
             }
         }
     }
@@ -147,6 +167,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     private var shutdown: Task<Void, Never>?
     private var ownsFocus = true
     private var admitted: UInt64 = 0, discarded: UInt64 = 0
+    private var stateObservers: [UUID: @MainActor () -> Void] = [:]
 
     public init(focus: TerminalFocus, coordinator: TerminalInputCoordinator,
                 encoder: any TerminalKeyboardEncoding, maximumEvents: Int = 128,
@@ -166,6 +187,18 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
               admittedEvents: admitted, discardedUnadmittedEvents: discarded)
     }
     private func requireActive() throws { guard acceptsInput else { throw TerminalKeyboardError.unavailable } }
+    /// Native responders observe lifecycle without replacing the application's
+    /// callback. A bounded snapshot permits removal/suspension from a callback.
+    public func observeState(_ observer: @escaping @MainActor () -> Void) throws -> UUID {
+        guard stateObservers.count < 8 else { throw TerminalKeyboardError.capacity }
+        let token = UUID(); stateObservers[token] = observer; return token
+    }
+    public func removeStateObserver(_ token: UUID) { stateObservers[token] = nil }
+    private func notifyStateChange() {
+        let callbacks = Array(stateObservers.values)
+        onStateChange?()
+        for callback in callbacks { callback() }
+    }
     private func append(_ event: Event) throws {
         let usage = accounting
         guard usage.pendingEvents < maximumEvents, event.charge <= maximumBytes - usage.pendingUTF8Bytes else {
@@ -208,8 +241,17 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     }
     public func key(_ key: TerminalHardwareKey, phase keyPhase: TerminalKeyPhase) throws {
         try requireActive()
-        guard !document.isMarked else { throw TerminalInputError.compositionPending }
+        // A physical key already released by beginComposition can still produce
+        // its delayed UIKit key-up. Keep it ordered; process ignores it once its
+        // original held-key ownership has been settled.
+        guard !document.isMarked || keyPhase == .up else { throw TerminalInputError.compositionPending }
         try append(.key(key, keyPhase))
+    }
+    public func paste(_ review: TerminalPasteReview) throws {
+        try requireActive()
+        guard acceptsPaste else { throw TerminalKeyboardError.unavailable }
+        guard review.keyboardID == id, review.focus == originalFocus else { throw TerminalInputError.stale }
+        try append(.paste(review))
     }
 
     private func schedule() {
@@ -232,6 +274,18 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
         var receipt: TerminalInputReceipt?
         switch event {
         case .beginComposition:
+            let keys = held.values.sorted { $0.usage < $1.usage }
+            if !keys.isEmpty {
+                let bytes = try await encode(.releaseAll(keys), maximum: 1024)
+                try checkLivePump()
+                let cleanup = try await coordinator.cleanup(originalFocus, encodedBytes: bytes)
+                // Only clear captured keys after their release has passed the
+                // reserved admission boundary. Failure leaves this event/held
+                // state blocked on the original source for retry or suspension.
+                held.removeAll()
+                if let cleanup { onAdmission?(cleanup) }
+                try checkLivePump()
+            }
             composition = try await coordinator.beginComposition(originalFocus)
         case .commitComposition(let text):
             guard let token = composition else { throw TerminalKeyboardError.encoding }
@@ -259,6 +313,12 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             case .up: held[key.usage] = nil
             case .press: break
             }
+        case .paste(let review):
+            guard let source = originalFocus.source else { throw TerminalKeyboardError.unavailable }
+            let prepared = try await encoder.preparePaste(review.text, source: source, maximumBytes: maximumEncodedBytes)
+            try checkLivePump()
+            guard prepared.text.utf8.count <= maximumEncodedBytes else { throw TerminalKeyboardError.capacity }
+            receipt = try await coordinator.paste(originalFocus, text: prepared.text, bracketed: prepared.bracketed)
         }
         if admitted < UInt64.max { admitted += 1 }
         if let receipt { onAdmission?(receipt) }
@@ -277,7 +337,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
                 break
             }
         }
-        worker = nil; onStateChange?()
+        worker = nil; notifyStateChange()
     }
     public func waitUntilSettled() async { if let worker { await worker.value } }
     /// Only retries a synchronous coordinator admission/side-effect-free encoder
@@ -313,11 +373,11 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
                 // retire that token here rather than leak an invisible stream.
                 if phase != .suspending {
                     _ = try? await coordinator.suspend(next)
-                    ownsFocus = false; phase = .retired; onStateChange?()
+                    ownsFocus = false; phase = .retired; notifyStateChange()
                 }
                 throw TerminalKeyboardError.unavailable
             }
-            ownsFocus = false; phase = .retired; onStateChange?()
+            ownsFocus = false; phase = .retired; notifyStateChange()
             return next
         }
         transition = job
@@ -334,7 +394,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             transition = nil; return result
         } catch {
             transition = nil
-            if phase == .handingOff { phase = .active; lastFailure = .blocked; onStateChange?() }
+            if phase == .handingOff { phase = .active; lastFailure = .blocked; notifyStateChange() }
             throw error
         }
     }
@@ -364,9 +424,9 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
                 if try await !coordinator.suspend(focus, cleanup: cleanup) { lastFailure = .capacity }
             } catch { lastFailure = .blocked }
             held.removeAll(); composition = nil; ownsFocus = false; phase = .retired
-            onStateChange?()
+            notifyStateChange()
         }
-        onStateChange?()
+        notifyStateChange()
     }
     public func waitUntilSuspended() async { if let shutdown { await shutdown.value } }
 }
