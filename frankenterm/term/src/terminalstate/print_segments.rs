@@ -20,7 +20,8 @@
 //!
 //! [`PrintCharTable`] also keeps each character's `grapheme_column_width`
 //! under the terminal's Unicode version, so the print path looks a lone
-//! character up once for both.
+//! character up once for both, and a letter with its combining marks is as
+//! wide as their widths add up to.
 
 use crate::pagegrid::RunGrapheme;
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -154,7 +155,7 @@ fn same_widths(a: &UnicodeVersion, b: &UnicodeVersion) -> bool {
 
 impl PrintCharTable {
     /// The graphemes of `text`, with the column width of each lone
-    /// character the fast path settles, under `version`.
+    /// character and plain cluster the fast path settles, under `version`.
     pub(crate) fn segments<'a, 't>(
         &'t mut self,
         text: &'a str,
@@ -210,7 +211,8 @@ impl PrintCharTable {
 }
 
 /// The graphemes of a print buffer, as `Graphemes` yields them, each with
-/// its column width when it is a lone character the table knows.
+/// its column width when it is a lone character the table knows, or a
+/// cluster [`PrintSegments::plain_cluster_len`] settles.
 pub(crate) struct PrintSegments<'a, 't> {
     text: &'a str,
     pos: usize,
@@ -242,9 +244,9 @@ impl<'a> Iterator for PrintSegments<'a, '_> {
             return Some((&rest[..len], width));
         }
         if u16::from(PLAIN) & entry != 0 {
-            if let Some(len) = self.plain_cluster_len(rest, c.len_utf8()) {
+            if let Some((len, width)) = self.plain_cluster_len(rest, c.len_utf8(), entry) {
                 self.pos += len;
-                return Some((&rest[..len], None));
+                return Some((&rest[..len], width));
             }
         }
         let grapheme = Graphemes::new(rest).next()?;
@@ -287,8 +289,9 @@ impl<'a> PrintSegments<'a, '_> {
             let next = chars.next();
             let next_entry = next.map(|next| self.table.entry(next));
             // `next`'s test of a lone character.
-            let alone = next_entry
-                .is_none_or(|next| u16::from(PLAIN) & entry != 0 && u16::from(CONTINUES) & next == 0);
+            let alone = next_entry.is_none_or(|next| {
+                u16::from(PLAIN) & entry != 0 && u16::from(CONTINUES) & next == 0
+            });
             let width = usize::from(entry >> 8);
             let len = c.len_utf8();
             if !alone
@@ -317,11 +320,28 @@ impl<'a> PrintSegments<'a, '_> {
     /// The length of the cluster that the plain character `first` bytes
     /// long at the front of `rest` starts, when each character continuing
     /// it resumes the plain state: it then ends before the first character
-    /// that does not continue it (a letter and its combining marks, say).
-    /// `None` when a continuing character does not resume it.
+    /// that does not continue it (a letter and its combining marks, say),
+    /// with the cluster's column width where the table settles it. `None`
+    /// when a continuing character does not resume it.
+    ///
+    /// Without a variation selector, `grapheme_column_width` of a grapheme
+    /// is the sum of its characters' widths, at most 2: one with emoji
+    /// presentation makes it 2, and is 2 alone. So the width is the sum of
+    /// the table's widths (`first_entry` is the first character's), which
+    /// spares such a cluster the width's two decodes and the print path's
+    /// general checks. A cluster holding a selector is left to
+    /// `grapheme_column_width`, and one holding a ZWJ too, since a cell
+    /// ending in one is a tail the print path notes.
     #[inline]
-    fn plain_cluster_len(&mut self, rest: &str, first: usize) -> Option<usize> {
+    fn plain_cluster_len(
+        &mut self,
+        rest: &str,
+        first: usize,
+        first_entry: u16,
+    ) -> Option<(usize, Option<usize>)> {
         let mut len = first;
+        let mut width = usize::from(first_entry >> 8);
+        let mut known = first_entry & WIDTH_KNOWN != 0;
         for k in rest[first..].chars() {
             let entry = self.table.entry(k);
             if u16::from(CONTINUES) & entry == 0 {
@@ -330,9 +350,11 @@ impl<'a> PrintSegments<'a, '_> {
             if u16::from(RESUMES) & entry == 0 {
                 return None;
             }
+            known &= entry & WIDTH_KNOWN != 0 && !matches!(k, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}');
+            width += usize::from(entry >> 8);
             len += k.len_utf8();
         }
-        Some(len)
+        Some((len, known.then(|| width.min(2))))
     }
 }
 

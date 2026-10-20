@@ -1091,7 +1091,8 @@ impl<'a> Performer<'a> {
         while let Some((g, known_width)) = graphemes.next() {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             // The common case, decided in a few compares: a lone character
-            // whose width the segmentation knows, after a printed cell, with
+            // (or a letter and its combining marks) whose width the
+            // segmentation knows, after a printed cell, with
             // no junction to merge, no ZWJ tail it could continue, no
             // pending wrap and room before the margin. It is printed exactly
             // as the general path below prints it (a cell joining the
@@ -4407,9 +4408,29 @@ mod tests {
     fn plain_run_regression_insert_mode_after_a_zwj_tail() {
         let _switches = test_switches();
         let pieces = [
-            "\x1b[?7h", "\x08", "\x1b[?69l", "\u{4e2d}", "\u{1f600}", "\t", "\x1b[4l", " ",
-            "\n", "\n", "a\u{200d}", "\u{1f3fb}", "\t", "\u{903}", "\x1b[m", "\u{200b}",
-            "\x1b[31m", "\n", "\x1b[m", "\x1b[4h", "\u{645}\u{631}", "\u{1f3fb}", "\x1b[4l",
+            "\x1b[?7h",
+            "\x08",
+            "\x1b[?69l",
+            "\u{4e2d}",
+            "\u{1f600}",
+            "\t",
+            "\x1b[4l",
+            " ",
+            "\n",
+            "\n",
+            "a\u{200d}",
+            "\u{1f3fb}",
+            "\t",
+            "\u{903}",
+            "\x1b[m",
+            "\u{200b}",
+            "\x1b[31m",
+            "\n",
+            "\x1b[m",
+            "\x1b[4h",
+            "\u{645}\u{631}",
+            "\u{1f3fb}",
+            "\x1b[4l",
         ];
         assert_eq!(
             print_pieces(&pieces, 9, 11, false, false),
