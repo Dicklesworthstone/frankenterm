@@ -58,7 +58,7 @@ The phone can attach directly to a persistent remote FrankenTerm mux, use a conv
 1. **Build a client of real terminals.** The remote mux owns persistent PTYs. The phone owns its view, input intent, credentials, and bounded caches.
 2. **Share terminal meaning and renderer data.** Adapt the existing Rust terminal, protocol contracts, Metal data structures, and shaders. Add native iOS surface and lifecycle integration.
 3. **Make Mac export a product feature.** Export a typed, resolved workspace, with a portability report and deliberate credential handling. A copied Lua file or SSH config is insufficient.
-4. **Treat input destination as immutable evidence.** Capture machine, route, connection generation, exact pane registration, and focus generation before admitting input. A later swipe cannot retarget it.
+4. **Treat input destination as immutable evidence.** Capture machine, route, connection generation, tagged session or pane identity, and focus generation before admitting input. A later swipe cannot retarget it.
 5. **Separate viewing from controlling.** Looking at a pane, changing local zoom, or previewing another machine never implicitly resizes a shared PTY or steals another client's input authority.
 6. **Make suspension ordinary.** Save local state, stop rendering, and resume by reauthorizing and resynchronizing the exact surviving remote pane. Never depend on indefinite background SSH execution.
 7. **Spend resources on what is visible.** One renderer per scene, bounded adjacent previews, a small active working set, and separate budgets for transport, scrollback, glyphs, images, and retained frames.
@@ -219,12 +219,12 @@ Every admitted input event carries an immutable route token containing:
 
 Focus generation is scoped to the scene/input stream, not globally to the workspace. Controller-lease generation and terminal mode/layout witnesses are included when the negotiated operation needs them. The queued event is never resolved later through a mutable `currentPane` pointer.
 
-When focus changes:
+When the user changes focus within a scene:
 
 1. Settle active IME composition on the source under the explicit policy in section 15; a preview can animate, but focus cannot move while composition is unresolved.
-2. Stop accepting new source input and enqueue an ordered barrier behind its already admitted events. Await the runtime's acknowledgement asynchronously, without blocking MainActor.
+2. Stop ordinary source admission, admit any supported held-key cleanup through the original stream's reserved cleanup path, and enqueue an ordered barrier behind that cleanup and all previously admitted events. Await the runtime's acknowledgement asynchronously, without blocking MainActor.
 3. Keep already admitted source events attached to their original route and disposition; settle or report them there. A later focus change alone cannot invalidate or retarget an admitted event.
-4. End held-key state on the source where the terminal protocol supports key release. Never forward a delayed release to the new pane.
+4. Clear the retiring stream's local held-key/modifier state after its cleanup is owned by the runtime. Ignore duplicate late release callbacks; never forward a delayed release to the new pane.
 5. Publish the destination identity and new focus generation together after the barrier is acknowledged. The acknowledgement settles local ordering; it does not pretend that an outstanding remote operation has a known outcome.
 6. Open destination input only after its connection, source identity, and applicable controller authority are valid.
 
@@ -483,6 +483,7 @@ The baseline resolver also has direct ProxyJump and two-phase matching limitatio
 | LocalForward, RemoteForward, DynamicForward | Report unsupported in the first terminal slice unless a separately qualified forwarding feature exists; never silently open listeners. |
 | Agent/X11 forwarding and connection sharing | Do not imply portability of desktop sockets or forwarding authority; expose the limitation. |
 | Compression, keepalive, timeouts | Map only supported semantics into bounded mobile policy; report differences that change behavior. |
+| Private DNS and VPN-dependent endpoints | Preserve the endpoint and explain the network dependency; use an already configured system route rather than pretending the Mac's VPN is exported. |
 
 ### 8.3 Separate machine identity from connection routes
 
@@ -585,6 +586,7 @@ This fixture is complete JSON. The reserved `.invalid` endpoints and synthetic f
       {
         "id": "route-build",
         "mode": "direct_ssh",
+        "session_creation": "on_select",
         "host": "build.example.invalid",
         "port": 22,
         "user": "operator",
@@ -709,6 +711,8 @@ Resolve credentials by canonical public-key identity and compatible access polic
 Do not silently remove machines absent from a later export or close their sessions. A differently paired or unsigned source cannot overwrite an existing trusted namespace by copying IDs; import separately or require an explicit reviewed association.
 
 Publish a structurally valid workspace atomically, while allowing reviewed machines to be in different readiness states. A missing credential or unreachable host can remain on its card without blocking every other machine. Pairing acceptance, structural validation, credential availability, trust approval, network reachability, and remote capability are separate checks.
+
+The direct-SSH fixture's proposed `session_creation: on_select` policy opens one new terminal when the user first selects a ready machine without a live local session. The import review explains and authorizes that behavior once. Background auto-connect establishes eligible transports without spawning a shell per discovered item. After session loss, the UI identifies a new-session action rather than silently relabeling a new PTY as recovered. Mux routes use their separate `existing_only` attachment policy.
 
 Automatic admission requires the accepted workspace policy, an opted-in active group, that machine's enabled preference, usable credentials/trust, and current device network policy. A device-local disable wins over incoming defaults. Membership in several groups must not create duplicate connection attempts; connect the union of deliberately active groups through one machine/route scheduler.
 
@@ -1156,7 +1160,7 @@ The default user-initiated navigation policy is **finish composition on the orig
 2. Ask the input adapter to finish marked text without synthesizing Enter.
 3. Keep the retiring responder/composition context bound to its original route.
 4. Admit the final composed text exactly once while that source remains valid.
-5. Receive local composition-completion acknowledgement, then submit an ordered close-generation barrier to the Rust session owner.
+5. Receive local composition-completion acknowledgement, admit supported held-key cleanup to the original stream, then submit an ordered close-generation barrier behind all owned source operations.
 6. After barrier acknowledgement, publish the destination identity and new stream generation together.
 7. Open destination input only when that destination is ready and authorized.
 
@@ -1257,11 +1261,13 @@ Use the existing coordinate-witness and row metadata in [render_mirror.rs](frank
 
 For a phone-created direct SSH channel, its owning client determines PTY dimensions. For a shared mux pane, resize requires negotiated geometry authority, independently represented from local focus.
 
-A resize intent contains exact pane identity, owner/lease generation, expected geometry revision, requested rows/columns, and a monotonic request generation. Bound dimensions and reject zero-sized or overflowing products before allocation or transmission.
+For mux mode, a resize intent contains exact pane identity, owner/lease generation, expected geometry revision, requested rows/columns, and a monotonic request generation. For direct SSH, identify the local session, transport/channel generation, and local request generation instead; do not invent a server pane registration or controller lease. Bound dimensions and reject zero-sized or overflowing products before allocation or transmission.
 
 Permit one in-flight resize per controlling view, with at most one coalesced successor containing the newest desired dimensions. Discard superseded unsent requests. Process responses against their request and source generations; a late acknowledgement from another pane or lease cannot update the current grid.
 
-Until an acknowledged authoritative layout arrives, retain coherent old terminal geometry and transform its presentation locally. Do not combine rows from one size with cursor coordinates from another. If the source cannot provide the required geometry contract, expose the limitation and use its qualified simpler behavior.
+For mux mode, retain coherent old geometry and transform presentation locally until the authoritative new layout arrives. Do not combine rows from one size with cursor coordinates from another.
+
+Ordinary SSH's window-change request does not supply a mux-style geometry acknowledgement; see [RFC 4254 section 6.7](https://www.rfc-editor.org/rfc/rfc4254#section-6.7). Resize the phone-owned terminal model through an explicitly ordered local resize/window-change operation, retaining the request and transport generation. Successful local transmission is not proof that the remote application has redrawn. On failure, report the actual connection/geometry uncertainty rather than fabricate an acknowledged server revision. Qualify cursor, parser, and remote TUI behavior on that weaker contract.
 
 ### 17.3 Keyboard appearance is a layout transition
 
@@ -1519,7 +1525,7 @@ The initial phone workload is twenty configured machines, two hundred discovered
 | Warm focus commit to first correctly identified destination frame | p95 at or below 50 ms | Destination already has a compatible resident snapshot; IME settlement and explicit authentication are reported separately. |
 | Gesture tracking and active terminal animation | Meet the currently selected display interval without sustained hitching | Evaluate 60 Hz and supported higher-refresh modes separately; the app cannot command the system's actual refresh rate. |
 | Render preparation plus encoding | p95 below 6 ms at 60 Hz; below 3 ms when qualifying 120 Hz | Off-main-thread work still consumes the frame deadline and device power. |
-| MainActor work associated with an update | No routine synchronous task above 8 ms; no blocking I/O or GPU waits | Inspect worst cases during import, font changes, keyboard transitions, and reconnect. |
+| MainActor work associated with an update | No routine synchronous task above 8 ms; no frame-by-frame blocking I/O or GPU waits | Inspect import, fonts, keyboard transitions, and reconnect; section 13 separately governs the required background scheduling barrier. |
 | Focused input echo on a controlled local test host | p95 within measured transport RTT plus 50 ms | Use a known echo workload and report SSH/mux processing separately; a busy remote editor is a different workload. |
 | Selected-pane synchronization after a warm authenticated reconnect | p95 within two measured RTTs plus 250 ms, excluding required user interaction | A starting target for a bounded snapshot on the controlled fixture, not a universal internet guarantee. |
 | Peak measured phone footprint in the standard workload | At or below 320 MiB | Reconcile with section 18's ledger; include churn and in-flight retirement. |
