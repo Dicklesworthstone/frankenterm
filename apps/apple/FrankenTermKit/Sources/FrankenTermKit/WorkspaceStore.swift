@@ -105,6 +105,13 @@ public struct WorkspaceLocalState: Sendable {
 /// One app-owned actor shared by every scene. There are no suspension points
 /// inside a transaction, and the persistence lease also fences other instances.
 public actor WorkspaceStore {
+    private struct CredentialIdentity: Hashable {
+        let algorithm: String
+        let fingerprint: String
+        init(_ credential: WorkspaceDocument.Credential) {
+            algorithm = credential.algorithm; fingerprint = credential.fingerprint
+        }
+    }
     private struct AcceptedImport: Codable {
         let exporterID: String
         let workspaceID: String
@@ -298,14 +305,11 @@ public actor WorkspaceStore {
             try recover(catalog: &catalog)
             let document = archive.workspace
             let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
-            var fingerprints = Set<String>()
-            if let old = review.existingWorkspace {
-                let available = try availableCredentials(old, catalog: catalog)
-                fingerprints.formUnion(try old.document().credentials.filter { available.contains($0.id) }.map(\.fingerprint))
-            }
+            var identities = Set(try reusableCredentialAccounts(for: document, preferredWorkspace: review.existingWorkspace,
+                                                               catalog: catalog).keys)
             let included = Set(archive.keys.map(\.credentialID))
-            fingerprints.formUnion(document.credentials.filter { included.contains($0.id) }.map(\.fingerprint))
-            let available = Set(document.credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id))
+            identities.formUnion(document.credentials.filter { included.contains($0.id) }.map(CredentialIdentity.init))
+            let available = Set(document.credentials.filter { identities.contains(CredentialIdentity($0)) }.map(\.id))
             return (review, try readiness(document: document, workspaceID: review.existingWorkspace?.id,
                 available: available,
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
@@ -383,40 +387,48 @@ public actor WorkspaceStore {
                 guard allowMachineRemoval || oldIDs.isSubset(of: Set(document.machines.map(\.id))) else {
                     throw WorkspaceStoreError.removalNeedsApproval
                 }
-                if old.envelopeDigest == envelopeDigest {
-                    guard old.manifest == document.raw else { throw WorkspaceStoreError.corruptStore }
-                    let available = try old.bindings.filter { try vault.fingerprint(account: $0.account) == $0.fingerprint }
-                    let fingerprints = Set(available.map(\.fingerprint))
-                    let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0.fingerprint) })
-                    if !historyUpdated, archive.keys.allSatisfy({ references[$0.credentialID].map(fingerprints.contains) == true }) {
-                        return receipt(old, requested: document.credentials.map(\.id),
-                                       available: Set(document.credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id)), cleanupPending: false)
-                    }
-                }
             } else if catalog.workspaces.count >= 32 { throw FTError.limit("store.workspaces") }
+
+            let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0) })
+            var accounts = try reusableCredentialAccounts(for: document, preferredWorkspace: old, catalog: catalog)
+            if let old, old.envelopeDigest == envelopeDigest {
+                guard old.manifest == document.raw else { throw WorkspaceStoreError.corruptStore }
+                let reusableBindings = credentialBindings(for: document, accounts: accounts)
+                let priorIdentities = Set(old.bindings.compactMap { binding -> CredentialIdentity? in
+                    guard let credential = references[binding.credentialID] else { return nil }
+                    let identity = CredentialIdentity(credential)
+                    return accounts[identity] == binding.account ? identity : nil
+                })
+                // Legacy bindings may name only one alias of a public identity.
+                // Preserve that already usable, idempotent representation.
+                let availabilityUnchanged = priorIdentities == Set(accounts.keys)
+                let includedKeysAvailable = archive.keys.allSatisfy { key in
+                    references[key.credentialID].map { accounts[CredentialIdentity($0)] != nil } == true
+                }
+                if !historyUpdated, availabilityUnchanged, includedKeysAvailable {
+                    return receipt(old, requested: document.credentials.map(\.id),
+                                   available: Set(reusableBindings.map(\.credentialID)), cleanupPending: false)
+                }
+                // The exact same public document may now resolve a key imported
+                // through another workspace. Publish those reviewed bindings in
+                // the normal transaction instead of returning a stale receipt.
+            }
 
             let transaction = UUID(), revision = UUID()
             let prefix = "ft-import:\(transaction.uuidString):"
-            let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0.fingerprint) })
-            var byFingerprint: [String: String] = [:]
-            for binding in old?.bindings ?? [] where try vault.fingerprint(account: binding.account) == binding.fingerprint {
-                byFingerprint[binding.fingerprint] = binding.account
-            }
             var creations: [(account: String, material: Data, fingerprint: String)] = []
             for key in archive.keys {
-                guard let fingerprint = references[key.credentialID] else { throw FTError.malformed("store.key_reference") }
-                if byFingerprint[fingerprint] == nil {
+                guard let credential = references[key.credentialID] else { throw FTError.malformed("store.key_reference") }
+                let identity = CredentialIdentity(credential)
+                if accounts[identity] == nil {
                     let account = prefix + String(creations.count)
-                    byFingerprint[fingerprint] = account
-                    creations.append((account, key.container, fingerprint))
+                    accounts[identity] = account
+                    creations.append((account, key.container, credential.fingerprint))
                 }
             }
             // A shared public identity can satisfy several manifest aliases without
             // making duplicate Keychain items or weakening route-specific policy.
-            let bindings = document.credentials.compactMap { credential -> InstalledWorkspace.Binding? in
-                guard let account = byFingerprint[credential.fingerprint] else { return nil }
-                return .init(credentialID: credential.id, fingerprint: credential.fingerprint, account: account)
-            }
+            let bindings = credentialBindings(for: document, accounts: accounts)
             let installed = InstalledWorkspace(id: old?.id ?? UUID(), revision: revision, manifest: document.raw,
                 envelopeDigest: envelopeDigest, bindings: bindings,
                 inactiveSettings: archive.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
@@ -508,6 +520,40 @@ public actor WorkspaceStore {
             return try vault.fingerprint(account: $0.account) == $0.fingerprint
         }.map(\.fingerprint))
         return Set(try workspace.document().credentials.filter { fingerprints.contains($0.fingerprint) }.map(\.id))
+    }
+
+    /// A public reference can reuse a canonical identity already protected by
+    /// this app, regardless of which workspace first supplied it. Metadata is
+    /// checked under the same lease as review/installation; no key is exported,
+    /// inserted, or granted permission to connect by this lookup.
+    private func reusableCredentialAccounts(for document: WorkspaceDocument, preferredWorkspace: InstalledWorkspace?,
+                                            catalog: Catalog) throws -> [CredentialIdentity: String] {
+        let requested = Set(document.credentials.filter { !catalog.revokedFingerprints.contains($0.fingerprint) }
+            .map(CredentialIdentity.init))
+        var accounts: [CredentialIdentity: String] = [:]
+        var checkedAccounts = Set<String>()
+        // Keep existing live bindings stable even when a legacy catalog contains
+        // more than one protected account for the same canonical identity.
+        let candidates = preferredWorkspace.map { [$0] } ?? []
+        for saved in candidates + catalog.workspaces.filter({ $0.id != preferredWorkspace?.id }) {
+            let references = Dictionary(uniqueKeysWithValues: try saved.document().credentials.map { ($0.id, $0) })
+            for binding in saved.bindings {
+                guard let credential = references[binding.credentialID] else { throw WorkspaceStoreError.corruptStore }
+                let identity = CredentialIdentity(credential)
+                guard requested.contains(identity), accounts[identity] == nil,
+                      checkedAccounts.insert(binding.account).inserted else { continue }
+                guard try vault.fingerprint(account: binding.account) == identity.fingerprint else { continue }
+                accounts[identity] = binding.account
+            }
+        }
+        return accounts
+    }
+
+    private func credentialBindings(for document: WorkspaceDocument, accounts: [CredentialIdentity: String]) -> [InstalledWorkspace.Binding] {
+        document.credentials.compactMap { credential in
+            guard let account = accounts[CredentialIdentity(credential)] else { return nil }
+            return .init(credentialID: credential.id, fingerprint: credential.fingerprint, account: account)
+        }
     }
 
     /// Reconcile the complete accepted identity under the storage lease. Matching

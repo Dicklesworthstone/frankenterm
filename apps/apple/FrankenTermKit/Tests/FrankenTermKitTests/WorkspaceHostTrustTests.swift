@@ -266,7 +266,9 @@ final class WorkspaceHostTrustTests: XCTestCase {
         XCTAssertEqual(decision, .revoked)
         let readiness = try await relaunched.routeReadiness(workspaceID: installed.id, support: support)
         XCTAssertEqual(readiness.first?.issues, [.hostIdentityRevoked])
-        XCTAssertEqual(vault.creates, 2, "a separate workspace owns its own staged private-key account")
+        XCTAssertEqual(vault.creates, 1, "a matching identity is reused across workspaces")
+        XCTAssertEqual(try XCTUnwrap(installed.bindings.first).account,
+                       try XCTUnwrap(second.bindings.first).account)
     }
 
     func testPublishedVersionThreeMigrationFaultKeepsGlobalDenialsAndEveryOwnedKeyUntilRecovery() async throws {

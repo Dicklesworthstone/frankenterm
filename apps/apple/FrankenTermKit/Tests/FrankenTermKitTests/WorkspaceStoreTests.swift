@@ -48,7 +48,7 @@ final class StoreTestPersistence: WorkspacePersistence, @unchecked Sendable {
 }
 
 final class StoreTestVault: WorkspaceCredentialVault, @unchecked Sendable {
-    enum Fault { case beforeInsert, afterInsert, remove }
+    enum Fault { case beforeInsert, afterInsert, remove, readFingerprint }
     private let lock = NSLock()
     private var items: [String: (Data, String)] = [:]
     private var fault: Fault?
@@ -64,7 +64,9 @@ final class StoreTestVault: WorkspaceCredentialVault, @unchecked Sendable {
         if case .afterInsert = fault { fault = nil; throw FTError.storage }
     }
     func fingerprint(account: String) throws -> String? {
-        lock.lock(); defer { lock.unlock() }; return items[account]?.1
+        lock.lock(); defer { lock.unlock() }
+        if case .readFingerprint = fault { fault = nil; throw FTError.storage }
+        return items[account]?.1
     }
     func remove(account: String) throws {
         lock.lock(); defer { lock.unlock() }
@@ -83,6 +85,19 @@ final class WorkspaceStoreTests: XCTestCase {
         var document = try WorkspaceDocument(data: sampleManifest(fingerprint: fingerprint))
         if let bundleID { document = try document.reissuingBundle(id: bundleID) }
         return try AirGapArchive(workspace: document, keys: keys ? [key] : [], using: crypto)
+    }
+    private func workspaceArchive(id: String, bundleID: String, keys: Bool = false,
+                                  edit: (inout [String: Any]) -> Void = { _ in }) throws -> AirGapArchive {
+        let original = try archive(keys: keys, bundleID: bundleID)
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: original.workspace.raw) as? [String: Any])
+        var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
+        workspace["id"] = id; edit(&workspace); root["workspace"] = workspace
+        return try AirGapArchive(workspace: WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])),
+                                 keys: original.keys, using: crypto)
+    }
+    private var supportedIdentityProfile: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
     }
     /// The catalog shape published before host-revocation history was added.
     /// Keep these fields explicit so migration is tested against that real format.
@@ -232,6 +247,182 @@ final class WorkspaceStoreTests: XCTestCase {
         let receipt = try await store.install(archive(keys: false), envelopeDigest: digest, expectedRevision: nil, sourceAndContentsConfirmed: true)
         XCTAssertEqual(receipt.missingCredentialIDs, ["key"])
         XCTAssertTrue(receipt.workspace.bindings.isEmpty)
+    }
+
+    func testPublicWorkspaceReusesDeviceIdentityAcrossWorkspacesAndOrderedAliases() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let source = try await store.install(archive(), envelopeDigest: digest, transferID: transferID,
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        let candidate = try workspaceArchive(id: "public-work", bundleID: "public-aliases") { workspace in
+            var credentials = workspace["credentials"] as! [[String: Any]], alias = credentials[0]
+            alias["id"] = "alias"; credentials.append(alias); workspace["credentials"] = credentials
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["credential_refs"] = ["alias", "key"]; workspace["routes"] = routes
+        }
+        let before = disk.bytes(.catalog)
+        let preview = try await store.previewImport(candidate, envelopeDigest: Data(repeating: 31, count: 32),
+            support: supportedIdentityProfile)
+        XCTAssertNil(preview.assessment.existingWorkspace)
+        XCTAssertEqual(preview.routes.first?.usableCredentialIDs, ["alias", "key"])
+        XCTAssertEqual(preview.routes.first?.isLocallyReady, true)
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 1)
+
+        let restore = OfflineRestore(using: crypto, store: store)
+        let initial = await restore.status()
+        let review = try await restore.acceptWorkspaceDocument(candidate.workspace.raw, generation: initial.generation)
+        XCTAssertEqual(review.source, .workspaceDocument); XCTAssertNil(review.identity)
+        XCTAssertEqual(review.review?.includedFingerprints, [])
+        let completed = try await restore.commit(reviewToken: XCTUnwrap(review.review).token, generation: review.generation,
+            sourceAndContentsConfirmed: true)
+        let imported = try XCTUnwrap(completed.receipt)
+        XCTAssertTrue(imported.workspace.connectLater); XCTAssertTrue(imported.missingCredentialIDs.isEmpty)
+        XCTAssertEqual(Set(imported.workspace.bindings.map(\.credentialID)), ["alias", "key"])
+        XCTAssertEqual(Set(imported.workspace.bindings.map(\.account)), [source.workspace.bindings[0].account])
+        XCTAssertEqual(vault.creates, 1); XCTAssertEqual(vault.count, 1)
+
+        // Even an encrypted package carrying the same private identity must
+        // reuse the existing protected item rather than insert another copy.
+        let withKey = try workspaceArchive(id: "encrypted-work", bundleID: "encrypted-shared", keys: true)
+        let shared = try await store.install(withKey, envelopeDigest: Data(repeating: 32, count: 32),
+            transferID: Data(repeating: 32, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true)
+        XCTAssertEqual(shared.workspace.bindings[0].account, source.workspace.bindings[0].account)
+        XCTAssertTrue(shared.missingCredentialIDs.isEmpty); XCTAssertEqual(vault.creates, 1)
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let snapshot = try await reopened.loadWithLocalPolicy()
+        XCTAssertEqual(snapshot.first(where: { $0.workspace.id == imported.workspace.id })?.credentialIDs, ["alias", "key"])
+    }
+
+    func testPublicReplayAttachesKeyImportedLaterWithoutForgettingOriginalAcceptance() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let restore = OfflineRestore(using: crypto, store: store)
+        let candidate = try workspaceArchive(id: "waiting-work", bundleID: "waiting-public")
+        var state = await restore.status()
+        state = try await restore.acceptWorkspaceDocument(candidate.workspace.raw, generation: state.generation)
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+            sourceAndContentsConfirmed: true)
+        let missing = try XCTUnwrap(state.receipt)
+        XCTAssertEqual(missing.missingCredentialIDs, ["key"]); XCTAssertEqual(vault.creates, 0)
+        let source = try await store.install(archive(), envelopeDigest: digest, transferID: transferID,
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+
+        state = try await restore.reset()
+        state = try await restore.acceptWorkspaceDocument(candidate.workspace.raw, generation: state.generation)
+        XCTAssertEqual(state.review?.expectedRevision, missing.workspace.revision)
+        XCTAssertEqual(state.review?.firstAcceptedRevision, missing.workspace.revision)
+        XCTAssertEqual(state.review?.isRollback, false)
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+            sourceAndContentsConfirmed: true)
+        let resolved = try XCTUnwrap(state.receipt)
+        XCTAssertEqual(resolved.workspace.id, missing.workspace.id)
+        XCTAssertNotEqual(resolved.workspace.revision, missing.workspace.revision)
+        XCTAssertEqual(resolved.workspace.envelopeDigest, missing.workspace.envelopeDigest)
+        XCTAssertEqual(resolved.workspace.bindings[0].account, source.workspace.bindings[0].account)
+        XCTAssertTrue(resolved.missingCredentialIDs.isEmpty); XCTAssertEqual(vault.creates, 1)
+
+        let before = disk.bytes(.catalog)
+        do {
+            _ = try await store.install(candidate, envelopeDigest: missing.workspace.envelopeDigest,
+                expectedRevision: missing.workspace.revision, sourceAndContentsConfirmed: true)
+            XCTFail("a stale review replaced newly resolved credential bindings")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        XCTAssertEqual(disk.bytes(.catalog), before)
+        state = try await restore.reset()
+        state = try await restore.acceptWorkspaceDocument(candidate.workspace.raw, generation: state.generation)
+        XCTAssertEqual(state.review?.firstAcceptedRevision, missing.workspace.revision)
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+            sourceAndContentsConfirmed: true)
+        XCTAssertEqual(state.receipt?.workspace.revision, resolved.workspace.revision)
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertEqual(vault.creates, 1)
+        let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        XCTAssertEqual((catalog["acceptedImports"] as? [[String: Any]])?.count, 2)
+        XCTAssertNil(disk.bytes(.journal))
+    }
+
+    func testSharedDeviceKeySurvivesEverySourceRetirementPublicationBoundary() async throws {
+        for (fault, published) in [(StoreTestPersistence.Fault.before(.journal), false), (.after(.journal), false),
+                                  (.before(.catalog), false), (.after(.catalog), true)] {
+            let disk = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: disk, vault: vault)
+            let source = try await store.install(archive(), envelopeDigest: digest, transferID: transferID,
+                expectedRevision: nil, sourceAndContentsConfirmed: true)
+            let candidate = try workspaceArchive(id: "shared-work", bundleID: "shared-public")
+            let shared = try await store.install(candidate, envelopeDigest: Data(repeating: 33, count: 32),
+                expectedRevision: nil, sourceAndContentsConfirmed: true)
+            let account = try XCTUnwrap(source.workspace.bindings.first?.account)
+            XCTAssertEqual(shared.workspace.bindings.first?.account, account)
+            let replacement = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()).reissuingBundle(id: "retire-source"),
+                                                keys: [], using: crypto)
+            disk.configure(fault)
+            do {
+                _ = try await store.install(replacement, envelopeDigest: Data(repeating: 34, count: 32),
+                    transferID: Data(repeating: 34, count: 16), expectedRevision: source.workspace.revision, sourceAndContentsConfirmed: true)
+                XCTFail("source replacement publication fault was not exercised")
+            } catch {}
+            let reopened = WorkspaceStore(persistence: disk, vault: vault)
+            let snapshot = try await reopened.loadWithLocalPolicy()
+            XCTAssertEqual(snapshot.first(where: { $0.workspace.id == shared.workspace.id })?.credentialIDs, ["key"])
+            XCTAssertEqual(try snapshot.first(where: { $0.workspace.id == source.workspace.id })?.workspace.document().bundleID,
+                published ? "retire-source" : "bundle")
+            XCTAssertEqual(vault.count, 1); XCTAssertEqual(vault.creates, 1); XCTAssertNil(disk.bytes(.journal))
+
+            // Only removal of the final reachable binding can retire the item.
+            let removeShared = try workspaceArchive(id: "shared-work", bundleID: "retire-shared") { workspace in
+                var credentials = workspace["credentials"] as! [[String: Any]]
+                credentials[0]["public_fingerprint"] = "SHA256:" + String(repeating: "A", count: 43)
+                workspace["credentials"] = credentials
+            }
+            _ = try await reopened.install(removeShared, envelopeDigest: Data(repeating: 35, count: 32),
+                expectedRevision: shared.workspace.revision, sourceAndContentsConfirmed: true)
+            XCTAssertEqual(vault.count, published ? 0 : 1)
+        }
+    }
+
+    func testCrossWorkspaceReuseChecksProtectedMetadataAndCanonicalRevocationPolicy() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let source = try await store.install(original, envelopeDigest: digest, transferID: transferID,
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        let candidate = try workspaceArchive(id: "candidate-work", bundleID: "candidate-public")
+        let nextDigest = Data(repeating: 36, count: 32), before = disk.bytes(.catalog)
+        vault.configure(.readFingerprint)
+        do {
+            _ = try await store.previewImport(candidate, envelopeDigest: nextDigest, support: supportedIdentityProfile)
+            XCTFail("protected metadata failure was treated as a usable key")
+        } catch { XCTAssertEqual(error as? FTError, .storage) }
+        vault.configure(.readFingerprint)
+        do {
+            _ = try await store.install(candidate, envelopeDigest: nextDigest, expectedRevision: nil, sourceAndContentsConfirmed: true)
+            XCTFail("protected metadata failure was ignored during installation")
+        } catch { XCTAssertEqual(error as? FTError, .storage) }
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 1)
+
+        let relabeled = try workspaceArchive(id: "false-work", bundleID: "false-algorithm") { workspace in
+            var credentials = workspace["credentials"] as! [[String: Any]]
+            credentials[0]["algorithm"] = "ecdsa-sha2-nistp256"; workspace["credentials"] = credentials
+        }
+        do {
+            _ = try await store.previewImport(relabeled, envelopeDigest: nextDigest, support: supportedIdentityProfile)
+            XCTFail("a different workspace borrowed an identity with a conflicting algorithm")
+        } catch { XCTAssertEqual(error as? FTError, .malformed("store.credential_identity")) }
+        XCTAssertEqual(disk.bytes(.catalog), before)
+        try vault.remove(account: source.workspace.bindings[0].account)
+        let missing = try await store.previewImport(candidate, envelopeDigest: nextDigest, support: supportedIdentityProfile)
+        XCTAssertEqual(missing.routes.first?.usableCredentialIDs, [])
+        XCTAssertTrue(try XCTUnwrap(missing.routes.first).issues.contains(.credentialUnavailable))
+
+        try await store.revokeLocally(fingerprint: original.workspace.credentials[0].fingerprint)
+        let revoked = disk.bytes(.catalog)
+        do {
+            _ = try await store.previewImport(candidate, envelopeDigest: nextDigest, support: supportedIdentityProfile)
+            XCTFail("a new workspace bypassed a canonical credential revocation")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .revokedIdentity) }
+        do {
+            _ = try await store.install(candidate, envelopeDigest: nextDigest, expectedRevision: nil, sourceAndContentsConfirmed: true)
+            XCTFail("installation bypassed a canonical credential revocation")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .revokedIdentity) }
+        XCTAssertEqual(disk.bytes(.catalog), revoked); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 1)
     }
     func testUnreferencedOldKeyIsRetiredOnlyAfterReplacementPublishes() async throws {
         for (fault, oldSurvives) in [(StoreTestPersistence.Fault.before(.catalog), true), (.after(.catalog), false)] {
