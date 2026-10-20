@@ -7,6 +7,7 @@
   "notes": [
     "All secrets, salts, nonces, and transfer IDs are PUBLIC TEST INPUTS. Production must generate fresh random values.",
     "Ciphertext bytes are checked by their full SHA-256 plus exact length and tag; reconstruct using the exact chosen payload and padding.",
+    "Construct archive bytes as hex(prefix_hex) || hex(repeat_byte_hex) repeated repeat_count times || hex(suffix_hex); verify length and archive_sha256 before using the vector.",
     "The compressed fixture fixes one valid zlib stream. Other valid compressor outputs need not produce identical ciphertext.",
     "Successful decryption is followed by expected workspace-schema rejection. These fixtures must never publish configuration or stage a key.",
     "Transport-boundary cases are arithmetic tests; some lengths are deliberately not valid FTAG envelope lengths.",
@@ -25,7 +26,6 @@
       "transfer_id_hex": "303132333435363738393a3b3c3d3e3f",
       "salt_hex": "101112131415161718191a1b1c1d1e1f",
       "nonce_hex": "202122232425262728292a2b",
-      "archive_hex": "8501427b7d808080",
       "codec": 0,
       "chosen_payload_hex": "8501427b7d808080",
       "archive_length": 8,
@@ -41,7 +41,14 @@
       "envelope_length": 4170,
       "envelope_sha256": "67479d4af8f3ee221300eb16adc5ad2442eadaeccc562004c733c6247072fd34",
       "comparison_value": "6747-9D4A-F8F3-EE22-1300",
-      "expected_archive_validation": "reject_not_an_activation_ready_workspace"
+      "expected_archive_validation": "reject_not_an_activation_ready_workspace",
+      "archive_construction": {
+        "prefix_hex": "8501427b7d808080",
+        "repeat_byte_hex": "00",
+        "repeat_count": 0,
+        "suffix_hex": ""
+      },
+      "archive_sha256": "504ed7f760a9588660ea8bfaba63155892df7bfba86557288241ac1eb9d8f619"
     },
     {
       "name": "code-v1-codec-1",
@@ -50,7 +57,6 @@
       "transfer_id_hex": "707172737475767778797a7b7c7d7e7f",
       "salt_hex": "505152535455565758595a5b5c5d5e5f",
       "nonce_hex": "606162636465666768696a6b",
-      "archive_hex": "850159010e7b2266697874757265223a2241414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141227d808080",
       "codec": 1,
       "chosen_payload_hex": "78da6b658c64e4ab564acbac28292d4a55b252721ce140a9b6a1a1010044084830",
       "archive_length": 278,
@@ -66,7 +72,14 @@
       "envelope_length": 4170,
       "envelope_sha256": "7666f3a5e35309598f07201154f70821a4c7a6be55a4104414c0218901131bf9",
       "comparison_value": "7666-F3A5-E353-0959-8F07",
-      "expected_archive_validation": "reject_not_an_activation_ready_workspace"
+      "expected_archive_validation": "reject_not_an_activation_ready_workspace",
+      "archive_construction": {
+        "prefix_hex": "850159010e7b2266697874757265223a22",
+        "repeat_byte_hex": "41",
+        "repeat_count": 256,
+        "suffix_hex": "227d808080"
+      },
+      "archive_sha256": "4aff5169e7cda0a2c0cf1c2baf14538240d6971780329233e3bb986677de214b"
     }
   ],
   "code_boundaries": [
