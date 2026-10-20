@@ -17140,9 +17140,21 @@ mod tests {
 
     #[test]
     fn resize_preparation_releases_locks_and_observes_supersession() {
+        // Page rows reflow synchronously (no preparation) until page-wise
+        // reflow, so pin legacy rows whatever FT_GRID_ENGINE says.
+        #[derive(Debug)]
+        struct LegacyRowsConfig;
+        impl TerminalConfiguration for LegacyRowsConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> frankenterm_term::config::GridEngine {
+                frankenterm_term::config::GridEngine::Legacy
+            }
+        }
         let terminal = TerminalMutex::new(Terminal::new(
             term_size(80, 3),
-            Arc::new(GuardianLifetimeTestTermConfig),
+            Arc::new(LegacyRowsConfig),
             "FrankenTerm",
             "resize-preparation-test",
             Box::new(std::io::sink()),
