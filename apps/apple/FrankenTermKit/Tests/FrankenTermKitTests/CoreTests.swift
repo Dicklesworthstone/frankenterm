@@ -8,7 +8,7 @@ func publicBlob(_ raw: Data) -> Data {
     return result
 }
 
-func sampleManifest(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") throws -> Data {
+func sampleManifest(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", bundleID: String = "bundle") throws -> Data {
     let palette = Array(repeating: "#123456", count: 16)
     let theme: [String: Any] = ["id": "theme", "name": "Cobalt", "foreground": "#FFFFFF", "background": "#10223C", "accent": "#3B82F6", "ansi": palette,
                                 "cursor_foreground": "#000000", "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF", "selection_background": "#345D91"]
@@ -22,7 +22,7 @@ func sampleManifest(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
                         "pins": [["algorithm": "ssh-ed25519", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]]],
         "themes": [theme], "preferences": ["initial_machine_ref": "build", "initial_group_ref": "group", "connect_on_open": true]
     ]
-    return try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": "bundle", "source": ["exporter_id": "mac"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
+    return try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": bundleID, "source": ["exporter_id": "mac"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
 }
 
 private func changedWorkspace(_ change: (inout [String: Any]) -> Void) throws -> Data {
@@ -175,6 +175,33 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try ordinary.verifyHostKey(forRouteID: "route", presented: pin, reviewedTrustIDs: ["trust"], locallyRejectedTrustIDs: ["trust"], support: qualifiedTestTransport), .locallyRejected)
         XCTAssertEqual(try ordinary.verifyHostKey(forRouteID: "route", presented: pin, certificateAuthority: other, reviewedTrustIDs: ["trust"], support: qualifiedTestTransport), .unsupportedCertificate)
     }
+    func testLocalHostRevocationPrecedesAlgorithmReadinessForEachJump() throws {
+        let document = try WorkspaceDocument(data: changedWorkspace { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            var pins = trusts[0]["pins"] as! [[String: Any]]
+            pins.append(["algorithm": "ssh-rsa", "fingerprint": "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"])
+            trusts[0]["pins"] = pins
+            var hopTrust = trusts[0]; hopTrust["id"] = "hop-trust"; hopTrust["host"] = "jump.example.invalid"
+            trusts.append(hopTrust); workspace["host_trust"] = trusts
+            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
+            hop["id"] = "jump"; hop["host"] = "jump.example.invalid"; hop["host_trust_ref"] = "hop-trust"
+            routes[0]["jump_routes"] = ["jump"]; routes.append(hop); workspace["routes"] = routes
+        })
+        let ed25519 = try XCTUnwrap(document.hostTrust[0].pins.first)
+        let reviewed: Set<String> = ["trust", "hop-trust"]
+        XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            support: qualifiedTestTransport).isLocallyReady)
+        let targetRevoked = try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: ["trust": [ed25519]], support: qualifiedTestTransport)
+        XCTAssertEqual(targetRevoked.issues, [.hostAlgorithmUnavailable], "An unrevoked unsupported pin cannot replace a revoked supported pin.")
+        let hopRevocations: [String: Set<WorkspaceDocument.HostKey>] = ["hop-trust": [ed25519]]
+        XCTAssertEqual(try document.readiness(forRouteID: "jump", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.hostAlgorithmUnavailable])
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: hopRevocations, support: qualifiedTestTransport).issues, [.blockedJumpRoute("jump")])
+        XCTAssertEqual(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: reviewed,
+            locallyRevokedHostKeys: ["trust": Set(document.hostTrust[0].pins)], support: qualifiedTestTransport).issues, [.hostIdentityRevoked])
+    }
     func testIncompleteTrustAndUnsupportedRouteRemainVisibleWithoutDowngrade() throws {
         let data = try changedWorkspace { workspace in
             var routes = workspace["routes"] as! [[String: Any]]
@@ -273,6 +300,59 @@ final class CoreTests: XCTestCase {
             XCTAssertEqual(document.routes[0].host, expected); XCTAssertEqual(document.hostTrust[0].host, expected)
         }
         for invalid in ["host/path", "host#fragment", "-bad.example", "bad..example", "fe80::1%en0", "1.2.3.999", "01.2.3.4", "2001:db8::xyz"] {
+            XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
+        }
+    }
+    func testPersistedHostIdentityDecodingCannotSkipValidation() throws {
+        let key = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        XCTAssertEqual(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONEncoder().encode(key)), key)
+        for fields in [
+            ["algorithm": "ssh-ed25519", "fingerprint": "invalid"],
+            ["algorithm": "", "fingerprint": key.fingerprint],
+            ["algorithm": "ssh-ed25519\n", "fingerprint": key.fingerprint],
+            ["algorithm": key.algorithm, "fingerprint": key.fingerprint + "="]
+        ] {
+            XCTAssertThrowsError(try JSONDecoder().decode(WorkspaceDocument.HostKey.self, from: JSONSerialization.data(withJSONObject: fields)))
+        }
+    }
+    func testMappedIPv4CannotAcquireASecondTrustIdentity() throws {
+        for spelling in ["::FFFF:C000:0201", "::ffff:192.0.2.1", "[::ffff:192.0.2.1]"] {
+            XCTAssertEqual(try WorkspaceDocument.host(spelling), "192.0.2.1")
+            let raw = try changedWorkspace { workspace in
+                var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
+                routes[0]["host"] = spelling; trusts[0]["host"] = "192.0.2.1"
+                workspace["routes"] = routes; workspace["host_trust"] = trusts
+            }
+            let document = try WorkspaceDocument(data: raw)
+            XCTAssertEqual(document.routes[0].host, document.hostTrust[0].host)
+            XCTAssertEqual(document.raw, raw, "Canonical trust identity must preserve the imported display/export bytes.")
+        }
+    }
+    func testEndpointCanonicalFormIsStableAcrossIDNAAndIPv6Variants() throws {
+        for (spelling, canonical) in [
+            ("BÜCHER.example.", "xn--bcher-kva.example"),
+            ("bu\u{0308}cher.example", "xn--bcher-kva.example"),
+            ("ＢＵＩＬＤ。ＥＸＡＭＰＬＥ", "build.example"),
+            ("host.example。", "host.example"),
+            ("192.0.2.1。", "192.0.2.1"),
+            ("2001:0:0:1:0:0:1:1", "2001::1:0:0:1:1"),
+            ("1:2:3:4:5:6:0:8", "1:2:3:4:5:6:0:8"),
+            ("0:0:0:0:0:0:0:0", "::")
+        ] {
+            XCTAssertEqual(try WorkspaceDocument.host(spelling), canonical, spelling)
+            XCTAssertEqual(try WorkspaceDocument.host(canonical), canonical, "Endpoint normalization must be idempotent.")
+        }
+    }
+    func testEndpointAdmissionRefusesResolverAliasesAndEncodedAuthorityDelimiters() throws {
+        for invalid in [
+            "127.1", "2130706433", "0x7f000001", "0x7f.0.0.1", "0177.0.0.1", "127.00.0.1",
+            "ssh://host.example", "user@host.example", "host.example:22", "host%2eexample", "host.example?next=other",
+            "host／example", "user＠host.example", "host.example：22", "host.example？next", "host.example＃other",
+            "host.example＼path", "host％2eexample", "host\u{00A0}example", "host\0.example",
+            "[::1]:22", "[127.0.0.1]", "[::1", "::1]",
+            String(repeating: "a", count: 64) + ".example",
+            Array(repeating: String(repeating: "a", count: 63), count: 4).joined(separator: ".")
+        ] {
             XCTAssertThrowsError(try WorkspaceDocument.host(invalid), invalid)
         }
     }

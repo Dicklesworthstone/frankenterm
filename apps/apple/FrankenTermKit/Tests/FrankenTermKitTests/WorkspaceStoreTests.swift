@@ -370,7 +370,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let first = try await store.install(original, envelopeDigest: digest, transferID: transferID,
                                             expectedRevision: nil, sourceAndContentsConfirmed: true)
         var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        legacy["version"] = 1; legacy.removeValue(forKey: "acceptedImports")
+        legacy["version"] = 1; legacy.removeValue(forKey: "acceptedImports"); legacy.removeValue(forKey: "hostRevocations")
         persistence.seed(try JSONSerialization.data(withJSONObject: legacy), slot: .catalog)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let loaded = try await reopened.load()
@@ -385,7 +385,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(repeated.workspace.revision, first.workspace.revision)
         XCTAssertEqual(vault.creates, 1)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 2)
+        XCTAssertEqual(upgraded["version"] as? Int, 3)
         let accepted = try XCTUnwrap((upgraded["acceptedImports"] as? [[String: Any]])?.first)
         XCTAssertEqual(accepted["transferID"] as? String, transferID.base64EncodedString())
         XCTAssertEqual(accepted["envelopeDigest"] as? String, digest.base64EncodedString())

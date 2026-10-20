@@ -258,11 +258,17 @@ public struct WorkspaceDocument: Sendable {
         public let requiredCapabilities: [String], requiredExtensions: [String]
     }
     /// Canonical SSH public-key identity, not a negotiated signature algorithm.
-    public struct HostKey: Hashable, Sendable {
+    public struct HostKey: Hashable, Codable, Sendable {
         public let algorithm: String, fingerprint: String
         public init(algorithm: String, fingerprint: String) throws {
             self.algorithm = try WorkspaceDocument.sshAlgorithm(algorithm)
             self.fingerprint = try WorkspaceDocument.fingerprint(fingerprint, at: "trust.fingerprint")
+        }
+        private enum CodingKeys: String, CodingKey { case algorithm, fingerprint }
+        public init(from decoder: any Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            try self.init(algorithm: fields.decode(String.self, forKey: .algorithm),
+                          fingerprint: fields.decode(String.self, forKey: .fingerprint))
         }
     }
     public struct HostTrust: Identifiable, Sendable {
@@ -523,6 +529,7 @@ public struct WorkspaceDocument: Sendable {
     }
     public func readiness(forRouteID id: String, availableCredentialIDs: Set<String>, reviewedTrustIDs: Set<String> = [],
                           revokedCredentialFingerprints: Set<String> = [], locallyRejectedTrustIDs: Set<String> = [],
+                          locallyRevokedHostKeys: [String: Set<HostKey>] = [:],
                           support: RouteSupport = .offlineOnly) throws -> RouteReadiness {
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
@@ -555,7 +562,11 @@ public struct WorkspaceDocument: Sendable {
                 else if usable.isEmpty, !methods.isEmpty { add(.credentialAlgorithmUnavailable) }
             }
             if locallyRejectedTrustIDs.contains(trust.id) { add(.locallyRejectedTrust) }
+            // The store resolves durable endpoint decisions to every matching
+            // trust ID. Apply them before deciding which key algorithms remain
+            // usable, including when this route supplies a transit hop.
             let revoked = Set(trust.revokedKeys.map(\.fingerprint))
+                .union((locallyRevokedHostKeys[trust.id] ?? []).map(\.fingerprint))
             let acceptablePins = trust.pins.filter { !revoked.contains($0.fingerprint) }
             if trust.pins.isEmpty { add(.hostTrustMissing) }
             else if acceptablePins.isEmpty { add(.hostIdentityRevoked) }
@@ -695,43 +706,83 @@ public struct WorkspaceDocument: Sendable {
         return UInt16(value)
     }
     static func host(_ value: String) throws -> String {
+        // This parser performs no name resolution. Original display/export
+        // spelling stays in raw; trust comparisons and network targets use the
+        // same canonical endpoint, including persistent negative trust.
         guard !value.isEmpty, value.utf8.count <= 1024,
-              !value.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),
-              !value.contains("/"), !value.contains("\\"), !value.contains("@"), !value.contains("%"), !value.contains("?") else {
-            throw FTError.malformed("route.host")
+              !value.unicodeScalars.contains(where: { $0.properties.isWhitespace || $0.value < 32 || (127...159).contains($0.value) }),
+              value.rangeOfCharacter(from: CharacterSet(charactersIn: "/\\@?#%")) == nil
+        else { throw FTError.malformed("route.host") }
+        var input = value
+        if input.contains("[") || input.contains("]") {
+            guard input.first == "[", input.last == "]" else { throw FTError.malformed("route.host") }
+            input = String(input.dropFirst().dropLast())
+            guard input.contains(":"), !input.contains("["), !input.contains("]") else { throw FTError.malformed("route.host") }
         }
-        var normalized = value
-        if normalized.hasPrefix("[") && normalized.hasSuffix("]") { normalized = String(normalized.dropFirst().dropLast()) }
-        if normalized.contains(":") {
+        if input.contains(":") {
             #if canImport(Darwin) || canImport(Glibc)
-            var address = in6_addr(), output = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-            guard normalized.withCString({ inet_pton(AF_INET6, $0, &address) }) == 1,
-                  inet_ntop(AF_INET6, &address, &output, socklen_t(INET6_ADDRSTRLEN)) != nil else { throw FTError.malformed("route.ipv6") }
-            return String(decoding: output.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            // The C string and destination address live only for this call.
+            // No pointer escapes these synchronous closures.
+            var address = in6_addr()
+            guard input.withCString({ inet_pton(AF_INET6, $0, &address) }) == 1 else { throw FTError.malformed("route.ipv6") }
+            let bytes = withUnsafeBytes(of: &address) { Array($0) }
+            guard bytes.count == 16 else { throw FTError.malformed("route.ipv6") }
+            // IPv4-mapped IPv6 reaches the same IPv4 endpoint. It cannot become
+            // another identity that bypasses that endpoint's rejected key.
+            if bytes.prefix(10).allSatisfy({ $0 == 0 }), bytes[10] == 255, bytes[11] == 255 {
+                return bytes.suffix(4).map(String.init).joined(separator: ".")
+            }
+            // Deterministic RFC 5952 spelling, including first-run tie breaking.
+            // Do not depend on platform-specific inet_ntop display conventions.
+            let words = stride(from: 0, to: 16, by: 2).map { (UInt16(bytes[$0]) << 8) | UInt16(bytes[$0 + 1]) }
+            var bestStart = 0, bestLength = 0, index = 0
+            while index < words.count {
+                guard words[index] == 0 else { index += 1; continue }
+                let start = index
+                while index < words.count, words[index] == 0 { index += 1 }
+                if index - start > bestLength { bestStart = start; bestLength = index - start }
+            }
+            let text = words.map { String($0, radix: 16) }
+            guard bestLength >= 2 else { return text.joined(separator: ":") }
+            return text[..<bestStart].joined(separator: ":") + "::" + text[(bestStart + bestLength)...].joined(separator: ":")
             #else
             throw FTError.unsupported("route.ipv6")
             #endif
         }
-        guard !value.contains("[") && !value.contains("]") else { throw FTError.malformed("route.host") }
-        // Foundation's URL host conversion applies IDNA. Validate the resulting
-        // ASCII labels separately so URL syntax cannot become an endpoint.
-        if normalized.unicodeScalars.contains(where: { $0.value > 127 }) {
-            var components = URLComponents(); components.scheme = "ssh"; components.host = normalized
-            guard let converted = components.url?.host else { throw FTError.malformed("route.idna") }
-            normalized = converted
+        // Foundation's documented IDNA conversion supports internationalized
+        // names. Check the whole authority and then the ASCII result; percent
+        // fallback, userinfo, ports and path interpretation are never endpoints.
+        guard let parsed = URLComponents(string: "https://" + input, encodingInvalidCharacters: true),
+              parsed.scheme == "https", parsed.user == nil, parsed.password == nil, parsed.port == nil,
+              parsed.path.isEmpty, parsed.query == nil, parsed.fragment == nil,
+              var canonical = parsed.encodedHost, !canonical.isEmpty
+        else { throw FTError.malformed("route.host") }
+        canonical = canonical.lowercased()
+        if canonical.last == "." { canonical.removeLast() }
+        guard !canonical.isEmpty, canonical.utf8.count <= 253,
+              canonical.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 46 })
+        else { throw FTError.malformed("route.host") }
+        let labels = canonical.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 63 && $0.first != "-" && $0.last != "-" }) else {
+            throw FTError.malformed("route.host")
         }
-        normalized = normalized.lowercased()
-        if normalized.hasSuffix(".") { normalized.removeLast() }
-        guard !normalized.isEmpty, normalized.utf8.count <= 253 else { throw FTError.malformed("route.host") }
-        let labels = normalized.split(separator: ".", omittingEmptySubsequences: false)
-        for label in labels {
-            guard !label.isEmpty, label.utf8.count <= 63, label.first != "-", label.last != "-", label.utf8.allSatisfy({
-                (48...57).contains($0) || (97...122).contains($0) || $0 == 45
-            }) else { throw FTError.malformed("route.host") }
+        let numeric = labels.allSatisfy { label in
+            if label.utf8.allSatisfy({ (48...57).contains($0) }) { return true }
+            return label.hasPrefix("0x") && label.count > 2 && label.dropFirst(2).utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
         }
-        if labels.count == 4, labels.allSatisfy({ $0.utf8.allSatisfy({ (48...57).contains($0) }) }) {
-            guard labels.allSatisfy({ UInt8($0) != nil && ($0.count == 1 || $0.first != "0") }) else { throw FTError.malformed("route.ipv4") }
+        if numeric {
+            // Legacy octal, hexadecimal, shortened and integer IPv4 spellings
+            // are accepted by some resolvers. Refuse them before networking.
+            guard labels.count == 4, labels.allSatisfy({
+                $0.utf8.allSatisfy({ (48...57).contains($0) }) && ($0.count == 1 || $0.first != "0") && UInt8($0) != nil
+            }) else { throw FTError.malformed("route.ipv4") }
+            #if canImport(Darwin) || canImport(Glibc)
+            var address = in_addr()
+            guard canonical.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else { throw FTError.malformed("route.ipv4") }
+            #endif
         }
-        return normalized
+        return canonical
     }
 }
