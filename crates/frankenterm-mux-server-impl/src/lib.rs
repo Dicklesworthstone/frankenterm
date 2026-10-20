@@ -17485,7 +17485,19 @@ impl LiveScrollbackSpillSink {
                 max_retained_rows,
                 LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES,
             )
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            .map_err(|error| {
+                log::error!(
+                    "staging the replacement scrollback ledger beside {} failed: {error}",
+                    self.manifest_path.display()
+                );
+                ScrollbackSpillError::StorageUnavailable
+            })?;
+        if staged.set_aside_interrupted() {
+            log::warn!(
+                "set aside an interrupted attempt at this scrollback replacement beside {} and staged it again",
+                self.manifest_path.display()
+            );
+        }
         if staged.record_count() != row_count || staged.committed_bytes() != committed_record_bytes
         {
             return Err(ScrollbackSpillError::StorageUnavailable);

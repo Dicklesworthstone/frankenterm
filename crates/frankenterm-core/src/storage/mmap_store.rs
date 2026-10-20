@@ -723,6 +723,7 @@ pub struct MmapStagedPaneLedger {
     record_bytes: u64,
     committed_bytes: u64,
     reused_existing: bool,
+    set_aside_interrupted: bool,
 }
 
 impl MmapStagedPaneLedger {
@@ -750,6 +751,13 @@ impl MmapStagedPaneLedger {
     pub const fn reused_existing(self) -> bool {
         self.reused_existing
     }
+
+    /// An earlier attempt at this transaction stopped partway (a failed
+    /// write or a crash); its files were set aside before this one staged.
+    #[must_use]
+    pub const fn set_aside_interrupted(self) -> bool {
+        self.set_aside_interrupted
+    }
 }
 
 impl std::fmt::Debug for MmapStagedPaneLedger {
@@ -761,6 +769,7 @@ impl std::fmt::Debug for MmapStagedPaneLedger {
             .field("record_bytes", &self.record_bytes)
             .field("committed_bytes", &self.committed_bytes)
             .field("reused_existing", &self.reused_existing)
+            .field("set_aside_interrupted", &self.set_aside_interrupted)
             .finish()
     }
 }
@@ -1282,6 +1291,57 @@ impl PaneFile {
             line_offsets: Vec::new(),
             pruned_offsets: Vec::new(),
         }))
+    }
+
+    /// Whether an existing deterministic slot is an earlier attempt at the
+    /// same transaction that stopped before writing all `expected_records`.
+    /// Staging creates the log, then the empty sequence journal, then writes
+    /// records; setting a slot aside renames the log first. So a failed
+    /// write, a crash, or an interrupted set-aside leaves an empty or absent
+    /// journal beside a header-free log holding fewer complete records than
+    /// expected (or no log, or an empty log with no journal yet).
+    fn versioned_slot_is_interrupted(
+        log_path: &Path,
+        sequence_path: &Path,
+        log_exists: bool,
+        sequence_exists: bool,
+        expected_records: usize,
+        max_physical_bytes: u64,
+    ) -> Result<bool, MmapStoreError> {
+        if sequence_exists && std::fs::symlink_metadata(sequence_path)?.len() != 0 {
+            return Ok(false);
+        }
+        if !log_exists {
+            return Ok(true);
+        }
+        let file = Self::open_existing_append_file(log_path)?;
+        let physical_bytes = file.metadata()?.len();
+        Ok(matches!(
+            Self::scan_offsets_and_base_bounded(
+                &file,
+                Some(expected_records),
+                Some(max_physical_bytes),
+            ),
+            Ok((line_offsets, _, 0, 0))
+                if line_offsets.len() < expected_records
+                    || (!sequence_exists && physical_bytes == 0)
+        ))
+    }
+
+    /// Retain an interrupted slot's files under unique hidden names, log
+    /// first, so the slot can be staged again. Nothing is deleted.
+    fn set_aside_interrupted_slot(
+        log_path: &Path,
+        sequence_path: &Path,
+    ) -> Result<(), MmapStoreError> {
+        for path in [log_path, sequence_path] {
+            match std::fs::rename(path, Self::unique_staging_path(path, "interrupted")?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Self::sync_parent_directory(log_path)
     }
 
     fn unique_staging_path(path: &Path, purpose: &str) -> Result<PathBuf, MmapStoreError> {
@@ -3443,10 +3503,26 @@ impl MmapScrollbackStore {
         };
         let log_exists = path_is_regular(&log_path)?;
         let sequence_exists = path_is_regular(&sequence_path)?;
-        if log_exists != sequence_exists {
+        // A slot this store has open was staged or published here; never
+        // move it.
+        let set_aside_interrupted = (log_exists || sequence_exists)
+            && !self.panes.contains_key(&pane_id)
+            && PaneFile::versioned_slot_is_interrupted(
+                &log_path,
+                &sequence_path,
+                log_exists,
+                sequence_exists,
+                records.len(),
+                committed_byte_limit_observation,
+            )?;
+        if set_aside_interrupted {
+            // Publication follows a complete, synchronized stage, so a short
+            // slot was never published. Refusing it as a collision would fail
+            // every retry of this transaction for good.
+            PaneFile::set_aside_interrupted_slot(&log_path, &sequence_path)?;
+        } else if log_exists != sequence_exists {
             return Err(MmapStoreError::VersionedPaneIdentityCollision);
-        }
-        if log_exists {
+        } else if log_exists {
             let pane = PaneFile::open_bounded(
                 &self.base_dir,
                 pane_id,
@@ -3480,6 +3556,7 @@ impl MmapScrollbackStore {
                 record_bytes,
                 committed_bytes: pane.file_len,
                 reused_existing: true,
+                set_aside_interrupted: false,
             };
             self.panes.insert(pane_id, pane);
             return Ok(staged);
@@ -3518,6 +3595,7 @@ impl MmapScrollbackStore {
             record_bytes,
             committed_bytes,
             reused_existing: false,
+            set_aside_interrupted,
         };
         self.verify_staged_pane_ledger(staged, records)?;
         Ok(staged)
@@ -6401,6 +6479,88 @@ mod tests {
             2,
             "one deterministic transaction owns exactly one .log/.seq pair"
         );
+    }
+
+    #[test]
+    fn interrupted_replacement_slot_is_set_aside_and_staged_again() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let records = vec!["first".to_string(), "second".to_string()];
+        let set_aside = |replacement_id: u64| -> Vec<Vec<u8>> {
+            let mut kept: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with(&format!(".{replacement_id}."))
+                        && name.contains(".interrupted-")
+                })
+                .map(|entry| entry.path())
+                .collect();
+            kept.sort();
+            kept.into_iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect()
+        };
+        // A write that failed after one record and part of the next, a crash
+        // between the set-aside renames, and a crash between creating the
+        // log and its journal.
+        let cases: [(u64, Option<&[u8]>, Option<&[u8]>, &[String]); 3] = [
+            (0x260, Some(b"first\nsec"), Some(b""), &records),
+            (0x261, None, Some(b""), &records),
+            (0x262, Some(b""), None, &[]),
+        ];
+        for (low, log, sequence, expected) in cases {
+            let replacement_id = (1_u64 << 63) | low;
+            let log_path = dir.path().join(format!("{replacement_id}.log"));
+            let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+            if let Some(bytes) = log {
+                std::fs::write(&log_path, bytes).unwrap();
+            }
+            if let Some(bytes) = sequence {
+                std::fs::write(&sequence_path, bytes).unwrap();
+            }
+            let committed =
+                u64::try_from(expected.iter().map(|r| r.len() + 1).sum::<usize>()).unwrap();
+            let staged = store
+                .stage_versioned_pane_replacement(
+                    replacement_id,
+                    expected,
+                    expected.len(),
+                    committed,
+                )
+                .expect("an interrupted attempt must not block its retry");
+            assert!(staged.set_aside_interrupted());
+            assert!(!staged.reused_existing());
+            assert_eq!(staged.record_count(), expected.len());
+            let mut kept: Vec<Vec<u8>> = [log, sequence]
+                .into_iter()
+                .flatten()
+                .map(<[u8]>::to_vec)
+                .collect();
+            kept.sort();
+            let mut retained = set_aside(replacement_id);
+            retained.sort();
+            assert_eq!(retained, kept, "every interrupted file is retained");
+            store
+                .verify_staged_pane_ledger(staged, expected)
+                .expect("the restaged slot holds this transaction exactly");
+        }
+
+        // A journal entry or a header means the slot is not this
+        // transaction's interrupted stage: refuse it, untouched.
+        let replacement_id = (1_u64 << 63) | 0x263;
+        let log_path = dir.path().join(format!("{replacement_id}.log"));
+        let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+        std::fs::write(&log_path, b"first\n").unwrap();
+        std::fs::write(&sequence_path, b"FTSEQ1:0\n").unwrap();
+        assert!(
+            store
+                .stage_versioned_pane_replacement(replacement_id, &records, 2, 13)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"first\n");
+        assert!(set_aside(replacement_id).is_empty());
     }
 
     #[test]
