@@ -3,26 +3,26 @@ import Foundation
 import XCTest
 @testable import FrankenTermKit
 
+private struct AppleSourceFixtureFile: Decodable, Sendable {
+    let passphrase: String
+    let pairs: [AppleSourcePair]
+}
+private struct AppleSourcePair: Decodable, Sendable {
+    let id: String, algorithm: String, cipher: String, fingerprint: String
+    let rounds: UInt32
+    let encryptedPEM: String, clearPEM: String
+}
+
 /// These tests execute CryptoKit SHA-512/key derivation and CommonCrypto AES on
 /// Apple platforms. A Linux run excludes this file and does not qualify them.
 /// The portable source tests separately cover malformed files and retry policy.
 @MainActor
 final class AppleOpenSSHSourceKeyTests: XCTestCase {
-    private struct FixtureFile: Decodable, Sendable {
-        let passphrase: String
-        let pairs: [Pair]
-    }
-    private struct Pair: Decodable, Sendable {
-        let id: String, algorithm: String, cipher: String, fingerprint: String
-        let rounds: UInt32
-        let encryptedPEM: String, clearPEM: String
-    }
-
-    private func fixtures() throws -> FixtureFile {
+    private func fixtures() throws -> AppleSourceFixtureFile {
         let repository = (0..<6).reduce(URL(fileURLWithPath: #filePath)) { result, _ in
             result.deletingLastPathComponent()
         }
-        return try JSONDecoder().decode(FixtureFile.self, from: Data(contentsOf:
+        return try JSONDecoder().decode(AppleSourceFixtureFile.self, from: Data(contentsOf:
             repository.appendingPathComponent("fixtures/ios-airgap/openssh-source-keys.json")))
     }
 

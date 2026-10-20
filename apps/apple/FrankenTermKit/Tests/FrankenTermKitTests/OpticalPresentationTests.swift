@@ -104,6 +104,12 @@ final class AppleOpticalPresentationTests: XCTestCase {
         let source = try XCTUnwrap(CGImageSourceCreateWithData(symbol.png as CFData, nil))
         let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
         XCTAssertEqual(image.width, symbol.moduleSide)
+        XCTAssertEqual(image.width, 113)
+        XCTAssertEqual(image.height, 113)
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = [.qr]
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        XCTAssertEqual(request.results?.map(\.payloadStringValue), [text])
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ft-animation-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         let url = root.appendingPathComponent("test.apng")

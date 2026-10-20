@@ -5,7 +5,8 @@ var testDependencies: [Target.Dependency] = ["FrankenTermKit"]
 var targets: [Target] = [
     .systemLibrary(name: "CZlib"),
     .target(name: "COpenSSHBcrypt", path: "Sources/COpenSSHBcrypt", publicHeadersPath: "include"),
-    .target(name: "FrankenTermKit", dependencies: ["CZlib", "COpenSSHBcrypt"])
+    .target(name: "CQRCodeGen", path: "Sources/CQRCodeGen", publicHeadersPath: "include"),
+    .target(name: "FrankenTermKit", dependencies: ["CZlib", "COpenSSHBcrypt", "CQRCodeGen"])
 ]
 #if os(Linux)
 // Independent test oracle only. No OpenSSL edge enters an Apple product.

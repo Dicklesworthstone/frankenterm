@@ -91,12 +91,10 @@ struct OpticalVideoVerifier: Sendable {
     }
 }
 
-#if canImport(AVFoundation) && canImport(CoreImage) && canImport(Vision) && canImport(CryptoKit) && canImport(Darwin)
+#if canImport(AVFoundation) && canImport(CoreGraphics) && canImport(Vision) && canImport(CryptoKit) && canImport(Darwin)
 // AVFoundation's macOS 14-compatible writer/reader APIs predate Swift actor
 // annotations. Every native object below stays on this actor, including cancel.
 @preconcurrency import AVFoundation
-import CoreImage
-import CoreImage.CIFilterBuiltins
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -108,7 +106,6 @@ import Vision
 /// Source buffers are limited to four 1024-square BGRA buffers. Native codec and
 /// Vision calls run serially with a cooperative ten-minute operation deadline.
 public actor NativeOpticalVideo {
-    private let context = CIContext(options: [.cacheIntermediates: false])
     private let crypto = AppleCryptography()
     private var operationID: UUID?
     private var expired = false
@@ -181,15 +178,13 @@ public actor NativeOpticalVideo {
                          deadline: ContinuousClock.Instant) async throws -> OpticalVideoReceipt {
         var verifier = try OpticalVideoVerifier(source: source, symbolsPerSecond: symbolsPerSecond, using: crypto)
         let plan = verifier.plan
-        var largestCode = 0
         for text in verifier.expectedTexts {
             try checkpoint(deadline)
-            largestCode = max(largestCode, try autoreleasepool { try qrCode(text).width })
+            _ = try FixedQRCode(text: text)
         }
-        // Core Image chooses each QR version itself. Preflight every symbol and
-        // use one common integer module scale, fixed canvas, and >=4-module quiet
-        // zone. This does not claim that the SDK can force a fixed QR version.
-        let scale = OpticalVideoPlan.pixelSide / (largestCode + 8)
+        // The shared profile fixes version, ECC, integer scale, and quiet zone
+        // before any source frame is encoded. No SDK chooses a per-frame size.
+        let scale = OpticalVideoPlan.pixelSide / FixedQRCodeProfile.ftqr1.rasterSide
         guard scale >= 4 else { throw FTError.limit("video.qr_scale") }
         let access = destination.startAccessingSecurityScopedResource()
         defer { if access { destination.stopAccessingSecurityScopedResource() } }
@@ -251,7 +246,7 @@ public actor NativeOpticalVideo {
         for (symbolIndex, text) in verifier.expectedTexts.enumerated() {
             try checkpoint(deadline)
             let buffer = try await buffer(from: pool, deadline: deadline)
-            try autoreleasepool { try draw(text: text, into: buffer, scale: scale) }
+            try autoreleasepool { try draw(text: text, into: buffer) }
             // The buffer is immutable for every hold and while retained by the
             // encoder. There is no interpolation or crossfade between symbols.
             for heldFrame in 0..<plan.framesPerSymbol {
@@ -322,16 +317,6 @@ public actor NativeOpticalVideo {
         return Int(size.uint64Value)
     }
 
-    private func qrCode(_ text: String) throws -> CGImage {
-        guard text.hasPrefix("FTQR1/"), text.utf8.count <= FTLimit.qrText,
-              text.utf8.allSatisfy({ $0 < 128 }) else { throw FTError.malformed("video.qr_payload") }
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(text.utf8); filter.correctionLevel = "Q"
-        guard let output = filter.outputImage, let code = context.createCGImage(output, from: output.extent),
-              code.width == code.height, code.width >= 21, code.width <= 185 else { throw FTError.unsupported("video.qr_capacity") }
-        return code
-    }
-
     private func buffer(from pool: CVPixelBufferPool, deadline: ContinuousClock.Instant) async throws -> CVPixelBuffer {
         let bound = [kCVPixelBufferPoolAllocationThresholdKey as String: 4] as CFDictionary
         while true {
@@ -345,21 +330,27 @@ public actor NativeOpticalVideo {
         }
     }
 
-    private func draw(text: String, into buffer: CVPixelBuffer, scale: Int) throws {
-        let code = try qrCode(text), side = OpticalVideoPlan.pixelSide
-        guard (code.width + 8) * scale <= side,
+    private func draw(text: String, into buffer: CVPixelBuffer) throws {
+        let side = OpticalVideoPlan.pixelSide
+        let raster = try FixedQRCode(text: text).raster(pixelSide: side)
+        guard raster.moduleScale >= 4,
+              CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(buffer) == side, CVPixelBufferGetHeight(buffer) == side,
               CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { throw FTError.storage }
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let address = CVPixelBufferGetBaseAddress(buffer),
-              let canvas = CGContext(data: address, width: side, height: side, bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue) else { throw FTError.storage }
-        canvas.setFillColor(gray: 1, alpha: 1)
-        canvas.fill(CGRect(x: 0, y: 0, width: side, height: side))
-        canvas.interpolationQuality = .none; canvas.setShouldAntialias(false)
-        let margin = (side - code.width * scale) / 2
-        guard margin >= 4 * scale else { throw FTError.limit("video.quiet_zone") }
-        canvas.draw(code, in: CGRect(x: margin, y: margin, width: code.width * scale, height: code.height * scale))
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        guard rowBytes >= side * 4, let address = CVPixelBufferGetBaseAddress(buffer) else { throw FTError.storage }
+        let output = address.assumingMemoryBound(to: UInt8.self)
+        raster.pixels.withUnsafeBytes { source in
+            let input = source.bindMemory(to: UInt8.self)
+            for y in 0..<side {
+                for x in 0..<side {
+                    let shade = input[y * side + x], offset = y * rowBytes + x * 4
+                    output[offset] = shade; output[offset + 1] = shade; output[offset + 2] = shade
+                    output[offset + 3] = 255
+                }
+            }
+        }
     }
 
     private func verify(candidate: URL, verifier: inout OpticalVideoVerifier,

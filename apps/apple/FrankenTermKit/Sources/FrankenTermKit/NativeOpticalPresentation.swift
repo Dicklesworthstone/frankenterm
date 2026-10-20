@@ -54,9 +54,7 @@ public enum SelectedLocalFile {
     }
 }
 
-#if canImport(CoreImage) && canImport(Vision) && canImport(CryptoKit)
-import CoreImage
-import CoreImage.CIFilterBuiltins
+#if canImport(CoreGraphics) && canImport(Vision) && canImport(CryptoKit)
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -71,7 +69,6 @@ public struct QRCodeSymbol: Sendable {
 /// Native image objects and their buffers remain isolated to this actor. Only
 /// owned PNG data crosses to the UI. No screenshot or capture API is involved.
 public actor NativeOpticalPresentation {
-    private let context = CIContext(options: [.cacheIntermediates: false])
     private let crypto = AppleCryptography()
     public init() {}
 
@@ -84,27 +81,14 @@ public actor NativeOpticalPresentation {
         return .init(png: bytes as Data, moduleSide: image.width)
     }
     private func raster(text: String, pixelSide: Int?) throws -> CGImage {
-        guard text.utf8.count <= FTLimit.qrText, text.hasPrefix("FTQR1/"), text.utf8.allSatisfy({ $0 < 128 }) else {
-            throw FTError.malformed("qr.presentation")
-        }
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(text.utf8); filter.correctionLevel = "Q"
-        guard let output = filter.outputImage,
-              let code = context.createCGImage(output, from: output.extent) else { throw FTError.unsupported("qr.capacity") }
-        guard code.width == code.height, code.width <= 185 else { throw FTError.limit("qr.modules") }
-        let modules = code.width + 8, side = pixelSide ?? modules
-        guard side >= modules, side <= 2048 else { throw FTError.limit("qr.pixels") }
-        let scale = side / modules, quiet = 4 * scale
-        guard let canvas = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
-                                     bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+        let raster = try FixedQRCode(text: text).raster(pixelSide: pixelSide)
+        guard let provider = CGDataProvider(data: raster.pixels as CFData),
+              let image = CGImage(width: raster.pixelSide, height: raster.pixelSide, bitsPerComponent: 8,
+                bitsPerPixel: 8, bytesPerRow: raster.pixelSide, space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: provider,
+                decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
             throw FTError.storage
         }
-        canvas.setFillColor(gray: 1, alpha: 1)
-        canvas.fill(CGRect(x: 0, y: 0, width: side, height: side))
-        canvas.interpolationQuality = .none; canvas.setShouldAntialias(false)
-        let margin = (side - modules * scale) / 2 + quiet
-        canvas.draw(code, in: CGRect(x: margin, y: margin, width: code.width * scale, height: code.height * scale))
-        guard let image = canvas.makeImage() else { throw FTError.storage }
         return image
     }
 
