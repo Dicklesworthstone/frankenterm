@@ -525,6 +525,47 @@ mod tests {
                 segmented(&mut table, &text).into_iter().map(|(g, _)| g).collect();
             prop_assert_eq!(graphemes, reference(&text));
         }
+
+        /// `plain_run` and `next` called in any order, as the print loop
+        /// calls them, segment a buffer as `Graphemes` does between them,
+        /// every width they give `grapheme_column_width`'s: each call starts
+        /// where the one before stopped, whatever stopped it.
+        #[test]
+        fn plain_runs_and_next_interleaved_segment_as_graphemes_segments_them(
+            chars in prop::collection::vec(mixed_char(), 0..48),
+            calls in prop::collection::vec((any::<bool>(), 1usize..12, any::<bool>()), 1..16),
+        ) {
+            let text: String = chars.into_iter().collect();
+            let version = latest();
+            let mut table = PrintCharTable::default();
+            let mut segments = table.segments(&text, &version);
+            let mut got: Vec<(String, Option<usize>)> = Vec::new();
+            let mut cells = Vec::new();
+            for &(run, room, multibyte) in calls.iter().cycle() {
+                if run {
+                    cells.clear();
+                    if segments.plain_run(room, multibyte, &mut cells) > 0 {
+                        got.extend(
+                            cells
+                                .iter()
+                                .map(|cell| (cell.text.to_string(), Some(usize::from(cell.width)))),
+                        );
+                        continue;
+                    }
+                }
+                match segments.next() {
+                    Some((g, width)) => got.push((g.to_string(), width)),
+                    None => break,
+                }
+            }
+            let graphemes: Vec<String> = got.iter().map(|(g, _)| g.clone()).collect();
+            prop_assert_eq!(graphemes, reference(&text));
+            for (g, width) in got {
+                if let Some(width) = width {
+                    prop_assert_eq!(width, grapheme_column_width(&g, Some(&version)), "{:?}", g);
+                }
+            }
+        }
     }
 
     /// A new Unicode version refills the widths.
