@@ -333,6 +333,7 @@ impl GuardianPanePublicationReceipt {
 enum UnpublishedPaneRollback {
     KillNative,
     RetireGuardian,
+    CloseGuardianBirth,
 }
 
 impl UnpublishedPane {
@@ -351,6 +352,24 @@ impl UnpublishedPane {
         Ok(Self {
             pane: Some(Arc::new(pane)),
             rollback: UnpublishedPaneRollback::RetireGuardian,
+            guardian_publication: Some(Arc::new(AtomicU8::new(GUARDIAN_PUBLICATION_PENDING))),
+        })
+    }
+
+    /// [`Self::from_guardian_proxy`] for a pane whose child the guardian
+    /// started for this spawn (a birth). Nothing ever showed the pane, so
+    /// abandoning it closes the child, as a native spawn's rollback kills
+    /// its own, instead of leaving it running unclaimed under the guardian
+    /// (ft-hn80q). A restored pane keeps lease-only retirement: its child is
+    /// the user's running process.
+    pub fn from_guardian_birth(pane: LocalPane) -> anyhow::Result<Self> {
+        if let Err(error) = pane.validate_unpublished_guardian_proxy() {
+            Pane::kill(&pane);
+            return Err(error);
+        }
+        Ok(Self {
+            pane: Some(Arc::new(pane)),
+            rollback: UnpublishedPaneRollback::CloseGuardianBirth,
             guardian_publication: Some(Arc::new(AtomicU8::new(GUARDIAN_PUBLICATION_PENDING))),
         })
     }
@@ -406,6 +425,9 @@ impl Drop for UnpublishedPane {
             drop(pane);
             return;
         }
+        // A birth (CloseGuardianBirth) closes its guardian child through
+        // the pane's kill, which marks the lease closed so the LocalPane's
+        // Drop then retires nothing; a native pane kills its child.
         let rollback = catch_recoverable(
             RecoverablePanicSite::MuxRegistrationRollback,
             std::panic::AssertUnwindSafe(|| pane.kill()),

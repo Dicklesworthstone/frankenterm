@@ -216,7 +216,9 @@ pub fn guardian_admits_image_scrollback_rows(socket: &Path, token: &Path) -> boo
 
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
-/// transaction; an unadopted birth fences further spawning in this domain.
+/// transaction. A birth fences further spawning in this domain until it is
+/// published, fails or is abandoned; a failed or abandoned birth closes its
+/// child once claimed and never fences the domain for good (ft-hn80q).
 pub struct GuardianDomain {
     commands: LocalDomain,
     owner: std::sync::Weak<mux::Mux>,
@@ -232,6 +234,42 @@ struct GuardianDomainState {
     census: Option<Arc<GuardianCensusCoordinator>>,
     unadopted_birth: Option<(Uuid, Uuid, Uuid)>,
     publication: Option<GuardianPanePublicationReceipt>,
+}
+
+/// What the birth fence still asks of a spawn or a recovery capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BirthFence {
+    /// No birth holds the fence, or the last one was published.
+    Clear,
+    /// A settled birth's pane is about to be registered: retry shortly.
+    AwaitingRegistration,
+}
+
+impl GuardianDomainState {
+    /// Settles the fence a birth sets before its Spawn. A published birth
+    /// asks nothing more, and a settled one not yet registered keeps the
+    /// fence for a retry. Any other birth failed or was abandoned: its child
+    /// was closed with it, or, if the birth failed before claiming it, keeps
+    /// running unclaimed under the guardian. Keeping the fence then refused
+    /// every later spawn and every recovery capture for the mux's lifetime,
+    /// so one failed spawn ended upgrades (ft-hn80q); it is released.
+    fn settle_birth(&mut self) -> BirthFence {
+        let Some((pane, request, effect)) = self.unadopted_birth else {
+            return BirthFence::Clear;
+        };
+        match self.publication.as_ref() {
+            Some(receipt) if receipt.was_published() => BirthFence::Clear,
+            Some(receipt) if receipt.is_pending() => BirthFence::AwaitingRegistration,
+            _ => {
+                log::warn!(
+                    "guardian birth pane={pane} request={request} effect={effect} ended without registration; releasing its spawn fence"
+                );
+                self.unadopted_birth = None;
+                self.publication = None;
+                BirthFence::Clear
+            }
+        }
+    }
 }
 
 struct GuardianDomainSpawnAdmission(Arc<AtomicBool>);
@@ -337,24 +375,16 @@ impl Domain for GuardianDomain {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| mux::domain::DomainRecoveryPolicyBusy)?;
         let _admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
-        let state = self
+        let mut state = self
             .state
             .try_lock()
             .ok_or(mux::domain::DomainRecoveryPolicyBusy)?;
-        if state.unadopted_birth.is_some() {
-            match state.publication.as_ref() {
-                Some(receipt) if receipt.was_published() => {}
-                // A settled birth whose pane is about to be registered: the
-                // next capture sees it published. Refusing it as unsupported
-                // disabled recovery for the mux's lifetime whenever the first
-                // capture raced the first spawn.
-                Some(receipt) if receipt.is_pending() => {
-                    return Err(mux::domain::DomainRecoveryPolicyBusy.into());
-                }
-                _ => anyhow::bail!(
-                    "guardian domain retains an unpublished birth during recovery capture"
-                ),
-            }
+        // A settled birth whose pane is about to be registered: the next
+        // capture sees it published. Refusing it as unsupported disabled
+        // recovery for the mux's lifetime whenever the first capture raced
+        // the first spawn.
+        if state.settle_birth() == BirthFence::AwaitingRegistration {
+            return Err(mux::domain::DomainRecoveryPolicyBusy.into());
         }
         anyhow::ensure!(
             [self.socket_path.as_path(), self.token_path.as_path()]
@@ -398,17 +428,13 @@ impl Domain for GuardianDomain {
         let admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
         {
             let mut state = self.state.lock();
-            if let Some((pane, request, effect)) = state.unadopted_birth {
-                anyhow::ensure!(
-                    state
-                        .publication
-                        .as_ref()
-                        .is_some_and(|receipt| receipt.was_published()),
-                    "guardian domain retains an unadopted birth: pane={pane} request={request} effect={effect}"
-                );
-                state.unadopted_birth = None;
-                state.publication = None;
-            }
+            anyhow::ensure!(
+                state.settle_birth() == BirthFence::Clear,
+                "guardian domain has a settled birth awaiting registration"
+            );
+            // A published birth's bookkeeping ends with the next spawn.
+            state.unadopted_birth = None;
+            state.publication = None;
         }
         let pane_id = mux::pane::alloc_pane_id()?;
         let command = self
@@ -569,53 +595,76 @@ impl Domain for GuardianDomain {
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
-            let (client, reply) = reconcile_genesis_birth(
-                client,
-                (pane, request, effect),
-                command,
-                pty_size,
-                started,
-                || connect(Some(census.guardian_incarnation()), false),
-            )?;
-            anyhow::ensure!(
-                reply
-                    == (GuardianReply::Spawned {
-                        pane_id: pane,
-                        generation: 0
-                    }),
-                "guardian returned an unexpected birth receipt"
-            );
-            // Hello authenticates the guardian UUID, not its or the broker's
-            // build. Recover those nonsecret fields only from private AEAD
-            // custody, binding all identities known by this successful birth.
-            let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
-                &token,
-                client.guardian_incarnation(),
-                mux_incarnation,
-                pane,
-                effect,
-                frankenterm_pty_guardian::guardian_runtime_build_identity()
-                    .context("guardian birth requires the compiled mux build")?
-                    .into_bytes(),
-            )
-            .context("authenticate existing guardian birth custody")?;
-            let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
-                .context("prepare guardian birth lease")?
-                .with_spawn_custody(custody)?
-                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
-                .context("claim guardian birth lease")?
-                .restore_and_activate(config, birth_limits)
-                .context("restore and activate guardian birth")?;
-            let unpublished = UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
-                pane_id,
-                domain_id,
-                description,
-            ))?;
-            // The read-only receipt can become true only after actual mux
-            // publication. Cancellation keeps it false; successful publication
-            // remains remembered even after a short-lived pane is pruned.
-            state.lock().publication = unpublished.guardian_publication_receipt();
-            Ok(unpublished)
+            let born = (|| -> anyhow::Result<UnpublishedPane> {
+                let (client, reply) = reconcile_genesis_birth(
+                    client,
+                    (pane, request, effect),
+                    command,
+                    pty_size,
+                    started,
+                    || connect(Some(census.guardian_incarnation()), false),
+                )?;
+                anyhow::ensure!(
+                    reply
+                        == (GuardianReply::Spawned {
+                            pane_id: pane,
+                            generation: 0
+                        }),
+                    "guardian returned an unexpected birth receipt"
+                );
+                // Hello authenticates the guardian UUID, not its or the
+                // broker's build. Recover those nonsecret fields only from
+                // private AEAD custody, binding all identities known by this
+                // successful birth.
+                let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+                    &token,
+                    client.guardian_incarnation(),
+                    mux_incarnation,
+                    pane,
+                    effect,
+                    frankenterm_pty_guardian::guardian_runtime_build_identity()
+                        .context("guardian birth requires the compiled mux build")?
+                        .into_bytes(),
+                )
+                .context("authenticate existing guardian birth custody")?;
+                // From the claim on, a failure's lease rollback closes the
+                // child (a birth's), and so does abandoning the unpublished
+                // pane.
+                let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
+                    .context("prepare guardian birth lease")?
+                    .with_spawn_custody(custody)?
+                    .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+                    .context("claim guardian birth lease")?
+                    .restore_and_activate(config, birth_limits)
+                    .context("restore and activate guardian birth")?;
+                UnpublishedPane::from_guardian_birth(activated.into_local_pane(
+                    pane_id,
+                    domain_id,
+                    description,
+                ))
+            })();
+            let mut state = state.lock();
+            match born {
+                Ok(unpublished) => {
+                    // The read-only receipt can become true only after actual
+                    // mux publication. Cancellation keeps it false; successful
+                    // publication remains remembered even after a short-lived
+                    // pane is pruned.
+                    state.publication = unpublished.guardian_publication_receipt();
+                    Ok(unpublished)
+                }
+                Err(error) => {
+                    // A failed birth releases the fence: keeping it refused
+                    // every later spawn and recovery capture for the mux's
+                    // lifetime (ft-hn80q).
+                    log::warn!(
+                        "guardian birth pane={pane} request={request} effect={effect} failed after it sent its Spawn; releasing its spawn fence: {error:#}"
+                    );
+                    state.unadopted_birth = None;
+                    state.publication = None;
+                    Err(error)
+                }
+            }
         })
         .await;
         drop(cancellation);
@@ -5428,6 +5477,13 @@ impl GuardianProxyLeasePlan {
         if self.recovery_claim.is_some() {
             return self.claim_recovery(request_id, effect_id);
         }
+        // A birth: the first claim of a child this mux incarnation's own spawn
+        // started, whose rollback closes it.
+        let birth = self.successor_custody.is_none()
+            && observed_generation == 0
+            && self
+                .spawn_custody
+                .is_some_and(|scope| scope.mux_incarnation == self.client.mux_incarnation());
         let generation = observed_generation
             .checked_add(1)
             .ok_or(GuardianProxyError::Client(GuardianClientError::Protocol(
@@ -5529,6 +5585,7 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             None,
+            birth,
         )?;
         staging.spawn_custody = spawn_custody;
         if let Some(acknowledged) = acknowledged {
@@ -5753,6 +5810,7 @@ impl GuardianProxyLeasePlan {
                     self.size,
                     Arc::clone(&self.census),
                     Some(Arc::clone(&recovery.admission)),
+                    false,
                 )?;
                 // Rollback is armed before reopening the ACK-selected record.
                 staging.successor_custody = Some(
@@ -5886,6 +5944,7 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             None,
+            false,
         )?;
         staging.spawn_custody = spawn_custody;
         staging.successor_custody = successor_custody;
@@ -5945,6 +6004,11 @@ struct GuardianClaimedLeaseRollback {
     actor: SharedGuardianPaneLeaseActor,
     retirement_reservation: Option<GuardianRetirementReservation>,
     armed: bool,
+    /// The lease is a birth's: its child was started for a spawn that never
+    /// reached the mux, so rolling back closes the child rather than leaving
+    /// it running unclaimed (ft-hn80q). A restored pane's child is the user's
+    /// running process, and rolling back only retires the lease.
+    close_child: bool,
 }
 
 impl GuardianClaimedLeaseRollback {
@@ -5956,6 +6020,28 @@ impl GuardianClaimedLeaseRollback {
             actor,
             retirement_reservation: Some(retirement_reservation),
             armed: true,
+            close_child: false,
+        }
+    }
+
+    /// The rollback's mutation: Close for a birth, Retire otherwise.
+    fn release_unpublished_lease(
+        &self,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Result<(), GuardianProxyError> {
+        let mut actor = self.actor.lock();
+        if self.close_child {
+            actor.close(identity)
+        } else {
+            actor.retire(identity)
+        }
+    }
+
+    fn release_name(&self) -> &'static str {
+        if self.close_child {
+            "birth close"
+        } else {
+            "lease retirement"
         }
     }
 
@@ -5968,7 +6054,8 @@ impl GuardianClaimedLeaseRollback {
 
     fn retain_for_later_retry(&mut self, error: &GuardianProxyError) {
         log::error!(
-            "guardian lease retirement after unpublished restore remains unconfirmed; retaining exact cleanup authority: {error}"
+            "guardian {} after unpublished restore remains unconfirmed; retaining exact cleanup authority: {error}",
+            self.release_name()
         );
         if let Some(reservation) = self.retirement_reservation.take() {
             reservation.retain(
@@ -5981,7 +6068,8 @@ impl GuardianClaimedLeaseRollback {
 
     fn resolve_absent_lease(&mut self, error: &GuardianProxyError) {
         log::warn!(
-            "guardian lease retirement after unpublished restore is already resolved by terminal lease state: {error}"
+            "guardian {} after unpublished restore is already resolved by terminal lease state: {error}",
+            self.release_name()
         );
         metrics::counter!(
             "mux.guardian_proxy.retained_retirement_retry_total",
@@ -5991,7 +6079,7 @@ impl GuardianClaimedLeaseRollback {
         self.disarm();
     }
 
-    fn retire_unpublished_lease(&mut self) {
+    fn roll_back_unpublished_lease(&mut self) {
         if !self.armed {
             return;
         }
@@ -6001,7 +6089,7 @@ impl GuardianClaimedLeaseRollback {
         };
         let identity = reservation.identity;
         reservation.coordinator.invalidate();
-        let first_result = self.actor.lock().retire(identity);
+        let first_result = self.release_unpublished_lease(identity);
         match first_result {
             Ok(()) => self.disarm(),
             Err(error) if guardian_retirement_is_resolved(&error) => {
@@ -6009,9 +6097,10 @@ impl GuardianClaimedLeaseRollback {
             }
             Err(error) if guardian_cleanup_retry_is_safe(&error) => {
                 log::warn!(
-                    "guardian lease retirement reply was lost before topology publication; retrying the exact pending mutation: {error}"
+                    "guardian {} reply was lost before topology publication; retrying the exact pending mutation: {error}",
+                    self.release_name()
                 );
-                let retry_result = self.actor.lock().retire(identity);
+                let retry_result = self.release_unpublished_lease(identity);
                 match retry_result {
                     Ok(()) => self.disarm(),
                     Err(retry_error) if guardian_retirement_is_resolved(&retry_error) => {
@@ -6027,7 +6116,7 @@ impl GuardianClaimedLeaseRollback {
 
 impl Drop for GuardianClaimedLeaseRollback {
     fn drop(&mut self) {
-        self.retire_unpublished_lease();
+        self.roll_back_unpublished_lease();
     }
 }
 
@@ -6057,6 +6146,7 @@ impl GuardianProxyStaging {
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
         recovery_admission: Option<Arc<frankenterm_pty_guardian::GuardianRecoveryClaimAdmission>>,
+        birth: bool,
     ) -> Result<Self, GuardianProxyError> {
         debug_assert_eq!(
             claimed_lease.guardian_incarnation(),
@@ -6081,6 +6171,9 @@ impl GuardianProxyStaging {
             retirement_reservation,
         );
         staging.actor.lock()._recovery_admission = recovery_admission;
+        // A birth's rollback closes the child its spawn started (ft-hn80q),
+        // from any failure from here on.
+        staging.lease_rollback.close_child = birth;
         // Stage the rollback guard before opening the independent replay
         // channel. A replay-channel setup failure must not leak the Claim that
         // the caller completed before entering this constructor.
@@ -7281,13 +7374,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
-    fn guardian_domain_real_birth_publishes_output_and_cancellation_retires_only_lease() {
+    fn guardian_domain_real_birth_publishes_output_and_cancellation_closes_its_child() {
         run_guardian_domain_real_birth(RealBirthFixtureMode::BirthAndCancellation);
     }
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
-    fn guardian_domain_in_flight_cancellation_finishes_adoption_then_retires_only_lease() {
+    fn guardian_domain_in_flight_cancellation_finishes_adoption_then_closes_its_child() {
         run_guardian_domain_real_birth(RealBirthFixtureMode::InFlightCancellation);
     }
 
@@ -7867,28 +7960,27 @@ mod tests {
                     Err(error) => panic!("census snapshot refused: {error}"),
                 }
             };
+            // ft-hn80q: abandoning the unpublished birth closed its child
+            // (the fixture traps the HUP and exits), so the census shows it
+            // terminal rather than running unclaimed under the guardian.
+            let closed = |rows: &[GuardianCensusEntry]| {
+                rows.iter()
+                    .filter(|row| row.status == GuardianCensusPaneStatus::ClosedTerminal)
+                    .count()
+            };
             let deadline = Instant::now() + Duration::from_secs(5);
             let rows = loop {
                 let rows = snapshot(deadline);
-                if rows
-                    .iter()
-                    .any(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
-                {
+                if closed(&rows) == 1 {
                     break rows;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "cancelled pane lease was not retired"
+                    "the abandoned birth's child was not closed"
                 );
                 thread::sleep(Duration::from_millis(2));
             };
             assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
-                    .count(),
-                1
-            );
             assert_eq!(
                 rows.iter()
                     .filter(|row| row.status == GuardianCensusPaneStatus::LiveClaimed)
@@ -7900,46 +7992,50 @@ mod tests {
                 b"BB",
                 "exact replay duplicated a birth"
             );
-            assert!(
-                !signaled.exists(),
-                "unpublished cancellation signaled an owned child"
+            let signals = |expected: &[u8], what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while std::fs::read(&signaled).unwrap_or_default() != expected {
+                    assert!(Instant::now() < deadline, "{what}");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            };
+            signals(
+                b"S",
+                "the abandoned birth's child was not signaled exactly once",
             );
-            assert!(domain.state.lock().unadopted_birth.is_some());
-            assert!(
-                !domain
-                    .state
-                    .lock()
-                    .publication
-                    .as_ref()
-                    .unwrap()
-                    .was_published()
-            );
-            let unresolved_birth = domain.state.lock().unadopted_birth;
+            // The fence is released: recovery captures the mux, and the next
+            // spawn starts a child, instead of both refusing for the mux's
+            // lifetime.
             assert!(!domain.admission.load(Ordering::Acquire));
-            assert!(domain.recovery_policy(&config::configuration()).is_err());
-            assert!(matches!(
-                mux.capture_topology_coherent(Default::default()),
-                Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
-            ));
-            assert_eq!(domain.state.lock().unadopted_birth, unresolved_birth);
-            assert!(!domain.admission.load(Ordering::Acquire));
-            assert!(
-                promise::spawn::block_on(domain.spawn_unpublished_pane(
-                    &mux,
-                    size,
-                    Some(command()),
-                    None,
-                ))
-                .is_err(),
-                "cancelled birth must remain fenced, not create a replacement child"
-            );
-            assert_eq!(std::fs::read(&births).unwrap(), b"BB");
+            domain
+                .recovery_policy(&config::configuration())
+                .expect("an abandoned birth must not disable recovery");
+            assert!(domain.state.lock().unadopted_birth.is_none());
+            assert!(mux.capture_topology_coherent(Default::default()).is_ok());
+            let third = promise::spawn::block_on(domain.spawn_unpublished_pane(
+                &mux,
+                size,
+                Some(command()),
+                None,
+            ))
+            .expect("an abandoned birth must not fence the next spawn");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::read(&births).unwrap() != b"BBB" {
+                assert!(
+                    Instant::now() < deadline,
+                    "the next spawn's child did not start"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            drop(third);
+            signals(b"SS", "the second abandoned birth's child was not closed");
             std::fs::write(&release, b"release").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 while executor.try_tick().unwrap() {}
                 let rows = snapshot(deadline);
-                if rows.len() == 2 && rows.iter().all(|row| row.exit_status == Some(0)) {
+                if rows.len() == 3 && rows.iter().all(|row| row.exit_status == Some(0)) {
+                    assert_eq!(closed(&rows), 2);
                     break;
                 }
                 assert!(
@@ -7948,8 +8044,10 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(std::fs::read(&finished).unwrap(), b"DD");
-            assert!(!signaled.exists());
+            // Only the published child ran to its release; the closed ones
+            // exited from the HUP.
+            assert_eq!(std::fs::read(&finished).unwrap(), b"D");
+            assert_eq!(std::fs::read(&signaled).unwrap(), b"SS");
             let deadline = Instant::now() + Duration::from_secs(5);
             while !pane.is_dead() {
                 assert!(

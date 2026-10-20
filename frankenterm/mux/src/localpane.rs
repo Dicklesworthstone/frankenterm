@@ -15528,6 +15528,61 @@ mod tests {
         assert_eq!(kills.load(Ordering::SeqCst), 0);
     }
 
+    /// ft-hn80q: a guardian birth that never reached the mux closes its
+    /// child when abandoned, once, and retires nothing; the legacy killer
+    /// stays unreachable. A restored pane only retires (above).
+    #[test]
+    fn unpublished_guardian_birth_cancellation_closes_once_without_retirement() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(725, identity, control.clone(), Arc::clone(&kills));
+        let unpublished = crate::domain::UnpublishedPane::from_guardian_birth(pane)
+            .expect("complete guardian facets admit an unpublished birth");
+        let publication = unpublished.guardian_publication_receipt().unwrap();
+        assert!(publication.is_pending());
+        drop(unpublished);
+        assert!(!publication.was_published());
+        assert!(!publication.is_pending());
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.close_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    /// ft-hn80q: a birth whose pane cannot be admitted (missing or consumed
+    /// facets) closes its child before reporting the refusal, rather than
+    /// leaving it to a lease retirement; one already closed closes no more.
+    #[test]
+    fn unadmitted_guardian_birth_closes_its_child() {
+        for missing in 0..4 {
+            let identity = guardian_lifetime_test_identity(1);
+            let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+            let kills = Arc::new(AtomicUsize::new(0));
+            let mut pane =
+                guardian_lifetime_test_pane(724, identity, control.clone(), Arc::clone(&kills));
+            match missing {
+                0 => {
+                    pane.guardian_live_output_reader.lock().take();
+                }
+                1 => {
+                    pane.guardian_checkpoint_publisher.take();
+                }
+                2 => {
+                    pane.durable_pane_id = [0x92; 16];
+                }
+                3 => {
+                    Pane::kill(&pane);
+                }
+                _ => unreachable!(),
+            }
+            assert!(crate::domain::UnpublishedPane::from_guardian_birth(pane).is_err());
+            assert_eq!(kills.load(Ordering::SeqCst), 0);
+            assert_eq!(control.close_attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[test]
     fn unpublished_guardian_admission_rejects_missing_or_consumed_facets() {
         for missing in 0..4 {
