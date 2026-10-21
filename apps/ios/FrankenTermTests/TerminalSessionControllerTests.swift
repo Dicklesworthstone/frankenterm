@@ -103,30 +103,25 @@ final class TerminalSessionControllerTests: XCTestCase {
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
                                                 journalIdentifier: "scene-test-" + UUID().uuidString,
                                                 signer: SceneMemorySigner(vault: vault), liveness: liveness)
-        await connections.setActive(true)
+        await connections.activate()
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized,
                 routes: [.init(id: "route-\(id)", credentialID: "key", host: "127.0.0.1", port: port)]),
                 unavailable: "", theme: nil)
         }
-        let scene = try WorkspaceTerminalScene(workspaceID: installed.id, workspaceName: "Scene", machines: machines,
-                                               initialMachineID: "alpha", connections: connections)
+        let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision, workspaceName: "Scene",
+                                               machines: machines, initialMachineID: "alpha", connections: connections,
+                                               autoConnect: false)
+        scene.appear(selecting: "alpha", active: true)
         return LiveScene(connections: connections, scene: scene, outPath: outPath)
     }
 
     /// Connects a machine through the scene and waits for its session to settle
     /// into a phase other than connecting.
     @discardableResult
-    private func connect(_ scene: WorkspaceTerminalScene, _ machine: String,
-                         acknowledging: Bool = false) async throws -> TerminalSessionController {
-        if acknowledging, let current = scene.sessions[machine] {
-            for _ in 0..<200 where !current.recoveryReviewReady {
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            XCTAssertTrue(current.recoveryReviewReady, "a new session must use the exact displayed history")
-        }
-        scene.connect(machine, acknowledging: acknowledging)
+    private func connect(_ scene: WorkspaceTerminalScene, _ machine: String) async throws -> TerminalSessionController {
+        scene.connect(machine)
         let session = try XCTUnwrap(scene.sessions[machine])
         for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
             try await Task.sleep(for: .milliseconds(50))
@@ -162,6 +157,22 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await scene.navigation.perform(plan)
         XCTAssertEqual(scene.selectedMachineID, machine)
         XCTAssertEqual(scene.navigation.phase, .ready)
+    }
+
+    /// Switches to a machine whose session connected in the background: it
+    /// did not take the screen, and its view attaches on the switch.
+    private func shownAfterSelecting(_ scene: WorkspaceTerminalScene, _ machine: String,
+                                     connected session: TerminalSessionController) async throws -> NativeTerminalView {
+        XCTAssertEqual(session.phase, .live)
+        XCTAssertNotEqual(scene.selectedMachineID, machine, "a background connection leaves the screen alone")
+        XCTAssertNil(session.terminal, "its view waits until the machine is shown")
+        let plan = try XCTUnwrap(try scene.navigation.navigation.plan(machineID: machine))
+        try await scene.navigation.perform(plan)
+        for _ in 0..<200 where session.terminal == nil || scene.navigation.phase != .ready {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(scene.selectedMachineID, machine)
+        return try shown(session)
     }
 
     /// Types through UIKit's text-input protocol once a caret has been drawn
@@ -235,7 +246,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// A shell that exits ends the session from inside the pump task; teardown
     /// must still finish there, and the next session on the machine needs the
     /// user's acknowledgement of the first one's unknown outcome.
-    func testRemoteExitSettlesAndANewSessionNeedsAcknowledgement() async throws {
+    func testRemoteExitSettlesAndANewSessionStartsWithoutAReview() async throws {
         let live = try await liveScene(), connections = live.connections, scene = live.scene
         let first = try await connect(scene, "alpha")
         let terminal = try shown(first)
@@ -255,18 +266,16 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(scene.navigation.navigation.machines.first?.panes.count, 0, "the ended source leaves navigation")
         await assertReleased(first, connections: connections)
 
-        let unacknowledged = try await connect(scene, "alpha")
+        // The ended session's record is acknowledged as the next one starts.
+        let second = try await connect(scene, "alpha")
         XCTAssertNil(first.retainedOutput, "replacing a controller releases its volatile output")
-        XCTAssertEqual(unacknowledged.phase, .needsReview, "the ended session's outcome must be reviewed first")
-        XCTAssertTrue(unacknowledged.settled)
-        await assertReleased(unacknowledged, connections: connections)
-
-        let second = try await connect(scene, "alpha", acknowledging: true)
         let again = try shown(second)
         defer { again.removeFromSuperview() }
         try await type("echo AGAIN-$((40+2)) > \(live.outPath)", into: again)
         let output = try await hostFile(live.outPath, containing: "AGAIN-42")
-        XCTAssertTrue(output.contains("AGAIN-42"), "the acknowledged new session must run commands (output: \(output))")
+        XCTAssertTrue(output.contains("AGAIN-42"), "the new session must run commands (output: \(output))")
+        let unresolved = try await connections.journal.records().filter { $0.requiresReview }
+        XCTAssertTrue(unresolved.isEmpty, "starting the new session acknowledged the earlier one")
         await scene.close()
         XCTAssertTrue(second.settled)
         await assertReleased(second, connections: connections)
@@ -282,9 +291,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let alpha = try shown(try await connect(scene, "alpha"))
         defer { alpha.removeFromSuperview() }
         try await type("export FT_WHO=alpha", into: alpha)
-        let beta = try shown(try await connect(scene, "beta"))
+        let beta = try await shownAfterSelecting(scene, "beta", connected: try await connect(scene, "beta"))
         defer { beta.removeFromSuperview() }
-        XCTAssertEqual(scene.selectedMachineID, "beta", "connecting a machine selects it")
         try await type("export FT_WHO=beta", into: beta)
         XCTAssertEqual(scene.navigation.navigation.machines.map(\.panes.count), [1, 1])
 
@@ -581,7 +589,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         _ = try await rows(of: alpha) { $0.contains("HIST-1") }
         let place = try XCTUnwrap(alpha.renderer.admittedFrame?.viewportFirst)
 
-        let beta = try shown(try await connect(scene, "beta"))
+        let beta = try await shownAfterSelecting(scene, "beta", connected: try await connect(scene, "beta"))
         defer { beta.removeFromSuperview() }
         try await type("echo BETA-$((40+2))", into: beta)
         _ = try await rows(of: beta) { self.shows($0, "BETA-42") }
@@ -632,7 +640,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertLessThan(detected, .seconds(10), "about interval x (missedReplies + 1) after the last reply")
         await assertReleased(session, connections: live.connections)
 
-        let again = try await connect(scene, "alpha", acknowledging: true)
+        let again = try await connect(scene, "alpha")
         let fresh = try shown(again)
         defer { fresh.removeFromSuperview() }
         try await type("echo REVIVED-$((40+2)) > \(live.outPath)", into: fresh)
@@ -682,8 +690,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "machine",
             machineName: "Never connected", routes: [.init(id: "route", credentialID: "key", host: "127.0.0.1", port: 22)])
         let machine = SceneMachine(id: "machine", name: "Never connected", target: target, unavailable: "", theme: nil)
-        let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, workspaceName: "Dormant",
-            machines: [machine], initialMachineID: "machine", connections: connections)
+        let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, revision: target.revision, workspaceName: "Dormant",
+            machines: [machine], initialMachineID: "machine", connections: connections, autoConnect: false)
         return (connections, scene, target)
     }
 
@@ -713,45 +721,34 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
         await controller.retryCleanup()
         await assertReleased(controller, connections: connections)
-        scene.connect("machine", acknowledging: true)
+        scene.connect("machine")
         XCTAssertTrue(scene.sessions["machine"] === controller)
         let records = try await connections.journal.records(), pending = await connections.manager.pendingCount
         XCTAssertTrue(records.isEmpty)
         XCTAssertEqual(pending, 0)
     }
 
-    /// A new or changed record after review must remain unresolved. A generic
-    /// confirmation must never reread and acknowledge unseen session history.
-    func testNewSessionActionCannotAcknowledgeRecordsCreatedAfterReview() async throws {
+    /// A new session acknowledges its own machine's earlier records as it
+    /// starts, whatever the connection then does; other machines' records
+    /// stay as they are.
+    func testANewSessionAcknowledgesOnlyItsMachinesEarlierRecords() async throws {
         let (connections, scene, target) = try dormantScene()
         let journal = connections.journal
-        func scope() throws -> TerminalSessionScope {
+        func scope(_ machineID: String) throws -> TerminalSessionScope {
             try .init(workspaceID: target.workspaceID, workspaceRevision: target.revision,
-                      machineID: target.machineID, routeID: target.routes[0].id,
+                      machineID: machineID, routeID: target.routes[0].id,
                       transportID: UUID(), channelID: UUID())
         }
-        let firstEpoch = try await journal.beginCreation(scope: scope())
-        try await journal.markInterrupted(epoch: firstEpoch)
-        let first = try await connect(scene, "machine")
-        for _ in 0..<200 where !first.recoveryReviewReady { try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertTrue(first.recoveryReviewReady)
-        let displayed = try XCTUnwrap(first.recoveryRecords.first)
-        XCTAssertTrue(displayed.inputEvidence.isEmpty)
-
-        // Another explicit owner resolves the first record and creates a new
-        // session while the original review is still visible on this scene.
-        try await journal.resolve(displayed)
-        let unseen = try await journal.beginCreation(scope: scope())
-        try await journal.markInterrupted(epoch: unseen)
-        let attempted = try await connect(scene, "machine", acknowledging: true)
-        XCTAssertFalse(attempted === first)
-        XCTAssertEqual(attempted.phase, .failed(TerminalSessionController.describe(TerminalSessionJournalError.staleReview)))
-        for _ in 0..<200 where !attempted.recoveryReviewReady { try await Task.sleep(for: .milliseconds(20)) }
+        let earlier = try await journal.beginCreation(scope: scope(target.machineID))
+        try await journal.markInterrupted(epoch: earlier)
+        let elsewhere = try await journal.beginCreation(scope: scope("other-machine"))
+        try await journal.markInterrupted(epoch: elsewhere)
+        scene.appear(selecting: "machine", active: true)
+        let attempt = try await connect(scene, "machine")
+        XCTAssertNotEqual(attempt.phase, .idle)
         let records = try await journal.records()
-        XCTAssertEqual(records.first(where: { $0.id == unseen.id })?.state, .interrupted)
-        XCTAssertEqual(attempted.recoveryRecords.map(\.id), [unseen.id])
-        let pending = await connections.manager.pendingCount
-        XCTAssertEqual(pending, 0, "stale review must fail before connection admission")
+        XCTAssertEqual(records.first(where: { $0.id == earlier.id })?.state, .acknowledged)
+        XCTAssertEqual(records.first(where: { $0.id == elsewhere.id })?.state, .interrupted)
         await scene.close()
     }
 

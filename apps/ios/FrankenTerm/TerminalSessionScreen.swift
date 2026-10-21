@@ -20,8 +20,6 @@ final class MobileConnections {
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
     private var pendingCleanup: [UUID: TerminalSessionController] = [:]
-    private var groups: [UUID: MobileConnectionBatch] = [:]
-    private var activityGeneration = UUID()
 
     /// `signer` defaults to the protected Keychain signer; tests inject one,
     /// and may shorten how long an unanswering server takes to be reported.
@@ -37,37 +35,12 @@ final class MobileConnections {
                                                 coordinator: coordinator, liveness: liveness)
     }
 
-    /// Foreground admits explicit connections; background seals every source and
-    /// settles native teardown (the remote shell may keep running).
-    func setActive(_ active: Bool) async {
-        let generation = UUID(); activityGeneration = generation
-        if active {
-            for group in Array(groups.values) where group.isRetired { _ = await closeGroup(group) }
-            let retained = Array(pendingCleanup.values)
-            for controller in retained { await controller.retryCleanup() }
-            guard activityGeneration == generation else { return }
-            await manager.resume()
-        } else {
-            let retained = Array(groups.values)
-            for group in retained { group.retire() }
-            await manager.suspend()
-            for group in retained { _ = await closeGroup(group) }
-        }
-    }
-
-    /// Retain a batch independently of its screen until every unclaimed native
-    /// connection has closed. Failed cleanup is retried on the next activation.
-    func registerGroup(_ group: MobileConnectionBatch) throws {
-        guard groups.count < 16, groups[group.id] == nil else { throw WorkspaceSSHConnectionError.capacity }
-        groups[group.id] = group
-    }
-    @discardableResult func closeGroup(_ group: MobileConnectionBatch) async -> Bool {
-        group.retire()
-        do {
-            try await group.close()
-            groups[group.id] = nil
-            return true
-        } catch { return false }
+    /// Admits connections and retries any cleanup that failed earlier. Sessions
+    /// run until the user closes them: leaving the foreground does not suspend
+    /// the manager (a dropped connection reconnects on return instead).
+    func activate() async {
+        for controller in Array(pendingCleanup.values) { await controller.retryCleanup() }
+        await manager.resume()
     }
 
     fileprivate func retainForCleanup(_ controller: TerminalSessionController) {
@@ -127,15 +100,6 @@ struct TerminalSessionTarget: Hashable, Sendable {
     }
 }
 
-/// Group authentication retains the real managed connection, not a second
-/// transport or an authorization token. No PTY/model/input exists yet. Claiming
-/// this value transfers cleanup responsibility to TerminalSessionController.
-struct PreparedTerminalConnection: Sendable {
-    let connection: WorkspaceSSHConnection
-    let route: TerminalSessionRoute
-}
-typealias MobileConnectionBatch = TerminalConnectionBatch<String, PreparedTerminalConnection>
-
 /// Publishes each owned FTSF frame from the Rust model to the native view.
 @MainActor
 private final class TerminalFramePresenter: TerminalModelDelivery {
@@ -189,6 +153,9 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
 /// Detachment must succeed before the source and its canonical model retire.
 @MainActor
 protocol TerminalSessionFocus: AnyObject {
+    /// Whether this machine is the one on screen now; a session connecting in
+    /// the background waits to attach its view until it is.
+    func shows(machineID: String) -> Bool
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
     func detach(machineID: String, source: TerminalSource) async throws
@@ -202,9 +169,6 @@ protocol TerminalSessionFocus: AnyObject {
 final class TerminalSessionController {
     enum Phase: Equatable {
         case idle, connecting, live
-        /// An earlier session on this machine left input with an unknown
-        /// outcome; a new shell waits for the user's acknowledgement (plan 11.8).
-        case needsReview
         /// No route reached a signed-in connection, so no shell started and
         /// nothing was sent.
         case couldNotConnect(WorkspaceConnectionHelp)
@@ -212,48 +176,28 @@ final class TerminalSessionController {
         case failed(String)
     }
     let id = UUID()
-    private(set) var phase: Phase = .idle
+    private(set) var phase: Phase = .idle { didSet { if phase != oldValue { onChange?() } } }
     /// The route being tried, then the one connected.
     private(set) var route: TerminalSessionRoute
     private(set) var terminal: NativeTerminalView?
     /// True only after every owned cleanup operation actually succeeds.
-    private(set) var settled = false
+    private(set) var settled = false { didSet { if settled != oldValue { onChange?() } } }
+    /// The connection went away underneath a live session (lost, failed, or
+    /// the server stopped answering): worth reconnecting. A remote exit or a
+    /// close on this phone is not a drop.
+    private(set) var dropped = false
     private(set) var cleanupFailure: String?
     private(set) var interruptedInput = false
     private(set) var interactionProblem: String?
-    private(set) var recoveryRecords: [TerminalSessionRecord] = []
-    private(set) var recoveryFailure: String?
-    private(set) var recoveryLoading = false
-    private(set) var recoveryLoaded = false
     private(set) var historyInspection: TerminalHistoryInspection?
     private(set) var historyReturnBookmark: TerminalHistoryBookmark?
     private(set) var historyReturning = false
     private(set) var retainedOutput: TerminalRetainedOutput?
     private(set) var retainedOutputFailure: String?
     let target: TerminalSessionTarget
-
-    var recoveryReviewReady: Bool {
-        settled && recoveryLoaded && !recoveryLoading && recoveryRecords.allSatisfy(\.canResolve)
-    }
-
-    /// These exact immutable snapshots are shown before a new-session action.
-    /// A late outcome or another owner changing history invalidates resolution;
-    /// a click never acknowledges newly discovered, unseen records.
-    func refreshRecoveryReview() async {
-        guard !recoveryLoading else { return }
-        recoveryLoading = true; recoveryLoaded = false; recoveryFailure = nil
-        defer { recoveryLoading = false }
-        do {
-            recoveryRecords = try await connections.journal.records().filter {
-                $0.requiresReview && $0.scope.workspaceID == target.workspaceID
-                    && $0.scope.machineID == target.machineID
-            }
-            recoveryLoaded = true
-        } catch {
-            recoveryRecords = []
-            recoveryFailure = Self.describe(error)
-        }
-    }
+    /// The scene's hook for phase and settlement changes: it starts the next
+    /// background connection and reconnects dropped sessions from here.
+    @ObservationIgnored var onChange: (@MainActor () -> Void)?
 
     @ObservationIgnored private let connections: MobileConnections
     @ObservationIgnored private var connection: WorkspaceSSHConnection?
@@ -282,13 +226,12 @@ final class TerminalSessionController {
     @ObservationIgnored private var historyReturn: Task<Void, Never>?
     @ObservationIgnored private var retainedCaptureAttempted = false
     @ObservationIgnored private var retainEndedOutput = true
+    @ObservationIgnored private var viewAttachment: Task<Void, Never>?
 
-    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
-         prepared: PreparedTerminalConnection? = nil) {
+    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
         self.target = target; self.connections = connections; self.focus = focus
         basePalette = target.basePalette
-        route = prepared?.route ?? target.routes[0]
-        connection = prepared?.connection
+        route = target.routes[0]
     }
 
     /// "Machine · Route", for labels that leave the session.
@@ -391,16 +334,20 @@ final class TerminalSessionController {
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
-        clipboard?.setActive(visible)
         if !visible {
             interactionProblem = nil
             historyInspection?.retire()
             historyReturn?.cancel(); historyReturnBookmark = nil
         }
-        presenter?.acceptsFrames = visible
-        terminal?.renderer.setSceneActive(visible)
+        // Frames need a view. A session that connected in the background turns
+        // visible when its view attaches (attachView calls this again), so
+        // that transition draws its first frame instead of one nobody saw.
+        let shown = visible && terminal != nil
+        clipboard?.setActive(shown)
+        presenter?.acceptsFrames = shown
+        terminal?.renderer.setSceneActive(shown)
         if let presentation, !presentation.isRetired {
-            do { try presentation.request(visible, source: presentation.source) }
+            do { try presentation.request(shown, source: presentation.source) }
             catch { fail(Self.describe(error)) }
         }
     }
@@ -429,10 +376,10 @@ final class TerminalSessionController {
 
     /// The retained startup task owns partially constructed resources. Teardown
     /// cancels and joins it; a late connection/view cannot outlive a settled UI.
-    func start(reviewingEarlierSessions: [TerminalSessionRecord] = []) async {
+    func start() async {
         guard phase == .idle, !stopped else { return }
         phase = .connecting
-        let job = Task { await self.performStart(reviewingEarlierSessions: reviewingEarlierSessions) }
+        let job = Task { await self.performStart() }
         startup = job
         await withTaskCancellationHandler { await job.value } onCancel: { job.cancel() }
         if Task.isCancelled { requestStop() }
@@ -446,33 +393,11 @@ final class TerminalSessionController {
 
     /// Never calls teardown: teardown must be able to join this task without a
     /// self-join. Retain each resource BEFORE the next cancellation check/await.
-    private func performStart(reviewingEarlierSessions: [TerminalSessionRecord]) async {
+    private func performStart() async {
         do {
             try checkStarting()
-            for record in reviewingEarlierSessions {
-                guard record.requiresReview, record.canResolve,
-                      record.scope.workspaceID == target.workspaceID,
-                      record.scope.machineID == target.machineID else { throw TerminalSessionJournalError.staleReview }
-                try checkStarting()
-                try await connections.journal.resolve(record)
-            }
-            try checkStarting()
-            let connection: WorkspaceSSHConnection
-            if let prepared = self.connection {
-                // The selected target must still describe this exact prepared
-                // owner. openTerminal independently revalidates current durable
-                // trust/credential/foreground policy before creating its PTY.
-                guard prepared.scope.workspaceID == target.workspaceID,
-                      prepared.scope.workspaceRevision == target.revision,
-                      prepared.scope.machineID == target.machineID,
-                      prepared.scope.routeID == route.id, target.routes.contains(route) else {
-                    throw WorkspaceSSHConnectionError.stale
-                }
-                connection = prepared
-            } else {
-                connection = try await connectFirstReachable()
-                self.connection = connection
-            }
+            let connection = try await connectAcknowledgingEarlierSessions()
+            self.connection = connection
             try checkStarting()
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
             let pump = try await connection.openTerminal(geometry: geometry)
@@ -491,19 +416,6 @@ final class TerminalSessionController {
             let runtime = TerminalModelRuntime(model: model, coordinator: coordinator,
                                                delivery: presenter, initiallyVisible: false)
             self.runtime = runtime; unadoptedModel = nil
-            guard let focus else { throw TerminalKeyboardError.unavailable }
-            attached = true
-            let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
-            self.keyboard = keyboard
-            try checkStarting()
-            let view = try await NativeTerminalView(session: keyboard, configuration: Self.renderConfiguration)
-            terminal = view
-            try checkStarting()
-            presenter.view = view
-            let clipboard = try NativeTerminalClipboardController(terminal: view,
-                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)")
-            self.clipboard = clipboard; presenter.clipboard = clipboard
-            clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
             let source = pump.source
             let resize = TerminalViewportResize(source: source, initial: geometry) { geometry in
                 do {
@@ -520,22 +432,13 @@ final class TerminalSessionController {
             }
             self.history = history
             history.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
-            view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
-            view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
-            view.onFailure = { [weak self] error in self?.inputFailed(error) }
-            view.onInputRetired = { [weak self] in
-                guard let self else { return }
-                self.clipboard?.inputRetired()
-                self.focus?.inputRetired(machineID: self.target.machineID)
-            }
-            phase = .live
             let presentation = TerminalPresentationVisibility(source: source, initiallyVisible: false) { visible, source in
                 try await runtime.setVisible(visible, source: source)
             }
             self.presentation = presentation
             presentation.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
-            setPresentationVisible(presentationVisible)
-            view.requestKeyboard(presentationVisible)
+            phase = .live
+            dropped = false
             let run = Task {
                 try await pump.run(consumer: runtime) { geometry, appliedSource in
                     // Retirement can race the MainActor hop after the pump's
@@ -554,13 +457,84 @@ final class TerminalSessionController {
                 let result = await run.result
                 await self?.pumpEnded(result)
             }
+            // The shell runs and its output arrives from here on. The machine on
+            // screen gets its view now; one connecting in the background gets
+            // it when the user switches to it (showView).
+            if focus?.shows(machineID: target.machineID) == true {
+                showView()
+                await viewAttachment?.value
+            }
         } catch TerminalSessionJournalError.reviewRequired {
-            if !stopped { phase = .needsReview }
+            if !stopped { phase = .failed("The previous session on this machine is still closing. Try again in a moment.") }
         } catch let failure as ConnectFailure {
             if !stopped { phase = .couldNotConnect(failure.help) }
         } catch {
             if !stopped { phase = .failed(Self.describe(error)) }
         }
+    }
+
+    /// Puts a live session on screen: the scene's keyboard, the Metal view and
+    /// what follows the view. Idempotent; teardown joins it.
+    func showView() {
+        guard !stopped, phase == .live, terminal == nil, viewAttachment == nil else { return }
+        viewAttachment = Task { [weak self] in
+            await self?.attachView()
+            self?.viewAttachment = nil
+        }
+    }
+
+    private func attachView() async {
+        guard let pump, let runtime, let presenter else { return }
+        func checkLive() throws {
+            try Task.checkCancellation()
+            guard !stopped, phase == .live else { throw CancellationError() }
+        }
+        do {
+            guard let focus else { throw TerminalKeyboardError.unavailable }
+            attached = true
+            let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
+            self.keyboard = keyboard
+            try checkLive()
+            let view = try await NativeTerminalView(session: keyboard, configuration: Self.renderConfiguration)
+            terminal = view
+            try checkLive()
+            presenter.view = view
+            let clipboard = try NativeTerminalClipboardController(terminal: view,
+                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)")
+            self.clipboard = clipboard; presenter.clipboard = clipboard
+            clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
+            view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
+            view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
+            view.onFailure = { [weak self] error in self?.inputFailed(error) }
+            view.onInputRetired = { [weak self] in
+                guard let self else { return }
+                self.clipboard?.inputRetired()
+                self.focus?.inputRetired(machineID: self.target.machineID)
+            }
+            setPresentationVisible(presentationVisible)
+            view.requestKeyboard(presentationVisible)
+        } catch is CancellationError {
+        } catch { fail(Self.describe(error)) }
+    }
+
+    /// Earlier sessions on this machine are acknowledged as the new one
+    /// starts: their records only note that input may have been in flight
+    /// when they ended, and asking about it first just got in the way. A
+    /// record whose own cleanup is still running holds the start briefly.
+    private func connectAcknowledgingEarlierSessions() async throws -> WorkspaceSSHConnection {
+        for attempt in 0..<20 {
+            for record in try await connections.journal.records()
+                where record.requiresReview && record.canResolve
+                    && record.scope.workspaceID == target.workspaceID && record.scope.machineID == target.machineID {
+                try checkStarting()
+                try? await connections.journal.resolve(record)
+            }
+            do { return try await connectFirstReachable() }
+            catch TerminalSessionJournalError.reviewRequired where attempt < 19 {
+                try await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        throw TerminalSessionJournalError.reviewRequired
     }
 
     private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp }
@@ -616,25 +590,22 @@ final class TerminalSessionController {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
-    /// Only a reported nonzero exit code or signal describes remote termination.
-    /// libssh2 cannot distinguish a reported zero from an absent exit status.
+    /// Only a reported nonzero exit code or signal names how the shell ended;
+    /// libssh2 cannot tell a reported zero from an absent exit status.
     static func describe(_ end: TerminalSessionEnd) -> String {
         switch end {
         case let .completed(completion):
             switch completion.remoteExit {
-            case let .exitStatus(status): "The remote program reported exit status \(status)."
-            case let .signal(signal): "The remote program reported termination by signal \(signal)."
-            case nil:
-                completion.channelClosed
-                    ? "The machine closed this session's channel; a usable remote exit status was not reported."
-                    : "The machine ended its output; channel closure and remote process status remain unconfirmed."
+            case let .exitStatus(status): "The shell exited with status \(status)."
+            case let .signal(signal): "The shell ended on signal \(signal)."
+            case nil: "The shell exited."
             }
-        case .peerOutputEnded: "The machine closed this session's output; remote process status is unknown."
-        case .cancelled: "This device closed the session, for example when FrankenTerm left the foreground."
+        case .peerOutputEnded: "The machine closed the session."
+        case .cancelled: "Disconnected."
         case .disconnected: "The connection to the machine was lost."
         case .transportFailed: "The connection to the machine failed."
-        case .consumerFailed: "The terminal could not process the session's output."
-        case .ownershipConflict: "Another owner took over this session's input."
+        case .consumerFailed: "The terminal couldn't show this session's output."
+        case .ownershipConflict: "Another window took over this session."
         }
     }
 
@@ -683,7 +654,7 @@ final class TerminalSessionController {
             phase = .ended(Self.describe(TerminalSessionEnd.cancelled))
         }
         stopped = true
-        startup?.cancel()
+        startup?.cancel(); viewAttachment?.cancel()
         sealLocalOwnership()
     }
 
@@ -699,8 +670,15 @@ final class TerminalSessionController {
         guard !stopped else { return }
         if phase == .live {
             switch end {
-            case let .success(reason): phase = .ended(Self.describe(reason))
-            case let .failure(error): phase = .failed(Self.describe(error))
+            case let .success(reason):
+                switch reason {
+                case .disconnected, .transportFailed: dropped = true
+                default: break
+                }
+                phase = .ended(Self.describe(reason))
+            case let .failure(error):
+                dropped = error is TerminalTransportError || (error as? NativeSSHError)?.isConnectionFailure == true
+                phase = .failed(Self.describe(error))
             }
         }
         await teardown()
@@ -727,12 +705,12 @@ final class TerminalSessionController {
 
     private func performTeardown() async {
         cleanupFailure = nil
-        recoveryLoaded = false
         // Interrupt an already-published native connection promptly. Startup may
         // still be in openTerminal/view creation; it never joins this cleanup.
         if let connection { try? await connections.manager.close(connectionID: connection.id) }
         if let startup { await startup.value }
         startup = nil
+        if let viewAttachment { await viewAttachment.value }
         sealLocalOwnership()
         var failure: Error?
         if let connection {
@@ -823,7 +801,6 @@ final class TerminalSessionController {
             settled = true
             connections.releaseCleanup(id)
         }
-        await refreshRecoveryReview()
     }
 }
 

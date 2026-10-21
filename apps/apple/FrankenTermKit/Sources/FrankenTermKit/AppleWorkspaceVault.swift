@@ -158,6 +158,34 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
         let queue = DispatchQueue(label: "org.frankenterm.ssh.credential-worker", qos: .userInitiated)
         let lock = NSLock()
         var current: Request?
+        /// The context one Face ID approval authenticated, reused until it
+        /// expires or approval ends (see AppleSSHCredentialSigner.endApproval).
+        var approval: (context: LAContext, expires: ContinuousClock.Instant)?
+
+        func approvedContext() -> LAContext? {
+            lock.lock()
+            guard let approval, ContinuousClock.now < approval.expires else {
+                let lapsed = approval?.context; approval = nil
+                lock.unlock(); lapsed?.invalidate(); return nil
+            }
+            lock.unlock()
+            return approval.context
+        }
+        /// Keeps this request's freshly approved context for the requests that
+        /// follow; finishing the request no longer invalidates it.
+        func adopt(_ context: LAContext, for id: UUID, lasting duration: Duration) {
+            lock.lock()
+            guard current?.id == id, current?.context === context else { lock.unlock(); return }
+            current?.context = nil
+            let previous = approval?.context
+            approval = (context, ContinuousClock.now + duration)
+            lock.unlock()
+            previous?.invalidate()
+        }
+        func endApproval() {
+            lock.lock(); let context = approval?.context; approval = nil; lock.unlock()
+            context?.invalidate()
+        }
 
         func admit(_ id: UUID) throws {
             lock.lock(); defer { lock.unlock() }
@@ -199,6 +227,13 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
     private static let worker = Worker()
     public init() {}
 
+    /// How long one Face ID approval keeps signing: every machine of a
+    /// workspace connecting together, and reconnects soon after, ask once.
+    public static let approvalDuration: Duration = .seconds(300)
+    /// Ends the standing approval at once; the app calls this when it leaves
+    /// the foreground, so a later connection asks again.
+    public static func endApproval() { worker.endApproval() }
+
     public func cancel(requestID: UUID) { Self.worker.cancel(requestID) }
 
     public func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
@@ -236,18 +271,32 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         }
                         guard case .signature(let challenge) = operation else { return identity.blob }
                         guard identity.blob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
-                        let context = LAContext()
-                        context.localizedReason = "Use your SSH identity for \(authorization.user)@\(authorization.host):\(authorization.port)."
-                        context.touchIDAuthenticationAllowableReuseDuration = 0
-                        defer { context.invalidate() }
-                        try Self.worker.installContext(context, for: requestID)
-                        var query = try AppleWorkspaceVault().query(account: authorization.account)
-                        query[kSecMatchLimit as String] = kSecMatchLimitOne
-                        query[kSecReturnData as String] = true
-                        query[kSecUseAuthenticationContext as String] = context
-                        var item: CFTypeRef?
-                        let status = SecItemCopyMatching(query as CFDictionary, &item)
-                        try Self.worker.check(requestID)
+                        func read(_ context: LAContext) throws -> (OSStatus, CFTypeRef?) {
+                            var query = try AppleWorkspaceVault().query(account: authorization.account)
+                            query[kSecMatchLimit as String] = kSecMatchLimitOne
+                            query[kSecReturnData as String] = true
+                            query[kSecUseAuthenticationContext as String] = context
+                            var item: CFTypeRef?
+                            let status = SecItemCopyMatching(query as CFDictionary, &item)
+                            try Self.worker.check(requestID)
+                            return (status, item)
+                        }
+                        // A standing approval signs without asking again; it
+                        // was given for exactly these keys moments ago.
+                        var (status, item) = (errSecInteractionNotAllowed, CFTypeRef?.none)
+                        if let approved = Self.worker.approvedContext() {
+                            (status, item) = try read(approved)
+                            if status != errSecSuccess { Self.worker.endApproval() }
+                        }
+                        if status != errSecSuccess {
+                            let context = LAContext()
+                            context.localizedReason = "Unlock your SSH keys to connect to your machines."
+                            try Self.worker.installContext(context, for: requestID)
+                            (status, item) = try read(context)
+                            if status == errSecSuccess {
+                                Self.worker.adopt(context, for: requestID, lasting: Self.approvalDuration)
+                            }
+                        }
                         try WorkspaceVaultError.check(status, "use")
                         guard var container = item as? Data, !container.isEmpty, container.count <= FTLimit.key else {
                             throw FTError.storage

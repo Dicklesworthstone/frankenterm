@@ -194,16 +194,57 @@ final class MobileWorkspaceModel {
             .write(to: documents.appendingPathComponent("connect-self-test.txt"), options: .atomic)
     }
     /// Inactive (a Face ID sheet, a permission alert, Control Center, the app
-    /// switcher) covers the screen and pauses restore; only background ends
-    /// connections. Face ID itself makes the app inactive, so tying
-    /// connections to "active" tore down every sign-in while its prompt was up.
+    /// switcher) covers the screen and pauses restore. Live sessions run until
+    /// the user closes them, background included: leaving asks iOS for its
+    /// usual grace period and ends the standing Face ID approval; returning
+    /// reconnects whatever dropped meanwhile (WorkspaceTerminalScene).
     func setScenePhase(_ phase: ScenePhase) {
+        if phase == .background {
+            AppleSSHCredentialSigner.endApproval()
+            beginBackgroundRun()
+        } else { endBackgroundRun() }
         let foreground = phase != .background
         if foreground != connectionsForeground {
             connectionsForeground = foreground
-            updateConnectionLifecycle()
+            if foreground { updateConnectionLifecycle() }
+        }
+        // Scenes run whether or not their screen is showing, so they hear the
+        // app's phase from here, not from their screen.
+        for scene in liveScenes.values {
+            scene.setForeground(phase == .active)
+            if phase == .background { scene.enteredBackground() }
         }
         if (phase == .active) != active { setActive(phase == .active) }
+    }
+    @ObservationIgnored private var backgroundRun = UIBackgroundTaskIdentifier.invalid
+    /// Keeps live sessions answering their servers through a quick app switch.
+    private func beginBackgroundRun() {
+        guard backgroundRun == .invalid else { return }
+        backgroundRun = UIApplication.shared.beginBackgroundTask(withName: "FrankenTerm sessions") { [weak self] in
+            MainActor.assumeIsolated { self?.endBackgroundRun() }
+        }
+    }
+    private func endBackgroundRun() {
+        guard backgroundRun != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundRun)
+        backgroundRun = .invalid
+    }
+
+    /// Live workspace scenes outlive their screens: leaving the terminal keeps
+    /// every session running until the user disconnects it. A new revision of
+    /// a workspace (a re-import) or its removal retires its scene.
+    @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
+    func liveScene(workspaceID: UUID, revision: UUID,
+                   make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
+        if let scene = liveScenes[workspaceID], scene.revision == revision, !scene.closed { return scene }
+        if let stale = liveScenes.removeValue(forKey: workspaceID) { retire(stale) }
+        let scene = try make()
+        liveScenes[workspaceID] = scene
+        return scene
+    }
+    private func retire(_ scene: WorkspaceTerminalScene) {
+        scene.requestClose()
+        Task { await scene.close() }
     }
     private func setActive(_ value: Bool) {
         active = value
@@ -215,14 +256,13 @@ final class MobileWorkspaceModel {
         } else if pendingImport != nil { showRestore = true }
         updateLifecycle()
     }
-    /// Serialized so a quick background/foreground pair reaches the connection
-    /// manager in order; it seals and settles live sessions in the background.
+    /// Serialized activations: admit connections and retry failed cleanup.
     private func updateConnectionLifecycle() {
         guard let connections else { return }
-        let prior = connectionLifecycle, value = connectionsForeground
+        let prior = connectionLifecycle
         connectionLifecycle = Task {
             await prior?.value
-            await connections.setActive(value)
+            await connections.activate()
         }
     }
     func setRestoreVisible(_ value: Bool) {
@@ -314,6 +354,9 @@ final class MobileWorkspaceModel {
         let snapshot = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
         guard active, epoch == ticket else { return }
         workspaces = snapshot.map(\.workspace)
+        for (id, scene) in liveScenes where !workspaces.contains(where: { $0.id == id && $0.revision == scene.revision }) {
+            liveScenes[id] = nil; retire(scene)
+        }
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
         // A first import, or new machines in a replaced one: machines that
@@ -1368,17 +1411,21 @@ private struct MachineWorkspaceView: View {
         }
     }
 
-    /// The live scene over this group's machines in their order, opening on
-    /// `initial`. Each machine tries its ready direct-SSH routes, those this
+    /// The workspace's live scene, kept by the app across visits, opening on
+    /// `initial`. It holds every machine, this group's first, and keeps all
+    /// of them connected; each tries its ready direct-SSH routes, those this
     /// phone can reach now first (TerminalSessionTarget.attemptOrder).
     private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String) -> some View {
         let themes = SceneThemeSource(
             themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
             choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
-        return LiveWorkspaceView(initialMachineID: initial, themes: themes) {
-            try WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
-                machines: machines.map { sceneMachine($0, local: local) },
-                initialMachineID: initial, connections: connections)
+        let ordered = machines + document.machines.filter { machine in !machines.contains { $0.id == machine.id } }
+        return LiveWorkspaceView(initialMachineID: initial, themes: themes) { [model, workspaceID, document] in
+            try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision) {
+                try WorkspaceTerminalScene(workspaceID: workspaceID, revision: local.workspace.revision,
+                    workspaceName: document.name, machines: ordered.map { sceneMachine($0, local: local) },
+                    initialMachineID: initial, connections: connections)
+            }
         }
     }
 
