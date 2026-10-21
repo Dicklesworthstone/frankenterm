@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import Observation
+import os
 import FrankenTermKit
 import FrankenTermSSH
 import FrankenTermSSHIntegration
@@ -516,6 +517,9 @@ final class TerminalSessionController {
     }
 
     private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp }
+    /// Each failed route, for `idevicesyslog` or Console: the screen shows
+    /// only the explanation.
+    private static let log = Logger(subsystem: "org.frankenterm.mobile", category: "connect")
 
     /// Tries the machine's routes in attempt order and moves on only while an
     /// address never answers. A refused key or a changed host key ends the
@@ -531,18 +535,20 @@ final class TerminalSessionController {
                 return try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
                     credentialID: candidate.credentialID, confirmedByUser: true)
-            } catch let error as NativeSSHError where error.isUnreachable {
-                if let help = WorkspaceConnectionHelp(failure: error, machine: target.machineName, host: candidate.host,
-                                                      port: candidate.port, onTailnet: onTailnet, device: device) {
-                    unreachable.append(help)
-                }
             } catch is CancellationError {
                 throw CancellationError()
             } catch TerminalSessionJournalError.reviewRequired {
                 throw TerminalSessionJournalError.reviewRequired
             } catch {
-                throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
-                                                 message: Self.describe(error), remedy: .none))
+                Self.log.error("route \(candidate.id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                guard let failure = error as? NativeSSHError, failure.isUnreachable else {
+                    throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                                                     message: Self.describe(error), remedy: .none))
+                }
+                if let help = WorkspaceConnectionHelp(failure: failure, machine: target.machineName, host: candidate.host,
+                                                      port: candidate.port, onTailnet: onTailnet, device: device) {
+                    unreachable.append(help)
+                }
             }
         }
         throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)

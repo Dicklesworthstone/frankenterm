@@ -36,10 +36,10 @@ public enum WorkspaceStorageSelfTest {
                     // A connection's key selection, which must not prompt.
                     let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
                         credentialAlgorithms: [identity.algorithm], hostKeyAlgorithms: [identity.algorithm])
-                    for issue in try await store.loadWithReadiness(support: support).flatMap({ $0.routes.flatMap(\.issues) }) {
-                        report.append("route not ready: \(issue.message)")
-                    }
                     do {
+                        for issue in try await store.loadWithReadiness(support: support).flatMap({ $0.routes.flatMap(\.issues) }) {
+                            report.append("route not ready: \(issue.message)")
+                        }
                         let authorization = try await store.authorizeSSHAuthentication(workspaceID: saved.id,
                             expectedRevision: saved.revision, routeID: "route", credentialID: binding.credentialID,
                             presentedHostKey: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support)

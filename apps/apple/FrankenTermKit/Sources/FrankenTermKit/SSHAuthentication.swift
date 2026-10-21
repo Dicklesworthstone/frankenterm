@@ -15,7 +15,7 @@ public enum SSHAuthenticationError: Error, Equatable, Sendable, LocalizedError {
         case .unavailable: "This machine's key isn't available on this device."
         case .busy: "Another sign-in is already in progress."
         case .stale: "This machine's saved settings changed. Open it again."
-        case .denied: "This route isn't ready to connect on this device."
+        case .denied: "This connection isn't allowed on this device: the route isn't ready, or the machine's host key or encryption isn't one it accepts."
         case .invalidChallenge: "The machine sent a sign-in request this app can't answer."
         case .identityMismatch: "The saved key doesn't match the key this machine expects."
         case .unsupportedAlgorithm: "This key type isn't supported yet."

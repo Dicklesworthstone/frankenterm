@@ -41,7 +41,7 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
             case FTSSH_IO: "The connection to the machine was lost."
             case FTSSH_NEGOTIATION: "The machine's SSH server offers no encryption this app accepts."
             case FTSSH_HOST_REJECTED: "The machine's host key changed during the connection."
-            case FTSSH_AUTH_REJECTED: "The machine didn't accept this key. Add its public key to the machine's authorized_keys."
+            case FTSSH_AUTH_REJECTED: "The machine didn't accept this key. Add the key's public half to ~/.ssh/authorized_keys on the machine."
             case FTSSH_CLOSED: "The machine closed the connection."
             case FTSSH_UNSUPPORTED: "The machine requires an SSH feature this app doesn't support."
             default: "The SSH connection failed (code \(code))."

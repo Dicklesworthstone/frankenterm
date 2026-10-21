@@ -116,10 +116,12 @@ final class WorkspaceConnectionManagerTests: XCTestCase, @unchecked Sendable {
 
 final class WorkspaceRouteDiagnosisTests: XCTestCase {
     func testAddressesAreClassifiedByTheNetworkThatReachesThem() {
-        for host in ["100.64.0.1", "100.91.120.17", "100.127.255.254", "fd7a:115c:a1e0::1", "trj.tail1234.ts.net"] {
+        for host in ["100.64.0.1", "100.91.120.17", "100.127.255.254", "fd7a:115c:a1e0::1", "trj.tail1234.ts.net",
+                     "TRJ.tail1234.TS.NET."] {
             XCTAssertEqual(WorkspaceRouteNetwork(host: host), .tailnet, host)
         }
-        for host in ["10.10.10.1", "172.16.0.1", "172.31.255.1", "192.168.1.240", "169.254.1.1", "fe80::1", "fd00::1", "mmax.local"] {
+        for host in ["10.10.10.1", "172.16.0.1", "172.31.255.1", "192.168.1.240", "169.254.1.1", "fe80::1",
+                     "fe80::1%en0", "fd00::1", "mmax.local", "mmax.local."] {
             XCTAssertEqual(WorkspaceRouteNetwork(host: host), .localNetwork, host)
         }
         for host in ["100.63.255.255", "100.128.0.1", "172.32.0.1", "209.145.54.164", "2606:4700::1", "example.com"] {
@@ -138,19 +140,28 @@ final class WorkspaceRouteDiagnosisTests: XCTestCase {
             host: "100.91.120.17", port: 22, onTailnet: true, device: "this iPhone"))
         XCTAssertEqual(asleep.remedy, .none)
         XCTAssertTrue(asleep.message.hasPrefix("This iPhone is on Tailscale"))
+        // Refused before leaving the device: possibly the Local Network permission.
         let lan = try XCTUnwrap(WorkspaceConnectionHelp(failure: NativeSSHError.connection(EHOSTUNREACH), machine: "mold",
             host: "192.168.1.233", port: 22, onTailnet: true))
         XCTAssertEqual(lan.remedy, .allowLocalNetwork)
+        // Silence from a local address: another network, not a permission.
+        let away = try XCTUnwrap(WorkspaceConnectionHelp(failure: NativeSSHError.timedOut, machine: "mold",
+            host: "192.168.1.233", port: 22, onTailnet: true))
+        XCTAssertEqual(away.remedy, .none)
+        XCTAssertTrue(away.message.contains("same Wi-Fi"))
         let refused = try XCTUnwrap(WorkspaceConnectionHelp(failure: NativeSSHError.connection(ECONNREFUSED), machine: "css",
             host: "209.145.54.164", port: 2222, onTailnet: false))
         XCTAssertEqual(refused.title, "css refused the connection")
         XCTAssertTrue(refused.message.contains("port 2222"))
+        let offline = try XCTUnwrap(WorkspaceConnectionHelp(failure: NativeSSHError.connection(ENETUNREACH), machine: "css",
+            host: "209.145.54.164", port: 22, onTailnet: false))
+        XCTAssertEqual(offline.title, "No network connection")
         XCTAssertNil(WorkspaceConnectionHelp(failure: NativeSSHError.native(-1006), machine: "css",
             host: "209.145.54.164", port: 22, onTailnet: false))
         XCTAssertNil(WorkspaceConnectionHelp(failure: SSHAuthenticationError.hostKeyMismatch, machine: "css",
             host: "209.145.54.164", port: 22, onTailnet: false))
         XCTAssertEqual(WorkspaceConnectionHelp.best([refused, lan, tailscale]), tailscale)
-        XCTAssertEqual(WorkspaceConnectionHelp.best([refused, lan]), lan)
+        XCTAssertEqual(WorkspaceConnectionHelp.best([refused, lan]), refused)
         XCTAssertEqual(WorkspaceConnectionHelp.best([refused]), refused)
         XCTAssertNil(WorkspaceConnectionHelp.best([]))
     }

@@ -100,11 +100,21 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         foreground = active
         if active { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
-        // Back from turning Tailscale on: try the machine that needed it.
-        if active, let id = selectedMachineID, case .couldNotConnect(let help) = sessions[id]?.phase,
-           help.remedy == .turnOnTailscale, WorkspaceRouteNetwork.deviceTailnetAddress() != nil {
-            connect(id)
+        // Back from turning Tailscale on: try the machine that needed it, once
+        // the app's own resume has let connections through again.
+        if active, let id = selectedMachineID, needsTailscale(id), WorkspaceRouteNetwork.deviceTailnetAddress() != nil {
+            let manager = connections.manager
+            Task { [weak self] in
+                for _ in 0..<20 where await !manager.permitsConnections { try? await Task.sleep(for: .milliseconds(100)) }
+                guard let self, !self.closed, self.foreground, self.needsTailscale(id) else { return }
+                self.connect(id)
+            }
         }
+    }
+
+    private func needsTailscale(_ machineID: String) -> Bool {
+        guard case .couldNotConnect(let help) = sessions[machineID]?.phase else { return false }
+        return help.remedy == .turnOnTailscale
     }
 
     /// Synchronously seal every scene-owned responder before scheduling joins.
@@ -347,7 +357,7 @@ struct WorkspaceTerminalScreen: View {
             case .live:
                 EmptyView()
             case let .couldNotConnect(help):
-                connectionHelp(help) { scene.connect(machine.id) }
+                connectionHelp(help, settled: session.settled) { scene.connect(machine.id) }
             case .needsReview:
                 notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
                        message: "A previous session may have left remote effects whose outcome is unknown.",
@@ -378,9 +388,11 @@ struct WorkspaceTerminalScreen: View {
     }
 
     /// Nothing ran, so there is no session to review: the reason, the one
-    /// change that fixes it, and Try Again.
-    private func connectionHelp(_ help: WorkspaceConnectionHelp, retry: @escaping () -> Void) -> some View {
-        VStack(spacing: 14) {
+    /// change that fixes it, and Try Again once the attempt has settled.
+    private func connectionHelp(_ help: WorkspaceConnectionHelp, settled: Bool,
+                                retry: @escaping () -> Void) -> some View {
+        let retry = Button("Try Again", systemImage: "arrow.clockwise", action: retry).disabled(!settled)
+        return VStack(spacing: 14) {
             Image(systemName: help.remedy == .turnOnTailscale ? "network.badge.shield.half.filled" : "wifi.exclamationmark")
                 .font(.system(size: 40)).symbolRenderingMode(.hierarchical)
             Text(verbatim: help.title).font(.title3.bold()).multilineTextAlignment(.center)
@@ -390,18 +402,16 @@ struct WorkspaceTerminalScreen: View {
             case .turnOnTailscale:
                 Button("Open Tailscale", systemImage: "arrow.up.forward.app") { Self.openTailscale() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
-                Button("Try Again", systemImage: "arrow.clockwise", action: retry).buttonStyle(.bordered)
+                retry.buttonStyle(.bordered)
                 Text("FrankenTerm tries again on its own when you come back with Tailscale on.")
                     .font(.caption).multilineTextAlignment(.center).foregroundStyle(.white.opacity(0.7))
             case .allowLocalNetwork:
-                Button("Try Again", systemImage: "arrow.clockwise", action: retry)
-                    .buttonStyle(.borderedProminent).controlSize(.large)
+                retry.buttonStyle(.borderedProminent).controlSize(.large)
                 Button("Open Settings", systemImage: "gear") {
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                 }.buttonStyle(.bordered)
             case .none:
-                Button("Try Again", systemImage: "arrow.clockwise", action: retry)
-                    .buttonStyle(.borderedProminent).controlSize(.large)
+                retry.buttonStyle(.borderedProminent).controlSize(.large)
             }
         }.padding(24).frame(maxWidth: 420).foregroundStyle(.white)
             .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 20)).padding()

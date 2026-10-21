@@ -17,7 +17,11 @@ public enum WorkspaceRouteNetwork: Sendable, Equatable {
     case internet
 
     public init(host: String) {
-        let name = host.lowercased()
+        // A fully qualified name may end in a dot; an IPv6 literal may carry
+        // a zone ("fe80::1%en0") that inet_pton does not accept.
+        var name = host.lowercased()
+        if name.hasSuffix(".") { name.removeLast() }
+        if let zone = name.firstIndex(of: "%") { name = String(name[..<zone]) }
         if name.hasSuffix(".ts.net") { self = .tailnet; return }
         if name.hasSuffix(".local") { self = .localNetwork; return }
         var v4 = in_addr()
@@ -103,45 +107,54 @@ public struct WorkspaceConnectionHelp: Sendable, Equatable {
                  onTailnet: Bool, device: String = "this device") {
         guard let failure = failure as? NativeSSHError, failure.isUnreachable else { return nil }
         let Device = device.prefix(1).uppercased() + device.dropFirst()
-        switch WorkspaceRouteNetwork(host: host) {
-        case .tailnet where !onTailnet:
-            title = "Turn on Tailscale"
-            message = "\(machine) is on your Tailscale network, and \(device) isn't connected to Tailscale. Open Tailscale, switch it on, then try again."
-            remedy = .turnOnTailscale
-        case .tailnet:
-            title = "\(machine) isn't answering"
-            message = "\(Device) is on Tailscale, but \(machine) (\(host)) didn't answer. It may be asleep, offline or signed out of Tailscale."
-            remedy = .none
-        case .localNetwork:
-            title = "\(machine) is on a local network"
-            message = "\(host) is a local-network address, so \(device) has to be on the same Wi-Fi as \(machine). If it is, allow Local Network access for FrankenTerm in Settings."
-            remedy = .allowLocalNetwork
-        case .internet:
-            remedy = .none
-            switch failure {
-            case .resolution:
-                title = "Couldn't find \(machine)"
-                message = "\(Device) couldn't look up \(host). Check the internet connection, then try again."
-            case .connection(ECONNREFUSED):
-                title = "\(machine) refused the connection"
-                message = "\(host) answered, but nothing is accepting SSH on port \(port)."
-            default:
-                title = "\(machine) isn't answering"
-                message = "\(host) didn't answer on port \(port). The machine may be off, or a firewall may block SSH from this network."
-            }
+        // Refused at once, before any packet left: no network at all, or (for
+        // a local address) iOS withholding Local Network access.
+        let noRoute = [.connection(ENETDOWN), .connection(ENETUNREACH), .connection(EHOSTUNREACH)].contains(failure)
+        switch (WorkspaceRouteNetwork(host: host), failure) {
+        case (.tailnet, _) where !onTailnet:
+            self.init(title: "Turn on Tailscale",
+                      message: "\(machine) is on your Tailscale network, and \(device) isn't connected to Tailscale. Open Tailscale, switch it on, then try again.",
+                      remedy: .turnOnTailscale)
+        case (_, .connection(ECONNREFUSED)):
+            self.init(title: "\(machine) refused the connection",
+                      message: "\(host) answered, but nothing is accepting SSH on port \(port).", remedy: .none)
+        case (.tailnet, _):
+            self.init(title: "\(machine) isn't answering",
+                      message: "\(Device) is on Tailscale, but \(machine) (\(host)) didn't answer. It may be asleep, offline or signed out of Tailscale.",
+                      remedy: .none)
+        case (.localNetwork, _) where noRoute:
+            self.init(title: "Couldn't reach \(machine)",
+                      message: "\(host) is on a local network. If \(device) is on the same Wi-Fi as \(machine), turn on Local Network for FrankenTerm in Settings.",
+                      remedy: .allowLocalNetwork)
+        case (.localNetwork, _):
+            self.init(title: "\(machine) isn't answering",
+                      message: "\(host) is on a local network, so \(device) has to be on the same Wi-Fi as \(machine), or reach it over Tailscale.",
+                      remedy: .none)
+        case (.internet, .resolution):
+            self.init(title: "Couldn't find \(machine)",
+                      message: "\(Device) couldn't look up \(host). Check the internet connection, then try again.", remedy: .none)
+        case (.internet, _) where noRoute && failure != .connection(EHOSTUNREACH):
+            self.init(title: "No network connection",
+                      message: "\(Device) isn't connected to a network. Check Wi-Fi or cellular data, then try again.", remedy: .none)
+        case (.internet, _):
+            self.init(title: "\(machine) isn't answering",
+                      message: "\(host) didn't answer on port \(port). The machine may be off, or a firewall may block SSH from this network.",
+                      remedy: .none)
         }
     }
 
-    /// The most useful explanation among several routes' failures: one the
-    /// user can fix outright first, then the first route's.
+    /// The most useful explanation among several routes' failures, given in
+    /// the order they were tried: turning on Tailscale when that is the fix,
+    /// otherwise the first route's, the one this device was likeliest to reach.
     public static func best(_ helps: [WorkspaceConnectionHelp]) -> WorkspaceConnectionHelp? {
-        helps.first { $0.remedy == .turnOnTailscale } ?? helps.first { $0.remedy == .allowLocalNetwork } ?? helps.first
+        helps.first { $0.remedy == .turnOnTailscale } ?? helps.first
     }
 }
 
 /// Reaches a route the way a connection does, through the transport and the
 /// host-key exchange, and stops before any key is selected or offered. It
-/// needs no protected storage and never prompts.
+/// needs no protected storage and never prompts, but it is network use: it
+/// holds a connection lease, so it is refused during an offline restore.
 public enum WorkspaceRouteProbe {
     public struct Result: Sendable {
         public let network: WorkspaceRouteNetwork
@@ -153,17 +166,20 @@ public enum WorkspaceRouteProbe {
     }
 
     public static func run(route: WorkspaceDocument.Route, document: WorkspaceDocument,
-                           timeout: Duration = .seconds(8)) async -> Result {
+                           timeout: Duration = .seconds(8),
+                           networkActivity: WorkspaceNetworkActivity = .shared) async -> Result {
         let network = WorkspaceRouteNetwork(host: route.host)
-        let session: NativeSSHSession
+        let session: NativeSSHSession, lease: WorkspaceNetworkLease
         do {
+            lease = try networkActivity.beginConnection()
             session = try await NativeSSHConnector.connect(to: NativeSSHEndpoint(host: route.host, port: route.port),
-                                                           timeout: timeout)
+                                                           timeout: timeout, networkLifetime: lease)
         } catch { return .init(network: network, hostKey: nil, peer: nil, failure: error) }
         let witness = PeerWitness(transportID: session.transportID)
         var failure: (any Error)?
         do { _ = try await session.authenticate(using: witness, timeout: timeout) } catch { failure = error }
         await session.close()
+        withExtendedLifetime(lease) {}
         guard let peer = await witness.peer else { return .init(network: network, hostKey: nil, peer: nil, failure: failure) }
         do {
             let identity = try SSHPublicIdentity(blob: peer.hostKey)
