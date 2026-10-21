@@ -9,8 +9,8 @@ The existing FrankenTerm terminal, keyboard and Metal components remain canonica
 
 The offline workspace browser does not yet enable this backend. An authorized
 Apple build must supply the correct iOS/device/simulator libssh2 and crypto
-artifacts, integrate the workspace-policy/signing broker and canonical terminal
-bridge, and qualify the resulting app. A system macOS libssh2 is NOT an iOS
+artifacts, integrate the canonical terminal bridge and native workspace connection
+owner with the application, and qualify the resulting app. A system macOS libssh2 is NOT an iOS
 library. No libssh2 artifact is downloaded, built by Cargo, or bundled here.
 Do not substitute a Homebrew desktop dylib into an iPhone artifact. Release
 artifacts remain subject to DSR and development Rust proof remains subject to RCH.
@@ -94,9 +94,10 @@ and protected signing; there is no default trust acceptance. The provider gets
 actual negotiated methods and the verified exchange's host key before a public
 identity can be offered. A typed, exact-bound user-authentication challenge is
 supplied to the signer, then policy is rechecked before signature submission,
-authentication publication and explicit PTY/shell creation. It is suitable for an
-adapter to the existing workspace broker; that adapter and public-key discovery
-from protected storage are not wired into the offline application yet.
+authentication publication and explicit PTY/shell creation. The optional integration
+product supplies `WorkspaceNativeSSHAuthentication` for the existing workspace
+broker and protected public-key discovery. The offline application does not yet
+enable connections.
 
 Authentication and shell creation use finite ContinuousClock deadlines. A stale
 expiry callback cannot close a later operation. Cancellation or expiry invalidates
@@ -119,6 +120,38 @@ preventing stale readiness callbacks from targeting a reused descriptor. One
 shared readiness queue serves all sessions. Concurrent close calls await the same
 cleanup. The application still owns foreground/network permission, route policy,
 keepalive/reconnect decisions, durable uncertainty markers, and terminal binding.
+
+## Imported workspace authentication and connection ownership
+
+`WorkspaceNativeSSHAuthentication` implements the native authentication provider
+with `FrankenTermKit.SSHAuthenticationBroker`. Configure the shared foreground
+broker with the adapter's `routeSupport`: direct SSH, pinned Ed25519 or NIST ECDSA
+host keys, and Ed25519/P-256/P-384/P-521 client keys. Unsupported jumps, mux routes,
+certificates, RSA, password/MFA and mandatory source policies remain blocked.
+The adapter compares the actual negotiated methods, original endpoint, selected
+route revision, host pin and transport identity before looking up a public key.
+The broker checks current protected storage and local revocations before and after
+lookup. New Keychain items provide validated public metadata without an unlock;
+older items can derive their public half on the same protected worker.
+
+The signer reconstructs the exact typed RFC 4252 challenge rather than signing
+arbitrary driver bytes. A selected identity carries an unforgeable foreground
+lifetime witness. Suspension/resume, reimport, revocation or cancellation cannot
+revive it, including cancellation before work reaches the broker. The single
+protected-worker reservation remains held until cancelled native work settles.
+`validateCurrent()` repeats durable policy checks for a retained live connection.
+
+`WorkspaceNativeSSHConnection.connect` adds explicit user confirmation, current
+machine/route/credential readiness, and foreground checks before DNS. Its shared
+`WorkspaceNetworkActivity` lease excludes strict Offline Restore until owned
+network work has joined, including uncancellable resolver work. Requesting
+restoration while connected reports the conflict; it never silently closes a
+remote shell. The owner's raw session does not escape. Its separate `openTerminal`
+operation invokes the app's exact-source durability callback before creating a
+PTY, claims the package driver, and attaches the existing coordinator/pump. Writes,
+service and resize revalidate foreground and current authority. Close joins native
+teardown before releasing network exclusion. The caller still owns canonical
+terminal consumption, scene lifecycle, and retained input-outcome reconciliation.
 
 ## Binding a native channel to terminal input and output
 
@@ -222,7 +255,10 @@ cleanup.
 Four attachment tests additionally reject unauthenticated sockets, mismatched
 native transport/channel identities, pre-cancelled attachment and closed-channel
 revival without publishing a source or consuming caller-owned live state. All
-twenty-three XCTest cases pass under Swift 6.2.1 with warnings-as-errors.
+twenty-three cases remain in the complete package run. With the five workspace
+authentication cases and six route-admission cases, **34 XCTest cases pass** under
+Swift 6.2.1 with warnings-as-errors. One additional live-server entry point is
+explicitly skipped in an ordinary run, then executed by the harness below.
 Nine additional integration tests drive the production Swift actor and C adapter
 against the independent server: four signing families, exact Unicode/binary data,
 resize, wake-up, idle timeout followed by working input, rejected peer policy,
@@ -236,12 +272,26 @@ acceptance accounting, duplicate attachment and raw-I/O refusal, latched wake
 before/during idle service, and prompt cancellation of a quiet reader. These are
 separate from the nine native-driver scenarios above.
 
+Eight additional real-server scenarios exercise the production workspace import,
+canonical public-key discovery, actual signing broker, native connector/libssh2,
+and independent libssh server together. They verify exact Unicode PTY bytes,
+rejection of wrong/revoked host keys before credential access, credential
+revocation before shell creation, and the complete route owner/coordinator/pump
+flow with resize. The owned flow also proves network/offline exclusion and joined
+release, failure of the app's marker callback before any shell request, refusal
+of queued input after revocation, and closed coordinator admission before the
+pump has started. The harness runs the live XCTest entry point once per scenario
+and rejects a skipped or undiscovered test. Its synthetic memory-backed vault uses
+the real production signer; native Keychain prompts and device durability remain
+separate qualification work.
+
 ```sh
 swift test -j 2 -Xswiftc -warnings-as-errors
 swift build --product FrankenTermSSHInteropProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHInteropProbe
 swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so .build/debug/TerminalPumpProbe
+python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest
 ```
 
 The retained legacy `TerminalPumpProbe` independently covers all four signing
@@ -255,5 +305,5 @@ editor. Neither test-only executable enters an application's linked products.
 These native/test builds do not alter the main FrankenTermKit package or add
 runtime downloads. No Apple SDK typecheck, Keychain prompt or physical-device
 qualification is inferred from Linux execution. Supply platform-correct native
-artifacts and perform the remaining session-owner/terminal integration before
+artifacts and perform the remaining app scene/native-terminal integration before
 enabling Connect in the app.

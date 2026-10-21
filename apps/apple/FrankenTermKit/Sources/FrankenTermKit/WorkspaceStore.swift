@@ -702,6 +702,7 @@ public actor WorkspaceStore {
             return .init(storeOwner: sshAuthorizationOwner, account: binding.account,
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
                 credentialID: credentialID, host: route.host, port: route.port, user: route.user,
+                routeMode: route.mode, jumpRouteIDs: route.jumpRoutes,
                 algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey)
         }
     }

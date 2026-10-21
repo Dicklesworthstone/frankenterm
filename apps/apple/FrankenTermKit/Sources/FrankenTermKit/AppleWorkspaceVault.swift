@@ -23,6 +23,8 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
     public func create(account: String, privateContainer: Data, fingerprint: String) throws {
         guard !privateContainer.isEmpty, privateContainer.count <= FTLimit.key,
               fingerprint.utf8.count == 50, fingerprint.hasPrefix("SHA256:") else { throw FTError.limit("vault.item") }
+        let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: privateContainer)
+        guard identity.fingerprint == fingerprint else { throw SSHAuthenticationError.identityMismatch }
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
                                                           .userPresence, &error) else {
@@ -31,6 +33,9 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
         var item = try query(account: account)
         item[kSecAttrAccessControl as String] = access
         item[kSecAttrGeneric as String] = Data(fingerprint.utf8)
+        // Public metadata avoids prompting merely to offer a key. It is checked
+        // against the independently stored fingerprint and never grants signing.
+        item[kSecAttrComment as String] = "ft-ssh-public-v1:" + identity.blob.base64EncodedString()
         item[kSecValueData as String] = privateContainer
         // Add only. A duplicate must never overwrite an identity or relax its ACL.
         guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw FTError.storage }
@@ -67,6 +72,7 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
 /// Mutable request/context ownership is protected by the lock; no private key is
 /// retained in shared state. The broker still rechecks durable policy afterward.
 public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sendable {
+    private enum Operation: Sendable { case publicIdentity, signature(SSHUserAuthenticationChallenge) }
     private final class Worker: @unchecked Sendable {
         struct Request {
             let id: UUID
@@ -120,11 +126,19 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
 
     public func cancel(requestID: UUID) { Self.worker.cancel(requestID) }
 
+    public func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
+        try await perform(requestID: requestID, authorization: authorization, operation: .publicIdentity)
+    }
+
     public func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
                      challenge: SSHUserAuthenticationChallenge) async throws -> Data {
-        try Task.checkCancellation()
         guard challenge.user == authorization.user, challenge.algorithm == authorization.algorithm,
               challenge.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
+        return try await perform(requestID: requestID, authorization: authorization, operation: .signature(challenge))
+    }
+
+    private func perform(requestID: UUID, authorization: WorkspaceSSHAuthorization, operation: Operation) async throws -> Data {
+        try Task.checkCancellation()
         let result: Data = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 do {
@@ -136,6 +150,36 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                 Self.worker.queue.async {
                     let result = Result<Data, Error> {
                         try Self.worker.check(requestID)
+                        if case .publicIdentity = operation {
+                            let metadataContext = LAContext(); metadataContext.interactionNotAllowed = true
+                            defer { metadataContext.invalidate() }
+                            var query = try AppleWorkspaceVault().query(account: authorization.account)
+                            query[kSecMatchLimit as String] = kSecMatchLimitOne
+                            query[kSecReturnAttributes as String] = true
+                            query[kSecUseAuthenticationContext as String] = metadataContext
+                            var item: CFTypeRef?
+                            let status = SecItemCopyMatching(query as CFDictionary, &item)
+                            try Self.worker.check(requestID)
+                            guard status == errSecSuccess, let attributes = item as? [String: Any],
+                                  attributes[kSecAttrGeneric as String] as? Data == Data(authorization.fingerprint.utf8) else {
+                                throw SSHAuthenticationError.denied
+                            }
+                            if let comment = attributes[kSecAttrComment as String] as? String {
+                                let prefix = "ft-ssh-public-v1:"
+                                guard comment.hasPrefix(prefix), comment.utf8.count <= 768,
+                                      let blob = Data(base64Encoded: String(comment.dropFirst(prefix.count))) else {
+                                    throw SSHAuthenticationError.identityMismatch
+                                }
+                                let identity = try SSHPublicIdentity(blob: blob)
+                                guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
+                                    throw SSHAuthenticationError.identityMismatch
+                                }
+                                return blob
+                            }
+                            // An identity imported before public metadata existed
+                            // stays usable. Obtain its public half on the same
+                            // bounded user-presence worker; never export the key.
+                        }
                         let context = LAContext()
                         context.localizedReason = "Use your SSH identity for \(authorization.user)@\(authorization.host):\(authorization.port)."
                         context.touchIDAuthenticationAllowableReuseDuration = 0
@@ -159,9 +203,19 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         // Foundation and Security may retain other copies. This
                         // clears the owned buffer, not a forensic-erasure promise.
                         defer { container.resetBytes(in: 0..<container.count) }
-                        let signature = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
+                        let value: Data
+                        switch operation {
+                        case .publicIdentity:
+                            let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container)
+                            guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
+                                throw SSHAuthenticationError.identityMismatch
+                            }
+                            value = identity.blob
+                        case .signature(let challenge):
+                            value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
+                        }
                         try Self.worker.check(requestID)
-                        return signature
+                        return value
                     }
                     continuation.resume(with: Self.worker.finish(requestID, result: result))
                 }

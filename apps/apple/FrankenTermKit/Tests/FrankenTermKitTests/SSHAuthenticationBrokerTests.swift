@@ -7,19 +7,27 @@ import XCTest
 /// authentication callback that still owns resources while cancellation arrives.
 private final class DelayedSSHSigner: WorkspaceSSHSigning, @unchecked Sendable {
     private struct Pending {
-        let id: UUID, challenge: SSHUserAuthenticationChallenge
+        let id: UUID, challenge: SSHUserAuthenticationChallenge?
         let continuation: CheckedContinuation<Data, Error>
     }
     private let lock = NSLock()
     private let container: Data
+    private let delayIdentity: Bool
     private var pending: Pending?
     private var observer: CheckedContinuation<Void, Never>?
     private var callCount = 0, cancellationCount = 0
-    init(_ container: Data) { self.container = container }
+    init(_ container: Data, delayIdentity: Bool = false) { self.container = container; self.delayIdentity = delayIdentity }
     var calls: Int { lock.lock(); defer { lock.unlock() }; return callCount }
     var cancellations: Int { lock.lock(); defer { lock.unlock() }; return cancellationCount }
+    func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
+        if !delayIdentity { return try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container).blob }
+        return try await wait(requestID: requestID, challenge: nil)
+    }
     func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
               challenge: SSHUserAuthenticationChallenge) async throws -> Data {
+        try await wait(requestID: requestID, challenge: challenge)
+    }
+    private func wait(requestID: UUID, challenge: SSHUserAuthenticationChallenge?) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             guard pending == nil else { lock.unlock(); continuation.resume(throwing: SSHAuthenticationError.busy); return }
@@ -45,7 +53,10 @@ private final class DelayedSSHSigner: WorkspaceSSHSigning, @unchecked Sendable {
         lock.lock(); let selected = pending; pending = nil; lock.unlock()
         guard let selected else { return }
         selected.continuation.resume(with: Result {
-            try SSHUserAuthenticationSigner.sign(selected.challenge, privateContainer: container)
+            if let challenge = selected.challenge {
+                return try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
+            }
+            return try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container).blob
         })
     }
 }
@@ -53,6 +64,9 @@ private final class DelayedSSHSigner: WorkspaceSSHSigning, @unchecked Sendable {
 private struct ImmediateSSHSigner: WorkspaceSSHSigning {
     let container: Data
     func cancel(requestID: UUID) {}
+    func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
+        try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container).blob
+    }
     func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
               challenge: SSHUserAuthenticationChallenge) async throws -> Data {
         try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
@@ -116,6 +130,61 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         await expectFailure { _ = try await broker.confirm(requestID: request.id) }
         XCTAssertTrue(f.installed.connectLater, "Signing never changes imported connection preferences.")
         XCTAssertEqual(f.vault.creates, 1, "Signing does not create another private identity.")
+    }
+
+    func testPublicIdentityUsesStoredKeyAndCannotSurviveForegroundReplacement() async throws {
+        let f = try await fixture()
+        let signer = ImmediateSSHSigner(container: f.key.container)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        let selected = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID())
+        XCTAssertEqual(selected.identity.blob, f.key.publicBlob)
+        XCTAssertEqual(selected.identity.fingerprint, f.archive.workspace.credentials[0].fingerprint)
+        XCTAssertEqual(selected.authorization.routeMode, "direct_ssh")
+        XCTAssertTrue(selected.authorization.jumpRouteIDs.isEmpty)
+        try await broker.validate(selected)
+        let other = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await other.resume()
+        await expectFailure { try await other.validate(selected) }
+        await broker.suspend(); await broker.resume()
+        await expectFailure { try await broker.validate(selected) }
+        XCTAssertEqual(f.vault.creates, 1)
+    }
+
+    func testRetiredPublicLookupRetainsWorkerUntilItSettles() async throws {
+        for revocation in [false, true] {
+            let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container, delayIdentity: true)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+            await broker.resume()
+            let transport = UUID()
+            let lookup = Task { try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: transport) }
+            await signer.waitUntilStarted()
+            if revocation { try await f.store.revokeLocally(fingerprint: f.archive.workspace.credentials[0].fingerprint) }
+            else {
+                await broker.cancel(transportID: transport)
+                await broker.suspend(); await broker.resume()
+                await expectFailure { _ = try await self.prepare(broker, f) }
+                XCTAssertGreaterThan(signer.cancellations, 0)
+            }
+            signer.finish()
+            await expectFailure { _ = try await lookup.value }
+            let busy = await broker.isBusy
+            XCTAssertFalse(busy)
+        }
+    }
+
+    func testUntrustedPublicLookupDoesNotReachProtectedReader() async throws {
+        let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container, delayIdentity: true)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.pin)
+        await expectFailure {
+            _ = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID())
+        }
+        XCTAssertEqual(signer.calls, 0)
     }
 
     func testNoQualificationNoPermittedCredentialOrWrongActualHostCannotPrompt() async throws {

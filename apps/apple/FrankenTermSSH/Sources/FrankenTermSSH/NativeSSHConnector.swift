@@ -35,13 +35,19 @@ public enum NativeSSHConnector {
         .init(resolvingHosts: ConnectionBudget.resolvers.current, connectingSockets: ConnectionBudget.sockets.current)
     }
     public static func connect(to endpoint: NativeSSHEndpoint, timeout: Duration = .seconds(15),
-                               maximumNativeBytes: Int = 2 * 1024 * 1024) async throws -> NativeSSHSession {
+                               maximumNativeBytes: Int = 2 * 1024 * 1024,
+                               networkLifetime: (any Sendable)? = nil) async throws -> NativeSSHSession {
+        defer { withExtendedLifetime(networkLifetime) {} }
         guard timeout > .zero, timeout <= .seconds(120), (65536...4 * 1024 * 1024).contains(maximumNativeBytes) else {
             throw NativeSSHError.invalidInput
         }
         try Task.checkCancellation()
         let deadline = ContinuousClock.now + timeout
-        let addresses = try await HostResolution(endpoint: endpoint, deadline: deadline).value()
+        // Native DNS may outlive cancellation of this task. Retain the caller's
+        // application network scope until the actual resolver worker settles.
+        // This witness grants no authority and is never inspected by the driver.
+        let addresses = try await HostResolution(endpoint: endpoint, deadline: deadline,
+                                                 networkLifetime: networkLifetime).value()
         try Task.checkCancellation()
         guard ContinuousClock.now < deadline else { throw NativeSSHError.timedOut }
         let result = await race(addresses, deadline: deadline)
@@ -112,11 +118,14 @@ private final class ConnectionBudget: @unchecked Sendable {
 private final class HostResolution: @unchecked Sendable {
     private static let queue = DispatchQueue(label: "org.frankenterm.ssh.resolve", qos: .userInitiated, attributes: .concurrent)
     private let endpoint: NativeSSHEndpoint, deadline: ContinuousClock.Instant
+    private let networkLifetime: (any Sendable)?
     private let lock = NSLock()
     private var continuation: CheckedContinuation<[SocketAddress], Error>?
     private var outcome: Result<[SocketAddress], Error>?
     private var timer: DispatchSourceTimer?
-    init(endpoint: NativeSSHEndpoint, deadline: ContinuousClock.Instant) { self.endpoint = endpoint; self.deadline = deadline }
+    init(endpoint: NativeSSHEndpoint, deadline: ContinuousClock.Instant, networkLifetime: (any Sendable)?) {
+        self.endpoint = endpoint; self.deadline = deadline; self.networkLifetime = networkLifetime
+    }
     func value() async throws -> [SocketAddress] {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in start(continuation) }
@@ -144,7 +153,10 @@ private final class HostResolution: @unchecked Sendable {
         timer.resume()
         if retired { timer.cancel(); ConnectionBudget.resolvers.release(); return }
         Self.queue.async {
-            defer { ConnectionBudget.resolvers.release() }
+            defer {
+                ConnectionBudget.resolvers.release()
+                withExtendedLifetime(self.networkLifetime) {}
+            }
             self.lock.lock(); let live = self.outcome == nil; self.lock.unlock()
             guard live else { return }
             let result = Result { try Self.resolve(self.endpoint) }
