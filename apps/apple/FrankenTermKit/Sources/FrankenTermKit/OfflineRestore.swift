@@ -62,6 +62,9 @@ public struct OfflineRestoreStatus: Sendable {
     public let incompletePageIndices: [Int]
     public let review: OfflineRestoreReview?
     public let receipt: WorkspaceImportReceipt?
+    /// After a scanned or encrypted transfer commits: what tells its sender
+    /// it arrived (see TransferCompletion).
+    public let arrival: TransferArrival?
 }
 
 /// The application shares one instance across its scanner and document importer.
@@ -87,6 +90,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
     private var archive: AirGapArchive?
     private var review: OfflineRestoreReview?
     private var receipt: WorkspaceImportReceipt?
+    private var arrival: TransferArrival?
     private var pendingNamespace: (exporter: String, workspace: String)?
 
     public init(using crypto: C, store: WorkspaceStore,
@@ -96,10 +100,12 @@ public actor OfflineRestore<C: AirGapCryptography> {
 
     /// Call before presenting a scanner or reading the selected local file.
     /// Existing connections must be closed deliberately by their owners; entering
-    /// restore never disconnects a shell on the user's behalf.
+    /// restore never disconnects a shell on the user's behalf. A completed
+    /// restore has nothing left to read and gives up exclusion (so the device
+    /// may tell the sender, or connect) until a reset and this call again.
     public func enterOfflineMode() throws {
         try Task.checkCancellation()
-        if offlineLease == nil { offlineLease = try networkActivity.beginOfflineRestore() }
+        if offlineLease == nil, phase != .complete { offlineLease = try networkActivity.beginOfflineRestore() }
     }
 
     private var importDigest: Data? { identity?.envelopeDigest ?? documentDigest }
@@ -117,7 +123,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
                      receivedParts: receiver?.receivedParts ?? (envelope == nil ? 0 : identity?.sourcePartCount ?? 0),
                      requiredParts: identity?.sourcePartCount ?? 0,
                      incompletePageIndices: receiver?.incompletePageIndices ?? [],
-                     review: suspended ? nil : review, receipt: suspended ? nil : receipt)
+                     review: suspended ? nil : review, receipt: suspended ? nil : receipt,
+                     arrival: phase == .complete ? arrival : nil)
     }
 
     private func matchingRecipient() -> Bool {
@@ -333,7 +340,10 @@ public actor OfflineRestore<C: AirGapCryptography> {
                 allowRollback: allowRollback, transferID: identity?.transferID,
                 securityChangesConfirmed: securityChangesConfirmed,
                 associateWithExistingWorkspace: associateWithExistingWorkspace)
-            receipt = result; phase = .complete
+            receipt = result; phase = .complete; offlineLease = nil
+            if let identity {
+                arrival = .init(envelopeDigest: identity.envelopeDigest, workspaceDigest: crypto.sha256(archive.workspace.raw))
+            }
             envelope = nil; documentData = nil; receiver = nil; candidate = nil; pendingNamespace = nil
             retireRecipientSession()
             return status()
@@ -374,7 +384,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
             if let recovered = try await store.recoverImport(exporterID: pendingNamespace.exporter,
                 workspaceID: pendingNamespace.workspace, envelopeDigest: digest, transferID: identity?.transferID) {
                 receipt = recovered
-                phase = .complete; envelope = nil; documentData = nil; self.pendingNamespace = nil
+                phase = .complete; offlineLease = nil; envelope = nil; documentData = nil; self.pendingNamespace = nil
                 retireRecipientSession()
             } else { phase = reviewFallback; self.pendingNamespace = nil }
             return status()
@@ -404,7 +414,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
         guard phase != .committing, phase != .recoveryRequired else { throw WorkspaceStoreError.recoveryRequired }
         generation = UUID(); phase = .idle; suspended = false
         candidate = nil; receiver = nil; identity = nil; envelope = nil; archive = nil; review = nil; receipt = nil; pendingNamespace = nil
-        source = nil; documentData = nil; documentDigest = nil; encryptionMode = nil
+        source = nil; documentData = nil; documentDigest = nil; encryptionMode = nil; arrival = nil
         retireRecipientSession()
         return status()
     }

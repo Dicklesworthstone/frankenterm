@@ -98,6 +98,17 @@ final class MobileWorkspaceModel {
             defer { self.requestingCameraAccess = false }
             guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked,
                   self.state?.isSuspended == false else { return }
+            // A finished restore gave up offline exclusion; the next scan
+            // starts over from idle and takes it back first.
+            if self.state?.phase == .complete, let restore = self.restore {
+                do {
+                    _ = try await restore.reset()
+                    try await restore.enterOfflineMode()
+                    let fresh = await restore.status()
+                    guard self.active, self.showRestore, self.epoch == ticket else { return }
+                    self.state = fresh; self.lastObservation = nil
+                } catch { self.report(error); return }
+            }
             guard DataScannerViewController.isSupported else {
                 self.message = "This device does not support the native scanner. Open a local encrypted file instead."
                 return
@@ -397,6 +408,20 @@ final class MobileWorkspaceModel {
         }
     }
 
+    @ObservationIgnored private var announced = Set<Data>()
+    /// Tells the Mac that sent this transfer that it arrived, so it can say so
+    /// and stop its animation (TransferCompletion). Once per transfer, under a
+    /// connection lease like any network use; a Mac that is not listening, or
+    /// not on this network, simply never hears.
+    private func announce(_ arrival: TransferArrival?) {
+        guard let arrival, announced.insert(arrival.envelopeDigest).inserted,
+              let lease = try? WorkspaceNetworkActivity.shared.beginConnection() else { return }
+        Task {
+            _ = await TransferCompletionNotice.send(arrival, timeout: .seconds(8))
+            withExtendedLifetime(lease) {}
+        }
+    }
+
     /// Keep the camera while a code-protected transfer still waits for its code.
     private func keepsCamera(_ status: OfflineRestoreStatus) -> Bool {
         [.idle, .candidate, .collecting].contains(status.phase)
@@ -440,6 +465,7 @@ final class MobileWorkspaceModel {
                 guard self.active, self.epoch == ticket else { return }
                 if current.generation != result.generation { self.lastObservation = nil }
                 self.state = result
+                if result.phase == .complete { self.announce(result.arrival) }
                 if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
                 let latest = await restore.status()

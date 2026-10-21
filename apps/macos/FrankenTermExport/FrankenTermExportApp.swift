@@ -59,6 +59,8 @@ private actor MacExportEngine {
         /// (`FTCODE1:<envelope digest prefix>:<code>`), so the phone needs
         /// nothing typed. Anyone filming the animation can read it too.
         let codeFrame: String?
+        /// What the phone proves once this transfer has arrived.
+        let arrival: TransferArrival
     }
     struct SelectionState: Sendable {
         let source: WorkspaceDocument
@@ -401,7 +403,8 @@ private actor MacExportEngine {
         let digest = optical.identity.envelopeDigest
         return .init(comparison: FTAG.comparison(envelope, using: crypto), pages: optical.identity.pageCount,
                      bytes: envelope.count, protection: protection, recipientComparison: recipientComparison,
-                     codeFrame: code.map { TransferCodeFrame.text(envelopeDigest: digest, code: $0.reveal(using: crypto)) })
+                     codeFrame: code.map { TransferCodeFrame.text(envelopeDigest: digest, code: $0.reveal(using: crypto)) },
+                     arrival: .init(envelopeDigest: digest, workspaceDigest: crypto.sha256(archive.workspace.raw)))
     }
     func next(repairPage: Int?) throws -> String {
         guard var active = sender else { throw FTError.stale }
@@ -454,7 +457,9 @@ private final class MacExportModel {
     var sshSearch = ""
     var sourceSheet: ExportSourceSheet?
     var keyUnlockRequest: SourceKeyUnlockRequest?
-    var prepared: MacExportEngine.Prepared?
+    var prepared: MacExportEngine.Prepared? { didSet { listenForArrival() } }
+    /// The phone said this transfer arrived; the animation has stopped.
+    private(set) var arrived = false
     var symbol: QRCodeSymbol?
     var message: String?
     var busy = false
@@ -486,6 +491,18 @@ private final class MacExportModel {
     @ObservationIgnored private var sshSelectionID: UUID?
     @ObservationIgnored private var loadedAtLaunch = false
     @ObservationIgnored private var playWhenPrepared = false
+    @ObservationIgnored private var arrivalListener: TransferCompletionListener?
+
+    /// Each prepared transfer listens for its own arrival, and only while it
+    /// is the one on screen (see TransferCompletion).
+    private func listenForArrival() {
+        arrivalListener?.stop(); arrivalListener = nil; arrived = false
+        guard let arrival = prepared?.arrival else { return }
+        arrivalListener = TransferCompletionListener(arrival: arrival) { [weak self] in
+            guard let self, self.prepared?.arrival == arrival else { return }
+            self.arrived = true; self.pause()
+        }
+    }
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
     var recipientConfirmed: Bool {
@@ -819,13 +836,16 @@ private final class MacExportModel {
     private func requireCurrentWork(_ operation: UUID) throws {
         guard !Task.isCancelled, windowOpen, workOperationID == operation else { throw CancellationError() }
     }
-    private func perform(_ body: @escaping @MainActor (UUID) async throws -> Void) {
+    /// `resumingPlayback`: a save paused the animation; it plays again once
+    /// the save settles, however it ends.
+    private func perform(resumingPlayback: Bool = false, _ body: @escaping @MainActor (UUID) async throws -> Void) {
         guard !busy, windowOpen else { return }
         let operation = UUID()
         workOperationID = operation; busy = true; message = nil
         work = Task {
             defer {
                 if workOperationID == operation { busy = false; work = nil; workOperationID = nil }
+                if resumingPlayback { play() }
             }
             do { try requireCurrentWork(operation); try await body(operation) }
             catch {
@@ -836,7 +856,7 @@ private final class MacExportModel {
     /// Plays while the window is open, focused or not: the person is looking
     /// at their phone, and often clicked another window to get there.
     func play() {
-        guard !busy, prepared != nil, windowOpen else { return }
+        guard !busy, prepared != nil, windowOpen, !arrived else { return }
         pause(); playing = true
         let token = generation
         awake = ProcessInfo.processInfo.beginActivity(options: [.idleDisplaySleepDisabled], reason: "Display encrypted workspace QR transfer")
@@ -904,8 +924,8 @@ private final class MacExportModel {
         panel.message = recipientOnly
             ? "Save encrypted bytes for the confirmed iPhone. This file will not open after the phone loses its active request key. Choose a new filename."
             : "Save encrypted bytes only. Keep the separately revealed transfer code in a different place. Choose a new filename."
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
-        perform { [self] operation in
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
+        perform(resumingPlayback: true) { [self] operation in
             try await engine.saveEncryptedFile(to: url)
             try requireCurrentWork(operation)
             message = recipientOnly
@@ -934,9 +954,9 @@ private final class MacExportModel {
         let recipientOnly = prepared?.protection == .recipient
         panel.message = "Save a lossless animated PNG. Every encoded frame is checked before the final file is published. Choose a new filename."
             + (recipientOnly ? " The confirmed iPhone must retain its active request key; this is not an independent recovery backup." : " Keep its transfer code separate.")
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
         let speed = rate
-        perform { [self] operation in
+        perform(resumingPlayback: true) { [self] operation in
             let bytes = try await engine.encryptedEnvelope()
             try requireCurrentWork(operation)
             let count = try await renderer.saveAnimation(envelope: bytes, to: url, symbolsPerSecond: speed)
@@ -953,9 +973,9 @@ private final class MacExportModel {
         let recipientOnly = prepared?.protection == .recipient
         panel.message = "Save an encrypted QR video. Every decoded frame and the reconstructed package must pass verification before the new file is published."
             + (recipientOnly ? " The confirmed iPhone must retain its active request key; this is not an independent recovery backup." : " Keep its transfer code separate.")
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
         let speed = rate
-        perform { [self] operation in
+        perform(resumingPlayback: true) { [self] operation in
             let bytes = try await engine.encryptedEnvelope()
             try requireCurrentWork(operation)
             let source = try OpticalVideoSource(envelope: bytes)
@@ -1107,33 +1127,48 @@ private struct MacExportView: View {
             .onDisappear { model.closeExport() }
     }
 
-    /// While sending, the window is the animation: nothing to read, choose or type.
+    /// While sending, the window is the animation: nothing to read, choose or
+    /// type. When the phone says it has everything, the window says so.
     private var sending: some View {
         VStack(spacing: 18) {
-            Text("Point your iPhone's camera at this").font(.largeTitle.bold())
-            Text("In FrankenTerm on the iPhone, tap Get Machines from My Mac.").font(.title3).foregroundStyle(.secondary)
-            ZStack {
-                RoundedRectangle(cornerRadius: 20).fill(.white)
-                if let symbol = model.symbol {
-                    PixelPerfectQRCode(symbol: symbol).padding(20)
-                } else {
-                    ProgressView().controlSize(.large)
-                }
-            }.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+            if model.arrived {
+                Spacer()
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 96)).foregroundStyle(.green)
+                    .symbolEffect(.bounce, value: model.arrived)
+                Text("Your iPhone has your machines").font(.largeTitle.bold())
+                Text("You can close this window.").font(.title3).foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                Text("Point your iPhone's camera at this").font(.largeTitle.bold())
+                Text("In FrankenTerm on the iPhone, tap Scan My Mac.").font(.title3).foregroundStyle(.secondary)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 20).fill(.white)
+                    if let symbol = model.symbol {
+                        PixelPerfectQRCode(symbol: symbol).padding(20)
+                    } else {
+                        ProgressView().controlSize(.large)
+                    }
+                }.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             if let message = model.message { Text(verbatim: message).font(.callout).foregroundStyle(.red) }
             HStack {
                 Spacer()
                 Button("Done") { model.stopSending() }.controlSize(.large).keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent).tint(model.arrived ? .green : .accentColor)
                 Spacer()
             }.overlay(alignment: .trailing) {
-                Menu {
-                    Button("Save Encrypted File…") { model.saveEncryptedFile() }
-                    Button("Save as MP4 Video…") { model.saveVideo() }
-                    Button("Save as QR Animation…") { model.saveAnimation() }
-                } label: { Image(systemName: "ellipsis.circle") }
-                    .menuStyle(.borderlessButton).fixedSize().disabled(model.busy)
+                // Recordings and files carry no code, so only a transfer
+                // encrypted for one phone can be opened from them.
+                if model.prepared?.protection == .recipient, !model.arrived {
+                    Menu {
+                        Button("Save Encrypted File…") { model.saveEncryptedFile() }
+                        Button("Save as MP4 Video…") { model.saveVideo() }
+                        Button("Save as QR Animation…") { model.saveAnimation() }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                        .menuStyle(.borderlessButton).fixedSize().disabled(model.busy)
+                }
             }
-        }.padding(28)
+        }.padding(28).animation(.smooth, value: model.arrived)
     }
 
     private func recipientCamera(scanID: UUID) -> some View {

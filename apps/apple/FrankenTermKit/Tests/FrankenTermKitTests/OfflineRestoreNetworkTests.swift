@@ -213,3 +213,39 @@ final class OfflineRestoreNetworkTests: XCTestCase {
         XCTAssertEqual(saved.count, 1)
     }
 }
+
+#if canImport(MultipeerConnectivity) && canImport(CryptoKit)
+@MainActor
+final class TransferCompletionTests: XCTestCase {
+    let arrival = TransferArrival(envelopeDigest: Data(repeating: 0xA5, count: 32), workspaceDigest: Data(repeating: 7, count: 32))
+
+    /// The proof binds both the transfer and its decrypted manifest; the tag
+    /// only finds the Mac and is what the animation already shows.
+    func testTheProofNeedsTheDecryptedManifestAndThisTransfer() {
+        XCTAssertEqual(TransferCompletion.tag(arrival), "A5A5A5A5A5A5A5A5")
+        let proof = TransferCompletion.proof(arrival)
+        XCTAssertEqual(proof.count, 32)
+        XCTAssertEqual(TransferCompletion.proof(arrival), proof)
+        XCTAssertNotEqual(TransferCompletion.proof(.init(envelopeDigest: arrival.envelopeDigest,
+                                                         workspaceDigest: Data(repeating: 8, count: 32))), proof)
+        XCTAssertNotEqual(TransferCompletion.proof(.init(envelopeDigest: Data(repeating: 0xA4, count: 32),
+                                                         workspaceDigest: arrival.workspaceDigest)), proof)
+    }
+
+    /// A real Multipeer exchange on this machine: the listener hears the
+    /// matching notice and nothing from a phone that holds another manifest.
+    func testTheMacHearsOnlyThePhoneThatOpenedItsTransfer() async throws {
+        var heard = 0
+        let listener = TransferCompletionListener(arrival: arrival) { heard += 1 }
+        defer { listener.stop() }
+        let forged = TransferArrival(envelopeDigest: arrival.envelopeDigest, workspaceDigest: Data(repeating: 9, count: 32))
+        let forgedAnswered = await TransferCompletionNotice.send(forged, timeout: .seconds(10))
+        XCTAssertTrue(forgedAnswered, "the advertised Mac was not found")
+        XCTAssertEqual(heard, 0)
+        let answered = await TransferCompletionNotice.send(arrival, timeout: .seconds(10))
+        XCTAssertTrue(answered)
+        for _ in 0..<50 where heard == 0 { try await Task.sleep(for: .milliseconds(100)) }
+        XCTAssertEqual(heard, 1)
+    }
+}
+#endif

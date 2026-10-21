@@ -197,6 +197,7 @@
             GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
             INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
             INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Hear from your iPhone when it has received your machines, so this window can say so.";
             ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
             LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
         }; };
@@ -206,6 +207,7 @@
             GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
             INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
             INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Hear from your iPhone when it has received your machines, so this window can say so.";
             ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
             LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
         }; };

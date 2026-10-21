@@ -44,6 +44,45 @@ final class OfflineRestoreTests: XCTestCase {
         let saved = try await store.load()
         XCTAssertEqual(saved.count, 1)
     }
+    /// After the import commits there is nothing left to read: exclusion ends
+    /// (the phone may tell its Mac, or connect) and reset takes it back. The
+    /// arrival proof key is the digest of the very manifest the Mac sealed.
+    func testACommittedTransferEndsOfflineExclusionAndCarriesItsArrival() async throws {
+        let activity = WorkspaceNetworkActivity()
+        let restore = OfflineRestore(using: crypto, store: WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault()),
+                                     networkActivity: activity)
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest(fingerprint: fingerprint)), keys: [key], using: crypto)
+        let exported = try FTAG.seal(archive, using: crypto)
+        let sender = try OpticalSender(envelope: exported.envelope, using: crypto)
+        try await restore.enterOfflineMode()
+        var state = await restore.status()
+        state = try await restore.observe(sender.frame(page: 0, sequence: 1, using: crypto), generation: state.generation)
+        state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
+        for sequence in UInt32(2)..<500 where state.phase != .locked {
+            state = try await restore.observe(sender.frame(page: 0, sequence: sequence, using: crypto), generation: state.generation)
+        }
+        state = try await restore.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
+        XCTAssertNil(state.arrival)
+        XCTAssertEqual(activity.accounting().offlineRestores, 1)
+        XCTAssertThrowsError(try activity.beginConnection())
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+                                         sourceAndContentsConfirmed: true)
+        XCTAssertEqual(state.phase, .complete)
+        XCTAssertEqual(state.arrival, TransferArrival(envelopeDigest: sender.identity.envelopeDigest,
+                                                      workspaceDigest: crypto.sha256(archive.workspace.raw)))
+        XCTAssertEqual(activity.accounting().offlineRestores, 0)
+        try await restore.enterOfflineMode()
+        XCTAssertEqual(activity.accounting().offlineRestores, 0, "a finished restore stays online")
+        var connection: WorkspaceNetworkLease? = try activity.beginConnection()
+        state = try await restore.reset()
+        XCTAssertNil(state.arrival); XCTAssertEqual(state.phase, .idle)
+        do { try await restore.enterOfflineMode(); XCTFail("entered offline mode beside a connection") }
+        catch { XCTAssertEqual(error as? WorkspaceNetworkError, .connectionsActive) }
+        withExtendedLifetime(connection) {}; connection = nil
+        try await restore.enterOfflineMode()
+        XCTAssertEqual(activity.accounting().offlineRestores, 1)
+    }
     func testWrongCodeDoesNotDestroyCollectedEnvelopeOrTouchStorage() async throws {
         let (restore, _, persistence, vault) = environment(), exported = try export()
         let initial = await restore.status()
