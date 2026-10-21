@@ -75,7 +75,11 @@ done
 
 headers="$(mktemp -d "${TMPDIR:-/tmp}/ft-terminal-headers.XXXXXX")"
 cp "$HEADER" "$headers/"
-printf 'module CFrankenTermTerminal {\n    header "frankenterm_terminal.h"\n    export *\n}\n' > "$headers/module.modulemap"
+# The module map sits in a directory named after the module: Xcode copies every
+# XCFramework's headers into one shared include/ directory, so a top-level
+# module.modulemap would collide with the libssh2 artifact's.
+mkdir "$headers/CFrankenTermTerminal"
+printf 'module CFrankenTermTerminal {\n    header "../frankenterm_terminal.h"\n    export *\n}\n' > "$headers/CFrankenTermTerminal/module.modulemap"
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/ft-terminal-xcframework.XXXXXX")"
 arguments=()

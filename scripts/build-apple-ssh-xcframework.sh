@@ -100,7 +100,11 @@ build_slice macos-arm64 darwin64-arm64-cc "-mmacosx-version-min=$MACOS_MIN" maco
 headers="$(mktemp -d "${TMPDIR:-/tmp}/ft-libssh2-headers.XXXXXX")"
 cp "$BUILD/install/ios-arm64/include/libssh2.h" "$BUILD/install/ios-arm64/include/libssh2_publickey.h" \
    "$BUILD/install/ios-arm64/include/libssh2_sftp.h" "$headers/"
-printf 'module CLibssh2 {\n    header "libssh2.h"\n    export *\n}\n' > "$headers/module.modulemap"
+# The module map sits in a directory named after the module: Xcode copies every
+# XCFramework's headers into one shared include/ directory, so a top-level
+# module.modulemap would collide with the terminal artifact's.
+mkdir "$headers/CLibssh2"
+printf 'module CLibssh2 {\n    header "../libssh2.h"\n    export *\n}\n' > "$headers/CLibssh2/module.modulemap"
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/ft-libssh2-xcframework.XXXXXX")"
 xcodebuild -create-xcframework \
