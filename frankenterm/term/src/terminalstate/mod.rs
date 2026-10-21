@@ -32,7 +32,7 @@ pub mod checkpoint;
 mod bounded_output;
 pub use bounded_output::{
     BoundedOutputDrain, BoundedOutputLimits, BoundedOutputSettlement, BoundedOutputStatus,
-    BoundedWriteResult,
+    BoundedReplyCopy, BoundedReplyDisposition, BoundedWriteResult,
 };
 use bounded_output::BoundedOutputWriter;
 mod image;
@@ -386,6 +386,7 @@ impl ScreenOrAlt {
 #[derive(Clone, Debug)]
 struct BatchConfig {
     max_accumulating_title_len: usize,
+    maximum_cell_grapheme_bytes: usize,
     normalize_output_to_unicode_nfc: bool,
     bidi_mode: BidiMode,
 }
@@ -394,6 +395,7 @@ impl BatchConfig {
     fn capture(config: &dyn TerminalConfiguration) -> Self {
         Self {
             max_accumulating_title_len: config.max_accumulating_title_len(),
+            maximum_cell_grapheme_bytes: config.maximum_cell_grapheme_bytes(),
             normalize_output_to_unicode_nfc: config.normalize_output_to_unicode_nfc(),
             bidi_mode: config.bidi_mode(),
         }
@@ -541,6 +543,8 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     seqno: SequenceNo,
+    cell_grapheme_limit_exceeded: bool,
+    native_execution_limit_exceeded: bool,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -1183,6 +1187,8 @@ impl TerminalState {
                 kitty
             },
             seqno,
+            cell_grapheme_limit_exceeded: false,
+            native_execution_limit_exceeded: false,
             unicode_version,
             unicode_version_stack: vec![],
             zwj_tail_cell_possible: false,
@@ -1904,6 +1910,50 @@ impl TerminalState {
         }
     }
 
+    /// Copy the oldest complete parser reply into caller-owned bounded storage.
+    /// No reservation is released. Refuses user input and any reply previously
+    /// partially drained. Do not mix this whole-reply protocol with prefix
+    /// drains: after downstream admission, settle the exact sequence before
+    /// copying another reply, closing, or retrying. A capacity refusal copies
+    /// nothing; an empty queue returns `None`.
+    pub fn copy_bounded_reply(
+        &self,
+        output: &mut [u8],
+    ) -> std::io::Result<Option<BoundedReplyCopy>> {
+        match self.writer.get_ref() {
+            ThreadedWriter::Bounded(writer) => writer.copy_reply(output),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    /// Sticky, content-free evidence that an explicitly configured retained
+    /// grapheme bound refused model data. The embedding must stop presenting
+    /// this model as exact; default desktop configuration has no such limit.
+    pub fn cell_grapheme_limit_exceeded(&self) -> bool {
+        self.cell_grapheme_limit_exceeded
+    }
+
+    /// Sticky evidence that the native text profile refused expanded command
+    /// work. Later parser actions are inert; the embedding must close this
+    /// model rather than display a truncated execution as exact output.
+    pub fn native_execution_limit_exceeded(&self) -> bool {
+        self.native_execution_limit_exceeded
+    }
+
+    /// Release one exact complete reply after the downstream owner accepted it
+    /// or deliberately dropped it whole. A stale/repeated sequence cannot
+    /// release the next reply. This does not assert remote delivery.
+    pub fn settle_bounded_reply(
+        &mut self,
+        sequence: u64,
+        disposition: BoundedReplyDisposition,
+    ) -> std::io::Result<()> {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => writer.settle_reply(sequence, disposition),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
     /// Informs the terminal that the viewport of the window has resized to the
     /// specified dimensions.
     /// We need to resize both the primary and alt screens, adjusting
@@ -2310,6 +2360,17 @@ impl TerminalState {
     }
 
     fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+        let link = link.filter(|link| {
+            if self.config.feature_profile() != crate::config::TerminalFeatureProfile::NativeText {
+                return true;
+            }
+            // OSC parsing has a separate retained-string cap. Bound metadata
+            // retained by every cell as well, including arbitrary OSC 8
+            // parameter names/values rather than just the URI.
+            link.params().iter().try_fold(link.uri().len(), |total, (key, value)| {
+                total.checked_add(key.len())?.checked_add(value.len())
+            }).is_some_and(|total| total <= 512)
+        });
         self.pen.set_hyperlink(match link {
             Some(hyperlink) => Some(Arc::new(hyperlink)),
             None => None,
@@ -2331,7 +2392,12 @@ impl TerminalState {
                     res.push_str(&encoded_name);
                     res.push('=');
 
-                    let encoded_val = hex::encode_upper(&self.term_program);
+                    let name = if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                        "xterm-256color"
+                    } else {
+                        &self.term_program
+                    };
+                    let encoded_val = hex::encode_upper(name);
                     res.push_str(&encoded_val);
                 }
 
@@ -2352,7 +2418,9 @@ impl TerminalState {
                 }
 
                 _ => {
-                    if let Some(value) = DB.raw(name) {
+                    let unavailable = self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText
+                        && matches!(name.as_str(), "Ms" | "set_selection");
+                    if let Some(value) = DB.raw(name).filter(|_| !unavailable) {
                         res.push_str("1+r");
                         res.push_str(&encoded_name);
                         res.push('=');
@@ -2420,10 +2488,15 @@ impl TerminalState {
             }
             Device::RequestPrimaryDeviceAttributes => {
                 let mut ident = "\x1b[?65".to_string(); // Vt500
-                ident.push_str(";4"); // Sixel graphics
-                ident.push_str(";18"); // windowing extensions
+                let native = self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText;
+                if !native {
+                    ident.push_str(";4"); // Sixel graphics
+                    ident.push_str(";18"); // windowing extensions
+                }
                 ident.push_str(";22"); // ANSI color, vt525
-                ident.push_str(";52"); // Clipboard access
+                if !native {
+                    ident.push_str(";52"); // Clipboard access
+                }
                 ident.push('c');
 
                 self.writer.write(ident.as_bytes()).ok();
@@ -2470,7 +2543,9 @@ impl TerminalState {
                 self.writer.flush().ok();
             }
             Device::XtSmGraphics(g) => {
-                let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_)) {
+                let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_))
+                    || self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText
+                {
                     XtSmGraphics {
                         item: g.item,
                         action_or_status: XtSmGraphicsStatus::InvalidItem.to_i64(),
@@ -3620,8 +3695,12 @@ impl TerminalState {
                     && self.left_and_right_margins.contains(&x)
                 {
                     let right_margin = self.left_and_right_margins.end;
+                    // Once every cell through the margin is blank, further
+                    // insertions have no effect. A remote u32 count must not
+                    // turn that fixed geometry into billions of iterations.
+                    let count = (n as usize).min(right_margin - x);
                     let screen = self.screen_mut();
-                    for _ in 0..n as usize {
+                    for _ in 0..count {
                         screen.insert_cell(x, y, right_margin, seqno);
                     }
                 }
@@ -3775,16 +3854,24 @@ impl TerminalState {
 
             Cursor::ForwardTabulation(n) => {
                 for _ in 0..n {
+                    let prior = self.cursor.x;
                     self.c0_horizontal_tab();
+                    if self.cursor.x == prior {
+                        break;
+                    }
                 }
             }
             Cursor::BackwardTabulation(n) => {
                 for _ in 0..n {
+                    let prior = self.cursor.x;
                     let x = match self.tabs.find_prev_tab_stop(self.cursor.x) {
                         Some(x) => x,
                         None => 0,
                     };
                     self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Relative(0));
+                    if self.cursor.x == prior {
+                        break;
+                    }
                 }
             }
 

@@ -106,6 +106,8 @@ pub enum RecoverablePanicSite {
     ClientCallback,
     /// A scripting callback isolated from the host runtime.
     ScriptingCallback,
+    /// A bounded canonical terminal operation at the audited native C ABI.
+    NativeTerminalBridge,
 }
 
 impl RecoverablePanicSite {
@@ -136,6 +138,7 @@ impl RecoverablePanicSite {
             Self::AsyncOpenSslCallback => "async_ossl.callback",
             Self::ClientCallback => "client.callback",
             Self::ScriptingCallback => "scripting.callback",
+            Self::NativeTerminalBridge => "terminal.native_bridge",
         }
     }
 }
@@ -294,6 +297,28 @@ pub fn is_recoverable_panic() -> bool {
 #[must_use]
 pub const fn panic_recovery_is_executable() -> bool {
     cfg!(panic = "unwind")
+}
+
+/// Wrap the host's current panic hook once, suppressing only panics already
+/// inside a canonical audited recoverable boundary. Native library embeddings
+/// have no Rust `main` in which to install the project's process policy.
+///
+/// This does not replace the host's fatal reporting, broken-pipe handling or
+/// exit policy: unmarked panics delegate to the exact previously installed
+/// hook. Install before entering native operations. Any later host hook must
+/// preserve this chain and check [`is_recoverable_panic`] before reflecting a
+/// payload or performing fatal side effects. An aborting build has no active
+/// recovery marker and therefore continues to delegate every panic.
+pub fn install_recoverable_boundary_hook_once() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !is_recoverable_panic() {
+                previous(info);
+            }
+        }));
+    });
 }
 
 /// Execute one audited synchronous panic-recovery boundary.
@@ -739,6 +764,35 @@ mod tests {
         assert!(!result.unwrap_err().to_string().contains("sentinel"));
     }
 
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn native_hook_suppresses_recovered_payloads_and_preserves_host_policy() {
+        const PROBE_ENV: &str = "FT_NATIVE_PANIC_HOOK_PROBE";
+        if std::env::var_os(PROBE_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "tests::native_hook_suppresses_recovered_payloads_and_preserves_host_policy", "--nocapture"])
+                .env(PROBE_ENV, "1")
+                .output()
+                .expect("isolated native panic-hook probe");
+            assert!(output.status.success(), "isolated panic-hook probe failed");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private-native-payload"));
+            return;
+        }
+        // Hook mutation stays in this exact-test subprocess; parallel tests
+        // cannot replace it or observe a temporary host policy.
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let observer = std::sync::Arc::clone(&calls);
+        std::panic::set_hook(Box::new(move |_| { observer.fetch_add(1, Ordering::Relaxed); }));
+        install_recoverable_boundary_hook_once();
+        install_recoverable_boundary_hook_once();
+        assert!(catch_recoverable(RecoverablePanicSite::NativeTerminalBridge,
+            || panic!("private-native-payload")).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        // Test-only unmarked catch proves the original host hook still runs.
+        assert!(std::panic::catch_unwind(|| panic!("host-policy-probe")).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn secondary_payload_quarantine_claim_is_sticky_and_single_owner() {
         let poisoned = AtomicBool::new(false);
@@ -798,6 +852,7 @@ mod tests {
             RecoverablePanicSite::AsyncOpenSslCallback,
             RecoverablePanicSite::ClientCallback,
             RecoverablePanicSite::ScriptingCallback,
+            RecoverablePanicSite::NativeTerminalBridge,
         ];
         for site in sites {
             assert!(site.as_str().len() <= 32, "{}", site.as_str());

@@ -4764,6 +4764,7 @@ dependencies = [
  "frankenterm-cell",
  "frankenterm-dynamic",
  "frankenterm-escape-parser",
+ "frankenterm-sigpipe",
  "frankenterm-surface",
  "frankenterm-term",
  "hex",

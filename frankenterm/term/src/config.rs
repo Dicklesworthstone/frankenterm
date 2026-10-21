@@ -17,6 +17,15 @@ pub enum NewlineCanon {
     CarriageReturnAndLineFeed,
 }
 
+/// A consumer's implemented terminal feature surface. The native text profile
+/// deliberately refuses image execution and clipboard capability claims until
+/// those consumers exist; changing TERM alone does not change these protocols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalFeatureProfile {
+    Full,
+    NativeText,
+}
+
 /// Operator policy for OSC 52 clipboard write requests. Per
 /// ft-io922 (cont of ft-2okh0.1.5).
 ///
@@ -1423,6 +1432,19 @@ impl TerminalConfigurationRevision {
 /// increments the generation counter appropriately, the changes will be detected
 /// and applied at the next appropriate opportunity.
 pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
+    fn feature_profile(&self) -> TerminalFeatureProfile {
+        TerminalFeatureProfile::Full
+    }
+
+    /// Retained UTF-8 bytes in one cell, including continuations across parse
+    /// batches. Unlimited preserves desktop semantics. A bounded embedding
+    /// must inspect `cell_grapheme_limit_exceeded` after feeding and close a
+    /// model that exceeded the limit; it must not present a truncated cell as
+    /// an exact copy of the remote terminal.
+    fn maximum_cell_grapheme_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Returns a generation counter for the active
     /// configuration.  If the implementation may be
     /// changed at runtime, it must increment the generation

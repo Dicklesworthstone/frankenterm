@@ -77,6 +77,23 @@ pub enum BoundedOutputDrain {
     Closed(BoundedOutputSettlement),
 }
 
+/// An immutable copy of one complete, never partially drained parser reply.
+/// Copying does not transfer ownership or release the reply's reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedReplyCopy {
+    pub sequence: u64,
+    pub bytes: usize,
+}
+
+/// Settlement of a complete reply copied into the embedding's bounded buffer.
+/// `Accepted` means another bounded owner admitted the whole reply. `Dropped`
+/// means no bytes were admitted; it increments this owner's drop counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedReplyDisposition {
+    Accepted,
+    Dropped,
+}
+
 /// Content-free close evidence. The uncertain prefix belongs to the first
 /// remaining unit; no later byte was offered to the sink. A driver must not
 /// replay the uncertain prefix or claim that accepted input was executed.
@@ -384,6 +401,55 @@ impl BoundedOutputWriter {
         }
     }
 
+    pub(super) fn copy_reply(&self, output: &mut [u8]) -> io::Result<Option<BoundedReplyCopy>> {
+        if self.settlement.is_some() || self.offered != 0 {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let Some(unit) = self.units.front() else {
+            return Ok(None);
+        };
+        if unit.class != WriteClass::Reply || unit.accepted != 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if output.len() < unit.remaining {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        for (destination, source) in output.iter_mut().zip(self.bytes.iter()).take(unit.remaining) {
+            *destination = *source;
+        }
+        Ok(Some(BoundedReplyCopy {
+            sequence: unit.sequence,
+            bytes: unit.remaining,
+        }))
+    }
+
+    pub(super) fn settle_reply(
+        &mut self,
+        sequence: u64,
+        disposition: BoundedReplyDisposition,
+    ) -> io::Result<()> {
+        if self.settlement.is_some() || self.offered != 0 {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let unit = self.units.front().ok_or(io::ErrorKind::InvalidInput)?;
+        if unit.sequence != sequence || unit.class != WriteClass::Reply || unit.accepted != 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let bytes = unit.remaining;
+        self.bytes.drain(..bytes);
+        self.units.pop_front();
+        self.release_bytes(WriteClass::Reply, bytes);
+        self.release_unit(WriteClass::Reply);
+        match disposition {
+            BoundedReplyDisposition::Accepted => self.status.accepted_through = sequence,
+            BoundedReplyDisposition::Dropped => {
+                self.status.dropped_replies = self.status.dropped_replies.saturating_add(1);
+                self.status.dropped_reply_bytes = self.status.dropped_reply_bytes.saturating_add(bytes as u64);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn close(&mut self) -> BoundedOutputSettlement {
         if let Some(settlement) = self.settlement {
             return settlement;
@@ -535,6 +601,60 @@ mod tests {
             assert!(matches!(result, BoundedOutputDrain::Accepted { .. }));
         }
         output
+    }
+
+    #[test]
+    fn whole_reply_copy_keeps_reservations_across_ring_wrap_and_exact_settlement() {
+        let mut configured = limits();
+        configured.reply_bytes = 32;
+        configured.reply_units = 4;
+        let mut writer = BoundedOutputWriter::new(configured).unwrap();
+        for _ in 0..2 {
+            writer.write_all(b"abc").unwrap();
+            writer.flush().unwrap();
+        }
+        let mut wrapped = false;
+        // Keep two units resident so the ring's head advances without an
+        // empty-ring normalization hiding the fragmented-unit case.
+        for _ in 0..=writer.bytes.capacity() {
+            let before = writer.status();
+            let mut refused = [0xa5; 2];
+            assert_eq!(writer.copy_reply(&mut refused).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(refused, [0xa5; 2]);
+            let mut copied = [0; 3];
+            let reply = writer.copy_reply(&mut copied).unwrap().unwrap();
+            wrapped |= writer.bytes.as_slices().0.len() < reply.bytes;
+            assert_eq!(&copied, b"abc");
+            assert_eq!(writer.status(), before);
+            assert_eq!(writer.settle_reply(reply.sequence + 1, BoundedReplyDisposition::Accepted).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(writer.status(), before);
+            writer.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+            assert_eq!(writer.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            writer.write_all(b"abc").unwrap();
+            writer.flush().unwrap();
+        }
+        assert!(wrapped, "a complete reply must be copied across both ring slices");
+        let reply = writer.copy_reply(&mut [0; 3]).unwrap().unwrap();
+        writer.settle_reply(reply.sequence, BoundedReplyDisposition::Dropped).unwrap();
+        assert_eq!(writer.status().dropped_replies, 1);
+        assert_eq!(writer.status().dropped_reply_bytes, 3);
+        assert_eq!(writer.status().pending_reply_bytes, 3);
+    }
+
+    #[test]
+    fn whole_reply_protocol_refuses_a_previously_partially_drained_unit() {
+        let mut writer = writer();
+        writer.write_all(b"reply").unwrap();
+        writer.flush().unwrap();
+        let sequence = writer.status().admitted_through;
+        writer.drain(2, |_, _| BoundedWriteResult::Accepted(2)).unwrap();
+        let before = writer.status();
+        let mut output = [0xa5; 8];
+        assert_eq!(writer.copy_reply(&mut output).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(output, [0xa5; 8]);
+        assert_eq!(writer.settle_reply(sequence, BoundedReplyDisposition::Dropped).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(writer.status(), before);
+        assert_eq!(collect(&mut writer), b"ply");
     }
 
     #[test]

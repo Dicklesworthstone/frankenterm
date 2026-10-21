@@ -41,6 +41,9 @@
 //!
 //! The entrypoint to the crate is the [Terminal](terminal/struct.Terminal.html)
 //! struct.
+#[cfg(all(feature = "native-ffi", not(panic = "unwind")))]
+compile_error!("native-ffi requires panic=unwind so Rust panics cannot abort across the C boundary");
+
 use anyhow::Error;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use frankenterm_surface::SequenceNo;
@@ -63,6 +66,14 @@ pub use crate::screen::*;
 
 /// Canonical semantic row capture and bounded owned native render transactions.
 pub mod render;
+
+/// Caller-driven canonical terminal model for native direct-SSH embeddings.
+#[cfg(feature = "native")]
+pub mod native;
+
+/// Audited C ownership boundary; see include/frankenterm_terminal.h.
+#[cfg(feature = "native-ffi")]
+mod native_ffi;
 
 pub mod terminal;
 pub use crate::terminal::*;

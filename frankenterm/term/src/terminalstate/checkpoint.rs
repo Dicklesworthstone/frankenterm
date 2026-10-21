@@ -3217,6 +3217,16 @@ impl PendingReplayConfigV2 {
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, TerminalCheckpointError> {
         limits.validate_policy()?;
+        // V3 recovery checkpoints do not encode the native feature/resource
+        // profile. Refuse both capture and restore projection rather than
+        // replay a suffix under different image/grapheme semantics.
+        if config.feature_profile() != crate::config::TerminalFeatureProfile::Full
+            || config.maximum_cell_grapheme_bytes() != usize::MAX
+        {
+            return Err(TerminalCheckpointError::InvalidRestoreConfiguration {
+                reason: "checkpoint format does not encode bounded native feature profiles",
+            });
+        }
         let revision_before = config.revision();
         let scrollback_size = config.scrollback_size();
         let enable_kitty_keyboard = config.enable_kitty_keyboard();
@@ -5579,6 +5589,18 @@ impl TerminalCheckpointV3 {
         limits: TerminalCheckpointLimits,
     ) -> Result<StagedHotCheckpoint, TerminalCheckpointError> {
         limits.validate_policy()?;
+        if terminal.cell_grapheme_limit_exceeded() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "cell_grapheme_bytes",
+                reason: "terminal refused data at its configured retained grapheme bound",
+            });
+        }
+        if terminal.native_execution_limit_exceeded() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "native_execution_limit",
+                reason: "terminal refused expanded command work at its native execution bound",
+            });
+        }
         if terminal.current_seqno() == usize::MAX {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "seqno",
@@ -7183,6 +7205,8 @@ impl TerminalState {
             user_vars: restored_user_vars,
             kitty_img: restored_kitty,
             seqno,
+            cell_grapheme_limit_exceeded: false,
+            native_execution_limit_exceeded: false,
             unicode_version: restored_unicode_version,
             unicode_version_stack: restored_unicode_stack,
             // Restored cells were not written by this performer, so any of

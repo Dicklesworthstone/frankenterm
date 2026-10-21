@@ -1333,6 +1333,32 @@ impl Terminal {
         term_version: &str,
         limits: BoundedOutputLimits,
     ) -> std::io::Result<Terminal> {
+        Self::new_bounded_output_with_parser_limit(
+            size,
+            config,
+            term_program,
+            term_version,
+            limits,
+            frankenterm_escape_parser::DEFAULT_MAX_STRING_SEQUENCE_BYTES,
+        )
+    }
+
+    /// The caller-drained constructor with an additional retained parser
+    /// string cap. The parser applies this across feed calls to OSC/APC and
+    /// the lower of this cap and its protocol hard caps to Sixel, short DCS,
+    /// XTGETTCAP and tmux control-mode builders. Oversize sequences are dropped
+    /// whole by the canonical parser, never split into terminal text.
+    pub fn new_bounded_output_with_parser_limit(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration + Send + Sync>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+        maximum_string_bytes: usize,
+    ) -> std::io::Result<Terminal> {
+        if maximum_string_bytes == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         Ok(Terminal {
             state: TerminalState::new_bounded_output(
                 size,
@@ -1341,7 +1367,7 @@ impl Terminal {
                 term_version,
                 limits,
             )?,
-            parser: Parser::new(),
+            parser: Parser::new_with_max_string_sequence_bytes(maximum_string_bytes),
         })
     }
 

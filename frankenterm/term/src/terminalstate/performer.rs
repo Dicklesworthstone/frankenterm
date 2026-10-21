@@ -13,7 +13,8 @@ use frankenterm_cell::{
     grapheme_column_width, is_white_space_grapheme, SemanticType, UnicodeVersion,
 };
 use frankenterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Sgr,
+    CharacterPath, Cursor, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
+    Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Mode, Sgr, Window,
 };
 use frankenterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -36,6 +37,11 @@ use url::Url;
 const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
 const LINE_FEED_FLOOD_ENV: &str = "FT_LINE_FEED_FLOOD";
+
+/// Conservative expanded cell/step work, separate from the bounded number of
+/// input bytes. One compact CSI may otherwise request u32::MAX operations.
+/// Reset for each performer (one native feed), never for each CSI command.
+pub(crate) const NATIVE_EXPANDED_WORK_BUDGET: usize = 65_536;
 
 impl TerminalState {
     /// Bytes retained by an unfinished legacy tmux title sequence.
@@ -222,6 +228,7 @@ pub(crate) struct Performer<'a> {
     ascii_junction: Option<PrintedCell>,
     /// The buffer of [`PendingCells`], kept empty between `flush_print`s.
     pending_cells: Vec<RunGrapheme<'static>>,
+    native_work_remaining: Option<usize>,
 }
 
 /// Cells `flush_print` has placed but not yet written: graphemes side by
@@ -526,6 +533,9 @@ impl<'a> Handler for Performer<'a> {
     /// the `last_printed` shortcut stays valid.
     #[inline]
     fn print(&mut self, c: char) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         if matches!(c, ' '..='~') {
             let mut utf8 = [0; 1];
             Handler::print_ascii_run(self, c.encode_utf8(&mut utf8));
@@ -537,6 +547,9 @@ impl<'a> Handler for Performer<'a> {
     /// What `perform` does for `Action::PrintString`.
     #[inline]
     fn print_str(&mut self, text: &str) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         self.print_string(text);
     }
 
@@ -548,6 +561,9 @@ impl<'a> Handler for Performer<'a> {
     /// escapes, CSI, OSC, images) flushes pending print first.
     #[inline]
     fn print_ascii_run(&mut self, run: &str) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         if !self.print.is_empty() || self.accumulating_title.is_some() || !self.write_ascii_run(run)
         {
             self.print_string(run);
@@ -562,6 +578,11 @@ impl<'a> Handler for Performer<'a> {
         bytes: &[u8],
         scan: frankenterm_escape_parser::parser::AsciiScan,
     ) -> usize {
+        if self.native_execution_limit_exceeded {
+            // The parser consumes the remaining bounded input using its
+            // ordinary handlers, all of which become inert after refusal.
+            return 0;
+        }
         self.line_flood(bytes, scan)
     }
 
@@ -571,6 +592,9 @@ impl<'a> Handler for Performer<'a> {
     /// concerns OSC. A `cat` flood hands over one LF per line.
     #[inline]
     fn control(&mut self, code: ControlCode) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         Performer::control(self, code);
         self.last_printed = None;
     }
@@ -582,6 +606,9 @@ impl<'a> Handler for Performer<'a> {
     /// `last_printed`.
     #[inline]
     fn sgr(&mut self, sgrs: &[Sgr]) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         self.pop_tmux_title_state();
         self.flush_print();
         for sgr in sgrs {
@@ -592,13 +619,80 @@ impl<'a> Handler for Performer<'a> {
 
 impl<'a> Performer<'a> {
     pub fn new(state: &'a mut TerminalState) -> Self {
+        let native_work_remaining =
+            (state.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText)
+                .then_some(NATIVE_EXPANDED_WORK_BUDGET);
         Self {
             state,
             print: String::new(),
             last_printed: None,
             ascii_junction: None,
             pending_cells: Vec::new(),
+            native_work_remaining,
         }
+    }
+
+    /// Refuse before a counted operation runs. Counts that saturate geometry
+    /// are charged at their exact clamp; REP and reverse wrapping remain
+    /// genuinely expansive and must never be silently truncated. Charging
+    /// shifted row widths also bounds repeated quadratic ICH/DCH/SL/SR work.
+    fn admit_native_csi_work(&mut self, csi: &CSI) -> bool {
+        if self.native_work_remaining.is_none() {
+            return true;
+        }
+        let cols = self.screen().physical_cols.max(1);
+        let rows = self.screen().physical_rows.max(1);
+        let cost = match csi {
+            CSI::Edit(Edit::Repeat(n)) => (*n as usize).saturating_mul(cols),
+            CSI::Edit(Edit::InsertCharacter(n) | Edit::DeleteCharacter(n)
+                | Edit::EraseCharacter(n)) => (*n as usize).min(cols).saturating_mul(cols),
+            CSI::Edit(Edit::ScrollLeft(n) | Edit::ScrollRight(n)) => (*n as usize)
+                .min(cols).saturating_mul(cols).saturating_mul(rows),
+            CSI::Edit(Edit::EraseInLine(_) | Edit::SelectiveEraseInLine(_)) => cols,
+            CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseScrollback)
+                | Edit::SelectiveEraseInDisplay(EraseInDisplay::EraseScrollback)) => {
+                cols.saturating_mul(self.screen().scrollback_rows())
+            }
+            CSI::Edit(Edit::SelectCharacterProtection(_)) => 0,
+            CSI::Edit(_) => cols.saturating_mul(rows),
+            CSI::Cursor(Cursor::ForwardTabulation(n) | Cursor::BackwardTabulation(n)) => {
+                (*n as usize).min(cols.saturating_add(1)).saturating_mul(cols)
+            }
+            CSI::Cursor(Cursor::Left(n))
+                if self.reverse_wraparound_mode && self.dec_auto_wrap => *n as usize,
+            CSI::Cursor(Cursor::Left(_)) if self.cursor.x < self.left_and_right_margins.start => cols,
+            CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(code))
+                | Mode::ResetDecPrivateMode(DecPrivateMode::Code(code))
+                | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(code)))
+                if matches!(code,
+                    DecPrivateModeCode::Select132Columns
+                    | DecPrivateModeCode::OptEnableAlternateScreen
+                    | DecPrivateModeCode::EnableAlternateScreen
+                    | DecPrivateModeCode::ClearAndEnableAlternateScreen) => cols.saturating_mul(rows),
+            CSI::Device(device) if matches!(device.as_ref(), Device::SoftReset) => {
+                rows.saturating_mul(2)
+            }
+            CSI::Window(window) if matches!(window.as_ref(), Window::ChecksumRectangularArea { .. }) => {
+                cols.saturating_mul(rows)
+            }
+            _ => 0,
+        };
+        self.admit_native_work(cost)
+    }
+
+    fn admit_native_work(&mut self, cost: usize) -> bool {
+        let Some(remaining) = self.native_work_remaining else {
+            return true;
+        };
+        if cost > remaining {
+            self.native_execution_limit_exceeded = true;
+            self.print.clear();
+            self.last_printed = None;
+            self.ascii_junction = None;
+            return false;
+        }
+        self.native_work_remaining = Some(remaining - cost);
+        true
     }
 
     /// Writes the cells `flush_print` left pending; see [`PendingCells`].
@@ -795,6 +889,14 @@ impl<'a> Performer<'a> {
             }
             text.len()
         };
+
+        if combined.len() > self.batch_config.maximum_cell_grapheme_bytes {
+            self.cell_grapheme_limit_exceeded = true;
+            // Consume the refused continuation so it cannot become an
+            // unrelated replacement cell. The bounded embedding closes after
+            // this feed; no retained cell grows beyond its configured bound.
+            return Some(joined);
+        }
 
         let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
         if !(width..=2).contains(&combined_width) {
@@ -1031,6 +1133,11 @@ impl<'a> Performer<'a> {
     /// flush's large frame.
     #[inline]
     fn flush_print(&mut self) {
+        if self.native_execution_limit_exceeded {
+            self.print.clear();
+            self.ascii_junction = None;
+            return;
+        }
         if self.print.is_empty() {
             // Whatever flushes also ends a direct ASCII run's junction.
             self.ascii_junction = None;
@@ -1099,6 +1206,10 @@ impl<'a> Performer<'a> {
         // turns batching off): the fast path below may run.
         let plain_print = batch && self.active_charset() == CharSet::Ascii;
         while let Some((g, known_width)) = graphemes.next() {
+            if g.len() > self.batch_config.maximum_cell_grapheme_bytes {
+                self.cell_grapheme_limit_exceeded = true;
+                continue;
+            }
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             // The common case, decided in a few compares: a lone character
             // (or a letter and its combining marks) whose width the
@@ -1986,6 +2097,10 @@ impl<'a> Performer<'a> {
         if Graphemes::new(combined.as_str()).count() != 1 {
             return false;
         }
+        if combined.len() > self.batch_config.maximum_cell_grapheme_bytes {
+            self.cell_grapheme_limit_exceeded = true;
+            return true;
+        }
         let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
         if !(width..=2).contains(&combined_width) {
             return false;
@@ -2038,6 +2153,9 @@ impl<'a> Performer<'a> {
     }
 
     pub fn perform(&mut self, action: Action) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         debug!("perform {:?}", action);
         if self.suppress_initial_title_change {
             match &action {
@@ -2076,6 +2194,9 @@ impl<'a> Performer<'a> {
             Action::Esc(esc) => self.esc_dispatch(esc),
             Action::CSI(csi) => self.csi_dispatch(csi),
             Action::Sixel(sixel) => {
+                if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                    return;
+                }
                 // FND-017: a sixel renders an image at the current cursor, so any
                 // buffered text must be committed (and the cursor advanced) first
                 // — exactly as the KittyImage arm below already does. Without this
@@ -2090,6 +2211,9 @@ impl<'a> Performer<'a> {
             }
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
+                if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                    return;
+                }
                 self.flush_print();
                 if let Err(err) = self.kitty_img(*img) {
                     log::error!("kitty_img: {:#}", err);
@@ -2339,7 +2463,11 @@ impl<'a> Performer<'a> {
 
         if self.cursor.x < self.left_and_right_margins.start {
             for _ in 0..n {
+                let prior = (self.cursor.x, self.cursor.y, self.wrap_next);
                 self.control(ControlCode::Backspace);
+                if prior == (self.cursor.x, self.cursor.y, self.wrap_next) {
+                    break;
+                }
             }
             return;
         }
@@ -2356,6 +2484,9 @@ impl<'a> Performer<'a> {
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
+        if !self.admit_native_csi_work(&csi) {
+            return;
+        }
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::Cursor(frankenterm_escape_parser::csi::Cursor::Left(n)) => {
@@ -2419,9 +2550,11 @@ impl<'a> Performer<'a> {
                 }
             }
             CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                for _ in 0..n {
-                    self.screen_mut().keyboard_stack.pop();
-                }
+                // Popping an already empty stack is inert, including when
+                // Kitty support is disabled. Truncation preserves all effects
+                // without looping over an untrusted u32 count.
+                let stack = &mut self.screen_mut().keyboard_stack;
+                stack.truncate(stack.len().saturating_sub(n as usize));
             }
             CSI::Keyboard(Keyboard::QueryKittySupport) => {
                 if self.config.enable_kitty_keyboard() {
@@ -2448,6 +2581,19 @@ impl<'a> Performer<'a> {
     fn esc_dispatch(&mut self, esc: Esc) {
         let seqno = self.seqno;
         self.flush_print();
+        if self.native_work_remaining.is_some() {
+            let cols = self.screen().physical_cols;
+            let rows = self.screen().physical_rows;
+            let cost = match esc {
+                Esc::Code(EscCode::DecScreenAlignmentDisplay) => cols.saturating_mul(rows),
+                Esc::Code(EscCode::FullReset) => rows.saturating_mul(2)
+                    .saturating_add(self.config.scrollback_size()).saturating_mul(cols),
+                _ => 0,
+            };
+            if !self.admit_native_work(cost) {
+                return;
+            }
+        }
         if esc != Esc::Code(EscCode::StringTerminator) {
             self.pop_tmux_title_state();
         }
@@ -2780,7 +2926,11 @@ impl<'a> Performer<'a> {
                     write!(self.writer, "{}", response).ok();
                     self.writer.flush().ok();
                 }
-                ITermProprietary::File(image) => self.set_image(*image),
+                ITermProprietary::File(image) => {
+                    if self.config.feature_profile() != crate::config::TerminalFeatureProfile::NativeText {
+                        self.set_image(*image);
+                    }
+                }
                 ITermProprietary::SetUserVar { name, value } => {
                     let maximum = self.config.max_user_vars();
                     if maximum != 0 {
