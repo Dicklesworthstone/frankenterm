@@ -153,7 +153,7 @@ xcodebuild test -project apps/apple/FrankenTerm.xcodeproj -scheme FrankenTerm \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
-The simulator build excludes x86_64 (both artifacts ship arm64 slices only). An Apple-host build of FrankenTermSSH or FrankenTermTerminal deletes their tracked `Package.resolved` (its pins are Linux-only); restore it rather than committing the deletion. Passing `-onlyUsePackageVersionsFromResolvedFile` to `xcodebuild` avoids it.
+The simulator build excludes x86_64 (both artifacts ship arm64 slices only). An Apple-host build of FrankenTermSSH or FrankenTermTerminal deletes their tracked `Package.resolved` (its pins are Linux-only); restore it rather than committing the deletion. On an Apple host the dependency graph has no remote pins (Kit links CryptoKit there), so SwiftPM writes an empty resolution and removes the file. Avoid that by passing `--only-use-versions-from-resolved-file` to `swift build`/`swift test` and `-onlyUsePackageVersionsFromResolvedFile` to `xcodebuild`. On Linux, the same flag pins the tracked versions.
 
 **UI journey runner notes.** `OfflineRestoreConnectUITests` skips unless it is given a real package and a reachable SSH server. It always imports, so use a freshly created simulator for each run (a second import of the same transfer is a different flow). Use only disposable keys:
 

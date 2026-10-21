@@ -72,7 +72,7 @@ No private user key or external host is involved.
 From this directory, with the system development/test dependencies installed:
 
 ```sh
-swift build -j 2
+swift build --only-use-versions-from-resolved-file -j 2
 cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fPIC -shared \
   -I Sources/CFrankenTermSSH/include Sources/CFrankenTermSSH/FrankenTermSSH.c \
   -lssh2 -pthread -o /tmp/libfrankenterm-ssh-tests.so
@@ -353,13 +353,13 @@ managed echo flow also checks exact terminal bytes, retained outcomes, duplicate
 creation refusal, explicit review, network exclusion and nonfatal resize busy.
 
 ```sh
-swift test -j 2 -Xswiftc -warnings-as-errors
-swift build --product FrankenTermSSHInteropProbe -j 2 -Xswiftc -warnings-as-errors
+swift test --only-use-versions-from-resolved-file -j 2 -Xswiftc -warnings-as-errors
+swift build --only-use-versions-from-resolved-file --product FrankenTermSSHInteropProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHInteropProbe
-swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
+swift build --only-use-versions-from-resolved-file --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so .build/debug/TerminalPumpProbe
 python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest
-swift build --product WorkspaceSSHProbe -j 2 -Xswiftc -warnings-as-errors
+swift build --only-use-versions-from-resolved-file --product WorkspaceSSHProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest .build/debug/WorkspaceSSHProbe
 ```
 
