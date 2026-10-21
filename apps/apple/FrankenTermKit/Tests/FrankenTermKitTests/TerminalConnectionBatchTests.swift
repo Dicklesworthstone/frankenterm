@@ -302,7 +302,7 @@ final class TerminalConnectionBatchTests: XCTestCase {
         }
     }
 
-    func testTwentyMachineFleetSettlesWithoutFocusOrShellSideEffects() async throws {
+    func testTwentyMachineFleetSettlesWithBoundedResourcesAndOneShotClaims() async throws {
         let probe = BatchProbe(), batch = try batch(probe)
         defer { probe.releaseAll() }
         let expected = [10, 11, 9] + (0..<20).filter { ![10, 11, 9].contains($0) }
@@ -336,5 +336,44 @@ final class TerminalConnectionBatchTests: XCTestCase {
         XCTAssertEqual(claimed, [value])
         try await batch.close()
         XCTAssertTrue(probe.disposed.isEmpty)
+    }
+
+    func testPriorityUsesTheFullRingEvenWhenSelectedMachineIsAlreadyConnected() async throws {
+        let inventory = ["one", "two", "three", "four", "five"]
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize(inventory, selected: "three",
+            including: Set(inventory)), ["three", "four", "two", "one", "five"])
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize(inventory, selected: "three",
+            including: ["one", "two", "four", "five"]), ["four", "two", "one", "five"])
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize(inventory, selected: "one",
+            including: Set(inventory)), ["one", "two", "five", "three", "four"])
+    }
+
+    func testPriorityCannotAddUnapprovedHostsAndHandlesEmptyAndSingleRings() async throws {
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize([Int](), selected: nil, including: []), [])
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize([1], selected: 1, including: [1]), [1])
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize([1, 2], selected: 1, including: [1, 2]), [1, 2])
+        XCTAssertEqual(try TerminalConnectionOrder.prioritize([1, 2, 3], selected: 99, including: [2]), [2])
+        XCTAssertThrowsError(try TerminalConnectionOrder.prioritize([1, 2], selected: 1, including: [3]))
+        XCTAssertThrowsError(try TerminalConnectionOrder.prioritize([1, 1], selected: 1, including: [1]))
+        XCTAssertThrowsError(try TerminalConnectionOrder.prioritize(Array(0..<129), selected: 1, including: [1]))
+    }
+
+    func testMaximumInventoryFailureStormCannotLeakWorkersOrRestartRequests() async throws {
+        let probe = BatchProbe(), batch = try batch(probe)
+        defer { probe.releaseAll() }
+        var failed = Set<Int>()
+        batch.onFailure = { id, _ in failed.insert(id) }
+        try batch.enqueue(Array(0..<128))
+        for id in 0..<128 {
+            await eventually { probe.waiting[id] != nil }
+            probe.fail(id)
+        }
+        await batch.waitUntilSettled()
+        XCTAssertEqual(failed, Set(0..<128))
+        XCTAssertEqual(batch.activeCount, 0)
+        XCTAssertEqual(batch.retainedResourceCount, 0)
+        XCTAssertEqual(probe.started.count, 128)
+        XCTAssertLessThanOrEqual(probe.maximumActive, 3)
+        try await batch.close()
     }
 }

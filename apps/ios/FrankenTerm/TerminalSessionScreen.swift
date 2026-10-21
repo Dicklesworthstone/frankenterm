@@ -19,6 +19,7 @@ final class MobileConnections {
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
     private var pendingCleanup: [UUID: TerminalSessionController] = [:]
+    private var groups: [UUID: MobileConnectionBatch] = [:]
     private var activityGeneration = UUID()
 
     /// `signer` defaults to the protected Keychain signer; tests inject one,
@@ -40,11 +41,32 @@ final class MobileConnections {
     func setActive(_ active: Bool) async {
         let generation = UUID(); activityGeneration = generation
         if active {
+            for group in Array(groups.values) where group.isRetired { _ = await closeGroup(group) }
             let retained = Array(pendingCleanup.values)
             for controller in retained { await controller.retryCleanup() }
             guard activityGeneration == generation else { return }
             await manager.resume()
-        } else { await manager.suspend() }
+        } else {
+            let retained = Array(groups.values)
+            for group in retained { group.retire() }
+            await manager.suspend()
+            for group in retained { _ = await closeGroup(group) }
+        }
+    }
+
+    /// Retain a batch independently of its screen until every unclaimed native
+    /// connection has closed. Failed cleanup is retried on the next activation.
+    func registerGroup(_ group: MobileConnectionBatch) throws {
+        guard groups.count < 16, groups[group.id] == nil else { throw WorkspaceSSHConnectionError.capacity }
+        groups[group.id] = group
+    }
+    @discardableResult func closeGroup(_ group: MobileConnectionBatch) async -> Bool {
+        group.retire()
+        do {
+            try await group.close()
+            groups[group.id] = nil
+            return true
+        } catch { return false }
     }
 
     fileprivate func retainForCleanup(_ controller: TerminalSessionController) {
@@ -55,12 +77,12 @@ final class MobileConnections {
 
 /// One ready direct-SSH route to a machine, with the key it uses: the first of
 /// the route's ordered references available on this device.
-struct TerminalSessionRoute: Hashable {
+struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialID: String, host: String, port: UInt16
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
-struct TerminalSessionTarget: Hashable {
+struct TerminalSessionTarget: Hashable, Sendable {
     let workspaceID: UUID, revision: UUID
     let machineID: String, machineName: String
     /// Never empty.
@@ -103,6 +125,15 @@ struct TerminalSessionTarget: Hashable {
         return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0) < 0.179
     }
 }
+
+/// Group authentication retains the real managed connection, not a second
+/// transport or an authorization token. No PTY/model/input exists yet. Claiming
+/// this value transfers cleanup responsibility to TerminalSessionController.
+struct PreparedTerminalConnection: Sendable {
+    let connection: WorkspaceSSHConnection
+    let route: TerminalSessionRoute
+}
+typealias MobileConnectionBatch = TerminalConnectionBatch<String, PreparedTerminalConnection>
 
 /// Publishes each owned FTSF frame from the Rust model to the native view.
 @MainActor
@@ -251,10 +282,12 @@ final class TerminalSessionController {
     @ObservationIgnored private var retainedCaptureAttempted = false
     @ObservationIgnored private var retainEndedOutput = true
 
-    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
+    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
+         prepared: PreparedTerminalConnection? = nil) {
         self.target = target; self.connections = connections; self.focus = focus
         basePalette = target.basePalette
-        route = target.routes[0]
+        route = prepared?.route ?? target.routes[0]
+        connection = prepared?.connection
     }
 
     /// "Machine · Route", for labels that leave the session.
@@ -423,8 +456,22 @@ final class TerminalSessionController {
                 try await connections.journal.resolve(record)
             }
             try checkStarting()
-            let connection = try await connectFirstReachable()
-            self.connection = connection
+            let connection: WorkspaceSSHConnection
+            if let prepared = self.connection {
+                // The selected target must still describe this exact prepared
+                // owner. openTerminal independently revalidates current durable
+                // trust/credential/foreground policy before creating its PTY.
+                guard prepared.scope.workspaceID == target.workspaceID,
+                      prepared.scope.workspaceRevision == target.revision,
+                      prepared.scope.machineID == target.machineID,
+                      prepared.scope.routeID == route.id, target.routes.contains(route) else {
+                    throw WorkspaceSSHConnectionError.stale
+                }
+                connection = prepared
+            } else {
+                connection = try await connectFirstReachable()
+                self.connection = connection
+            }
             try checkStarting()
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
             let pump = try await connection.openTerminal(geometry: geometry)
