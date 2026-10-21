@@ -76233,7 +76233,7 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
                             id,
                             target: RouteTarget::Alias(alias),
                         } => {
-                            println!("  {}: ssh alias {}", id, alias)
+                            println!("  {}: ssh alias {}", id, alias);
                         }
                         MachineRoute::Ssh {
                             id,
@@ -76247,7 +76247,7 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
                                 .mux_proxy_command(id, &context)
                                 .map(|argv| argv.join(" "))
                                 .unwrap_or_default();
-                            println!("  {}: mux via {}", id, command)
+                            println!("  {}: mux via {}", id, command);
                         }
                     }
                 }
