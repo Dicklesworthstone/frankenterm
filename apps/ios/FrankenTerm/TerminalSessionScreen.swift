@@ -121,8 +121,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var attached = false
     @ObservationIgnored private var run: Task<Void, Never>?
     @ObservationIgnored private var presenter: TerminalFramePresenter?
-    @ObservationIgnored private var wantedGeometry: TerminalSessionGeometry?
-    @ObservationIgnored private var resizing = false
+    @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
     @ObservationIgnored private var stopped = false
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
@@ -170,6 +169,15 @@ final class TerminalSessionController {
             self.presenter = presenter
             let runtime = TerminalModelRuntime(model: model, coordinator: connections.coordinator, delivery: presenter)
             self.runtime = runtime
+            // Latest-value PTY resize: a busy native slot retries only after the
+            // pump reports an applied resize, never on a timer.
+            let source = pump.source
+            let resize = TerminalViewportResize(source: source, initial: geometry) { geometry in
+                do { try await connection.requestResize(geometry, source: source); return .queued }
+                catch NativeSSHError.busy { return .busy }
+            }
+            resize.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            self.resize = resize
             guard let focus else { throw TerminalKeyboardError.unavailable }
             attached = true
             let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
@@ -189,7 +197,12 @@ final class TerminalSessionController {
             view.requestKeyboard(true)
             run = Task { [weak self] in
                 let end: Result<TerminalSessionEnd, Error>
-                do { end = .success(try await pump.run(consumer: runtime)) } catch { end = .failure(error) }
+                do {
+                    end = .success(try await pump.run(consumer: runtime, onResizeApplied: { geometry, source in
+                        // A late completion after retirement is not a session failure.
+                        try? await resize.didApply(geometry, source: source)
+                    }))
+                } catch { end = .failure(error) }
                 await self?.pumpEnded(end)
             }
         } catch TerminalSessionJournalError.reviewRequired {
@@ -228,33 +241,14 @@ final class TerminalSessionController {
         }
     }
 
-    /// Applies the renderer's measured grid to the remote PTY. One native resize
-    /// is in flight at a time; only the newest proposal is retained meanwhile.
-    /// Kit's TerminalViewportResize is the intended owner of this once
-    /// TerminalModelRuntime reports applied geometry (its didApply input); until
-    /// then a refused (busy) request is retried briefly with the newest value.
+    /// Applies the renderer's measured grid to the remote PTY through Kit's
+    /// latest-value driver; the model follows when the pump applies the result.
     private func propose(_ viewport: NativeTerminalViewport) {
-        guard let geometry = try? TerminalSessionGeometry(columns: UInt32(viewport.columns), rows: UInt32(viewport.rows),
-            pixelWidth: UInt32(min(viewport.pixelWidth, 65_535)), pixelHeight: UInt32(min(viewport.pixelHeight, 65_535)))
+        guard !stopped, let resize, let source = pump?.source,
+              let geometry = try? TerminalSessionGeometry(columns: UInt32(viewport.columns), rows: UInt32(viewport.rows),
+                  pixelWidth: UInt32(min(viewport.pixelWidth, 65_535)), pixelHeight: UInt32(min(viewport.pixelHeight, 65_535)))
         else { return }
-        wantedGeometry = geometry
-        guard !resizing else { return }
-        resizing = true
-        Task { [weak self] in await self?.drainResizes() }
-    }
-
-    private func drainResizes() async {
-        defer { resizing = false }
-        while let geometry = wantedGeometry, !stopped, let connection, let source = pump?.source {
-            wantedGeometry = nil
-            do { try await connection.requestResize(geometry, source: source) }
-            catch NativeSSHError.busy {
-                // The previous request still owns the native slot; retry the
-                // newest geometry shortly instead of dropping it.
-                if wantedGeometry == nil { wantedGeometry = geometry }
-                try? await Task.sleep(for: .milliseconds(50))
-            } catch { return }
-        }
+        do { try resize.propose(geometry, source: source) } catch { fail(Self.describe(error)) }
     }
 
     /// A display that cannot show this session's output must not keep sending
@@ -287,6 +281,7 @@ final class TerminalSessionController {
 
     private func teardown(joiningRun: Bool = true) async {
         terminal?.retire()
+        resize?.retire()
         pump?.requestStop()
         if let connection { try? await connections.manager.close(connectionID: connection.id) }
         if joiningRun, let run { await run.value }
