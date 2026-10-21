@@ -386,6 +386,105 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// The rendered rows once `ready` holds for them (or after ~10 s).
+    private func rows(of terminal: NativeTerminalView, until ready: ([String]) -> Bool) async throws -> [String] {
+        var rows: [String] = []
+        for _ in 0..<200 {
+            rows = (terminal.renderer.accessibilityValue ?? "").components(separatedBy: "\n")
+            if ready(rows) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return rows
+    }
+
+    /// Whether a row shows `marker`. Output that arrives at an idle prompt
+    /// shares the prompt's row, so markers are matched within rows.
+    private func shows(_ rows: [String], _ marker: String) -> Bool { rows.contains { $0.contains(marker) } }
+
+    /// Prints numbered lines well past one screen and waits for the last.
+    private func printHistory(into terminal: NativeTerminalView, count: Int) async throws {
+        try await type("for i in $(seq 1 \(count)); do echo HIST-$i; done", into: terminal)
+        let bottom = try await rows(of: terminal) { $0.contains("HIST-\(count)") }
+        XCTAssertTrue(bottom.contains("HIST-\(count)"), "the shell printed its lines (screen: \(bottom))")
+        XCTAssertFalse(bottom.contains("HIST-1"), "the first lines scrolled off the screen")
+    }
+
+    /// Scrollback: earlier output scrolls back into view and stays put while
+    /// output continues; typing over history is not sent and returns live.
+    func testScrollingBackShowsEarlierOutputAndTypingReturnsLive() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await printHistory(into: terminal, count: 80)
+        try await type("(sleep 3; echo LATE-$((40+2))) &", into: terminal)
+        _ = try await rows(of: terminal) { $0.contains { $0.hasPrefix("[1]") } }
+
+        let frame = try XCTUnwrap(terminal.renderer.admittedFrame)
+        let history = try XCTUnwrap(frame.history, "frames report the retained history")
+        XCTAssertTrue(frame.isLive)
+        terminal.scrollHistory(byRows: -Int(history.live - history.first))
+        let oldest = try await rows(of: terminal) { $0.contains("HIST-1") }
+        XCTAssertTrue(oldest.contains("HIST-1"), "scrolling back shows the first lines (screen: \(oldest))")
+        XCTAssertEqual(terminal.renderer.admittedFrame?.viewportFirst, history.first)
+        let control = try await subview(UIButton.self, in: terminal) { $0.accessibilityLabel == "Return to live output" }
+        XCTAssertFalse(control.isHidden, "history offers the way back")
+        XCTAssertFalse(terminal.input.isEditable, "the caret has no place over history")
+
+        try await Task.sleep(for: .seconds(4))
+        let kept = try await rows(of: terminal) { _ in true }
+        XCTAssertTrue(kept.contains("HIST-1") && !shows(kept, "LATE-42"), "new output keeps the reader's place (screen: \(kept))")
+
+        terminal.input.insertText("x")
+        let returned = try await rows(of: terminal) { self.shows($0, "LATE-42") }
+        XCTAssertTrue(shows(returned, "LATE-42"), "typing returns to the live screen (screen: \(returned))")
+        XCTAssertEqual(terminal.renderer.admittedFrame?.isLive, true)
+        XCTAssertTrue(control.isHidden)
+        try await type("echo SCROLLED-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "SCROLLED-42")
+        XCTAssertEqual(output, "SCROLLED-42\n", "the keystroke typed over history was not sent")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    /// M1: switching machines keeps each one's place in its history.
+    func testEachMachineKeepsItsHistoryPositionAcrossSwitches() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let alpha = try shown(try await connect(scene, "alpha"))
+        defer { alpha.removeFromSuperview() }
+        try await printHistory(into: alpha, count: 60)
+        // Output that arrives while alpha is hidden must not move its place.
+        try await type("(sleep 3; echo HIDDEN-$((40+2))) &", into: alpha)
+        alpha.scrollHistory(byRows: -1_000)
+        _ = try await rows(of: alpha) { $0.contains("HIST-1") }
+        let place = try XCTUnwrap(alpha.renderer.admittedFrame?.viewportFirst)
+
+        let beta = try shown(try await connect(scene, "beta"))
+        defer { beta.removeFromSuperview() }
+        try await type("echo BETA-$((40+2))", into: beta)
+        _ = try await rows(of: beta) { self.shows($0, "BETA-42") }
+        try await Task.sleep(for: .seconds(3))
+        // Hidden alpha receives no frames, so anything newer comes from the return.
+        let shownBefore = try XCTUnwrap(alpha.renderer.admittedFrame?.revision)
+        try await select(scene, "alpha")
+        for _ in 0..<200 where (alpha.renderer.admittedFrame?.revision ?? 0) <= shownBefore {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(alpha.renderer.admittedFrame?.revision), shownBefore,
+                             "returning to alpha draws a new frame")
+        let back = try await rows(of: alpha) { _ in true }
+        XCTAssertTrue(back.contains("HIST-1") && !shows(back, "HIDDEN-42"), "alpha returns where it was (screen: \(back))")
+        XCTAssertEqual(alpha.renderer.admittedFrame?.viewportFirst, place)
+
+        let control = try await subview(UIButton.self, in: alpha) { $0.accessibilityLabel == "Return to live output" }
+        control.sendActions(for: .touchUpInside)
+        let bottom = try await rows(of: alpha) { self.shows($0, "HIDDEN-42") }
+        XCTAssertTrue(shows(bottom, "HIDDEN-42"), "the control returns to live output, including what arrived while hidden (screen: \(bottom))")
+        XCTAssertEqual(alpha.renderer.admittedFrame?.isLive, true)
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
     private func assertReleased(_ controller: TerminalSessionController, connections: MobileConnections,
                                 file: StaticString = #filePath, line: UInt = #line) async {
         XCTAssertTrue(controller.settled, file: file, line: line)

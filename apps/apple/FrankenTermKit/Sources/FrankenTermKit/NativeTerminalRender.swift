@@ -44,6 +44,8 @@ public final class NativeTerminalRenderView: MTKView {
     public var onAppearance: (@MainActor (UIFont, UIColor) -> Void)?
     public var onViewportChange: (@MainActor (NativeTerminalViewport) -> Void)?
     public var onFailure: (@MainActor (TerminalRenderError) -> Void)?
+    /// Each decoded frame as it is admitted, before it is drawn.
+    public var onFrameAdmitted: (@MainActor (TerminalRenderFrame) -> Void)?
     public private(set) var configuration: NativeTerminalRenderConfiguration
 
     private let commandQueue: any MTLCommandQueue
@@ -105,6 +107,9 @@ public final class NativeTerminalRenderView: MTKView {
     public required init(coder: NSCoder) { fatalError("Use init(source:bundle:configuration:)") }
     deinit { NotificationCenter.default.removeObserver(self) }
 
+    /// The last admitted frame: what is shown, or about to be.
+    public var admittedFrame: TerminalRenderFrame? { latest }
+
     /// The last admitted screen, read on demand so steady output costs nothing.
     public override var accessibilityValue: String? {
         get { latest?.readableText ?? super.accessibilityValue }
@@ -161,6 +166,7 @@ public final class NativeTerminalRenderView: MTKView {
         worker.setActive(false)
         onCaretUnavailable?()
         onCaret = nil; onCaretUnavailable = nil; onAppearance = nil; onViewportChange = nil; onFailure = nil
+        onFrameAdmitted = nil
     }
 
     public override func layoutSubviews() {
@@ -231,6 +237,7 @@ public final class NativeTerminalRenderView: MTKView {
                             }
                             self.latest = semantic
                             self.lastAdmittedRevision = semantic.revision
+                            self.onFrameAdmitted?(semantic)
                         }
                         guard case let .ready(frame) = result else {
                             try? self.slots.abandon(lease)

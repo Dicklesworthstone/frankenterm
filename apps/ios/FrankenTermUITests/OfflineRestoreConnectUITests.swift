@@ -214,6 +214,23 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("echo BACK-$((40+2))\n")
         waitFor("BACK-42", in: terminal, "the session must accept input again after the keyboard returns")
 
+        // Dragging down scrolls back through history; the button returns live.
+        app.typeText("for i in $(seq 1 60); do echo UIH-$i; done\n")
+        waitFor("UIH-60", in: terminal, "the shell must print its lines")
+        func rows() -> [String] { screen(terminal).components(separatedBy: "\n") }
+        for _ in 0..<6 where !rows().contains("UIH-1") {
+            terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.15))
+                .press(forDuration: 0.05, thenDragTo: terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85)))
+        }
+        XCTAssertTrue(rows().contains("UIH-1"), "dragging down must reach the first lines; screen:\n\(screen(terminal))")
+        XCTAssertFalse(rows().contains("UIH-60"))
+        snapshot("6c-history")
+        app.buttons["Return to live output"].tap()
+        waitFor("UIH-60", in: terminal, "the button must return to live output")
+        XCTAssertTrue(app.buttons["Return to live output"].waitForNonExistence(timeout: 5), "live output hides the button")
+        app.typeText("echo LIVE-$((40+2))\n")
+        waitFor("LIVE-42", in: terminal, "typing works again on the live screen")
+
         // A full-screen program on the alternate screen, left with Esc: if Esc
         // is lost, ":q!" is inserted as text and vim never exits.
         app.typeText("vim -u NONE -N\n")

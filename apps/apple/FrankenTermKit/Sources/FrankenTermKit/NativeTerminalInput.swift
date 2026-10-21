@@ -53,6 +53,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)?
     public var onRetired: (@MainActor () -> Void)?
+    public var onInputWithoutProjection: (@MainActor () -> Void)?
     public private(set) var accessoryModifiers = TerminalAccessoryModifiers()
     public private(set) var pendingPaste: TerminalPasteReview?
 
@@ -236,6 +237,12 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         do { try operation(); refreshComposition() }
         catch { onFailure?(error) }
     }
+    /// Typing while no rendered projection exists (for example while history
+    /// is shown) is still not sent; the owner may bring the live screen back.
+    private func typed(_ operation: () throws -> Void) {
+        if !retiring, !hasGeometry { onInputWithoutProjection?() }
+        mutate(operation)
+    }
     public func text(in range: UITextRange) -> String? {
         guard let range = value(range) else { return nil }
         return try? session.document.substring(range)
@@ -250,14 +257,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
         // Helper modifiers never silently transform a native language candidate.
         // Starting IME returns them to the visibly inactive state.
-        mutate {
+        typed {
             try session.setMarkedText(markedText, selectedRange: selectedRange)
             accessoryModifiers.clear()
         }
     }
     public func unmarkText() { mutate { try session.unmarkText() } }
     public func insertText(_ text: String) {
-        mutate {
+        typed {
             if !session.document.isMarked,
                !accessoryModifiers.modifiers.isEmpty || ["\n", "\r", "\t"].contains(text) {
                 let key = try TerminalHardwareRouting.accessoryKey(text: text, modifiers: accessoryModifiers.modifiers)
@@ -266,7 +273,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         }
     }
     public func deleteBackward() {
-        mutate {
+        typed {
             if session.document.isMarked { try session.deleteBackward() }
             else {
                 try session.key(TerminalHardwareKey(usage: 0x2A, modifiers: accessoryModifiers.modifiers), phase: .press)
@@ -442,7 +449,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
                                                        hasMarkedText: session.document.isMarked) == .terminal else {
                 unhandled.insert(press); continue
             }
-            mutate {
+            typed {
                 guard physicalKeys[usage] != nil || physicalKeys.count < 32 else { throw TerminalKeyboardError.capacity }
                 let value = try TerminalHardwareKey(usage: usage, modifiers: mods.union(accessoryModifiers.modifiers),
                                                     characters: key.charactersIgnoringModifiers)
@@ -692,7 +699,15 @@ public final class NativeTerminalView: UIView {
     /// The owner applies this measured geometry to the canonical terminal and
     /// its SSH PTY, then submits the corresponding revised semantic frame.
     public var onViewportChange: (@MainActor (NativeTerminalViewport) -> Void)?
+    /// The owner selects this history viewport on the canonical model (nil is
+    /// the live screen) and submits the frame it produces. A one-finger
+    /// vertical pan, the return-to-live control and typing over history ask.
+    public var onHistoryViewportRequest: (@MainActor (Int64?) -> Void)?
 
+    private let liveButton = UIButton(type: .system)
+    private let panDelegate = NativeTerminalHistoryPanDelegate()
+    private var panAnchor: (top: Int64, history: TerminalRenderHistory)?
+    private var lastHistoryRequest: Int64??
     private var lastCaret: NativeTerminalCaret?
     private var lastAppearance: (font: UIFont, foreground: UIColor)?
     private var retired = false
@@ -721,6 +736,20 @@ public final class NativeTerminalView: UIView {
         input.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(renderer); addSubview(input)
         bindInput()
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+        pan.maximumNumberOfTouches = 1; pan.delegate = panDelegate
+        addGestureRecognizer(pan)
+        var button = UIButton.Configuration.filled()
+        button.image = UIImage(systemName: "arrow.down.to.line"); button.cornerStyle = .capsule
+        liveButton.configuration = button
+        liveButton.accessibilityLabel = "Return to live output"
+        liveButton.isHidden = true
+        liveButton.addAction(UIAction { [weak self] _ in self?.returnToLiveOutput() }, for: .touchUpInside)
+        addSubview(liveButton)
+        renderer.onFrameAdmitted = { [weak self] frame in
+            guard let self, !self.retired else { return }
+            self.liveButton.isHidden = frame.isLive
+        }
         renderer.onFailure = { [weak self] error in
             guard let self, !self.retired else { return }
             self.onFailure?(error)
@@ -773,6 +802,47 @@ public final class NativeTerminalView: UIView {
             self.wantsKeyboard = false
             self.onInputRetired?()
         }
+        input.onInputWithoutProjection = { [weak self] in
+            guard let self, !self.retired, self.renderer.admittedFrame?.isLive == false else { return }
+            self.returnToLiveOutput()
+        }
+    }
+
+    /// Moves the shown rows by `rows` (negative is older history), within the
+    /// history range of the last admitted frame.
+    public func scrollHistory(byRows rows: Int) {
+        guard !retired, let frame = renderer.admittedFrame, let history = frame.history else { return }
+        lastHistoryRequest = nil
+        requestHistory(top: frame.viewportFirst + Int64(rows), within: history)
+    }
+    public func returnToLiveOutput() {
+        guard !retired else { return }
+        lastHistoryRequest = .some(nil)
+        onHistoryViewportRequest?(nil)
+    }
+    private func requestHistory(top: Int64, within history: TerminalRenderHistory) {
+        let clamped = min(max(top, history.first), history.live)
+        let target = clamped == history.live ? nil : clamped
+        guard lastHistoryRequest != .some(target) else { return }
+        lastHistoryRequest = .some(target)
+        onHistoryViewportRequest?(target)
+    }
+    @objc private func panned(_ pan: UIPanGestureRecognizer) {
+        guard !retired else { return }
+        switch pan.state {
+        case .began:
+            lastHistoryRequest = nil
+            guard let frame = renderer.admittedFrame, let history = frame.history,
+                  history.first < history.live else { panAnchor = nil; return }
+            panAnchor = (frame.viewportFirst, history)
+        case .changed:
+            guard let anchor = panAnchor, let rows = renderer.admittedFrame?.rows, rows > 0,
+                  bounds.height > 0 else { return }
+            // Dragging down reveals older rows above, one row per row height.
+            let moved = pan.translation(in: self).y / (bounds.height / CGFloat(rows))
+            requestHistory(top: anchor.top - Int64(moved.rounded(.towardZero)), within: anchor.history)
+        default: panAnchor = nil
+        }
     }
     private func bindPasteReview() {
         guard !retired, onPasteReview != nil else {
@@ -788,6 +858,7 @@ public final class NativeTerminalView: UIView {
     public override func layoutSubviews() {
         super.layoutSubviews()
         renderer.frame = bounds; input.frame = bounds
+        liveButton.frame = CGRect(x: bounds.maxX - 60, y: bounds.maxY - 60, width: 48, height: 48)
     }
     public override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -840,9 +911,9 @@ public final class NativeTerminalView: UIView {
         catch { replacement.retire(); throw error }
         replacement.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         replacement.frame = bounds
-        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil
+        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
         input.removeFromSuperview(); input = replacement
-        bindInput(); addSubview(replacement)
+        bindInput(); insertSubview(replacement, belowSubview: liveButton)
     }
     public func confirmPaste(id: UUID) throws {
         guard !retired else { throw TerminalInputError.unavailable }
@@ -854,10 +925,21 @@ public final class NativeTerminalView: UIView {
     public func retire() {
         guard !retired else { return }
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
-        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil
+        input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
+        onHistoryViewportRequest = nil; liveButton.isHidden = true
         renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil
         renderer.onCaretUnavailable = nil; renderer.onViewportChange = nil; onViewportChange = nil
         input.retire(); renderer.retire()
+    }
+}
+
+/// Only a mostly vertical drag scrolls history; sideways drags stay free.
+@MainActor
+private final class NativeTerminalHistoryPanDelegate: NSObject, UIGestureRecognizerDelegate {
+    func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+        guard let pan = recognizer as? UIPanGestureRecognizer, let view = pan.view else { return false }
+        let velocity = pan.velocity(in: view)
+        return abs(velocity.y) > abs(velocity.x)
     }
 }
 #endif

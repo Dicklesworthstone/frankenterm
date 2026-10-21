@@ -88,6 +88,13 @@ public struct TerminalRenderRow: Equatable, Sendable {
     }
 }
 
+/// Stable rows of the oldest retained history line and of the live viewport's
+/// first line. Equal on the alternate screen, which keeps no history.
+public struct TerminalRenderHistory: Equatable, Sendable {
+    public let first: Int64, live: Int64
+    public init(first: Int64, live: Int64) { self.first = first; self.live = live }
+}
+
 public struct TerminalRenderCursor: Equatable, Sendable {
     public let stableRow: Int64
     public let column: Int, shape: UInt32, width: Int
@@ -133,8 +140,13 @@ public struct TerminalRenderFrame: Equatable, Sendable {
     public let lines: [TerminalRenderRow]
     public let palette: [TerminalRenderRGBA]
     public let links: [String]
+    /// The stable rows a history viewport may start at, when the producer
+    /// reports them (flag 16); `viewportFirst` lies within this range.
+    public let history: TerminalRenderHistory?
     public var reverseVideo: Bool { flags & 2 != 0 }
     public var alternateScreen: Bool { flags & 4 != 0 }
+    /// Whether this frame shows the live screen rather than earlier history.
+    public var isLive: Bool { history.map { viewportFirst == $0.live } ?? true }
     /// The viewport one line per row for VoiceOver and UI automation, without
     /// the blank rows below the last written one.
     public var readableText: String {
@@ -150,10 +162,11 @@ public struct TerminalRenderFrame: Equatable, Sendable {
         guard data.count >= 256 else { throw TerminalRenderError.malformed }
         let bytes = [UInt8](data)
         let read = RenderBytes(bytes)
+        let reportsHistory = read.u32(12) & 16 != 0
         guard Array(bytes[0..<4]) == [70, 84, 83, 70], read.u16(4) == 1,
               read.u16(6) == 256, Int(read.u32(8)) == bytes.count,
-              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(15) == 0,
-              bytes[176..<256].allSatisfy({ $0 == 0 })
+              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(31) == 0,
+              bytes[(reportsHistory ? 192 : 176)..<256].allSatisfy({ $0 == 0 })
         else { throw TerminalRenderError.malformed }
         let identity = expectedSource.identity
         guard Array(bytes[16..<32]) == uuidBytes(identity.channelID),
@@ -182,6 +195,10 @@ public struct TerminalRenderFrame: Equatable, Sendable {
               Int(read.u32(172)) <= columns - Int(read.u32(120)) else { throw TerminalRenderError.malformed }
         let first = read.i64(104)
         guard first <= Int64.max - Int64(rows - 1) else { throw TerminalRenderError.malformed }
+        let history = reportsHistory ? TerminalRenderHistory(first: read.i64(176), live: read.i64(184)) : nil
+        if let history {
+            guard history.first <= first, first <= history.live else { throw TerminalRenderError.malformed }
+        }
         let pool = Array(bytes[textOffset..<paletteOffset])
         guard String(bytes: pool, encoding: .utf8) != nil else { throw TerminalRenderError.malformed }
         var lines = [TerminalRenderRow](); lines.reserveCapacity(rows)
@@ -240,7 +257,17 @@ public struct TerminalRenderFrame: Equatable, Sendable {
             rows: rows, columns: columns, viewportFirst: first, flags: read.u32(12),
             cursor: TerminalRenderCursor(stableRow: read.i64(112), column: Int(read.u32(120)),
                 shape: read.u32(124), width: Int(read.u32(172)), visible: read.u32(168) == 1),
-            lines: lines, palette: palette, links: links)
+            lines: lines, palette: palette, links: links, history: history)
+    }
+
+    /// The history range of encoded frame bytes, read from the header alone.
+    /// For an owner that selects viewports without decoding whole frames.
+    public static func history(ofEncoded data: Data) -> TerminalRenderHistory? {
+        guard data.count >= 256 else { return nil }
+        let read = RenderBytes([UInt8](data.prefix(256)))
+        guard read.u32(0) == 0x4653_5446, read.u32(12) & 16 != 0 else { return nil }
+        let history = TerminalRenderHistory(first: read.i64(176), live: read.i64(184))
+        return history.first <= history.live ? history : nil
     }
 
     private static func uuidBytes(_ value: UUID) -> [UInt8] {

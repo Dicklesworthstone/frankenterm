@@ -55,15 +55,28 @@ private final class OwnedModelFixture: TerminalSessionModel, @unchecked Sendable
     private let unavailableExplicitViewport: Bool
     private let encoded: Data
     private let paste: TerminalPreparedPaste?
+    // When set, frames are 256-byte FTSF headers reporting this retained
+    // history range, and explicit viewports outside it are unavailable.
+    private var history: TerminalRenderHistory?
 
     init(source: TerminalSource, replies: [TerminalModelReply] = [],
          frameError: TerminalModelError? = nil, encoded: Data = Data([0xA5]),
          paste: TerminalPreparedPaste? = nil, closeFailures: Int = 0,
-         cancelFirstReplyCopy: Bool = false, unavailableExplicitViewport: Bool = false) {
+         cancelFirstReplyCopy: Bool = false, unavailableExplicitViewport: Bool = false,
+         history: TerminalRenderHistory? = nil) {
         self.source = source; self.replies = replies; self.frameError = frameError
         self.encoded = encoded; self.paste = paste; self.closeFailures = closeFailures
         self.cancelFirstReplyCopy = cancelFirstReplyCopy
         self.unavailableExplicitViewport = unavailableExplicitViewport
+        self.history = history
+    }
+    func retain(_ history: TerminalRenderHistory) {
+        lock.lock(); defer { lock.unlock() }
+        self.history = history
+    }
+    /// The viewport's first stable row in a header frame from this fixture.
+    static func viewportFirst(_ frame: Data) -> Int64 {
+        frame.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 104, as: Int64.self) }
     }
     func feed(_ bytes: Data) {
         lock.lock(); defer { lock.unlock() }
@@ -110,7 +123,17 @@ private final class OwnedModelFixture: TerminalSessionModel, @unchecked Sendable
         events.append("capture"); captures += 1; viewports.append(viewportTop)
         if unavailableExplicitViewport, viewportTop != nil { throw TerminalModelError.viewportUnavailable }
         if let frameError { throw frameError }
-        return Data([0xF0, UInt8(truncatingIfNeeded: captures)])
+        guard let history else { return Data([0xF0, UInt8(truncatingIfNeeded: captures)]) }
+        if let top = viewportTop, top < history.first || top > history.live {
+            throw TerminalModelError.viewportUnavailable
+        }
+        var header = Data(repeating: 0, count: 256)
+        header.replaceSubrange(0..<4, with: Array("FTSF".utf8))
+        for (at, value) in [(12, Int64(17)), (104, viewportTop ?? history.live),
+                            (176, history.first), (184, history.live)] {
+            withUnsafeBytes(of: value.littleEndian) { header.replaceSubrange(at..<(at + 8), with: $0) }
+        }
+        return header
     }
     func setFontRevision(_ revision: UInt64) {
         lock.lock(); defer { lock.unlock() }
@@ -309,7 +332,11 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         // One bounded consumer is waiting; the competing one must complete
         // refusal before publication is released, without dropping the channel.
         await refused.wait()
-        do { try await runtime.setViewport(top: -20, source: source); XCTFail("Concurrent viewport mutation admitted") }
+        // A history scroll waits once behind publication like a presentation
+        // request; a second concurrent viewport request is refused, not queued.
+        let viewport = Task { try await runtime.setViewport(top: -20, source: source) }
+        while await runtime.accounting().waitingViewportRequests == 0 { await Task.yield() }
+        do { try await runtime.setViewport(top: -21, source: source); XCTFail("Second viewport request queued") }
         catch { XCTAssertEqual(error as? TerminalModelError, .busy) }
         let encoded = try await runtime.encode(.text("x"), source: source, maximumBytes: 2)
         XCTAssertEqual(encoded, Data([0xA1, 0xA2]))
@@ -318,9 +345,11 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         await hold.release()
         try await receive.value
         let results = try await (next.value, excess.value)
+        try await viewport.value
         XCTAssertNotEqual(results.0, results.1)
         XCTAssertEqual(model.snapshot().fed, Data([0x90, results.0 ? 0x91 : 0x92]))
-        XCTAssertEqual(model.snapshot().captures, 2)
+        XCTAssertEqual(model.snapshot().captures, 3)
+        XCTAssertEqual(model.snapshot().viewports, [nil, nil, -20], "the waiting request ran after the waiting consumer")
         try await runtime.close()
     }
 
@@ -484,33 +513,51 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         try await runtime.close()
     }
 
-    func testEvictedViewportIsUnavailableWhileLiveOutputAndAnswerbacksContinue() async throws {
+    /// Output evicts the oldest history first. A reader whose rows were evicted
+    /// moves to the oldest retained row, or to the live screen when none is
+    /// left; the terminal is never reported unavailable for it, and output and
+    /// answerbacks continue throughout.
+    func testEvictedViewportFollowsRetainedHistoryWhileLiveOutputAndAnswerbacksContinue() async throws {
         let (coordinator, transport, source) = try await source()
         let model = OwnedModelFixture(source: source,
-            replies: [try .init(sequence: 5, bytes: Data([0x41, 0x42]))], unavailableExplicitViewport: true)
+            replies: [try .init(sequence: 5, bytes: Data([0x41, 0x42]))], history: .init(first: 100, live: 200))
         let delivery = ModelRuntimeDelivery(), runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery)
-        try await runtime.setViewport(top: 9_000, source: source)
+        try await runtime.setViewport(top: 120, source: source)
+        model.retain(.init(first: 150, live: 260))
         try await runtime.receive(.init(output: Data([0x90])), source: source)
         XCTAssertEqual(model.snapshot().fed, Data([0x90]))
         XCTAssertEqual(model.snapshot().settled, [5])
         _ = try await coordinator.drainOne(source)
         let reply = await transport.bytes()
         XCTAssertEqual(reply, Data([0x41, 0x42]))
-        try await runtime.setViewport(top: nil, source: source)
-        let delivered = await delivery.snapshot()
-        XCTAssertEqual(delivered.0.count, 3)
-        for presentation in delivered.0.prefix(2) {
-            guard case .unavailable(.unavailable) = presentation else {
-                XCTFail("Evicted historical viewport appeared live"); continue
-            }
+        try await runtime.receive(.init(output: Data([0x91])), source: source)
+        model.retain(.init(first: 300, live: 300))
+        try await runtime.receive(.init(output: Data([0x92])), source: source)
+        try await runtime.receive(.init(output: Data([0x93])), source: source)
+        let shown = await delivery.snapshot().0.compactMap { presentation -> Int64? in
+            guard case let .frame(bytes) = presentation else { return nil }
+            return OwnedModelFixture.viewportFirst(bytes)
         }
-        guard case .frame = delivered.0.last else { return XCTFail("Return to live view did not publish") }
-        XCTAssertEqual(model.snapshot().viewports, [9_000, 9_000, nil])
+        XCTAssertEqual(shown, [120, 150, 150, 300, 300], "every publication is a frame at a retained row")
+        XCTAssertEqual(model.snapshot().viewports, [120, 120, nil, 150, 150, 150, nil, nil])
         let stats = await runtime.accounting()
-        XCTAssertEqual(stats.unavailableFrames, 2)
-        XCTAssertEqual(stats.publishedFrames, 1)
+        XCTAssertEqual(stats.unavailableFrames, 0)
+        XCTAssertEqual(stats.publishedFrames, 5)
         XCTAssertEqual(stats.queuedReplies, 1)
         XCTAssertFalse(stats.closed)
+        try await runtime.close()
+    }
+
+    func testEvictedViewportWithoutReportedHistoryReturnsLive() async throws {
+        let (coordinator, _, source) = try await source()
+        let model = OwnedModelFixture(source: source, unavailableExplicitViewport: true)
+        let delivery = ModelRuntimeDelivery(), runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery)
+        try await runtime.setViewport(top: 9_000, source: source)
+        try await runtime.receive(.init(output: Data([0x90])), source: source)
+        XCTAssertEqual(model.snapshot().viewports, [9_000, nil, nil], "one failed attempt, then live")
+        for presentation in await delivery.snapshot().0 {
+            guard case .frame = presentation else { return XCTFail("The terminal was reported unavailable") }
+        }
         try await runtime.close()
     }
 

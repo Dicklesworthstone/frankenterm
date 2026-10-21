@@ -88,3 +88,57 @@ public final class TerminalPresentationVisibility<Source: Equatable & Sendable> 
         }
     }
 }
+
+/// One latest-value owner for a terminal's selected history viewport. A pan
+/// asks many times per second; at most one model call runs and only the
+/// newest request waits behind it. Every request is applied even when it
+/// equals an earlier one: the model may have moved the viewport since (input,
+/// eviction), so a repeated value is not known to be in effect.
+@MainActor
+public final class TerminalHistorySelection<Source: Equatable & Sendable> {
+    public let source: Source
+    public private(set) var isRetired = false
+    public var onFailure: (@MainActor (any Error) -> Void)?
+
+    private let apply: @Sendable (Int64?, Source) async throws -> Void
+    private var pending: Int64??
+    private var worker: Task<Void, Never>?
+
+    public init(source: Source, apply: @escaping @Sendable (Int64?, Source) async throws -> Void) {
+        self.source = source; self.apply = apply
+    }
+
+    public var isSettled: Bool { worker == nil }
+
+    /// `top` is the first stable row to show; nil is the live screen.
+    public func request(top: Int64?, source: Source) throws {
+        guard source == self.source else { throw TerminalPresentationVisibilityError.staleSource }
+        guard !isRetired else { throw TerminalPresentationVisibilityError.retired }
+        pending = .some(top)
+        guard worker == nil else { return }
+        worker = Task { await self.drive() }
+    }
+
+    /// Irreversible. Drops a waiting request; an in-flight call completes and
+    /// callers may join it before releasing the model.
+    public func retire() {
+        isRetired = true; pending = nil
+    }
+
+    public func waitUntilSettled() async {
+        while let worker { await worker.value }
+    }
+
+    private func drive() async {
+        defer { worker = nil }
+        while !isRetired, let next = pending {
+            pending = nil
+            do { try await apply(next, source) } catch {
+                // No automatic retry: a later request is a new user intent.
+                pending = nil
+                if !isRetired { onFailure?(error) }
+                return
+            }
+        }
+    }
+}

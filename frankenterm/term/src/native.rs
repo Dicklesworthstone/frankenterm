@@ -1159,6 +1159,46 @@ mod tests {
     }
 
     #[test]
+    fn frames_report_the_resident_history_range_a_viewport_may_select() {
+        let mut terminal = terminal();
+        let flags = |frame: &[u8]| u32::from_le_bytes(frame[12..16].try_into().unwrap());
+        let row =
+            |frame: &[u8], at: usize| i64::from_le_bytes(frame[at..at + 8].try_into().unwrap());
+        let history = |frame: &[u8]| (row(frame, 176), row(frame, 184));
+        let fresh = terminal.capture_frame(None).unwrap();
+        assert_eq!(flags(&fresh) & 16, 16);
+        assert_eq!(history(&fresh), (0, 0));
+
+        terminal.feed(b"1\r\n2\r\n3\r\n4\r\n5\r\n6").unwrap();
+        let live = terminal.capture_frame(None).unwrap();
+        assert_eq!(history(&live), (0, 3), "rows 1..3 scrolled into history");
+        assert_eq!(row(&live, 104), 3);
+        let oldest = terminal.capture_frame(Some(0)).unwrap();
+        assert_eq!((row(&oldest, 104), history(&oldest)), (0, (0, 3)));
+        assert!(
+            terminal.capture_frame(Some(4)).is_err(),
+            "past the live viewport"
+        );
+
+        // Eight rows of scrollback keep 11 of the 26 rows; the range follows.
+        terminal.feed(b"\r\nx".repeat(20).as_slice()).unwrap();
+        let evicted = terminal.capture_frame(None).unwrap();
+        assert_eq!(history(&evicted), (15, 23));
+        assert_eq!(
+            terminal.capture_frame(Some(14)),
+            Err(NativeTerminalError::ViewportUnavailable)
+        );
+        assert_eq!(row(&terminal.capture_frame(Some(15)).unwrap(), 104), 15);
+
+        // The alternate screen has no history to select.
+        terminal.feed(b"\x1b[?1049h").unwrap();
+        let alternate = terminal.capture_frame(None).unwrap();
+        let (first, live) = history(&alternate);
+        assert_eq!(first, live);
+        assert_eq!(row(&alternate, 104), live);
+    }
+
+    #[test]
     fn evicted_history_viewport_is_unavailable_without_stopping_live_output_or_replies() {
         let mut terminal = terminal();
         terminal.capture_frame(Some(0)).unwrap();

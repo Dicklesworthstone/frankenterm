@@ -150,6 +150,31 @@ final class TerminalRenderFrameTests: XCTestCase {
         XCTAssertEqual(frame.palette[200], .init(200, 55, 200 ^ 0x55, 255))
     }
 
+    func testHistoryRangeIsReportedOnlyUnderItsFlagAndContainsTheViewport() async throws {
+        let source = try await source()
+        XCTAssertNil(try TerminalRenderFrame.decode(fixture(), expectedSource: source).history)
+        var data = fixture() // viewport first row -4
+        u32(17, at: 12, in: &data); i64(-10, at: 176, in: &data); i64(-4, at: 184, in: &data)
+        let live = try TerminalRenderFrame.decode(data, expectedSource: source)
+        XCTAssertEqual(live.history, TerminalRenderHistory(first: -10, live: -4))
+        XCTAssertTrue(live.isLive)
+        XCTAssertEqual(TerminalRenderFrame.history(ofEncoded: data), live.history)
+        var scrolled = data; i64(-2, at: 184, in: &scrolled)
+        XCTAssertFalse(try TerminalRenderFrame.decode(scrolled, expectedSource: source).isLive)
+
+        var after = data; i64(-3, at: 176, in: &after)
+        assertRejected(after, source: source, "history must begin at or before the viewport")
+        var beyond = data; i64(-5, at: 184, in: &beyond)
+        assertRejected(beyond, source: source, "the viewport cannot follow the live screen")
+        var reserved = data; reserved[192] = 1
+        assertRejected(reserved, source: source, "bytes after the history range stay zero")
+        var unflagged = fixture(); i64(-10, at: 176, in: &unflagged)
+        assertRejected(unflagged, source: source, "history bytes need their flag")
+        XCTAssertNil(TerminalRenderFrame.history(ofEncoded: unflagged))
+        var unknown = data; u32(1 | 16 | 32, at: 12, in: &unknown)
+        assertRejected(unknown, source: source, "unknown flags are still refused")
+    }
+
     func testReadableTextKeepsRowOrderAndWithholdsTheConcealedCell() async throws {
         let frame = try TerminalRenderFrame.decode(fixture(), expectedSource: try await source())
         XCTAssertEqual(frame.readableText, "A界\n\(Self.emoji)z")

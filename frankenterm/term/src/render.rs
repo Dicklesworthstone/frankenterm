@@ -385,6 +385,10 @@ pub const RENDER_FRAME_ROW_BYTES: usize = 24;
 pub const RENDER_FRAME_CELL_BYTES: usize = 48;
 pub const RENDER_FRAME_LINK_BYTES: usize = 8;
 pub const RENDER_FRAME_PALETTE_COLORS: usize = 265;
+/// Header flag: bytes 176..192 hold the active screen's oldest resident stable
+/// row and its live viewport's first stable row, the range a history viewport
+/// may select. A decoder that predates it rejects the flag rather than guess.
+pub const RENDER_FRAME_FLAG_HISTORY: u32 = 16;
 
 /// These witnesses are supplied by the immutable session owner, not by remote
 /// terminal output. UUID bytes use RFC UUID order, not a platform GUID layout.
@@ -605,13 +609,14 @@ fn put_color(bytes: &mut [u8], at: usize, color: MirrorColor) {
 /// Links identify frame-local URI entries, not OSC 8 remote authority.
 ///
 /// Header offsets: magic0, version-u16@4, header-size-u16@6, total-u32@8,
-/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8), channelUUID@16,
+/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8/history=16), channelUUID@16,
 /// transportUUID@32, route-revision-u64@48, terminal-sequence-u64@56,
 /// geometry/palette/font/frame revisions-u64@64/72/80/88, rows/cols-u32@96/100,
 /// viewport/cursor stable rows-i64@104/112, cursor-column/shape-u32@120/124,
 /// row/cell/text counts-u32@128/132/136, row/cell/text/palette offsets-u32
 /// @140/144/148/152, palette-count-u32@156, link-count/offset-u32@160/164,
-/// cursor-visible/width-u32@168/172. Bytes176..256 are zero.
+/// cursor-visible/width-u32@168/172, oldest-resident/live-first stable rows
+/// -i64@176/184 (history flag). Bytes192..256 are zero.
 ///
 /// Row24: stable-i64, sequence-u64, first-cell-u32, cell-count-u32.
 /// Cell48: column, width, text-start, text-length, flags, foreground-tag/value,
@@ -666,11 +671,12 @@ pub fn capture_terminal_frame(
         return Err(RenderFrameError::SequenceExhausted);
     }
     let live_first = screen.visible_row_to_stable_row(0);
+    let oldest = screen.phys_to_stable_row_index(0);
     let first = viewport_top.unwrap_or(live_first);
     let end = first
         .checked_add(StableRowIndex::try_from(rows).map_err(|_| RenderFrameError::InvalidGeometry)?)
         .ok_or(RenderFrameError::InvalidGeometry)?;
-    if first < screen.phys_to_stable_row_index(0) || first > live_first {
+    if first < oldest || first > live_first {
         return Err(RenderFrameError::UnresidentViewport);
     }
     let physical = screen.stable_range(&(first..end));
@@ -695,7 +701,11 @@ pub fn capture_terminal_frame(
         captured = encode_frame(
             term,
             witness,
-            first,
+            FrameRows {
+                first,
+                oldest,
+                live_first,
+            },
             cursor_stable,
             cursor_width,
             lines,
@@ -705,10 +715,22 @@ pub fn capture_terminal_frame(
     captured
 }
 
+/// Stable rows of the captured viewport's first line and of the history range
+/// it may select within: the oldest retained line and the live screen's first.
+struct FrameRows {
+    first: StableRowIndex,
+    oldest: StableRowIndex,
+    live_first: StableRowIndex,
+}
+
 fn encode_frame(
     term: &Terminal,
     witness: RenderFrameWitness,
-    first: StableRowIndex,
+    FrameRows {
+        first,
+        oldest,
+        live_first,
+    }: FrameRows,
     cursor_stable: StableRowIndex,
     cursor_width: usize,
     lines: &[&Line],
@@ -748,7 +770,8 @@ fn encode_frame(
     let flags = 1
         | if term.get_reverse_video() { 2 } else { 0 }
         | if term.is_alt_screen_active() { 4 } else { 0 }
-        | if term.synchronized_output() { 8 } else { 0 };
+        | if term.synchronized_output() { 8 } else { 0 }
+        | RENDER_FRAME_FLAG_HISTORY;
     put_u32(&mut bytes, 12, flags);
     bytes[16..32].copy_from_slice(&witness.channel_id);
     bytes[32..48].copy_from_slice(&witness.transport_id);
@@ -793,6 +816,13 @@ fn encode_frame(
         112,
         i64::try_from(cursor_stable).map_err(|_| RenderFrameError::InvalidGeometry)?,
     );
+    for (at, row) in [(176, oldest), (184, live_first)] {
+        put_i64(
+            &mut bytes,
+            at,
+            i64::try_from(row).map_err(|_| RenderFrameError::InvalidGeometry)?,
+        );
+    }
     let cursor = term.cursor_pos();
     put_count(&mut bytes, 120, cursor.x)?;
     put_u32(
@@ -977,7 +1007,12 @@ mod tests {
         assert_eq!(&bytes[16..32], &[0x11; 16]);
         assert_eq!(&bytes[32..48], &[0x22; 16]);
         assert_eq!((u64_at(&bytes, 48), u64_at(&bytes, 88)), (7, 13));
-        assert!(bytes[176..256].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            u32_at(&bytes, 12) & RENDER_FRAME_FLAG_HISTORY,
+            RENDER_FRAME_FLAG_HISTORY
+        );
+        assert_eq!((i64_at(&bytes, 176), i64_at(&bytes, 184)), (0, 0));
+        assert!(bytes[192..256].iter().all(|byte| *byte == 0));
         assert_eq!(u32_at(&bytes, 140), 256);
         assert_eq!(u32_at(&bytes, 144), 256 + 3 * 24);
         assert_eq!(u32_at(&bytes, 156), 265);

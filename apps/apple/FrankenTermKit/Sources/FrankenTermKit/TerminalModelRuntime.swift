@@ -59,7 +59,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
     public let queuedReplies: UInt64, droppedReplies: UInt64
     public let publishedFrames: UInt64, unavailableFrames: UInt64
     public let endOfOutput: Bool, closing: Bool, closed: Bool
-    public let waitingPresentationRequests: Int
+    public let waitingPresentationRequests: Int, waitingViewportRequests: Int
 }
 
 /// One source-bound owner joins the real SSH session pump, canonical terminal,
@@ -77,7 +77,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private let coordinator: TerminalInputCoordinator
     private let delivery: any TerminalModelDelivery
     private var operationActive = false
-    private enum OperationKind { case consumer, keyboard, presentation }
+    private enum OperationKind { case consumer, keyboard, presentation, viewport }
     private struct WaitingOperation {
         let kind: OperationKind
         let continuation: CheckedContinuation<Void, Error>
@@ -106,7 +106,8 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         .init(queuedReplies: queuedReplies, droppedReplies: droppedReplies,
               publishedFrames: publishedFrames, unavailableFrames: unavailableFrames,
               endOfOutput: endOfOutput, closing: closing, closed: closed,
-              waitingPresentationRequests: waitingOperations.filter { $0.kind == .presentation }.count)
+              waitingPresentationRequests: waitingOperations.filter { $0.kind == .presentation }.count,
+              waitingViewportRequests: waitingOperations.filter { $0.kind == .viewport }.count)
     }
 
     private func requireSource(_ source: TerminalSource) throws {
@@ -133,7 +134,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try Task.checkCancellation()
         guard !closing, !closed else { throw TerminalModelError.closed }
         if operationActive {
-            guard waitingOperations.count < 3, !waitingOperations.contains(where: { $0.kind == kind }) else {
+            guard waitingOperations.count < 4, !waitingOperations.contains(where: { $0.kind == kind }) else {
                 throw TerminalModelError.busy
             }
             try await withCheckedThrowingContinuation { continuation in
@@ -254,7 +255,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private func publishFrame() async throws {
         let presentation: TerminalModelPresentation
         do {
-            let bytes = try model.captureFrame(viewportTop: viewportTop)
+            let bytes = try captureSelectedViewport()
             guard !bytes.isEmpty, bytes.count <= 8 * 1024 * 1024 else { throw TerminalModelError.capacity }
             presentation = .frame(bytes)
         } catch TerminalModelError.unsupported {
@@ -270,6 +271,27 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         switch presentation {
         case .frame: if publishedFrames < UInt64.max { publishedFrames += 1 }
         case .unavailable: if unavailableFrames < UInt64.max { unavailableFrames += 1 }
+        }
+    }
+
+    /// Output evicts the oldest history first, and a resize or screen switch
+    /// can move it, so a selected history row may no longer be resident. Keep
+    /// the reader as close as the retained history allows: its oldest row, or
+    /// the live screen when no history remains.
+    private func captureSelectedViewport() throws -> Data {
+        guard let top = viewportTop else { return try model.captureFrame(viewportTop: nil) }
+        do { return try model.captureFrame(viewportTop: top) }
+        catch TerminalModelError.viewportUnavailable {
+            let live = try model.captureFrame(viewportTop: nil)
+            guard let history = TerminalRenderFrame.history(ofEncoded: live) else {
+                viewportTop = nil; return live
+            }
+            let clamped = min(max(top, history.first), history.live)
+            viewportTop = nil
+            guard clamped != history.live, clamped != top,
+                  let retained = try? model.captureFrame(viewportTop: clamped) else { return live }
+            viewportTop = clamped
+            return retained
         }
     }
 
@@ -298,10 +320,12 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try requireSource(source); try beginOperation(); defer { finishOperation() }
         if visible { try await publishFrame() }
     }
+    /// Selects a history viewport (nil is the live screen). Like presentation,
+    /// a request waits once behind output instead of failing a busy terminal.
     public func setViewport(top: Int64?, source: TerminalSource) async throws {
         try requireSource(source)
         guard top != Int64.min else { throw TerminalModelError.invalid }
-        try beginOperation(); defer { finishOperation() }
+        try await acquireOperation(.viewport); defer { finishOperation() }
         viewportTop = top
         if visible { try await publishFrame() }
     }

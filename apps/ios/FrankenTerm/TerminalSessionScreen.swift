@@ -169,6 +169,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
     @ObservationIgnored private var presentationVisible = true
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
+    @ObservationIgnored private var history: TerminalHistorySelection<TerminalSource>?
     @ObservationIgnored private var lastViewportRevision: UInt64 = 0
     @ObservationIgnored private var stopped = false
 
@@ -306,6 +307,14 @@ final class TerminalSessionController {
             }
             self.resize = resize
             resize.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            // The model keeps the selected history row while output arrives and
+            // while this machine is hidden, so returning finds the same place.
+            let history = TerminalHistorySelection(source: source) { top, source in
+                try await runtime.setViewport(top: top, source: source)
+            }
+            self.history = history
+            history.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
@@ -390,6 +399,12 @@ final class TerminalSessionController {
         } catch { fail(Self.describe(error)) }
     }
 
+    private func selectHistory(_ top: Int64?) {
+        guard !stopped, phase == .live, let history else { return }
+        do { try history.request(top: top, source: history.source) }
+        catch { fail(Self.describe(error)) }
+    }
+
     private func sealLocalOwnership() {
         presentationVisible = false
         clipboard?.retire()
@@ -399,6 +414,7 @@ final class TerminalSessionController {
         terminal?.retire()
         keyboard?.suspend()
         resize?.retire()
+        history?.retire()
         pump?.requestStop()
     }
 
@@ -477,6 +493,7 @@ final class TerminalSessionController {
             self.presentation = nil
         }
         if let resize { await resize.waitUntilSettled(); self.resize = nil }
+        if let history { await history.waitUntilSettled(); self.history = nil }
         if attached, let source = pump?.source {
             do {
                 // A live scene removes the exact binding and joins its sealed
