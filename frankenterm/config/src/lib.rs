@@ -79,6 +79,7 @@ pub mod keyassignment;
 mod keys;
 #[cfg(feature = "lua")]
 pub mod lua;
+pub mod machines;
 pub mod meta;
 pub mod migrate;
 mod scheme_data;
@@ -266,6 +267,17 @@ pub fn build_default_schemes() -> HashMap<String, Palette> {
         }
     }
     color_schemes
+}
+
+/// Each built-in scheme once, under its canonical name, in catalog order.
+pub fn builtin_scheme_palettes() -> Vec<(String, Palette)> {
+    scheme_data::SCHEMES
+        .iter()
+        .map(|(name, data)| {
+            let scheme = ColorSchemeFile::from_toml_str(data).unwrap();
+            (name.to_string(), scheme.colors)
+        })
+        .collect()
 }
 
 struct LuaPipe {
