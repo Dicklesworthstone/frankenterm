@@ -11,7 +11,25 @@ import FrankenTermSSHIntegration
 @MainActor
 struct FrankenTermMobileApp: App {
     @State private var model = MobileWorkspaceModel()
-    var body: some Scene { WindowGroup { MobileWorkspaceRoot(model: model) } }
+    var body: some Scene {
+        WindowGroup {
+            MobileWorkspaceRoot(model: model).task { await Self.storageSelfTestIfRequested() }
+        }
+    }
+
+    /// `devicectl device process launch --environment-variables
+    /// '{"FT_STORAGE_SELF_TEST":"1"}'` runs a restore's save against a
+    /// throwaway key and writes Documents/storage-self-test.txt.
+    private static func storageSelfTestIfRequested() async {
+        guard ProcessInfo.processInfo.environment["FT_STORAGE_SELF_TEST"] == "1" else { return }
+        let files = FileManager.default
+        let scratch = files.temporaryDirectory.appendingPathComponent("storage-self-test-" + UUID().uuidString)
+        let report = await WorkspaceStorageSelfTest.run(directory: scratch)
+        try? files.removeItem(at: scratch)
+        guard let documents = files.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        try? Data((report.joined(separator: "\n") + "\n").utf8)
+            .write(to: documents.appendingPathComponent("storage-self-test.txt"), options: .atomic)
+    }
 }
 
 @MainActor
@@ -280,7 +298,8 @@ final class MobileWorkspaceModel {
                     let next = try await restore.observe(observation.text, generation: observation.generation)
                     guard self.active, self.epoch == observation.epoch else { continue }
                     self.state = next
-                    if ![.idle, .candidate, .collecting].contains(next.phase) { self.cameraRequested = false }
+                    if !self.keepsCamera(next) { self.cameraRequested = false }
+                    self.advanceAutomatically()
                 } catch FTError.stale { continue }
                 catch is CancellationError { break }
                 catch {
@@ -294,8 +313,51 @@ final class MobileWorkspaceModel {
             }
         }
     }
+    /// The unlock code the Mac's animation carries (`FTCODE1:<digest>:<code>`),
+    /// bound to the transfer whose envelope digest starts with that prefix.
+    @ObservationIgnored private var scannedCode: (digest: String, code: String)?
+
+    private static func digestPrefix(_ digest: Data) -> String {
+        digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The transfer moves on by itself: the transfer in view is the one to
+    /// collect, and the code its animation carries unlocks it. Nothing to tap
+    /// or type between pointing the camera and reviewing what arrives.
+    private func advanceAutomatically() {
+        guard !busy, active, showRestore, let state, !state.isSuspended else { return }
+        switch state.phase {
+        case .candidate:
+            guard let digest = state.identity?.envelopeDigest else { return }
+            run { restore, state in try await restore.selectCandidate(generation: state.generation, digest: digest) }
+        case .locked where state.encryptionMode == .code:
+            guard let scanned = scannedCode, let digest = state.identity?.envelopeDigest,
+                  scanned.digest == Self.digestPrefix(digest) else { return }
+            scannedCode = nil
+            let code = scanned.code
+            run { restore, state in try await restore.unlock(enteredCode: code, generation: state.generation) }
+        default: break
+        }
+    }
+
+    /// Keep the camera while a code-protected transfer still waits for its code.
+    private func keepsCamera(_ status: OfflineRestoreStatus) -> Bool {
+        [.idle, .candidate, .collecting].contains(status.phase)
+            || (status.phase == .locked && status.encryptionMode == .code && scannedCode == nil)
+    }
+
     /// At most eight bounded strings wait on one consumer. No task-per-frame fanout.
     func observed(_ text: String) {
+        if text.hasPrefix("FTCODE1:") {
+            let parts = text.dropFirst(8).split(separator: ":", maxSplits: 1).map(String.init)
+            guard active, showRestore, parts.count == 2, parts[0].count == 16, !parts[1].isEmpty,
+                  parts[1].utf8.count <= 128 else { return }
+            if scannedCode?.digest != parts[0] || scannedCode?.code != parts[1] {
+                scannedCode = (parts[0], parts[1])
+                advanceAutomatically()
+            }
+            return
+        }
         guard active, showRestore, !busy, let state, !state.isSuspended,
               [.idle, .candidate, .collecting].contains(state.phase), text.hasPrefix("FTQR1/"),
               text.utf8.count <= FTLimit.qrText, text != lastObservation else { return }
@@ -314,6 +376,7 @@ final class MobileWorkspaceModel {
             defer {
                 self.busy = false
                 self.openPendingFileIfReady()
+                self.advanceAutomatically()
             }
             guard self.active, self.epoch == ticket, !self.offlineModeBlocked else { return }
             do {
@@ -422,7 +485,12 @@ final class MobileWorkspaceModel {
         }
         else if let error = error as? WorkspaceStoreError { message = error.localizedDescription }
         else if let error = error as? WorkspaceNetworkError { message = error.localizedDescription }
-        else if !(error is CancellationError) { message = "The operation could not finish. Your existing workspace was not replaced without a completed import. Check saved workspaces before retrying." }
+        else if !(error is CancellationError) {
+            // Say what failed: a generic message hid the Keychain status a
+            // person (or a bug report) needs.
+            let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            message = "The restore did not finish, and nothing was saved. \(detail)"
+        }
     }
 }
 
@@ -497,7 +565,6 @@ struct MobileWorkspaceRoot: View {
 struct OfflineRestoreSheet: View {
     @Bindable var model: MobileWorkspaceModel
     @State private var code = ""
-    @State private var confirmed = false
     @State private var allowRemoval = false
     @State private var allowRollback = false
     @State private var associateWithExistingWorkspace = false
@@ -528,12 +595,6 @@ struct OfflineRestoreSheet: View {
                                     Button("Dismiss Message") { model.message = nil }
                                 }.font(.callout).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
                             }
-                            if let comparison = state.comparison {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(state.source == .workspaceDocument ? "File comparison value" : "Compare with your Mac").font(.caption).foregroundStyle(.secondary)
-                                    Text(verbatim: comparison).font(.system(.headline, design: .monospaced)).minimumScaleFactor(0.6).lineLimit(1)
-                                }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
-                            }
                             if state.requiresRecipientResume {
                                 Label("Phone request paused", systemImage: "lock.shield").font(.headline)
                                 Text("Your request key is still held only in this running app. Resume this request deliberately before scanning or decrypting. Closing this restore or terminating the app loses the key.")
@@ -548,7 +609,7 @@ struct OfflineRestoreSheet: View {
                                 Text("The selected file is still waiting after an interruption. Continue when you are ready; the app will not reopen it automatically.")
                                 Button("Continue Selected File") { model.retryPendingImport() }.buttonStyle(.borderedProminent)
                             }
-                            if [.idle, .collecting].contains(state.phase), model.cameraRequested, !state.isSuspended {
+                            if [.idle, .candidate, .collecting, .locked].contains(state.phase), model.cameraRequested, !state.isSuspended {
                                 if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
                                     OpticalCamera(onCode: model.observed, onError: model.report)
                                         .frame(height: 290).clipShape(RoundedRectangle(cornerRadius: 20))
@@ -558,69 +619,13 @@ struct OfflineRestoreSheet: View {
                             }
                             switch state.phase {
                             case .idle:
-                                if let request = state.recipientRequest {
-                                    RecipientRequestCard(request: request)
-                                    Text("On your Mac, choose Only This Phone and scan this QR. Compare the recipient value on both devices before exporting. Then point this phone at the Mac’s encrypted transfer.")
-                                    Button("Scan the Mac’s Encrypted Transfer") { model.requestCamera() }.disabled(model.requestingCameraAccess)
-                                } else {
-                                    Text("Point at the Mac’s Offline QR Transfer. No network service is used.")
-                                    Button("Open Camera") { model.requestCamera() }.disabled(model.requestingCameraAccess)
-                                    Button("Encrypt Only for This Phone") { model.requestRecipient() }
-                                }
-                                Button(state.recipientRequest == nil ? "Open Local Workspace File" : "Open Local Encrypted File") {
-                                    chooseFile = true
-                                }
+                                idleContent(state)
                             case .candidate:
-                                Text("A transfer is in view. Confirm that this is the Mac you intend to use before collecting it.")
-                                Button("Use This Transfer") {
-                                    guard let digest = state.identity?.envelopeDigest else { return }
-                                    model.run { restore, state in try await restore.selectCandidate(generation: state.generation, digest: digest) }
-                                }.buttonStyle(.borderedProminent)
+                                ProgressView("Found your Mac…")
                             case .collecting:
-                                ProgressView(value: Double(state.verifiedBytes), total: Double(state.identity?.envelopeLength ?? 1))
-                                Text("\(state.verifiedPages) of \(state.identity?.pageCount ?? 0) pages verified · \(state.verifiedBytes) bytes")
-                                Text("\(state.independentParts) independent fragments in unfinished pages. Duplicate frames do not count as progress.")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                Button(model.cameraRequested ? "Pause Camera" : "Resume Camera") {
-                                    if model.cameraRequested { model.cameraRequested = false } else { model.requestCamera() }
-                                }.disabled(model.requestingCameraAccess)
-                                if !state.incompletePageIndices.isEmpty {
-                                    DisclosureGroup("Repair an unfinished page") {
-                                        Text("Select the same page in Repair Page on your Mac. Reset only if this page has stopped recovering; verified pages are kept.")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                        Picker("Page", selection: $repairPage) {
-                                            ForEach(state.incompletePageIndices, id: \.self) { index in
-                                                Text("Page \(index + 1)").tag(index)
-                                            }
-                                        }
-                                        Button("Reset This Unfinished Page") {
-                                            let page = state.incompletePageIndices.contains(repairPage) ? repairPage : (state.incompletePageIndices.first ?? 0)
-                                            model.run { restore, state in try await restore.resetIncompletePage(page, generation: state.generation) }
-                                        }
-                                    }
-                                }
+                                collectingContent(state)
                             case .locked:
-                                if state.encryptionMode == .recipient {
-                                    if state.canUnlockRecipient {
-                                        Text("The complete package is encrypted for this phone request. Decrypt it, then compare the envelope value on your Mac and review the source and contents.")
-                                        Button("Decrypt for This Phone and Review") {
-                                            confirmed = false; allowRemoval = false; allowRollback = false
-                                            model.run { restore, state in try await restore.unlockRecipient(generation: state.generation) }
-                                        }.buttonStyle(.borderedProminent)
-                                    } else {
-                                        Text("This package needs a matching private phone request that is not available in this session. Start a different transfer, create a fresh phone request, and have the Mac encrypt again. A transfer code cannot unlock this package.")
-                                    }
-                                } else if state.recipientRequest != nil {
-                                    Text("This package uses a transfer code, but you requested encryption only for this phone. Ask the Mac to use the confirmed phone request, or start a different transfer to choose code mode explicitly.")
-                                } else {
-                                Text("The complete encrypted package is collected. Reveal the transfer code separately on your Mac and enter it here.")
-                                SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
-                                    .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
-                                Button("Decrypt and Review") {
-                                    let entered = code; code = ""; confirmed = false; allowRemoval = false; allowRollback = false
-                                    model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
-                                }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
-                                }
+                                lockedContent(state)
                             case .documentReady:
                                 Text("The public workspace is ready for a fresh source and settings review. It contains no private keys and needs no transfer code.")
                                 Button("Review Workspace") {
@@ -629,106 +634,16 @@ struct OfflineRestoreSheet: View {
                             case .preparingReview, .committing:
                                 ProgressView(state.phase == .committing ? "Saving protected workspace…" : "Preparing review…")
                             case .review:
-                                if let review = state.review {
-                                    Text(verbatim: review.document.name).font(.headline)
-                                    Text("\(review.document.machines.count) machines · \(review.includedFingerprints.count) private identities included")
-                                    if state.source == .workspaceDocument {
-                                        Text("This public document is not encrypted or authenticated. Review its source, endpoints, and host trust before accepting it. Existing matching device credentials can be reused.")
-                                            .font(.callout)
-                                    } else if state.encryptionMode == .recipient {
-                                        Text("Encryption to this phone does not identify the sender. Compare this envelope’s value with the trusted Mac before accepting host policy or private keys.")
-                                            .font(.callout)
-                                    }
-                                    ForEach(review.document.machines) { machine in
-                                        let theme = review.document.themes.first { $0.id == machine.themeID }
-                                        HStack {
-                                            Circle().fill(Color(ftHex: theme?.accent ?? "#777777")).frame(width: 12, height: 12)
-                                            Text(verbatim: machine.name).lineLimit(1)
-                                        }
-                                        ForEach(review.document.routes.filter { machine.routeIDs.contains($0.id) }) { route in
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.caption, design: .monospaced))
-                                                Text("\(route.credentialIDs.count) permitted identities · \(route.authenticationMethods.map(\.rawValue).joined(separator: ", "))")
-                                                    .font(.caption).foregroundStyle(.secondary)
-                                                if let trust = review.document.hostTrust.first(where: { $0.id == route.trustID }) {
-                                                    ForEach(trust.pins, id: \.self) { key in
-                                                        Text(verbatim: "Host \(key.algorithm) \(key.fingerprint)").font(.system(.caption2, design: .monospaced))
-                                                    }
-                                                    if !trust.revokedKeys.isEmpty { Text("\(trust.revokedKeys.count) host-key revocations apply.").font(.caption) }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
-                                        Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
-                                    }
-                                    ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
-                                    if let changes = review.changeReview {
-                                        WorkspaceReplacementReview(changes: changes,
-                                            existingName: review.existingWorkspaceName ?? review.document.name)
-                                    }
-                                    if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
-                                    ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
-                                        VStack(alignment: .leading) {
-                                            Text(verbatim: finding.setting).font(.caption.bold())
-                                            Text(verbatim: finding.reason).font(.caption)
-                                        }
-                                    }
-                                    if review.preservedHostRevocationCount > 0 {
-                                        Text("\(review.preservedHostRevocationCount) previously accepted host-key denials remain in force.").font(.caption)
-                                    }
-                                    if review.preservedHostRequirementCount > 0 {
-                                        Text("\(review.preservedHostRequirementCount) mandatory host-trust requirements remain in force, even if this export omits them.").font(.caption)
-                                    }
-                                    if !review.document.diagnostics.isEmpty {
-                                        Text("Unknown optional extensions were discarded. Only validated public settings will be saved.").font(.caption)
-                                    }
-                                    Toggle(state.source == .workspaceDocument
-                                           ? "I recognize this source and approve the reviewed settings and host trust."
-                                           : "I verified the comparison value on my Mac and approve these settings, trust records, and keys.", isOn: $confirmed)
-                                    if review.requiresSourceAssociation {
-                                        VStack(alignment: .leading, spacing: 8) {
-                                            Label("This export claims a saved workspace", systemImage: "arrow.triangle.branch").font(.headline)
-                                            Text("Matching workspace IDs and successful decryption do not prove the same Mac created this export. Continue only after verifying its source. This will replace the saved workspace shown above; cancel to keep it.")
-                                                .font(.callout)
-                                            Toggle("I associate this source with the saved workspace and approve replacing its settings.",
-                                                   isOn: $associateWithExistingWorkspace)
-                                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                                    }
-                                    if review.requiresSecurityApproval {
-                                        Toggle("I reviewed and approve the highlighted connection, credential, and host-trust changes.",
-                                               isOn: $securityChangesConfirmed)
-                                    }
-                                    if review.removesMachines { Toggle("Replace this workspace even though some existing machines are removed.", isOn: $allowRemoval) }
-                                    if review.isRollback {
-                                        VStack(alignment: .leading, spacing: 8) {
-                                            Label("Previously restored recording", systemImage: "clock.arrow.circlepath").font(.headline)
-                                            Text("This package was accepted before and differs from the workspace currently saved on this phone. Restoring it replaces the current settings. Local revocations and mandatory host-trust policy stay in effect.")
-                                                .font(.callout)
-                                            Toggle("I approve restoring this previously accepted workspace version.", isOn: $allowRollback)
-                                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                                    }
-                                    Text("No connection or remote command will run. A device passcode is required for private-key storage.").font(.footnote).foregroundStyle(.secondary)
-                                    Button("Restore Offline") {
-                                        let token = review.token, consent = confirmed, removal = allowRemoval, rollback = allowRollback
-                                        let association = associateWithExistingWorkspace, security = securityChangesConfirmed
-                                        model.run { restore, state in
-                                            try await restore.commit(reviewToken: token, generation: state.generation,
-                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal, allowRollback: rollback,
-                                                                     associateWithExistingWorkspace: association, securityChangesConfirmed: security)
-                                        }
-                                    }.buttonStyle(.borderedProminent).disabled(!confirmed || (review.removesMachines && !allowRemoval)
-                                        || (review.isRollback && !allowRollback)
-                                        || (review.requiresSourceAssociation && !associateWithExistingWorkspace)
-                                        || (review.requiresSecurityApproval && !securityChangesConfirmed))
-                                }
+                                if let review = state.review { reviewSummary(review) }
                             case .complete:
-                                Label("Restored offline — Connect later", systemImage: "checkmark.shield.fill").font(.headline)
+                                Label("Your machines are on this phone", systemImage: "checkmark.circle.fill").font(.headline)
                                 if let receipt = state.receipt {
-                                    Text("\(receipt.missingCredentialIDs.count) credential references still need a key.")
+                                    if !receipt.missingCredentialIDs.isEmpty {
+                                        Text("\(receipt.missingCredentialIDs.count) keys were not included, so their machines cannot connect yet.")
+                                    }
                                     if receipt.cleanupPending { Text("The workspace is saved. Cleanup will be reconciled when storage is available.") }
                                 }
-                                Button("Done") { model.setRestoreVisible(false) }.buttonStyle(.borderedProminent)
+                                Button("Done") { model.setRestoreVisible(false) }.buttonStyle(.borderedProminent).controlSize(.large)
                             case .recoveryRequired:
                                 Text("The save may have completed. Check the saved result before attempting another import.")
                                 Button("Reconcile Saved Workspace") {
@@ -738,7 +653,7 @@ struct OfflineRestoreSheet: View {
                             }
                             if ![.committing, .preparingReview, .recoveryRequired].contains(state.phase) {
                                 Button("Start a Different Transfer", role: .destructive) {
-                                    code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
+                                    code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
                                     associateWithExistingWorkspace = false; securityChangesConfirmed = false
                                     model.resetRestore()
                                 }
@@ -747,7 +662,7 @@ struct OfflineRestoreSheet: View {
                         }.padding(24).disabled(model.busy)
                     }
                 } else { ProgressView("Opening protected workspace…") }
-            }.navigationTitle("Offline Restore").navigationBarTitleDisplayMode(.inline)
+            }.navigationTitle("Restore").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
@@ -759,28 +674,135 @@ struct OfflineRestoreSheet: View {
         }
         .onChange(of: model.active) { _, active in
             if !active {
-                code = ""; confirmed = false; allowRemoval = false; allowRollback = false
+                code = ""; allowRemoval = false; allowRollback = false
                 associateWithExistingWorkspace = false; securityChangesConfirmed = false
             }
         }
         .onChange(of: model.state?.review?.token) { _, _ in
-            confirmed = false; allowRemoval = false; allowRollback = false
+            allowRemoval = false; allowRollback = false
             associateWithExistingWorkspace = false; securityChangesConfirmed = false
         }
         .onDisappear {
-            code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
+            code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
             associateWithExistingWorkspace = false; securityChangesConfirmed = false
         }
     }
+
+    /// What arrives, in its colors, and one Restore button; everything a
+    /// person might audit is one tap away under Details.
+    @ViewBuilder private func reviewSummary(_ review: OfflineRestoreReview) -> some View {
+        Text(verbatim: review.document.name).font(.headline)
+        Text("\(review.document.machines.count) machines · \(review.includedFingerprints.count) keys")
+            .foregroundStyle(.secondary)
+        ForEach(review.document.machines) { machine in
+            let theme = review.document.themes.first { $0.id == machine.themeID }
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 6).fill(Color(ftHex: theme?.background ?? "#000000"))
+                    .overlay(Circle().fill(Color(ftHex: theme?.accent ?? "#777777")).padding(7))
+                    .frame(width: 34, height: 26)
+                Text(verbatim: machine.name).lineLimit(1)
+            }
+        }
+        restoreDecisions(review)
+        Button(review.changeReview == nil ? "Restore" : "Replace and Restore") {
+            let token = review.token, removal = allowRemoval, rollback = allowRollback
+            let association = associateWithExistingWorkspace, security = securityChangesConfirmed
+            model.run { restore, state in
+                try await restore.commit(reviewToken: token, generation: state.generation,
+                                         sourceAndContentsConfirmed: true, allowMachineRemoval: removal, allowRollback: rollback,
+                                         associateWithExistingWorkspace: association, securityChangesConfirmed: security)
+            }
+        }.buttonStyle(.borderedProminent).controlSize(.large).frame(maxWidth: .infinity)
+            .disabled((review.removesMachines && !allowRemoval)
+                || (review.isRollback && !allowRollback)
+                || (review.requiresSourceAssociation && !associateWithExistingWorkspace)
+                || (review.requiresSecurityApproval && !securityChangesConfirmed))
+        DisclosureGroup("Details") { reviewDetails(review).padding(.top, 8) }
+    }
+
+    @ViewBuilder private func reviewDetails(_ review: OfflineRestoreReview) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let comparison = model.state?.comparison {
+                Text(verbatim: "Transfer \(comparison)").font(.system(.caption, design: .monospaced))
+            }
+            if model.state?.source == .workspaceDocument {
+                Text("This file is not encrypted or signed. Matching keys already on this phone can be reused.")
+                    .font(.caption)
+            }
+            ForEach(review.document.machines) { machine in
+                Text(verbatim: machine.name).font(.caption.bold())
+                ForEach(review.document.routes.filter { machine.routeIDs.contains($0.id) }) { route in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.caption, design: .monospaced))
+                        Text("\(route.credentialIDs.count) permitted identities · \(route.authenticationMethods.map(\.rawValue).joined(separator: ", "))")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let trust = review.document.hostTrust.first(where: { $0.id == route.trustID }) {
+                            ForEach(trust.pins, id: \.self) { key in
+                                Text(verbatim: "Host \(key.algorithm) \(key.fingerprint)").font(.system(.caption2, design: .monospaced))
+                            }
+                            if !trust.revokedKeys.isEmpty { Text("\(trust.revokedKeys.count) host-key revocations apply.").font(.caption) }
+                        }
+                    }
+                }
+            }
+            ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
+                Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+            }
+            ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
+            if let changes = review.changeReview, !(review.requiresSourceAssociation || review.requiresSecurityApproval
+                                                    || review.removesMachines || review.isRollback) {
+                WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
+            }
+            if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
+            ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
+                VStack(alignment: .leading) {
+                    Text(verbatim: finding.setting).font(.caption.bold())
+                    Text(verbatim: finding.reason).font(.caption)
+                }
+            }
+            if review.preservedHostRevocationCount > 0 {
+                Text("\(review.preservedHostRevocationCount) previously accepted host-key denials remain in force.").font(.caption)
+            }
+            if review.preservedHostRequirementCount > 0 {
+                Text("\(review.preservedHostRequirementCount) mandatory host-trust requirements remain in force, even if this export omits them.").font(.caption)
+            }
+            if !review.document.diagnostics.isEmpty {
+                Text("Unknown optional extensions were discarded. Only validated public settings will be saved.").font(.caption)
+            }
+        }
+    }
+
+    /// Only a replacement asks anything: which saved workspace this source
+    /// replaces, changed connection or trust policy, removed machines, or an
+    /// older version. A first restore asks nothing beyond Restore itself.
+    @ViewBuilder private func restoreDecisions(_ review: OfflineRestoreReview) -> some View {
+        if review.requiresSourceAssociation || review.requiresSecurityApproval || review.removesMachines || review.isRollback {
+            VStack(alignment: .leading, spacing: 10) {
+                if let changes = review.changeReview {
+                    WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
+                }
+                if review.requiresSourceAssociation {
+                    Toggle("Replace the saved “\(review.existingWorkspaceName ?? review.document.name)” with this one",
+                           isOn: $associateWithExistingWorkspace)
+                }
+                if review.requiresSecurityApproval {
+                    Toggle("Accept the changed connections and host keys above", isOn: $securityChangesConfirmed)
+                }
+                if review.removesMachines { Toggle("Remove the machines this version no longer has", isOn: $allowRemoval) }
+                if review.isRollback { Toggle("Go back to this older version", isOn: $allowRollback) }
+            }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
     private func title(_ phase: OfflineRestorePhase) -> String {
         switch phase {
-        case .idle: "Scan your Mac"
-        case .candidate: "Choose this source"
-        case .collecting: "Collecting encrypted pages"
-        case .locked: "Unlock the package"
-        case .documentReady, .preparingReview, .review: "Review your workspace"
-        case .committing: "Restoring workspace"
-        case .complete: "Your workspace is restored"
+        case .idle: "Restore from your Mac"
+        case .candidate: "Found your Mac"
+        case .collecting: "Receiving"
+        case .locked: "Unlocking"
+        case .documentReady, .preparingReview, .review: "Ready to restore"
+        case .committing: "Saving"
+        case .complete: "All set"
         case .recoveryRequired: "Check the save result"
         }
     }
@@ -936,7 +958,7 @@ private struct OpticalCamera: UIViewControllerRepresentable {
         private func submit(_ items: [RecognizedItem]) {
             for item in items.prefix(4) {
                 if case .barcode(let barcode) = item, let text = barcode.payloadStringValue,
-                   text.hasPrefix("FTQR1/"), text.utf8.count <= FTLimit.qrText { onCode(text) }
+                   text.hasPrefix("FTQR1/") || text.hasPrefix("FTCODE1:"), text.utf8.count <= FTLimit.qrText { onCode(text) }
             }
         }
         func dataScanner(_ scanner: DataScannerViewController, didAdd items: [RecognizedItem], allItems: [RecognizedItem]) { submit(items) }
