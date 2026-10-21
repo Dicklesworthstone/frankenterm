@@ -61,6 +61,36 @@ public struct SSHWorkspaceSource: Sendable {
     public static let maximumIncludedFiles = 64
     public static let maximumIncludeDepth = 8
     public static let maximumIncludeDirectoryEntries = 16_384
+    public static let maximumKnownHostsFiles = 64
+    public static let maximumKnownHostsFilesPerSetting = 16
+
+    /// A frozen public trust inventory. An absent file differs from a file that
+    /// could not be read: only the former proves there were no records to apply.
+    /// References stay on the exporter; the workspace carries keys and policy.
+    public struct KnownHostsSnapshot: Sendable {
+        public enum File: Equatable, Sendable {
+            case present(Data), missing, unavailable
+        }
+        public let files: [String: File]
+
+        public init(files: [String: File]) throws {
+            guard files.count <= SSHWorkspaceSource.maximumKnownHostsFiles else { throw FTError.limit("ssh.known_hosts.files") }
+            var bytes = 0, lines = 0
+            for (reference, file) in files {
+                try Task.checkCancellation()
+                guard SSHWorkspaceSource.knownHostsReference(reference) else { throw FTError.malformed("ssh.known_hosts.reference") }
+                if case .present(let data) = file {
+                    guard data.count <= SSHWorkspaceSource.maximumSourceBytes - bytes else { throw FTError.limit("ssh.known_hosts.bytes") }
+                    bytes += data.count
+                    let count = data.reduce(into: 1) { if $1 == 10 { $0 += 1 } }
+                    guard count <= SSHWorkspaceSource.maximumLines - lines else { throw FTError.limit("ssh.known_hosts.lines") }
+                    lines += count
+                }
+            }
+            self.files = files
+        }
+    }
+
     public let aliases: [String]
     private let configuration: Data
     private let directives: [Directive]
@@ -422,13 +452,93 @@ public struct SSHWorkspaceSource: Sendable {
         return result
     }
 
-    /// `publicKeys` maps the exact IdentityFile reference to selected .pub contents
+    /// Effective file lists for just the selected destinations and their jump
+    /// graph. First matching assignment wins; none suppresses that whole list.
+    /// No path is globbed, no environment/token expression is evaluated, and a
+    /// partially supported list is never silently reduced to a usable prefix.
+    public func knownHostsFileReferences(for selectedAliases: [String]) throws -> [String] {
+        try validateSelection(selectedAliases)
+        var seen = Set<String>(), result: [String] = [], budget = MatchBudget()
+        for route in try plan(selectedAliases, budget: &budget) {
+            var problems: [Problem] = []
+            for reference in Self.knownHostsReferences(route.resolution.options, problems: &problems) {
+                if seen.insert(reference).inserted { result.append(reference) }
+            }
+        }
+        guard result.count <= Self.maximumKnownHostsFiles else { throw FTError.limit("ssh.known_hosts.files") }
+        return result
+    }
+
+    /// Read each selected public file reference once. A private key, process, agent,
+    /// DNS lookup or network service is never consulted. Unreadable/symlink/unsafe
+    /// sources keep their affected routes inactive; unrelated routes can export.
+    public func loadKnownHostFiles(for selectedAliases: [String],
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) throws -> KnownHostsSnapshot {
+        guard homeDirectory.isFileURL else { throw FTError.malformed("ssh.known_hosts.reference") }
+        let home = ConfigurationParser.physicalURL(homeDirectory, isDirectory: true) ?? homeDirectory.standardizedFileURL
+        var files: [String: KnownHostsSnapshot.File] = [:], bytes = 0
+        for reference in try knownHostsFileReferences(for: selectedAliases) {
+            try Task.checkCancellation()
+            var url = reference.hasPrefix("~/") ? home.appendingPathComponent(String(reference.dropFirst(2)))
+                : URL(fileURLWithPath: reference)
+            #if os(macOS) || os(iOS)
+            // Darwin's OS-owned /etc alias is the documented global default.
+            // Map only this fixed prefix; arbitrary source symlinks stay refused.
+            if reference.hasPrefix("/etc/") { url = URL(fileURLWithPath: "/private" + reference) }
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            #endif
+            do {
+                if let data = try Self.readKnownHostsFile(url, remaining: Self.maximumSourceBytes - bytes) {
+                    files[reference] = .present(data); bytes += data.count
+                } else { files[reference] = .missing }
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as FTError {
+                if case .limit = error { throw error }
+                files[reference] = .unavailable
+            } catch { files[reference] = .unavailable }
+        }
+        return try KnownHostsSnapshot(files: files)
+    }
+
+    private static func readKnownHostsFile(_ url: URL, remaining: Int) throws -> Data? {
+        guard let descriptor = try ConfigurationParser.openLocal(url, directory: false) else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
+              before.st_uid == getuid() || before.st_uid == 0, before.st_mode & 0o022 == 0 else {
+            throw FTError.unsupported("ssh.known_hosts.file")
+        }
+        guard before.st_size >= 0, before.st_size <= remaining else { throw FTError.limit("ssh.known_hosts.bytes") }
+        var data = Data()
+        while let chunk = try handle.read(upToCount: min(65_536, remaining + 1 - data.count)), !chunk.isEmpty {
+            try Task.checkCancellation()
+            guard chunk.count <= remaining - data.count else { throw FTError.limit("ssh.known_hosts.bytes") }
+            data += chunk
+        }
+        var after = stat()
+        guard fstat(descriptor, &after) == 0, after.st_size == before.st_size, data.count == before.st_size,
+              after.st_uid == before.st_uid, after.st_mode == before.st_mode else { throw FTError.stale }
+        #if canImport(Darwin)
+        guard before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw FTError.stale }
+        #else
+        guard before.st_mtim.tv_sec == after.st_mtim.tv_sec, before.st_mtim.tv_nsec == after.st_mtim.tv_nsec,
+              before.st_ctim.tv_sec == after.st_ctim.tv_sec, before.st_ctim.tv_nsec == after.st_ctim.tv_nsec else { throw FTError.stale }
+        #endif
+        return data
+    }
+
+    /// publicKeys maps the exact IdentityFile reference to selected .pub contents
     /// (or a binary SSH public blob). No private material is accepted or emitted.
-    /// `knownHosts` is one explicitly supplied public trust source, not proof that
-    /// every system/agent/revocation source has been captured.
+    /// knownHostFiles applies only each route's actual effective file lists.
+    /// The original knownHosts input remains a deliberately partial single
+    /// source; it cannot satisfy an explicit User/GlobalKnownHostsFile policy.
     public func export<C: AirGapCryptography>(aliases selectedAliases: [String], workspaceName: String,
                                               defaultUser: String, publicKeys: [String: Data] = [:],
-                                              knownHosts: Data? = nil, registry: inout SSHWorkspaceRegistry,
+                                              knownHosts: Data? = nil, knownHostFiles: KnownHostsSnapshot? = nil,
+                                              registry: inout SSHWorkspaceRegistry,
                                               using crypto: C) throws -> SSHWorkspaceExport {
         try validateSelection(selectedAliases)
         guard !workspaceName.isEmpty, workspaceName.utf8.count <= FTLimit.text,
@@ -436,10 +546,34 @@ public struct SSHWorkspaceSource: Sendable {
         try registry.validate()
         guard publicKeys.count <= 256 else { throw FTError.limit("ssh.public_keys") }
         if let knownHosts, knownHosts.count > Self.maximumSourceBytes { throw FTError.limit("ssh.known_hosts.bytes") }
+        guard knownHosts == nil || knownHostFiles == nil else { throw FTError.malformed("ssh.known_hosts.ambiguous_sources") }
+        var knownByFile: [String: (entries: [KnownHost], problems: [Problem])] = [:]
+        if let knownHostFiles {
+            let expected = Set(try knownHostsFileReferences(for: selectedAliases))
+            guard Set(knownHostFiles.files.keys).isSubset(of: expected) else { throw FTError.malformed("ssh.known_hosts.unselected_source") }
+            for (reference, file) in knownHostFiles.files {
+                if case .present(let data) = file { knownByFile[reference] = try Self.knownHosts(data) }
+            }
+        }
         var sourceBytes = Data("FrankenTerm/SSHWorkspaceSource/v1\0".utf8)
         sourceBytes.appendBE(UInt64(configuration.count), bytes: 4); sourceBytes += configuration
-        sourceBytes.appendBE(UInt64(knownHosts?.count ?? 0), bytes: 4)
-        if let knownHosts { sourceBytes += knownHosts }
+        if let knownHostFiles {
+            sourceBytes += Data("file-scoped-known-hosts/v1\0".utf8)
+            sourceBytes.appendBE(UInt64(knownHostFiles.files.count), bytes: 4)
+            for reference in knownHostFiles.files.keys.sorted() {
+                guard let file = knownHostFiles.files[reference] else { throw FTError.stale }
+                sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
+                switch file {
+                case .present(let data):
+                    sourceBytes.append(1); sourceBytes.appendBE(UInt64(data.count), bytes: 4); sourceBytes += data
+                case .missing: sourceBytes.append(2)
+                case .unavailable: sourceBytes.append(3)
+                }
+            }
+        } else {
+            sourceBytes.appendBE(UInt64(knownHosts?.count ?? 0), bytes: 4)
+            if let knownHosts { sourceBytes += knownHosts }
+        }
         for reference in publicKeys.keys.sorted() {
             guard let bytes = publicKeys[reference], reference.utf8.count <= FTLimit.text,
                   bytes.count <= FTLimit.key else { throw FTError.limit("ssh.public_key") }
@@ -448,7 +582,7 @@ public struct SSHWorkspaceSource: Sendable {
             guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
         }
         let revision = crypto.sha256(sourceBytes).ftHex.lowercased()
-        let known = try Self.knownHosts(knownHosts)
+        let legacyKnown = try Self.knownHosts(knownHosts)
         var workingRegistry = registry, budget = MatchBudget()
         let planned = try plan(selectedAliases, budget: &budget)
         var routeIDs: [RouteKey: String] = [:]
@@ -464,6 +598,26 @@ public struct SSHWorkspaceSource: Sendable {
             guard let routeID = routeIDs[item.key] else { throw FTError.stale }
             let trustID = try workingRegistry.id("trust", alias)
             var resolved = item.resolution
+            var known = (entries: [KnownHost](), problems: [Problem]())
+            if let knownHostFiles {
+                let references = Self.knownHostsReferences(resolved.options, problems: &resolved.problems)
+                for reference in references {
+                    switch knownHostFiles.files[reference] {
+                    case .present:
+                        guard let parsed = knownByFile[reference] else { throw FTError.stale }
+                        known.entries += parsed.entries; known.problems += parsed.problems
+                    case .missing: break
+                    case .unavailable, nil:
+                        resolved.problems.append(Problem("known_hosts", "An effective known-hosts source could not be read safely or was not supplied. Its positive trust and revocations remain unresolved; this route cannot authenticate."))
+                    }
+                }
+            } else {
+                let explicit = ["userknownhostsfile", "globalknownhostsfile"].filter { resolved.options[$0] != nil }
+                if explicit.isEmpty { known = legacyKnown }
+                for keyword in explicit {
+                    resolved.problems.append(Problem(keyword, "This route selects its own known-hosts file policy. Supply a file-scoped trust snapshot; a pooled file cannot establish which keys and revocations apply."))
+                }
+            }
             let requestedHost = resolved.options["hostname"]?.first ?? alias
             let host: String
             let sourceHost: String
@@ -695,6 +849,10 @@ public struct SSHWorkspaceSource: Sendable {
             switch key {
             case "hostname", "port", "user", "hostkeyalias", "preferredauthentications", "pubkeyauthentication", "passwordauthentication", "kbdinteractiveauthentication", "identitiesonly":
                 if arguments.count != 1 { problems.append(Problem(key, "This SSH setting requires exactly one value; its semantics remain unresolved.")) }
+            case "userknownhostsfile", "globalknownhostsfile":
+                // The whole first matching list is resolved against a frozen
+                // file inventory at export, separately for every route and hop.
+                break
             case "proxyjump":
                 // The complete ordered dependency planner validates this value
                 // in its actual destination/transit context before publication.
@@ -760,6 +918,27 @@ public struct SSHWorkspaceSource: Sendable {
     private static func localReference(_ reference: String) -> Bool {
         (reference.hasPrefix("/") || reference.hasPrefix("~/")) && !reference.contains("%") && !reference.contains("$") &&
         !reference.contains("\\") && !reference.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 })
+    }
+    private static func knownHostsReference(_ reference: String) -> Bool {
+        !reference.isEmpty && reference.utf8.count <= FTLimit.text && localReference(reference)
+            && !reference.split(separator: "/").contains("..")
+    }
+    private static func knownHostsReferences(_ options: [String: [String]], problems: inout [Problem]) -> [String] {
+        let defaults = [("userknownhostsfile", ["~/.ssh/known_hosts", "~/.ssh/known_hosts2"]),
+                        ("globalknownhostsfile", ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"])]
+        var result: [String] = [], seen = Set<String>()
+        for (keyword, fallback) in defaults {
+            let references = options[keyword] ?? fallback
+            if references.count == 1, references[0].lowercased() == "none" { continue }
+            guard !references.isEmpty, references.count <= maximumKnownHostsFilesPerSetting,
+                  !references.contains(where: { $0.lowercased() == "none" }),
+                  references.allSatisfy(knownHostsReference) else {
+                problems.append(Problem(keyword, "The complete known-hosts file list needs unsupported relative-path, token, environment, named-user or parent-directory resolution, mixes none with paths, or exceeds the sixteen-file limit. No partial list was substituted."))
+                continue
+            }
+            for reference in references where seen.insert(reference).inserted { result.append(reference) }
+        }
+        return result
     }
     private static func validUser(_ user: String) -> Bool {
         !user.isEmpty && user.utf8.count <= 256 && !user.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 })
