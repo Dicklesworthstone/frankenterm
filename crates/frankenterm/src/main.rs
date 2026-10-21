@@ -76154,7 +76154,8 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
     fn write_output(output: Option<&Path>, bytes: &[u8]) -> anyhow::Result<()> {
         match output {
             Some(path) => {
-                std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+                std::fs::write(path, bytes)
+                    .with_context(|| format!("writing {}", path.display()))?;
                 eprintln!("wrote {}", path.display());
             }
             None => std::io::Write::write_all(&mut std::io::stdout(), bytes)?,
@@ -76168,7 +76169,8 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
             .unwrap_or_else(|| PathBuf::from(".")),
         home: ::config::HOME_DIR.clone(),
     };
-    let inventory_path = |explicit: &Option<PathBuf>| explicit.clone().unwrap_or_else(machines::default_path);
+    let inventory_path =
+        |explicit: &Option<PathBuf>| explicit.clone().unwrap_or_else(machines::default_path);
 
     match command {
         MobileCommands::Init { hosts, inventory } => {
@@ -76202,8 +76204,17 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
             let inventory = MachineInventory::load(&path)?;
             println!("{} ({})", inventory.workspace_name, path.display());
             for group in &inventory.groups {
-                let marker = if group.id == inventory.default_group { " (default)" } else { "" };
-                println!("group {}{}: {}", group.id, marker, group.machines.join(", "));
+                let marker = if group.id == inventory.default_group {
+                    " (default)"
+                } else {
+                    ""
+                };
+                println!(
+                    "group {}{}: {}",
+                    group.id,
+                    marker,
+                    group.machines.join(", ")
+                );
             }
             for machine in &inventory.machines {
                 let theme = &machine.theme;
@@ -76218,12 +76229,18 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
                 );
                 for route in &machine.routes {
                     match route {
-                        MachineRoute::Ssh { id, target: RouteTarget::Alias(alias) } => {
+                        MachineRoute::Ssh {
+                            id,
+                            target: RouteTarget::Alias(alias),
+                        } => {
                             println!("  {}: ssh alias {}", id, alias)
                         }
                         MachineRoute::Ssh {
                             id,
-                            target: RouteTarget::Direct { host, user, port, .. },
+                            target:
+                                RouteTarget::Direct {
+                                    host, user, port, ..
+                                },
                         } => println!("  {}: ssh {}@{}:{}", id, user, host, port.unwrap_or(22)),
                         MachineRoute::FrankenTermMux { id, .. } => {
                             let command = machine
@@ -76243,15 +76260,20 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
             check,
         } => {
             let path = inventory_path(inventory);
-            let source = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let source =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let context = context_for(&path);
             let inventory = MachineInventory::load(&path)?;
             let sources = mobile_export::SshSources::from_disk(&inventory, &context);
-            let export = mobile_export::export(&inventory, &source, group.as_deref(), &sources, &context)?;
+            let export =
+                mobile_export::export(&inventory, &source, group.as_deref(), &sources, &context)?;
             for note in &export.notes {
                 eprintln!("note: {}", note);
             }
-            eprintln!("{} machines and {} SSH routes for the phone", export.machines, export.routes);
+            eprintln!(
+                "{} machines and {} SSH routes for the phone",
+                export.machines, export.routes
+            );
             if !*check {
                 let mut bytes = serde_json::to_vec_pretty(&export.document)?;
                 bytes.push(b'\n');

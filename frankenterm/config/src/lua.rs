@@ -1606,7 +1606,10 @@ mod test {
         let config_file = dir.path().join("frankenterm.lua");
         let lua = make_lua_context(&config_file)?;
         let missing: Value = lua.load("return frankenterm.machines()").eval()?;
-        assert!(missing.is_nil(), "no inventory is nil, so a config can fall back");
+        assert!(
+            missing.is_nil(),
+            "no inventory is nil, so a config can fall back"
+        );
 
         std::fs::write(
             dir.path().join(crate::machines::FILE_NAME),
@@ -1662,15 +1665,35 @@ ssh = "css"
         assert_eq!(indexed, "#123456");
         assert_eq!(order, "css,trj", "with no groups, machines read by id");
         assert_eq!(theme, "trj");
-        assert!(mux.ends_with("ubuntu@100.91.120.17 nc -N -U /run/user/1000/frankenterm/sock"), "{}", mux);
-        assert!(mux.starts_with("ssh -i /keys/trj -o ConnectTimeout=10"), "{}", mux);
+        assert!(
+            mux.ends_with("ubuntu@100.91.120.17 nc -N -U /run/user/1000/frankenterm/sock"),
+            "{}",
+            mux
+        );
+        assert!(
+            mux.starts_with("ssh -i /keys/trj -o ConnectTimeout=10"),
+            "{}",
+            mux
+        );
         assert_eq!(alias, "css");
         assert!(automatic);
         let watched: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
-        assert!(watched.iter().any(|p| p.ends_with(crate::machines::FILE_NAME)), "{:?}", watched);
+        assert!(
+            watched
+                .iter()
+                .any(|p| p.ends_with(crate::machines::FILE_NAME)),
+            "{:?}",
+            watched
+        );
 
-        std::fs::write(dir.path().join(crate::machines::FILE_NAME), "version = 1\n[machines.a]\n")?;
-        let err = lua.load("return frankenterm.machines()").exec().expect_err("no routes");
+        std::fs::write(
+            dir.path().join(crate::machines::FILE_NAME),
+            "version = 1\n[machines.a]\n",
+        )?;
+        let err = lua
+            .load("return frankenterm.machines()")
+            .exec()
+            .expect_err("no routes");
         assert!(err.to_string().contains("machines.a.routes"), "{}", err);
         Ok(())
     }

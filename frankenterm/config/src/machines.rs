@@ -35,7 +35,8 @@ impl Rgba {
     /// Only `#RRGGBB` and `#RRGGBBAA`: the forms every consumer accepts.
     pub fn parse(text: &str) -> Option<Self> {
         let digits = text.strip_prefix('#')?;
-        if !(digits.len() == 6 || digits.len() == 8) || !digits.bytes().all(|b| b.is_ascii_hexdigit())
+        if !(digits.len() == 6 || digits.len() == 8)
+            || !digits.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return None;
         }
@@ -277,7 +278,10 @@ const DISTINCT_HUES: [(&str, f64); 12] = [
 
 /// The name of distinct theme `index`, e.g. "FrankenTerm Azure".
 pub fn distinct_theme_name(index: usize) -> String {
-    format!("FrankenTerm {}", DISTINCT_HUES[index % DISTINCT_HUES.len()].0)
+    format!(
+        "FrankenTerm {}",
+        DISTINCT_HUES[index % DISTINCT_HUES.len()].0
+    )
 }
 
 /// A dark theme tinted toward one hue, with a vivid accent of that hue and
@@ -424,8 +428,12 @@ impl Overrides {
 fn resolve(set: &Overrides, accent: Option<Rgba>) -> (Rgba, ThemePalette) {
     let base = ColorPalette::default();
     let base_color = |c: SrgbaTuple| Rgba::from_srgba(c);
-    let background = set.background.unwrap_or_else(|| base_color(base.background));
-    let foreground = set.foreground.unwrap_or_else(|| base_color(base.foreground));
+    let background = set
+        .background
+        .unwrap_or_else(|| base_color(base.background));
+    let foreground = set
+        .foreground
+        .unwrap_or_else(|| base_color(base.foreground));
     let accent = accent
         .or(set.cursor_bg)
         .unwrap_or_else(|| base_color(base.cursor_bg));
@@ -499,7 +507,10 @@ impl<'a> Fields<'a> {
             None => Ok(None),
             Some(toml::Value::String(text)) => {
                 if text.is_empty() || text.chars().any(char::is_control) || text.len() > 256 {
-                    return fail(&self.at(key), "expected non-empty text without control characters, at most 256 bytes");
+                    return fail(
+                        &self.at(key),
+                        "expected non-empty text without control characters, at most 256 bytes",
+                    );
                 }
                 Ok(Some(text.clone()))
             }
@@ -585,7 +596,7 @@ fn identifier(path: &str, text: &str) -> Result<String, InventoryError> {
         && text
             .bytes()
             .next()
-            .map_or(false, |b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         && text.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-'
         });
@@ -656,7 +667,13 @@ impl MachineInventory {
             Err(err) => return fail("", format!("not valid TOML: {}", err.message())),
         };
         let fields = Fields::new("", &root)?;
-        fields.allow(&["version", "workspace", "default_group", "groups", "machines"])?;
+        fields.allow(&[
+            "version",
+            "workspace",
+            "default_group",
+            "groups",
+            "machines",
+        ])?;
         match fields.get("version") {
             Some(toml::Value::Integer(FORMAT_VERSION)) => {}
             Some(_) => return fail("version", "only version 1 is understood"),
@@ -671,7 +688,9 @@ impl MachineInventory {
                     Some(id) => identifier("workspace.id", &id)?,
                     None => "machines".to_string(),
                 };
-                let name = workspace.string("name")?.unwrap_or_else(|| "Machines".to_string());
+                let name = workspace
+                    .string("name")?
+                    .unwrap_or_else(|| "Machines".to_string());
                 (id, name)
             }
             None => ("machines".to_string(), "Machines".to_string()),
@@ -707,7 +726,12 @@ impl MachineInventory {
                 group.allow(&["name", "machines"])?;
                 let members = match group.strings("machines")? {
                     Some(members) if !members.is_empty() => members,
-                    _ => return fail(&group.at("machines"), "is required: at least one machine id"),
+                    _ => {
+                        return fail(
+                            &group.at("machines"),
+                            "is required: at least one machine id",
+                        )
+                    }
                 };
                 let mut seen = BTreeSet::new();
                 for (index, member) in members.iter().enumerate() {
@@ -830,7 +854,11 @@ fn hue_distance(a: f64, b: f64) -> f64 {
 /// 22 degrees from every hue in use, in assignment order. Once none is left
 /// (more machines than hues), the hue farthest from those in use, with a
 /// numeric suffix when its name is already taken.
-fn next_distinct(next: &mut usize, used_names: &BTreeSet<String>, used_hues: &[f64]) -> MachineTheme {
+fn next_distinct(
+    next: &mut usize,
+    used_names: &BTreeSet<String>,
+    used_hues: &[f64],
+) -> MachineTheme {
     let nearest = |hue: f64| {
         used_hues
             .iter()
@@ -889,7 +917,15 @@ fn parse_machine(
     context: &InventoryContext,
 ) -> Result<(ParsedMachine, Option<ParsedTheme>), InventoryError> {
     let machine = Fields::new(path, value)?;
-    machine.allow(&["name", "short_label", "icon", "cwd", "tags", "theme", "routes"])?;
+    machine.allow(&[
+        "name",
+        "short_label",
+        "icon",
+        "cwd",
+        "tags",
+        "theme",
+        "routes",
+    ])?;
     let short_label = machine.string("short_label")?;
     if let Some(label) = &short_label {
         if label.len() > 32 {
@@ -947,12 +983,20 @@ fn parse_theme(
             };
             match ColorSchemeFile::from_toml_str(&data) {
                 Ok(parsed) => set.overlay(&Overrides::from_palette(&parsed.colors)),
-                Err(err) => return fail(&at, format!("{} is not a colour scheme: {:#}", file.display(), err)),
+                Err(err) => {
+                    return fail(
+                        &at,
+                        format!("{} is not a colour scheme: {:#}", file.display(), err),
+                    )
+                }
             }
         } else if let Some(palette) = crate::COLOR_SCHEMES.get(&scheme) {
             set.overlay(&Overrides::from_palette(palette));
         } else {
-            return fail(&at, format!("no built-in scheme or FrankenTerm theme named {:?}", scheme));
+            return fail(
+                &at,
+                format!("no built-in scheme or FrankenTerm theme named {:?}", scheme),
+            );
         }
         name = Some(scheme);
     }
@@ -988,7 +1032,12 @@ fn parse_theme(
                 let at = indexed.at(key);
                 let index = match key.parse::<u8>() {
                     Ok(index) if index >= 16 && index.to_string() == *key => index,
-                    _ => return fail(&at, "indexed keys are 16 through 255 (use ansi or brights below 16)"),
+                    _ => {
+                        return fail(
+                            &at,
+                            "indexed keys are 16 through 255 (use ansi or brights below 16)",
+                        )
+                    }
                 };
                 top.indexed.insert(index, parse_color(&at, value)?);
             }
@@ -1065,7 +1114,9 @@ fn parse_gradient(path: &str, value: &toml::Value) -> Result<BackgroundGradient,
         Some(toml::Value::Array(values)) if (1..=8).contains(&values.len()) => values
             .iter()
             .enumerate()
-            .map(|(index, value)| parse_color(&format!("{}[{}]", gradient.at("colors"), index), value))
+            .map(|(index, value)| {
+                parse_color(&format!("{}[{}]", gradient.at("colors"), index), value)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         _ => return fail(&gradient.at("colors"), "expected 1 through 8 colours"),
     };
@@ -1080,7 +1131,10 @@ fn parse_gradient(path: &str, value: &toml::Value) -> Result<BackgroundGradient,
     })
 }
 
-fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRoute>, InventoryError> {
+fn parse_routes(
+    path: &str,
+    value: Option<&toml::Value>,
+) -> Result<Vec<MachineRoute>, InventoryError> {
     let values = match value {
         Some(toml::Value::Array(values)) if !values.is_empty() => values,
         Some(toml::Value::Array(_)) | None => return fail(path, "is required: at least one route"),
@@ -1108,14 +1162,20 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
                     None => Vec::new(),
                 };
                 if via.is_empty() {
-                    return fail(&route.at("via"), "is required: the SSH route ids to reach the mux, in order");
+                    return fail(
+                        &route.at("via"),
+                        "is required: the SSH route ids to reach the mux, in order",
+                    );
                 }
                 let socket = route.string("socket")?;
                 let relay = route.string("relay")?;
                 for (key, value) in [("socket", &socket), ("relay", &relay)] {
                     if let Some(text) = value {
                         if !text.starts_with('/') || text.contains('\'') {
-                            return fail(&route.at(key), "expected an absolute remote path without quotes");
+                            return fail(
+                                &route.at(key),
+                                "expected an absolute remote path without quotes",
+                            );
                         }
                     }
                 }
@@ -1130,12 +1190,24 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
                 }
             }
             None | Some("ssh") => {
-                route.allow(&["id", "kind", "ssh", "host", "user", "port", "identity_file", "identity_files"])?;
+                route.allow(&[
+                    "id",
+                    "kind",
+                    "ssh",
+                    "host",
+                    "user",
+                    "port",
+                    "identity_file",
+                    "identity_files",
+                ])?;
                 let target = match (route.string("ssh")?, route.string("host")?) {
                     (Some(alias), None) => {
                         for key in ["user", "port", "identity_file", "identity_files"] {
                             if route.get(key).is_some() {
-                                return fail(&route.at(key), "an ssh alias route takes these from ~/.ssh/config");
+                                return fail(
+                                    &route.at(key),
+                                    "an ssh alias route takes these from ~/.ssh/config",
+                                );
                             }
                         }
                         RouteTarget::Alias(alias)
@@ -1143,7 +1215,9 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
                     (None, Some(host)) => {
                         let port = match route.get("port") {
                             None => None,
-                            Some(toml::Value::Integer(port)) if (1..=65535).contains(port) => Some(*port as u16),
+                            Some(toml::Value::Integer(port)) if (1..=65535).contains(port) => {
+                                Some(*port as u16)
+                            }
                             Some(_) => return fail(&route.at("port"), "expected 1 through 65535"),
                         };
                         let mut identity_files = Vec::new();
@@ -1152,7 +1226,9 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
                         }
                         identity_files.extend(route.strings("identity_files")?.unwrap_or_default());
                         let user = route.required_string("user")?;
-                        if user.chars().any(char::is_whitespace) || host.chars().any(char::is_whitespace) {
+                        if user.chars().any(char::is_whitespace)
+                            || host.chars().any(char::is_whitespace)
+                        {
                             return fail(&at, "host and user cannot contain spaces");
                         }
                         RouteTarget::Direct {
@@ -1162,12 +1238,24 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
                             identity_files,
                         }
                     }
-                    (Some(_), Some(_)) => return fail(&at, "use either ssh (an alias) or host, not both"),
-                    (None, None) => return fail(&at, "needs ssh (an alias from ~/.ssh/config) or host and user"),
+                    (Some(_), Some(_)) => {
+                        return fail(&at, "use either ssh (an alias) or host, not both")
+                    }
+                    (None, None) => {
+                        return fail(
+                            &at,
+                            "needs ssh (an alias from ~/.ssh/config) or host and user",
+                        )
+                    }
                 };
                 MachineRoute::Ssh { id, target }
             }
-            Some(other) => return fail(&route.at("kind"), format!("unknown route kind {:?} (ssh or frankenterm_mux)", other)),
+            Some(other) => {
+                return fail(
+                    &route.at("kind"),
+                    format!("unknown route kind {:?} (ssh or frankenterm_mux)", other),
+                )
+            }
         };
         routes.push(parsed);
     }
@@ -1183,7 +1271,10 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
         if let MachineRoute::FrankenTermMux { via, .. } = route {
             for name in via {
                 if !ssh_ids.contains(name.as_str()) {
-                    return fail(&format!("{}[{}].via", path, index), format!("no ssh route named {:?} on this machine", name));
+                    return fail(
+                        &format!("{}[{}].via", path, index),
+                        format!("no ssh route named {:?} on this machine", name),
+                    );
                 }
             }
         }
@@ -1200,9 +1291,17 @@ pub fn inventory_template(aliases: &[String]) -> String {
         let mut id: String = alias
             .to_ascii_lowercase()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
-        id = id.trim_start_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+        id = id
+            .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_string();
         id.truncate(40);
         if id.is_empty() {
             id = "machine".to_string();
@@ -1224,7 +1323,12 @@ pub fn inventory_template(aliases: &[String]) -> String {
          # A machine with no theme table gets an unused hue theme automatically.\n\n\
          version = 1\ndefault_group = \"machines\"\n\n[groups.machines]\nname = \"Machines\"\nmachines = [",
     );
-    text.push_str(&ids.iter().map(|id| quoted(id)).collect::<Vec<_>>().join(", "));
+    text.push_str(
+        &ids.iter()
+            .map(|id| quoted(id))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     text.push_str("]\n");
     for (index, (id, alias)) in ids.iter().zip(aliases).enumerate() {
         text.push_str(&format!(
@@ -1270,7 +1374,11 @@ impl Machine {
     /// per `via` route, tried in order. A single route is a plain argv; more
     /// than one runs under `sh -c` joined with `||`, so each next address is
     /// tried only when the previous connection failed.
-    pub fn mux_proxy_command(&self, route_id: &str, context: &InventoryContext) -> Option<Vec<String>> {
+    pub fn mux_proxy_command(
+        &self,
+        route_id: &str,
+        context: &InventoryContext,
+    ) -> Option<Vec<String>> {
         let (via, socket, relay) = match self.route(route_id)? {
             MachineRoute::FrankenTermMux {
                 via, socket, relay, ..
@@ -1450,11 +1558,17 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         // selection blends the accent into the background.
         assert_eq!(p.cursor_fg, p.background);
         assert_eq!(p.cursor_border.hex(), "#FF00FF");
-        assert_eq!(p.selection_bg, Rgba::parse("#ff00ff").unwrap().over(p.background, 0.35));
+        assert_eq!(
+            p.selection_bg,
+            Rgba::parse("#ff00ff").unwrap().over(p.background, 0.35)
+        );
         assert_eq!(p.ansi[1].hex(), "#FF3366");
         assert_eq!(p.ansi[15].hex(), "#FFFFFF");
         let gradient = trj.theme.background_gradient.as_ref().unwrap();
-        assert_eq!((gradient.angle, gradient.opacity, gradient.colors.len()), (-45.0, 0.92, 3));
+        assert_eq!(
+            (gradient.angle, gradient.opacity, gradient.colors.len()),
+            (-45.0, 0.92, 3)
+        );
 
         // css and mmax declared no theme: distinct automatic hue themes,
         // neither one near trj's magenta.
@@ -1484,12 +1598,24 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         let inventory = fleet_of(8, "[machines.m00.theme]\nscheme = \"FrankenTerm Azure\"\n");
         assert!(!inventory.machines[0].theme.automatic);
         assert!(inventory.machines[1..].iter().all(|m| m.theme.automatic));
-        assert_ne!(inventory.machines[1].theme.name, "FrankenTerm Azure", "an explicitly used theme is not reassigned");
-        let hues: Vec<f64> = inventory.machines.iter().filter_map(|m| m.theme.accent.hue()).collect();
+        assert_ne!(
+            inventory.machines[1].theme.name, "FrankenTerm Azure",
+            "an explicitly used theme is not reassigned"
+        );
+        let hues: Vec<f64> = inventory
+            .machines
+            .iter()
+            .filter_map(|m| m.theme.accent.hue())
+            .collect();
         assert_eq!(hues.len(), 8);
         for (i, a) in hues.iter().enumerate() {
             for b in &hues[i + 1..] {
-                assert!(hue_distance(*a, *b) >= 20.0, "{} and {} are too close", a, b);
+                assert!(
+                    hue_distance(*a, *b) >= 20.0,
+                    "{} and {} are too close",
+                    a,
+                    b
+                );
             }
         }
     }
@@ -1497,11 +1623,19 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
     #[test]
     fn a_large_fleet_never_repeats_a_theme_name() {
         let inventory = fleet_of(30, "");
-        let names: BTreeSet<&str> = inventory.machines.iter().map(|m| m.theme.name.as_str()).collect();
+        let names: BTreeSet<&str> = inventory
+            .machines
+            .iter()
+            .map(|m| m.theme.name.as_str())
+            .collect();
         assert_eq!(names.len(), 30, "every machine gets its own theme name");
         // Past the distinct hues, a repeat hue is always marked by a suffix.
         for machine in &inventory.machines {
-            let base: String = machine.theme.name.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ').to_string();
+            let base: String = machine
+                .theme
+                .name
+                .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ')
+                .to_string();
             assert!(base.starts_with("FrankenTerm "), "{}", machine.theme.name);
         }
     }
@@ -1516,7 +1650,11 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         let inventory = parse(&text).unwrap();
         let theme = &inventory.machines[0].theme;
         assert_eq!(theme.name, scheme);
-        assert_eq!(theme.palette.background.hex(), "#123456", "overrides win over the scheme");
+        assert_eq!(
+            theme.palette.background.hex(),
+            "#123456",
+            "overrides win over the scheme"
+        );
         let base = Overrides::from_palette(&crate::COLOR_SCHEMES[&scheme]);
         let foreground = base.foreground.expect("built-in schemes set a foreground");
         assert_eq!(theme.palette.foreground, foreground);
@@ -1526,7 +1664,11 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         assert_eq!(parse(missing).unwrap_err().path, "machines.a.theme.scheme");
         let file = "version = 1\n[machines.a.theme]\nscheme = \"themes/missing.toml\"\n[[machines.a.routes]]\nid = \"ssh\"\nssh = \"a\"\n";
         let err = parse(file).unwrap_err();
-        assert!(err.message.contains("/inventory/themes/missing.toml"), "{}", err);
+        assert!(
+            err.message.contains("/inventory/themes/missing.toml"),
+            "{}",
+            err
+        );
     }
 
     #[test]
@@ -1540,7 +1682,11 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
             assert_eq!(theme.palette.background.0[3], 255);
         }
         for theme in &catalog {
-            assert!(theme.palette.indexed.keys().all(|index| *index >= 16), "{}", theme.name);
+            assert!(
+                theme.palette.indexed.keys().all(|index| *index >= 16),
+                "{}",
+                theme.name
+            );
         }
     }
 
@@ -1579,7 +1725,7 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
             (format!("version = 1\nflavour = 1\n{}", ok_route), "flavour"),
             (format!("version = 1\nx-note = 1\n[machines.a]\ncolour = 1\n{}", ok_route), "machines.a.colour"),
             ("version = 1\n[machines.a]\n".to_string(), "machines.a.routes"),
-            (format!("version = 1\n[machines.A]\n[[machines.A.routes]]\nid = \"s\"\nssh = \"a\"\n"), "machines.A"),
+            ("version = 1\n[machines.A]\n[[machines.A.routes]]\nid = \"s\"\nssh = \"a\"\n".to_string(), "machines.A"),
             (format!("version = 1\n[machines.a.theme.colors]\nbackground = \"red\"\n{}", ok_route), "machines.a.theme.colors.background"),
             (format!("version = 1\n[machines.a.theme.colors]\nansi = [\"#000000\"]\n{}", ok_route), "machines.a.theme.colors.ansi"),
             (format!("version = 1\n[machines.a.theme.colors.indexed]\n\"7\" = \"#000000\"\n{}", ok_route), "machines.a.theme.colors.indexed.7"),
@@ -1602,18 +1748,31 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
 
     #[test]
     fn a_first_inventory_pins_a_distinct_theme_to_every_host() {
-        let aliases: Vec<String> = ["css", "Trj", "my host", "css"].iter().map(|s| s.to_string()).collect();
+        let aliases: Vec<String> = ["css", "Trj", "my host", "css"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let text = inventory_template(&aliases);
         let inventory = parse(&text).unwrap();
         let ids: Vec<&str> = inventory.machines.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["css", "trj", "my-host", "css-2"]);
-        let names: BTreeSet<&str> = inventory.machines.iter().map(|m| m.theme.name.as_str()).collect();
+        let names: BTreeSet<&str> = inventory
+            .machines
+            .iter()
+            .map(|m| m.theme.name.as_str())
+            .collect();
         assert_eq!(names.len(), 4);
-        assert!(inventory.machines.iter().all(|m| !m.theme.automatic), "pinned, not automatic");
+        assert!(
+            inventory.machines.iter().all(|m| !m.theme.automatic),
+            "pinned, not automatic"
+        );
         assert_eq!(inventory.machines[2].name, "my host");
         assert_eq!(
             inventory.machines[1].routes,
-            vec![MachineRoute::Ssh { id: "ssh".into(), target: RouteTarget::Alias("Trj".into()) }]
+            vec![MachineRoute::Ssh {
+                id: "ssh".into(),
+                target: RouteTarget::Alias("Trj".into())
+            }]
         );
     }
 
@@ -1621,7 +1780,14 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
     fn colours_parse_strictly_and_round_trip_exactly() {
         assert_eq!(Rgba::parse("#0a0e14").unwrap().hex(), "#0A0E14");
         assert_eq!(Rgba::parse("#FFFFFF33").unwrap().hex(), "#FFFFFF33");
-        for bad in ["0a0e14", "#0a0e1", "#0a0e14f", "#gggggg", "rgba(1,2,3,4)", ""] {
+        for bad in [
+            "0a0e14",
+            "#0a0e1",
+            "#0a0e14f",
+            "#gggggg",
+            "rgba(1,2,3,4)",
+            "",
+        ] {
             assert_eq!(Rgba::parse(bad), None, "{}", bad);
         }
         for value in 0..=255u8 {

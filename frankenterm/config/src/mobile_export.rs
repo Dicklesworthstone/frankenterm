@@ -9,7 +9,9 @@
 //! attach to mux panes. Everything left out is reported, never dropped
 //! silently.
 
-use crate::machines::{InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget};
+use crate::machines::{
+    InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget,
+};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
@@ -86,7 +88,8 @@ impl SshSources {
                         if let Some(resolver) = resolver.as_ref() {
                             let options = resolver.for_host(alias);
                             identities.extend(split_paths(options.get("identityfile"), context));
-                            known_files.extend(split_paths(options.get("userknownhostsfile"), context));
+                            known_files
+                                .extend(split_paths(options.get("userknownhostsfile"), context));
                         }
                     }
                     MachineRoute::FrankenTermMux { .. } => {}
@@ -139,7 +142,7 @@ fn split_paths(value: Option<&String>, context: &InventoryContext) -> Vec<PathBu
 }
 
 fn public_key_path(identity: &Path) -> PathBuf {
-    if identity.extension().map_or(false, |ext| ext == "pub") {
+    if identity.extension().is_some_and(|ext| ext == "pub") {
         identity.to_path_buf()
     } else {
         let mut text = identity.as_os_str().to_owned();
@@ -170,7 +173,10 @@ impl PublicKey {
 
     /// OpenSSH's `SHA256:` fingerprint, the form the phone pins.
     pub fn fingerprint(&self) -> String {
-        format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(&self.blob)))
+        format!(
+            "SHA256:{}",
+            STANDARD_NO_PAD.encode(Sha256::digest(&self.blob))
+        )
     }
 }
 
@@ -398,16 +404,22 @@ fn resolve_endpoint(
             let resolver = match resolver {
                 Some(resolver) => resolver,
                 None => {
-                    note(notes, "no ~/.ssh/config to resolve this alias; not exported".into());
+                    note(
+                        notes,
+                        "no ~/.ssh/config to resolve this alias; not exported".into(),
+                    );
                     return None;
                 }
             };
             let options = resolver.for_host(alias);
             for unsupported in ["proxyjump", "proxycommand"] {
-                if options.get(unsupported).map_or(false, |v| v != "none") {
+                if options.get(unsupported).is_some_and(|v| v != "none") {
                     note(
                         notes,
-                        format!("uses {} in ~/.ssh/config, which the phone cannot run; not exported", unsupported),
+                        format!(
+                            "uses {} in ~/.ssh/config, which the phone cannot run; not exported",
+                            unsupported
+                        ),
                     );
                     return None;
                 }
@@ -416,19 +428,28 @@ fn resolve_endpoint(
                 None => 22,
                 Some(Ok(port)) if port > 0 => port,
                 Some(_) => {
-                    note(notes, "its port in ~/.ssh/config is not a number; not exported".into());
+                    note(
+                        notes,
+                        "its port in ~/.ssh/config is not a number; not exported".into(),
+                    );
                     return None;
                 }
             };
             let user = match options.get("user") {
                 Some(user) => user.clone(),
                 None => {
-                    note(notes, "no User for this alias in ~/.ssh/config; not exported".into());
+                    note(
+                        notes,
+                        "no User for this alias in ~/.ssh/config; not exported".into(),
+                    );
                     return None;
                 }
             };
             Some(Endpoint {
-                host: options.get("hostname").cloned().unwrap_or_else(|| alias.clone()),
+                host: options
+                    .get("hostname")
+                    .cloned()
+                    .unwrap_or_else(|| alias.clone()),
                 port,
                 user,
                 identities: split_paths(options.get("identityfile"), context),
@@ -462,14 +483,26 @@ pub fn export(
             .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?],
         None => inventory.groups.iter().collect(),
     };
-    let wanted: BTreeSet<&str> = groups.iter().flat_map(|g| g.machines.iter().map(String::as_str)).collect();
+    let wanted: BTreeSet<&str> = groups
+        .iter()
+        .flat_map(|g| g.machines.iter().map(String::as_str))
+        .collect();
     let resolver = alias_resolver(sources.config.as_deref(), &context.home);
     let mut notes = Vec::new();
-    let (mut machines, mut routes, mut credentials, mut trusts, mut themes) =
-        (Vec::new(), Vec::new(), BTreeMap::new(), BTreeMap::new(), Vec::new());
+    let (mut machines, mut routes, mut credentials, mut trusts, mut themes) = (
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        Vec::new(),
+    );
     let mut exported = BTreeSet::new();
 
-    for machine in inventory.machines.iter().filter(|m| wanted.contains(m.id.as_str())) {
+    for machine in inventory
+        .machines
+        .iter()
+        .filter(|m| wanted.contains(m.id.as_str()))
+    {
         let mut route_ids = Vec::new();
         let mut mux = 0;
         for route in &machine.routes {
@@ -480,7 +513,15 @@ pub fn export(
                     continue;
                 }
             };
-            let endpoint = match resolve_endpoint(machine, route_name, target, sources, resolver.as_ref(), context, &mut notes) {
+            let endpoint = match resolve_endpoint(
+                machine,
+                route_name,
+                target,
+                sources,
+                resolver.as_ref(),
+                context,
+                &mut notes,
+            ) {
                 Some(endpoint) => endpoint,
                 None => continue,
             };
@@ -488,14 +529,19 @@ pub fn export(
             for identity in &endpoint.identities {
                 let public = public_key_path(identity);
                 let key = match sources.public_keys.get(&public).and_then(|text| {
-                    text.lines().find(|l| !l.trim().is_empty()).and_then(PublicKey::parse_line)
+                    text.lines()
+                        .find(|l| !l.trim().is_empty())
+                        .and_then(PublicKey::parse_line)
                 }) {
                     Some(key) => key,
                     None => {
                         notes.push(ExportNote {
                             machine: machine.id.clone(),
                             route: Some(route_name.clone()),
-                            message: format!("no readable public key at {}; that identity is not offered", public.display()),
+                            message: format!(
+                                "no readable public key at {}; that identity is not offered",
+                                public.display()
+                            ),
                         });
                         continue;
                     }
@@ -519,10 +565,15 @@ pub fn export(
                 notes.push(ExportNote {
                     machine: machine.id.clone(),
                     route: Some(route_name.clone()),
-                    message: "no public key is available, so the phone cannot sign in on this route".into(),
+                    message:
+                        "no public key is available, so the phone cannot sign in on this route"
+                            .into(),
                 });
             }
-            let lookup = endpoint.host_key_alias.clone().unwrap_or_else(|| endpoint.host.clone());
+            let lookup = endpoint
+                .host_key_alias
+                .clone()
+                .unwrap_or_else(|| endpoint.host.clone());
             let mut keys = HostKeys::default();
             for file in &endpoint.known_hosts {
                 if let Some(text) = sources.known_hosts.get(file) {
@@ -553,7 +604,12 @@ pub fn export(
                     ),
                 });
             }
-            let trust_key = format!("{}:{}:{}", endpoint.host, endpoint.port, endpoint.host_key_alias.as_deref().unwrap_or(""));
+            let trust_key = format!(
+                "{}:{}:{}",
+                endpoint.host,
+                endpoint.port,
+                endpoint.host_key_alias.as_deref().unwrap_or("")
+            );
             let trust_id = format!("h.{}", short_digest(&trust_key));
             trusts.entry(trust_id.clone()).or_insert_with(|| {
                 let pin = |key: &PublicKey| json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()});
@@ -593,7 +649,8 @@ pub fn export(
             notes.push(ExportNote {
                 machine: machine.id.clone(),
                 route: None,
-                message: "mux routes stay on the desktop until the phone can attach to mux panes".into(),
+                message: "mux routes stay on the desktop until the phone can attach to mux panes"
+                    .into(),
             });
         }
         if route_ids.is_empty() {
@@ -642,7 +699,9 @@ pub fn export(
         .iter()
         .find(|g| g["id"] == json!(format!("g.{}", inventory.default_group)))
         .or_else(|| group_records.first())
-        .ok_or_else(|| anyhow::anyhow!("no machine in the selection has an exportable SSH route"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("no machine in the selection has an exportable SSH route")
+        })?;
     let initial_machine = initial_group["machine_order"][0].clone();
     let initial_group_id = initial_group["id"].clone();
     let workspace_id = match group {
@@ -657,7 +716,10 @@ pub fn export(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let bundle_id = format!("b.{}", short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id())));
+    let bundle_id = format!(
+        "b.{}",
+        short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
+    );
     let machine_count = machines.len();
     let route_count = routes.len();
     let document = json!({
@@ -721,36 +783,65 @@ mod tests {
     #[test]
     fn known_hosts_match_plain_ported_wildcard_negated_and_hashed_names() {
         let line = |hosts: &str| format!("{} ssh-ed25519 {}\n", hosts, ED25519);
-        assert_eq!(host_keys(&line("trj,100.91.120.17"), "100.91.120.17", 22).pins.len(), 1);
-        assert_eq!(host_keys(&line("Trj"), "trj", 22).pins.len(), 1, "names compare case-insensitively");
+        assert_eq!(
+            host_keys(&line("trj,100.91.120.17"), "100.91.120.17", 22)
+                .pins
+                .len(),
+            1
+        );
+        assert_eq!(
+            host_keys(&line("Trj"), "trj", 22).pins.len(),
+            1,
+            "names compare case-insensitively"
+        );
         assert_eq!(host_keys(&line("[box]:2222"), "box", 2222).pins.len(), 1);
-        assert_eq!(host_keys(&line("box"), "box", 2222).pins.len(), 0, "a bare name is port 22 only");
+        assert_eq!(
+            host_keys(&line("box"), "box", 2222).pins.len(),
+            0,
+            "a bare name is port 22 only"
+        );
         assert_eq!(host_keys(&line("*.lan"), "nas.lan", 22).pins.len(), 1);
-        assert_eq!(host_keys(&line("*.lan,!nas.lan"), "nas.lan", 22).pins.len(), 0);
+        assert_eq!(
+            host_keys(&line("*.lan,!nas.lan"), "nas.lan", 22).pins.len(),
+            0
+        );
         assert_eq!(host_keys(&line("# comment"), "comment", 22).pins.len(), 0);
 
         // `ssh-keygen -H` form: |1|base64(salt)|base64(HMAC-SHA1(salt, name)).
         let salt = [7u8; 20];
         let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&salt).unwrap();
         mac.update(b"10.10.10.1");
-        let hashed = format!("|1|{}|{}", STANDARD.encode(salt), STANDARD.encode(mac.finalize().into_bytes()));
+        let hashed = format!(
+            "|1|{}|{}",
+            STANDARD.encode(salt),
+            STANDARD.encode(mac.finalize().into_bytes())
+        );
         assert_eq!(host_keys(&line(&hashed), "10.10.10.1", 22).pins.len(), 1);
         assert_eq!(host_keys(&line(&hashed), "10.10.10.2", 22).pins.len(), 0);
 
         let revoked = format!("{}@revoked * ssh-ed25519 {}\n", line("trj"), ED25519);
         let keys = host_keys(&revoked, "trj", 22);
-        assert!(keys.pins.is_empty() && keys.revoked.len() == 1, "a revoked key is never pinned");
+        assert!(
+            keys.pins.is_empty() && keys.revoked.len() == 1,
+            "a revoked key is never pinned"
+        );
         let ca = format!("@cert-authority *.corp ssh-ed25519 {}\n", ED25519);
         assert_eq!(host_keys(&ca, "a.corp", 22).certificate_authorities, 1);
     }
 
     fn sources(config: Option<&str>) -> SshSources {
         let mut public_keys = BTreeMap::new();
-        public_keys.insert(PathBuf::from("/home/me/.ssh/trj_ed25519.pub"), format!("ssh-ed25519 {} trj", ED25519));
+        public_keys.insert(
+            PathBuf::from("/home/me/.ssh/trj_ed25519.pub"),
+            format!("ssh-ed25519 {} trj", ED25519),
+        );
         let mut known_hosts = BTreeMap::new();
         known_hosts.insert(
             PathBuf::from("/home/me/.ssh/known_hosts"),
-            format!("100.91.120.17 ssh-ed25519 {}\ncss.example ssh-ed25519 {}\n", ED25519, ED25519),
+            format!(
+                "100.91.120.17 ssh-ed25519 {}\ncss.example ssh-ed25519 {}\n",
+                ED25519, ED25519
+            ),
         );
         SshSources {
             config: config.map(str::to_string),
@@ -801,39 +892,81 @@ ssh = "jumped"
     fn an_inventory_exports_routes_trust_identities_and_resolved_themes() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
         let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\nHost jumped\n  HostName inner\n  User u\n  ProxyJump bastion\n";
-        let export = export(&inventory, INVENTORY.as_bytes(), None, &sources(Some(config)), &context()).unwrap();
+        let export = export(
+            &inventory,
+            INVENTORY.as_bytes(),
+            None,
+            &sources(Some(config)),
+            &context(),
+        )
+        .unwrap();
         let doc = &export.document;
         assert_eq!(doc["format"], "ftworkspace");
         assert_eq!(doc["source"]["exporter_id"], EXPORTER_ID);
         let workspace = &doc["workspace"];
         assert_eq!(workspace["id"], "w.machines");
-        let machines: Vec<&str> = workspace["machines"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(machines, ["m.trj", "m.css"], "dark has only a ProxyJump alias and a mux route");
+        let machines: Vec<&str> = workspace["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            machines,
+            ["m.trj", "m.css"],
+            "dark has only a ProxyJump alias and a mux route"
+        );
         assert_eq!(export.machines, 2);
-        assert_eq!(workspace["groups"][0]["machine_order"], json!(["m.trj", "m.css"]));
+        assert_eq!(
+            workspace["groups"][0]["machine_order"],
+            json!(["m.trj", "m.css"])
+        );
         assert_eq!(workspace["preferences"]["initial_machine_ref"], "m.trj");
 
         let routes = workspace["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0]["id"], "r.trj.tailscale");
         assert_eq!(routes[0]["host"], "100.91.120.17");
-        assert_eq!(routes[1]["host"], "css.example", "the alias resolves through ~/.ssh/config");
+        assert_eq!(
+            routes[1]["host"], "css.example",
+            "the alias resolves through ~/.ssh/config"
+        );
         assert_eq!(routes[1]["user"], "ubuntu");
         // Both routes use the same key: one credential record.
         assert_eq!(workspace["credentials"].as_array().unwrap().len(), 1);
         assert_eq!(routes[0]["credential_refs"], routes[1]["credential_refs"]);
         let trust = workspace["host_trust"].as_array().unwrap();
         assert_eq!(trust.len(), 2);
-        assert!(trust.iter().all(|t| t["pins"].as_array().unwrap().len() == 1));
+        assert!(trust
+            .iter()
+            .all(|t| t["pins"].as_array().unwrap().len() == 1));
 
         let theme = &workspace["themes"][0];
         assert_eq!(theme["background"], "#0A0E14");
         assert_eq!(theme["ansi"].as_array().unwrap().len(), 16);
 
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
-        assert!(messages.iter().any(|m| m.starts_with("trj: mux routes stay on the desktop")), "{:?}", messages);
-        assert!(messages.iter().any(|m| m.contains("dark (ssh): uses proxyjump")), "{:?}", messages);
-        assert!(messages.iter().any(|m| m.starts_with("dark: no exportable SSH route")), "{:?}", messages);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("trj: mux routes stay on the desktop")),
+            "{:?}",
+            messages
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("dark (ssh): uses proxyjump")),
+            "{:?}",
+            messages
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("dark: no exportable SSH route")),
+            "{:?}",
+            messages
+        );
     }
 
     #[test]
@@ -845,9 +978,27 @@ ssh = "jumped"
         let export = export(&inventory, b"x", Some("fleet"), &bare, &context()).unwrap();
         assert_eq!(export.document["workspace"]["id"], "w.machines.fleet");
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
-        assert!(messages.iter().any(|m| m.contains("no readable public key at /home/me/.ssh/trj_ed25519.pub")), "{:?}", messages);
-        assert!(messages.iter().any(|m| m.contains("no host key for 100.91.120.17")), "{:?}", messages);
-        assert!(messages.iter().any(|m| m.contains("css (ssh): no ~/.ssh/config")), "{:?}", messages);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("no readable public key at /home/me/.ssh/trj_ed25519.pub")),
+            "{:?}",
+            messages
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("no host key for 100.91.120.17")),
+            "{:?}",
+            messages
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("css (ssh): no ~/.ssh/config")),
+            "{:?}",
+            messages
+        );
         assert!(super::export(&inventory, b"x", Some("nope"), &bare, &context()).is_err());
     }
 
@@ -855,20 +1006,28 @@ ssh = "jumped"
     fn the_theme_catalog_lists_distinct_themes_then_every_builtin() {
         let catalog = theme_catalog_json();
         let themes = catalog["themes"].as_array().unwrap();
-        assert_eq!(catalog["distinct"], json!(crate::machines::distinct_theme_count()));
+        assert_eq!(
+            catalog["distinct"],
+            json!(crate::machines::distinct_theme_count())
+        );
         assert!(themes.len() > 1000);
         assert_eq!(themes[0]["name"], "FrankenTerm Azure");
-        assert!(themes.iter().all(|t| t["ansi"].as_array().unwrap().len() == 16));
+        assert!(themes
+            .iter()
+            .all(|t| t["ansi"].as_array().unwrap().len() == 16));
     }
 
     /// The app and Kit read these files; they must be what this code writes.
     /// FT_WRITE_MOBILE_FIXTURES=1 rewrites them for review.
     fn matches_file(relative: &str, expected: &[u8]) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
         if std::env::var_os("FT_WRITE_MOBILE_FIXTURES").is_some() {
             std::fs::write(&path, expected).unwrap();
         }
-        let actual = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {}", path.display(), err));
+        let actual =
+            std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {}", path.display(), err));
         assert!(
             actual == expected,
             "{} is stale; run this test with FT_WRITE_MOBILE_FIXTURES=1 and review the diff",
@@ -886,10 +1045,17 @@ ssh = "jumped"
     #[test]
     fn the_kit_fixture_is_this_exporters_output() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
-        let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n";
-        let mut document = export(&inventory, INVENTORY.as_bytes(), None, &sources(Some(config)), &context())
-            .unwrap()
-            .document;
+        let config =
+            "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n";
+        let mut document = export(
+            &inventory,
+            INVENTORY.as_bytes(),
+            None,
+            &sources(Some(config)),
+            &context(),
+        )
+        .unwrap()
+        .document;
         // The only per-run field.
         document["bundle_id"] = json!("b.fixture");
         let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
