@@ -85,7 +85,8 @@ public final class NativeTerminalRenderView: MTKView {
         colorPixelFormat = .bgra8Unorm_srgb; framebufferOnly = true
         isPaused = true; enableSetNeedsDisplay = false; autoResizeDrawable = true
         isOpaque = true; backgroundColor = .black
-        accessibilityLabel = "Terminal output"
+        isAccessibilityElement = true; accessibilityLabel = "Terminal output"
+        accessibilityTraits = .updatesFrequently
         NotificationCenter.default.addObserver(self, selector: #selector(applicationDeactivated),
             name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(applicationBackgrounded),
@@ -100,6 +101,12 @@ public final class NativeTerminalRenderView: MTKView {
     @available(*, unavailable)
     public required init(coder: NSCoder) { fatalError("Use init(source:bundle:configuration:)") }
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    /// The last admitted screen, read on demand so steady output costs nothing.
+    public override var accessibilityValue: String? {
+        get { latest?.readableText ?? super.accessibilityValue }
+        set { super.accessibilityValue = newValue }
+    }
 
     /// Complete replacements can supersede an unprepared frame. No byte stream
     /// or partial terminal delta is dropped or coalesced here.

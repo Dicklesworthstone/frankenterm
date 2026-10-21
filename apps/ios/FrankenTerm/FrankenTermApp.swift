@@ -5,6 +5,7 @@ import AVFoundation
 import UniformTypeIdentifiers
 import UIKit
 import FrankenTermKit
+import FrankenTermSSHIntegration
 
 @main
 @MainActor
@@ -226,7 +227,7 @@ final class MobileWorkspaceModel {
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
-        let snapshot = try await store.loadWithLocalPolicy()
+        let snapshot = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
         guard active, epoch == ticket else { return }
         workspaces = snapshot.map(\.workspace)
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })

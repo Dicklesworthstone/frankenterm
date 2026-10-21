@@ -150,6 +150,11 @@ final class TerminalRenderFrameTests: XCTestCase {
         XCTAssertEqual(frame.palette[200], .init(200, 55, 200 ^ 0x55, 255))
     }
 
+    func testReadableTextKeepsRowOrderAndWithholdsTheConcealedCell() async throws {
+        let frame = try TerminalRenderFrame.decode(fixture(), expectedSource: try await source())
+        XCTAssertEqual(frame.readableText, "A界\n\(Self.emoji)z")
+    }
+
     func testNonzeroDataStartIndexDoesNotChangeWireOffsets() async throws {
         let source = try await source(), bytes = fixture()
         let prefixed = Data(repeating: 0xA5, count: 17) + bytes
@@ -401,6 +406,15 @@ final class TerminalRenderTextLayoutTests: XCTestCase {
         XCTAssertEqual(layout.text.utf16.count, 10)
         XCTAssertNoThrow(try TerminalRenderTextLayout(row: row, maximumUTF16: 10))
         XCTAssertThrowsError(try TerminalRenderTextLayout(row: row, maximumUTF16: 9))
+    }
+
+    func testReadableRowTextSpacesGapsAndBlanksAndConcealsHiddenCells() {
+        let row = TerminalRenderRow(stableIndex: 0, sequence: 1, cells: [
+            cell(0, 2, "界"), cell(2, 1, ""), cell(3, 1, "x"), cell(6, 6, "secret", 1 << 10), cell(12, 1, "y"),
+            cell(13, 1, " ")
+        ])
+        XCTAssertEqual(row.readableText, "界 x" + String(repeating: " ", count: 8) + "y")
+        XCTAssertEqual(TerminalRenderRow(stableIndex: 1, sequence: 1, cells: []).readableText, "")
     }
 
     func testShapingBudgetBoundsGapsAndLongGraphemesBeforeAllocation() throws {

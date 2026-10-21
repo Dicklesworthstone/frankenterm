@@ -286,7 +286,10 @@ public actor WorkspaceStore {
         }
     }
 
-    public func loadWithLocalPolicy() throws -> [WorkspaceLocalState] {
+    /// Route readiness is judged against `support`, the transports and
+    /// algorithms this build actually links; the default reports every route
+    /// as unsupported, which is right only for a build with no SSH engine.
+    public func loadWithLocalPolicy(support: WorkspaceDocument.RouteSupport = .offlineOnly) throws -> [WorkspaceLocalState] {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
@@ -297,7 +300,7 @@ public actor WorkspaceStore {
                       revokedHostKeysByTrustScope: hostRevocations(workspace.id, document: document, catalog: catalog),
                       requiredHostCapabilitiesByTrustScope: hostRequirements(workspace.id, catalog: catalog),
                       routes: try readiness(document: document, workspaceID: workspace.id, available: available,
-                          findings: workspace.findings, catalog: catalog, support: .offlineOnly))
+                          findings: workspace.findings, catalog: catalog, support: support))
             }
         }
     }

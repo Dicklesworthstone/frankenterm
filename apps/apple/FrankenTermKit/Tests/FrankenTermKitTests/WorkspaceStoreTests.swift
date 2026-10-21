@@ -1016,6 +1016,19 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(revoked[0].credentialIDs.isEmpty); XCTAssertEqual(vault.count, 1)
     }
 
+    func testLocalPolicyJudgesRouteReadinessAgainstTheLinkedSupport() async throws {
+        let store = WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault())
+        _ = try await store.install(try archive(), envelopeDigest: digest, transferID: transferID,
+                                    expectedRevision: nil, sourceAndContentsConfirmed: true)
+        let offline = try await store.loadWithLocalPolicy()
+        let direct = try XCTUnwrap(offline[0].routes.first { $0.routeID == "route" })
+        XCTAssertFalse(direct.issues.isEmpty, "a build without an SSH engine must not report a route ready")
+        let linked = try await store.loadWithLocalPolicy(support: supportedIdentityProfile)
+        let ready = try XCTUnwrap(linked[0].routes.first { $0.routeID == "route" })
+        XCTAssertEqual(ready.issues.count, 0, "\(ready.issues.map(\.message))")
+        XCTAssertTrue(ready.isLocallyReady); XCTAssertEqual(ready.usableCredentialIDs, ["key"])
+    }
+
     func testLegacyMetadataSanitizationPreservesReplayIdentityAndCanonicalizesPublicValues() async throws {
         for version in [1, 2] {
             let persistence = StoreTestPersistence(), vault = StoreTestVault()

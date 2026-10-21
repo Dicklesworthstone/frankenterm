@@ -23,9 +23,11 @@
         A10000000000000000000010 = {isa = PBXBuildFile; fileRef = A2000000000000000000000A; };
         A10000000000000000000011 = {isa = PBXBuildFile; fileRef = A2000000000000000000000B; };
         A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A2000000000000000000000C; };
+        A10000000000000000000013 = {isa = PBXBuildFile; fileRef = A2000000000000000000000D; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
+        A7000000000000000000000E = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
 /* End PBXContainerItemProxy section */
 /* Begin PBXFileReference section */
         A20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermApp.swift; path = ../ios/FrankenTerm/FrankenTermApp.swift; sourceTree = SOURCE_ROOT; };
@@ -37,6 +39,8 @@
         A20000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NativeTerminalRenderTests.swift; path = ../ios/FrankenTermTests/NativeTerminalRenderTests.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
         A20000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LiveSSHTerminalTests.swift; path = ../ios/FrankenTermTests/LiveSSHTerminalTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000D = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OfflineRestoreConnectUITests.swift; path = ../ios/FrankenTermUITests/OfflineRestoreConnectUITests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000E = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
         A2000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionControllerTests.swift; path = ../ios/FrankenTermTests/TerminalSessionControllerTests.swift; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionScreen.swift; path = ../ios/FrankenTerm/TerminalSessionScreen.swift; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
@@ -44,11 +48,12 @@
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
         A30000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
+        A30000000000000000000004 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
         A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000E, A1000000000000000000000F,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
-        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
-        A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008,); name = Products; sourceTree = "<group>"; };
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008, A2000000000000000000000E,); name = Products; sourceTree = "<group>"; };
         A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
@@ -82,6 +87,15 @@
             productName = FrankenTermTests; productReference = A20000000000000000000008;
             productType = "com.apple.product-type.bundle.unit-test";
         };
+        A50000000000000000000004 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A80000000000000000000005;
+            buildPhases = (A60000000000000000000006, A30000000000000000000004,);
+            buildRules = (); dependencies = (A7000000000000000000000F,);
+            name = FrankenTermUITests;
+            productName = FrankenTermUITests; productReference = A2000000000000000000000E;
+            productType = "com.apple.product-type.bundle.ui-testing";
+        };
 /* End PBXNativeTarget section */
 /* Begin PBXProject section */
         A70000000000000000000001 = {
@@ -90,6 +104,7 @@
                 A50000000000000000000001 = {CreatedOnToolsVersion = 26.0; };
                 A50000000000000000000002 = {CreatedOnToolsVersion = 26.0; };
                 A50000000000000000000003 = {CreatedOnToolsVersion = 26.0; TestTargetID = A50000000000000000000001; };
+                A50000000000000000000004 = {CreatedOnToolsVersion = 26.0; TestTargetID = A50000000000000000000001; };
             }; };
             buildConfigurationList = A80000000000000000000001;
             compatibilityVersion = "Xcode 14.0";
@@ -98,7 +113,7 @@
             packageReferences = (A90000000000000000000003, A90000000000000000000004, A90000000000000000000005,);
             productRefGroup = A40000000000000000000002;
             projectDirPath = ""; projectRoot = "";
-            targets = (A50000000000000000000001, A50000000000000000000002, A50000000000000000000003,);
+            targets = (A50000000000000000000001, A50000000000000000000002, A50000000000000000000003, A50000000000000000000004,);
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
@@ -108,10 +123,12 @@
 /* Begin PBXSourcesBuildPhase section */
         A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D, A10000000000000000000012,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXTargetDependency section */
         A7000000000000000000000B = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000A; };
+        A7000000000000000000000F = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000E; };
 /* End PBXTargetDependency section */
 /* Begin XCBuildConfiguration section */
         AB0000000000000000000001 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
@@ -177,11 +194,28 @@
             GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
             TEST_HOST = "$(BUILT_PRODUCTS_DIR)/FrankenTerm.app/FrankenTerm"; BUNDLE_LOADER = "$(TEST_HOST)";
         }; };
+        AB0000000000000000000009 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.uitests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_TARGET_NAME = FrankenTerm;
+        }; };
+        AB000000000000000000000A = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.uitests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_TARGET_NAME = FrankenTerm;
+        }; };
 /* End XCBuildConfiguration section */
 /* Begin XCConfigurationList section */
         A80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000001, AB0000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
         A80000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000003, AB0000000000000000000004,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
         A80000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000005, AB0000000000000000000006,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A80000000000000000000005 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000009, AB000000000000000000000A,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
         A80000000000000000000004 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000007, AB0000000000000000000008,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 /* Begin XCLocalSwiftPackageReference section */

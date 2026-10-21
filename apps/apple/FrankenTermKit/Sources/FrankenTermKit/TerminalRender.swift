@@ -73,6 +73,19 @@ public struct TerminalRenderCell: Equatable, Sendable {
 public struct TerminalRenderRow: Equatable, Sendable {
     public let stableIndex: Int64, sequence: UInt64
     public let cells: [TerminalRenderCell]
+
+    /// The row as a reader hears it: gaps and blank cells are spaces, concealed
+    /// (SGR 8) cells are withheld as spaces, and trailing blanks are dropped.
+    public var readableText: String {
+        var text = "", column = 0
+        for cell in cells where cell.column >= column {
+            text.append(String(repeating: " ", count: cell.column - column))
+            text.append(cell.invisible || cell.text.isEmpty ? String(repeating: " ", count: cell.width) : cell.text)
+            column = cell.column + cell.width
+        }
+        while text.last == " " { text.removeLast() }
+        return text
+    }
 }
 
 public struct TerminalRenderCursor: Equatable, Sendable {
@@ -122,6 +135,13 @@ public struct TerminalRenderFrame: Equatable, Sendable {
     public let links: [String]
     public var reverseVideo: Bool { flags & 2 != 0 }
     public var alternateScreen: Bool { flags & 4 != 0 }
+    /// The viewport one line per row for VoiceOver and UI automation, without
+    /// the blank rows below the last written one.
+    public var readableText: String {
+        var rows = lines.map(\.readableText)
+        while rows.last?.isEmpty == true { rows.removeLast() }
+        return rows.joined(separator: "\n")
+    }
 
     public static func decode(_ data: Data, expectedSource: TerminalSource,
                               limits: TerminalRenderLimits = .init()) throws -> Self {
