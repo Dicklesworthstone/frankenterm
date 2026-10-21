@@ -37,7 +37,8 @@ struct FrankenTermExportApp: App {
 
 /// File reads, parsing, key validation, compression and encryption remain off UI.
 /// SSH source selection reads the chosen user config, bounded local includes,
-/// referenced public identities, and known_hosts. Private keys need a separate pick.
+/// referenced public identities, and each route's local known-hosts files.
+/// Private keys need a separate pick.
 private actor MacExportEngine {
     struct Prepared: Sendable {
         let comparison: String, pages: Int, bytes: Int
@@ -131,19 +132,10 @@ private actor MacExportEngine {
             catch is CancellationError { throw CancellationError() }
             catch { /* The source reports missing public identities explicitly. */ }
         }
-        let knownHostsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/known_hosts")
-        let knownHosts: Data?
-        do { knownHosts = try SelectedLocalFile.read(knownHostsURL, limit: SSHWorkspaceSource.maximumSourceBytes) }
-        catch is CancellationError { throw CancellationError() }
-        catch {
-            let code = (error as? CocoaError)?.code
-            if code == .fileNoSuchFile || code == .fileReadNoSuchFile || (error as? POSIXError)?.code == .ENOENT {
-                knownHosts = nil
-            } else {
-                // An unreadable revocation source is not equivalent to no file.
-                throw FTError.unsupported("ssh.known_hosts_unreadable")
-            }
-        }
+        // Freeze the actual user/global trust-file selection for every chosen
+        // destination and jump. Never pool unrelated aliases' trust or treat an
+        // unreadable revocation source as an absent file.
+        let knownHostFiles = try pending.source.loadKnownHostFiles(for: aliases)
         let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                   appropriateFor: nil, create: true)
         let sourceID = crypto.sha256(Data(pending.url.standardizedFileURL.path.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -153,7 +145,7 @@ private actor MacExportEngine {
                 try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: $0)
             } ?? SSHWorkspaceRegistry()
             let result = try pending.source.export(aliases: aliases, workspaceName: "SSH Machines", defaultUser: NSUserName(),
-                publicKeys: publicKeys, knownHosts: knownHosts, registry: &registry, using: crypto)
+                publicKeys: publicKeys, knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
             let selected = try WorkspaceExportSelection(workspace: result.workspace,
                 groupIDs: [result.workspace.initialGroupID], findings: result.portability)
             _ = try selected.review(decisions: [:], loadedFingerprints: [])
@@ -541,7 +533,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-        panel.message = "Choose a user SSH config, then select its hosts. Local Include files (including * and ? patterns), matching public .pub files, and ~/.ssh/known_hosts are read within fixed limits. Relative Include paths use ~/.ssh. Commands and Match conditions are never executed; private keys are chosen separately."
+        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, matching public .pub files, and each host's user/global known-hosts files are read within fixed limits. Relative Include paths use ~/.ssh. Commands and Match conditions are never executed; private keys are chosen separately."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
@@ -903,9 +895,9 @@ private final class MacExportModel {
             } else if error == .unsupported("video.published_durability_unconfirmed") {
                 message = "The MP4 was verified and saved. The filesystem could not confirm that the directory change would survive a sudden system failure. The completed movie is retained at the selected destination."
             } else if error == .unsupported("ssh.no_concrete_hosts") {
-                message = "This config has no concrete Host aliases to select. Wildcard-only definitions need named hosts in the selected file; included files are not evaluated."
-            } else if error == .unsupported("ssh.known_hosts_unreadable") {
-                message = "The public ~/.ssh/known_hosts file could not be read safely. Check its access and size before exporting so host revocations are not silently lost."
+                message = "This config and its supported local Include files have no concrete Host aliases to select. Add named hosts to the selected configuration; wildcard rules alone do not identify a finite machine list."
+            } else if [.limit("ssh.known_hosts.files"), .limit("ssh.known_hosts.bytes"), .limit("ssh.known_hosts.lines")].contains(error) {
+                message = "The selected known-hosts sources exceed 64 files, 2 MiB, or 16,384 lines. Select fewer hosts or a smaller explicit trust-file policy. No partial trust or revocation list was imported."
             } else if error == .unsupported("recipient.camera") {
                 message = "A camera with QR scanning is unavailable. Choose a local image of the phone’s recipient-request QR, or use a generated transfer code."
             } else if error == .unsupported("recipient.camera_interrupted") {
@@ -1043,7 +1035,7 @@ private struct MacExportView: View {
     private var sshSelection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Choose SSH hosts").font(.title2.bold())
-            Text("Select up to 128 named hosts. Matching public .pub files and ~/.ssh/known_hosts supply public identities and host policy. Commands, Include files, and Match conditions remain unresolved and are reported before export.")
+            Text("Select up to 128 named hosts. Matching public .pub files and each route's UserKnownHostsFile and GlobalKnownHostsFile settings supply public identities and host policy. Supported local Include files are already resolved. Unreadable trust files, commands, and Match conditions are reported before export; affected routes remain inactive.")
                 .font(.callout).foregroundStyle(.secondary)
             TextField("Filter host aliases", text: $model.sshSearch).textFieldStyle(.roundedBorder)
             List(model.filteredSSHAliases, id: \.self) { alias in

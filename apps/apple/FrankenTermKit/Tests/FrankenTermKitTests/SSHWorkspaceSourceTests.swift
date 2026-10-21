@@ -65,6 +65,22 @@ final class SSHWorkspaceSourceTests: XCTestCase {
                                  registry: &registry, using: crypto)
     }
 
+    private func exportFiles(_ source: SSHWorkspaceSource, _ files: SSHWorkspaceSource.KnownHostsSnapshot,
+                             aliases: [String]? = nil, keys: [String: Data] = [:]) throws -> SSHWorkspaceExport {
+        var registry = SSHWorkspaceRegistry()
+        return try source.export(aliases: aliases ?? source.aliases, workspaceName: "File-scoped trust", defaultUser: "operator",
+            publicKeys: keys, knownHostFiles: files, registry: &registry, using: crypto)
+    }
+
+    private func trust(_ alias: String, in document: WorkspaceDocument) throws -> WorkspaceDocument.HostTrust {
+        let route = try destination(alias, in: document)
+        return try XCTUnwrap(document.hostTrust.first { $0.id == route.trustID })
+    }
+
+    private func sourceRevision(_ document: WorkspaceDocument) throws -> JSONValue? {
+        try StrictJSON.decode(document.raw).object().required("source").object()["configuration_revision"]
+    }
+
     func testLocalIncludeInventoryLexicalOrderAndFrozenSource() throws {
         let home = try configurationFiles([
             "config": "Include conf.d/*.conf\nHost *\nIdentityFile none\n",
@@ -221,6 +237,218 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertEqual(restored.workspace.raw, result.workspace.raw)
         XCTAssertEqual(restored.keys.count, 1)
         XCTAssertTrue(restored.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
+    func testKnownHostsDefaultListsFirstAssignmentAndNoneAreResolvedPerHost() throws {
+        let input = try source("""
+        Host build
+          UserKnownHostsFile /selected/first "/selected/with space"
+          UserKnownHostsFile /must-not-replace
+          GlobalKnownHostsFile NONE
+        Host no-user
+          UserKnownHostsFile none
+        Host no-trust
+          UserKnownHostsFile none
+          GlobalKnownHostsFile none
+        Host defaults
+          IdentityFile none
+        """)
+        XCTAssertEqual(try input.knownHostsFileReferences(for: ["build"]), ["/selected/first", "/selected/with space"])
+        XCTAssertEqual(try input.knownHostsFileReferences(for: ["no-user"]), ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"])
+        XCTAssertEqual(try input.knownHostsFileReferences(for: ["no-trust"]), [])
+        XCTAssertEqual(try input.knownHostsFileReferences(for: ["defaults"]),
+            ["~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"])
+        let result = try exportFiles(input, .init(files: [:]), aliases: ["no-trust"])
+        XCTAssertTrue(result.workspace.hostTrust[0].pins.isEmpty)
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.host_trust" && $0.disposition == 0 })
+    }
+
+    func testLocalTrustFilesPreserveRouteScopeAndGlobalRevocations() throws {
+        let home = try configurationFiles([
+            "config": """
+            IdentityFile none
+            Host build
+              HostName shared.example.invalid
+              UserKnownHostsFile ~/.ssh/build_hosts
+              GlobalKnownHostsFile ~/.ssh/system_hosts
+            Host gpu
+              HostName shared.example.invalid
+              UserKnownHostsFile ~/.ssh/gpu_hosts
+              GlobalKnownHostsFile none
+            """,
+            "build_hosts": try hostLine("*", seed: 8),
+            "gpu_hosts": try hostLine("*", seed: 16),
+            "system_hosts": try hashedLine("shared.example.invalid", seed: 8, marker: "@revoked")
+        ])
+        let input = try loadFiles(home), files = try input.loadKnownHostFiles(for: input.aliases, homeDirectory: home)
+        let result = try exportFiles(input, files)
+        let build = try trust("build", in: result.workspace), gpu = try trust("gpu", in: result.workspace)
+        XCTAssertEqual(build.pins.count, 1); XCTAssertEqual(gpu.pins.count, 1)
+        XCTAssertNotEqual(build.pins, gpu.pins, "A wildcard in one alias's file cannot add trust to another alias's route.")
+        XCTAssertEqual(build.revokedKeys, build.pins)
+        XCTAssertTrue(gpu.revokedKeys.isEmpty)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+        let selection = try WorkspaceExportSelection(workspace: result.workspace,
+            groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertEqual(review.blockedRouteIDs, [try destination("build", in: result.workspace).id])
+    }
+
+    func testTrustFileInventoryIncludesOnlySelectedRoutesAndTheirJumps() throws {
+        let home = try configurationFiles([
+            "config": """
+            IdentityFile none
+            GlobalKnownHostsFile none
+            Host target
+              ProxyJump gate
+              UserKnownHostsFile ~/.ssh/target_hosts
+            Host gate
+              HostName gateway.example.invalid
+              HostKeyAlias pinned-gateway
+              Port 2200
+              UserKnownHostsFile ~/.ssh/gate_hosts
+            Host unrelated
+              UserKnownHostsFile ~/.ssh/unreadable_hosts
+            """,
+            "target_hosts": try hostLine("target", seed: 8),
+            "gate_hosts": try hashedLine("pinned-gateway", seed: 16) + hostLine("[pinned-gateway]:2200", seed: 24),
+            "unreadable_hosts": "This malformed unrelated trust source must never be read.\n"
+        ])
+        let input = try loadFiles(home)
+        XCTAssertEqual(try input.knownHostsFileReferences(for: ["target"]), ["~/.ssh/target_hosts", "~/.ssh/gate_hosts"])
+        let files = try input.loadKnownHostFiles(for: ["target"], homeDirectory: home)
+        XCTAssertNil(files.files["~/.ssh/unreadable_hosts"])
+        let result = try exportFiles(input, files, aliases: ["target"])
+        let target = try destination("target", in: result.workspace), gate = try XCTUnwrap(hops(target, in: result.workspace).first)
+        let gateTrust = try XCTUnwrap(result.workspace.hostTrust.first { $0.id == gate.trustID })
+        XCTAssertEqual(gateTrust.pins.count, 1, "HostKeyAlias remains a verbatim lookup independent of the port.")
+        XCTAssertEqual(result.workspace.machines.map(\.name), ["target"])
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
+    func testTrustSnapshotIsFrozenAndEverySourceStateChangesRevision() throws {
+        let home = try configurationFiles([
+            "config": "Host build\nIdentityFile none\nUserKnownHostsFile ~/.ssh/pins\nGlobalKnownHostsFile none\n",
+            "pins": try hostLine("build", seed: 8)
+        ])
+        let input = try loadFiles(home), frozen = try input.loadKnownHostFiles(for: ["build"], homeDirectory: home)
+        let linkedHome = home.deletingLastPathComponent().appendingPathComponent("ft-trust-home-link-" + UUID().uuidString)
+        try FileManager.default.createSymbolicLink(at: linkedHome, withDestinationURL: home)
+        XCTAssertEqual(try input.loadKnownHostFiles(for: ["build"], homeDirectory: linkedHome).files, frozen.files)
+        let first = try exportFiles(input, frozen)
+        try Data(hostLine("build", seed: 16).utf8).write(to: home.appendingPathComponent(".ssh/pins"))
+        XCTAssertEqual(try exportFiles(input, frozen).workspace.hostTrust[0].pins, first.workspace.hostTrust[0].pins)
+        let changed = try exportFiles(input, input.loadKnownHostFiles(for: ["build"], homeDirectory: home))
+        XCTAssertNotEqual(try sourceRevision(first.workspace), try sourceRevision(changed.workspace))
+        var revisions = Set<String>()
+        for state: SSHWorkspaceSource.KnownHostsSnapshot.File in [.missing, .unavailable, .present(Data())] {
+            let result = try exportFiles(input, .init(files: ["~/.ssh/pins": state]))
+            revisions.insert(try XCTUnwrap(sourceRevision(result.workspace)).string())
+        }
+        XCTAssertEqual(revisions.count, 3, "Missing, unreadable and an empty verified file are different frozen observations.")
+    }
+
+    func testUnreadableTrustFilesBlockOnlyAffectedRoutesAndMissingFilesRemainMissing() throws {
+        let home = try configurationFiles([
+            "config": """
+            IdentityFile none
+            GlobalKnownHostsFile none
+            Host good
+              UserKnownHostsFile ~/.ssh/good_hosts
+            Host unsafe
+              UserKnownHostsFile ~/.ssh/unsafe_hosts
+            Host linked
+              UserKnownHostsFile ~/.ssh/link_hosts
+            Host absent
+              UserKnownHostsFile ~/.ssh/absent_hosts
+            """,
+            "good_hosts": try hostLine("*", seed: 8),
+            "unsafe_hosts": try hostLine("*", seed: 16, marker: "@revoked")
+        ])
+        try FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: home.appendingPathComponent(".ssh/unsafe_hosts").path)
+        try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".ssh/link_hosts"),
+            withDestinationURL: home.appendingPathComponent(".ssh/good_hosts"))
+        let input = try loadFiles(home), files = try input.loadKnownHostFiles(for: input.aliases, homeDirectory: home)
+        XCTAssertEqual(files.files["~/.ssh/unsafe_hosts"], .unavailable)
+        XCTAssertEqual(files.files["~/.ssh/link_hosts"], .unavailable)
+        XCTAssertEqual(files.files["~/.ssh/absent_hosts"], .missing)
+        let result = try exportFiles(input, files)
+        for name in ["unsafe", "linked"] {
+            let route = try destination(name, in: result.workspace)
+            XCTAssertFalse(route.requiredCapabilities.isEmpty)
+            XCTAssertTrue(result.portability.contains { $0.entityID == route.id && $0.setting == "ssh_config.known_hosts" && $0.disposition == 1 })
+        }
+        XCTAssertTrue(try destination("good", in: result.workspace).requiredCapabilities.isEmpty)
+        XCTAssertTrue(try destination("absent", in: result.workspace).requiredCapabilities.isEmpty)
+        XCTAssertTrue(try trust("absent", in: result.workspace).pins.isEmpty)
+    }
+
+    func testUnsupportedTrustListsNeverUseAPartialPrefixOrPooledTrust() throws {
+        for value in ["none /selected/pins", "/selected/pins none", "/selected/pins %d/other",
+                      "/selected/pins ${HOME}/other", "/selected/pins relative", "/selected/pins ~someone/other",
+                      "/selected/pins ~/../other", Array(repeating: "/selected/pins", count: 17).joined(separator: " ")] {
+            let input = try source("Host build\nIdentityFile none\nUserKnownHostsFile \(value)\nGlobalKnownHostsFile none\n")
+            XCTAssertEqual(try input.knownHostsFileReferences(for: ["build"]), [], value)
+            let result = try exportFiles(input, .init(files: [:]))
+            XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, value)
+            XCTAssertTrue(result.workspace.hostTrust[0].pins.isEmpty, value)
+        }
+        let input = try source("Host build\nIdentityFile none\nUserKnownHostsFile /selected/pins\nGlobalKnownHostsFile none\n")
+        let omitted = try exportFiles(input, .init(files: [:]))
+        XCTAssertFalse(omitted.workspace.routes[0].requiredCapabilities.isEmpty, "Not supplying a file is not proof it is absent.")
+        var registry = SSHWorkspaceRegistry()
+        let legacy = try input.export(aliases: ["build"], workspaceName: "Partial", defaultUser: "operator",
+            knownHosts: Data(hostLine("build").utf8), registry: &registry, using: crypto)
+        XCTAssertFalse(legacy.workspace.routes[0].requiredCapabilities.isEmpty)
+        XCTAssertTrue(legacy.workspace.hostTrust[0].pins.isEmpty)
+        XCTAssertThrowsError(try exportFiles(input, .init(files: ["/unselected/pins": .missing]))) {
+            XCTAssertEqual($0 as? FTError, .malformed("ssh.known_hosts.unselected_source"))
+        }
+    }
+
+    func testTrustSnapshotBoundsApplyAcrossFilesWithoutTruncation() throws {
+        let tooMany = Dictionary(uniqueKeysWithValues: (0...64).map { ("/selected/\($0)", SSHWorkspaceSource.KnownHostsSnapshot.File.missing) })
+        XCTAssertThrowsError(try SSHWorkspaceSource.KnownHostsSnapshot(files: tooMany)) {
+            XCTAssertEqual($0 as? FTError, .limit("ssh.known_hosts.files"))
+        }
+        XCTAssertThrowsError(try SSHWorkspaceSource.KnownHostsSnapshot(files: [
+            "/selected/one": .present(Data(repeating: 32, count: SSHWorkspaceSource.maximumSourceBytes)),
+            "/selected/two": .present(Data([32]))
+        ])) { XCTAssertEqual($0 as? FTError, .limit("ssh.known_hosts.bytes")) }
+        XCTAssertThrowsError(try SSHWorkspaceSource.KnownHostsSnapshot(files: [
+            "/selected/one": .present(Data(repeating: 10, count: 8192)),
+            "/selected/two": .present(Data(repeating: 10, count: 8192))
+        ])) { XCTAssertEqual($0 as? FTError, .limit("ssh.known_hosts.lines")) }
+        let home = try configurationFiles([
+            "config": "Host build\nUserKnownHostsFile ~/.ssh/large\nGlobalKnownHostsFile none\n",
+            "large": String(repeating: " ", count: SSHWorkspaceSource.maximumSourceBytes + 1)
+        ])
+        XCTAssertThrowsError(try loadFiles(home).loadKnownHostFiles(for: ["build"], homeDirectory: home)) {
+            XCTAssertEqual($0 as? FTError, .limit("ssh.known_hosts.bytes"))
+        }
+    }
+
+    func testFileScopedTrustAndSelectedIdentityRoundTripThroughEncryptedArchive() throws {
+        let input = try source("Host build\nIdentityFile ~/.ssh/key\nUserKnownHostsFile /selected/pins /selected/revoked\nGlobalKnownHostsFile none\n")
+        let files = try SSHWorkspaceSource.KnownHostsSnapshot(files: [
+            "/selected/pins": .present(Data(hostLine("build", seed: 8).utf8)),
+            "/selected/revoked": .present(Data(hashedLine("build", seed: 16, marker: "@revoked").utf8))
+        ])
+        let result = try exportFiles(input, files, keys: ["~/.ssh/key": try publicFile()])
+        let original = try sampleKey(using: crypto).0, reference = try XCTUnwrap(result.workspace.credentials.first)
+        let key = PrivateKeyRecord(credentialID: reference.id, container: original.container, publicBlob: original.publicBlob)
+        let selection = try WorkspaceExportSelection(workspace: result.workspace,
+            groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        let archive = try selection.archive(including: [key], using: crypto), sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.hostTrust[0].pins, result.workspace.hostTrust[0].pins)
+        XCTAssertEqual(restored.workspace.hostTrust[0].revokedKeys, result.workspace.hostTrust[0].revokedKeys)
+        XCTAssertEqual(restored.keys[0].publicBlob, original.publicBlob)
+        XCTAssertTrue(restored.workspace.routes[0].requiredCapabilities.isEmpty)
+        let manifest = String(decoding: restored.workspace.raw, as: UTF8.self)
+        XCTAssertFalse(manifest.contains("/selected/"))
+        XCTAssertFalse(manifest.contains("~/.ssh/"))
     }
 
     func testConcreteInventoryFirstValueWildcardNegationAndIdentityOrder() throws {
