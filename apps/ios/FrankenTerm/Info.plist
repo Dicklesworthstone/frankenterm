@@ -20,7 +20,7 @@
   <dict><key>UTTypeIdentifier</key><string>org.frankenterm.airgap</string><key>UTTypeDescription</key><string>FrankenTerm Encrypted Workspace</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ftairgap</string></array></dict></dict>
  </array>
  <key>LSSupportsOpeningDocumentsInPlace</key><true/>
- <key>UIAppFonts</key><array><string>SymbolsNerdFontMono-Regular.ttf</string></array>
+ <key>UIAppFonts</key><array><string>pragmasevka-nf-regular.ttf</string><string>pragmasevka-nf-bold.ttf</string><string>pragmasevka-nf-italic.ttf</string><string>pragmasevka-nf-bolditalic.ttf</string><string>SymbolsNerdFontMono-Regular.ttf</string></array>
  <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
  <key>UILaunchScreen</key><dict/>
  <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>

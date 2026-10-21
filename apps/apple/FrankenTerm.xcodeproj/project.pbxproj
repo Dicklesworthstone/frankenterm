@@ -24,6 +24,8 @@
         A10000000000000000000011 = {isa = PBXBuildFile; fileRef = A2000000000000000000000B; };
         A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A2000000000000000000000C; };
         A10000000000000000000013 = {isa = PBXBuildFile; fileRef = A2000000000000000000000D; };
+        A10000000000000000000014 = {isa = PBXBuildFile; fileRef = A2000000000000000000000F; };
+        A10000000000000000000015 = {isa = PBXBuildFile; fileRef = A20000000000000000000010; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
@@ -44,6 +46,8 @@
         A2000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionControllerTests.swift; path = ../ios/FrankenTermTests/TerminalSessionControllerTests.swift; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionScreen.swift; path = ../ios/FrankenTerm/TerminalSessionScreen.swift; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000F = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = Pragmasevka-LICENSE.md; path = ../ios/FrankenTerm/Fonts/Pragmasevka-LICENSE.md; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = text; name = NerdFonts-LICENSE.txt; path = ../ios/FrankenTerm/Fonts/NerdFonts-LICENSE.txt; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
@@ -54,13 +58,13 @@
 /* Begin PBXGroup section */
         A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008, A2000000000000000000000E,); name = Products; sourceTree = "<group>"; };
-        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
+        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A, A2000000000000000000000F, A20000000000000000000010,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
         A50000000000000000000001 = {
             isa = PBXNativeTarget;
             buildConfigurationList = A80000000000000000000002;
-            buildPhases = (A60000000000000000000001, A30000000000000000000001, A60000000000000000000003,);
+            buildPhases = (A60000000000000000000001, A30000000000000000000001, A60000000000000000000003, A60000000000000000000007,);
             buildRules = (); dependencies = ();
             name = FrankenTerm;
             packageProductDependencies = (A90000000000000000000001, A90000000000000000000006, A90000000000000000000007, A90000000000000000000008,);
@@ -117,9 +121,18 @@
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
+/* Begin PBXShellScriptBuildPhase section */
+        A60000000000000000000007 = {isa = PBXShellScriptBuildPhase; buildActionMask = 2147483647; files = ();
+            name = "Bundle Pragmasevka Nerd Font";
+            inputPaths = ("$(SRCROOT)/../../crates/frankenterm/assets/Pragmasevka_NF.zip.zst",);
+            outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-regular.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bold.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-italic.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bolditalic.ttf",);
+            runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh;
+            shellScript = "# The desktop's default font (OFL 1.1; Fonts/Pragmasevka-LICENSE.md) is tracked\n# once as a zstd tar; extract the four faces rather than duplicating them in git.\nset -eu\n/usr/bin/tar -xf \"${SCRIPT_INPUT_FILE_0}\" -C \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\" pragmasevka-nf-regular.ttf pragmasevka-nf-bold.ttf pragmasevka-nf-italic.ttf pragmasevka-nf-bolditalic.ttf\n";
+        };
+/* End PBXShellScriptBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
         A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };

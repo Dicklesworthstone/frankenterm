@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import CoreText
 import FrankenTermKit
 import FrankenTermSSH
 import FrankenTermSSHIntegration
@@ -127,6 +128,19 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTFail("the native input view never became editable")
+    }
+
+    func testTerminalUsesTheBundledDesktopFontWithItsLicenses() {
+        XCTAssertEqual(TerminalSessionController.renderConfiguration.fontName, "PragmasevkaNF")
+        for face in ["PragmasevkaNF", "PragmasevkaNF-Bold", "PragmasevkaNF-Italic", "PragmasevkaNF-BoldItalic"] {
+            XCTAssertNotNil(UIFont(name: face, size: 12), "\(face) must be bundled and registered")
+        }
+        // Prompt symbols come from the font itself, not only from the fallback.
+        let font = CTFontCreateWithName("PragmasevkaNF" as CFString, 12, nil)
+        var character: UniChar = 0xE0B0, glyph = CGGlyph(0)
+        XCTAssertTrue(CTFontGetGlyphsForCharacters(font, &character, &glyph, 1))
+        XCTAssertNotNil(Bundle.main.url(forResource: "Pragmasevka-LICENSE", withExtension: "md"))
+        XCTAssertNotNil(Bundle.main.url(forResource: "NerdFonts-LICENSE", withExtension: "txt"))
     }
 
     func testChromeContrastFollowsTheThemeBackground() {

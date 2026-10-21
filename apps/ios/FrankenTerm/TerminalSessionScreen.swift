@@ -153,7 +153,7 @@ final class TerminalSessionController {
             let focus = try await coordinator.changeFocus(stream, to: pump.source)
             self.focus = focus
             let keyboard = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: runtime)
-            let view = try await NativeTerminalView(session: keyboard)
+            let view = try await NativeTerminalView(session: keyboard, configuration: Self.renderConfiguration)
             presenter.view = view
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
             view.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
@@ -174,6 +174,15 @@ final class TerminalSessionController {
             phase = .failed(Self.describe(error))
             await teardown()
         }
+    }
+
+    /// The desktop's default terminal font, bundled with its license, when it
+    /// is registered; otherwise Kit's Menlo default, because Core Text would
+    /// replace an unknown name with a proportional system font.
+    static var renderConfiguration: NativeTerminalRenderConfiguration {
+        var configuration = NativeTerminalRenderConfiguration()
+        if UIFont(name: "PragmasevkaNF", size: 12) != nil { configuration.fontName = "PragmasevkaNF" }
+        return configuration
     }
 
     /// User-facing text: an error's own description when it has one.
