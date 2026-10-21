@@ -93,7 +93,7 @@ pub struct NativeTerminalConfig {
 
 impl NativeTerminalConfig {
     pub fn validate(&self) -> Result<(), NativeTerminalError> {
-        validate_geometry(self.size, self.scrollback_rows)?;
+        self.retained_scrollback_rows()?;
         if self.channel_id == [0; 16]
             || self.transport_id == [0; 16]
             || self.route_revision == 0
@@ -104,25 +104,34 @@ impl NativeTerminalConfig {
         Ok(())
     }
 
-    pub fn resident_cell_budget(&self) -> Result<usize, NativeTerminalError> {
-        validate_geometry(self.size, self.scrollback_rows)
+    /// `scrollback_rows` is the most history kept. Both screens plus the
+    /// history must fit [`MAX_RESIDENT_CELLS`], so a larger grid keeps what
+    /// fits beside them; only a grid whose two screens alone exceed the
+    /// budget is refused.
+    pub fn retained_scrollback_rows(&self) -> Result<usize, NativeTerminalError> {
+        let size = self.size;
+        if !(1..=512).contains(&size.cols)
+            || !(1..=512).contains(&size.rows)
+            || size.pixel_width > 65535
+            || size.pixel_height > 65535
+            || self.scrollback_rows > 4096
+        {
+            return Err(NativeTerminalError::Invalid);
+        }
+        let screens = 2 * size.rows * size.cols;
+        if screens > MAX_RESIDENT_CELLS {
+            return Err(NativeTerminalError::Capacity);
+        }
+        Ok(self
+            .scrollback_rows
+            .min((MAX_RESIDENT_CELLS - screens) / size.cols))
     }
-}
 
-fn validate_geometry(size: TerminalSize, scrollback: usize) -> Result<usize, NativeTerminalError> {
-    if !(1..=512).contains(&size.cols)
-        || !(1..=512).contains(&size.rows)
-        || size.pixel_width > 65535
-        || size.pixel_height > 65535
-        || scrollback > 4096
-    {
-        return Err(NativeTerminalError::Invalid);
+    /// Cells kept resident: both screens and the retained history.
+    pub fn resident_cell_budget(&self) -> Result<usize, NativeTerminalError> {
+        let retained = self.retained_scrollback_rows()?;
+        Ok((2 * self.size.rows + retained) * self.size.cols)
     }
-    let cells = (2 * size.rows + scrollback) * size.cols;
-    if cells > MAX_RESIDENT_CELLS {
-        return Err(NativeTerminalError::Capacity);
-    }
-    Ok(cells)
 }
 
 #[derive(Debug)]
@@ -199,6 +208,9 @@ pub struct NativePreparedPaste {
 pub struct NativeTerminal {
     terminal: Terminal,
     config: NativeTerminalConfig,
+    /// The installed history size and theme; both survive changes of the other.
+    retained_scrollback: usize,
+    base_palette: ColorPalette,
     witness: RenderFrameWitness,
     pending_reply: Option<u64>,
     closed: bool,
@@ -207,10 +219,11 @@ pub struct NativeTerminal {
 impl NativeTerminal {
     pub fn new(config: NativeTerminalConfig) -> Result<Self, NativeTerminalError> {
         config.validate()?;
+        let retained_scrollback = config.retained_scrollback_rows()?;
         let terminal = Terminal::new_bounded_output_with_parser_limit(
             config.size,
             Arc::new(NativeConfiguration {
-                scrollback_rows: config.scrollback_rows,
+                scrollback_rows: retained_scrollback,
                 palette: ColorPalette::default(),
             }),
             "FrankenTerm",
@@ -232,6 +245,8 @@ impl NativeTerminal {
         Ok(Self {
             terminal,
             config,
+            retained_scrollback,
+            base_palette: ColorPalette::default(),
             witness: RenderFrameWitness {
                 channel_id: config.channel_id,
                 transport_id: config.transport_id,
@@ -311,9 +326,14 @@ impl NativeTerminal {
         Ok(())
     }
 
+    /// A grid too large to keep the configured history beside both screens
+    /// keeps the history that fits, dropping the oldest rows now; a smaller
+    /// grid later raises the limit again but cannot recover dropped rows.
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), NativeTerminalError> {
         self.can_mutate()?;
-        validate_geometry(size, self.config.scrollback_rows)?;
+        let mut proposed = self.config;
+        proposed.size = size;
+        let retained = proposed.retained_scrollback_rows()?;
         if size == self.config.size {
             return Ok(());
         }
@@ -323,9 +343,27 @@ impl NativeTerminal {
             .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
         self.terminal.resize(size);
+        if retained != self.retained_scrollback {
+            self.retained_scrollback = retained;
+            self.install_configuration();
+            self.terminal.trim_scrollback_to_config();
+        }
         self.config.size = size;
         self.witness.geometry_revision = revision;
         Ok(())
+    }
+
+    fn install_configuration(&mut self) {
+        self.terminal.set_config(Arc::new(NativeConfiguration {
+            scrollback_rows: self.retained_scrollback,
+            palette: self.base_palette.clone(),
+        }));
+    }
+
+    /// The history rows this grid keeps at most (see
+    /// [`NativeTerminalConfig::retained_scrollback_rows`]).
+    pub fn retained_scrollback_rows(&self) -> usize {
+        self.retained_scrollback
     }
 
     pub fn config(&self) -> NativeTerminalConfig {
@@ -362,10 +400,8 @@ impl NativeTerminal {
         palette.cursor_border = color(260);
         palette.selection_fg = color(261);
         palette.selection_bg = color(262);
-        self.terminal.set_config(Arc::new(NativeConfiguration {
-            scrollback_rows: self.config.scrollback_rows,
-            palette,
-        }));
+        self.base_palette = palette;
+        self.install_configuration();
         self.witness.palette_revision = revision;
         Ok(())
     }
@@ -1140,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn geometry_accounts_for_both_screens_and_retained_history_before_creation() {
+    fn geometry_accounts_for_both_screens_and_keeps_the_history_that_fits() {
         let mut config = config();
         config.size.rows = 256;
         config.size.cols = 256;
@@ -1151,11 +1187,66 @@ mod tests {
         ));
         config.size.rows = 128;
         assert!(NativeTerminal::new(config).is_ok());
+        // Both screens fill the budget exactly: no history fits beside them.
         config.scrollback_rows = 1;
-        assert!(matches!(
-            NativeTerminal::new(config),
+        let terminal = NativeTerminal::new(config).unwrap();
+        assert_eq!(terminal.retained_scrollback_rows(), 0);
+        assert_eq!(config.resident_cell_budget(), Ok(MAX_RESIDENT_CELLS));
+    }
+
+    #[test]
+    fn a_grid_too_large_for_its_history_keeps_the_history_that_fits() {
+        let mut terminal = terminal();
+        let row =
+            |frame: &[u8], at: usize| i64::from_le_bytes(frame[at..at + 8].try_into().unwrap());
+        let history = |frame: &[u8]| (row(frame, 176), row(frame, 184));
+        terminal.feed(b"\r\nx".repeat(20).as_slice()).unwrap();
+        assert_eq!(history(&terminal.capture_frame(None).unwrap()), (10, 18));
+
+        // 100 rows of 320 columns: (200 + 8) * 320 cells would exceed the
+        // budget, which leaves room for 4 history rows beside both screens.
+        let large = TerminalSize {
+            rows: 100,
+            cols: 320,
+            ..TerminalSize::default()
+        };
+        terminal.resize(large).unwrap();
+        assert_eq!(terminal.retained_scrollback_rows(), 4);
+        assert!(terminal.terminal.screen().scrollback_rows() <= 104);
+        let (first, live) = history(&terminal.capture_frame(None).unwrap());
+        assert!(live - first <= 4, "{:?}", (first, live));
+        assert_eq!(
+            terminal.config().resident_cell_budget(),
+            Ok((200 + 4) * 320)
+        );
+
+        // A new theme keeps the smaller history, which refills only to it.
+        terminal.set_base_palette(&[9; BASE_PALETTE_BYTES]).unwrap();
+        terminal.feed(b"\r\ny".repeat(200).as_slice()).unwrap();
+        let (first, live) = history(&terminal.capture_frame(None).unwrap());
+        assert_eq!(live - first, 4);
+        assert!(terminal.terminal.screen().scrollback_rows() <= 104);
+
+        // A smaller grid raises the limit again.
+        terminal
+            .resize(TerminalSize {
+                rows: 3,
+                cols: 12,
+                ..TerminalSize::default()
+            })
+            .unwrap();
+        assert_eq!(terminal.retained_scrollback_rows(), 8);
+        // Two screens alone over the budget are refused, changing nothing.
+        assert_eq!(
+            terminal.resize(TerminalSize {
+                rows: 256,
+                cols: 256,
+                ..TerminalSize::default()
+            }),
             Err(NativeTerminalError::Capacity)
-        ));
+        );
+        assert_eq!(terminal.config().size.rows, 3);
+        assert_eq!(terminal.retained_scrollback_rows(), 8);
     }
 
     #[test]

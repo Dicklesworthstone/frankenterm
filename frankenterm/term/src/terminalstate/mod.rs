@@ -1316,6 +1316,20 @@ impl TerminalState {
         evicted
     }
 
+    /// Applies a smaller scrollback size now: after installing a
+    /// configuration with less history, drops the primary screen's oldest
+    /// rows beyond it (see `Screen::trim_scrollback_to_policy`). Returns the
+    /// rows dropped; the sequence number advances only when rows went.
+    pub fn trim_scrollback_to_config(&mut self) -> usize {
+        self.refresh_batch_config();
+        let seqno = next_sequence_no(self.seqno);
+        let trimmed = self.screen.screen.trim_scrollback_to_policy(seqno);
+        if trimmed > 0 {
+            self.seqno = seqno;
+        }
+        trimmed
+    }
+
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         self.increment_seqno();
         self.osc52_prompt.replace(None);

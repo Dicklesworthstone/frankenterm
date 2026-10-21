@@ -10952,6 +10952,37 @@ impl Screen {
         Ok(())
     }
 
+    /// Drops, now rather than on the next scroll, the oldest history rows
+    /// beyond the installed scrollback policy: the rows the next line feed
+    /// would drop, with stable row indices advancing as scrolling advances
+    /// them. A terminal that shrinks its history to fit a larger grid must be
+    /// within its memory budget when the resize returns. Only plain in-memory
+    /// history is trimmed; tiered, spilled and recovery history has somewhere
+    /// to go and is left to scrolling. Returns the number of rows dropped.
+    pub(crate) fn trim_scrollback_to_policy(&mut self, seqno: SequenceNo) -> usize {
+        if !self.allow_scrollback
+            || self.recovery_scrollback.is_some()
+            || self.scrollback_policy.tier.enabled
+            || self.config.scrollback_spill_sink().is_some()
+        {
+            return 0;
+        }
+        let limit = self
+            .physical_rows
+            .saturating_add(self.hot_scrollback_size());
+        let excess = self.lines.len().saturating_sub(limit);
+        if excess == 0 {
+            return 0;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        for _ in 0..excess {
+            self.lines.pop_front();
+        }
+        self.advance_stable_row_index_offset(excess);
+        self.lines.shrink_to_fit();
+        excess
+    }
+
     /// ```text
     /// ---------
     /// |

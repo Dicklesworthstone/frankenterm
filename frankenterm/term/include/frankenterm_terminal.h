@@ -36,11 +36,12 @@ typedef struct ft_terminal_v1_config {
     uint32_t abi_version;       /* offset 0 */
     uint32_t struct_size;       /* offset 4 */
     uint32_t columns;           /* offset 8; 1..512 */
-    uint32_t rows;              /* offset 12; 1..512; rows*columns<=65536 */
+    uint32_t rows;              /* offset 12; 1..512; 2*rows*columns<=65536 */
     uint32_t pixel_width;       /* offset 16; 0..65535 */
     uint32_t pixel_height;      /* offset 20; 0..65535 */
-    uint32_t scrollback_rows;   /* offset 24; 0..4096;
-                                * (2*rows+scrollback_rows)*columns<=65536 */
+    uint32_t scrollback_rows;   /* offset 24; 0..4096; the most history kept:
+                                * a grid keeps the rows that fit beside both
+                                * screens, (65536-2*rows*columns)/columns */
     uint32_t reserved;          /* offset 28; must be zero */
     uint8_t channel_id[16];     /* offset 32; nonzero, direct SSH only */
     uint8_t transport_id[16];   /* offset 48; nonzero */
