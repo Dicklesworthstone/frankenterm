@@ -11,6 +11,15 @@ dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", e
 testDependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 #endif
 
+#if os(Linux)
+let libssh2: Target = .systemLibrary(name: "CLibssh2", pkgConfig: "libssh2",
+                                     providers: [.apt(["libssh2-1-dev"])])
+#else
+// Apple hosts (including iOS apps, which cannot use a desktop libssh2) link the
+// libssh2 + OpenSSL XCFramework built by scripts/build-apple-ssh-xcframework.sh.
+let libssh2: Target = .binaryTarget(name: "CLibssh2", path: "Artifacts/CLibssh2.xcframework")
+#endif
+
 let package = Package(
     name: "FrankenTermSSH",
     platforms: [.iOS("26.0"), .macOS("14.0")],
@@ -21,8 +30,7 @@ let package = Package(
                .executable(name: "WorkspaceSSHProbe", targets: ["WorkspaceSSHProbe"])],
     dependencies: dependencies,
     targets: [
-        .systemLibrary(name: "CLibssh2", pkgConfig: "libssh2",
-                       providers: [.brew(["libssh2"]), .apt(["libssh2-1-dev"])]),
+        libssh2,
         .target(name: "CFrankenTermSSH", dependencies: ["CLibssh2"], publicHeadersPath: "include",
                 cSettings: [.define("_DEFAULT_SOURCE", .when(platforms: [.linux]))],
                 linkerSettings: [.linkedLibrary("pthread", .when(platforms: [.linux]))]),
