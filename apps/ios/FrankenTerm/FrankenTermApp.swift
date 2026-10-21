@@ -98,13 +98,10 @@ final class MobileWorkspaceModel {
             defer { self.requestingCameraAccess = false }
             guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked,
                   self.state?.isSuspended == false else { return }
-            // A finished restore gave up offline exclusion; the next scan
-            // starts over from idle and takes it back first.
+            // The next scan starts over from a finished restore.
             if self.state?.phase == .complete, let restore = self.restore {
                 do {
-                    _ = try await restore.reset()
-                    try await restore.enterOfflineMode()
-                    let fresh = await restore.status()
+                    let fresh = try await self.restartFinished(restore)
                     guard self.active, self.showRestore, self.epoch == ticket else { return }
                     self.state = fresh; self.lastObservation = nil
                 } catch { self.report(error); return }
@@ -231,8 +228,8 @@ final class MobileWorkspaceModel {
     func requestRecipient() {
         guard active, !busy else { return }
         pendingImport = nil; cameraRequested = false; setRestoreVisible(true)
-        run { restore, state in
-            let current = state.phase == .complete ? try await restore.reset() : state
+        run { [self] restore, state in
+            let current = state.phase == .complete ? try await self.restartFinished(restore) : state
             return try await restore.createRecipientRequest(generation: current.generation)
         }
     }
@@ -409,15 +406,28 @@ final class MobileWorkspaceModel {
     }
 
     @ObservationIgnored private var announced = Set<Data>()
+    @ObservationIgnored private var announcement: Task<Void, Never>?
+
+    /// Starts over from a finished restore, which gave up offline exclusion:
+    /// ends its arrival notice, resets, and takes exclusion back before
+    /// anything is scanned or read.
+    private func restartFinished(_ restore: OfflineRestore<AppleCryptography>) async throws -> OfflineRestoreStatus {
+        announcement?.cancel(); await announcement?.value; announcement = nil
+        _ = try await restore.reset()
+        try await restore.enterOfflineMode()
+        return await restore.status()
+    }
     /// Tells the Mac that sent this transfer that it arrived, so it can say so
     /// and stop its animation (TransferCompletion). Once per transfer, under a
     /// connection lease like any network use; a Mac that is not listening, or
-    /// not on this network, simply never hears.
+    /// not on this network, simply never hears. The first time, discovery
+    /// waits on iOS's Local Network prompt, so the limit leaves time to answer
+    /// it; the search ends as soon as the Mac replies.
     private func announce(_ arrival: TransferArrival?) {
         guard let arrival, announced.insert(arrival.envelopeDigest).inserted,
               let lease = try? WorkspaceNetworkActivity.shared.beginConnection() else { return }
-        Task {
-            _ = await TransferCompletionNotice.send(arrival, timeout: .seconds(8))
+        announcement = Task {
+            _ = await TransferCompletionNotice.send(arrival, timeout: .seconds(30))
             withExtendedLifetime(lease) {}
         }
     }
@@ -509,7 +519,7 @@ final class MobileWorkspaceModel {
             guard !current.isSuspended else { return }
             var submittedDocument = false
             do {
-                let ready = current.phase == .complete ? try await restore.reset() : current
+                let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
                 guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
                 guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
                     self.markPendingImportInterrupted(selected.id)

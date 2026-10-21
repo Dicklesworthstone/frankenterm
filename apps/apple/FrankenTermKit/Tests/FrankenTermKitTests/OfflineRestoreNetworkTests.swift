@@ -247,5 +247,17 @@ final class TransferCompletionTests: XCTestCase {
         for _ in 0..<50 where heard == 0 { try await Task.sleep(for: .milliseconds(100)) }
         XCTAssertEqual(heard, 1)
     }
+
+    /// A new restore cancels a notice still searching; it ends at once.
+    func testCancellingANoticeEndsItsSearchAtOnce() async {
+        let lonely = TransferArrival(envelopeDigest: Data(repeating: 0x5A, count: 32), workspaceDigest: Data(repeating: 1, count: 32))
+        let started = ContinuousClock.now
+        let notice = Task { await TransferCompletionNotice.send(lonely, timeout: .seconds(30)) }
+        try? await Task.sleep(for: .milliseconds(200))
+        notice.cancel()
+        let answered = await notice.value
+        XCTAssertFalse(answered)
+        XCTAssertLessThan(started.duration(to: .now), .seconds(5))
+    }
 }
 #endif

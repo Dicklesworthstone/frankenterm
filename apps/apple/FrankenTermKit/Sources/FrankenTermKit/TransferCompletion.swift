@@ -95,16 +95,22 @@ public final class TransferCompletionNotice: NSObject, MCNearbyServiceBrowserDel
         super.init()
     }
 
+    /// Cancelling the calling task ends the search at once, returning false.
     public static func send(_ arrival: TransferArrival, timeout: Duration = .seconds(15)) async -> Bool {
         let notice = TransferCompletionNotice(arrival: arrival)
-        return await withCheckedContinuation { continuation in
-            notice.finish = { continuation.resume(returning: $0) }
-            notice.browser.delegate = notice; notice.session.delegate = notice
-            notice.browser.startBrowsingForPeers()
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                notice.done(false)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                notice.finish = { continuation.resume(returning: $0) }
+                guard !Task.isCancelled else { notice.done(false); return }
+                notice.browser.delegate = notice; notice.session.delegate = notice
+                notice.browser.startBrowsingForPeers()
+                Task { @MainActor in
+                    try? await Task.sleep(for: timeout)
+                    notice.done(false)
+                }
             }
+        } onCancel: {
+            Task { @MainActor in notice.done(false) }
         }
     }
 
