@@ -66,10 +66,10 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         done.tap()
     }
 
-    /// Opens the restored machine and connects. `reviewed` reports whether an
-    /// earlier session's unknown-outcome review had to be acknowledged first.
+    /// Opens the restored machine and connects; an earlier session on it is
+    /// acknowledged without asking.
     @MainActor
-    private func connect(_ app: XCUIApplication, _ inputs: Inputs) -> (terminal: XCUIElement, reviewed: Bool) {
+    private func connect(_ app: XCUIApplication, _ inputs: Inputs) -> XCUIElement {
         let saved = savedWorkspace(app, inputs)
         XCTAssertTrue(saved.waitForExistence(timeout: 20), "the restored workspace must be listed")
         saved.tap()
@@ -80,22 +80,16 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.tap() // lets the interruption monitor handle a first-use Face ID alert
 
         let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
-        let review = app.buttons["Start New Session"]
-        var reviewed = false
-        let deadline = Date().addingTimeInterval(60)
-        while !terminal.exists, Date() < deadline {
-            // The action enables once the saved session records are loaded.
-            if !reviewed, review.exists, review.isEnabled {
-                XCTAssertTrue(app.staticTexts["Earlier session on this machine"].exists)
-                snapshot("4b-earlier-session-review")
-                review.tap(); app.tap(); reviewed = true
-            }
-            usleep(250_000)
-        }
-        XCTAssertTrue(terminal.exists, "the terminal surface must appear")
-        XCTAssertTrue(app.navigationBars[inputs.machine].waitForExistence(timeout: 5))
+        XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal surface must appear")
+        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 5), "the strip shows the machine live")
         snapshot("5-terminal")
-        return (terminal, reviewed)
+        return terminal
+    }
+
+    /// A machine's chip in the strip, by name and state.
+    @MainActor
+    private func chip(_ app: XCUIApplication, _ machine: String, _ state: String) -> XCUIElement {
+        app.buttons["\(machine), \(state)"].firstMatch
     }
 
     private func screen(_ terminal: XCUIElement) -> String { terminal.value as? String ?? "" }
@@ -122,8 +116,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         let inputs = try inputs()
         let app = launch()
         restore(app, inputs)
-        let (terminal, reviewed) = connect(app, inputs)
-        XCTAssertFalse(reviewed, "a freshly restored machine has no earlier session to review")
+        let terminal = connect(app, inputs)
 
         // Keystrokes leave through SSH; only the remote shell can turn the
         // arithmetic into 42, and the result is read from the admitted frame.
@@ -139,7 +132,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
                           "terminal background \(shown) must be the theme's \(expected)")
         }
 
-        // The toolbar's Select Output shows the received viewport as read-only text.
+        // Select Output, under More, shows the received viewport as read-only text.
+        app.buttons["terminal.more"].tap()
         app.buttons["Select Output"].tap()
         let captured = app.textViews["Captured terminal output"]
         XCTAssertTrue(captured.waitForExistence(timeout: 10), "Select Output must show the captured viewport")
@@ -173,11 +167,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     func testTerminalKeysFullScreenRotationAndBackground() throws {
         let inputs = try inputs()
         let app = launch()
-        let reused = savedWorkspace(app, inputs).waitForExistence(timeout: 5)
-        if !reused { restore(app, inputs) }
-        let (terminal, reviewed) = connect(app, inputs)
-        // The journey test's session ended when its app process was killed.
-        if reused { XCTAssertTrue(reviewed, "a machine used by an earlier launch must show the unknown-outcome review") }
+        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
+        let terminal = connect(app, inputs)
         app.typeText("echo READY-$((40+2))\n")
         guard waitFor("READY-42", in: terminal, timeout: 30, "the shell must accept input") else { return }
 
@@ -258,74 +249,49 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertLessThan(landscape.rows, portrait.rows, "landscape must shorten the PTY")
         XCUIDevice.shared.orientation = .portrait
 
-        // Background seals the connection; on return the screen must say so,
-        // state the unknown outcome, and offer a new session that works.
+        // A quick trip to the home screen keeps the session: the same shell
+        // (its variable still set) answers on return.
+        app.typeText("export FT_KEPT=yes\n")
         XCUIDevice.shared.press(.home)
         sleep(3)
         app.activate()
-        let again = app.buttons["Start New Session"]
-        XCTAssertTrue(again.waitForExistence(timeout: 15), "a session closed by backgrounding must offer a new one")
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Nothing is sent again automatically")).firstMatch.exists)
         snapshot("9-after-background")
-        let ready = expectation(for: NSPredicate(format: "isEnabled == true"), evaluatedWith: again)
-        XCTAssertEqual(XCTWaiter().wait(for: [ready], timeout: 15), .completed, "the reviewed new session becomes available")
-        again.tap()
-        app.tap()
-        // The ended view stays visible until its successor replaces it; the
-        // keyboard returns only when the new session's view takes focus.
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 60), "the new session must take keyboard focus")
-        let fresh = app.descendants(matching: .any)["Terminal output"].firstMatch
-        app.typeText("echo AGAIN-$((40+2))\n")
-        waitFor("AGAIN-42", in: fresh, timeout: 30, "the reconnected session must run commands")
-        snapshot("10-reconnected")
+        terminal.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "the session takes the keyboard again")
+        app.typeText("echo KEPT-$FT_KEPT\n")
+        waitFor("KEPT-yes", in: terminal, timeout: 30, "the same session runs commands after the background trip")
+        snapshot("10-kept")
     }
 
-    /// M1 through the real rail (named to run after the journeys above): with
-    /// two machines restored, connect the first, pick the second from the
-    /// machine menu and connect it, then return. Each machine keeps its own
-    /// shell and screen, and typing reaches only the machine on screen.
+    /// M1 through the machine strip (named to run after the journeys above):
+    /// with two machines restored, opening the first connects the second in
+    /// the background; switching to it shows its own shell at once, and
+    /// switching back finds the first as it was. Typing reaches only the
+    /// machine on screen.
     @MainActor
-    func testWorkspaceRailSwitchesBetweenConnectedMachines() throws {
+    func testMachineStripSwitchesBetweenConnectedMachines() throws {
         let inputs = try inputs()
         guard let second = ProcessInfo.processInfo.environment["FT_UI_SECOND_MACHINE_NAME"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_UI_SECOND_MACHINE_NAME for a package with a second machine")
         }
         let app = launch()
         if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
-        let (terminal, _) = connect(app, inputs)
+        let terminal = connect(app, inputs)
         app.typeText("export FT_WHO=first; echo WHO-$FT_WHO-$((1+1))\n")
         waitFor("WHO-first-2", in: terminal, timeout: 30, "the first machine's shell must run")
 
-        app.buttons["Machine: \(inputs.machine)"].tap()
-        let secondItem = app.buttons[second].firstMatch
-        XCTAssertTrue(secondItem.waitForExistence(timeout: 5), "the rail's machine menu lists the second machine")
-        secondItem.tap()
-        XCTAssertTrue(app.navigationBars[second].waitForExistence(timeout: 10), "the scene shows the chosen machine")
-        let connect = app.buttons["Connect"].firstMatch
-        XCTAssertTrue(connect.waitForExistence(timeout: 10), "an unconnected machine offers Connect in the scene")
-        snapshot("11-second-machine")
-        connect.tap()
-        app.tap() // lets the interruption monitor handle a Face ID alert
-        // A simulator that ran this test before holds the second machine's
-        // earlier session too; its review comes first.
-        let review = app.buttons["Start New Session"]
-        let deadline = Date().addingTimeInterval(60)
-        while !app.keyboards.firstMatch.exists, Date() < deadline {
-            if review.exists, review.isEnabled { review.tap(); app.tap() }
-            usleep(250_000)
-        }
-        XCTAssertTrue(app.keyboards.firstMatch.exists, "the second session must take the keyboard")
+        let secondChip = chip(app, second, "connected")
+        XCTAssertTrue(secondChip.waitForExistence(timeout: 60), "the second machine connects in the background")
+        snapshot("11-second-machine-live")
+        secondChip.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "the second session must take the keyboard")
         let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
         app.typeText("export FT_WHO=second; echo WHO-$FT_WHO-$((2+2))\n")
         waitFor("WHO-second-4", in: screen, timeout: 30, "the second machine's shell must run")
         XCTAssertFalse(self.screen(screen).contains("WHO-first-2"), "the second machine has its own screen")
         snapshot("12-second-terminal")
 
-        app.buttons["Machine: \(second)"].tap()
-        let firstItem = app.buttons[inputs.machine].firstMatch
-        XCTAssertTrue(firstItem.waitForExistence(timeout: 5))
-        firstItem.tap()
-        XCTAssertTrue(app.navigationBars[inputs.machine].waitForExistence(timeout: 10))
+        chip(app, inputs.machine, "connected").tap()
         waitFor("WHO-first-2", in: screen, timeout: 10, "returning keeps the first machine's screen")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
         app.typeText("echo AGAIN-$FT_WHO-$((3+3))\n")

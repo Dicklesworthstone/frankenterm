@@ -242,6 +242,10 @@ final class MobileWorkspaceModel {
         liveScenes[workspaceID] = scene
         return scene
     }
+    /// What a machine's live session is doing, once its workspace has a scene.
+    func liveStatus(_ workspaceID: UUID, machineID: String) -> WorkspaceTerminalScene.Status? {
+        liveScenes[workspaceID].flatMap { $0.closed ? nil : $0.status(of: machineID) }
+    }
     private func retire(_ scene: WorkspaceTerminalScene) {
         scene.requestClose()
         Task { await scene.close() }
@@ -1365,7 +1369,9 @@ private struct MachineWorkspaceView: View {
                 NavigationLink {
                     liveWorkspace(connections: connections, local: local, initial: machine.id)
                 } label: {
-                    Label("Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
+                    // A session that is already running opens where it is.
+                    let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
+                    Label(live ? "Open Terminal" : "Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
                 }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
                 // Tailscale only: say so before the first attempt waits out a timeout.
