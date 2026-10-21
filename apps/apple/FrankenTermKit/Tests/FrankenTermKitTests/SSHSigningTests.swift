@@ -42,6 +42,55 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
             + (try SSHECDSACurve.allCases.map { try ecdsaFixture($0) })
     }
 
+    /// Generated independently by pyca/cryptography 50.0.2 from the public
+    /// synthetic scalar 2^254; OpenSSH ssh-keygen -y accepts this exact record.
+    /// Its aligned private body has a complete 01...08 padding block. Never
+    /// authorize this published fixture on a real machine.
+    private func independentlyPaddedFixture() throws -> Fixture {
+        let pem = Data("""
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNl
+        Y2RzYS1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQB7n/CAnCM/rDCv5ML
+        8zporQhtTOmaEeONk8ppjrmYBZZVzvAbAkiCEkvgLvNFVxGBGDbqNb55mwn9X04Q
+        7syvAAAAoCMHJpsjByabAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAy
+        NTYAAABBBAHuf8ICcIz+sMK/kwvzOmitCG1M6ZoR442TymmOuZgFllXO8BsCSIIS
+        S+Au80VXEYEYNuo1vnmbCf1fThDuzK8AAAAgQAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAQIDBAUGBwg=
+        -----END OPENSSH PRIVATE KEY-----
+        """.utf8)
+        return Fixture(key: try PrivateKeyRecord.fromPEM(pem, credentialID: "synthetic", using: TestCryptography()), curve: .nistp256)
+    }
+
+    func testIndependentOpenSSHFullBlockPaddingImportsAndSigns() throws {
+        let fixture = try independentlyPaddedFixture()
+        XCTAssertEqual(fixture.key.container.suffix(8), Data(1...8))
+        let scalar = Data([0x40]) + Data(repeating: 0, count: 31)
+        let point = try TestCryptography().ecdsaPublicKey(scalar: scalar, curve: .nistp256)
+        let expected = string(Data("ecdsa-sha2-nistp256".utf8)) + string(Data("nistp256".utf8)) + string(point)
+        XCTAssertEqual(fixture.key.publicBlob, expected)
+        let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: "operator", publicBlob: expected)
+        let signature = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: fixture.key.container)
+        XCTAssertTrue(try verify(signature, message: challenge.signedData, fixture: fixture))
+    }
+
+    func testFullBlockPaddingStillRejectsMalformedAndExcessPadding() throws {
+        let fixture = try independentlyPaddedFixture()
+        var reader = Reader(Data(fixture.key.container.dropFirst(15)))
+        let cipher = try reader.string(), kdf = try reader.string(), options = try reader.string()
+        reader.offset += 4
+        let publicKey = try reader.string(), privatePart = try reader.string()
+        XCTAssertTrue(reader.finished)
+        func container(_ part: Data) -> Data {
+            Data("openssh-key-v1\0".utf8) + string(cipher) + string(kdf) + string(options)
+                + Data([0, 0, 0, 1]) + string(publicKey) + string(part)
+        }
+        for part in [privatePart + Data(9...16), Data(privatePart.dropLast()) + Data([0])] {
+            XCTAssertThrowsError(try PrivateKeyRecord.validateContainer(container(part), using: TestCryptography()))
+        }
+        // OpenSSH's own writer can omit padding for an already aligned body.
+        XCTAssertEqual(try PrivateKeyRecord.validateContainer(container(Data(privatePart.dropLast(8))), using: TestCryptography()), publicKey)
+    }
+
     /// Deliberately separate from the production ByteCursor/SSH serializers.
     private struct Reader {
         let bytes: [UInt8]

@@ -22,7 +22,19 @@ public protocol WorkspacePersistence: Sendable {
 public protocol WorkspaceCredentialVault: Sendable {
     func create(account: String, privateContainer: Data, fingerprint: String) throws
     func fingerprint(account: String) throws -> String?
+    /// Read bounded public attributes of this exact protected item. Never read
+    /// private material, prompt, enumerate accounts or infer identity from a label.
+    func publicIdentity(account: String) throws -> SSHPublicIdentity?
+    /// Explicitly reviewed reimport may fill missing public metadata on a
+    /// fingerprint-matching item. Preserve its account, private value and ACL.
+    /// False means this operation is unsupported and changed nothing.
+    func enrichPublicIdentity(account: String, identity: SSHPublicIdentity) throws -> Bool
     func remove(account: String) throws
+}
+
+public extension WorkspaceCredentialVault {
+    func publicIdentity(account: String) throws -> SSHPublicIdentity? { nil }
+    func enrichPublicIdentity(account: String, identity: SSHPublicIdentity) throws -> Bool { false }
 }
 
 public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
@@ -422,6 +434,31 @@ public actor WorkspaceStore {
 
             let references = Dictionary(uniqueKeysWithValues: document.credentials.map { ($0.id, $0) })
             var accounts = try reusableCredentialAccounts(for: document, preferredWorkspace: old, catalog: catalog)
+            // Derive every incoming identity with the production primitive
+            // before changing any reusable item's public metadata. Archive
+            // construction through another provider is not private-key proof.
+            let importedIdentities = try archive.keys.map { key -> (CredentialIdentity, SSHPublicIdentity) in
+                try Task.checkCancellation()
+                guard let credential = references[key.credentialID] else { throw FTError.malformed("store.key_reference") }
+                let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: key.container)
+                guard identity.blob == key.publicBlob, identity.algorithm == credential.algorithm,
+                      identity.fingerprint == credential.fingerprint else { throw SSHAuthenticationError.identityMismatch }
+                return (CredentialIdentity(credential), identity)
+            }
+            for (identity, publicIdentity) in importedIdentities {
+                guard let account = accounts[identity] else { continue }
+                try Task.checkCancellation()
+                if let existing = try vault.publicIdentity(account: account) {
+                    guard existing == publicIdentity else { throw SSHAuthenticationError.identityMismatch }
+                } else if try vault.enrichPublicIdentity(account: account, identity: publicIdentity) {
+                    guard try vault.publicIdentity(account: account) == publicIdentity else { throw FTError.storage }
+                }
+            }
+            // Enrichment grants no route or signing authority and creates or
+            // retires no private account. Its idempotent public-only mutation
+            // leaves journal ownership unchanged, including an exact reimport.
+            // Failure preserves the prior catalog; retry reads actual metadata.
+            try Task.checkCancellation()
             if let old, old.envelopeDigest == envelopeDigest {
                 guard old.manifest == document.raw else { throw WorkspaceStoreError.corruptStore }
                 let reusableBindings = credentialBindings(for: document, accounts: accounts)
@@ -501,6 +538,10 @@ public actor WorkspaceStore {
                 }
                 for binding in bindings {
                     guard try vault.fingerprint(account: binding.account) == binding.fingerprint else { throw FTError.storage }
+                    if let identity = try vault.publicIdentity(account: binding.account) {
+                        guard identity.fingerprint == binding.fingerprint,
+                              identity.algorithm == references[binding.credentialID]?.algorithm else { throw FTError.storage }
+                    }
                 }
                 try Task.checkCancellation()
                 try persistence.write(next, to: .catalog)

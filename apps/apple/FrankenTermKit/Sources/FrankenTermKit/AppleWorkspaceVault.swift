@@ -32,30 +32,70 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
         }
         var item = try query(account: account)
         item[kSecAttrAccessControl as String] = access
-        item[kSecAttrGeneric as String] = Data(fingerprint.utf8)
+        let metadata = WorkspaceCredentialMetadata(identity: identity)
+        item[kSecAttrGeneric as String] = metadata.fingerprintBytes
         // Public metadata avoids prompting merely to offer a key. It is checked
         // against the independently stored fingerprint and never grants signing.
-        item[kSecAttrComment as String] = "ft-ssh-public-v1:" + identity.blob.base64EncodedString()
+        if let comment = metadata.publicComment { item[kSecAttrComment as String] = comment }
         item[kSecValueData as String] = privateContainer
         // Add only. A duplicate must never overwrite an identity or relax its ACL.
         guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw FTError.storage }
     }
     public func fingerprint(account: String) throws -> String? {
+        try metadata(account: account)?.fingerprint
+    }
+    public func publicIdentity(account: String) throws -> SSHPublicIdentity? {
+        try metadata(account: account)?.identity
+    }
+
+    /// Upgrade only the public comment during explicitly reviewed reimport.
+    /// The exact account and independently stored fingerprint constrain the
+    /// update. The protected value, accessibility and ACL are never update fields.
+    /// A platform requiring authentication for metadata updates fails without UI.
+    public func enrichPublicIdentity(account: String, identity: SSHPublicIdentity) throws -> Bool {
+        guard let existing = try metadata(account: account), existing.fingerprint == identity.fingerprint else {
+            throw SSHAuthenticationError.identityMismatch
+        }
+        if let known = existing.identity {
+            guard known == identity else { throw SSHAuthenticationError.identityMismatch }
+            return true
+        }
+        guard let comment = WorkspaceCredentialMetadata(identity: identity).publicComment else { throw FTError.storage }
+        var request = try query(account: account)
+        request[kSecAttrGeneric as String] = existing.fingerprintBytes
+        let context = LAContext(); context.interactionNotAllowed = true
+        defer { context.invalidate() }
+        request[kSecUseAuthenticationContext as String] = context
+        let changes = [kSecAttrComment as String: comment]
+        guard SecItemUpdate(request as CFDictionary, changes as CFDictionary) == errSecSuccess else { throw FTError.storage }
+        guard try publicIdentity(account: account) == identity else { throw FTError.storage }
+        return true
+    }
+
+    private func metadata(account: String) throws -> WorkspaceCredentialMetadata? {
         var request = try query(account: account)
         request[kSecReturnAttributes as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         let context = LAContext()
         context.interactionNotAllowed = true
+        defer { context.invalidate() }
         request[kSecUseAuthenticationContext as String] = context
         var result: CFTypeRef?
         let status = SecItemCopyMatching(request as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         // Locked/unavailable is NOT absent and never authorizes orphan cleanup.
-        guard status == errSecSuccess, let attributes = result as? [String: Any],
-              let bytes = attributes[kSecAttrGeneric as String] as? Data,
-              let value = String(data: bytes, encoding: .utf8), value.utf8.count == 50,
-              value.hasPrefix("SHA256:") else { throw FTError.storage }
-        return value
+        guard status == errSecSuccess, let attributes = result as? [String: Any] else { throw FTError.storage }
+        return try Self.metadata(attributes: attributes)
+    }
+
+    fileprivate static func metadata(attributes: [String: Any]) throws -> WorkspaceCredentialMetadata {
+        guard let fingerprint = attributes[kSecAttrGeneric as String] as? Data else { throw FTError.storage }
+        let comment: String?
+        if let value = attributes[kSecAttrComment as String] {
+            guard let text = value as? String else { throw FTError.storage }
+            comment = text
+        } else { comment = nil }
+        return try WorkspaceCredentialMetadata(fingerprintBytes: fingerprint, publicComment: comment)
     }
     public func remove(account: String) throws {
         var request = try query(account: account)
@@ -160,21 +200,16 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                             var item: CFTypeRef?
                             let status = SecItemCopyMatching(query as CFDictionary, &item)
                             try Self.worker.check(requestID)
-                            guard status == errSecSuccess, let attributes = item as? [String: Any],
-                                  attributes[kSecAttrGeneric as String] as? Data == Data(authorization.fingerprint.utf8) else {
+                            guard status == errSecSuccess, let attributes = item as? [String: Any] else {
                                 throw SSHAuthenticationError.denied
                             }
-                            if let comment = attributes[kSecAttrComment as String] as? String {
-                                let prefix = "ft-ssh-public-v1:"
-                                guard comment.hasPrefix(prefix), comment.utf8.count <= 768,
-                                      let blob = Data(base64Encoded: String(comment.dropFirst(prefix.count))) else {
-                                    throw SSHAuthenticationError.identityMismatch
-                                }
-                                let identity = try SSHPublicIdentity(blob: blob)
+                            let metadata = try AppleWorkspaceVault.metadata(attributes: attributes)
+                            guard metadata.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
+                            if let identity = metadata.identity {
                                 guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
                                     throw SSHAuthenticationError.identityMismatch
                                 }
-                                return blob
+                                return identity.blob
                             }
                             // An identity imported before public metadata existed
                             // stays usable. Obtain its public half on the same
@@ -194,8 +229,6 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         let status = SecItemCopyMatching(query as CFDictionary, &item)
                         try Self.worker.check(requestID)
                         guard status == errSecSuccess, let attributes = item as? [String: Any],
-                              let metadata = attributes[kSecAttrGeneric as String] as? Data,
-                              metadata == Data(authorization.fingerprint.utf8),
                               var container = attributes[kSecValueData as String] as? Data,
                               !container.isEmpty, container.count <= FTLimit.key else {
                             throw SSHAuthenticationError.denied
@@ -203,6 +236,8 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         // Foundation and Security may retain other copies. This
                         // clears the owned buffer, not a forensic-erasure promise.
                         defer { container.resetBytes(in: 0..<container.count) }
+                        let metadata = try AppleWorkspaceVault.metadata(attributes: attributes)
+                        guard metadata.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
                         let value: Data
                         switch operation {
                         case .publicIdentity:
@@ -210,8 +245,12 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                             guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
                                 throw SSHAuthenticationError.identityMismatch
                             }
+                            guard metadata.identity.map({ $0 == identity }) ?? true else { throw SSHAuthenticationError.identityMismatch }
                             value = identity.blob
                         case .signature(let challenge):
+                            guard metadata.identity.map({ $0.blob == challenge.publicBlob }) ?? true else {
+                                throw SSHAuthenticationError.identityMismatch
+                            }
                             value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
                         }
                         try Self.worker.check(requestID)
