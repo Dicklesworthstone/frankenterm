@@ -36,8 +36,8 @@ struct FrankenTermExportApp: App {
 }
 
 /// File reads, parsing, key validation, compression and encryption remain off UI.
-/// SSH source selection reads only the chosen config, its referenced public
-/// identities, and the user's known_hosts. Private files require a separate pick.
+/// SSH source selection reads the chosen user config, bounded local includes,
+/// referenced public identities, and known_hosts. Private keys need a separate pick.
 private actor MacExportEngine {
     struct Prepared: Sendable {
         let comparison: String, pages: Int, bytes: Int
@@ -104,7 +104,7 @@ private actor MacExportEngine {
     func inspectSSHConfiguration(_ url: URL) throws -> [String] {
         retireKeyRequest(); invalidateExport()
         sshSource = nil
-        let source = try SSHWorkspaceSource(configuration: SelectedLocalFile.read(url, limit: SSHWorkspaceSource.maximumSourceBytes))
+        let source = try SSHWorkspaceSource.loadUserConfiguration(url)
         guard !source.aliases.isEmpty else { throw FTError.unsupported("ssh.no_concrete_hosts") }
         try Task.checkCancellation()
         sshSource = (source, url)
@@ -541,7 +541,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-        panel.message = "Choose an SSH config, then select its hosts. This reads matching public .pub files and ~/.ssh/known_hosts. Private keys are chosen separately; commands and Include files are not evaluated."
+        panel.message = "Choose a user SSH config, then select its hosts. Local Include files (including * and ? patterns), matching public .pub files, and ~/.ssh/known_hosts are read within fixed limits. Relative Include paths use ~/.ssh. Commands and Match conditions are never executed; private keys are chosen separately."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
@@ -884,6 +884,18 @@ private final class MacExportModel {
                 message = "This protected key uses an unsupported format. Source unlocking supports OpenSSH bcrypt with AES-128-CTR or AES-256-CTR."
             } else if error == .limit("source_key.passphrase") {
                 message = "Enter a passphrase between 1 and 1,024 UTF-8 bytes."
+            } else if error == .malformed("ssh.include_cycle") {
+                message = "The selected SSH configuration includes itself through a file cycle. Resolve the cycle, then select the configuration again. No partial host list was imported."
+            } else if error == .unsupported("ssh.include_permissions") {
+                message = "An SSH configuration file has unsafe ownership or is writable by a group or other users. Use a source owned by you or the system with those write permissions removed."
+            } else if error == .unsupported("ssh.include_not_local") {
+                message = "An included SSH configuration is on a network volume or is not downloaded locally. Choose an already-local configuration before offline export."
+            } else if error == .unsupported("ssh.include_file") || error == .unsupported("ssh.include_directory") {
+                message = "An included SSH configuration could not be read. Check local access and permissions; symbolic links in Include paths are not followed. No partial host list was imported."
+            } else if [.limit("ssh.include_bytes"), .limit("ssh.include_lines"), .limit("ssh.include_files_or_depth"),
+                       .limit("ssh.include_matches"), .limit("ssh.include_directory_entries"), .limit("ssh.include_patterns"),
+                       .limit("ssh.include_path_depth"), .limit("ssh.include_file")].contains(error) {
+                message = "The SSH configuration exceeds the bounded Include profile: 64 file reads, eight nested includes, 2 MiB of source, 16,384 lines, and 16,384 scanned directory entries. Choose a smaller explicit configuration; no partial source was imported."
             } else if error == .limit("animation.use_live_transfer") {
                 message = "This package exceeds the 256-symbol saved-animation limit. Use live QR playback or save the encrypted .ftairgap file. No settings or keys were omitted."
             } else if error == .limit("video.use_live_transfer") {

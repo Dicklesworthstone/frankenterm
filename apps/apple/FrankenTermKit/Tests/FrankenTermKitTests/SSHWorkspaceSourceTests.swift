@@ -39,6 +39,167 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         try route.jumpRoutes.map { id in try XCTUnwrap(document.routes.first { $0.id == id }) }
     }
 
+    private func configurationFiles(_ files: [String: String]) throws -> URL {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("ft-ssh-includes-" + UUID().uuidString)
+            .resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+        for (path, text) in files {
+            let destination = home.appendingPathComponent(".ssh").appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: destination)
+        }
+        return home
+    }
+
+    private func loadFiles(_ home: URL, root: String = "config") throws -> SSHWorkspaceSource {
+        try SSHWorkspaceSource.loadUserConfiguration(home.appendingPathComponent(".ssh").appendingPathComponent(root), homeDirectory: home)
+    }
+
+    private func exportSource(_ source: SSHWorkspaceSource) throws -> SSHWorkspaceExport {
+        var registry = SSHWorkspaceRegistry()
+        return try source.export(aliases: source.aliases, workspaceName: "Included hosts", defaultUser: "fallback",
+                                 registry: &registry, using: crypto)
+    }
+
+    func testLocalIncludeInventoryLexicalOrderAndFrozenSource() throws {
+        let home = try configurationFiles([
+            "config": "Include conf.d/*.conf\nHost *\nIdentityFile none\n",
+            "conf.d/20-beta.conf": "Host beta\nHostName beta.example.invalid\nUser beta-user\n",
+            "conf.d/10-alpha.conf": "Host alpha\nHostName alpha.example.invalid\nUser alpha-user\n",
+            "conf.d/.hidden.conf": "Host hidden\n"
+        ])
+        let loaded = try loadFiles(home)
+        XCTAssertEqual(loaded.aliases, ["alpha", "beta"])
+        let first = try exportSource(loaded)
+        XCTAssertEqual(first.workspace.routes.map(\.host), ["alpha.example.invalid", "beta.example.invalid"])
+        XCTAssertTrue(first.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+        XCTAssertFalse(first.portability.contains { $0.setting == "ssh_config.include" })
+        try Data("Host alpha\nHostName changed.example.invalid\n".utf8).write(to: home.appendingPathComponent(".ssh/conf.d/10-alpha.conf"))
+        XCTAssertEqual(try exportSource(loaded).workspace.routes[0].host, "alpha.example.invalid", "A source selection is frozen before the host picker opens.")
+        let changed = try exportSource(loadFiles(home))
+        let firstSource = try StrictJSON.decode(first.workspace.raw).object().required("source").object()
+        let changedSource = try StrictJSON.decode(changed.workspace.raw).object().required("source").object()
+        XCTAssertNotEqual(firstSource["configuration_revision"], changedSource["configuration_revision"], "Included bytes participate in the source revision.")
+    }
+
+    func testIncludedHostConditionsCannotEscapeAndParentResumesForEveryFile() throws {
+        let home = try configurationFiles([
+            "config": "Host alpha beta\nInclude conf.d/*.conf\nUser outer\nHost gamma\nUser gamma-user\nHost *\nIdentityFile none\n",
+            "conf.d/10-hosts.conf": "Host alpha\nUser alpha-user\nHost *\nPort 2200\nHost unreachable\nHostName must-not-appear.invalid\n",
+            "conf.d/20-defaults.conf": "User included-default\n"
+        ])
+        let loaded = try loadFiles(home)
+        XCTAssertEqual(loaded.aliases, ["alpha", "beta", "gamma"])
+        let result = try exportSource(loaded)
+        XCTAssertEqual(result.workspace.routes.map(\.user), ["alpha-user", "included-default", "gamma-user"])
+        XCTAssertEqual(result.workspace.routes.map(\.port), [2200, 2200, 22])
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
+    func testNestedIncludeUsesUserSSHDirectoryAndRestoresOuterHost() throws {
+        let home = try configurationFiles([
+            "config": "Include conf.d/hosts.conf\nHost gamma\nIdentityFile none\n",
+            "conf.d/hosts.conf": "Host alpha\nInclude shared.conf\nUser outer\nHost beta\nUser beta-user\n",
+            "shared.conf": "User shared-user\nHost *\nPort 2222\n",
+            "conf.d/shared.conf": "User wrong-directory\nPort 9999\n"
+        ])
+        let result = try exportSource(loadFiles(home))
+        XCTAssertEqual(result.workspace.machines.map(\.name), ["alpha", "beta", "gamma"])
+        XCTAssertEqual(result.workspace.routes.map(\.user), ["shared-user", "beta-user", "fallback"])
+        XCTAssertEqual(result.workspace.routes.map(\.port), [2222, 22, 22])
+    }
+
+    func testIncludeMultiplePathsTildeQuestionMarkDotAndMissingMatches() throws {
+        let home = try configurationFiles([
+            "config": "Include missing/*.conf missing-file ~/../unsupported\nInclude \"with space.conf\" ~/.ssh/team?.conf .hidden/*.conf\nHost *\nIdentityFile none\n",
+            "with space.conf": "Host first\nUser first-user\n",
+            "team1.conf": "Host second\n",
+            "team10.conf": "Host must-not-match\n",
+            ".hidden/host.conf": "Host third\n"
+        ])
+        let result = try exportSource(loadFiles(home))
+        XCTAssertEqual(result.workspace.machines.map(\.name), ["first", "second", "third"])
+        XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.include" && $0.disposition == 1 })
+        XCTAssertTrue(result.workspace.routes.allSatisfy { !$0.requiredCapabilities.isEmpty })
+    }
+
+    func testUnmatchedIncludeIsNoOpButMatchAndDynamicPathsRemainBlocked() throws {
+        let empty = try configurationFiles(["config": "Include absent*.conf missing/subdir/*.conf missing.conf\nHost build\nIdentityFile none\n"])
+        let unblocked = try exportSource(loadFiles(empty))
+        XCTAssertTrue(unblocked.workspace.routes[0].requiredCapabilities.isEmpty)
+        for include in ["%h.conf", "${HOME}/secret.conf", "~someone/config", "[ab].conf", "escaped\\*.conf"] {
+            let home = try configurationFiles(["config": "Include \(include)\nHost build\nIdentityFile none\n"])
+            let result = try exportSource(loadFiles(home))
+            XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.include" && $0.disposition == 1 }, include)
+        }
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("ft-include-no-exec-" + UUID().uuidString)
+        let home = try configurationFiles([
+            "config": "Include hosts.conf\nHost build\nIdentityFile none\n",
+            "hosts.conf": "Match exec \"touch \(marker.path)\"\nInclude never-read.conf\nHost build\nUser included-user\n",
+            "never-read.conf": "This deliberately is not a valid SSH file\n"
+        ])
+        let result = try exportSource(loadFiles(home))
+        XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.match" && $0.disposition == 1 })
+        XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.include" && $0.disposition == 1 })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testIncludeRejectsCyclesSymlinksAndUnsafePermissions() throws {
+        let cycle = try configurationFiles(["config": "Include second.conf\nHost build\n", "second.conf": "Include config\n"])
+        XCTAssertThrowsError(try loadFiles(cycle)) { XCTAssertEqual($0 as? FTError, .malformed("ssh.include_cycle")) }
+        let hardLink = try configurationFiles(["config": "Include again.conf\nHost build\n"])
+        try FileManager.default.linkItem(at: hardLink.appendingPathComponent(".ssh/config"), to: hardLink.appendingPathComponent(".ssh/again.conf"))
+        XCTAssertThrowsError(try loadFiles(hardLink)) { XCTAssertEqual($0 as? FTError, .malformed("ssh.include_cycle")) }
+        for directory in [false, true] {
+            let home = try configurationFiles(["config": "Include \(directory ? "linked/*.conf" : "linked.conf")\nHost build\n", "actual/host.conf": "Host other\n"])
+            let target = home.appendingPathComponent(directory ? ".ssh/actual" : ".ssh/actual/host.conf")
+            try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(directory ? ".ssh/linked" : ".ssh/linked.conf"), withDestinationURL: target)
+            XCTAssertThrowsError(try loadFiles(home)) { XCTAssertEqual($0 as? FTError, .unsupported("ssh.include_file")) }
+        }
+        let writable = try configurationFiles(["config": "Include writable.conf\nHost build\n", "writable.conf": "User bad-permissions\n"])
+        try FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: writable.appendingPathComponent(".ssh/writable.conf").path)
+        XCTAssertThrowsError(try loadFiles(writable)) { XCTAssertEqual($0 as? FTError, .unsupported("ssh.include_permissions")) }
+    }
+
+    func testIncludeDepthAndAggregateFileAdmissionAreBounded() throws {
+        var depth: [String: String] = ["config": "Include depth1.conf\nHost build\n"]
+        for index in 1...9 { depth["depth\(index).conf"] = index < 9 ? "Include depth\(index + 1).conf\n" : "User deep\n" }
+        XCTAssertThrowsError(try loadFiles(configurationFiles(depth))) {
+            XCTAssertEqual($0 as? FTError, .limit("ssh.include_files_or_depth"))
+        }
+        var files = ["config": "Include nodes/*.conf\nHost build\n"]
+        for index in 0..<64 { files["nodes/\(index).conf"] = "IdentityFile none\n" }
+        XCTAssertThrowsError(try loadFiles(configurationFiles(files))) {
+            XCTAssertEqual($0 as? FTError, .limit("ssh.include_files_or_depth"))
+        }
+        let line = "#" + String(repeating: "x", count: 4094) + "\n"
+        let extent = String(repeating: line, count: 260)
+        let large = try configurationFiles(["config": "Include first.conf second.conf\nHost build\n", "first.conf": extent, "second.conf": extent])
+        XCTAssertThrowsError(try loadFiles(large)) { XCTAssertEqual($0 as? FTError, .limit("ssh.include_file")) }
+    }
+
+    func testRepeatedIncludeIsAllowedAndConditionalIdentityOrderSurvivesArchive() throws {
+        let home = try configurationFiles([
+            "config": "Host build gpu\nInclude identity.conf\nHost build\nInclude identity.conf\nHost *\nIdentityFile ~/.ssh/second\n",
+            "identity.conf": "IdentityFile ~/.ssh/first\nPreferredAuthentications publickey\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+        ])
+        let source = try loadFiles(home)
+        XCTAssertEqual(try source.identityFileReferences(for: ["gpu", "build"]), ["~/.ssh/first", "~/.ssh/second"])
+        var registry = SSHWorkspaceRegistry()
+        let result = try source.export(aliases: source.aliases, workspaceName: "Split configuration", defaultUser: "operator",
+            publicKeys: ["~/.ssh/first": try publicFile(), "~/.ssh/second": try publicFile(42)],
+            knownHosts: Data(try hostLine("build,gpu", seed: 64).utf8), registry: &registry, using: crypto)
+        let original = try sampleKey(using: crypto).0
+        let selected = try XCTUnwrap(result.workspace.credentials.first { $0.algorithm == "ssh-ed25519" })
+        let key = PrivateKeyRecord(credentialID: selected.id, container: original.container, publicBlob: original.publicBlob)
+        let archive = try AirGapArchive(workspace: result.workspace, keys: [key], portability: result.portability, using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.raw, result.workspace.raw)
+        XCTAssertEqual(restored.keys.count, 1)
+        XCTAssertTrue(restored.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
     func testConcreteInventoryFirstValueWildcardNegationAndIdentityOrder() throws {
         let input = try source("""
         User global-first

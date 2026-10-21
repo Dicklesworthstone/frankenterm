@@ -48,8 +48,9 @@ public struct SSHWorkspaceExport: Sendable {
 }
 
 /// A bounded, passive export of an explicitly selected SSH configuration file.
-/// This is deliberately not `ssh -G`: Include, Match, local commands, environment
-/// expansion, DNS, agent queries, and filesystem discovery are never evaluated.
+/// This is deliberately not `ssh -G`: Match, local commands, environment
+/// expansion, DNS and agent queries are never evaluated. The file entry point
+/// resolves a bounded set of declarative Include files without executing SSH.
 /// Unsupported effective semantics keep the affected route visibly inactive.
 public struct SSHWorkspaceSource: Sendable {
     public static let maximumSourceBytes = 2 * 1024 * 1024
@@ -57,6 +58,9 @@ public struct SSHWorkspaceSource: Sendable {
     public static let maximumAliases = 512
     public static let maximumExpandedJumpHosts = 3
     public static let maximumKnownHostHashComparisons = 131_072
+    public static let maximumIncludedFiles = 64
+    public static let maximumIncludeDepth = 8
+    public static let maximumIncludeDirectoryEntries = 16_384
     public let aliases: [String]
     private let configuration: Data
     private let directives: [Directive]
@@ -64,7 +68,7 @@ public struct SSHWorkspaceSource: Sendable {
 
     private struct Directive: Sendable {
         let section: Int
-        let patterns: [String], keyword: String, arguments: [String]
+        let conditions: [[String]], keyword: String, arguments: [String]
     }
     private struct Problem: Sendable {
         let setting: String, reason: String
@@ -131,43 +135,260 @@ public struct SSHWorkspaceSource: Sendable {
     }
 
     public init(configuration: Data) throws {
-        let lines = try Self.lines(configuration, site: "ssh.config")
+        var parser = ConfigurationParser(homeDirectory: nil)
+        try parser.parse(configuration, conditions: [], depth: 0)
+        self.init(parser: parser)
+    }
+
+    /// The selected file is a USER configuration, including when it lives outside
+    /// ~/.ssh. OpenSSH resolves every relative Include against ~/.ssh, not against
+    /// the containing file. Only already-local files are admitted. Paths with
+    /// tokens, environment variables, named-user tildes or unsupported glob syntax
+    /// remain visible required omissions; no executable resolution is attempted.
+    public static func loadUserConfiguration(_ url: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> SSHWorkspaceSource {
+        guard url.isFileURL, homeDirectory.isFileURL else { throw FTError.malformed("ssh.include_path") }
+        let home = homeDirectory.resolvingSymlinksInPath().standardizedFileURL
+        var parser = ConfigurationParser(homeDirectory: home)
+        #if os(macOS) || os(iOS)
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        #endif
+        try parser.load(url.resolvingSymlinksInPath().standardizedFileURL, conditions: [], depth: 0, required: true)
+        return SSHWorkspaceSource(parser: parser)
+    }
+
+    private init(parser: ConfigurationParser) {
+        configuration = parser.snapshot; aliases = parser.aliases
+        directives = parser.directives; globalProblems = parser.problems
+    }
+
+    private struct ConfigurationParser {
+        let homeDirectory: URL?
         var aliases: [String] = [], seen = Set<String>()
         var directives: [Directive] = [], problems: [Problem] = []
-        var patterns = ["*"], inMatch = false, section = 0
-        for line in lines {
-            guard let (keyword, arguments) = try Self.directive(line) else { continue }
-            switch keyword {
-            case "host":
-                guard arguments.count <= 128, arguments.allSatisfy({ $0.utf8.count <= 254 }) else { throw FTError.limit("ssh.host_patterns") }
-                patterns = arguments; inMatch = false; section += 1
-                for alias in arguments where !alias.hasPrefix("!") && !alias.contains("*") && !alias.contains("?") {
-                    guard !alias.isEmpty, alias.utf8.count <= 253,
-                          !alias.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),
-                          !alias.contains("/"), !alias.contains("\\"), !alias.contains("@"),
-                          !alias.contains(","), !alias.contains("%"), !alias.contains("$") else {
-                        throw FTError.malformed("ssh.host_alias")
-                    }
-                    if seen.insert(alias).inserted { aliases.append(alias) }
-                    guard aliases.count <= Self.maximumAliases else { throw FTError.limit("ssh.aliases") }
-                }
-            case "match":
-                inMatch = true
-                if !problems.contains(where: { $0.setting == "match" }) {
-                    problems.append(Problem("match", "Match conditions and final/canonical passes were not evaluated. Resolve this route from a trusted live snapshot before using it."))
-                }
-            case "include":
-                // An included file can change the parsing context as well as values.
-                // Without reading it, narrowing its effect to one Host is unsafe.
-                if !problems.contains(where: { $0.setting == "include" }) {
-                    problems.append(Problem("include", "Included configuration was not read. Its endpoints, identities, and required security policies remain unresolved."))
-                }
-            default:
-                if !inMatch { directives.append(Directive(section: section, patterns: patterns, keyword: keyword, arguments: arguments)) }
+        var snapshot = Data("FrankenTerm/SSH-configuration-snapshot/v1\0".utf8)
+        var sourceBytes = 0, sourceLines = 0, fileCount = 0, section = 0
+        var directoryEntries = 0, includePatterns = 0, globBudget = MatchBudget()
+        var activeFiles = Set<FileIdentity>()
+
+        struct FileIdentity: Hashable { let device: UInt64, inode: UInt64 }
+
+        mutating func unresolvedInclude(_ reason: String) {
+            if !problems.contains(where: { $0.setting == "include" }) {
+                problems.append(Problem("include", reason))
             }
         }
-        self.configuration = configuration; self.aliases = aliases
-        self.directives = directives; globalProblems = problems
+
+        mutating func parse(_ data: Data, conditions: [[String]], depth: Int) throws {
+            try Task.checkCancellation()
+            guard sourceBytes <= maximumSourceBytes - data.count else { throw FTError.limit("ssh.include_bytes") }
+            sourceBytes += data.count
+            let lines = try SSHWorkspaceSource.lines(data, site: "ssh.config")
+            guard sourceLines <= maximumLines - lines.count else { throw FTError.limit("ssh.include_lines") }
+            sourceLines += lines.count
+            snapshot.appendBE(UInt64(data.count), bytes: 4); snapshot += data
+            var patterns = ["*"], inMatch = false
+            section += 1
+            var currentSection = section
+            for line in lines {
+                try Task.checkCancellation()
+                guard let (keyword, arguments) = try SSHWorkspaceSource.directive(line) else { continue }
+                switch keyword {
+                case "host":
+                    guard arguments.count <= 128, arguments.allSatisfy({ $0.utf8.count <= 254 }) else { throw FTError.limit("ssh.host_patterns") }
+                    patterns = arguments; inMatch = false; section += 1; currentSection = section
+                    for alias in arguments where !alias.hasPrefix("!") && !alias.contains("*") && !alias.contains("?") {
+                        guard !alias.isEmpty, alias.utf8.count <= 253,
+                              !alias.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),
+                              !alias.contains("/"), !alias.contains("\\"), !alias.contains("@"),
+                              !alias.contains(","), !alias.contains("%"), !alias.contains("$") else {
+                            throw FTError.malformed("ssh.host_alias")
+                        }
+                        var eligible = true
+                        for condition in conditions {
+                            if try !SSHWorkspaceSource.matches(alias, patterns: condition, budget: &globBudget) { eligible = false; break }
+                        }
+                        if eligible, seen.insert(alias).inserted { aliases.append(alias) }
+                        guard aliases.count <= maximumAliases else { throw FTError.limit("ssh.aliases") }
+                    }
+                case "match":
+                    inMatch = true
+                    if !problems.contains(where: { $0.setting == "match" }) {
+                        problems.append(Problem("match", "Match conditions and final/canonical passes were not evaluated. Resolve this route from a trusted live snapshot before using it."))
+                    }
+                case "include":
+                    guard homeDirectory != nil, !inMatch else {
+                        unresolvedInclude("Included configuration was not resolved in this source context. Its endpoints, identities, and required security policies remain unresolved.")
+                        continue
+                    }
+                    for argument in arguments {
+                        guard includePatterns < 256 else { throw FTError.limit("ssh.include_patterns") }
+                        includePatterns += 1
+                        guard let pattern = includePath(argument) else {
+                            unresolvedInclude("An Include path requires unsupported token, environment, named-user, parent-directory, bracket or escape expansion. No command was run and affected routes remain inactive.")
+                            continue
+                        }
+                        for included in try files(matching: pattern) {
+                            // OpenSSH restores the containing Host/Match state
+                            // after EACH included file. A Host * inside a file
+                            // cannot escape the condition on its Include line.
+                            try load(included, conditions: conditions + [patterns], depth: depth + 1)
+                        }
+                    }
+                default:
+                    if !inMatch {
+                        directives.append(Directive(section: currentSection, conditions: conditions + [patterns],
+                                                    keyword: keyword, arguments: arguments))
+                    }
+                }
+            }
+        }
+
+        func includePath(_ argument: String) -> URL? {
+            guard let homeDirectory, !argument.isEmpty, argument.utf8.count <= FTLimit.text,
+                  !argument.contains("%"), !argument.contains("$"), !argument.contains("\\"),
+                  !argument.contains("["), !argument.contains("]"),
+                  !argument.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+                  !argument.split(separator: "/").contains("..") else { return nil }
+            if argument.hasPrefix("~/") { return homeDirectory.appendingPathComponent(String(argument.dropFirst(2))) }
+            if argument.hasPrefix("~") { return nil }
+            if argument.hasPrefix("/") { return URL(fileURLWithPath: argument) }
+            return homeDirectory.appendingPathComponent(".ssh").appendingPathComponent(argument)
+        }
+
+        mutating func files(matching pattern: URL) throws -> [URL] {
+            let components = pattern.pathComponents.filter { $0 != "/" && $0 != "." }
+            guard !components.isEmpty, components.count <= 32 else { throw FTError.limit("ssh.include_path_depth") }
+            var candidates = [URL(fileURLWithPath: "/", isDirectory: true)]
+            for component in components {
+                try Task.checkCancellation()
+                var next: [URL] = []
+                for directory in candidates {
+                    if component.contains("*") || component.contains("?") {
+                        for name in try directoryNames(directory) {
+                            if name.hasPrefix("."), !component.hasPrefix(".") { continue }
+                            if try SSHWorkspaceSource.glob(name, component, budget: &globBudget) {
+                                next.append(directory.appendingPathComponent(name))
+                            }
+                        }
+                    } else { next.append(directory.appendingPathComponent(component)) }
+                    guard next.count <= maximumIncludedFiles else { throw FTError.limit("ssh.include_matches") }
+                }
+                candidates = next
+            }
+            // POSIX glob's C lexical order, stable regardless of directory order.
+            return candidates.sorted { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
+        }
+
+        mutating func directoryNames(_ url: URL) throws -> [String] {
+            guard let descriptor = try Self.openLocal(url, directory: true) else { return [] }
+            guard let directory = fdopendir(descriptor) else { close(descriptor); throw FTError.unsupported("ssh.include_directory") }
+            defer { closedir(directory) }
+            var result: [String] = []
+            while true {
+                try Task.checkCancellation()
+                errno = 0
+                guard let entry = readdir(directory) else {
+                    guard errno == 0 else { throw FTError.unsupported("ssh.include_directory") }
+                    break
+                }
+                guard directoryEntries < maximumIncludeDirectoryEntries else { throw FTError.limit("ssh.include_directory_entries") }
+                directoryEntries += 1
+                let nameCapacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
+                let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: nameCapacity) { String(validatingCString: $0) }
+                }
+                guard let name else { throw FTError.malformed("ssh.include_filename") }
+                if name != ".", name != ".." { result.append(name) }
+            }
+            return result
+        }
+
+        static func requireLocal(_ url: URL) throws {
+            #if os(macOS) || os(iOS)
+            let values = try url.resourceValues(forKeys: [.volumeIsLocalKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+            guard values.volumeIsLocal == true,
+                  values.isUbiquitousItem != true || values.ubiquitousItemDownloadingStatus == .current else {
+                throw FTError.unsupported("ssh.include_not_local")
+            }
+            #endif
+        }
+
+        /// Walk from a held directory descriptor; O_NOFOLLOW applies to EVERY
+        /// path component, so an included symlink cannot evade cycle/locality
+        /// checks by pointing at a different directory or a special file.
+        static func openLocal(_ url: URL, directory: Bool) throws -> Int32? {
+            let components = url.pathComponents.filter { $0 != "/" && $0 != "." }
+            guard !components.contains(".."), components.count <= 32 else { throw FTError.malformed("ssh.include_path") }
+            var current = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            guard current >= 0 else { throw FTError.unsupported("ssh.include_directory") }
+            defer { if current >= 0 { close(current) } }
+            var path = URL(fileURLWithPath: "/", isDirectory: true)
+            for (index, component) in components.enumerated() {
+                try Task.checkCancellation()
+                path.appendPathComponent(component)
+                do { try requireLocal(path) }
+                catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return nil }
+                let needsDirectory = directory || index < components.count - 1
+                let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | (needsDirectory ? O_DIRECTORY : 0)
+                let next = component.withCString { openat(current, $0, flags) }
+                if next < 0 {
+                    let code = errno
+                    if code == ENOENT { return nil }
+                    if code == ENOTDIR {
+                        var metadata = stat()
+                        let status = component.withCString { fstatat(current, $0, &metadata, AT_SYMLINK_NOFOLLOW) }
+                        if status == 0, metadata.st_mode & S_IFMT != S_IFLNK { return nil }
+                    }
+                    throw FTError.unsupported("ssh.include_file")
+                }
+                close(current); current = next
+            }
+            let result = current; current = -1
+            return result
+        }
+
+        mutating func load(_ url: URL, conditions: [[String]], depth: Int, required: Bool = false) throws {
+            try Task.checkCancellation()
+            guard depth <= maximumIncludeDepth, fileCount < maximumIncludedFiles else { throw FTError.limit("ssh.include_files_or_depth") }
+            // A file URL does not authorize network-backed or cloud-placeholder
+            // reads. Reject symbolic links rather than silently changing sources.
+            guard let descriptor = try Self.openLocal(url, directory: false) else {
+                if required { throw FTError.unsupported("ssh.include_file") }
+                return
+            }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+            defer { try? handle.close() }
+            var before = stat()
+            guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
+                  before.st_size >= 0, before.st_size <= maximumSourceBytes - sourceBytes else { throw FTError.limit("ssh.include_file") }
+            guard (before.st_uid == getuid() || before.st_uid == 0), before.st_mode & 0o022 == 0 else { throw FTError.unsupported("ssh.include_permissions") }
+            let identity = FileIdentity(device: UInt64(truncatingIfNeeded: before.st_dev), inode: UInt64(truncatingIfNeeded: before.st_ino))
+            guard activeFiles.insert(identity).inserted else { throw FTError.malformed("ssh.include_cycle") }
+            defer { activeFiles.remove(identity) }
+            fileCount += 1
+            var data = Data()
+            let remaining = maximumSourceBytes - sourceBytes
+            while let chunk = try handle.read(upToCount: min(65_536, remaining + 1 - data.count)), !chunk.isEmpty {
+                try Task.checkCancellation()
+                guard chunk.count <= remaining - data.count else { throw FTError.limit("ssh.include_bytes") }
+                data += chunk
+            }
+            var after = stat()
+            guard fstat(descriptor, &after) == 0, after.st_size == before.st_size, data.count == before.st_size else { throw FTError.stale }
+            #if canImport(Darwin)
+            guard before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+                  before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw FTError.stale }
+            #else
+            guard before.st_mtim.tv_sec == after.st_mtim.tv_sec, before.st_mtim.tv_nsec == after.st_mtim.tv_nsec,
+                  before.st_ctim.tv_sec == after.st_ctim.tv_sec, before.st_ctim.tv_nsec == after.st_ctim.tv_nsec else { throw FTError.stale }
+            #endif
+            let name = Data(url.path.utf8)
+            guard name.count <= FTLimit.text else { throw FTError.limit("ssh.include_path") }
+            snapshot.appendBE(UInt64(name.count), bytes: 4); snapshot += name
+            try parse(data, conditions: conditions, depth: depth)
+        }
     }
 
     /// Returns references from the selected concrete aliases and their complete
@@ -434,7 +655,11 @@ public struct SSHWorkspaceSource: Sendable {
             let matched: Bool
             if let cached = matchedSections[directive.section] { matched = cached }
             else {
-                matched = try Self.matches(alias, patterns: directive.patterns, budget: &budget)
+                var all = true
+                for patterns in directive.conditions {
+                    if try !Self.matches(alias, patterns: patterns, budget: &budget) { all = false; break }
+                }
+                matched = all
                 matchedSections[directive.section] = matched
             }
             guard matched else { continue }
