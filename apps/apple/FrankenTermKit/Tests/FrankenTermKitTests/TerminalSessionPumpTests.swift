@@ -79,6 +79,7 @@ private actor PumpConsumer: TerminalSessionConsumer {
     private var eof = false
     private var failureOnOutput = false, failureOnOutcomes = false
     private var thresholds: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var outcomeThresholds: [(Int, CheckedContinuation<Void, Never>)] = []
     private let outputHold: SessionTestGate?
     let outputEntered = SessionTestGate()
     let outcomesEntered = SessionTestGate()
@@ -106,10 +107,17 @@ private actor PumpConsumer: TerminalSessionConsumer {
         if failureOnOutcomes { throw TerminalInputError.unavailable }
         guard values.allSatisfy({ $0.receipt.source == source }) else { throw TerminalInputError.stale }
         outcomes += values
+        let ready = outcomeThresholds.filter { outcomes.count >= $0.0 }
+        outcomeThresholds.removeAll { outcomes.count >= $0.0 }
+        for (_, continuation) in ready { continuation.resume() }
     }
     func waitForBytes(_ count: Int) async {
         if output.count >= count { return }
         await withCheckedContinuation { thresholds.append((count, $0)) }
+    }
+    func waitForOutcomes(_ count: Int) async {
+        if outcomes.count >= count { return }
+        await withCheckedContinuation { outcomeThresholds.append((count, $0)) }
     }
     func stats() -> (Data, [TerminalSource], [TerminalInputOutcome], Bool, TerminalSessionGeometry?) {
         (output, sources, outcomes, eof, resize)
@@ -255,15 +263,15 @@ final class TerminalSessionPumpTests: XCTestCase {
         }
         let sink = PumpConsumer()
         let run = Task { try await pump.run(consumer: sink) }
-        for _ in 0..<10_000 {
-            if await sink.stats().2.count == 200 { break }
-            await Task.yield()
-        }
+        await sink.waitForOutcomes(200)
+        // Delivery and acknowledgement are distinct actor turns. Join the pump
+        // after delivery; it must acknowledge a successful callback even if this
+        // cancellation arrives before the acknowledgement message is scheduled.
+        pump.requestStop(); _ = try await run.value
         let stats = await sink.stats()
         XCTAssertEqual(stats.2.count, 200)
         let accounting = await coordinator.accounting()
         XCTAssertEqual(accounting.retainedRecords, 0)
-        pump.requestStop(); _ = try await run.value
         let native = await transport.stats()
         XCTAssertEqual(native.3, 0)
         XCTAssertLessThan(native.1, 20)
@@ -294,12 +302,18 @@ final class TerminalSessionPumpTests: XCTestCase {
         let closeRelease = SessionTestGate(), consumerRelease = SessionTestGate()
         let coordinator = try TerminalInputCoordinator(), transport = try PumpTransport(closeRelease: closeRelease)
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
+        let blank = try await coordinator.makeStream(sceneID: UUID())
+        let focus = try await coordinator.changeFocus(blank, to: pump.source)
         let sink = PumpConsumer(outputHold: consumerRelease)
         await transport.inject(.init(output: Data("held".utf8)))
         let run = Task { try await pump.run(consumer: sink) }
         await sink.outputEntered.wait()
         run.cancel()
         await transport.closedGate.wait()
+        // The consumer is STILL suspended. Stop must already have closed
+        // admission, not merely the underlying network descriptor.
+        do { _ = try await coordinator.submit(focus, encodedBytes: Data("too late".utf8)); XCTFail("input admitted after stop") }
+        catch let error as TerminalInputError { XCTAssertEqual(error, .unavailable) }
         await closeRelease.release()
         await consumerRelease.release()
         let end = try await run.value

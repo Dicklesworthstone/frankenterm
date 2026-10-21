@@ -11,7 +11,7 @@ The offline workspace browser does not yet enable this backend. An authorized
 Apple build must supply the correct iOS/device/simulator libssh2 and crypto
 artifacts, integrate the workspace-policy/signing broker and canonical terminal
 bridge, and qualify the resulting app. A system macOS libssh2 is NOT an iOS
-library. No library is downloaded, built by Cargo, or bundled by this package.
+library. No libssh2 artifact is downloaded, built by Cargo, or bundled here.
 Do not substitute a Homebrew desktop dylib into an iPhone artifact. Release
 artifacts remain subject to DSR and development Rust proof remains subject to RCH.
 
@@ -152,7 +152,7 @@ the workspace's IDNA/trust canonicalization. It does not implement proxy-command
 execution, jump hosts, automatic reconnect, permission UI or session routing.
 Those remain separate features with explicit authority and continuity contracts.
 
-## Combined Swift validation
+## Original session and connector validation
 
 Ten Swift XCTest cases pass with warnings-as-errors, including 64 repeated
 concurrent-close cycles with fd accounting, stalled handshakes, cancellation,
@@ -186,3 +186,87 @@ runtime downloads. No Apple SDK typecheck, Keychain prompt or physical-device
 qualification is inferred from Linux execution. Supply platform-correct native
 artifacts and perform the remaining session-owner/terminal integration before
 enabling Connect in the app.
+
+## Joined terminal input and streaming output
+
+The opt-in `FrankenTermSSHIntegration` product now joins this native session to
+`FrankenTermKit.TerminalInputCoordinator` and `TerminalSessionPump`. It depends on
+the existing local kit, not a second implementation of terminal semantics. Apple
+builds use the kit's system dependencies; Linux package builds also resolve its
+existing pinned Swift Crypto dependency. No network or native dependency is added
+to the offline application's Xcode target by this product's mere existence.
+
+After explicit authentication, shell creation and preparation of the app's
+content-free durable uncertainty marker, call
+`NativeSSHTerminalChannel.attach(session:identity:coordinator:)`. It verifies the
+transport ID, claims that live channel exactly once, and returns the source-owned
+pump. Authentication alone is insufficient. An existing channel with unbound
+input, output servicing or resize work cannot be relabeled as a new source. A
+wrong transport or competing claim does not close another owner's connection.
+After claiming, ordinary unbound `admit`, `service`, and `requestResize` calls are
+refused; the matching channel ID must accompany those operations.
+
+Run `pump.run(consumer:)` in one retained task. The canonical terminal adapter
+implements `TerminalSessionConsumer`, consuming each bounded output chunk before
+returning, publishing its actual shared-core frames, and routing answerbacks
+through the same coordinator and source. This module does not parse ANSI, encode
+keys, manufacture frames, or echo input locally. UIKit's existing keyboard session
+continues to submit through the coordinator. No separate per-key wake task is
+needed: admission and cancellation signal one coalescing mailbox automatically.
+
+The pump's single wake child interrupts idle native service with a latched work
+bit. Native service still makes a bounded network-progress pass before returning
+for that bit. The input loop leases at most eight chunks before servicing output;
+one blocked source or consumer cannot own another source's pump. Resize proposals
+use `requestResize(_:channelID:)` on the same session. The consumer receives its
+local completion with the original source; it is not a remote geometry ACK.
+
+Disposition batches are peeked, delivered and acknowledged, in that order. A
+failed consumer retains the batch and its bounded accounting charge. Cancellation
+closes coordinator admission even while a consumer callback is suspended, aborts
+the native connection, and joins the wake child. `run` completion additionally
+joins its already-owned consumer work. A callback may call `requestStop()` but
+must not await the same run task from inside itself. The pump deliberately ends
+the client attachment after delivering peer output EOF; it does not report an
+exit code, infer remote process survival, or automatically create a new shell.
+Final undispatched outcomes remain available for explicit reconciliation, and the
+owner must retire its focus/source handles after preserving required metadata.
+
+### Integration evidence
+
+Sixteen focused Swift 6 tests pass with warnings-as-errors against the actual kit
+coordinator and pump, including deterministic suspended-consumer shutdown and
+successful-callback acknowledgement across cancellation. Five repeated runs also
+passed. Eight real-network test cases run the production native connector,
+libssh2 driver, Swift session, channel adapter, coordinator and pump together.
+They cover all four supported signing families, a 96,030-byte hidden-pane stream,
+a 70,024-byte bracketed Unicode paste, source-owned replies, idle cancellation,
+failed outcome delivery, and rejection of competing or previously consumed
+channels. The Python harness reuses the original independent libssh server and
+checks exact host-side bytes. It accepts PTY/shell protocol requests and supplies
+synthetic echo data; this is not a real shell/editor or iPhone demonstration.
+The original nine native C-driver cases were rerun successfully.
+
+The integration sources were compiled and linked directly on Linux against the
+actual coordinator/pump and system libssh2. No mock production types were used.
+The package manifest passed `dump-package`, but the full dependent package suite
+was not built or rerun in this session. Apple SDK, native Keychain, Metal, Rust
+C ABI/XCFramework, device lifecycle and the app's workspace authentication adapter
+remain separate required integration/qualification work. Connect stays disabled
+in the offline application; this product does not authorize networking or import
+activation.
+
+With the package dependencies and system test libraries available, from this
+directory:
+
+```sh
+swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
+cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fPIC -shared \
+  -I Sources/CFrankenTermSSH/include Sources/CFrankenTermSSH/FrankenTermSSH.c \
+  -lssh2 -pthread -o /tmp/libfrankenterm-ssh-tests.so
+python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so \
+  .build/debug/TerminalPumpProbe
+```
+
+`TerminalPumpProbe` is a test-only executable. Its synthetic signing IPC and
+independent server never enter either application's linked product graph.

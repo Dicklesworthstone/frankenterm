@@ -143,11 +143,14 @@ public actor TerminalSessionPump {
         let result = await withTaskCancellationHandler {
             await withTaskGroup(of: Void.self, returning: TerminalSessionEnd.self) { group in
                 let signal = self.signal, transport = self.transport
+                let coordinator = self.coordinator, source = self.source
                 group.addTask {
                     while await signal.wait() { await transport.wakeService() }
-                    // Cancellation or requestStop also interrupts an idle native
-                    // read, before the pump next regains executor time.
-                    await transport.close()
+                    // Retire input admission even while the consumer is suspended.
+                    // Closing only the socket would leave the coordinator accepting
+                    // new input until that unrelated callback returned.
+                    do { try await coordinator.disconnect(source) }
+                    catch { await transport.close() }
                 }
                 let reason = await self.drive(consumer: consumer)
                 signal.finish()
