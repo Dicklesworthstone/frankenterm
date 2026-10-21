@@ -156,9 +156,16 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
         let fixture = try fixtures()[0], identifier = Data(0..<32)
         let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: identifier, user: "operator",
                                                            publicBlob: fixture.key.publicBlob)
-        let expected = string(identifier) + Data([50]) + string(Data("operator".utf8))
-            + string(Data("ssh-connection".utf8)) + string(Data("publickey".utf8))
-            + Data([1]) + string(Data("ssh-ed25519".utf8)) + string(fixture.key.publicBlob)
+        // Built incrementally: the single nine-term `+` chain exceeds the Apple
+        // SDK type checker's time limit (Linux's overload set happens to fit).
+        var expected = string(identifier)
+        expected.append(Data([50]))
+        expected.append(string(Data("operator".utf8)))
+        expected.append(string(Data("ssh-connection".utf8)))
+        expected.append(string(Data("publickey".utf8)))
+        expected.append(Data([1]))
+        expected.append(string(Data("ssh-ed25519".utf8)))
+        expected.append(string(fixture.key.publicBlob))
         XCTAssertEqual(challenge.signedData, expected)
         XCTAssertEqual(challenge.sessionIdentifier, identifier)
         XCTAssertEqual(challenge.user, "operator")

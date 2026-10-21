@@ -246,7 +246,7 @@ public actor NativeOpticalVideo {
         for (symbolIndex, text) in verifier.expectedTexts.enumerated() {
             try checkpoint(deadline)
             let buffer = try await buffer(from: pool, deadline: deadline)
-            try autoreleasepool { try draw(text: text, into: buffer) }
+            try autoreleasepool { try Self.draw(text: text, into: buffer) }
             // The buffer is immutable for every hold and while retained by the
             // encoder. There is no interpolation or crossfade between symbols.
             for heldFrame in 0..<plan.framesPerSymbol {
@@ -330,7 +330,10 @@ public actor NativeOpticalVideo {
         }
     }
 
-    private func draw(text: String, into buffer: CVPixelBuffer) throws {
+    // Pure pixel fill is static so the autorelease-pool closure around it never
+    // captures the actor (an actor-isolated closure holding the pixel buffer is
+    // rejected by Swift 6 region isolation when passed to `autoreleasepool`).
+    private static func draw(text: String, into buffer: CVPixelBuffer) throws {
         let side = OpticalVideoPlan.pixelSide
         let raster = try FixedQRCode(text: text).raster(pixelSide: side)
         guard raster.moduleScale >= 4,
@@ -381,6 +384,7 @@ public actor NativeOpticalVideo {
         guard reader.canAdd(output) else { throw FTError.unsupported("video.reader_output") }
         reader.add(output)
         guard reader.startReading() else { throw FTError.unsupported("video.decoder_unavailable") }
+        let crypto = self.crypto
         while true {
             try checkpoint(deadline)
             let hasFrame: Bool = try autoreleasepool {
@@ -390,8 +394,15 @@ public actor NativeOpticalVideo {
                       CVPixelBufferGetWidth(pixels) == OpticalVideoPlan.pixelSide,
                       CVPixelBufferGetHeight(pixels) == OpticalVideoPlan.pixelSide,
                       CVPixelBufferGetDataSize(pixels) <= OpticalVideoPlan.pixelSide * OpticalVideoPlan.pixelSide * 8 else { throw FTError.malformed("video.decoded_frame") }
-                let presentation = try exactTick(CMSampleBufferGetPresentationTimeStamp(sample))
-                let hold = try exactTick(CMSampleBufferGetDuration(sample))
+                let presentation = try Self.exactTick(CMSampleBufferGetPresentationTimeStamp(sample))
+                // macOS 26 AVAssetReader decodes H.264 with exact presentation
+                // stamps but an invalid (0/0) duration on every frame. A frame's
+                // hold is then fixed by the verifier's contiguity check (frame n
+                // presents at tick n, none missing or repeated) plus the asset and
+                // track durations checked above (exactly frameCount ticks). A
+                // duration the decoder does report must still be exactly one tick.
+                let reported = CMSampleBufferGetDuration(sample)
+                let hold = reported.isValid ? try Self.exactTick(reported) : 1
                 let request = VNDetectBarcodesRequest(); request.symbologies = [.qr]
                 try VNImageRequestHandler(cvPixelBuffer: pixels, options: [:]).perform([request])
                 guard let results = request.results, results.count == 1,
@@ -408,7 +419,7 @@ public actor NativeOpticalVideo {
         try verifier.finish(using: crypto)
     }
 
-    private func exactTick(_ value: CMTime) throws -> Int {
+    private static func exactTick(_ value: CMTime) throws -> Int {
         guard value.isNumeric, value.epoch == 0 else { throw FTError.malformed("video.frame_timing") }
         let tick = CMTimeConvertScale(value, timescale: CMTimeScale(OpticalVideoPlan.framesPerSecond), method: .default)
         guard tick.value >= 0, tick.value <= Int64(OpticalVideoPlan.maximumVideoFrames),

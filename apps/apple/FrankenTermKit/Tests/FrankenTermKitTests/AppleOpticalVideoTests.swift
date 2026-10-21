@@ -53,7 +53,13 @@ final class AppleOpticalVideoTests: XCTestCase {
                 guard received < plan.frameCount else { throw FTError.malformed("test.video_extra_frame") }
                 XCTAssertEqual(CMSampleBufferGetNumSamples(sample), 1)
                 XCTAssertEqual(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), CMTime(value: Int64(received), timescale: 30)), 0)
-                XCTAssertEqual(CMTimeCompare(CMSampleBufferGetDuration(sample), CMTime(value: 1, timescale: 30)), 0)
+                // Real macOS decoders return an invalid (0/0) duration for every
+                // decoded H.264 frame; contiguous exact stamps plus the asset
+                // duration above fix each hold. A reported duration must be 1/30.
+                let reported = CMSampleBufferGetDuration(sample)
+                if reported.isValid {
+                    XCTAssertEqual(CMTimeCompare(reported, CMTime(value: 1, timescale: 30)), 0)
+                }
                 let pixels = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
                 XCTAssertEqual(CVPixelBufferGetWidth(pixels), 1024)
                 XCTAssertEqual(CVPixelBufferGetHeight(pixels), 1024)
@@ -79,18 +85,23 @@ final class AppleOpticalVideoTests: XCTestCase {
         XCTAssertEqual(try receiver?.envelope(using: crypto), source.envelope)
     }
 
-    func testH264MoviesHoldSinglePartSymbolsForExactlyTenSixAndThreeFrames() async throws {
+    /// FTAG pads plaintext to 4096-byte multiples, so even a 20-byte archive is a
+    /// multipart page: every systematic part plus ceil(n/2)+16 repair parts.
+    func testH264MoviesHoldEverySymbolForExactlyTenSixAndThreeFrames() async throws {
         let root = try directory(), encrypted = try source(bytes: 20)
         let renderer = NativeOpticalVideo()
+        let sender = try OpticalSender(envelope: encrypted.envelope, using: crypto)
+        let parts = try sender.sourcePartCount(page: 0)
+        XCTAssertGreaterThan(parts, 1, "a padded FTAG envelope never fits one QR part")
         for (rate, frames) in [(3, 10), (5, 6), (10, 3)] {
             let url = root.appendingPathComponent("recording-\(rate).mp4")
             let receipt = try await renderer.save(source: encrypted, to: url, symbolsPerSecond: rate)
-            XCTAssertEqual(receipt.symbolCount, 1)
-            XCTAssertEqual(receipt.frameCount, frames)
+            XCTAssertEqual(receipt.symbolCount, parts + (parts + 1) / 2 + 16)
+            XCTAssertEqual(receipt.frameCount, receipt.symbolCount * frames)
             XCTAssertEqual(receipt.framesPerSecond, 30)
             XCTAssertEqual(receipt.symbolsPerSecond, rate)
             XCTAssertEqual(receipt.pixelSide, 1024)
-            XCTAssertEqual(receipt.durationSeconds, 1.0 / Double(rate), accuracy: 0.000001)
+            XCTAssertEqual(receipt.durationSeconds, Double(receipt.symbolCount) / Double(rate), accuracy: 0.000001)
             XCTAssertEqual(receipt.byteCount, try Data(contentsOf: url).count)
             try await assertPublishedMovie(url, source: encrypted, rate: rate)
         }
@@ -139,7 +150,7 @@ final class AppleOpticalVideoTests: XCTestCase {
         XCTAssertFalse(stillExporting)
         let replacement = root.appendingPathComponent("replacement.mp4")
         let receipt = try await renderer.save(source: source(bytes: 20), to: replacement, symbolsPerSecond: 5)
-        XCTAssertEqual(receipt.frameCount, 6)
+        XCTAssertEqual(receipt.frameCount, receipt.symbolCount * 6)
         XCTAssertTrue(FileManager.default.fileExists(atPath: replacement.path))
     }
 
@@ -159,7 +170,10 @@ final class AppleOpticalVideoTests: XCTestCase {
         do { _ = try await task.value; XCTFail("exclusive publication replaced a concurrent file") }
         catch {}
         XCTAssertEqual(try Data(contentsOf: destination), sentinel)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil), [destination])
+        // Compare names: the listing reports the physical /private/var path for
+        // the /var temporary directory, so whole-URL equality is spelling-dependent.
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).map(\.lastPathComponent),
+                       [destination.lastPathComponent])
     }
 }
 #endif

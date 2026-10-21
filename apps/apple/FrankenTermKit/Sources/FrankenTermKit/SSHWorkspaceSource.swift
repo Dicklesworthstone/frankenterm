@@ -148,13 +148,15 @@ public struct SSHWorkspaceSource: Sendable {
     public static func loadUserConfiguration(_ url: URL,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> SSHWorkspaceSource {
         guard url.isFileURL, homeDirectory.isFileURL else { throw FTError.malformed("ssh.include_path") }
-        let home = homeDirectory.resolvingSymlinksInPath().standardizedFileURL
-        var parser = ConfigurationParser(homeDirectory: home)
         #if os(macOS) || os(iOS)
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         #endif
-        try parser.load(url.resolvingSymlinksInPath().standardizedFileURL, conditions: [], depth: 0, required: true)
+        let home = ConfigurationParser.physicalURL(homeDirectory, isDirectory: true) ?? homeDirectory.standardizedFileURL
+        var parser = ConfigurationParser(homeDirectory: home)
+        // A missing selected file keeps its literal path and fails as a required omission.
+        let root = ConfigurationParser.physicalURL(url, isDirectory: false) ?? url.standardizedFileURL
+        try parser.load(root, conditions: [], depth: 0, required: true)
         return SSHWorkspaceSource(parser: parser)
     }
 
@@ -313,6 +315,17 @@ public struct SSHWorkspaceSource: Sendable {
                 throw FTError.unsupported("ssh.include_not_local")
             }
             #endif
+        }
+
+        /// The physical path of an existing selected file or home directory.
+        /// Foundation's `resolvingSymlinksInPath` strips a leading `/private` on
+        /// Darwin, yielding `/var/...` or `/tmp/...` whose first component is
+        /// itself a symbolic link, so the O_NOFOLLOW walk below would reject
+        /// every include. `realpath(3)` returns the real location instead.
+        static func physicalURL(_ url: URL, isDirectory: Bool) -> URL? {
+            guard let resolved = realpath(url.path, nil) else { return nil }
+            defer { free(resolved) }
+            return URL(fileURLWithPath: String(cString: resolved), isDirectory: isDirectory)
         }
 
         /// Walk from a held directory descriptor; O_NOFOLLOW applies to EVERY

@@ -40,9 +40,13 @@ final class SSHWorkspaceSourceTests: XCTestCase {
     }
 
     private func configurationFiles(_ files: [String: String]) throws -> URL {
-        let home = FileManager.default.temporaryDirectory.appendingPathComponent("ft-ssh-includes-" + UUID().uuidString)
-            .resolvingSymlinksInPath()
-        try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+        let literal = FileManager.default.temporaryDirectory.appendingPathComponent("ft-ssh-includes-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: literal.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+        // Physical path (macOS temp lives under the /var -> /private/var link), so
+        // expected source paths match what the loader records.
+        let resolved = try XCTUnwrap(realpath(literal.path, nil))
+        defer { free(resolved) }
+        let home = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
         for (path, text) in files {
             let destination = home.appendingPathComponent(".ssh").appendingPathComponent(path)
             try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -107,6 +111,25 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertEqual(result.workspace.machines.map(\.name), ["alpha", "beta", "gamma"])
         XCTAssertEqual(result.workspace.routes.map(\.user), ["shared-user", "beta-user", "fallback"])
         XCTAssertEqual(result.workspace.routes.map(\.port), [2222, 22, 22])
+    }
+
+    /// macOS hands out home/config locations under `/var` and `/tmp`, which are
+    /// themselves symbolic links into `/private`. Selecting the configuration and
+    /// home through such a linked directory must still load its includes (the
+    /// selected locations are canonicalized physically), while links *inside*
+    /// the include graph remain rejected by the O_NOFOLLOW walk.
+    func testSelectionThroughALinkedDirectoryStillLoadsIncludes() throws {
+        let home = try configurationFiles([
+            "config": "Include conf.d/*.conf\nHost *\nIdentityFile none\n",
+            "conf.d/hosts.conf": "Host alpha\nUser linked-user\n"
+        ])
+        let link = home.deletingLastPathComponent().appendingPathComponent("ft-ssh-link-" + UUID().uuidString)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: home)
+        defer { try? FileManager.default.removeItem(at: link) }
+        let result = try exportSource(SSHWorkspaceSource.loadUserConfiguration(
+            link.appendingPathComponent(".ssh").appendingPathComponent("config"), homeDirectory: link))
+        XCTAssertEqual(result.workspace.machines.map(\.name), ["alpha"])
+        XCTAssertEqual(result.workspace.routes.map(\.user), ["linked-user"])
     }
 
     func testIncludeMultiplePathsTildeQuestionMarkDotAndMissingMatches() throws {

@@ -73,13 +73,13 @@ public actor NativeOpticalPresentation {
     public init() {}
 
     public func symbol(text: String) throws -> QRCodeSymbol {
-        try symbol(image: raster(text: text, pixelSide: nil))
+        try symbol(image: Self.raster(text: text, pixelSide: nil))
     }
     /// A public recipient request has a distinct parser and cannot be confused
     /// with a ciphertext transfer frame or an arbitrary string to display.
     public func recipientSymbol(text: String) throws -> QRCodeSymbol {
         let request = try RecipientRequest(text: text)
-        return try symbol(image: image(raster: FixedQRCode(recipientRequest: request).raster()))
+        return try symbol(image: Self.image(raster: FixedQRCode(recipientRequest: request).raster()))
     }
     private func symbol(image: CGImage) throws -> QRCodeSymbol {
         let bytes = NSMutableData()
@@ -88,10 +88,14 @@ public actor NativeOpticalPresentation {
         guard CGImageDestinationFinalize(encoder) else { throw FTError.storage }
         return .init(png: bytes as Data, moduleSide: image.width)
     }
-    private func raster(text: String, pixelSide: Int?) throws -> CGImage {
+    // Pure rasterization is static so the autorelease-pool closures in the
+    // actor's loops never capture `self`. A closure capturing the actor is
+    // actor-isolated, and passing it to the nonisolated `autoreleasepool` while
+    // it holds native image objects is rejected by Swift 6 region isolation.
+    private static func raster(text: String, pixelSide: Int?) throws -> CGImage {
         try image(raster: FixedQRCode(text: text).raster(pixelSide: pixelSide))
     }
-    private func image(raster: FixedQRCodeRaster) throws -> CGImage {
+    private static func image(raster: FixedQRCodeRaster) throws -> CGImage {
         guard let provider = CGDataProvider(data: raster.pixels as CFData),
               let image = CGImage(width: raster.pixelSide, height: raster.pixelSide, bitsPerComponent: 8,
                 bitsPerPixel: 8, bytesPerRow: raster.pixelSide, space: CGColorSpaceCreateDeviceGray(),
@@ -108,6 +112,7 @@ public actor NativeOpticalPresentation {
     /// Existing destinations are never overwritten by this API.
     public func saveAnimation(envelope: Data, to destination: URL, symbolsPerSecond: Int = 5) throws -> Int {
         guard destination.isFileURL, [3, 5, 10].contains(symbolsPerSecond) else { throw FTError.malformed("animation.options") }
+        let crypto = self.crypto
         let sender = try OpticalSender(envelope: envelope, using: crypto)
         // Image I/O does not promise constant-memory encoding. Bound the entire
         // raw grayscale input to 256 MiB, not just the final compressed file.
@@ -130,7 +135,7 @@ public actor NativeOpticalPresentation {
             try Task.checkCancellation()
             try autoreleasepool {
                 let text = try sender.frame(page: address.page, sequence: address.sequence, using: crypto)
-                CGImageDestinationAddImage(writer, try raster(text: text, pixelSide: 1024), frameOptions)
+                CGImageDestinationAddImage(writer, try Self.raster(text: text, pixelSide: 1024), frameOptions)
             }
         }
         guard CGImageDestinationFinalize(writer) else { throw FTError.storage }
