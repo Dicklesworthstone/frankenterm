@@ -32,12 +32,13 @@ public struct WorkspaceVaultError: LocalizedError, Equatable, Sendable {
 /// No wildcard queries, access groups, synchronizable items, or keychain exports.
 /// SecItem calls run on WorkspaceStore's actor, never a SwiftUI/MainActor callback.
 ///
-/// Each account is two items. The key item holds only the private key behind
-/// user presence. Its public details (fingerprint and comment) live in a
-/// sibling item without access control: on a device, even reading the
-/// attributes of a user-presence item without a prompt fails with
-/// errSecInteractionNotAllowed, so details kept on the key item made every
-/// restore fail at its read-back. The simulator does not enforce that.
+/// Each account is two items: the private key, and its public details
+/// (fingerprint and comment). Both stay on this device only (never synced or
+/// carried by a backup to another device) and are readable only while it is
+/// unlocked and has a passcode; removing the passcode deletes them. Signing
+/// asks for no Face ID: the operator's call, so a workspace's machines all
+/// connect without a prompt each. A key stored earlier behind user presence
+/// is asked for once more and then stored this way (storeWithoutPresence).
 public struct AppleWorkspaceVault: WorkspaceCredentialVault {
     private static let keyService = "org.frankenterm.mobile.workspace-keys.v1"
     private static let detailsService = "org.frankenterm.mobile.workspace-key-details.v1"
@@ -58,17 +59,10 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
               fingerprint.utf8.count == 50, fingerprint.hasPrefix("SHA256:") else { throw FTError.limit("vault.item") }
         let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: privateContainer)
         guard identity.fingerprint == fingerprint else { throw SSHAuthenticationError.identityMismatch }
-        var error: Unmanaged<CFError>?
-        guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
-                                                          .userPresence, &error) else {
-            let code = (error?.takeRetainedValue()).map { OSStatus(CFErrorGetCode($0)) } ?? errSecParam
-            try WorkspaceVaultError.check(code == errSecSuccess ? errSecParam : code, "protect")
-            throw FTError.storage
-        }
         var item = try query(account: account)
-        item[kSecAttrAccessControl as String] = access
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
         item[kSecValueData as String] = privateContainer
-        // Add only. A duplicate must never overwrite an identity or relax its ACL.
+        // Add only. A duplicate must never overwrite an identity.
         try WorkspaceVaultError.check(SecItemAdd(item as CFDictionary, nil), "store")
         // The key first: a missing details item reads as absent, which only an
         // uncommitted transaction's cleanup acts on.
@@ -132,6 +126,26 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
         } else { comment = nil }
         return try WorkspaceCredentialMetadata(fingerprintBytes: fingerprint, publicComment: comment)
     }
+    /// Replaces a key item stored behind user presence with the same key
+    /// stored the current way, once its owner has unlocked it. If the new
+    /// item cannot be added, the key goes back behind user presence.
+    fileprivate func storeWithoutPresence(account: String, privateContainer: Data) throws {
+        let item = try query(account: account)
+        try WorkspaceVaultError.check(SecItemDelete(item as CFDictionary), "replace")
+        var replacement = item
+        replacement[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+        replacement[kSecValueData as String] = privateContainer
+        let status = SecItemAdd(replacement as CFDictionary, nil)
+        if status != errSecSuccess,
+           let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, .userPresence, nil) {
+            var original = item
+            original[kSecAttrAccessControl as String] = access
+            original[kSecValueData as String] = privateContainer
+            _ = SecItemAdd(original as CFDictionary, nil)
+        }
+        try WorkspaceVaultError.check(status, "store")
+    }
+
     /// Deleting never prompts; the key goes before its details.
     public func remove(account: String) throws {
         for service in [Self.keyService, Self.detailsService] {
@@ -281,16 +295,22 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                             try Self.worker.check(requestID)
                             return (status, item)
                         }
-                        // A standing approval signs without asking again; it
-                        // was given for exactly these keys moments ago.
-                        var (status, item) = (errSecInteractionNotAllowed, CFTypeRef?.none)
-                        if let approved = Self.worker.approvedContext() {
+                        // Keys are readable while the device is unlocked, with
+                        // no prompt (see AppleWorkspaceVault).
+                        let quiet = LAContext(); quiet.interactionNotAllowed = true
+                        var (status, item) = try read(quiet)
+                        quiet.invalidate()
+                        // A key stored earlier behind user presence: a standing
+                        // approval, or one Face ID, then it is stored the
+                        // current way and never asks again.
+                        let protected = status == errSecInteractionNotAllowed || status == errSecAuthFailed
+                        if protected, let approved = Self.worker.approvedContext() {
                             (status, item) = try read(approved)
                             if status != errSecSuccess { Self.worker.endApproval() }
                         }
-                        if status != errSecSuccess {
+                        if protected, status != errSecSuccess {
                             let context = LAContext()
-                            context.localizedReason = "Unlock your SSH keys to connect to your machines."
+                            context.localizedReason = "Unlock your SSH keys once to connect to your machines."
                             try Self.worker.installContext(context, for: requestID)
                             (status, item) = try read(context)
                             if status == errSecSuccess {
@@ -309,6 +329,10 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         }
                         let value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
                         try Self.worker.check(requestID)
+                        if protected {
+                            try? AppleWorkspaceVault().storeWithoutPresence(account: authorization.account,
+                                                                            privateContainer: container)
+                        }
                         return value
                     }
                     continuation.resume(with: Self.worker.finish(requestID, result: result))
