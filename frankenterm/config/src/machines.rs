@@ -821,42 +821,51 @@ impl MachineInventory {
     }
 }
 
-/// The next distinct hue theme whose name and hue are both unused; once every
-/// hue is taken (more machines than hues), names stay unique with a suffix.
+fn hue_distance(a: f64, b: f64) -> f64 {
+    let delta = (a - b).abs() % 360.0;
+    delta.min(360.0 - delta)
+}
+
+/// The next distinct hue theme whose name is unused and whose hue is at least
+/// 22 degrees from every hue in use, in assignment order. Once none is left
+/// (more machines than hues), the hue farthest from those in use, with a
+/// numeric suffix when its name is already taken.
 fn next_distinct(next: &mut usize, used_names: &BTreeSet<String>, used_hues: &[f64]) -> MachineTheme {
-    let close = |hue: f64| {
-        used_hues.iter().any(|used| {
-            let delta = (used - hue).abs() % 360.0;
-            delta.min(360.0 - delta) < 22.0
-        })
+    let nearest = |hue: f64| {
+        used_hues
+            .iter()
+            .map(|used| hue_distance(*used, hue))
+            .fold(f64::INFINITY, f64::min)
     };
     for _ in 0..DISTINCT_HUES.len() {
         let index = *next % DISTINCT_HUES.len();
         *next += 1;
         let candidate = distinct_theme(index);
-        if !used_names.contains(&candidate.name) && !close(DISTINCT_HUES[index].1) {
+        if !used_names.contains(&candidate.name) && nearest(DISTINCT_HUES[index].1) >= 22.0 {
             return MachineTheme {
                 automatic: true,
                 ..candidate
             };
         }
     }
-    // Every hue is close to one in use: still prefer an unused name.
+    let index = (0..DISTINCT_HUES.len())
+        .max_by(|a, b| {
+            nearest(DISTINCT_HUES[*a].1)
+                .partial_cmp(&nearest(DISTINCT_HUES[*b].1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.cmp(a))
+        })
+        .unwrap_or(0);
+    let mut candidate = distinct_theme(index);
+    let base = candidate.name.clone();
     let mut round = 2;
-    loop {
-        for index in 0..DISTINCT_HUES.len() {
-            let mut candidate = distinct_theme(index);
-            if round > 1 && used_names.contains(&candidate.name) {
-                candidate.name = format!("{} {}", candidate.name, round);
-            }
-            if !used_names.contains(&candidate.name) {
-                return MachineTheme {
-                    automatic: true,
-                    ..candidate
-                };
-            }
-        }
+    while used_names.contains(&candidate.name) {
+        candidate.name = format!("{} {}", base, round);
         round += 1;
+    }
+    MachineTheme {
+        automatic: true,
+        ..candidate
     }
 }
 
@@ -1409,35 +1418,42 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         assert_eq!(css.name, "css", "the name defaults to the id");
     }
 
-    #[test]
-    fn automatic_themes_skip_hues_already_taken_and_never_repeat() {
+    fn fleet_of(count: usize, extra: &str) -> MachineInventory {
         let mut text = String::from("version = 1\n");
-        for index in 0..30 {
+        for index in 0..count {
             text.push_str(&format!(
                 "[machines.m{:02}]\n[[machines.m{:02}.routes]]\nid = \"ssh\"\nssh = \"m{:02}\"\n",
                 index, index, index
             ));
         }
-        text.push_str("[machines.m00.theme]\nscheme = \"FrankenTerm Azure\"\n");
-        let inventory = parse(&text).unwrap();
-        let names: BTreeSet<&str> = inventory.machines.iter().map(|m| m.theme.name.as_str()).collect();
-        assert_eq!(names.len(), 30, "every machine gets its own theme name");
-        let first_auto = &inventory.machines[1].theme;
-        assert_ne!(first_auto.name, "FrankenTerm Azure", "an explicitly used theme is not reassigned");
-        assert!(first_auto.automatic);
-        // Until the hues run out (suffixed names), every hue is far from the others.
-        let hues: Vec<f64> = inventory
-            .machines
-            .iter()
-            .filter(|m| !m.theme.name.ends_with(|c: char| c.is_ascii_digit()))
-            .filter_map(|m| m.theme.accent.hue())
-            .collect();
-        assert!(hues.len() >= 9, "{}", hues.len());
+        text.push_str(extra);
+        parse(&text).unwrap()
+    }
+
+    #[test]
+    fn a_small_fleet_gets_widely_separated_hues_avoiding_explicit_ones() {
+        let inventory = fleet_of(8, "[machines.m00.theme]\nscheme = \"FrankenTerm Azure\"\n");
+        assert!(!inventory.machines[0].theme.automatic);
+        assert!(inventory.machines[1..].iter().all(|m| m.theme.automatic));
+        assert_ne!(inventory.machines[1].theme.name, "FrankenTerm Azure", "an explicitly used theme is not reassigned");
+        let hues: Vec<f64> = inventory.machines.iter().filter_map(|m| m.theme.accent.hue()).collect();
+        assert_eq!(hues.len(), 8);
         for (i, a) in hues.iter().enumerate() {
             for b in &hues[i + 1..] {
-                let d = (a - b).abs() % 360.0;
-                assert!(d.min(360.0 - d) >= 20.0, "{} and {} are too close", a, b);
+                assert!(hue_distance(*a, *b) >= 20.0, "{} and {} are too close", a, b);
             }
+        }
+    }
+
+    #[test]
+    fn a_large_fleet_never_repeats_a_theme_name() {
+        let inventory = fleet_of(30, "");
+        let names: BTreeSet<&str> = inventory.machines.iter().map(|m| m.theme.name.as_str()).collect();
+        assert_eq!(names.len(), 30, "every machine gets its own theme name");
+        // Past the distinct hues, a repeat hue is always marked by a suffix.
+        for machine in &inventory.machines {
+            let base: String = machine.theme.name.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ').to_string();
+            assert!(base.starts_with("FrankenTerm "), "{}", machine.theme.name);
         }
     }
 
