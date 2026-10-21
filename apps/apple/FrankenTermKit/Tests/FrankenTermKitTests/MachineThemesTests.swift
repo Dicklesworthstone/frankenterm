@@ -129,7 +129,7 @@ final class MachineThemesTests: XCTestCase {
 
     func testTheUsersChoicesStandAndOnlyStaleOrMissingOnesAreFilledIn() throws {
         let document = try lookalikes(), catalog = try catalog()
-        let picked = MachineThemeChoice(name: "Dracula")
+        let picked = MachineThemeChoice(name: "Dracula", catalog: true)
         var choices = MachineThemes(document: document, catalog: catalog,
                                     choices: ["m.css": picked]).distinguishingMachines()
         XCTAssertEqual(choices["m.css"], picked)
@@ -155,7 +155,7 @@ final class MachineThemesTests: XCTestCase {
         let first = try XCTUnwrap(fresh["m.css"])
         // css already wears an earlier automatic pick; dark is new.
         let later = MachineThemes(document: document, catalog: catalog,
-                                  choices: ["m.css": .init(name: catalog.distinct.last?.name, automatic: true)]).distinguishingMachines()
+                                  choices: ["m.css": .init(name: catalog.distinct.last?.name, catalog: true, automatic: true)]).distinguishingMachines()
         XCTAssertEqual(later["m.css"]?.name, catalog.distinct.last?.name, "an earlier automatic choice is kept")
         XCTAssertEqual(later["m.dark"]?.name, first.name, "the newcomer takes the first free theme")
     }
@@ -165,10 +165,28 @@ final class MachineThemesTests: XCTestCase {
         let automatic = MachineThemes(document: try lookalikes(), catalog: catalog, choices: [:]).distinguishingMachines()
         XCTAssertEqual(automatic.count, 2)
         // The desktop now exports a distinct theme for every machine.
-        let picked = MachineThemeChoice(name: "Dracula")
+        let picked = MachineThemeChoice(name: "Dracula", catalog: true)
         var kept = automatic; kept["m.trj"] = picked
         let choices = MachineThemes(document: try export(), catalog: catalog, choices: kept).distinguishingMachines()
         XCTAssertEqual(choices, ["m.trj": picked], "automatic picks give way to the workspace; the user's pick stays")
+    }
+
+    /// A desktop machine can wear a modified "Dracula": a pick names its source.
+    func testAChoiceResolvesInTheSourceItNamesWhenNamesCollide() throws {
+        let catalog = try catalog()
+        let document = try export { themes in themes[1]["name"] = "Dracula"; themes[1]["background"] = "#123456" }
+        let css = try machine(document, "m.css"), trj = try machine(document, "m.trj")
+        let fromCatalog = MachineThemes(document: document, catalog: catalog,
+                                        choices: ["m.trj": .init(name: "Dracula", catalog: true)])
+        XCTAssertEqual(fromCatalog.theme(for: trj)?.background, catalog.theme(named: "Dracula")?.background)
+        XCTAssertNotEqual(fromCatalog.theme(for: trj)?.background, "#123456")
+        let fromWorkspace = MachineThemes(document: document, catalog: catalog,
+                                          choices: ["m.trj": .init(name: "Dracula")])
+        XCTAssertEqual(fromWorkspace.theme(for: trj)?.background, "#123456")
+        XCTAssertEqual(fromWorkspace.theme(for: trj)?.id, fromWorkspace.workspaceTheme(of: css)?.id)
+        // Choices saved before the source was recorded still decode.
+        let legacy = try JSONDecoder().decode(MachineThemeChoice.self, from: Data(#"{"name":"Dracula","automatic":false}"#.utf8))
+        XCTAssertEqual(legacy, MachineThemeChoice(name: "Dracula"))
     }
 
     func testHueDistanceWrapsAndIgnoresGrays() {

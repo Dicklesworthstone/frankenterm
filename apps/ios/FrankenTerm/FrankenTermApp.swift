@@ -258,10 +258,10 @@ final class MobileWorkspaceModel {
     func machineThemes(_ workspaceID: UUID, document: WorkspaceDocument) -> MachineThemes? {
         Self.themeCatalog.map { MachineThemes(document: document, catalog: $0, choices: themeChoices(workspaceID)) }
     }
-    /// The user's pick; nil returns the machine to the workspace's own theme.
-    func chooseTheme(_ name: String?, machineID: String, workspaceID: UUID) {
+    /// The user's pick, which no automatic choice ever replaces.
+    func chooseTheme(_ choice: MachineThemeChoice, machineID: String, workspaceID: UUID) {
         var choices = themeChoices(workspaceID)
-        choices[machineID] = MachineThemeChoice(name: name)
+        choices[machineID] = MachineThemeChoice(name: choice.name, catalog: choice.catalog)
         setThemeChoices(choices, for: workspaceID)
     }
     private func setThemeChoices(_ choices: [String: MachineThemeChoice], for workspaceID: UUID) {
@@ -1052,8 +1052,8 @@ private struct MachineWorkspaceView: View {
             .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
                 if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
                    let themes = model.machineThemes(workspaceID, document: document) {
-                    MachineThemePicker(machine: machine, themes: themes) { name in
-                        model.chooseTheme(name, machineID: id, workspaceID: workspaceID)
+                    MachineThemePicker(machine: machine, themes: themes) { choice in
+                        model.chooseTheme(choice, machineID: id, workspaceID: workspaceID)
                     }
                 }
             }
@@ -1085,7 +1085,7 @@ private struct MachineWorkspaceView: View {
                                initial: String, route: String, credential: String) -> some View {
         let themes = SceneThemeSource(
             themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
-            choose: { [model, workspaceID] machineID, name in model.chooseTheme(name, machineID: machineID, workspaceID: workspaceID) })
+            choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
         return LiveWorkspaceView(initialMachineID: initial, themes: themes) {
             try WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
                 machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },

@@ -7,7 +7,7 @@ import FrankenTermKit
 struct MachineThemePicker: View {
     let machine: WorkspaceDocument.Machine
     let themes: MachineThemes
-    let choose: (String?) -> Void
+    let choose: (MachineThemeChoice) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
 
@@ -20,21 +20,23 @@ struct MachineThemePicker: View {
                 if own.map(matches) == true || !others.isEmpty {
                     Section("This workspace") {
                         if let own, matches(own) {
-                            row(own, title: "\(own.name) (exported for this machine)", current: current) { choose(nil) }
+                            row(own, title: "\(own.name) (exported for this machine)", current: current) {
+                                choose(MachineThemeChoice(name: nil))
+                            }
                         }
-                        ForEach(others, id: \.name) { theme in
-                            row(theme, current: current) { choose(theme.name) }
+                        ForEach(others, id: \.id) { theme in
+                            row(theme, current: current) { choose(MachineThemeChoice(name: theme.name)) }
                         }
                     }
                 }
                 Section("FrankenTerm") {
-                    ForEach(themes.catalog.distinct.filter(matches), id: \.name) { theme in
-                        row(theme, current: current) { choose(theme.name) }
+                    ForEach(themes.catalog.distinct.filter(matches), id: \.id) { theme in
+                        row(theme, current: current) { choose(MachineThemeChoice(name: theme.name, catalog: true)) }
                     }
                 }
                 Section("Color schemes") {
-                    ForEach(themes.catalog.themes.dropFirst(themes.catalog.distinctCount).filter(matches), id: \.name) { theme in
-                        row(theme, current: current) { choose(theme.name) }
+                    ForEach(themes.catalog.themes.dropFirst(themes.catalog.distinctCount).filter(matches), id: \.id) { theme in
+                        row(theme, current: current) { choose(MachineThemeChoice(name: theme.name, catalog: true)) }
                     }
                 }
             }
@@ -57,7 +59,7 @@ struct MachineThemePicker: View {
 
     private func row(_ theme: WorkspaceDocument.Theme, title: String? = nil, current: WorkspaceDocument.Theme?,
                      pick: @escaping () -> Void) -> some View {
-        let selected = current?.name == theme.name && current?.background == theme.background
+        let selected = current?.id == theme.id
         return Button(action: pick) {
             HStack(spacing: 12) {
                 ThemeSwatch(theme: theme).frame(width: 64, height: 40)

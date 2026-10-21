@@ -55,8 +55,6 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
 
-    /// Opens a session for a machine, replacing one that ended. Acknowledging
-    /// records that the user read the earlier session's unknown outcome.
     /// Shows a machine in another theme: its chrome at once, and its
     /// terminal from the next frame. A later session starts in it.
     func applyTheme(_ theme: WorkspaceDocument.Theme, to machineID: String) {
@@ -65,6 +63,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         sessions[machineID]?.applyPalette(theme.terminalBasePalette)
     }
 
+    /// Opens a session for a machine, replacing one that ended. Acknowledging
+    /// records that the user read the earlier session's unknown outcome.
     func connect(_ machineID: String, acknowledging: Bool = false) {
         guard !closed, var target = machines.first(where: { $0.id == machineID })?.target else { return }
         if let theme = themes[machineID] { target = target.wearing(theme) }
@@ -216,15 +216,15 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 }
 
-/// Builds the live scene once, when its screen is actually shown. A
-/// NavigationLink evaluates its destination on every redraw of the page that
-/// holds it, so constructing the scene there built and dropped one per redraw.
 /// How a live scene reads and records theme picks; the workspace owns them.
 struct SceneThemeSource {
     let themes: @MainActor () -> MachineThemes?
-    let choose: @MainActor (_ machineID: String, _ name: String?) -> Void
+    let choose: @MainActor (_ machineID: String, _ choice: MachineThemeChoice) -> Void
 }
 
+/// Builds the live scene once, when its screen is actually shown. A
+/// NavigationLink evaluates its destination on every redraw of the page that
+/// holds it, so constructing the scene there built and dropped one per redraw.
 struct LiveWorkspaceView: View {
     let initialMachineID: String
     var themes: SceneThemeSource? = nil
@@ -288,8 +288,8 @@ struct WorkspaceTerminalScreen: View {
         .sheet(isPresented: $pickingTheme) {
             if let themes, let id = machine?.id, let current = themes.themes(),
                let documentMachine = current.document.machines.first(where: { $0.id == id }) {
-                MachineThemePicker(machine: documentMachine, themes: current) { name in
-                    themes.choose(id, name)
+                MachineThemePicker(machine: documentMachine, themes: current) { choice in
+                    themes.choose(id, choice)
                     if let theme = themes.themes()?.theme(for: documentMachine) { scene.applyTheme(theme, to: id) }
                 }
             }

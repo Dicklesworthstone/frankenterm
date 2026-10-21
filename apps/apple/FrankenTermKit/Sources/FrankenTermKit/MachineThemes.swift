@@ -53,13 +53,24 @@ public struct ThemeCatalog: Sendable {
     public func theme(named name: String) -> WorkspaceDocument.Theme? { byName[name].map { themes[$0] } }
 }
 
-/// A machine's theme on this phone. `name` names a theme of the workspace or
-/// of the catalog; nil keeps the theme the workspace gave the machine.
+/// A machine's theme on this phone: a theme of the workspace or of the
+/// catalog by name, which can be the same name with different colors; nil
+/// keeps the theme the workspace gave the machine.
 public struct MachineThemeChoice: Codable, Equatable, Sendable {
     public let name: String?
+    /// The name is the catalog's theme, not the workspace's.
+    public let catalog: Bool
     /// The phone chose it to tell machines apart; the user did not.
     public let automatic: Bool
-    public init(name: String?, automatic: Bool = false) { self.name = name; self.automatic = automatic }
+    public init(name: String?, catalog: Bool = false, automatic: Bool = false) {
+        self.name = name; self.catalog = catalog; self.automatic = automatic
+    }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        catalog = try values.decodeIfPresent(Bool.self, forKey: .catalog) ?? false
+        automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+    }
 }
 
 /// What each machine of a workspace looks like on this phone.
@@ -77,22 +88,21 @@ public struct MachineThemes: Sendable {
         document.themes.first { $0.id == machine.themeID }
     }
 
-    /// A theme name resolves to the workspace's theme of that name first,
-    /// then the catalog's.
-    public func theme(named name: String) -> WorkspaceDocument.Theme? {
-        document.themes.first { $0.name == name } ?? catalog.theme(named: name)
+    /// The theme a named choice means, or nil when its source no longer has it.
+    public func theme(chosen choice: MachineThemeChoice) -> WorkspaceDocument.Theme? {
+        guard let name = choice.name else { return nil }
+        return choice.catalog ? catalog.theme(named: name) : document.themes.first { $0.name == name }
     }
 
-    /// The chosen theme; a name neither knows any more falls back.
+    /// The chosen theme; a name its source no longer has falls back.
     public func theme(for machine: WorkspaceDocument.Machine) -> WorkspaceDocument.Theme? {
-        if let name = choices[machine.id]?.name, let chosen = theme(named: name) { return chosen }
-        return workspaceTheme(of: machine)
+        choices[machine.id].flatMap(theme(chosen:)) ?? workspaceTheme(of: machine)
     }
 
     /// Whether a machine has a choice that still applies.
     func hasLiveChoice(_ machine: WorkspaceDocument.Machine) -> Bool {
         guard let choice = choices[machine.id] else { return false }
-        return choice.name.map { theme(named: $0) != nil } ?? true
+        return choice.name == nil || theme(chosen: choice) != nil
     }
 
     /// Choices that give no two machines the same look, for a workspace the
@@ -132,7 +142,7 @@ public struct MachineThemes: Sendable {
                 ?? free.max(by: { nearest($0) < nearest($1) })
                 ?? catalog.themes.dropFirst(catalog.distinctCount).filter({ !looksUsed($0) })
                     .max(by: { nearest($0) < nearest($1) }) else { continue }
-            result[machine.id] = MachineThemeChoice(name: pick.name, automatic: true)
+            result[machine.id] = MachineThemeChoice(name: pick.name, catalog: true, automatic: true)
             used.append(pick)
         }
         return result
@@ -145,11 +155,12 @@ public struct MachineThemes: Sendable {
         return min(distance, 360 - distance)
     }
 
+    /// The desktop's rule (machines.rs `Rgba::hue`): under 0.15 chroma is gray.
     static func hue(_ hex: String) -> Double? {
         guard let value = UInt32(hex.dropFirst().prefix(6), radix: 16) else { return nil }
         let r = Double(value >> 16 & 0xFF) / 255, g = Double(value >> 8 & 0xFF) / 255, b = Double(value & 0xFF) / 255
         let high = max(r, g, b), low = min(r, g, b), chroma = high - low
-        guard chroma > 0.08 else { return nil }
+        guard chroma >= 0.15 else { return nil }
         let sector: Double
         switch high {
         case r: sector = ((g - b) / chroma).truncatingRemainder(dividingBy: 6)
