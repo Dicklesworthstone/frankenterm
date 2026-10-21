@@ -1,5 +1,8 @@
 import Foundation
 import XCTest
+#if canImport(Security)
+import Security
+#endif
 @testable import FrankenTermKit
 
 /// Fail immediately before or after one real atomic, synchronized file write.
@@ -31,6 +34,27 @@ private final class SessionHistoryWriteFault: WorkspacePersistence, @unchecked S
 
 @MainActor
 final class TerminalSessionHistoryPersistenceTests: XCTestCase {
+    /// On Apple the continuity anchor is the device-only data-protection
+    /// Keychain, which needs a keychain-entitled process. An unhosted package
+    /// test process has none (errSecMissingEntitlement), so it skips here; the
+    /// app-hosted FrankenTermTests compiles this same file and runs it with one.
+    override func setUp() async throws {
+        try await super.setUp()
+        #if canImport(Security)
+        let probe: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "org.frankenterm.tests.keychain-probe",
+            kSecAttrAccount as String: UUID().uuidString, kSecUseDataProtectionKeychain as String: true,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecValueData as String: Data([1])]
+        let status = SecItemAdd(probe as CFDictionary, nil)
+        if status == errSecMissingEntitlement {
+            throw XCTSkip("The session-history anchor needs the data-protection Keychain, which this unhosted process cannot use; FrankenTermTests runs these tests in the entitled app")
+        }
+        var removal = probe; removal[kSecValueData as String] = nil; removal[kSecAttrAccessible as String] = nil
+        SecItemDelete(removal as CFDictionary)
+        #endif
+    }
+
     private func directory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("ft-session-continuity-" + UUID().uuidString)
     }
