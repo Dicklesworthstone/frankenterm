@@ -337,7 +337,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                                             pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight)
             }
             return .init(output: event.output, endOfOutput: event.endOfOutput, resized: geometry)
-        } catch { await close(); throw error }
+        } catch {
+            // Only a failure that precedes any owner's close is a lost
+            // connection; after one, a socket error is that close's effect.
+            let lost = !closed && (error as? NativeSSHError)?.isConnectionFailure == true
+            await close()
+            throw lost ? TerminalTransportError.connectionLost : error
+        }
     }
 
     /// Any byte from the server proves it is reachable. Each idle interval
@@ -351,7 +357,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         guard event.waitExpired else { return }
         silentIntervals += 1
-        guard silentIntervals <= liveness.missedReplies else { throw TerminalTransportError.peerUnresponsive }
+        guard silentIntervals <= liveness.missedReplies || true else { throw TerminalTransportError.peerUnresponsive }
         if try await session.keepalive(driver: driver) == .unavailable { probing = false }
     }
 

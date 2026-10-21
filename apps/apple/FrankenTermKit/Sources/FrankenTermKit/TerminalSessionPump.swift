@@ -89,6 +89,16 @@ public protocol TerminalSessionConsumer: Sendable {
     func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws
 }
 
+/// Thrown by a transport that closed itself because its connection failed,
+/// not because an owner closed it. The attachment ends as disconnected even
+/// though that self-close also finished the input signal.
+public enum TerminalTransportError: Error, Equatable, Sendable {
+    /// The peer stopped answering, including the replies liveness probes ask for.
+    case peerUnresponsive
+    /// The network connection itself failed: reset, closed or unreadable.
+    case connectionLost
+}
+
 public enum TerminalSessionEnd: Equatable, Sendable {
     case cancelled, disconnected, transportFailed, consumerFailed, ownershipConflict
     /// Client policy ends this attachment after peer output EOF. This is NOT an
@@ -247,6 +257,7 @@ public actor TerminalSessionPump {
             if signal.isFinished || Task.isCancelled { return .cancelled }
             let update: TerminalSessionUpdate
             do { update = try await transport.service() }
+            catch is TerminalTransportError { return Task.isCancelled ? .cancelled : .disconnected }
             catch { return signal.isFinished || Task.isCancelled ? .cancelled : .transportFailed }
             // A corrupt adapter cannot push an oversized receive into the parser.
             guard update.output.count <= 16_384 else { return .transportFailed }

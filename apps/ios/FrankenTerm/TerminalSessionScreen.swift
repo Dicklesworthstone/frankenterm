@@ -21,14 +21,17 @@ final class MobileConnections {
     private var pendingCleanup: [UUID: TerminalSessionController] = [:]
     private var activityGeneration = UUID()
 
-    /// `signer` defaults to the protected Keychain signer; tests inject one.
+    /// `signer` defaults to the protected Keychain signer; tests inject one,
+    /// and may shorten how long an unanswering server takes to be reported.
     init(store: WorkspaceStore, journalDirectory: URL,
-         signer: any WorkspaceSSHSigning = AppleSSHCredentialSigner()) throws {
+         signer: any WorkspaceSSHSigning = AppleSSHCredentialSigner(),
+         liveness: WorkspaceSSHLiveness = .standard) throws {
         let broker = SSHAuthenticationBroker(store: store, signer: signer,
                                              support: WorkspaceNativeSSHAuthentication.routeSupport)
         coordinator = try TerminalInputCoordinator()
         journal = try TerminalSessionJournal(directory: journalDirectory)
-        manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal, coordinator: coordinator)
+        manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal,
+                                                coordinator: coordinator, liveness: liveness)
     }
 
     /// Foreground admits explicit connections; background seals every source and

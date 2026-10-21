@@ -81,7 +81,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let connections: MobileConnections, scene: WorkspaceTerminalScene, outPath: String
     }
 
-    private func liveScene() async throws -> LiveScene {
+    private func liveScene(liveness: WorkspaceSSHLiveness = .standard) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -101,7 +101,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
             transferID: Data(repeating: 9, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
-                                                signer: SceneMemorySigner(vault: vault))
+                                                signer: SceneMemorySigner(vault: vault), liveness: liveness)
         await connections.setActive(true)
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
@@ -483,6 +483,55 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(alpha.renderer.admittedFrame?.isLive, true)
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A server that stops answering (its sshd frozen, as a hung host or a dead
+    /// network looks to the phone) is reported lost within the liveness window,
+    /// and an explicit new session works once it answers again. An idle server
+    /// that answers probes is never reported lost.
+    func testAnUnansweringServerIsReportedLostAndAnIdleOneIsNot() async throws {
+        let liveness = try WorkspaceSSHLiveness(interval: .seconds(2), missedReplies: 2)
+        let live = try await liveScene(liveness: liveness), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo IDLE-$((40+2))", into: terminal)
+        _ = try await rows(of: terminal) { self.shows($0, "IDLE-42") }
+        try await Task.sleep(for: .seconds(9))
+        XCTAssertEqual(session.phase, .live, "an idle server answers its probes and stays connected")
+
+        // Freeze this shell's sshd; a background job resumes it after the test.
+        try await type("(sleep 25; kill -CONT $PPID) & kill -STOP $PPID", into: terminal)
+        let frozen = ContinuousClock.now
+        for _ in 0..<300 where !session.settled { try await Task.sleep(for: .milliseconds(50)) }
+        let detected = ContinuousClock.now - frozen
+        XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
+        XCTAssertTrue(session.settled)
+        XCTAssertLessThan(detected, .seconds(10), "about interval x (missedReplies + 1) after the last reply")
+        await assertReleased(session, connections: live.connections)
+
+        let again = try await connect(scene, "alpha", acknowledging: true)
+        let fresh = try shown(again)
+        defer { fresh.removeFromSuperview() }
+        try await type("echo REVIVED-$((40+2)) > \(live.outPath)", into: fresh)
+        let output = try await hostFile(live.outPath, containing: "REVIVED-42")
+        XCTAssertTrue(output.contains("REVIVED-42"), "a new session after the loss works (output: \(output))")
+        await scene.close()
+        await assertReleased(again, connections: live.connections)
+    }
+
+    /// A server that drops the connection (its sshd killed, as in a reboot) is
+    /// reported as lost, not as something this device chose to close.
+    func testADroppedConnectionIsReportedLost() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("kill -9 $PPID", into: terminal)
+        for _ in 0..<200 where !session.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
+        await assertReleased(session, connections: live.connections)
+        await scene.close()
     }
 
     private func assertReleased(_ controller: TerminalSessionController, connections: MobileConnections,

@@ -11,6 +11,12 @@ public enum NativeSSHError: Error, Equatable, Sendable {
     case invalidInput, busy, closed, timedOut, invalidChallenge
     case native(Int32)
     case resolution(Int32), connection(Int32)
+
+    /// The socket itself failed: reset, closed by the peer, or unreadable.
+    public var isConnectionFailure: Bool {
+        if case let .native(code) = self { return code == FTSSH_IO }
+        return false
+    }
 }
 
 /// Public evidence from this exact completed exchange, not a trust decision.
