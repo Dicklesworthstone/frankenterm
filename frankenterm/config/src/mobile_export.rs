@@ -824,8 +824,8 @@ pub fn export(
 /// The companion source for the inventory at `path`, every group, read with
 /// this user's SSH files: what `ft mobile source` and the companion's helper print.
 pub fn load_companion_source(path: &Path) -> anyhow::Result<Value> {
-    let bytes =
-        std::fs::read(path).map_err(|err| anyhow::anyhow!("reading {}: {}", path.display(), err))?;
+    let bytes = std::fs::read(path)
+        .map_err(|err| anyhow::anyhow!("reading {}: {}", path.display(), err))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| anyhow::anyhow!("{} is not UTF-8 text", path.display()))?;
     let context = InventoryContext {
@@ -1105,25 +1105,42 @@ ssh = "bad"
         let inventory = MachineInventory::parse(text, &context()).unwrap();
         let mut sources = sources(Some("Host bad\n  HostName me@evil\n  User u\n"));
         // b names no identity, so OpenSSH's defaults apply; only id_ecdsa exists.
-        sources.public_keys.insert(
-            PathBuf::from("/home/me/.ssh/id_ecdsa.pub"),
-            fake_key(7),
-        );
+        sources
+            .public_keys
+            .insert(PathBuf::from("/home/me/.ssh/id_ecdsa.pub"), fake_key(7));
         let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
         let routes = export.document["workspace"]["routes"].as_array().unwrap();
-        assert_eq!(routes.len(), 2, "c's alias resolves to a host the phone refuses");
+        assert_eq!(
+            routes.len(),
+            2,
+            "c's alias resolves to a host the phone refuses"
+        );
         assert_eq!(routes[1]["credential_refs"].as_array().unwrap().len(), 1);
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
-        assert!(messages.iter().any(|m| m.starts_with("c (bad): its HostName")), "{:?}", messages);
         assert!(
-            !messages.iter().any(|m| m.contains("id_dsa") || m.contains("id_rsa")),
+            messages
+                .iter()
+                .any(|m| m.starts_with("c (bad): its HostName")),
+            "{:?}",
+            messages
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("id_dsa") || m.contains("id_rsa")),
             "absent default identities are not reported: {:?}",
             messages
         );
 
-        let source = companion_source(&export, Path::new("/home/me/.config/frankenterm/machines.toml"));
+        let source = companion_source(
+            &export,
+            Path::new("/home/me/.config/frankenterm/machines.toml"),
+        );
         assert_eq!(source["format"], "ftmachines-source");
-        assert_eq!(source["inventory"], "/home/me/.config/frankenterm/machines.toml");
+        assert_eq!(
+            source["inventory"],
+            "/home/me/.config/frankenterm/machines.toml"
+        );
         assert_eq!(source["document"], export.document);
         let files: BTreeSet<&str> = source["identity_files"]
             .as_object()

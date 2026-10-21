@@ -1788,10 +1788,18 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
 
     #[test]
     fn hosts_are_names_or_ip_addresses_the_phone_accepts() {
-        for host in ["trj", "100.91.120.17", "css.example", "fe80::1", "[2001:db8::1]"] {
+        for host in [
+            "trj",
+            "100.91.120.17",
+            "css.example",
+            "fe80::1",
+            "[2001:db8::1]",
+        ] {
             assert!(valid_host(host), "{}", host);
         }
-        for host in ["", "a b", "me@h", "h/x", "h:22", "[h]", "[::1", "::1]", "a%b", "h#"] {
+        for host in [
+            "", "a b", "me@h", "h/x", "h:22", "[h]", "[::1", "::1]", "a%b", "h#",
+        ] {
             assert!(!valid_host(host), "{:?}", host);
         }
     }

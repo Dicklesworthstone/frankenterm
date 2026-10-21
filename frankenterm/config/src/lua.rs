@@ -1622,7 +1622,9 @@ mod test {
         let lua = make_lua_context(&config_file)?;
         // Named explicitly: unnamed, a missing neighbour falls back to the
         // user's real inventory, which a test must not read.
-        let missing: Value = lua.load("return frankenterm.machines('absent.toml')").eval()?;
+        let missing: Value = lua
+            .load("return frankenterm.machines('absent.toml')")
+            .eval()?;
         assert!(
             missing.is_nil(),
             "no inventory is nil, so a config can fall back"
@@ -1697,7 +1699,10 @@ ssh = "css"
         let named: String = lua
             .load("return frankenterm.machines('machines.toml').machines.trj.name")
             .eval()?;
-        assert_eq!(named, "Threadripper", "a relative name is beside the config");
+        assert_eq!(
+            named, "Threadripper",
+            "a relative name is beside the config"
+        );
         let watched: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
         assert!(
             watched
