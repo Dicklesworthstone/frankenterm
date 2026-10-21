@@ -184,7 +184,9 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
         // Leave system screen-edge gestures alone; direct controls remain usable.
         return point.x >= 24 && point.x <= view.bounds.width - 24
     }
-    public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    // UIView declares this too; one override serves both the view's own check and
+    // the delegate role for recognizers it owns.
+    public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         !retired && action == nil && (gestureRecognizer !== canvasGesture || permitsCanvasNavigation())
     }
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,

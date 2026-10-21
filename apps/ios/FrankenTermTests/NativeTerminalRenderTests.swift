@@ -104,23 +104,33 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
     }
 
-    /// U+2580 UPPER HALF BLOCK fills the top half of its cell. An inverted atlas
-    /// upload (the first iOS render drew every glyph upside down) lights the
-    /// bottom half instead; colour/coverage counts alone cannot see that.
+    /// A glyph's atlas bitmap must keep its own top at the top. "T" has a wide
+    /// bar at the top of its ink and a narrow stem below, so an inverted atlas
+    /// upload (the first iOS render drew every glyph upside down) puts the wide
+    /// rows at the bottom. A symmetric-ink glyph such as a solid half block
+    /// cannot detect this: glyph placement comes from the font's ink bounds,
+    /// so flipping a solid rectangle changes nothing (verified with a planted
+    /// flip, which a U+2580 check let pass).
     func testGlyphsAreDrawnUprightInTheirCells() async throws {
-        let (shot, caret) = try await render(String(repeating: "\u{2580}", count: 8) + "\r\n",
-                                             name: "upper-half-block-orientation")
+        let (shot, caret) = try await render(String(repeating: "T", count: 8) + "\r\n", name: "glyph-orientation")
         let cell = try XCTUnwrap(caret?.rect, "the drawn frame must publish its caret (cursor at row 1, column 0)")
         let cellHeight = Int(cell.height.rounded()), rowTop = Int(cell.minY.rounded()) - cellHeight
         XCTAssertGreaterThanOrEqual(rowTop, 0)
         XCTAssertGreaterThan(cellHeight, 4)
-        let half = cellHeight / 2, columns = min(shot.width, Int((cell.width * 8).rounded()))
-        var upper = 0, lower = 0
-        for x in 0..<columns {
-            for y in rowTop..<(rowTop + half) where shot.isLight(x, y) { upper += 1 }
-            for y in (rowTop + cellHeight - half)..<(rowTop + cellHeight) where shot.isLight(x, y) { lower += 1 }
+        let columns = min(shot.width, Int((cell.width * 8).rounded()))
+        // Summed glyph intensity per scanline across the eight glyphs of row 0.
+        // Intensity, not a light/dark threshold: an antialiased bar can straddle
+        // two scanlines at half intensity each.
+        let profile = (rowTop..<(rowTop + cellHeight)).map { y in
+            (0..<columns).reduce(0) { total, x in
+                let (r, g, b) = shot.pixel(x, y)
+                return total + max(0, (r + g + b) / 3 - 40)
+            }
         }
-        XCTAssertGreaterThan(upper, columns * half / 2, "the upper half of the cells must be filled")
-        XCTAssertLessThan(lower, upper / 5, "the lower half of the cells must stay background")
+        let inked = profile.indices.filter { profile[$0] > 300 }
+        let first = try XCTUnwrap(inked.first), last = try XCTUnwrap(inked.last)
+        XCTAssertGreaterThan(last - first, 3, "the glyphs must span several scanlines")
+        let top = profile[first] + profile[first + 1], bottom = profile[last] + profile[last - 1]
+        XCTAssertGreaterThan(top, 2 * bottom, "a T's bar must be at the top of its ink, not the bottom (profile \(profile))")
     }
 }
