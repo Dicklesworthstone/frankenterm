@@ -59,6 +59,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
     public let queuedReplies: UInt64, droppedReplies: UInt64
     public let publishedFrames: UInt64, unavailableFrames: UInt64
     public let endOfOutput: Bool, closing: Bool, closed: Bool
+    public let waitingPresentationRequests: Int
 }
 
 /// One source-bound owner joins the real SSH session pump, canonical terminal,
@@ -66,7 +67,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
 /// key, reply or frame. The pump awaits complete consumption before reading again.
 ///
 /// Only one model transaction/publication runs at a time, with one bounded
-/// waiting consumer and one waiting keyboard transaction. During an awaited
+/// waiting consumer, keyboard transaction and presentation request. During an awaited
 /// reply/delivery handoff, read-only encoding may inspect already-applied modes.
 /// All egress still enters the same coordinator.
 public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSessionConsumer {
@@ -76,32 +77,36 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private let coordinator: TerminalInputCoordinator
     private let delivery: any TerminalModelDelivery
     private var operationActive = false
-    private enum OperationKind { case consumer, keyboard }
+    private enum OperationKind { case consumer, keyboard, presentation }
     private struct WaitingOperation {
         let kind: OperationKind
         let continuation: CheckedContinuation<Void, Error>
     }
     // One pump may retain its current bounded chunk while one keyboard owner
-    // waits for an input transaction. Neither creates another queue of bytes.
+    // waits for an input transaction. One presentation request may also wait;
+    // it retains no terminal bytes. No kind may install a second waiter.
     private var waitingOperations: [WaitingOperation] = []
     private var closeWaiter: CheckedContinuation<Void, Never>?
     private var closeTask: Task<Void, Error>?
     private var closing = false, closed = false, endOfOutput = false
     private var visible = true
+    private var visibilityGeneration = UUID()
     private var viewportTop: Int64?
     private var queuedReplies: UInt64 = 0, droppedReplies: UInt64 = 0
     private var publishedFrames: UInt64 = 0, unavailableFrames: UInt64 = 0
 
     public init(model: any TerminalSessionModel, coordinator: TerminalInputCoordinator,
-                delivery: any TerminalModelDelivery) {
+                delivery: any TerminalModelDelivery, initiallyVisible: Bool = true) {
         self.model = model; source = model.source
         self.coordinator = coordinator; self.delivery = delivery
+        visible = initiallyVisible
     }
 
     public func accounting() -> TerminalModelAccounting {
         .init(queuedReplies: queuedReplies, droppedReplies: droppedReplies,
               publishedFrames: publishedFrames, unavailableFrames: unavailableFrames,
-              endOfOutput: endOfOutput, closing: closing, closed: closed)
+              endOfOutput: endOfOutput, closing: closing, closed: closed,
+              waitingPresentationRequests: waitingOperations.filter { $0.kind == .presentation }.count)
     }
 
     private func requireSource(_ source: TerminalSource) throws {
@@ -128,7 +133,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try Task.checkCancellation()
         guard !closing, !closed else { throw TerminalModelError.closed }
         if operationActive {
-            guard waitingOperations.count < 2, !waitingOperations.contains(where: { $0.kind == kind }) else {
+            guard waitingOperations.count < 3, !waitingOperations.contains(where: { $0.kind == kind }) else {
                 throw TerminalModelError.busy
             }
             try await withCheckedThrowingContinuation { continuation in
@@ -276,12 +281,18 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         if !visible {
             // Hiding is a lifecycle state change, not a model mutation. It must
             // take effect even while the already-owned frame is being delivered.
+            visibilityGeneration = UUID()
             self.visible = false
             return
         }
-        try beginOperation(); defer { finishOperation() }
-        self.visible = visible
-        if visible { try await publishFrame() }
+        let generation = visibilityGeneration
+        // A swipe back to a busy terminal is ordinary scheduling, not a fatal
+        // display error. Wait once behind the current canonical transaction.
+        // A newer hide invalidates this request without waiting for that work.
+        try await acquireOperation(.presentation); defer { finishOperation() }
+        guard visibilityGeneration == generation else { return }
+        self.visible = true
+        try await publishFrame()
     }
     public func refresh(source: TerminalSource) async throws {
         try requireSource(source); try beginOperation(); defer { finishOperation() }
