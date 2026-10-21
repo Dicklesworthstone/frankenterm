@@ -269,6 +269,12 @@ impl NativeTerminal {
             .palette_revision
             .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
+        let geometry = self
+            .witness
+            .geometry_revision
+            .checked_add(1)
+            .ok_or(NativeTerminalError::SequenceExhausted)?;
+        let alternate = self.terminal.is_alt_screen_active();
         let dropped_replies = self
             .terminal
             .bounded_output_status()
@@ -289,6 +295,11 @@ impl NativeTerminal {
         // output batch. This may rebuild an unchanged palette; it never lets
         // changed colors reuse a stale palette identity.
         self.witness.palette_revision = palette;
+        // The alternate screen is a different grid with its own rows, so a
+        // renderer must not accept it under the previous geometry identity.
+        if self.terminal.is_alt_screen_active() != alternate {
+            self.witness.geometry_revision = geometry;
+        }
         Ok(())
     }
 
@@ -1007,6 +1018,30 @@ mod tests {
             terminal.set_font_revision(6),
             Err(NativeTerminalError::Stale)
         );
+    }
+
+    #[test]
+    fn switching_screens_advances_the_geometry_revision_and_other_output_does_not() {
+        let mut terminal = terminal();
+        let flags = |frame: &[u8]| u32::from_le_bytes(frame[12..16].try_into().unwrap());
+        let geometry = |frame: &[u8]| u64::from_le_bytes(frame[64..72].try_into().unwrap());
+        terminal.feed(b"primary").unwrap();
+        let primary = terminal.capture_frame(None).unwrap();
+        terminal.feed(b"\x1b[?1049h").unwrap();
+        let alternate = terminal.capture_frame(None).unwrap();
+        assert_eq!(flags(&primary) & 4, 0);
+        assert_eq!(flags(&alternate) & 4, 4);
+        assert!(geometry(&alternate) > geometry(&primary));
+        terminal.feed(b"full screen").unwrap();
+        let drawn = terminal.capture_frame(None).unwrap();
+        assert_eq!(geometry(&drawn), geometry(&alternate));
+        terminal.feed(b"\x1b[?1049l").unwrap();
+        let restored = terminal.capture_frame(None).unwrap();
+        assert_eq!(flags(&restored) & 4, 0);
+        assert!(geometry(&restored) > geometry(&drawn));
+        terminal.feed(b"\x1b[?1049h\x1b[?1049l").unwrap();
+        let round_trip = terminal.capture_frame(None).unwrap();
+        assert_eq!(geometry(&round_trip), geometry(&restored));
     }
 
     #[test]

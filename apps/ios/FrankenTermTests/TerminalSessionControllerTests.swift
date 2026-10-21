@@ -72,7 +72,11 @@ final class TerminalSessionControllerTests: XCTestCase {
             "workspace": workspace], options: [.sortedKeys]))
     }
 
-    func testSceneControllerTypesThroughTheNativeKeyboardAndResizesThePTY() async throws {
+    private struct LiveScene {
+        let connections: MobileConnections, target: TerminalSessionTarget, outPath: String
+    }
+
+    private func liveScene() async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -94,32 +98,43 @@ final class TerminalSessionControllerTests: XCTestCase {
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
                                                 signer: SceneMemorySigner(vault: vault))
         await connections.setActive(true)
+        return LiveScene(connections: connections, target: .init(workspaceID: installed.id, revision: installed.revision,
+            machineID: "machine", machineName: "Loopback", routeID: "route", credentialID: "key"), outPath: outPath)
+    }
 
-        let controller = TerminalSessionController(target: .init(workspaceID: installed.id, revision: installed.revision,
-            machineID: "machine", machineName: "Loopback", routeID: "route", credentialID: "key"), connections: connections)
-        await controller.start()
+    /// Starts `controller`, puts its view in the key window and returns it.
+    private func live(_ controller: TerminalSessionController,
+                      acknowledgingEarlierSessions: Bool = false) async throws -> NativeTerminalView {
+        await controller.start(acknowledgingEarlierSessions: acknowledgingEarlierSessions)
         XCTAssertEqual(controller.phase, .live)
         let terminal = try XCTUnwrap(controller.terminal)
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = try XCTUnwrap(scenes.flatMap(\.windows).first { $0.isKeyWindow } ?? scenes.first?.windows.first)
         terminal.frame = CGRect(x: 0, y: 0, width: min(window.bounds.width, 402), height: 300)
         window.addSubview(terminal)
-        defer { terminal.removeFromSuperview() }
+        return terminal
+    }
 
-        // Type through UIKit's text-input protocol once a caret has been drawn
-        // (input admission requires a matching rendered projection).
-        let command = "stty size > \(outPath); echo FRANKEN-$((6*7)) >> \(outPath)"
-        var typed = false
-        for _ in 0..<200 where !typed {
-            try await Task.sleep(for: .milliseconds(50))
+    /// Types through UIKit's text-input protocol once a caret has been drawn
+    /// (input admission requires a matching rendered projection).
+    private func type(_ text: String, into terminal: NativeTerminalView) async throws {
+        for _ in 0..<200 {
             // isEditable: input accepted and the rendered caret geometry exists.
             if terminal.input.isEditable {
-                terminal.input.insertText(command)
-                terminal.input.insertText("\n")
-                typed = true
+                terminal.input.insertText(text); terminal.input.insertText("\n")
+                return
             }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        XCTAssertTrue(typed, "the native input view never became editable")
+        XCTFail("the native input view never became editable")
+    }
+
+    func testSceneControllerTypesThroughTheNativeKeyboardAndResizesThePTY() async throws {
+        let scene = try await liveScene(), outPath = scene.outPath, connections = scene.connections
+        let controller = TerminalSessionController(target: scene.target, connections: connections)
+        let terminal = try await live(controller)
+        defer { terminal.removeFromSuperview() }
+        try await type("stty size > \(outPath); echo FRANKEN-$((6*7)) >> \(outPath)", into: terminal)
         var output = ""
         for _ in 0..<200 {
             output = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
@@ -140,5 +155,39 @@ final class TerminalSessionControllerTests: XCTestCase {
         await controller.stop()
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty, "stop must settle the connection through the manager")
+    }
+
+    /// A shell that exits ends the session from inside the pump task; teardown
+    /// must still finish there, and the next session on the machine needs the
+    /// user's acknowledgement of the first one's unknown outcome.
+    func testRemoteExitSettlesAndANewSessionNeedsAcknowledgement() async throws {
+        let scene = try await liveScene(), connections = scene.connections
+        let first = TerminalSessionController(target: scene.target, connections: connections)
+        let terminal = try await live(first)
+        defer { terminal.removeFromSuperview() }
+        try await type("exit", into: terminal)
+        for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.peerOutputEnded)))
+        XCTAssertTrue(first.settled, "teardown after a remote exit must finish")
+        let remaining = await connections.manager.connections()
+        XCTAssertTrue(remaining.isEmpty)
+
+        let unacknowledged = first.replacement()
+        await unacknowledged.start()
+        XCTAssertEqual(unacknowledged.phase, .needsReview, "the ended session's outcome must be reviewed first")
+        XCTAssertTrue(unacknowledged.settled)
+
+        let second = unacknowledged.replacement()
+        let again = try await live(second, acknowledgingEarlierSessions: true)
+        defer { again.removeFromSuperview() }
+        try await type("echo AGAIN-$((40+2)) > \(scene.outPath)", into: again)
+        var output = ""
+        for _ in 0..<200 where !output.contains("AGAIN-42") {
+            try await Task.sleep(for: .milliseconds(50))
+            output = (try? String(contentsOfFile: scene.outPath, encoding: .utf8)) ?? ""
+        }
+        XCTAssertTrue(output.contains("AGAIN-42"), "the acknowledged new session must run commands (output: \(output))")
+        await second.stop()
+        XCTAssertTrue(second.settled)
     }
 }
