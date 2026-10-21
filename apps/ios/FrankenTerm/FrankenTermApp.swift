@@ -1205,6 +1205,8 @@ private struct MachineWorkspaceView: View {
     @State private var selection = ""
     @State private var groupID = ""
     @State private var themeMachineID: String?
+    /// Read so a return from Tailscale re-evaluates what Connect needs.
+    @Environment(\.scenePhase) private var scenePhase
     private var document: WorkspaceDocument {
         (try? model.workspaces.first(where: { $0.id == workspaceID })?.document()) ?? initialDocument
     }
@@ -1225,57 +1227,27 @@ private struct MachineWorkspaceView: View {
             ForEach(machines) { machine in
                 let theme = theme(for: machine)
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
-                        HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
-                        if MobileWorkspaceModel.themeCatalog != nil {
-                            Button { themeMachineID = machine.id } label: {
-                                Label(theme.map { "Theme: \($0.name)" } ?? "Choose Theme", systemImage: "paintpalette")
-                            }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
-                                .accessibilityIdentifier("machine.theme")
-                        }
-                        Label("Restored offline", systemImage: "checkmark.shield")
-                        Text("Inspect the saved routes and their local requirements below. Nothing connects until you tap Connect on a ready direct SSH route; the pinned host key is verified before any key is offered.").font(.callout)
-                        ForEach(machine.routeIDs, id: \.self) { id in
-                            if let route = document.routes.first(where: { $0.id == id }) {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack {
-                                        Label(route.mode == "frankenterm_mux" ? "Persistent mux route" : "Direct SSH route", systemImage: "point.3.connected.trianglepath.dotted")
-                                            .font(.headline)
-                                        if id == machine.preferredRouteID { Text("Preferred").font(.caption.bold()) }
-                                    }
-                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)")
-                                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                                    if let local = model.localPolicies[workspaceID] {
-                                        Text("\(route.credentialIDs.filter(local.credentialIDs.contains).count) of \(route.credentialIDs.count) permitted key references are available on this device.")
-                                            .font(.caption)
-                                        if let readiness = local.routes.first(where: { $0.routeID == id }) {
-                                            ForEach(Array(readiness.issues.enumerated()), id: \.offset) { _, issue in
-                                                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
-                                            }
-                                        } else {
-                                            Label("Local requirements could not be validated.", systemImage: "exclamationmark.shield").font(.caption)
-                                        }
-                                    } else {
-                                        Label("Unlock protected storage to check credential availability.", systemImage: "lock.shield").font(.caption)
-                                    }
-                                    if !route.jumpRoutes.isEmpty {
-                                        Text("\(route.jumpRoutes.count) configured jump routes and their own dependencies must also be ready.").font(.caption)
-                                    }
-                                    if route.mode == "direct_ssh", let connections = model.connections,
-                                       let local = model.localPolicies[workspaceID],
-                                       local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
-                                       let credential = route.credentialIDs.first(where: local.credentialIDs.contains) {
-                                        NavigationLink {
-                                            liveWorkspace(connections: connections, local: local, initial: machine.id,
-                                                          route: id, credential: credential)
-                                        } label: { Label("Connect", systemImage: "terminal") }
-                                            .buttonStyle(.borderedProminent)
-                                    }
-                                }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color(ftHex: theme?.accent ?? "#3B82F6").opacity(0.14), in: RoundedRectangle(cornerRadius: 16))
+                    VStack(alignment: .leading, spacing: 20) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2)
+                            Spacer(minLength: 8)
+                            if MobileWorkspaceModel.themeCatalog != nil {
+                                Button { themeMachineID = machine.id } label: {
+                                    Label(theme?.name ?? "Theme", systemImage: "paintpalette").lineLimit(1)
+                                }.buttonStyle(.bordered).controlSize(.small).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                                    .accessibilityIdentifier("machine.theme")
                             }
                         }
+                        HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }
+                            .frame(height: 10).clipShape(Capsule()).accessibilityHidden(true)
+                        connectSection(machine, theme: theme)
+                        DisclosureGroup("Routes") {
+                            VStack(alignment: .leading, spacing: 14) {
+                                ForEach(machine.routeIDs, id: \.self) { id in
+                                    if let route = document.routes.first(where: { $0.id == id }) { routeRow(route, preferred: id == machine.preferredRouteID) }
+                                }
+                            }.padding(.top, 10)
+                        }.tint(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
                         if let saved = model.workspaces.first(where: { $0.id == workspaceID }), !saved.findings.isEmpty {
                             DisclosureGroup("Preserved settings and unresolved requirements") {
                                 VStack(alignment: .leading, spacing: 14) {
@@ -1290,7 +1262,6 @@ private struct MachineWorkspaceView: View {
                                 }.padding(.top, 8)
                             }
                         }
-                        Text("Swipe to inspect another machine. These are saved configurations, not live panes.").font(.caption)
                     }.padding(28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
@@ -1327,36 +1298,90 @@ private struct MachineWorkspaceView: View {
             }
     }
 
-    /// The live scene over this group's machines in their order. The chosen
-    /// route opens first; any other machine can connect through its first
-    /// ready direct-SSH route, preferred route first.
-    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState,
-                               initial: String, route: String, credential: String) -> some View {
+    /// One Connect for the machine, in its colors, and how it will go: the
+    /// route this phone can reach now, or what it needs first.
+    @ViewBuilder private func connectSection(_ machine: WorkspaceDocument.Machine, theme: WorkspaceDocument.Theme?) -> some View {
+        let _ = scenePhase
+        let accent = Color(ftHex: theme?.accent ?? "#3B82F6")
+        if let connections = model.connections, let local = model.localPolicies[workspaceID],
+           let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
+            VStack(alignment: .leading, spacing: 10) {
+                NavigationLink {
+                    liveWorkspace(connections: connections, local: local, initial: machine.id)
+                } label: {
+                    Label("Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 6)
+                }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+                // Tailscale only: say so before the first attempt waits out a timeout.
+                if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.host) == .tailnet }),
+                   WorkspaceRouteNetwork.deviceTailnetAddress() == nil {
+                    HStack {
+                        Label("Needs Tailscale on this \(UIDevice.current.model)", systemImage: "network.badge.shield.half.filled")
+                            .font(.callout)
+                        Spacer(minLength: 8)
+                        Button("Open Tailscale") { WorkspaceTerminalScreen.openTailscale() }.buttonStyle(.bordered).tint(accent)
+                    }
+                } else {
+                    Text(verbatim: WorkspaceTerminalScreen.via(first)).font(.callout).opacity(0.75)
+                }
+            }
+        } else if model.localPolicies[workspaceID] == nil {
+            Label("Unlock protected storage to connect.", systemImage: "lock.shield").font(.callout)
+        } else {
+            Label("No route to this machine is ready on this \(UIDevice.current.model). Routes below say what each needs.",
+                  systemImage: "exclamationmark.triangle").font(.callout)
+        }
+    }
+
+    /// A saved route: where it goes and anything this phone still needs for it.
+    @ViewBuilder private func routeRow(_ route: WorkspaceDocument.Route, preferred: Bool) -> some View {
+        let network = WorkspaceRouteNetwork(host: route.host)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: network == .tailnet ? "network.badge.shield.half.filled" : network == .localNetwork ? "wifi" : "globe")
+                Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.callout, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                if preferred { Text("Preferred").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.white.opacity(0.15), in: Capsule()) }
+            }
+            if route.mode != "direct_ssh" {
+                Text("Persistent mux route: opens from the desktop app for now.").font(.caption).opacity(0.75)
+            } else if !route.jumpRoutes.isEmpty {
+                Text("Reached through \(route.jumpRoutes.count) jump hosts, which this phone cannot use yet.").font(.caption).opacity(0.75)
+            }
+            ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
+                    id: \.offset) { _, issue in
+                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+            }
+        }
+    }
+
+    /// The live scene over this group's machines in their order, opening on
+    /// `initial`. Each machine tries its ready direct-SSH routes, those this
+    /// phone can reach now first (TerminalSessionTarget.attemptOrder).
+    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String) -> some View {
         let themes = SceneThemeSource(
             themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
             choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
         return LiveWorkspaceView(initialMachineID: initial, themes: themes) {
             try WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
-                machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },
+                machines: machines.map { sceneMachine($0, local: local) },
                 initialMachineID: initial, connections: connections)
         }
     }
 
-    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
-                              chosen: (route: String, credential: String)?) -> SceneMachine {
+    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState) -> SceneMachine {
         let theme = theme(for: machine)
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
                   unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
                   theme: theme)
         }
-        // Every ready direct-SSH route, the chosen one, then the preferred one, first.
+        // Every ready direct-SSH route, the preferred one first.
         var seen = Set<String>(), routes: [TerminalSessionRoute] = []
-        for id in [chosen?.route, machine.preferredRouteID].compactMap({ $0 }) + machine.routeIDs where seen.insert(id).inserted {
+        for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
                   route.jumpRoutes.isEmpty, local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
-                  let credential = id == chosen?.route ? chosen?.credential
-                      : route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
+                  let credential = route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
             routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port))
         }
         guard !routes.isEmpty else { return scene(nil) }
