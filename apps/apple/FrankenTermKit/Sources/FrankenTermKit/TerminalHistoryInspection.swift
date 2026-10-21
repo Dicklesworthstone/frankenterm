@@ -28,33 +28,15 @@ public final class TerminalHistoryInspection: Identifiable {
     private let prepare: @MainActor () async -> Void
     // Observation serves the Apple UI only. The same owner state and lifecycle
     // run on other platforms without a dependency on a UI observation runtime.
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
+    // These private fields are tracked like the rest: an @ObservationIgnored
+    // inside `#if` is invisible to @Observable, whose accessors then collide
+    // with its own (a Release build error), and no view reads them anyway.
     private var onClose: (@MainActor (UUID, TerminalHistoryBookmark?, String?) -> Void)?
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var bookmark: TerminalHistoryBookmark?
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var didReveal = false
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var generation = UUID()
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var work: Task<Void, Never>?
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var closing: Task<Void, Never>?
-    #if canImport(SwiftUI)
-    @ObservationIgnored
-    #endif
     private var closed = false
 
     public init(runtime: TerminalModelRuntime, source: TerminalSource, destination: String,
