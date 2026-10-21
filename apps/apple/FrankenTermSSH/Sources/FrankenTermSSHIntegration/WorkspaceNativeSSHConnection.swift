@@ -417,7 +417,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         guard event.waitExpired else { return }
         silentIntervals += 1
-        guard silentIntervals <= liveness.missedReplies || true else { throw TerminalTransportError.peerUnresponsive }
+        guard silentIntervals <= liveness.missedReplies else { throw TerminalTransportError.peerUnresponsive }
         if try await session.keepalive(driver: driver) == .unavailable { probing = false }
     }
 
