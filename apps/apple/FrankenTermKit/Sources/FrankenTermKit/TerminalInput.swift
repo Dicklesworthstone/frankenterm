@@ -492,6 +492,15 @@ public actor TerminalInputCoordinator {
         await task.value
         connection.closed = true
     }
+    /// Seal admission in one actor turn before awaiting prompts, writes, or
+    /// connection teardown. Queued input settles into the retained outcome
+    /// ledger; an already leased write keeps its owner until its result arrives.
+    /// This does not close the transport or make the source eligible to retire.
+    /// The caller must still disconnect to join actual native teardown.
+    public func stopAdmission(_ source: TerminalSource) throws {
+        let connection = try connection(source, active: false)
+        invalidate(connection)
+    }
     public func disconnect(_ source: TerminalSource) async throws {
         let connection = try connection(source, active: false)
         invalidate(connection)

@@ -17,7 +17,8 @@ let package = Package(
     products: [.library(name: "FrankenTermSSHNative", targets: ["CFrankenTermSSH"]),
                .library(name: "FrankenTermSSH", targets: ["FrankenTermSSH"]),
                .library(name: "FrankenTermSSHIntegration", targets: ["FrankenTermSSHIntegration"]),
-               .executable(name: "FrankenTermSSHInteropProbe", targets: ["FrankenTermSSHInteropProbe"])],
+               .executable(name: "FrankenTermSSHInteropProbe", targets: ["FrankenTermSSHInteropProbe"]),
+               .executable(name: "WorkspaceSSHProbe", targets: ["WorkspaceSSHProbe"])],
     dependencies: dependencies,
     targets: [
         .systemLibrary(name: "CLibssh2", pkgConfig: "libssh2",
@@ -34,10 +35,16 @@ let package = Package(
         // Independent loopback test driver only; not linked into the app.
         .executableTarget(name: "FrankenTermSSHInteropProbe", dependencies: ["FrankenTermSSHIntegration", "FrankenTermSSH",
                 .product(name: "FrankenTermKit", package: "FrankenTermKit")],
-                path: "Tests/Interop", exclude: ["PumpProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py"], sources: ["SessionProbe.swift"]),
+                path: "Tests/Interop", exclude: ["PumpProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py"],
+                sources: ["SessionProbe.swift"]),
         // Published legacy UUID-bound adapter probe, retained independently.
         .executableTarget(name: "TerminalPumpProbe", dependencies: ["FrankenTermSSHIntegration"],
-                path: "Tests/Interop", exclude: ["SessionProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py"], sources: ["PumpProbe.swift"])
+                path: "Tests/Interop", exclude: ["SessionProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py"],
+                sources: ["PumpProbe.swift"]),
+        // Independently generated keys, protected broker races, durable journal.
+        .executableTarget(name: "WorkspaceSSHProbe", dependencies: testDependencies,
+                path: "Tests/Interop", exclude: ["SessionProbe.swift", "PumpProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py"],
+                sources: ["WorkspaceProbe.swift"])
     ],
     cLanguageStandard: .c11
 )

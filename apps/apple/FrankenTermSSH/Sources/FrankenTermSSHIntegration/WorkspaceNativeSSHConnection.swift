@@ -14,15 +14,20 @@ public actor WorkspaceNativeSSHConnection {
     public nonisolated let identity: TerminalConnectionIdentity
     public nonisolated let peer: NativeSSHPeer
     public nonisolated let workspaceRevision: UUID
+    public nonisolated let scope: TerminalSessionScope
     private let transport: WorkspaceNativeSSHTransport
     private var attached: TerminalSessionPump?
-    private var opening = false, closed = false
+    private var coordinator: TerminalInputCoordinator?
+    private var opening: Task<TerminalSessionPump, Error>?
+    private var openingAttempted = false, sourcePublished = false, closed = false
     private var shutdown: Task<Void, Never>?
+    private var journalEpoch: (journal: TerminalSessionJournal, epoch: TerminalSessionEpoch)?
 
-    private init(transport: WorkspaceNativeSSHTransport, peer: NativeSSHPeer, workspaceRevision: UUID) {
+    private init(transport: WorkspaceNativeSSHTransport, peer: NativeSSHPeer, scope: TerminalSessionScope) {
         self.transport = transport; self.peer = peer; identity = transport.identity
-        self.workspaceRevision = workspaceRevision
+        self.scope = scope; workspaceRevision = scope.workspaceRevision
     }
+    public var isClosed: Bool { closed }
 
     /// The explicit confirmation is independent of imported preferences and is
     /// required on every new connection. The durable Connect Later bit remains
@@ -31,12 +36,19 @@ public actor WorkspaceNativeSSHConnection {
     public static func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
                                routeID: String, credentialID: String, confirmedByUser: Bool,
                                store: WorkspaceStore, broker: SSHAuthenticationBroker,
+                               journal: TerminalSessionJournal? = nil,
                                networkActivity: WorkspaceNetworkActivity = .shared,
                                connectionTimeout: Duration = .seconds(15),
                                authenticationTimeout: Duration = .seconds(60)) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         try Task.checkCancellation()
         let foreground = try await broker.foregroundLease()
+        if let journal {
+            let records = try await journal.records()
+            guard !records.contains(where: {
+                $0.requiresReview && $0.scope.workspaceID == workspaceID && $0.scope.machineID == machineID
+            }) else { throw TerminalSessionJournalError.reviewRequired }
+        }
         let lease = try networkActivity.beginConnection()
         let entries = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
         guard let entry = entries.first(where: { $0.workspace.id == workspaceID }),
@@ -70,9 +82,12 @@ public actor WorkspaceNativeSSHConnection {
             let identity = try TerminalConnectionIdentity(workspaceID: workspaceID.uuidString,
                 machineID: machineID, routeID: routeID, routeRevision: 1,
                 transportID: session.transportID, channelID: session.channelID)
+            let scope = try TerminalSessionScope(workspaceID: workspaceID, workspaceRevision: expectedRevision,
+                machineID: machineID, routeID: routeID, transportID: session.transportID,
+                channelID: session.channelID)
             let transport = WorkspaceNativeSSHTransport(session: session, identity: identity, broker: broker,
                 foreground: foreground, networkLease: lease, authority: authority)
-            return WorkspaceNativeSSHConnection(transport: transport, peer: peer, workspaceRevision: expectedRevision)
+            return WorkspaceNativeSSHConnection(transport: transport, peer: peer, scope: scope)
         } catch {
             await session.close()
             // Keep exclusion until cancellation/readiness teardown has joined.
@@ -84,28 +99,83 @@ public actor WorkspaceNativeSSHConnection {
     /// Separate deliberate remote side effect. prepareForInput must durably
     /// record this exact source's uncertainty marker before returning. Failure
     /// creates no shell. The caller supplies the canonical terminal consumer to
-    /// the returned pump; this owner adds no ANSI parser or local echo.
+    /// the returned pump; this owner adds no ANSI parser or local echo. Custom
+    /// durability providers retain their own marker and cleanup responsibility;
+    /// production workspace owners should use the journal overload below.
     public func openTerminal(geometry: NativeSSHGeometry, coordinator: TerminalInputCoordinator,
-                             prepareForInput: @Sendable (TerminalConnectionIdentity) async throws -> Void) async throws -> TerminalSessionPump {
-        guard !closed, !opening, attached == nil else { throw NativeSSHError.busy }
-        opening = true
-        defer { opening = false }
-        do {
-            try await validateCurrent()
-            try await prepareForInput(identity)
-            try await validateCurrent()
-            try await transport.openShell(geometry: geometry)
-            try await validateCurrent()
-            let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
-            attached = pump
-            do { try await validateCurrent() }
-            catch {
-                try? await pump.disconnect()
-                try? await coordinator.retire(pump.source)
+                             prepareForInput: @escaping @Sendable (TerminalConnectionIdentity) async throws -> Void) async throws -> TerminalSessionPump {
+        try await startOpening(geometry: geometry, coordinator: coordinator,
+                               journal: nil, prepareForInput: prepareForInput)
+    }
+
+    /// Persist the exact source's creation uncertainty before requesting a remote
+    /// shell. This owner retains the epoch through cancellation, native teardown,
+    /// and retryable storage errors. Every attempt is explicit and occurs once.
+    /// The scene must close this owner when pump.run ends, including EOF/error,
+    /// and separately join its pump consumer and outcome delivery.
+    public func openTerminal(geometry: NativeSSHGeometry, coordinator: TerminalInputCoordinator,
+                             journal: TerminalSessionJournal) async throws -> TerminalSessionPump {
+        try await startOpening(geometry: geometry, coordinator: coordinator,
+                               journal: journal, prepareForInput: nil)
+    }
+
+    private func startOpening(geometry: NativeSSHGeometry, coordinator: TerminalInputCoordinator,
+                              journal: TerminalSessionJournal?,
+                              prepareForInput: (@Sendable (TerminalConnectionIdentity) async throws -> Void)?)
+        async throws -> TerminalSessionPump {
+        try Task.checkCancellation()
+        guard !closed, !openingAttempted, attached == nil else { throw NativeSSHError.busy }
+        openingAttempted = true
+        self.coordinator = coordinator
+        let task = Task<TerminalSessionPump, Error> {
+            try await self.performOpen(geometry: geometry, coordinator: coordinator,
+                                       journal: journal, prepareForInput: prepareForInput)
+        }
+        opening = task
+        return try await withTaskCancellationHandler {
+            do {
+                let pump = try await task.value
+                try await validateCurrent()
+                sourcePublished = true
+                opening = nil
+                return pump
+            } catch {
+                // This wrapper is outside the retained opening task. Its close
+                // can join that task without creating an open/close self-join.
+                task.cancel()
+                await close()
+                opening = nil
                 throw error
             }
-            return pump
-        } catch { await close(); throw error }
+        } onCancel: { task.cancel() }
+    }
+
+    private func performOpen(geometry: NativeSSHGeometry, coordinator: TerminalInputCoordinator,
+                             journal: TerminalSessionJournal?,
+                             prepareForInput: (@Sendable (TerminalConnectionIdentity) async throws -> Void)?)
+        async throws -> TerminalSessionPump {
+        try await validateCurrent()
+        if let journal {
+            let epoch = try await journal.beginCreation(scope: scope)
+            // Close may have entered while the durable write was in progress.
+            // Store the returned owner before checking closed/cancelled state;
+            // shutdown joins this task before attempting epoch retirement.
+            journalEpoch = (journal, epoch)
+        } else if let prepareForInput {
+            try await prepareForInput(identity)
+        } else { throw NativeSSHError.closed }
+        try await validateCurrent()
+        try await transport.openShell(geometry: geometry)
+        try await validateCurrent()
+        let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
+        attached = pump
+        do { try await validateCurrent() }
+        catch {
+            try? await pump.disconnect()
+            try? await coordinator.retire(pump.source)
+            throw error
+        }
+        return pump
     }
 
     public func requestResize(_ geometry: NativeSSHGeometry) async throws {
@@ -113,23 +183,73 @@ public actor WorkspaceNativeSSHConnection {
             try await validateCurrent()
             guard attached != nil else { throw NativeSSHError.closed }
             try await transport.requestResize(geometry)
+        } catch NativeSSHError.busy {
+            // One immutable resize is already pending. Its service completion
+            // is the retry boundary; normal backpressure does not lose a shell.
+            throw NativeSSHError.busy
         } catch { await close(); throw error }
     }
 
-    /// Stop coordinator admission even when pump.run has not started. The
-    /// private transport is never returned, so a second coordinator cannot
-    /// claim this connection. Closing joins the actual native teardown.
-    public func close() async {
-        if let shutdown { await shutdown.value; return }
+    /// The manager facade preserves the exact coordinator-issued source witness
+    /// without retaining a second attachment or exposing the native owner.
+    func requestResize(_ geometry: NativeSSHGeometry, source: TerminalSource) async throws {
+        guard attached?.source == source else { throw TerminalInputError.stale }
+        try await requestResize(geometry)
+    }
+
+    /// Stop input before joining any prompts, opening operation, or native I/O.
+    /// Managers can seal every owned source first, then join their closes. This
+    /// barrier does not itself wait for native teardown or forget its journal.
+    public func sealAdmission() async {
         closed = true
-        let pump = attached, transport = self.transport
-        attached = nil
-        let task = Task<Void, Never> {
-            if let pump { try? await pump.disconnect() }
-            await transport.close()
+        opening?.cancel()
+        if let pump = attached {
+            pump.requestStop()
+            if let coordinator { try? await coordinator.stopAdmission(pump.source) }
         }
-        shutdown = task
+    }
+
+    /// Compatibility close. Storage failure retains the epoch and its durable
+    /// uncertainty; application owners use closeAndRecordInterruption to surface
+    /// the failure and retain this object for an explicit retry.
+    public func close() async {
+        try? await closeAndRecordInterruption()
+    }
+
+    /// Join native teardown and any in-progress creation before retiring its
+    /// epoch. A marker that arrives during close is included in this same join.
+    /// On storage failure the epoch remains owned for retry; another shell is
+    /// never authorized. Repeated or concurrent closes share one native job.
+    public func closeAndRecordInterruption() async throws {
+        await sealAdmission()
+        let task: Task<Void, Never>
+        if let existing = shutdown { task = existing }
+        else {
+            let pump = attached, transport = self.transport, opening = self.opening
+            task = Task<Void, Never> {
+                if let pump { try? await pump.disconnect() }
+                await transport.close()
+                // performOpen never calls this public close path. Its own
+                // transport cleanup can finish independently before this join.
+                if let opening { _ = await opening.result }
+            }
+            shutdown = task
+        }
         await task.value
+        if !sourcePublished, let pump = attached, let coordinator {
+            // A task result may have been completed but refused by the outer
+            // cancellation/closed check before its source reached the caller.
+            // No responder or consumer can own this unpublished source.
+            try? await pump.disconnect()
+            try? await coordinator.retire(pump.source)
+        }
+        attached = nil
+        // Keep this outside the once-only native close task: it must observe a
+        // late marker and retry a previously failed protected-storage write.
+        if let retained = journalEpoch {
+            try await retained.journal.markInterrupted(epoch: retained.epoch)
+            if journalEpoch?.epoch.id == retained.epoch.id { journalEpoch = nil }
+        }
     }
 
     private func validateCurrent() async throws {
@@ -140,11 +260,18 @@ public actor WorkspaceNativeSSHConnection {
         try Task.checkCancellation()
     }
 
+    /// A manager's final fence after its awaited factory call. Use the same
+    /// foreground and durable authority checks as the owned native operations.
+    func validateForPublication() async throws {
+        try await validateCurrent()
+    }
+
     deinit {
-        let pump = attached, transport = self.transport
+        let pump = attached, transport = self.transport, retained = journalEpoch
         Task {
             if let pump { try? await pump.disconnect() }
             await transport.close()
+            if let retained { try? await retained.journal.markInterrupted(epoch: retained.epoch) }
         }
     }
 }
@@ -213,6 +340,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try await validateForeground()
             guard let driver else { throw NativeSSHError.closed }
             try await session.requestResize(geometry, driver: driver)
+        } catch NativeSSHError.busy {
+            throw NativeSSHError.busy
         } catch { await close(); throw error }
     }
 

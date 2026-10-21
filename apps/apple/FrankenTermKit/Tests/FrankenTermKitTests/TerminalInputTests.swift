@@ -354,6 +354,47 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(outcomes.allSatisfy { $0.disposition == .cancelledBeforeWrite })
     }
 
+    func testStopAdmissionSettlesQueuedInputWithoutWaitingForTransportClose() async throws {
+        let (coordinator, transport, source, focus) = try await setup()
+        await transport.setBlocked(true)
+        let leased = try await coordinator.submit(focus, encodedBytes: Data("leased".utf8))
+        let queued = try await coordinator.submit(focus, encodedBytes: Data("queued".utf8))
+        let running = Task { try await coordinator.drainOne(source) }
+        await transport.waitUntilWriting()
+
+        try await coordinator.stopAdmission(source)
+        try await coordinator.stopAdmission(source) // The barrier is idempotent.
+        await expect(.unavailable) { _ = try await coordinator.submit(focus, encodedBytes: Data("late".utf8)) }
+        await expect(.unavailable) { _ = try await coordinator.reply(source, encodedBytes: Data("reply".utf8)) }
+        let refused = try await coordinator.drainOne(source)
+        XCTAssertEqual(refused, .connectionClosed)
+        let stopped = try await coordinator.pendingOutcomes(source)
+        XCTAssertEqual(stopped.outcomes.map(\.receipt), [queued])
+        XCTAssertEqual(stopped.outcomes[0].disposition, .definitelyNotWritten)
+        let initialCloses = await transport.closes(), calls = await transport.calls()
+        XCTAssertEqual(initialCloses, 0)
+        XCTAssertEqual(calls, 1)
+
+        // The previously leased write still owns its eventual exact result.
+        await transport.release(.wouldBlock)
+        let settled = try await running.value
+        XCTAssertEqual(settled, .connectionClosed)
+        let outcomes = try await coordinator.pendingOutcomes(source)
+        XCTAssertEqual(outcomes.outcomes.map(\.receipt), [queued, leased])
+        XCTAssertTrue(outcomes.outcomes.allSatisfy { $0.disposition == .definitelyNotWritten })
+        try await coordinator.acknowledgeOutcomes(outcomes)
+        _ = try await coordinator.suspend(focus)
+        await expect(.unavailable) { try await coordinator.retire(source) }
+        let beforeDisconnect = await transport.closes(), bytes = await transport.bytes()
+        XCTAssertEqual(beforeDisconnect, 0)
+        XCTAssertTrue(bytes.isEmpty)
+
+        try await coordinator.disconnect(source)
+        try await coordinator.retire(source)
+        let finalCloses = await transport.closes()
+        XCTAssertEqual(finalCloses, 1)
+    }
+
     func testDisconnectPreservesLateExactZeroOrPrefixEvidence() async throws {
         for (answer, accepted, disposition) in [
             (TerminalTransportWrite.wouldBlock, 0, TerminalInputDisposition.definitelyNotWritten),

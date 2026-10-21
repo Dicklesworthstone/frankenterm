@@ -132,7 +132,12 @@ The adapter compares the actual negotiated methods, original endpoint, selected
 route revision, host pin and transport identity before looking up a public key.
 The broker checks current protected storage and local revocations before and after
 lookup. New Keychain items provide validated public metadata without an unlock;
-older items can derive their public half on the same protected worker.
+older items can derive their public half on the same protected worker. An explicit
+reviewed reimport can enrich missing public metadata on that same account without
+replacing its private value or access controls. The existing fingerprint/comment
+format is validated canonically; malformed metadata never triggers a fallback to
+private-key access. Every incoming private/public pair is derived and checked
+before any reusable item's metadata is changed.
 
 The signer reconstructs the exact typed RFC 4252 challenge rather than signing
 arbitrary driver bytes. A selected identity carries an unforgeable foreground
@@ -147,11 +152,62 @@ machine/route/credential readiness, and foreground checks before DNS. Its shared
 network work has joined, including uncancellable resolver work. Requesting
 restoration while connected reports the conflict; it never silently closes a
 remote shell. The owner's raw session does not escape. Its separate `openTerminal`
-operation invokes the app's exact-source durability callback before creating a
-PTY, claims the package driver, and attaches the existing coordinator/pump. Writes,
+operation has a production journal overload that durably records the exact source
+before creating a PTY, claims the package driver, and attaches the existing coordinator/pump. Writes,
 service and resize revalidate foreground and current authority. Close joins native
 teardown before releasing network exclusion. The caller still owns canonical
 terminal consumption, scene lifecycle, and retained input-outcome reconciliation.
+
+## Durable creation and managed connections
+
+`TerminalSessionJournal` stores session-creation uncertainty in a **dedicated**
+protected persistence directory, separate from the workspace catalog and import
+journal. `beginCreation(scope:)` returns an opaque epoch only after its atomic
+write and durability confirmation succeed. The record binds the installed
+workspace, saved revision, machine, route, transport and channel. It contains no
+terminal input/output, private keys, hostnames or content-derived hashes.
+
+An unresolved record blocks another creation for the same installed workspace and
+machine, even after a route or revision changes. Passing the journal to the native
+connection factory checks that record before DNS. `markInterrupted(epoch:)` keeps
+the uncertainty visible after local close; SSH EOF is not proof that a remote
+process exited. After relaunch, records become available for deliberate recovery
+review. `resolve(_:)` requires a fresh journal-issued record and refuses an active
+creation. No stored marker authorizes reconnection or replay. The default bounds
+are 64 unresolved and 32 acknowledged records; only acknowledged history is pruned.
+
+`WorkspaceSSHConnectionManager` is the app-owned entry point shared by scenes.
+Construct it with the workspace store, foreground broker, dedicated journal,
+input coordinator and shared `WorkspaceNetworkActivity`. It starts with networking
+disabled. `resume()` enables foreground admission, and each `connect` separately
+requires `confirmedByUser: true`. Admission is bounded to three attempts and at
+most sixteen retained connection/settlement owners, with one owner per installed
+workspace and machine. There is no waiting queue or automatic reconnect.
+
+The returned `WorkspaceSSHConnection` is a facade over the existing native owner;
+it exposes neither the session nor an alternative authentication/transport path.
+Its separate `openTerminal(geometry:)` always uses the retained journal and
+coordinator and returns the canonical `TerminalSessionPump`. The scene retains
+the task running that pump with its terminal consumer. Source-bound
+`requestResize(_:source:)` keeps the first pending geometry immutable; another
+request returns busy without disconnecting, and can be retried after its service
+completion.
+
+On backgrounding, `suspend()` seals every live input source before joining any
+blocked prompt, journal write or socket teardown. Foreground transitions coalesce
+through one retained driver; an older suspension cannot override a newer resume.
+Repeated suspend, invalidation and close requests share one settlement job per
+exact owner. `invalidate(workspaceID:)` closes affected owners after reimport,
+revocation or policy changes, while native I/O also checks current durable policy.
+
+Use `manager.close(connectionID:)` when the pump ends, including EOF/error. The
+native owner joins any in-progress opening task, observes an epoch arriving during
+close, retires unpublished sources, and only then records interruption. Storage
+failure preserves the epoch and the manager's closed owner for a later explicit
+close retry. The scene separately joins consumer delivery and reconciles the
+published source's retained input outcomes. The native owner's compatibility
+durability-callback overload remains available for custom integrations, which
+retain responsibility for their own markers and recovery.
 
 ## Binding a native channel to terminal input and output
 
@@ -255,8 +311,8 @@ cleanup.
 Four attachment tests additionally reject unauthenticated sockets, mismatched
 native transport/channel identities, pre-cancelled attachment and closed-channel
 revival without publishing a source or consuming caller-owned live state. All
-twenty-three cases remain in the complete package run. With the five workspace
-authentication cases and six route-admission cases, **34 XCTest cases pass** under
+twenty-three cases remain in the complete package run. With the workspace
+authentication, route-admission and managed-connection cases, **40 XCTest cases pass** under
 Swift 6.2.1 with warnings-as-errors. One additional live-server entry point is
 explicitly skipped in an ordinary run, then executed by the harness below.
 Nine additional integration tests drive the production Swift actor and C adapter
@@ -285,6 +341,17 @@ and rejects a skipped or undiscovered test. Its synthetic memory-backed vault us
 the real production signer; native Keychain prompts and device durability remain
 separate qualification work.
 
+The optional `WorkspaceSSHProbe` adds eighteen real exchanges to those eight
+scenarios. These cover all four client-key families, independently generated
+OpenSSH full-block padding, canonical hostname handling, delayed credential/host
+revocation and reimport, cancellation while signing, and rejection before shell
+creation. Managed flows use the real protected-file journal: the independent
+server reads the durable marker before accepting any channel, PTY or shell
+request. A parked journal write proves suspension joins late publication without
+creating a shell or leaking a source, and a newer resume remains effective. The
+managed echo flow also checks exact terminal bytes, retained outcomes, duplicate
+creation refusal, explicit review, network exclusion and nonfatal resize busy.
+
 ```sh
 swift test -j 2 -Xswiftc -warnings-as-errors
 swift build --product FrankenTermSSHInteropProbe -j 2 -Xswiftc -warnings-as-errors
@@ -292,6 +359,8 @@ python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so .build/debug
 swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
 python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so .build/debug/TerminalPumpProbe
 python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest
+swift build --product WorkspaceSSHProbe -j 2 -Xswiftc -warnings-as-errors
+python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest .build/debug/WorkspaceSSHProbe
 ```
 
 The retained legacy `TerminalPumpProbe` independently covers all four signing

@@ -372,7 +372,9 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         }
         _ = try privateReader.sshString(cap: FTLimit.text)
         let bodyLength = privateReader.offset
-        guard privateReader.remaining < blockSize else { throw FTError.malformed("key.padding") }
+        // OpenSSH accepts both an aligned body without padding and a complete
+        // ascending padding block, as emitted by maintained key serializers.
+        guard privateReader.remaining <= blockSize else { throw FTError.malformed("key.padding") }
         let padding = try privateReader.take(privateReader.remaining)
         guard padding.enumerated().allSatisfy({ $0.element == UInt8($0.offset + 1) }) else { throw FTError.malformed("key.padding") }
         return bodyLength
