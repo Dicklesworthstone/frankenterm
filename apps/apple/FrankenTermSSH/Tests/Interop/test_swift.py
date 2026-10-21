@@ -76,9 +76,10 @@ class SwiftInteropTests(unittest.TestCase):
                     self.fail(event)
             self.assertIsNotNone(completed, "Swift integration did not finish before its outer deadline")
             self.assertEqual(process.wait(timeout=3), 0, process.stderr.read(8192).decode(errors="replace"))
-            if mode in ["io", "idle", "connect"]:
+            if mode in ["io", "idle", "connect", "wake", "pump", "pumpCancel"]:
                 self.assertEqual(len(server.received), completed["bytes"])
-                self.assertIn(("resize", 132, 42), server.events)
+                if mode != "pumpCancel":
+                    self.assertIn(("resize", 132, 42), server.events)
                 self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
                 self.assertTrue(any(e[0] == "shell" for e in server.events))
             else:
@@ -110,6 +111,17 @@ class SwiftInteropTests(unittest.TestCase):
 
     def test_hostname_connector_drives_real_authentication_and_pty_io(self):
         self.run_probe("connect")
+
+    def test_native_service_wake_is_latched_before_and_during_idle_wait(self):
+        self.run_probe("wake")
+
+    def test_terminal_coordinator_pump_preserves_large_lease_fifo_resize_and_eof(self):
+        for key in [ed25519.Ed25519PrivateKey.generate()] + [ec.generate_private_key(c) for c in [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()]]:
+            with self.subTest(curve=getattr(key, "curve", None)):
+                self.run_probe("pump", key)
+
+    def test_terminal_pump_stop_interrupts_a_quiet_native_reader_and_settles_close(self):
+        self.run_probe("pumpCancel")
 
     def test_cancelled_expired_or_revoked_signature_cannot_reach_peer(self):
         for mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign"]:

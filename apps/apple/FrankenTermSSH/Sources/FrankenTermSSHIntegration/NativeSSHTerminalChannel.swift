@@ -5,6 +5,8 @@ import FrankenTermSSH
 /// The actual libssh2 session bound to the existing input/streaming owner. This
 /// product is opt-in; the offline workspace application does not link or invoke
 /// it merely by restoring a workspace. It adds no parser, signer, or queue.
+/// This compatibility driver uses public UUID-bound raw I/O. New owners should
+/// use NativeSSHTerminalAttachment, whose driver capability never escapes.
 public final class NativeSSHTerminalChannel: TerminalSessionTransport, Sendable {
     public let identity: TerminalConnectionIdentity
     public let inputSignal = TerminalSessionSignal()
@@ -24,11 +26,18 @@ public final class NativeSSHTerminalChannel: TerminalSessionTransport, Sendable 
         guard identity.transportID == session.transportID else { throw TerminalInputError.invalidIdentity }
         try await session.claimTerminalChannel(identity.channelID)
         let transport = NativeSSHTerminalChannel(session: session, identity: identity)
+        var attached: TerminalSessionPump?
         do {
-            return try await TerminalSessionPump.attach(transport, coordinator: coordinator)
+            let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
+            attached = pump
+            try Task.checkCancellation()
+            return pump
         } catch {
-            transport.inputSignal.finish()
-            await session.close()
+            if let attached {
+                try? await attached.disconnect()
+                try? await coordinator.retire(attached.source)
+            }
+            await transport.close()
             throw error
         }
     }

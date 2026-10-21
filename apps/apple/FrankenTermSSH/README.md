@@ -120,6 +120,64 @@ shared readiness queue serves all sessions. Concurrent close calls await the sam
 cleanup. The application still owns foreground/network permission, route policy,
 keepalive/reconnect decisions, durable uncertainty markers, and terminal binding.
 
+## Binding a native channel to terminal input and output
+
+The optional `FrankenTermSSHIntegration` product joins the native channel to
+`FrankenTermKit`'s actual `TerminalSessionPump`. The offline Kit package has no SSH
+dependency. Apple builds use the Kit's system dependencies; Linux package builds
+also resolve its existing pinned Swift Crypto dependency. After authorization,
+authentication, explicit shell creation and preparation of the app's durable
+uncertainty marker,
+construct a `TerminalConnectionIdentity` with the session's `transportID` and
+`channelID`, then call
+`NativeSSHTerminalAttachment.attach(session:identity:coordinator:)`. The attachment
+publishes one immutable `source` and its `pump`. The app supplies the canonical
+terminal consumer and retains the task running `pump.run(consumer:)`.
+
+The session grants one package-scoped driver capability only before any raw
+channel input, output or resize has been driven. After that transfer, raw
+`admit`, `service` and `requestResize` calls are refused even if the caller supplies
+the attachment's public channel UUID. Legacy `wakeService(channelID:)` is a no-op
+for a capability-owned channel; only its private driver can wake it. Public
+`close` remains available for policy revocation. The transport itself stays
+private to its attachment and cannot be reused with a second coordinator.
+Failure after a native claim closes that session rather than returning a partially
+owned channel to the caller.
+
+Coordinator leases of up to 64 KiB are accepted in at most 16 KiB native prefixes,
+preserving the remaining bytes in the existing coordinator. There is no extra
+adapter queue. A coalesced wake interrupts an idle native service even if no peer
+output arrives, and a wake sent before service is retained. Every woken turn still
+services bounded network work so an input flood cannot starve output.
+
+`requestResize(_:source:)` requires the exact attachment source and permits only
+one immutable native request at a time. Completion is returned through the same
+pump and means local window-change transmission, not an SSH server geometry ACK.
+`close()` closes coordinator admission and joins native teardown, without waiting
+on a currently suspended consumer callback. The app separately joins its pump
+task and reconciles retained outcomes. `accounting()` remains available afterward
+with separate local and channel acceptance counts; neither proves remote effects
+or permits replay on a replacement connection.
+
+The published `NativeSSHTerminalChannel.attach(session:identity:coordinator:)`
+entry point remains available for compatibility and returns its source-owned
+pump. It uses the older explicit `claimTerminalChannel(_:)` UUID-bound surface,
+including `requestResize(_:channelID:)`. A matching UUID authorizes raw I/O on
+that legacy channel; it is not the private capability used by the recommended
+`NativeSSHTerminalAttachment`. Legacy and capability claims exclude one another,
+and a previously consumed channel cannot be relabeled under either API. A wrong
+transport or competing claim leaves the existing owner's connection intact.
+
+The pump delivers each bounded byte chunk to the canonical terminal consumer and
+routes answerbacks through the same coordinator. It does not parse ANSI, encode
+keys, manufacture frames, or echo input locally. Disposition batches are peeked,
+delivered and then acknowledged; a failed consumer retains its batch and bounded
+accounting charge. Cancellation closes coordinator admission even while delivery
+is suspended, aborts native I/O and joins the wake child. Completion of `run`
+additionally joins its already-owned consumer work. A callback can request stop
+but must not await that same run task. After final peer output EOF the attachment
+ends without inventing an exit code or automatically creating another shell.
+
 ## Hostname and dual-stack connection establishment
 
 `NativeSSHConnector.connect(to:)` accepts a validated canonical ASCII hostname or
@@ -152,7 +210,7 @@ the workspace's IDNA/trust canonicalization. It does not implement proxy-command
 execution, jump hosts, automatic reconnect, permission UI or session routing.
 Those remain separate features with explicit authority and continuity contracts.
 
-## Original session and connector validation
+## Combined Swift validation
 
 Ten Swift XCTest cases pass with warnings-as-errors, including 64 repeated
 concurrent-close cycles with fd accounting, stalled handshakes, cancellation,
@@ -160,113 +218,42 @@ deadlines, phase/admission bounds, retained closed-session handle release and
 strict typed-challenge truncation checks. Nine connector tests additionally cover
 numeric IPv4, IPv6, hostname fallback, refused sockets, input/deadline validation,
 pre-cancelled and concurrent cancelled work, budget recovery and losing-descriptor
-cleanup. All nineteen tests pass under Swift 6.2.1 with warnings-as-errors.
-Six additional integration tests drive the production Swift actor and C adapter
+cleanup.
+Four attachment tests additionally reject unauthenticated sockets, mismatched
+native transport/channel identities, pre-cancelled attachment and closed-channel
+revival without publishing a source or consuming caller-owned live state. All
+twenty-three XCTest cases pass under Swift 6.2.1 with warnings-as-errors.
+Nine additional integration tests drive the production Swift actor and C adapter
 against the independent server: four signing families, exact Unicode/binary data,
 resize, wake-up, idle timeout followed by working input, rejected peer policy,
 late cancelled/expired signatures, and revocation before sign or shell creation.
 The hostname-path case resolves localhost, establishes TCP itself, then performs
 real authentication, PTY/shell protocol requests, resize and exact byte transfer.
-These are separate from the nine native-driver scenarios above.
+The terminal-pump path also runs all four signing families and verifies a 202 KB
+payload through 64 KiB coordinator leases and 16 KiB native prefixes, two-operation
+FIFO order, exact final bytes, source-bound resize completion, EOF, retained
+acceptance accounting, duplicate attachment and raw-I/O refusal, latched wake
+before/during idle service, and prompt cancellation of a quiet reader. These are
+separate from the nine native-driver scenarios above.
 
 ```sh
 swift test -j 2 -Xswiftc -warnings-as-errors
-swiftc -swift-version 6 -parse-as-library -warnings-as-errors \
-  -I .build/debug/Modules -I .build/debug/CFrankenTermSSH.build \
-  -Xcc -I"$PWD/Sources/CFrankenTermSSH/include" Tests/Interop/SessionProbe.swift \
-  .build/debug/FrankenTermSSH.build/NativeSSHSession.swift.o \
-  .build/debug/FrankenTermSSH.build/NativeSSHConnector.swift.o \
-  .build/debug/CFrankenTermSSH.build/FrankenTermSSH.c.o \
-  -lssh2 -o /tmp/frankenterm-ssh-session-probe
-python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so /tmp/frankenterm-ssh-session-probe
+swift build --product FrankenTermSSHInteropProbe -j 2 -Xswiftc -warnings-as-errors
+python Tests/Interop/test_swift.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHInteropProbe
+swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
+python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so .build/debug/TerminalPumpProbe
 ```
+
+The retained legacy `TerminalPumpProbe` independently covers all four signing
+families, a 96,030-byte hidden-pane stream, a 70,024-byte bracketed Unicode paste,
+source-owned replies, idle cancellation, failed outcome delivery and rejection
+of competing or previously consumed channels. Both probes reuse the independent
+libssh server and check exact host-side bytes. The server accepts PTY/shell
+protocol requests and supplies synthetic echo data; it does not run a shell or
+editor. Neither test-only executable enters an application's linked products.
 
 These native/test builds do not alter the main FrankenTermKit package or add
 runtime downloads. No Apple SDK typecheck, Keychain prompt or physical-device
 qualification is inferred from Linux execution. Supply platform-correct native
 artifacts and perform the remaining session-owner/terminal integration before
 enabling Connect in the app.
-
-## Joined terminal input and streaming output
-
-The opt-in `FrankenTermSSHIntegration` product now joins this native session to
-`FrankenTermKit.TerminalInputCoordinator` and `TerminalSessionPump`. It depends on
-the existing local kit, not a second implementation of terminal semantics. Apple
-builds use the kit's system dependencies; Linux package builds also resolve its
-existing pinned Swift Crypto dependency. No network or native dependency is added
-to the offline application's Xcode target by this product's mere existence.
-
-After explicit authentication, shell creation and preparation of the app's
-content-free durable uncertainty marker, call
-`NativeSSHTerminalChannel.attach(session:identity:coordinator:)`. It verifies the
-transport ID, claims that live channel exactly once, and returns the source-owned
-pump. Authentication alone is insufficient. An existing channel with unbound
-input, output servicing or resize work cannot be relabeled as a new source. A
-wrong transport or competing claim does not close another owner's connection.
-After claiming, ordinary unbound `admit`, `service`, and `requestResize` calls are
-refused; the matching channel ID must accompany those operations.
-
-Run `pump.run(consumer:)` in one retained task. The canonical terminal adapter
-implements `TerminalSessionConsumer`, consuming each bounded output chunk before
-returning, publishing its actual shared-core frames, and routing answerbacks
-through the same coordinator and source. This module does not parse ANSI, encode
-keys, manufacture frames, or echo input locally. UIKit's existing keyboard session
-continues to submit through the coordinator. No separate per-key wake task is
-needed: admission and cancellation signal one coalescing mailbox automatically.
-
-The pump's single wake child interrupts idle native service with a latched work
-bit. Native service still makes a bounded network-progress pass before returning
-for that bit. The input loop leases at most eight chunks before servicing output;
-one blocked source or consumer cannot own another source's pump. Resize proposals
-use `requestResize(_:channelID:)` on the same session. The consumer receives its
-local completion with the original source; it is not a remote geometry ACK.
-
-Disposition batches are peeked, delivered and acknowledged, in that order. A
-failed consumer retains the batch and its bounded accounting charge. Cancellation
-closes coordinator admission even while a consumer callback is suspended, aborts
-the native connection, and joins the wake child. `run` completion additionally
-joins its already-owned consumer work. A callback may call `requestStop()` but
-must not await the same run task from inside itself. The pump deliberately ends
-the client attachment after delivering peer output EOF; it does not report an
-exit code, infer remote process survival, or automatically create a new shell.
-Final undispatched outcomes remain available for explicit reconciliation, and the
-owner must retire its focus/source handles after preserving required metadata.
-
-### Integration evidence
-
-Sixteen focused Swift 6 tests pass with warnings-as-errors against the actual kit
-coordinator and pump, including deterministic suspended-consumer shutdown and
-successful-callback acknowledgement across cancellation. Five repeated runs also
-passed. Eight real-network test cases run the production native connector,
-libssh2 driver, Swift session, channel adapter, coordinator and pump together.
-They cover all four supported signing families, a 96,030-byte hidden-pane stream,
-a 70,024-byte bracketed Unicode paste, source-owned replies, idle cancellation,
-failed outcome delivery, and rejection of competing or previously consumed
-channels. The Python harness reuses the original independent libssh server and
-checks exact host-side bytes. It accepts PTY/shell protocol requests and supplies
-synthetic echo data; this is not a real shell/editor or iPhone demonstration.
-The original nine native C-driver cases were rerun successfully.
-
-The integration sources were compiled and linked directly on Linux against the
-actual coordinator/pump and system libssh2. No mock production types were used.
-The package manifest passed `dump-package`, but the full dependent package suite
-was not built or rerun in this session. Apple SDK, native Keychain, Metal, Rust
-C ABI/XCFramework, device lifecycle and the app's workspace authentication adapter
-remain separate required integration/qualification work. Connect stays disabled
-in the offline application; this product does not authorize networking or import
-activation.
-
-With the package dependencies and system test libraries available, from this
-directory:
-
-```sh
-swift build --product TerminalPumpProbe -j 2 -Xswiftc -warnings-as-errors
-cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fPIC -shared \
-  -I Sources/CFrankenTermSSH/include Sources/CFrankenTermSSH/FrankenTermSSH.c \
-  -lssh2 -pthread -o /tmp/libfrankenterm-ssh-tests.so
-python Tests/Interop/test_pump.py /tmp/libfrankenterm-ssh-tests.so \
-  .build/debug/TerminalPumpProbe
-```
-
-`TerminalPumpProbe` is a test-only executable. Its synthetic signing IPC and
-independent server never enter either application's linked product graph.

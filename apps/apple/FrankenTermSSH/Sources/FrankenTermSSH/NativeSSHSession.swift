@@ -111,12 +111,22 @@ public struct NativeSSHServiceEvent: Sendable {
     public let accounting: NativeSSHAccounting
 }
 
+/// Issued only by the live channel owner. Other targets in this package may
+/// drive that channel without exposing a reusable raw-I/O capability to apps.
+package struct NativeSSHDriver: Equatable, Sendable {
+    fileprivate let id = UUID()
+}
+
 /// A single actor owns one libssh2 session/channel. Network progress uses dispatch
 /// readiness, not sleeps/poll loops or a thread per connection. No call returns a
 /// libssh2 pointer. Authentication, shell creation and each service request have
 /// finite monotonic deadlines. The app retains this owner while the pane is hidden.
 public actor NativeSSHSession {
+    public nonisolated static let maximumWriteBytes = Int(FTSSH_WRITE_CAPACITY)
     public nonisolated let transportID: UUID
+    /// This session creates at most one shell channel. A replacement connection
+    /// always gets a new channel identity, even when its endpoint is unchanged.
+    public nonisolated let channelID = UUID()
     public nonisolated let endpoint: NativeSSHEndpoint?
     private enum Phase { case fresh, authenticating, authenticated, opening, live, closed }
     private let native: NativeHandle
@@ -129,9 +139,13 @@ public actor NativeSSHSession {
     private var identity: NativeSSHIdentity?
     private var requestedResize: NativeSSHGeometry?
     private var outputEnded = false
-    private var terminalChannelID: UUID?
-    private var localWorkPending = false
-    private var unboundChannelUsed = false
+    private var driver: NativeSSHDriver?
+    private var legacyChannelID: UUID?
+    private enum ChannelAuthorization {
+        case legacy(UUID?)
+        case driver(NativeSSHDriver)
+    }
+    private var channelDriven = false, serviceWakePending = false
 
     /// On success consumes the already-connected descriptor. On failure the caller
     /// must close it. DNS/connect are deliberately owned by the endpoint connector.
@@ -245,17 +259,23 @@ public actor NativeSSHSession {
     /// Copies one whole bounded unit or none. This is local adapter acceptance,
     /// never remote execution. The session owner must drive service afterward.
     public func admit(_ bytes: Data, channelID: UUID? = nil) throws -> NativeSSHWriteAdmission {
+        try admit(bytes, authorized: .legacy(channelID))
+    }
+    package func admit(_ bytes: Data, driver: NativeSSHDriver) throws -> NativeSSHWriteAdmission {
+        try admit(bytes, authorized: .driver(driver))
+    }
+    private func admit(_ bytes: Data, authorized: ChannelAuthorization) throws -> NativeSSHWriteAdmission {
         try Task.checkCancellation()
-        try validateChannel(channelID)
         guard phase == .live else { throw NativeSSHError.closed }
-        guard !bytes.isEmpty, bytes.count <= Int(FTSSH_WRITE_CAPACITY) else { throw NativeSSHError.invalidInput }
+        try requireDriver(authorized)
+        guard !bytes.isEmpty, bytes.count <= Self.maximumWriteBytes else { throw NativeSSHError.invalidInput }
+        channelDriven = true
         if requestedResize != nil { return .wouldBlock }
         let result = bytes.withUnsafeBytes {
             ftssh_admit_write(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
         }
         if result == FTSSH_AGAIN { return .wouldBlock }
         try requireOK(result)
-        if terminalChannelID == nil { unboundChannelUsed = true }
         waiter?.wake()
         return .accepted(bytes.count)
     }
@@ -263,32 +283,67 @@ public actor NativeSSHSession {
     /// One pending immutable resize. Retry after its service completion, rather
     /// than overwriting a request that libssh2 has partially transmitted.
     public func requestResize(_ geometry: NativeSSHGeometry, channelID: UUID? = nil) throws {
+        try requestResize(geometry, authorized: .legacy(channelID))
+    }
+    package func requestResize(_ geometry: NativeSSHGeometry, driver: NativeSSHDriver) throws {
+        try requestResize(geometry, authorized: .driver(driver))
+    }
+    private func requestResize(_ geometry: NativeSSHGeometry, authorized: ChannelAuthorization) throws {
         try Task.checkCancellation()
-        try validateChannel(channelID)
         guard phase == .live else { throw NativeSSHError.closed }
+        try requireDriver(authorized)
         guard requestedResize == nil else { throw NativeSSHError.busy }
-        if terminalChannelID == nil { unboundChannelUsed = true }
-        requestedResize = geometry; waiter?.wake()
+        channelDriven = true; requestedResize = geometry; waiter?.wake()
     }
 
-    /// Transfer the live PTY to exactly one terminal driver. No transport or PTY
-    /// is created here. Once claimed, legacy unbound service/write/resize calls
-    /// cannot compete with that driver. Prior unbound input/output/resize cannot
-    /// be relabeled as a fresh source. Closing never makes the claim reusable.
+    /// Coalesces an owner notification even before service starts. The next
+    /// service turn still performs bounded I/O, then returns without waiting for
+    /// peer traffic. It does not cancel the connection or discard pending writes.
+    /// This legacy notification is a no-op for a capability-owned attachment,
+    /// even when its public channel UUID is supplied. It never grants ownership.
+    public func wakeService(channelID: UUID? = nil) {
+        guard phase == .live else { return }
+        do { try requireDriver(.legacy(channelID)) } catch { return }
+        serviceWakePending = true; waiter?.wake()
+    }
+    package func wakeService(driver: NativeSSHDriver) throws {
+        guard phase == .live else { throw NativeSSHError.closed }
+        try requireDriver(.driver(driver))
+        serviceWakePending = true; waiter?.wake()
+    }
+
+    /// Compatibility for existing explicit UUID-bound channel drivers. The UUID
+    /// authorizes that legacy surface only; it cannot access a package-capability
+    /// attachment. Either claim permanently excludes every competing driver.
     public func claimTerminalChannel(_ channelID: UUID) throws {
         try Task.checkCancellation()
         guard phase == .live, !outputEnded else { throw NativeSSHError.closed }
-        guard terminalChannelID == nil, operation == nil, !unboundChannelUsed else { throw NativeSSHError.busy }
-        terminalChannelID = channelID
+        guard driver == nil, legacyChannelID == nil, operation == nil, !channelDriven else {
+            throw NativeSSHError.busy
+        }
+        legacyChannelID = channelID
     }
-    private func validateChannel(_ channelID: UUID?) throws {
-        guard terminalChannelID == channelID else { throw NativeSSHError.invalidInput }
+
+    /// A shell can transfer into the terminal driver exactly once and only
+    /// before raw channel I/O has consumed output or admitted input. No prior
+    /// effects or partially transmitted resize can silently cross this boundary.
+    package func claimTerminalDriver(transportID: UUID, channelID: UUID) throws -> NativeSSHDriver {
+        try Task.checkCancellation()
+        guard transportID == self.transportID, channelID == self.channelID else { throw NativeSSHError.invalidInput }
+        guard phase == .live else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        guard driver == nil, legacyChannelID == nil, operation == nil, !channelDriven else { throw NativeSSHError.busy }
+        let issued = NativeSSHDriver()
+        driver = issued
+        return issued
     }
-    /// Latched before or during service. This does not touch the native pending
-    /// write, reset its EAGAIN arguments, cancel a socket, or spawn another task.
-    public func wakeService(channelID: UUID? = nil) {
-        guard phase == .live, terminalChannelID == channelID else { return }
-        localWorkPending = true; waiter?.wake()
+    private func requireDriver(_ authorized: ChannelAuthorization) throws {
+        switch authorized {
+        case .legacy(let channel):
+            guard driver == nil else { throw NativeSSHError.busy }
+            guard legacyChannelID == channel else { throw NativeSSHError.invalidInput }
+        case .driver(let candidate):
+            guard driver == candidate, legacyChannelID == nil else { throw NativeSSHError.busy }
+        }
     }
 
     /// One bounded receive/pump call at a time; admit and close remain available
@@ -296,13 +351,18 @@ public actor NativeSSHSession {
     /// invented. A readiness timeout preserves the connection and exact pending
     /// writes; cancellation explicitly aborts this owner, not an unrelated pane.
     public func service(timeout: Duration = .seconds(120), channelID: UUID? = nil) async throws -> NativeSSHServiceEvent {
+        try await service(timeout: timeout, authorized: .legacy(channelID))
+    }
+    package func service(timeout: Duration = .seconds(120), driver: NativeSSHDriver) async throws -> NativeSSHServiceEvent {
+        try await service(timeout: timeout, authorized: .driver(driver))
+    }
+    private func service(timeout: Duration, authorized: ChannelAuthorization) async throws -> NativeSSHServiceEvent {
         let deadline = try deadline(timeout)
-        try validateChannel(channelID)
         guard phase == .live else { throw NativeSSHError.closed }
+        try requireDriver(authorized)
         guard operation == nil else { throw NativeSSHError.busy }
         try Task.checkCancellation()
-        if terminalChannelID == nil { unboundChannelUsed = true }
-        let token = UUID(); operation = token
+        let token = UUID(); operation = token; channelDriven = true
         defer { if operation == token { operation = nil } }
         do {
             return try await withTaskCancellationHandler {
@@ -327,10 +387,9 @@ public actor NativeSSHSession {
                     if result == FTSSH_EOF { outputEnded = true }
                     if result == FTSSH_AGAIN { directions |= ftssh_directions(native.pointer) }
                     let after = try accounting()
-                    // Always make a bounded network-progress pass before honoring
-                    // local wakeups, so an input flood cannot starve socket I/O.
-                    let localWork = localWorkPending; localWorkPending = false
-                    if localWork || count > 0 || outputEnded || resized != nil || before.pendingWriteBytes != after.pendingWriteBytes {
+                    if count > 0 || outputEnded || resized != nil || serviceWakePending
+                        || before.pendingWriteBytes != after.pendingWriteBytes {
+                        serviceWakePending = false
                         return .init(output: output, endOfOutput: outputEnded, waitExpired: false, resized: resized, accounting: after)
                     }
                     try await ready(directions: directions, deadline: deadline)
@@ -357,9 +416,8 @@ public actor NativeSSHSession {
     public func close() async {
         if let shutdown { await shutdown.value; return }
         phase = .closed; operation = nil
-        localWorkPending = false
         authentication?.cancel(transportID: transportID)
-        authentication = nil; peer = nil; identity = nil; requestedResize = nil
+        authentication = nil; peer = nil; identity = nil; requestedResize = nil; serviceWakePending = false
         native.close()
         let old = waiter; waiter = nil
         let task = Task<Void, Never> { await old?.stop() }
