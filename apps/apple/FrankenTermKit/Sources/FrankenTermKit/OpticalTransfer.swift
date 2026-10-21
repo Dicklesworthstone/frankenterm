@@ -352,6 +352,24 @@ public struct OpticalReceiver: Sendable {
         }
     }
     public init(selecting frame: OpticalFrame) { identity = frame.identity }
+
+    /// Reconstitute only page-hash-verified ciphertext. Partial equations are
+    /// deliberately not persisted, and the caller must reapprove this source.
+    /// A complete checkpoint still passes the ordinary whole-envelope checks.
+    public init<C: AirGapCryptography>(resuming checkpoint: OpticalScanCheckpoint, using crypto: C) throws {
+        identity = checkpoint.identity
+        verified = checkpoint.pages; expectedDigests = checkpoint.pageDigests
+        if isComplete { _ = try envelope(using: crypto) }
+    }
+
+    /// No snapshot exists before the first verified page. This is explicit
+    /// opt-in data export; receiving camera frames never writes a file itself.
+    public func checkpoint<C: AirGapCryptography>(using crypto: C) throws -> OpticalScanCheckpoint? {
+        guard !verified.isEmpty else { return nil }
+        let digests = expectedDigests.filter { verified[$0.key] != nil }
+        return try OpticalScanCheckpoint(identity: identity, pages: verified, pageDigests: digests, using: crypto)
+    }
+
     public mutating func resetIncompletePage(_ page: Int) {
         guard verified[page] == nil else { return }
         decoders[page] = nil; expectedDigests[page] = nil
