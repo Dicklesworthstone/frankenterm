@@ -251,4 +251,49 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("AGAIN-42", in: fresh, timeout: 30, "the reconnected session must run commands")
         snapshot("10-reconnected")
     }
+
+    /// M1 through the real rail (named to run after the journeys above): with
+    /// two machines restored, connect the first, pick the second from the
+    /// machine menu and connect it, then return. Each machine keeps its own
+    /// shell and screen, and typing reaches only the machine on screen.
+    @MainActor
+    func testWorkspaceRailSwitchesBetweenConnectedMachines() throws {
+        let inputs = try inputs()
+        guard let second = ProcessInfo.processInfo.environment["FT_UI_SECOND_MACHINE_NAME"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_UI_SECOND_MACHINE_NAME for a package with a second machine")
+        }
+        let app = launch()
+        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
+        let (terminal, _) = connect(app, inputs)
+        app.typeText("export FT_WHO=first; echo WHO-$FT_WHO-$((1+1))\n")
+        waitFor("WHO-first-2", in: terminal, timeout: 30, "the first machine's shell must run")
+
+        app.buttons["Machine: \(inputs.machine)"].tap()
+        let secondItem = app.buttons[second].firstMatch
+        XCTAssertTrue(secondItem.waitForExistence(timeout: 5), "the rail's machine menu lists the second machine")
+        secondItem.tap()
+        XCTAssertTrue(app.navigationBars[second].waitForExistence(timeout: 10), "the scene shows the chosen machine")
+        let connect = app.buttons["Connect"].firstMatch
+        XCTAssertTrue(connect.waitForExistence(timeout: 10), "an unconnected machine offers Connect in the scene")
+        snapshot("11-second-machine")
+        connect.tap()
+        app.tap() // lets the interruption monitor handle a Face ID alert
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 60), "the second session must take the keyboard")
+        let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
+        app.typeText("export FT_WHO=second; echo WHO-$FT_WHO-$((2+2))\n")
+        waitFor("WHO-second-4", in: screen, timeout: 30, "the second machine's shell must run")
+        XCTAssertFalse(self.screen(screen).contains("WHO-first-2"), "the second machine has its own screen")
+        snapshot("12-second-terminal")
+
+        app.buttons["Machine: \(second)"].tap()
+        let firstItem = app.buttons[inputs.machine].firstMatch
+        XCTAssertTrue(firstItem.waitForExistence(timeout: 5))
+        firstItem.tap()
+        XCTAssertTrue(app.navigationBars[inputs.machine].waitForExistence(timeout: 10))
+        waitFor("WHO-first-2", in: screen, timeout: 10, "returning keeps the first machine's screen")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
+        app.typeText("echo AGAIN-$FT_WHO-$((3+3))\n")
+        waitFor("AGAIN-first-6", in: screen, timeout: 30, "typing after the switch reaches the first machine's shell")
+        snapshot("13-back-to-first")
+    }
 }
