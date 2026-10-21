@@ -17,6 +17,9 @@
         A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A20000000000000000000007; };
         A1000000000000000000000B = {isa = PBXBuildFile; productRef = A90000000000000000000009; };
         A1000000000000000000000C = {isa = PBXBuildFile; productRef = A9000000000000000000000A; };
+        A1000000000000000000000D = {isa = PBXBuildFile; fileRef = A20000000000000000000009; };
+        A1000000000000000000000E = {isa = PBXBuildFile; productRef = A9000000000000000000000B; };
+        A1000000000000000000000F = {isa = PBXBuildFile; productRef = A9000000000000000000000C; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
@@ -30,14 +33,15 @@
         A20000000000000000000006 = {isa = PBXFileReference; explicitFileType = text; name = text.metal; path = ../../crates/frankenterm-renderer-metal/src/shaders/text.metal; sourceTree = SOURCE_ROOT; };
         A20000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NativeTerminalRenderTests.swift; path = ../ios/FrankenTermTests/NativeTerminalRenderTests.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+        A20000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LiveSSHTerminalTests.swift; path = ../ios/FrankenTermTests/LiveSSHTerminalTests.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
         A30000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
-        A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C,); runOnlyForDeploymentPostprocessing = 0; };
+        A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000E, A1000000000000000000000F,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
-        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000007, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008,); name = Products; sourceTree = "<group>"; };
         A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006,); name = "Shared Terminal Shaders"; sourceTree = "<group>"; };
 /* End PBXGroup section */
@@ -68,7 +72,7 @@
             buildPhases = (A60000000000000000000005, A30000000000000000000003,);
             buildRules = (); dependencies = (A7000000000000000000000B,);
             name = FrankenTermTests;
-            packageProductDependencies = (A90000000000000000000009, A9000000000000000000000A,);
+            packageProductDependencies = (A90000000000000000000009, A9000000000000000000000A, A9000000000000000000000B, A9000000000000000000000C,);
             productName = FrankenTermTests; productReference = A20000000000000000000008;
             productType = "com.apple.product-type.bundle.unit-test";
         };
@@ -98,7 +102,7 @@
 /* Begin PBXSourcesBuildPhase section */
         A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
-        A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXTargetDependency section */
         A7000000000000000000000B = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000A; };
@@ -187,6 +191,8 @@
         A90000000000000000000008 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000005; productName = FrankenTermTerminal; };
         A90000000000000000000009 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000003; productName = FrankenTermKit; };
         A9000000000000000000000A = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000005; productName = FrankenTermTerminal; };
+        A9000000000000000000000B = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSH; };
+        A9000000000000000000000C = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSHIntegration; };
 /* End XCSwiftPackageProductDependency section */
     };
     rootObject = A70000000000000000000001;
