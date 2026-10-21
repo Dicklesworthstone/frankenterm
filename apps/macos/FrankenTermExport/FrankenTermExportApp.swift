@@ -55,6 +55,10 @@ private actor MacExportEngine {
         let comparison: String, pages: Int, bytes: Int
         let protection: ExportProtection
         let recipientComparison: String?
+        /// The unlock code as a frame the animation interleaves
+        /// (`FTCODE1:<envelope digest prefix>:<code>`), so the phone needs
+        /// nothing typed. Anyone filming the animation can read it too.
+        let codeFrame: String?
     }
     struct SelectionState: Sendable {
         let source: WorkspaceDocument
@@ -395,8 +399,10 @@ private actor MacExportEngine {
         try Task.checkCancellation()
         let optical = try OpticalSender(envelope: envelope, using: crypto)
         exportedEnvelope = envelope; transferCode = code; sender = optical
+        let digest = optical.identity.envelopeDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
         return .init(comparison: FTAG.comparison(envelope, using: crypto), pages: optical.identity.pageCount,
-                     bytes: envelope.count, protection: protection, recipientComparison: recipientComparison)
+                     bytes: envelope.count, protection: protection, recipientComparison: recipientComparison,
+                     codeFrame: code.map { "FTCODE1:\(digest):\($0.reveal(using: crypto))" })
     }
     func next(repairPage: Int?) throws -> String {
         guard var active = sender else { throw FTError.stale }
@@ -485,6 +491,7 @@ private final class MacExportModel {
     @ObservationIgnored private var sourceKeyOperation: UUID?
     @ObservationIgnored private var sshSelectionID: UUID?
     @ObservationIgnored private var loadedAtLaunch = false
+    @ObservationIgnored private var playWhenPrepared = false
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
     var recipientConfirmed: Bool {
@@ -505,6 +512,7 @@ private final class MacExportModel {
     }
     private func invalidatePrepared() {
         pause(); revealedCode = nil; prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
+        playWhenPrepared = false
     }
     private func retireSourceKeyPrompt() {
         sourceKeyOperation = nil; keyUnlockRequest = nil
@@ -773,6 +781,14 @@ private final class MacExportModel {
         // Bind cancellation to the dismissed request rather than the next file.
         Task { await engine.cancelKeyUnlock(operationID: token, requestID: requestID) }
     }
+    /// The one button: these keys are approved by pressing it, and the
+    /// animation starts as soon as the transfer is sealed.
+    func sendToPhone() {
+        guard !busy, exportReview?.canPrepare == true, destinationReady else { return }
+        approveSelectedKeys = true
+        playWhenPrepared = true
+        prepare()
+    }
     func prepare() {
         guard !busy, foreground, sourceSheet == nil, sourceKeyOperation == nil,
               approveSelectedKeys, exportReview?.canPrepare == true, destinationReady else { return }
@@ -789,6 +805,11 @@ private final class MacExportModel {
                     await engine.invalidateExport(); throw CancellationError()
                 }
                 prepared = result; emitted = 0; repairPage = -1
+                if playWhenPrepared {
+                    playWhenPrepared = false
+                    // After this work settles (busy clears), not inside it.
+                    Task { @MainActor [weak self] in self?.play() }
+                }
             } catch let error as FTError where mode == .recipient && error == .authentication {
                 guard !Task.isCancelled, workOperationID == operation, foreground, generation == token else {
                     await engine.invalidateExport(); throw CancellationError()
@@ -827,7 +848,11 @@ private final class MacExportModel {
             while !Task.isCancelled {
                 guard let self, self.playing, self.generation == token, self.foreground else { break }
                 do {
-                    let text = try await self.engine.next(repairPage: self.repairPage < 0 ? nil : self.repairPage)
+                    // Every sixth symbol carries the unlock code, so a phone
+                    // that collects the pages has the code too.
+                    let text: String
+                    if let frame = self.prepared?.codeFrame, self.emitted % 6 == 5 { text = frame }
+                    else { text = try await self.engine.next(repairPage: self.repairPage < 0 ? nil : self.repairPage) }
                     let image = try await self.renderer.symbol(text: text)
                     guard !Task.isCancelled, self.playing, self.generation == token, self.foreground else { break }
                     self.symbol = image; self.emitted += 1
@@ -1064,18 +1089,11 @@ private struct MacExportView: View {
                 }
                 if let prepared = model.prepared {
                     HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Package comparison").font(.caption)
-                            Text(verbatim: prepared.comparison).font(.system(.title3, design: .monospaced).bold())
-                            if let recipient = prepared.recipientComparison {
-                                Text(verbatim: "Confirmed recipient: " + recipient).font(.system(.caption, design: .monospaced))
-                            }
-                        }
+                        Text("On your iPhone, open FrankenTerm, tap Restore, and point the camera here. It unlocks by itself.")
+                            .font(.headline)
                         Spacer()
-                        Text("\(prepared.pages) pages · \(prepared.bytes) encrypted bytes").font(.caption)
+                        Text("\(prepared.pages) pages · \(prepared.bytes) bytes").font(.caption).foregroundStyle(.secondary)
                     }
-                    Text("Compare this package value with the completed transfer on the iPhone, then review its source and contents before activating the workspace.")
-                        .font(.caption).foregroundStyle(.secondary)
                     ZStack {
                         RoundedRectangle(cornerRadius: 20).fill(.white)
                         if let code = model.revealedCode {
@@ -1099,7 +1117,8 @@ private struct MacExportView: View {
                         Button(model.playing ? "Pause" : "Play QR Animation") { if model.playing { model.pause() } else { model.play() } }
                             .buttonStyle(.borderedProminent).disabled(model.busy)
                         if prepared.protection == .code {
-                            Button("Reveal Code Separately") { model.revealCode() }.disabled(model.busy)
+                            Button("Show Code") { model.revealCode() }.disabled(model.busy)
+                                .help("Only if the iPhone asks you to type it: the animation already carries it.")
                         } else {
                             Label("Only the confirmed iPhone", systemImage: "iphone.and.arrow.forward").font(.caption)
                         }
@@ -1267,14 +1286,19 @@ private struct MacExportView: View {
                     }
                     Text("The phone evaluates its existing identities, reviewed host trust, and transport support separately. Required policies remain enforced after restoring a narrower workspace.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle("I approve these selected groups, \(review.includedIdentityCount) private identities, and the omissions shown above.", isOn: $model.approveSelectedKeys)
-                        .disabled(model.busy || !review.canPrepare || !model.destinationReady)
                     HStack {
-                        Button("Prepare Encrypted Transfer") { model.prepare() }.buttonStyle(.borderedProminent)
-                            .disabled(model.busy || !model.approveSelectedKeys || !review.canPrepare || !model.destinationReady)
-                        Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
+                        Button {
+                            model.sendToPhone()
+                        } label: {
+                            Label("Send to iPhone", systemImage: "iphone.and.arrow.forward").font(.title3.bold()).padding(.horizontal, 8)
+                        }.buttonStyle(.borderedProminent).controlSize(.large)
+                            .disabled(model.busy || !review.canPrepare || !model.destinationReady)
                         if model.busy { ProgressView().controlSize(.small) }
+                        Spacer()
+                        Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
                     }
+                    Text("Sends \(review.includedIdentityCount) private keys with the machines. Anyone who films this screen while the animation plays could read them.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
         }

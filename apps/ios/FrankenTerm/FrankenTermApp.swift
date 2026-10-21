@@ -688,6 +688,89 @@ struct OfflineRestoreSheet: View {
         }
     }
 
+    @ViewBuilder private func idleContent(_ state: OfflineRestoreStatus) -> some View {
+        if let request = state.recipientRequest {
+            RecipientRequestCard(request: request)
+            Text("Hold this screen up to your Mac's camera. Then point this phone at the animation on your Mac.")
+            Button("Scan My Mac") { model.requestCamera() }
+                .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
+        } else {
+            Text("On your Mac, click Send to iPhone in FrankenTerm Export. Then point this phone at the animation. Everything else is automatic.")
+            if !model.cameraRequested {
+                Button("Scan My Mac") { model.requestCamera() }
+                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(model.requestingCameraAccess)
+            }
+        }
+        DisclosureGroup("Other ways to restore") {
+            VStack(alignment: .leading, spacing: 12) {
+                if state.recipientRequest == nil {
+                    Button("Encrypt Only for This Phone (uses your Mac's camera)") { model.requestRecipient() }
+                }
+                Button(state.recipientRequest == nil ? "Open a Workspace File" : "Open an Encrypted File") {
+                    chooseFile = true
+                }
+            }.padding(.top, 8)
+        }
+    }
+
+    @ViewBuilder private func collectingContent(_ state: OfflineRestoreStatus) -> some View {
+        let total = max(state.identity?.envelopeLength ?? 1, 1)
+        ProgressView(value: Double(state.verifiedBytes), total: Double(total)) {
+            Text("Keep the camera on your Mac")
+        } currentValueLabel: {
+            Text("\(Int((Double(state.verifiedBytes) / Double(total) * 100).rounded()))%")
+        }
+        if !model.cameraRequested {
+            Button("Resume Camera") { model.requestCamera() }
+                .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
+        }
+        if !state.incompletePageIndices.isEmpty {
+            DisclosureGroup("Stuck? Repair a page") {
+                Text("Select the same page in Repair Page on your Mac. Reset only if this page has stopped recovering; verified pages are kept.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Page", selection: $repairPage) {
+                    ForEach(state.incompletePageIndices, id: \.self) { index in
+                        Text("Page \(index + 1)").tag(index)
+                    }
+                }
+                Button("Reset This Unfinished Page") {
+                    let page = state.incompletePageIndices.contains(repairPage) ? repairPage : (state.incompletePageIndices.first ?? 0)
+                    model.run { restore, state in try await restore.resetIncompletePage(page, generation: state.generation) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func lockedContent(_ state: OfflineRestoreStatus) -> some View {
+        if state.encryptionMode == .recipient {
+            if state.canUnlockRecipient {
+                Button("Unlock") {
+                    allowRemoval = false; allowRollback = false
+                    model.run { restore, state in try await restore.unlockRecipient(generation: state.generation) }
+                }.buttonStyle(.borderedProminent).controlSize(.large)
+            } else {
+                Text("This transfer was encrypted for a phone request that this session no longer holds. Start a different transfer and send it again from your Mac.")
+            }
+        } else if state.recipientRequest != nil {
+            Text("This transfer was not encrypted for this phone. On your Mac, send it again after scanning this phone's request.")
+        } else {
+            if model.cameraRequested {
+                Text("Almost done. Keep the camera on your Mac for a moment.")
+            } else {
+                Button("Scan My Mac Again") { model.requestCamera() }
+                    .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
+            }
+            DisclosureGroup("Type the code instead") {
+                SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
+                Button("Unlock") {
+                    let entered = code; code = ""; allowRemoval = false; allowRollback = false
+                    model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
+                }.disabled(code.isEmpty)
+            }
+        }
+    }
+
     /// What arrives, in its colors, and one Restore button; everything a
     /// person might audit is one tap away under Details.
     @ViewBuilder private func reviewSummary(_ review: OfflineRestoreReview) -> some View {
