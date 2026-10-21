@@ -20,6 +20,7 @@
         A1000000000000000000000D = {isa = PBXBuildFile; fileRef = A20000000000000000000009; };
         A1000000000000000000000E = {isa = PBXBuildFile; productRef = A9000000000000000000000B; };
         A1000000000000000000000F = {isa = PBXBuildFile; productRef = A9000000000000000000000C; };
+        A10000000000000000000010 = {isa = PBXBuildFile; fileRef = A2000000000000000000000A; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
@@ -34,6 +35,7 @@
         A20000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NativeTerminalRenderTests.swift; path = ../ios/FrankenTermTests/NativeTerminalRenderTests.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
         A20000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LiveSSHTerminalTests.swift; path = ../ios/FrankenTermTests/LiveSSHTerminalTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
@@ -43,7 +45,7 @@
 /* Begin PBXGroup section */
         A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008,); name = Products; sourceTree = "<group>"; };
-        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006,); name = "Shared Terminal Shaders"; sourceTree = "<group>"; };
+        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
         A50000000000000000000001 = {
@@ -96,7 +98,7 @@
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */

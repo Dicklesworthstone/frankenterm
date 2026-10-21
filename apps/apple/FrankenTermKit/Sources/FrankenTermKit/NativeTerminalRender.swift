@@ -5,6 +5,11 @@ import CoreText
 
 public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     public var fontName = "Menlo"
+    /// PostScript names tried, in order, for characters the base font lacks,
+    /// before the system cascade. "SymbolsNFM" is the bundled Symbols Nerd Font
+    /// Mono (powerline separators and prompt icons, which Menlo lacks). Names
+    /// that are not installed are skipped.
+    public var fallbackFontNames = ["SymbolsNFM"]
     public var fontPointSize: Double = 15
     public var fontRevision: UInt64 = 1
     public var boldBrightensANSI = false
@@ -12,6 +17,7 @@ public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     public init() {}
     fileprivate func validate() throws {
         guard fontRevision > 0, !fontName.isEmpty, fontName.utf8.count <= 256,
+              fallbackFontNames.count <= 8, fallbackFontNames.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 }),
               fontPointSize.isFinite, (6...48).contains(fontPointSize)
         else { throw TerminalRenderError.capacity }
     }
@@ -593,6 +599,9 @@ private final class NativeTerminalFrameBuilder {
     private let configuration: NativeTerminalRenderConfiguration, scale: Double
     private let viewport: SIMD2<Int>, blinkPhase: UInt64
     private let baseFont: CTFont
+    /// Only kCTFontCascadeListAttribute; reapplied to every derived face, since
+    /// copying a font with new symbolic traits need not keep a custom cascade.
+    private let cascade: CTFontDescriptor?
     private let cellWidth: Double, cellHeight: Double, ascent: Double
     private var instances = [UInt8]()
     private var fonts = [CTFont]()
@@ -620,7 +629,19 @@ private final class NativeTerminalFrameBuilder {
         guard scale.isFinite, (1...4).contains(scale) else { throw TerminalRenderError.capacity }
         self.frame = frame; self.resources = resources; self.configuration = configuration
         self.scale = scale; self.viewport = viewport; self.blinkPhase = blinkPhase
-        baseFont = CTFontCreateWithName(configuration.fontName as CFString, configuration.fontPointSize * scale, nil)
+        let size = configuration.fontPointSize * scale
+        // An explicit cascade of the configured fallbacks that are actually
+        // installed: an unknown name is skipped rather than letting Core Text
+        // substitute an unrelated face for it.
+        let installed = configuration.fallbackFontNames.compactMap { name -> CTFontDescriptor? in
+            let candidate = CTFontCreateWithName(name as CFString, size, nil)
+            guard CTFontCopyPostScriptName(candidate) as String == name else { return nil }
+            return CTFontDescriptorCreateWithNameAndSize(name as CFString, size)
+        }
+        cascade = installed.isEmpty ? nil : CTFontDescriptorCreateWithAttributes(
+            [kCTFontCascadeListAttribute: installed] as CFDictionary)
+        let primary = CTFontCreateWithName(configuration.fontName as CFString, size, nil)
+        baseFont = cascade.map { CTFontCreateCopyWithAttributes(primary, size, nil, $0) } ?? primary
         var character: UniChar = 77, glyph: CGGlyph = 0, advance = CGSize.zero
         guard CTFontGetGlyphsForCharacters(baseFont, &character, &glyph, 1) else { throw TerminalRenderError.unavailable }
         CTFontGetAdvancesForGlyphs(baseFont, .horizontal, &glyph, &advance, 1)
@@ -744,9 +765,14 @@ private final class NativeTerminalFrameBuilder {
         if cell.intensity == 1 { traits.insert(.traitBold) }
         if cell.italic { traits.insert(.traitItalic) }
         let size = configuration.fontPointSize * scale * (cell.verticalAlignment == 0 ? 1 : 0.75)
-        if let font = CTFontCreateCopyWithSymbolicTraits(baseFont, size, nil, traits, [.traitBold,.traitItalic]) { return font }
-        guard traits.isEmpty else { throw TerminalRenderError.unsupported }
-        return CTFontCreateCopyWithAttributes(baseFont, size, nil, nil)
+        let derived: CTFont
+        if let font = CTFontCreateCopyWithSymbolicTraits(baseFont, size, nil, traits, [.traitBold,.traitItalic]) {
+            derived = font
+        } else {
+            guard traits.isEmpty else { throw TerminalRenderError.unsupported }
+            derived = CTFontCreateCopyWithAttributes(baseFont, size, nil, nil)
+        }
+        return cascade.map { CTFontCreateCopyWithAttributes(derived, size, nil, $0) } ?? derived
     }
 
     private func shape(_ row: TerminalRenderRow, rowIndex: Int) throws {

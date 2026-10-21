@@ -40,7 +40,8 @@ final class NativeTerminalRenderTests: XCTestCase {
 
     /// Feeds `output` to the real engine, draws its frame through Metal in the
     /// host app's window, and returns a 1x snapshot plus the drawn caret.
-    private func render(_ output: String, name: String) async throws -> (Snapshot, NativeTerminalCaret?) {
+    private func render(_ output: String, name: String,
+                        configuration: NativeTerminalRenderConfiguration = .init()) async throws -> (Snapshot, NativeTerminalCaret?) {
         let coordinator = try TerminalInputCoordinator()
         let source = try await coordinator.attach(InertTransport())
         let model = try NativeTerminalModel(source: source, geometry: .init(columns: 40, rows: 12), scrollbackRows: 16)
@@ -48,7 +49,8 @@ final class NativeTerminalRenderTests: XCTestCase {
         try model.feed(Data(output.utf8))
         let frame = try model.captureFrame(viewportTop: nil)
 
-        let view = try await NativeTerminalRenderView(source: source, bundle: .main)
+        view?.removeFromSuperview()
+        let view = try await NativeTerminalRenderView(source: source, bundle: .main, configuration: configuration)
         self.view = view
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = try XCTUnwrap(scenes.flatMap(\.windows).first { $0.isKeyWindow } ?? scenes.first?.windows.first)
@@ -102,6 +104,43 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(green, 200, "SGR 42 background cells were not drawn")
         XCTAssertGreaterThan(blue, 200, "SGR 44 background cells were not drawn")
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
+    }
+
+    /// Summed glyph intensity per pixel column of row 0, cell 0 (cell geometry
+    /// from the caret, cursor at row 1 column 0).
+    private func firstCellColumnProfile(_ shot: Snapshot, _ caret: NativeTerminalCaret?) throws -> [Int] {
+        let cell = try XCTUnwrap(caret?.rect, "the drawn frame must publish its caret")
+        let height = Int(cell.height.rounded()), top = Int(cell.minY.rounded()) - height
+        let width = Int(cell.width.rounded())
+        XCTAssertGreaterThanOrEqual(top, 0)
+        return (0..<width).map { x in
+            (top..<(top + height)).reduce(0) { total, y in
+                let (r, g, b) = shot.pixel(x, y)
+                return total + max(0, (r + g + b) / 3 - 40)
+            }
+        }
+    }
+
+    /// U+E0B0 (powerline solid right-pointing triangle) is in the bundled Symbols
+    /// Nerd Font Mono, not in Menlo. A filled triangle inks its left edge far more
+    /// than its right; the missing-glyph box Menlo would draw is a symmetric
+    /// outline. The same render with fallbacks disabled is the negative control.
+    func testNerdFontSymbolsComeFromTheBundledFallback() async throws {
+        let (shot, caret) = try await render("\u{e0b0}\r\n", name: "nerd-font-fallback")
+        let profile = try firstCellColumnProfile(shot, caret)
+        let inked = profile.indices.filter { profile[$0] > 100 }
+        let left = try XCTUnwrap(inked.first), right = try XCTUnwrap(inked.last)
+        XCTAssertGreaterThan(profile[left] + profile[left + 1], 3 * (profile[right] + profile[right - 1]),
+                             "U+E0B0 must be the filled powerline triangle (profile \(profile))")
+
+        var noFallback = NativeTerminalRenderConfiguration(); noFallback.fallbackFontNames = []
+        let (control, controlCaret) = try await render("\u{e0b0}\r\n", name: "nerd-font-no-fallback", configuration: noFallback)
+        let boxed = try firstCellColumnProfile(control, controlCaret)
+        let boxInk = boxed.indices.filter { boxed[$0] > 100 }
+        if let l = boxInk.first, let r = boxInk.last, r > l {
+            XCTAssertLessThan(boxed[l] + boxed[l + 1], 3 * (boxed[r] + boxed[r - 1]),
+                              "without the fallback the glyph must not look like the triangle (profile \(boxed))")
+        }
     }
 
     /// A glyph's atlas bitmap must keep its own top at the top. "T" has a wide
