@@ -44,6 +44,8 @@ final class MobileWorkspaceModel {
     var showRestore = false { didSet { updateIdleTimer() } }
     var cameraRequested = false { didSet { updateIdleTimer() } }
     var active = false { didSet { updateIdleTimer() } }
+    /// Not in the background (see setScenePhase): live connections may run.
+    @ObservationIgnored private var connectionsForeground = false
     var busy = false
     var requestingCameraAccess = false
     var offlineModeBlocked = false
@@ -191,7 +193,19 @@ final class MobileWorkspaceModel {
         try? Data((report.joined(separator: "\n") + "\n").utf8)
             .write(to: documents.appendingPathComponent("connect-self-test.txt"), options: .atomic)
     }
-    func setActive(_ value: Bool) {
+    /// Inactive (a Face ID sheet, a permission alert, Control Center, the app
+    /// switcher) covers the screen and pauses restore; only background ends
+    /// connections. Face ID itself makes the app inactive, so tying
+    /// connections to "active" tore down every sign-in while its prompt was up.
+    func setScenePhase(_ phase: ScenePhase) {
+        let foreground = phase != .background
+        if foreground != connectionsForeground {
+            connectionsForeground = foreground
+            updateConnectionLifecycle()
+        }
+        if (phase == .active) != active { setActive(phase == .active) }
+    }
+    private func setActive(_ value: Bool) {
         active = value
         if !value {
             cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
@@ -200,13 +214,12 @@ final class MobileWorkspaceModel {
             if busy { pendingImport?.needsExplicitRetry = true }
         } else if pendingImport != nil { showRestore = true }
         updateLifecycle()
-        updateConnectionLifecycle()
     }
     /// Serialized so a quick background/foreground pair reaches the connection
-    /// manager in order; it seals and settles live sessions when inactive.
+    /// manager in order; it seals and settles live sessions in the background.
     private func updateConnectionLifecycle() {
         guard let connections else { return }
-        let prior = connectionLifecycle, value = active
+        let prior = connectionLifecycle, value = connectionsForeground
         connectionLifecycle = Task {
             await prior?.value
             await connections.setActive(value)
@@ -613,8 +626,8 @@ struct MobileWorkspaceRoot: View {
             }
             if !model.active { Color(.systemBackground).ignoresSafeArea().overlay { Label("FrankenTerm", systemImage: "lock.shield").font(.title2) } }
         }
-        .task { model.setActive(scenePhase == .active); await model.bootstrap() }
-        .onChange(of: scenePhase) { _, phase in model.setActive(phase == .active) }
+        .task { model.setScenePhase(scenePhase); await model.bootstrap() }
+        .onChange(of: scenePhase) { _, phase in model.setScenePhase(phase) }
         .onOpenURL { model.importFile($0) }
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
             OfflineRestoreSheet(model: model)

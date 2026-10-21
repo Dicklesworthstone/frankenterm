@@ -59,6 +59,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored private var groupClose: Task<Void, Never>?
     @ObservationIgnored private var groupApprovals: [String: GroupConnectionReview.Request] = [:]
     @ObservationIgnored private var pendingGroupReview: UUID?
+    /// Set by enteredBackground until the next activation.
+    @ObservationIgnored private var inBackground = false
 
     init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
          connections: MobileConnections) throws {
@@ -137,7 +139,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 // Leave one of the manager's three attempt slots for an
                 // individually selected terminal. Its global cap still applies.
                 batch = try MobileConnectionBatch(maximumConcurrent: 2, connect: { [weak self] id in
-                    guard let self, !self.closed, self.foreground,
+                    // Not `foreground`: another machine's Face ID sheet makes
+                    // the app inactive while this one waits its turn.
+                    guard let self, !self.closed, !self.inBackground,
                           self.sessions[id] == nil, let request = self.groupApprovals[id] else {
                         throw WorkspaceSSHConnectionError.stale
                     }
@@ -242,8 +246,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func setForeground(_ active: Bool) {
         guard !closed else { return }
         foreground = active
-        if !active { pendingGroupReview = nil; closePreparedConnections() }
-        else if group?.isRetired == true { closePreparedConnections() }
+        if active { inBackground = false }
+        if active, group?.isRetired == true { closePreparedConnections() }
         if active { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
         // Back from turning Tailscale on: try the machine that needed it, once
@@ -256,6 +260,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 self.connect(id)
             }
         }
+    }
+
+    /// Only the background ends group preparation and closes unopened
+    /// connections. A Face ID sheet or permission alert makes the app merely
+    /// inactive, and group preparation signs in, so closing on inactive ended
+    /// every group sign-in while its own Face ID prompt was up.
+    func enteredBackground() {
+        guard !closed else { return }
+        inBackground = true
+        pendingGroupReview = nil; closePreparedConnections()
     }
 
     private func needsTailscale(_ machineID: String) -> Bool {
@@ -350,6 +364,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             self.bindings = next
             try self.navigation.replaceInventory(inventory)
         }
+        // The sign-in that led here usually ends behind Face ID's sheet, which
+        // leaves the scene inactive for a moment; the keyboard waits for it
+        // rather than failing the new session. Background still refuses.
+        for _ in 0..<200 where !foreground && !inBackground && !closed { try await Task.sleep(for: .milliseconds(50)) }
         try await whileBusy {
             guard !self.closed, self.bindings[machineID]?.source == source else { throw TerminalNavigationError.stale }
             guard let plan = try self.navigation.navigation.plan(paneID: binding.paneID)
@@ -554,6 +572,7 @@ struct WorkspaceTerminalScreen: View {
                 groupReview = nil; scene.cancelGroupReview()
             }
             scene.setForeground(phase == .active)
+            if phase == .background { scene.enteredBackground() }
         }
     }
 
