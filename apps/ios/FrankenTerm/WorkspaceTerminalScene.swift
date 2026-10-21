@@ -1,0 +1,290 @@
+import SwiftUI
+import UIKit
+import Observation
+import FrankenTermKit
+
+/// One machine of a live workspace scene, in the group's order. `target` is
+/// nil when none of its direct-SSH routes is ready on this device.
+struct SceneMachine: Identifiable {
+    let id: String, name: String
+    let target: TerminalSessionTarget?
+    let unavailable: String
+    let background: String?
+}
+
+/// Keeps one live direct-SSH session per connected machine of a workspace and
+/// gives the scene's single keyboard to exactly the selected machine. Every
+/// switch, from the rail, a menu, a two-finger swipe or a new connection, goes
+/// through Kit's navigation coordinator: the old source's composition and held
+/// keys settle behind a focus barrier before the new source can accept input.
+/// Machines without a session stay in the ring and show how to connect.
+@MainActor
+@Observable
+final class WorkspaceTerminalScene: TerminalSessionFocus {
+    let workspaceName: String
+    let machines: [SceneMachine]
+    private(set) var sessions: [String: TerminalSessionController] = [:]
+    /// The machine on screen; follows committed navigation only.
+    private(set) var selectedMachineID: String?
+    private(set) var problem: String?
+
+    @ObservationIgnored let connections: MobileConnections
+    @ObservationIgnored let owner: TerminalKeyboardNavigationOwner
+    @ObservationIgnored let navigation: TerminalNavigationCoordinator
+    @ObservationIgnored private var bindings: [String: TerminalKeyboardNavigationBinding] = [:]
+    @ObservationIgnored private var closed = false
+
+    init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
+         connections: MobileConnections) throws {
+        self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
+        owner = try TerminalKeyboardNavigationOwner(coordinator: connections.coordinator, sceneID: UUID(),
+                                                    workspaceID: workspaceID.uuidString, bindings: [])
+        let empty = try machines.map { try TerminalNavigationMachine(id: $0.id, name: $0.name, panes: []) }
+        navigation = TerminalNavigationCoordinator(
+            navigation: try TerminalNavigation(machines: empty, initialMachineID: initialMachineID), focusOwner: owner)
+        selectedMachineID = navigation.navigation.selection?.machineID
+        navigation.onChange = { [weak self] in self?.navigationChanged() }
+        navigation.resume()
+    }
+
+    var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
+
+    /// Opens a session for a machine, replacing one that ended. Acknowledging
+    /// records that the user read the earlier session's unknown outcome.
+    func connect(_ machineID: String, acknowledging: Bool = false) {
+        guard !closed, let target = machines.first(where: { $0.id == machineID })?.target else { return }
+        // A session that has not settled (starting, live, tearing down) blocks a second one.
+        if let current = sessions[machineID], !current.settled { return }
+        let controller = TerminalSessionController(target: target, connections: connections, focus: self)
+        sessions[machineID] = controller
+        Task { await controller.start(acknowledgingEarlierSessions: acknowledging) }
+    }
+
+    /// Re-establishes the keyboard after its input generation ended (dismissed
+    /// keyboard, an alert, scene deactivation). Never reconnects anything.
+    func activateKeyboard() async {
+        guard !closed, navigation.phase == .inactive, let selection = navigation.navigation.selection,
+              selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
+        await owner.joinSealed()
+        do { try await navigation.activateSelection() } catch { report(error) }
+    }
+
+    func setForeground(_ active: Bool) {
+        guard !closed else { return }
+        if active { navigation.resume() } else { navigation.suspend() }
+    }
+
+    /// Closes every session of the scene; their journal records stay for review.
+    func close() async {
+        guard !closed else { return }
+        closed = true
+        navigation.suspend()
+        for controller in sessions.values { await controller.stop() }
+        await navigation.joinSuspension()
+    }
+
+    func report(_ error: any Error) {
+        problem = TerminalSessionController.describe(error)
+    }
+
+    private func inventory() throws -> [TerminalNavigationMachine] {
+        try machines.map { machine in
+            let panes = try bindings[machine.id].map { [try TerminalNavigationPane(id: $0.paneID, title: "Direct SSH")] }
+            return try TerminalNavigationMachine(id: machine.id, name: machine.name, panes: panes ?? [])
+        }
+    }
+
+    /// Committed navigation: show its machine and, once the destination's focus
+    /// is published, put the new keyboard into that machine's view.
+    private func navigationChanged() {
+        let selection = navigation.navigation.selection
+        if selectedMachineID != selection?.machineID { selectedMachineID = selection?.machineID }
+        guard navigation.phase == .ready, let selection, selection.paneID != nil,
+              let keyboard = owner.keyboard else { return }
+        sessions[selection.machineID]?.install(keyboard)
+    }
+
+    /// Navigation refuses overlapping transactions; a gesture in flight ends
+    /// within its bounded handoff, so retry briefly rather than drop the change.
+    private func whileBusy(_ body: () async throws -> Void) async throws {
+        for attempt in 0..<100 {
+            do { return try await body() }
+            catch TerminalNavigationError.busy where attempt < 99 { try await Task.sleep(for: .milliseconds(50)) }
+        }
+    }
+
+    // MARK: TerminalSessionFocus
+
+    func attach(machineID: String, source: TerminalSource,
+                encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
+        guard !closed else { throw TerminalNavigationError.unavailable }
+        let binding = TerminalKeyboardNavigationBinding(source: source, encoder: encoder)
+        var next = bindings; next[machineID] = binding
+        // Bindings are installed before the inventory offers the new pane.
+        try await whileBusy { try self.owner.replaceBindings(Array(next.values)) }
+        bindings = next
+        try navigation.replaceInventory(inventory())
+        try await whileBusy {
+            guard let plan = try self.navigation.navigation.plan(paneID: binding.paneID)
+                    ?? self.navigation.navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
+            try await self.navigation.perform(plan)
+        }
+        guard owner.currentSelection?.paneID == binding.paneID, let keyboard = owner.keyboard else {
+            throw TerminalNavigationError.stale
+        }
+        return keyboard
+    }
+
+    func detach(machineID: String, source: TerminalSource) async {
+        guard bindings[machineID]?.source == source else { return }
+        var next = bindings; next[machineID] = nil
+        // Removing the visible source seals its input before the list changes.
+        do { try await whileBusy { try self.owner.replaceBindings(Array(next.values)) } } catch { report(error) }
+        bindings = next
+        do { try navigation.replaceInventory(inventory()) } catch { report(error) }
+        await owner.joinSealed()
+    }
+
+    func inputRetired(machineID: String) {
+        // A handoff retires the old keyboard itself and reports it synchronously;
+        // sealing then would invalidate the switch in flight. Only a settled
+        // selection's lost input (dismissal, resign, OS) is sealed here.
+        guard navigation.phase == .ready, owner.currentSelection?.machineID == machineID,
+              owner.keyboard?.acceptsInput != true else { return }
+        owner.seal()
+    }
+}
+
+/// The live workspace: the selected machine's terminal under a machine/pane
+/// rail, or that machine's connect, progress, review or ended card.
+struct WorkspaceTerminalScreen: View {
+    @State var scene: WorkspaceTerminalScene
+    let initialMachineID: String
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        let machine = scene.selectedMachine
+        let background = machine?.background.map { Color(ftHex: $0) } ?? .black
+        ZStack {
+            background.ignoresSafeArea()
+            WorkspaceCanvasHost(scene: scene, terminal: machine.flatMap { scene.sessions[$0.id]?.terminal })
+            if let machine { card(for: machine) }
+        }
+        .navigationTitle(machine?.name ?? scene.workspaceName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(background, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(TerminalSessionTarget.isDark(machine?.background) ? .dark : .light, for: .navigationBar)
+        .task { scene.connect(initialMachineID) }
+        .onDisappear { Task { await scene.close() } }
+        .onChange(of: scenePhase) { _, phase in scene.setForeground(phase == .active) }
+    }
+
+    @ViewBuilder private func card(for machine: SceneMachine) -> some View {
+        if let session = scene.sessions[machine.id] {
+            switch session.phase {
+            case .idle, .connecting:
+                ProgressView("Connecting to \(machine.name)…").tint(.white).foregroundStyle(.white)
+            case .live:
+                EmptyView()
+            case .needsReview:
+                notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
+                       message: "A previous session here ended before everything typed in it had a known outcome.",
+                       uncertain: true, enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+            case let .ended(message):
+                notice(symbol: "checkmark.circle", title: "Session ended", message: message, uncertain: true,
+                       enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+            case let .failed(message):
+                notice(symbol: "exclamationmark.triangle", title: "Session unavailable", message: message, uncertain: true,
+                       enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+            }
+        } else if machine.target != nil {
+            notice(symbol: "terminal", title: "Not connected", message: "Swipe the rail to return to a connected machine.",
+                   uncertain: false, enabled: true, action: "Connect") { scene.connect(machine.id) }
+        } else {
+            notice(symbol: "network.slash", title: "Not available here", message: machine.unavailable,
+                   uncertain: false, enabled: false, action: nil) {}
+        }
+    }
+
+    /// Every way out of a session states that its last input may or may not
+    /// have run; the only action is an informed, explicit new session.
+    private func notice(symbol: String, title: String, message: String, uncertain: Bool, enabled: Bool,
+                        action: String? = "Start New Session", perform: @escaping () -> Void) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: symbol).font(.largeTitle)
+            Text(title).font(.headline)
+            Text(verbatim: message).multilineTextAlignment(.center).font(.callout)
+            if uncertain {
+                Text("Commands typed just before it ended may or may not have run. Nothing is sent again automatically; check the machine before repeating one.")
+                    .multilineTextAlignment(.center).font(.caption)
+            }
+            if let action {
+                Button(action, systemImage: action == "Connect" ? "terminal" : "arrow.clockwise", action: perform)
+                    .buttonStyle(.borderedProminent).disabled(!enabled)
+            }
+        }.padding(24).foregroundStyle(.white)
+            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16)).padding()
+    }
+}
+
+/// Hosts the navigation rail above a canvas showing the selected machine's
+/// asynchronously created terminal. Other machines' views leave the window,
+/// which pauses their rendering; their sessions keep running.
+private struct WorkspaceCanvasHost: UIViewRepresentable {
+    let scene: WorkspaceTerminalScene
+    let terminal: NativeTerminalView?
+    func makeUIView(context: Context) -> WorkspaceCanvasView { WorkspaceCanvasView(scene: scene) }
+    func updateUIView(_ view: WorkspaceCanvasView, context: Context) { view.show(terminal) }
+}
+
+private final class WorkspaceCanvasView: UIView {
+    private let canvas = UIView()
+    private var controls: NativeTerminalNavigationControls?
+    private weak var scene: WorkspaceTerminalScene?
+
+    init(scene: WorkspaceTerminalScene) {
+        self.scene = scene
+        super.init(frame: .zero)
+        canvas.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(canvas)
+        var top = safeAreaLayoutGuide.topAnchor
+        do {
+            let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
+                                                                permitsCanvasNavigation: { true })
+            controls.onFailure = { [weak scene] error in scene?.report(error) }
+            controls.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(controls)
+            NSLayoutConstraint.activate([
+                controls.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),
+                controls.leadingAnchor.constraint(equalTo: leadingAnchor),
+                controls.trailingAnchor.constraint(equalTo: trailingAnchor)
+            ])
+            top = controls.bottomAnchor
+            self.controls = controls
+        } catch { scene.report(error) }
+        NSLayoutConstraint.activate([
+            canvas.topAnchor.constraint(equalTo: top), canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
+            canvas.leadingAnchor.constraint(equalTo: leadingAnchor), canvas.trailingAnchor.constraint(equalTo: trailingAnchor)
+        ])
+        // A tap brings the keyboard back after its input generation ended.
+        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
+        tap.cancelsTouchesInView = false
+        canvas.addGestureRecognizer(tap)
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func tapped() {
+        Task { [weak scene] in await scene?.activateKeyboard() }
+    }
+
+    func show(_ terminal: NativeTerminalView?) {
+        if let terminal, terminal.superview === canvas, canvas.subviews.count == 1 { return }
+        canvas.subviews.forEach { $0.removeFromSuperview() }
+        guard let terminal else { return }
+        terminal.frame = canvas.bounds
+        terminal.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        canvas.addSubview(terminal)
+    }
+}

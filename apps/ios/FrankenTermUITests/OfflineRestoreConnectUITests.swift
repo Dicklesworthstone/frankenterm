@@ -196,6 +196,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("printf '%s-%s\\n' café 日本\n")
         waitFor("café-日本", in: terminal, "typed Unicode must round-trip through the shell")
 
+        // Dismissing the keyboard retires its input; a tap on the terminal
+        // establishes a new input focus on the same session.
+        app.buttons["Dismiss keyboard"].tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5), "the keyboard must go away")
+        terminal.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "a tap must bring the keyboard back")
+        app.typeText("echo BACK-$((40+2))\n")
+        waitFor("BACK-42", in: terminal, "the session must accept input again after the keyboard returns")
+
         // A full-screen program on the alternate screen, left with Esc: if Esc
         // is lost, ":q!" is inserted as text and vim never exits.
         app.typeText("vim -u NONE -N\n")

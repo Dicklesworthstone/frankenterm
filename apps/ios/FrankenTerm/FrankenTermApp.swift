@@ -969,10 +969,8 @@ private struct MachineWorkspaceView: View {
                                        local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
                                        let credential = route.credentialIDs.first(where: local.credentialIDs.contains) {
                                         NavigationLink {
-                                            TerminalSessionScreen(controller: TerminalSessionController(target: .init(
-                                                workspaceID: workspaceID, revision: local.workspace.revision,
-                                                machineID: machine.id, machineName: machine.name, routeID: id,
-                                                credentialID: credential, theme: theme), connections: connections))
+                                            liveWorkspace(connections: connections, local: local, initial: machine.id,
+                                                          route: id, credential: credential)
                                         } label: { Label("Connect", systemImage: "terminal") }
                                             .buttonStyle(.borderedProminent)
                                     }
@@ -1021,6 +1019,41 @@ private struct MachineWorkspaceView: View {
                     ForEach(machines) { machine in Button { selection = machine.id } label: { Text(verbatim: machine.name) } }
                 }
             }
+    }
+
+    /// The live scene over this group's machines in their order. The chosen
+    /// route opens first; any other machine can connect through its first
+    /// ready direct-SSH route, preferred route first.
+    @ViewBuilder private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState,
+                                            initial: String, route: String, credential: String) -> some View {
+        let scene = try? WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
+            machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },
+            initialMachineID: initial, connections: connections)
+        if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initial) }
+        else { Text("These machines could not be opened together.").padding() }
+    }
+
+    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
+                              chosen: (route: String, credential: String)?) -> SceneMachine {
+        let theme = document.themes.first { $0.id == machine.themeID }
+        func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
+            .init(id: machine.id, name: machine.name, target: target,
+                  unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
+                  background: theme?.background)
+        }
+        func target(_ route: String, _ credential: String) -> TerminalSessionTarget {
+            .init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
+                  machineName: machine.name, routeID: route, credentialID: credential, theme: theme)
+        }
+        if let chosen { return scene(target(chosen.route, chosen.credential)) }
+        var seen = Set<String>()
+        for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
+            guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
+                  local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
+                  let credential = route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
+            return scene(target(id, credential))
+        }
+        return scene(nil)
     }
 }
 

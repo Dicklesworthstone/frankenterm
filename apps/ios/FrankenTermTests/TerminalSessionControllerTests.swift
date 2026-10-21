@@ -7,11 +7,12 @@ import FrankenTermSSHIntegration
 import FrankenTermTerminal
 @testable import FrankenTerm
 
-// The app scene's session owner (TerminalSessionScreen.swift) against a live
-// sshd, typing through the real NativeTerminalInputView -> TerminalKeyboardSession
-// -> TerminalModelRuntime (Rust encoder) path. The remote shell writes its PTY
-// size and a computed marker to a host file the Simulator process can read
-// (FT_LIVE_SSH_OUT), so the check observes remote effects, not local echo.
+// The app's live workspace scene (WorkspaceTerminalScene.swift) and its
+// per-machine sessions (TerminalSessionScreen.swift) against a live sshd, typing
+// through the real NativeTerminalInputView -> TerminalKeyboardSession ->
+// TerminalModelRuntime (Rust encoder) path with Kit's navigation owning focus.
+// The remote shells write to a host file the Simulator process can read
+// (FT_LIVE_SSH_OUT), so checks observe remote effects, not local echo.
 // Same live-endpoint variables as LiveSSHTerminalTests; skipped without them.
 
 private final class SceneMemoryVault: WorkspaceCredentialVault, @unchecked Sendable {
@@ -55,18 +56,21 @@ final class TerminalSessionControllerTests: XCTestCase {
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
             "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF",
             "selection_background": "#345D91"]
+        // Two machines on the same loopback host, each with its own route, so
+        // each gets its own SSH connection, shell and journal record.
         let workspace: [String: Any] = [
-            "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["machine"]]],
-            "machines": [["id": "machine", "name": "Loopback", "theme_ref": "theme", "route_refs": ["route"],
-                           "preferred_route_ref": "route", "auto_connect": false]],
-            "routes": [["id": "route", "mode": "direct_ssh", "session_creation": "on_select", "host": "127.0.0.1",
-                        "port": Int(port), "user": user, "credential_refs": ["key"], "authentication_methods": ["publickey"],
-                        "host_trust_ref": "trust", "jump_routes": []]],
+            "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["alpha", "beta"]]],
+            "machines": ["alpha", "beta"].map { ["id": $0, "name": $0.capitalized, "theme_ref": "theme", "route_refs": ["route-\($0)"],
+                                                 "preferred_route_ref": "route-\($0)", "auto_connect": false] as [String: Any] },
+            "routes": ["alpha", "beta"].map { ["id": "route-\($0)", "mode": "direct_ssh", "session_creation": "on_select",
+                                               "host": "127.0.0.1", "port": Int(port), "user": user, "credential_refs": ["key"],
+                                               "authentication_methods": ["publickey"], "host_trust_ref": "trust",
+                                               "jump_routes": []] as [String: Any] },
             "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
                              "requirement": "matching_private_key", "private_material": "not_included"]],
             "host_trust": [["id": "trust", "host": "127.0.0.1", "port": Int(port), "revoked_keys": [],
                             "pins": [["algorithm": host.algorithm, "fingerprint": host.fingerprint]]]],
-            "themes": [theme], "preferences": ["initial_machine_ref": "machine", "initial_group_ref": "group", "connect_on_open": false]
+            "themes": [theme], "preferences": ["initial_machine_ref": "alpha", "initial_group_ref": "group", "connect_on_open": false]
         ]
         return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1,
             "bundle_id": "scene-test", "source": ["exporter_id": "scene-test"], "required_capabilities": [],
@@ -74,7 +78,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     private struct LiveScene {
-        let connections: MobileConnections, target: TerminalSessionTarget, outPath: String
+        let connections: MobileConnections, scene: WorkspaceTerminalScene, outPath: String
     }
 
     private func liveScene() async throws -> LiveScene {
@@ -99,21 +103,57 @@ final class TerminalSessionControllerTests: XCTestCase {
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
                                                 signer: SceneMemorySigner(vault: vault))
         await connections.setActive(true)
-        return LiveScene(connections: connections, target: .init(workspaceID: installed.id, revision: installed.revision,
-            machineID: "machine", machineName: "Loopback", routeID: "route", credentialID: "key"), outPath: outPath)
+        let machines = ["alpha", "beta"].map { id in
+            SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
+                machineID: id, machineName: id.capitalized, routeID: "route-\(id)", credentialID: "key"),
+                unavailable: "", background: nil)
+        }
+        let scene = try WorkspaceTerminalScene(workspaceID: installed.id, workspaceName: "Scene", machines: machines,
+                                               initialMachineID: "alpha", connections: connections)
+        return LiveScene(connections: connections, scene: scene, outPath: outPath)
     }
 
-    /// Starts `controller`, puts its view in the key window and returns it.
-    private func live(_ controller: TerminalSessionController,
-                      acknowledgingEarlierSessions: Bool = false) async throws -> NativeTerminalView {
-        await controller.start(acknowledgingEarlierSessions: acknowledgingEarlierSessions)
-        XCTAssertEqual(controller.phase, .live)
-        let terminal = try XCTUnwrap(controller.terminal)
+    /// Connects a machine through the scene and waits for its session to settle
+    /// into a phase other than connecting.
+    @discardableResult
+    private func connect(_ scene: WorkspaceTerminalScene, _ machine: String,
+                         acknowledging: Bool = false) async throws -> TerminalSessionController {
+        scene.connect(machine, acknowledging: acknowledging)
+        let session = try XCTUnwrap(scene.sessions[machine])
+        for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return session
+    }
+
+    /// Puts a live session's view in the key window (rendering and the caret
+    /// need one) and returns it.
+    private func shown(_ session: TerminalSessionController) throws -> NativeTerminalView {
+        XCTAssertEqual(session.phase, .live)
+        let terminal = try XCTUnwrap(session.terminal)
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = try XCTUnwrap(scenes.flatMap(\.windows).first { $0.isKeyWindow } ?? scenes.first?.windows.first)
         terminal.frame = CGRect(x: 0, y: 0, width: min(window.bounds.width, 402), height: 300)
         window.addSubview(terminal)
         return terminal
+    }
+
+    /// The host file the remote shells write, once it contains `marker` (or after ~10 s).
+    private func hostFile(_ path: String, containing marker: String) async throws -> String {
+        var text = ""
+        for _ in 0..<200 where !text.contains(marker) {
+            try await Task.sleep(for: .milliseconds(50))
+            text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        }
+        return text
+    }
+
+    /// Switches the scene the way the rail does and waits for the published focus.
+    private func select(_ scene: WorkspaceTerminalScene, _ machine: String) async throws {
+        let plan = try XCTUnwrap(try scene.navigation.navigation.plan(machineID: machine))
+        try await scene.navigation.perform(plan)
+        XCTAssertEqual(scene.selectedMachineID, machine)
+        XCTAssertEqual(scene.navigation.phase, .ready)
     }
 
     /// Types through UIKit's text-input protocol once a caret has been drawn
@@ -153,17 +193,11 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     func testSceneControllerTypesThroughTheNativeKeyboardAndResizesThePTY() async throws {
-        let scene = try await liveScene(), outPath = scene.outPath, connections = scene.connections
-        let controller = TerminalSessionController(target: scene.target, connections: connections)
-        let terminal = try await live(controller)
+        let live = try await liveScene(), outPath = live.outPath, connections = live.connections
+        let terminal = try shown(try await connect(live.scene, "alpha"))
         defer { terminal.removeFromSuperview() }
         try await type("stty size > \(outPath); echo FRANKEN-$((6*7)) >> \(outPath)", into: terminal)
-        var output = ""
-        for _ in 0..<200 {
-            output = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
-            if output.contains("FRANKEN-42") { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let output = try await hostFile(outPath, containing: "FRANKEN-42")
         XCTAssertTrue(output.contains("FRANKEN-42"), "the remote shell never ran the typed command (output: \(output))")
         let size = output.split(separator: "\n").first.map(String.init) ?? ""
         XCTAssertNotEqual(size, "24 80", "the PTY must follow the view's viewport, not the provisional 80x24")
@@ -175,18 +209,18 @@ final class TerminalSessionControllerTests: XCTestCase {
         let attachment = XCTAttachment(image: image); attachment.name = "scene-controller-terminal"
         attachment.lifetime = .keepAlways; add(attachment)
 
-        await controller.stop()
+        await live.scene.close()
         let remaining = await connections.manager.connections()
-        XCTAssertTrue(remaining.isEmpty, "stop must settle the connection through the manager")
+        XCTAssertTrue(remaining.isEmpty, "closing the scene must settle the connection through the manager")
     }
 
     /// A shell that exits ends the session from inside the pump task; teardown
     /// must still finish there, and the next session on the machine needs the
     /// user's acknowledgement of the first one's unknown outcome.
     func testRemoteExitSettlesAndANewSessionNeedsAcknowledgement() async throws {
-        let scene = try await liveScene(), connections = scene.connections
-        let first = TerminalSessionController(target: scene.target, connections: connections)
-        let terminal = try await live(first)
+        let live = try await liveScene(), connections = live.connections, scene = live.scene
+        let first = try await connect(scene, "alpha")
+        let terminal = try shown(first)
         defer { terminal.removeFromSuperview() }
         try await type("exit", into: terminal)
         for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
@@ -194,23 +228,56 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(first.settled, "teardown after a remote exit must finish")
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
+        XCTAssertEqual(scene.navigation.navigation.machines.first?.panes.count, 0, "the ended source leaves navigation")
 
-        let unacknowledged = first.replacement()
-        await unacknowledged.start()
+        let unacknowledged = try await connect(scene, "alpha")
         XCTAssertEqual(unacknowledged.phase, .needsReview, "the ended session's outcome must be reviewed first")
         XCTAssertTrue(unacknowledged.settled)
 
-        let second = unacknowledged.replacement()
-        let again = try await live(second, acknowledgingEarlierSessions: true)
+        let second = try await connect(scene, "alpha", acknowledging: true)
+        let again = try shown(second)
         defer { again.removeFromSuperview() }
-        try await type("echo AGAIN-$((40+2)) > \(scene.outPath)", into: again)
-        var output = ""
-        for _ in 0..<200 where !output.contains("AGAIN-42") {
-            try await Task.sleep(for: .milliseconds(50))
-            output = (try? String(contentsOfFile: scene.outPath, encoding: .utf8)) ?? ""
-        }
+        try await type("echo AGAIN-$((40+2)) > \(live.outPath)", into: again)
+        let output = try await hostFile(live.outPath, containing: "AGAIN-42")
         XCTAssertTrue(output.contains("AGAIN-42"), "the acknowledged new session must run commands (output: \(output))")
-        await second.stop()
+        await scene.close()
         XCTAssertTrue(second.settled)
+    }
+
+    /// M1: two machines stay connected while the scene switches between them,
+    /// and typed input reaches exactly the selected machine's shell. Each shell
+    /// remembers its own FT_WHO, so the host file records which shell ran each
+    /// command, in switching order; a stale input view of the machine that lost
+    /// focus cannot inject anything.
+    func testSwitchingMachinesKeepsBothSessionsAndRoutesInputToTheSelectedOne() async throws {
+        let live = try await liveScene(), scene = live.scene, path = live.outPath + ".machines"
+        let alpha = try shown(try await connect(scene, "alpha"))
+        defer { alpha.removeFromSuperview() }
+        try await type("export FT_WHO=alpha", into: alpha)
+        let beta = try shown(try await connect(scene, "beta"))
+        defer { beta.removeFromSuperview() }
+        XCTAssertEqual(scene.selectedMachineID, "beta", "connecting a machine selects it")
+        try await type("export FT_WHO=beta", into: beta)
+        XCTAssertEqual(scene.navigation.navigation.machines.map(\.panes.count), [1, 1])
+
+        try await select(scene, "alpha")
+        try await type("echo SEEN-$FT_WHO > \(path)", into: alpha)
+        _ = try await hostFile(path, containing: "SEEN-alpha")
+        let staleBetaInput = beta.input
+        XCTAssertFalse(staleBetaInput.isEditable, "the unselected machine accepts no input")
+        staleBetaInput.insertText("echo LEAK-$FT_WHO >> \(path)\n")
+
+        try await select(scene, "beta")
+        XCTAssertFalse(alpha.input.isEditable)
+        try await type("echo SEEN-$FT_WHO >> \(path)", into: beta)
+        _ = try await hostFile(path, containing: "SEEN-beta")
+        try await select(scene, "alpha")
+        try await type("echo SEEN-$FT_WHO >> \(path)", into: alpha)
+        let lines = try await hostFile(path, containing: "SEEN-beta\nSEEN-alpha").split(separator: "\n")
+        XCTAssertEqual(lines, ["SEEN-alpha", "SEEN-beta", "SEEN-alpha"], "input must follow the selection exactly")
+
+        await scene.close()
+        let remaining = await live.connections.manager.connections()
+        XCTAssertTrue(remaining.isEmpty)
     }
 }

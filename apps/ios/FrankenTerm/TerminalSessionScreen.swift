@@ -77,9 +77,24 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
     func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {}
 }
 
-/// Owns one direct-SSH terminal: connection, PTY shell, canonical Rust model,
-/// keyboard session and Metal/UIKit view, in the order the components require
+/// How a session obtains the scene's single keyboard for its source and gives
+/// it back. WorkspaceTerminalScene implements this with Kit's navigation owner,
+/// so exactly one source of the scene accepts input at a time.
+@MainActor
+protocol TerminalSessionFocus: AnyObject {
+    /// Offers the new source to navigation and makes it the input destination.
+    func attach(machineID: String, source: TerminalSource,
+                encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
+    /// Withdraws the source before it is retired, sealing its input if focused.
+    func detach(machineID: String, source: TerminalSource) async
+    /// The view's input generation ended (keyboard dismissed, resign, OS).
+    func inputRetired(machineID: String)
+}
+
+/// Owns one direct-SSH terminal: connection, PTY shell, canonical Rust model
+/// and Metal/UIKit view, in the order the components require
 /// (apps/apple/FrankenTermTerminal/README.md, "Connecting the components").
+/// Its keyboard comes from the scene's focus owner.
 @MainActor
 @Observable
 final class TerminalSessionController {
@@ -99,22 +114,29 @@ final class TerminalSessionController {
     let target: TerminalSessionTarget
 
     @ObservationIgnored private let connections: MobileConnections
+    @ObservationIgnored private weak var focus: (any TerminalSessionFocus)?
     @ObservationIgnored private var connection: WorkspaceSSHConnection?
     @ObservationIgnored private var pump: TerminalSessionPump?
     @ObservationIgnored private var runtime: TerminalModelRuntime?
-    @ObservationIgnored private var focus: TerminalFocus?
+    @ObservationIgnored private var attached = false
     @ObservationIgnored private var run: Task<Void, Never>?
     @ObservationIgnored private var presenter: TerminalFramePresenter?
     @ObservationIgnored private var wantedGeometry: TerminalSessionGeometry?
     @ObservationIgnored private var resizing = false
     @ObservationIgnored private var stopped = false
 
-    init(target: TerminalSessionTarget, connections: MobileConnections) {
-        self.target = target; self.connections = connections
+    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
+        self.target = target; self.connections = connections; self.focus = focus
     }
 
-    /// A fresh controller for the same route once this one ended or failed.
-    func replacement() -> TerminalSessionController { .init(target: target, connections: connections) }
+    /// Puts the scene's newly published keyboard into this session's view.
+    func install(_ keyboard: TerminalKeyboardSession) {
+        guard phase == .live, let terminal, terminal.input.session !== keyboard else { return }
+        do {
+            try terminal.replaceInputSession(keyboard)
+            terminal.requestKeyboard(true)
+        } catch { fail(Self.describe(error)) }
+    }
 
     /// `acknowledgingEarlierSessions` records the user's explicit acceptance
     /// that earlier sessions on this machine may have had unknown effects.
@@ -146,17 +168,20 @@ final class TerminalSessionController {
                 self?.fail("The display is unavailable (\(Self.describe(reason))).")
             }
             self.presenter = presenter
-            let coordinator = connections.coordinator
-            let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: presenter)
+            let runtime = TerminalModelRuntime(model: model, coordinator: connections.coordinator, delivery: presenter)
             self.runtime = runtime
-            let stream = try await coordinator.makeStream(sceneID: UUID())
-            let focus = try await coordinator.changeFocus(stream, to: pump.source)
-            self.focus = focus
-            let keyboard = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: runtime)
+            guard let focus else { throw TerminalKeyboardError.unavailable }
+            attached = true
+            let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
+            guard !stopped else { return await teardown() }
             let view = try await NativeTerminalView(session: keyboard, configuration: Self.renderConfiguration)
             presenter.view = view
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
             view.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            view.onInputRetired = { [weak self] in
+                guard let self else { return }
+                self.focus?.inputRetired(machineID: self.target.machineID)
+            }
             terminal = view
             guard !stopped else { return await teardown() }
             phase = .live
@@ -266,81 +291,12 @@ final class TerminalSessionController {
         if let connection { try? await connections.manager.close(connectionID: connection.id) }
         if joiningRun, let run { await run.value }
         try? await runtime?.close()
-        let coordinator = connections.coordinator
-        if let focus { _ = try? await coordinator.suspend(focus) }
-        if let source = pump?.source { try? await coordinator.retire(source) }
-        connection = nil; runtime = nil; focus = nil; run = nil
+        if let source = pump?.source {
+            if attached { await focus?.detach(machineID: target.machineID, source: source) }
+            try? await connections.coordinator.retire(source)
+        }
+        connection = nil; runtime = nil; attached = false; run = nil
         settled = true
     }
 }
 
-/// Full-screen terminal for one chosen machine route.
-struct TerminalSessionScreen: View {
-    @State var controller: TerminalSessionController
-
-    var body: some View {
-        let background = controller.target.background.map { Color(ftHex: $0) } ?? .black
-        ZStack {
-            background.ignoresSafeArea()
-            TerminalHost(view: controller.terminal)
-            switch controller.phase {
-            case .idle, .connecting:
-                ProgressView("Connecting to \(controller.target.machineName)…").tint(.white).foregroundStyle(.white)
-            case .live:
-                EmptyView()
-            case .needsReview:
-                notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
-                       message: "A previous session here ended before everything typed in it had a known outcome.")
-            case let .ended(message):
-                notice(symbol: "checkmark.circle", title: "Session ended", message: message)
-            case let .failed(message):
-                notice(symbol: "exclamationmark.triangle", title: "Session unavailable", message: message)
-            }
-        }
-        .navigationTitle(controller.target.machineName)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(TerminalSessionTarget.isDark(controller.target.background) ? .dark : .light,
-                            for: .navigationBar)
-        .task { await controller.start() }
-        .onDisappear { Task { await controller.stop() } }
-    }
-
-    /// Every way out of a session states that its last input may or may not
-    /// have run; the only action is an informed, explicit new session.
-    private func notice(symbol: String, title: String, message: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: symbol).font(.largeTitle)
-            Text(title).font(.headline)
-            Text(verbatim: message).multilineTextAlignment(.center).font(.callout)
-            Text("Commands typed just before it ended may or may not have run. Nothing is sent again automatically; check the machine before repeating one.")
-                .multilineTextAlignment(.center).font(.caption)
-            Button("Start New Session", systemImage: "arrow.clockwise", action: startNewSession)
-                .buttonStyle(.borderedProminent).disabled(!controller.settled)
-        }.padding(24).foregroundStyle(.white)
-            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16)).padding()
-    }
-
-    /// The ended controller already tore down; its successor acknowledges the
-    /// unknown outcome the user just read and connects anew on the same route
-    /// through the same authorization and host checks.
-    private func startNewSession() {
-        let next = controller.replacement()
-        controller = next
-        Task { await next.start(acknowledgingEarlierSessions: true) }
-    }
-}
-
-/// Hosts the asynchronously created NativeTerminalView.
-private struct TerminalHost: UIViewRepresentable {
-    let view: NativeTerminalView?
-    func makeUIView(context: Context) -> UIView { UIView() }
-    func updateUIView(_ container: UIView, context: Context) {
-        guard let view, view.superview !== container else { return }
-        container.subviews.forEach { $0.removeFromSuperview() }
-        view.frame = container.bounds
-        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        container.addSubview(view)
-    }
-}
