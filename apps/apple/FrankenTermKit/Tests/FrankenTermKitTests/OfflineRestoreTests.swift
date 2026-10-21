@@ -307,12 +307,17 @@ final class OfflineRestoreTests: XCTestCase {
         var state = await restore.status()
         state = try await restore.observe(sender.frame(page: 0, sequence: 1, using: crypto), generation: state.generation)
         state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
+        // Progress counts parts, the same total the sender splits the pages into.
+        let required = try sender.sourcePartCount(page: 0) + sender.sourcePartCount(page: 1)
+        XCTAssertEqual(state.requiredParts, required); XCTAssertEqual(state.receivedParts, 1)
         for sequence in 2...(try sender.sourcePartCount(page: 0)) {
             state = try await restore.observe(sender.frame(page: 0, sequence: UInt32(sequence), using: crypto), generation: state.generation)
+            XCTAssertEqual(state.receivedParts, sequence)
         }
         state = try await restore.observe(sender.frame(page: 1, sequence: 1, using: crypto), generation: state.generation)
         XCTAssertEqual(state.verifiedPages, 1); XCTAssertEqual(state.verifiedBytes, FTLimit.page)
         XCTAssertEqual(state.independentParts, 1); XCTAssertEqual(state.incompletePageIndices, [1])
+        XCTAssertEqual(state.receivedParts, try sender.sourcePartCount(page: 0) + 1)
         let oldGeneration = state.generation
         state = try await restore.resetIncompletePage(1, generation: oldGeneration)
         XCTAssertEqual(state.phase, .collecting); XCTAssertNotEqual(state.generation, oldGeneration)

@@ -56,6 +56,9 @@ public struct OfflineRestoreStatus: Sendable {
     public let requiresRecipientResume: Bool
     public let canUnlockRecipient: Bool
     public let verifiedPages: Int, verifiedBytes: Int, independentParts: Int
+    /// Parts in hand out of those the transfer needs: the progress to show
+    /// while scanning (see OpticalReceiver.receivedParts).
+    public let receivedParts: Int, requiredParts: Int
     public let incompletePageIndices: [Int]
     public let review: OfflineRestoreReview?
     public let receipt: WorkspaceImportReceipt?
@@ -111,6 +114,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
                      verifiedPages: receiver?.verifiedPages ?? (envelope == nil ? 0 : identity?.pageCount ?? 0),
                      verifiedBytes: receiver?.verifiedBytes ?? envelope?.count ?? 0,
                      independentParts: receiver?.independentParts ?? 0,
+                     receivedParts: receiver?.receivedParts ?? (envelope == nil ? 0 : identity?.sourcePartCount ?? 0),
+                     requiredParts: identity?.sourcePartCount ?? 0,
                      incompletePageIndices: receiver?.incompletePageIndices ?? [],
                      review: suspended ? nil : review, receipt: suspended ? nil : receipt)
     }

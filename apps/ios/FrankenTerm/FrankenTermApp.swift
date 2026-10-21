@@ -821,12 +821,13 @@ struct OfflineRestoreSheet: View {
     }
 
     @ViewBuilder private func collectingContent(_ state: OfflineRestoreStatus) -> some View {
-        let total = max(state.identity?.envelopeLength ?? 1, 1)
-        ProgressView(value: Double(state.verifiedBytes), total: Double(total)) {
+        let total = max(state.requiredParts, 1), received = min(state.receivedParts, total)
+        ProgressView(value: Double(received), total: Double(total)) {
             Text("Keep the camera on your Mac")
         } currentValueLabel: {
-            Text("\(Int((Double(state.verifiedBytes) / Double(total) * 100).rounded()))%")
-        }
+            Text("\(Int((Double(received) / Double(total) * 100).rounded(.down)))%").monospacedDigit()
+                .contentTransition(.numericText())
+        }.animation(.smooth, value: received)
         if !model.cameraRequested {
             Button("Resume Camera") { model.requestCamera() }
                 .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
@@ -1317,7 +1318,7 @@ private struct MachineWorkspaceView: View {
         var seen = Set<String>(), routes: [TerminalSessionRoute] = []
         for id in [chosen?.route, machine.preferredRouteID].compactMap({ $0 }) + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
-                  local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
+                  route.jumpRoutes.isEmpty, local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
                   let credential = id == chosen?.route ? chosen?.credential
                       : route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
             routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port))

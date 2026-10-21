@@ -218,6 +218,13 @@ public struct OpticalFrame: Sendable {
         public let transferID: Data, envelopeDigest: Data
         public let envelopeLength: Int
         public var pageCount: Int { (envelopeLength + FTLimit.page - 1) / FTLimit.page }
+        /// The independent parts the whole envelope needs. A page's count
+        /// follows from its length alone, split as URPageEncoder splits it.
+        public var sourcePartCount: Int { (0..<pageCount).reduce(0) { $0 + sourcePartCount(page: $1) } }
+        func sourcePartCount(page: Int) -> Int {
+            let length = min(FTLimit.page, envelopeLength - page * FTLimit.page)
+            return (CBORWriter.head(2, UInt64(length)).count + length + 255) / 256
+        }
     }
     public let identity: Identity, pageIndex: Int, pageDigest: Data
     let ur: String
@@ -336,6 +343,14 @@ public struct OpticalReceiver: Sendable {
     public var isComplete: Bool { verified.count == identity.pageCount }
     public var incompletePageIndices: [Int] { (0..<identity.pageCount).filter { verified[$0] == nil } }
     public var independentParts: Int { decoders.values.reduce(0) { $0 + $1.rank } }
+    /// Progress toward `identity.sourcePartCount`: a verified page counts in
+    /// full and an unfinished one by its independent parts, so this moves with
+    /// every useful frame, not only when a whole page verifies.
+    public var receivedParts: Int {
+        (0..<identity.pageCount).reduce(0) { total, page in
+            total + (verified[page] != nil ? identity.sourcePartCount(page: page) : decoders[page]?.rank ?? 0)
+        }
+    }
     public init(selecting frame: OpticalFrame) { identity = frame.identity }
     public mutating func resetIncompletePage(_ page: Int) {
         guard verified[page] == nil else { return }
