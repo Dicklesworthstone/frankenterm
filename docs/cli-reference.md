@@ -280,6 +280,25 @@ ft config export [-o <path>] [--json]
 ft config import <path> [--dry-run] [--replace] [--yes]
 ```
 
+```bash
+ft mobile init [<ssh-alias>...] [--inventory <path>]
+ft mobile show [--inventory <path>]
+ft mobile export [--group <id>] [--inventory <path>] [-o <file.ftworkspace>] [--check]
+ft mobile themes [-o <path>]
+```
+
+`machines.toml` (in the FrankenTerm config directory) lists each machine once:
+its name, icon, routes (`ssh` alias, direct `host`/`user`/`identity_file`, or a
+`frankenterm_mux` route `via` those) and its theme (a built-in `scheme`, color
+overrides, an `accent`, a desktop background gradient). `frankenterm.lua` reads
+it with `frankenterm.machines()`; a machine without a theme gets one of twelve
+distinct hue themes no other machine uses. `init` writes a first inventory from
+`~/.ssh/config`, each host pinned to its own theme, and refuses to overwrite.
+`export` writes the iPhone workspace (direct SSH routes, public-key references
+and `known_hosts` pins; never private keys) and reports on stderr what stayed
+behind, such as mux routes and ProxyJump hosts. `themes` writes the catalog the
+iPhone app bundles.
+
 An applied remote `--install-ft` requires a caller-chosen stable transaction ID;
 reuse that exact ID after timeout or lost acknowledgement. The current command
 publishes a verified immutable pending process-family generation but does not
