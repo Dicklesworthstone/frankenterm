@@ -8191,6 +8191,13 @@ enum MobileCommands {
         #[arg(long)]
         check: bool,
     },
+    /// Print what the Mac companion loads: the workspace for every group and
+    /// where each credential's private key lives (paths only, never key material)
+    Source {
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
     /// Write every theme the iPhone can offer (the app bundles this catalog)
     Themes {
         /// Where to write the catalog (default: standard output)
@@ -76279,6 +76286,12 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
                 bytes.push(b'\n');
                 write_output(output.as_deref(), &bytes)?;
             }
+        }
+        MobileCommands::Source { inventory } => {
+            let source = mobile_export::load_companion_source(&inventory_path(inventory))?;
+            let mut bytes = serde_json::to_vec(&source)?;
+            bytes.push(b'\n');
+            write_output(None, &bytes)?;
         }
         MobileCommands::Themes { output } => {
             let mut bytes = serde_json::to_vec(&mobile_export::theme_catalog_json())?;

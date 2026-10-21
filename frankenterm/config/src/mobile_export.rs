@@ -48,6 +48,17 @@ pub struct MobileExport {
     pub machines: usize,
     pub routes: usize,
     pub notes: Vec<ExportNote>,
+    /// For each credential, the private key file its public key came from:
+    /// what the desktop's own ssh would offer. Read by nothing here.
+    pub identity_files: BTreeMap<String, PathBuf>,
+}
+
+/// OpenSSH's identities when a route names none, in its order.
+fn default_identities(context: &InventoryContext) -> Vec<PathBuf> {
+    ["id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"]
+        .iter()
+        .map(|name| context.home.join(".ssh").join(name))
+        .collect()
 }
 
 /// Where SSH settings come from. Tests supply text; the CLI reads the files.
@@ -80,7 +91,12 @@ impl SshSources {
                     MachineRoute::Ssh {
                         target: RouteTarget::Direct { identity_files, .. },
                         ..
-                    } => identities.extend(identity_files.iter().map(|f| context.expand(f))),
+                    } => {
+                        if identity_files.is_empty() {
+                            identities.extend(default_identities(context));
+                        }
+                        identities.extend(identity_files.iter().map(|f| context.expand(f)));
+                    }
                     MachineRoute::Ssh {
                         target: RouteTarget::Alias(alias),
                         ..
@@ -396,7 +412,11 @@ fn resolve_endpoint(
             host: host.clone(),
             port: port.unwrap_or(22),
             user: user.clone(),
-            identities: identity_files.iter().map(|f| context.expand(f)).collect(),
+            identities: if identity_files.is_empty() {
+                default_identities(context)
+            } else {
+                identity_files.iter().map(|f| context.expand(f)).collect()
+            },
             host_key_alias: None,
             known_hosts: sources.default_known_hosts.clone(),
         }),
@@ -436,7 +456,14 @@ fn resolve_endpoint(
                 }
             };
             let user = match options.get("user") {
-                Some(user) => user.clone(),
+                Some(user) if !user.chars().any(char::is_whitespace) => user.clone(),
+                Some(_) => {
+                    note(
+                        notes,
+                        "its User in ~/.ssh/config contains spaces; not exported".into(),
+                    );
+                    return None;
+                }
                 None => {
                     note(
                         notes,
@@ -445,11 +472,25 @@ fn resolve_endpoint(
                     return None;
                 }
             };
+            let host = options
+                .get("hostname")
+                .cloned()
+                .unwrap_or_else(|| alias.clone());
+            let alias_ok = options
+                .get("hostkeyalias")
+                .is_none_or(|alias| crate::machines::valid_host(alias));
+            if !crate::machines::valid_host(&host) || !alias_ok {
+                note(
+                    notes,
+                    format!(
+                        "its HostName or HostKeyAlias in ~/.ssh/config is not usable on the phone ({}); not exported",
+                        crate::machines::INVALID_HOST
+                    ),
+                );
+                return None;
+            }
             Some(Endpoint {
-                host: options
-                    .get("hostname")
-                    .cloned()
-                    .unwrap_or_else(|| alias.clone()),
+                host,
                 port,
                 user,
                 identities: split_paths(options.get("identityfile"), context),
@@ -497,6 +538,7 @@ pub fn export(
         Vec::new(),
     );
     let mut exported = BTreeSet::new();
+    let mut identity_files = BTreeMap::new();
 
     for machine in inventory
         .machines
@@ -526,6 +568,7 @@ pub fn export(
                 None => continue,
             };
             let mut credential_ids = Vec::new();
+            let defaults = default_identities(context);
             for identity in &endpoint.identities {
                 let public = public_key_path(identity);
                 let key = match sources.public_keys.get(&public).and_then(|text| {
@@ -534,6 +577,8 @@ pub fn export(
                         .and_then(PublicKey::parse_line)
                 }) {
                     Some(key) => key,
+                    // OpenSSH skips absent default identities silently too.
+                    None if defaults.contains(identity) => continue,
                     None => {
                         notes.push(ExportNote {
                             machine: machine.id.clone(),
@@ -548,6 +593,20 @@ pub fn export(
                 };
                 let fingerprint = key.fingerprint();
                 let id = format!("c.{}", short_digest(&fingerprint));
+                if credential_ids.contains(&id) {
+                    continue;
+                }
+                if credential_ids.len() == 8 {
+                    notes.push(ExportNote {
+                        machine: machine.id.clone(),
+                        route: Some(route_name.clone()),
+                        message: format!(
+                            "the phone offers at most 8 identities per route; {} is not offered",
+                            identity.display()
+                        ),
+                    });
+                    continue;
+                }
                 credentials.entry(id.clone()).or_insert_with(|| {
                     json!({
                         "id": id,
@@ -557,9 +616,14 @@ pub fn export(
                         "private_material": "not_included",
                     })
                 });
-                if credential_ids.len() < 8 && !credential_ids.contains(&id) {
-                    credential_ids.push(id);
-                }
+                identity_files.entry(id.clone()).or_insert_with(|| {
+                    if identity.extension().is_some_and(|ext| ext == "pub") {
+                        identity.with_extension("")
+                    } else {
+                        identity.clone()
+                    }
+                });
+                credential_ids.push(id);
             }
             if credential_ids.is_empty() {
                 notes.push(ExportNote {
@@ -753,6 +817,46 @@ pub fn export(
         machines: machine_count,
         routes: route_count,
         notes,
+        identity_files,
+    })
+}
+
+/// The companion source for the inventory at `path`, every group, read with
+/// this user's SSH files: what `ft mobile source` and the companion's helper print.
+pub fn load_companion_source(path: &Path) -> anyhow::Result<Value> {
+    let bytes =
+        std::fs::read(path).map_err(|err| anyhow::anyhow!("reading {}: {}", path.display(), err))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("{} is not UTF-8 text", path.display()))?;
+    let context = InventoryContext {
+        directory: path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        home: crate::HOME_DIR.clone(),
+    };
+    let inventory = MachineInventory::parse(text, &context)?;
+    let sources = SshSources::from_disk(&inventory, &context);
+    let export = export(&inventory, &bytes, None, &sources, &context)?;
+    Ok(companion_source(&export, path))
+}
+
+/// What the Mac companion loads at launch (`ft mobile source`): the workspace
+/// for every group, and where this Mac keeps each credential's private key,
+/// so the companion can seal the keys the desktop already uses without the
+/// user picking files. Paths only: no key material passes through here.
+pub fn companion_source(export: &MobileExport, inventory: &Path) -> Value {
+    json!({
+        "format": "ftmachines-source",
+        "version": 1,
+        "inventory": inventory.to_string_lossy(),
+        "document": export.document,
+        "identity_files": export
+            .identity_files
+            .iter()
+            .map(|(id, path)| (id.clone(), json!(path.to_string_lossy())))
+            .collect::<Map<String, Value>>(),
+        "notes": export.notes.iter().map(ToString::to_string).collect::<Vec<_>>(),
     })
 }
 
@@ -964,6 +1068,97 @@ ssh = "jumped"
             messages
                 .iter()
                 .any(|m| m.starts_with("dark: no exportable SSH route")),
+            "{:?}",
+            messages
+        );
+    }
+
+    /// A distinct well-formed Ed25519 public key line for `seed`.
+    fn fake_key(seed: u8) -> String {
+        let mut blob = vec![0, 0, 0, 11];
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&[0, 0, 0, 32]);
+        blob.extend_from_slice(&[seed; 32]);
+        format!("ssh-ed25519 {} k{}", STANDARD.encode(blob), seed)
+    }
+
+    #[test]
+    fn the_companion_source_names_the_private_key_behind_each_credential() {
+        let text = r#"
+version = 1
+[machines.a]
+[[machines.a.routes]]
+id = "direct"
+host = "100.91.120.17"
+user = "ubuntu"
+identity_file = "~/.ssh/trj_ed25519.pub"
+[machines.b]
+[[machines.b.routes]]
+id = "plain"
+host = "css.example"
+user = "ubuntu"
+[machines.c]
+[[machines.c.routes]]
+id = "bad"
+ssh = "bad"
+"#;
+        let inventory = MachineInventory::parse(text, &context()).unwrap();
+        let mut sources = sources(Some("Host bad\n  HostName me@evil\n  User u\n"));
+        // b names no identity, so OpenSSH's defaults apply; only id_ecdsa exists.
+        sources.public_keys.insert(
+            PathBuf::from("/home/me/.ssh/id_ecdsa.pub"),
+            fake_key(7),
+        );
+        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let routes = export.document["workspace"]["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 2, "c's alias resolves to a host the phone refuses");
+        assert_eq!(routes[1]["credential_refs"].as_array().unwrap().len(), 1);
+        let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
+        assert!(messages.iter().any(|m| m.starts_with("c (bad): its HostName")), "{:?}", messages);
+        assert!(
+            !messages.iter().any(|m| m.contains("id_dsa") || m.contains("id_rsa")),
+            "absent default identities are not reported: {:?}",
+            messages
+        );
+
+        let source = companion_source(&export, Path::new("/home/me/.config/frankenterm/machines.toml"));
+        assert_eq!(source["format"], "ftmachines-source");
+        assert_eq!(source["inventory"], "/home/me/.config/frankenterm/machines.toml");
+        assert_eq!(source["document"], export.document);
+        let files: BTreeSet<&str> = source["identity_files"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let expected: BTreeSet<&str> = ["/home/me/.ssh/trj_ed25519", "/home/me/.ssh/id_ecdsa"]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(files, expected, "private paths, never the .pub");
+    }
+
+    #[test]
+    fn a_route_offers_at_most_eight_identities_and_says_which_it_left_out() {
+        let mut text = "version = 1\n[[machines.a.routes]]\nid = \"many\"\nhost = \"100.91.120.17\"\nuser = \"u\"\nidentity_files = [".to_string();
+        let mut sources = sources(None);
+        for seed in 0..9u8 {
+            text.push_str(&format!("\"~/.ssh/k{}\", ", seed));
+            sources.public_keys.insert(
+                PathBuf::from(format!("/home/me/.ssh/k{}.pub", seed)),
+                fake_key(seed),
+            );
+        }
+        text.push_str("]\n");
+        let inventory = MachineInventory::parse(&text, &context()).unwrap();
+        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let route = &export.document["workspace"]["routes"][0];
+        assert_eq!(route["credential_refs"].as_array().unwrap().len(), 8);
+        let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("at most 8 identities") && m.contains("/home/me/.ssh/k8")),
             "{:?}",
             messages
         );

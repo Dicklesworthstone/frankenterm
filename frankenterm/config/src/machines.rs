@@ -936,6 +936,12 @@ fn parse_machine(
     if tags.len() > 64 {
         return fail(&machine.at("tags"), "at most 64 tags");
     }
+    if let Some(index) = tags.iter().position(|tag| tag.len() > 128) {
+        return fail(
+            &format!("{}[{}]", machine.at("tags"), index),
+            "at most 128 bytes",
+        );
+    }
     let theme = match machine.get("theme") {
         Some(value) => Some(ParsedTheme {
             theme: parse_theme(id, &machine.at("theme"), value, context)?,
@@ -1226,10 +1232,11 @@ fn parse_routes(
                         }
                         identity_files.extend(route.strings("identity_files")?.unwrap_or_default());
                         let user = route.required_string("user")?;
-                        if user.chars().any(char::is_whitespace)
-                            || host.chars().any(char::is_whitespace)
-                        {
-                            return fail(&at, "host and user cannot contain spaces");
+                        if user.chars().any(char::is_whitespace) {
+                            return fail(&route.at("user"), "cannot contain spaces");
+                        }
+                        if !valid_host(&host) {
+                            return fail(&route.at("host"), INVALID_HOST);
                         }
                         RouteTarget::Direct {
                             host,
@@ -1280,6 +1287,33 @@ fn parse_routes(
         }
     }
     Ok(routes)
+}
+
+pub(crate) const INVALID_HOST: &str =
+    "expected a host name or address (an IPv6 address in [brackets]), without spaces or / \\ @ ? # %";
+
+/// A host the phone accepts as a network target: no spaces, controls or URL
+/// punctuation, and anything with a colon an IPv6 address (brackets optional).
+pub(crate) fn valid_host(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 1024
+        || host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "/\\@?#%".contains(c))
+    {
+        return false;
+    }
+    let inner = match host.strip_prefix('[') {
+        Some(rest) => match rest.strip_suffix(']') {
+            Some(inner) if inner.contains(':') => inner,
+            _ => return false,
+        },
+        None => host,
+    };
+    if inner.contains(['[', ']']) {
+        return false;
+    }
+    !inner.contains(':') || inner.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 /// A first inventory for SSH config host aliases: one machine per alias, in
@@ -1737,12 +1771,28 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
             ("version = 1\n[[machines.a.routes]]\nid = \"m\"\nkind = \"frankenterm_mux\"\nvia = \"s\"\nsocket = \"relative\"\n[[machines.a.routes]]\nid = \"s\"\nssh = \"a\"\n".to_string(), "machines.a.routes[0].socket"),
             ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nssh = \"a\"\n[[machines.a.routes]]\nid = \"s\"\nssh = \"b\"\n".to_string(), "machines.a.routes[1].id"),
             ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nhost = \"h\"\nuser = \"u\"\nport = 70000\n".to_string(), "machines.a.routes[0].port"),
+            // The phone refuses these hosts, so the inventory does too.
+            ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nhost = \"me@h\"\nuser = \"u\"\n".to_string(), "machines.a.routes[0].host"),
+            ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nhost = \"h:22\"\nuser = \"u\"\n".to_string(), "machines.a.routes[0].host"),
+            ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nhost = \"[h]\"\nuser = \"u\"\n".to_string(), "machines.a.routes[0].host"),
+            ("version = 1\n[[machines.a.routes]]\nid = \"s\"\nhost = \"h\"\nuser = \"a u\"\n".to_string(), "machines.a.routes[0].user"),
+            (format!("version = 1\n[machines.a]\ntags = [\"{}\"]\n{}", "t".repeat(129), ok_route), "machines.a.tags[0]"),
         ];
         for (text, path) in cases {
             match parse(&text) {
                 Err(err) => assert_eq!(err.path, path, "{}\n---\n{}", err, text),
                 Ok(_) => panic!("accepted:\n{}", text),
             }
+        }
+    }
+
+    #[test]
+    fn hosts_are_names_or_ip_addresses_the_phone_accepts() {
+        for host in ["trj", "100.91.120.17", "css.example", "fe80::1", "[2001:db8::1]"] {
+            assert!(valid_host(host), "{}", host);
+        }
+        for host in ["", "a b", "me@h", "h/x", "h:22", "[h]", "[::1", "::1]", "a%b", "h#"] {
+            assert!(!valid_host(host), "{:?}", host);
         }
     }
 

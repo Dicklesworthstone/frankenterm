@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/frankenterm",
     "crates/frankenterm-build-identity",
+    "crates/frankenterm-machines",
     "crates/frankenterm-core",
     "crates/frankenterm-browser-ui",
     "crates/frankenterm-redactor",

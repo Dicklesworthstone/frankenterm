@@ -4501,6 +4501,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-machines"
+version = "0.15.21"
+dependencies = [
+ "anyhow",
+ "config",
+ "serde_json",
+]
+
+[[package]]
 name = "frankenterm-mux-server"
 version = "0.15.21"
 dependencies = [

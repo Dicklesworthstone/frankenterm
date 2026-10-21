@@ -24,6 +24,17 @@ private enum ExportProtection: Sendable, Hashable {
     case code, recipient
 }
 
+private enum MachineSourceError: LocalizedError {
+    case noCommand, failed(String)
+    var errorDescription: String? {
+        switch self {
+        case .noCommand:
+            return "This Mac's FrankenTerm machines need the bundled frankenterm-machines helper (scripts/build-apple-machines-helper.sh) or an ft with `ft mobile source`."
+        case let .failed(detail): return detail
+        }
+    }
+}
+
 @main
 @MainActor
 struct FrankenTermExportApp: App {
@@ -101,6 +112,96 @@ private actor MacExportEngine {
         document = candidate; selection = selected; decisions = [:]; keys = []; invalidateExport()
         sourceFindings = []; identityReferences = [:]; sshSource = nil
         return try state()
+    }
+    struct MachineSourceResult: Sendable {
+        let state: SelectionState
+        let inventory: String, notes: [String]
+        /// Credentials whose key file needs a passphrase or could not be used.
+        let unresolved: [(credentialID: String, reason: String)]
+    }
+    /// What prints this Mac's machines: the helper bundled beside this app,
+    /// else an `ft` new enough to have `ft mobile source`.
+    static func machineSourceCommand() -> (executable: URL, arguments: [String])? {
+        if let helper = Bundle.main.url(forAuxiliaryExecutable: "frankenterm-machines") { return (helper, ["source"]) }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [home.appendingPathComponent(".local/bin/ft"), URL(fileURLWithPath: "/opt/homebrew/bin/ft"),
+                          URL(fileURLWithPath: "/usr/local/bin/ft"),
+                          URL(fileURLWithPath: "/Applications/FrankenTerm.app/Contents/MacOS/ft")]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }.map { ($0, ["mobile", "source"]) }
+    }
+    private final class Captured: @unchecked Sendable { var data = Data() }
+    private static func run(_ executable: URL, _ arguments: [String], limit: Int) throws -> Data {
+        let process = Process()
+        process.executableURL = executable; process.arguments = arguments
+        let output = Pipe(), errors = Pipe()
+        process.standardOutput = output; process.standardError = errors
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        // Drain stderr alongside stdout, and stop a helper that hangs.
+        let stderr = Captured(), drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { stderr.data = errors.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
+        let watched = Captured()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [process] in
+            if process.isRunning { watched.data = Data([1]); process.terminate() }
+        }
+        var result = Data()
+        while let bytes = try output.fileHandleForReading.read(upToCount: 65536), !bytes.isEmpty {
+            result += bytes
+            guard result.count <= limit else { process.terminate(); throw FTError.limit("machines.source") }
+        }
+        process.waitUntilExit(); drained.wait()
+        guard watched.data.isEmpty else { throw MachineSourceError.failed("\(executable.lastPathComponent) did not finish within 30 seconds") }
+        guard process.terminationStatus == 0 else {
+            let detail = String(decoding: stderr.data.prefix(2048), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw MachineSourceError.failed("\(executable.path) \(arguments.joined(separator: " ")) failed: \(detail)")
+        }
+        return result
+    }
+    /// This Mac's FrankenTerm machines with every group selected, and every
+    /// key their routes use included, read from the files the desktop's own
+    /// ssh uses. A key that needs a passphrase is left for an explicit choice.
+    func loadThisMac() throws -> MachineSourceResult {
+        retireKeyRequest(); invalidateExport()
+        guard let command = Self.machineSourceCommand() else { throw MachineSourceError.noCommand }
+        let bytes = try Self.run(command.executable, command.arguments, limit: 2 * FTLimit.manifest)
+        try Task.checkCancellation()
+        guard let root = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              root["format"] as? String == "ftmachines-source", root["version"] as? Int == 1,
+              let documentObject = root["document"] as? [String: Any] else { throw FTError.unsupported("machines.source") }
+        let files = (root["identity_files"] as? [String: String]) ?? [:]
+        let candidate = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: documentObject))
+        let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: Set(candidate.groups.map(\.id)))
+        var loaded: [PrivateKeyRecord] = [], included: [String: WorkspaceExportSelection.IdentityDecision] = [:]
+        var unresolved: [(credentialID: String, reason: String)] = []
+        for identity in selected.identities {
+            try Task.checkCancellation()
+            guard let credentialID = identity.credentialIDs.first(where: { files[$0] != nil }),
+                  let path = files[credentialID], let url = Self.identityURL(path),
+                  let reference = selected.workspace.credentials.first(where: { $0.id == credentialID }) else {
+                if let first = identity.credentialIDs.first { unresolved.append((first, "no key file on this Mac")) }
+                continue
+            }
+            do {
+                switch try keyUnlocker.select(pem: SelectedLocalFile.read(url, limit: FTLimit.key), reference: reference) {
+                case let .ready(key):
+                    guard fingerprint(key) == identity.fingerprint else { throw OpenSSHSourceKeyError.identityMismatch }
+                    loaded.append(key); included[identity.fingerprint] = .includePrivateKey
+                case .passphraseRequired:
+                    try? keyUnlocker.cancel()
+                    unresolved.append((credentialID, "\(url.lastPathComponent) needs its passphrase"))
+                }
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                try? keyUnlocker.cancel()
+                unresolved.append((credentialID, "\(url.lastPathComponent): \(error.localizedDescription)"))
+            }
+        }
+        _ = try AirGapArchive(workspace: candidate, keys: loaded, using: crypto)
+        try Task.checkCancellation()
+        document = candidate; selection = selected; decisions = included; keys = loaded
+        sourceFindings = []; identityReferences = files; sshSource = nil; invalidateExport()
+        return .init(state: try state(), inventory: (root["inventory"] as? String) ?? "machines.toml",
+                     notes: (root["notes"] as? [String]) ?? [], unresolved: unresolved)
     }
     func inspectSSHConfiguration(_ url: URL) throws -> [String] {
         retireKeyRequest(); invalidateExport()
@@ -383,6 +484,7 @@ private final class MacExportModel {
     @ObservationIgnored private var cameraPermission: Task<Void, Never>?
     @ObservationIgnored private var sourceKeyOperation: UUID?
     @ObservationIgnored private var sshSelectionID: UUID?
+    @ObservationIgnored private var loadedAtLaunch = false
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
     var recipientConfirmed: Bool {
@@ -514,6 +616,23 @@ private final class MacExportModel {
         }
     }
 
+    /// This Mac's FrankenTerm machines and the keys their routes use, as the
+    /// desktop is configured now. Runs when the window first opens.
+    func loadThisMac() {
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan(); retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
+        perform { [self] operation in
+            let result = try await engine.loadThisMac()
+            try requireCurrentWork(operation)
+            apply(result.state)
+            let machines = result.state.selection.workspace.machines.count
+            var text = "Loaded \(machines) machines from \(result.inventory) with the \(result.state.loadedFingerprints.count) keys this Mac uses for them."
+            if !result.unresolved.isEmpty {
+                text += " Still to decide: " + result.unresolved.map(\.reason).joined(separator: "; ") + "."
+            }
+            message = text + " Approve the keys below, then Prepare Encrypted Transfer."
+        }
+    }
     func chooseWorkspace() {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan()
@@ -741,6 +860,10 @@ private final class MacExportModel {
     func openExport(isActive: Bool) {
         windowOpen = true
         setForeground(isActive)
+        if !loadedAtLaunch, document == nil, MacExportEngine.machineSourceCommand() != nil {
+            loadedAtLaunch = true
+            loadThisMac()
+        }
     }
     func setForeground(_ value: Bool) {
         foreground = value && windowOpen
@@ -928,6 +1051,7 @@ private struct MacExportView: View {
                 HStack {
                     Label("FrankenTerm", systemImage: "terminal.fill").font(.largeTitle.bold())
                     Spacer()
+                    Button("Load This Mac's Machines") { model.loadThisMac() }.disabled(model.busy)
                     Button("Import SSH Config…") { model.chooseSSHConfiguration() }.disabled(model.busy)
                     Button("Open Workspace…") { model.chooseWorkspace() }.disabled(model.busy)
                 }
@@ -936,7 +1060,7 @@ private struct MacExportView: View {
                     exportChoices(document)
                 } else {
                     ContentUnavailableView("Choose a workspace", systemImage: "rectangle.3.group",
-                        description: Text("Open a local .ftworkspace document, or import selected hosts from an SSH config with their public identities and known_hosts policy. Private keys always require a separate choice."))
+                        description: Text("This Mac's FrankenTerm machines load automatically, with the keys their routes use. You can also open a .ftworkspace document, or import selected hosts from an SSH config with their public identities and known_hosts policy."))
                 }
                 if let prepared = model.prepared {
                     HStack {

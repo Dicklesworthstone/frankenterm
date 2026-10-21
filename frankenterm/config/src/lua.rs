@@ -388,9 +388,24 @@ end
         wezterm_mod.set(
             "machines",
             lua.create_function(move |lua, path: Option<String>| {
-                let path = path
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| inventory_dir.join(crate::machines::FILE_NAME));
+                // A named file resolves like a scheme file: `~` is HOME and a
+                // relative path is beside the config. Unnamed, the inventory
+                // beside the config wins, else the one `ft mobile` reads.
+                let names = crate::machines::InventoryContext {
+                    directory: inventory_dir.clone(),
+                    home: crate::HOME_DIR.clone(),
+                };
+                let path = match path {
+                    Some(path) => names.expand(&path),
+                    None => {
+                        let beside = inventory_dir.join(crate::machines::FILE_NAME);
+                        if beside.exists() {
+                            beside
+                        } else {
+                            crate::machines::default_path()
+                        }
+                    }
+                };
                 if !path.exists() {
                     return Ok(Value::Nil);
                 }
@@ -1605,7 +1620,9 @@ mod test {
         let dir = tempfile::tempdir()?;
         let config_file = dir.path().join("frankenterm.lua");
         let lua = make_lua_context(&config_file)?;
-        let missing: Value = lua.load("return frankenterm.machines()").eval()?;
+        // Named explicitly: unnamed, a missing neighbour falls back to the
+        // user's real inventory, which a test must not read.
+        let missing: Value = lua.load("return frankenterm.machines('absent.toml')").eval()?;
         assert!(
             missing.is_nil(),
             "no inventory is nil, so a config can fall back"
@@ -1677,6 +1694,10 @@ ssh = "css"
         );
         assert_eq!(alias, "css");
         assert!(automatic);
+        let named: String = lua
+            .load("return frankenterm.machines('machines.toml').machines.trj.name")
+            .eval()?;
+        assert_eq!(named, "Threadripper", "a relative name is beside the config");
         let watched: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
         assert!(
             watched

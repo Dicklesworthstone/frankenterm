@@ -84,7 +84,7 @@
         A50000000000000000000002 = {
             isa = PBXNativeTarget;
             buildConfigurationList = A80000000000000000000003;
-            buildPhases = (A60000000000000000000002, A30000000000000000000002, A60000000000000000000004,);
+            buildPhases = (A60000000000000000000002, A30000000000000000000002, A60000000000000000000004, A60000000000000000000008,);
             buildRules = (); dependencies = ();
             name = FrankenTermExport;
             packageProductDependencies = (A90000000000000000000002,);
@@ -141,6 +141,12 @@
             outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-regular.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bold.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-italic.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bolditalic.ttf",);
             runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh;
             shellScript = "# The desktop's default font (OFL 1.1; Fonts/Pragmasevka-LICENSE.md) is tracked\n# once as a zstd tar; extract the four faces rather than duplicating them in git.\nset -eu\n/usr/bin/tar -xf \"${SCRIPT_INPUT_FILE_0}\" -C \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\" pragmasevka-nf-regular.ttf pragmasevka-nf-bold.ttf pragmasevka-nf-italic.ttf pragmasevka-nf-bolditalic.ttf\n";
+        };
+        A60000000000000000000008 = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = ();
+            name = "Bundle frankenterm-machines helper";
+            inputPaths = (); outputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/frankenterm-machines",);
+            runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh;
+            shellScript = "# At launch the companion runs this helper to load this Mac's FrankenTerm\n# machines and the keys their routes use. scripts/build-apple-machines-helper.sh\n# builds it; without it the app falls back to an ft that has `ft mobile source`.\nset -eu\nhelper=\"${SRCROOT}/../macos/FrankenTermExport/Artifacts/frankenterm-machines\"\nif [ ! -x \"$helper\" ]; then\n    echo \"warning: $helper is missing; run scripts/build-apple-machines-helper.sh to bundle it\"\n    exit 0\nfi\ndestination=\"${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/frankenterm-machines\"\n/usr/bin/ditto \"$helper\" \"$destination\"\n/usr/bin/codesign --force --options runtime --timestamp=none --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"$destination\"\n";
         };
 /* End PBXShellScriptBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
