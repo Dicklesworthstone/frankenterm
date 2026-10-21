@@ -972,7 +972,7 @@ private struct MachineWorkspaceView: View {
                                             TerminalSessionScreen(controller: TerminalSessionController(target: .init(
                                                 workspaceID: workspaceID, revision: local.workspace.revision,
                                                 machineID: machine.id, machineName: machine.name, routeID: id,
-                                                credentialID: credential), connections: connections))
+                                                credentialID: credential, theme: theme), connections: connections))
                                         } label: { Label("Connect", systemImage: "terminal") }
                                             .buttonStyle(.borderedProminent)
                                     }
@@ -1024,7 +1024,7 @@ private struct MachineWorkspaceView: View {
     }
 }
 
-private extension Color {
+extension Color {
     init(ftHex: String) {
         let raw = String(ftHex.dropFirst())
         let number = UInt64(raw, radix: 16) ?? 0

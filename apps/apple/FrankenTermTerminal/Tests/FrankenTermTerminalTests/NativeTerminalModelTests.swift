@@ -72,6 +72,31 @@ final class NativeTerminalModelTests: XCTestCase {
         XCTAssertNil(try model.copyReply(), "a settled reply is not offered again")
     }
 
+    func testBasePaletteIsTheConfiguredThemeThatQueriesAndResetsSee() async throws {
+        let (model, source) = try await makeModel()
+        defer { try? model.close() }
+        var theme = [UInt8](repeating: 9, count: 1052)
+        for index in stride(from: 3, to: theme.count, by: 4) { theme[index] = 0xFF }
+        theme.replaceSubrange(4..<8, with: [0xCC, 0x33, 0x33, 0xFF]) // ANSI red
+        theme.replaceSubrange(1028..<1032, with: [0x14, 0x21, 0x3D, 0xFF]) // background
+        XCTAssertThrowsError(try model.setBasePalette(Array(theme.dropLast())))
+        try model.setBasePalette(theme)
+        let themed = try frame(model, source)
+        XCTAssertEqual(themed.palette[1], .init(0xCC, 0x33, 0x33, 0xFF))
+        XCTAssertEqual(themed.palette[257], .init(0x14, 0x21, 0x3D, 0xFF))
+
+        try model.feed(Data("\u{1b}]11;?\u{07}".utf8))
+        let reply = try XCTUnwrap(model.copyReply())
+        XCTAssertTrue(String(decoding: reply.bytes, as: UTF8.self).contains("rgb:1414/2121/3d3d"),
+                      "a background query must report the machine theme")
+        try model.settleReply(sequence: reply.sequence, disposition: .accepted)
+        try model.feed(Data("\u{1b}]11;rgb:00/00/00\u{07}".utf8))
+        XCTAssertEqual(try frame(model, source).palette[257], .init(0, 0, 0, 0xFF))
+        try model.feed(Data("\u{1b}]111\u{07}".utf8))
+        XCTAssertEqual(try frame(model, source).palette[257], .init(0x14, 0x21, 0x3D, 0xFF),
+                       "resetting an OSC override returns to the theme")
+    }
+
     func testKeyboardEncodingFollowsNegotiatedTerminalModes() async throws {
         let (model, _) = try await makeModel()
         defer { try? model.close() }

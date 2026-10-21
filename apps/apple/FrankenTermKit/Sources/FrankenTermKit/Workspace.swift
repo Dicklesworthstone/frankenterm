@@ -292,6 +292,20 @@ public struct WorkspaceDocument: Sendable {
             let value = Int(index - 16), levels = [0, 95, 135, 175, 215, 255]
             return String(format: "#%02X%02X%02X", levels[value / 36], levels[(value / 6) % 6], levels[value % 6])
         }
+        /// The terminal's configured base palette in the native ABI order: all
+        /// 256 indexed colors, then foreground, background, cursor foreground,
+        /// cursor background, cursor border, selection foreground and
+        /// selection background, each as sRGB RGBA8 (1052 bytes).
+        public var terminalBasePalette: [UInt8] {
+            let named = [foreground, background, cursorForeground, cursorBackground, cursorBorder,
+                         selectionForeground, selectionBackground]
+            return ((0...255).map { indexedColor(UInt8($0)) } + named).flatMap { hex -> [UInt8] in
+                // Validated "#RRGGBB" or "#RRGGBBAA"; a missing alpha is opaque.
+                let digits = hex.dropFirst(), value = UInt32(digits, radix: 16) ?? 0
+                let rgba = digits.count == 8 ? value : value << 8 | 0xFF
+                return [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: rgba >> $0) }
+            }
+        }
     }
     public struct HostKey: Hashable, Codable, Sendable {
         public let algorithm: String, fingerprint: String

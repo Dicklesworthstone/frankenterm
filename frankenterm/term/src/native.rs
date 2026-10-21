@@ -6,7 +6,7 @@
 //! domain. No task, writer thread, clipboard, notification, filesystem spill,
 //! image decoder or alternate ANSI implementation is installed.
 
-use crate::color::ColorPalette;
+use crate::color::{ColorPalette, SrgbaTuple};
 use crate::config::{GridEngine, NewlineCanon, Osc52WritePolicy, TerminalFeatureProfile};
 use crate::render::{
     capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness,
@@ -26,6 +26,10 @@ pub const MAX_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESIDENT_CELLS: usize = 65536;
 pub const MAX_CELL_GRAPHEME_BYTES: usize = 256;
+/// RGBA8 entries of a base palette: 256 indexed colors, then foreground,
+/// background, cursor foreground/background/border, selection fg/bg.
+pub const BASE_PALETTE_COLORS: usize = 263;
+pub const BASE_PALETTE_BYTES: usize = BASE_PALETTE_COLORS * 4;
 
 /// Finite, content-free native boundary failures. The numeric values are also
 /// the version 1 C ABI status values; no parser or terminal bytes enter errors.
@@ -124,6 +128,9 @@ fn validate_geometry(size: TerminalSize, scrollback: usize) -> Result<usize, Nat
 #[derive(Debug)]
 struct NativeConfiguration {
     scrollback_rows: usize,
+    /// The machine's configured theme. Terminal OSC color changes override
+    /// it transiently and their resets return to it.
+    palette: ColorPalette,
 }
 
 impl TerminalConfiguration for NativeConfiguration {
@@ -140,7 +147,7 @@ impl TerminalConfiguration for NativeConfiguration {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        self.palette.clone()
     }
 
     fn scrollback_size(&self) -> usize {
@@ -204,6 +211,7 @@ impl NativeTerminal {
             config.size,
             Arc::new(NativeConfiguration {
                 scrollback_rows: config.scrollback_rows,
+                palette: ColorPalette::default(),
             }),
             "FrankenTerm",
             env!("CARGO_PKG_VERSION"),
@@ -322,6 +330,44 @@ impl NativeTerminal {
 
     pub fn config(&self) -> NativeTerminalConfig {
         self.config
+    }
+
+    /// Replaces the configured base palette (the machine theme) from
+    /// [`BASE_PALETTE_BYTES`] of sRGB RGBA8 in the [`BASE_PALETTE_COLORS`]
+    /// order. An application's OSC overrides stay in effect until it resets
+    /// them, which then yields this palette.
+    pub fn set_base_palette(&mut self, rgba: &[u8]) -> Result<(), NativeTerminalError> {
+        self.can_mutate()?;
+        if rgba.len() != BASE_PALETTE_BYTES {
+            return Err(NativeTerminalError::Invalid);
+        }
+        let revision = self
+            .witness
+            .palette_revision
+            .checked_add(1)
+            .ok_or(NativeTerminalError::SequenceExhausted)?;
+        let color = |index: usize| {
+            let [red, green, blue, alpha] =
+                [0, 1, 2, 3].map(|c| f32::from(rgba[index * 4 + c]) / 255.0);
+            SrgbaTuple(red, green, blue, alpha)
+        };
+        let mut palette = ColorPalette::default();
+        for (index, entry) in palette.colors.0.iter_mut().enumerate() {
+            *entry = color(index);
+        }
+        palette.foreground = color(256);
+        palette.background = color(257);
+        palette.cursor_fg = color(258);
+        palette.cursor_bg = color(259);
+        palette.cursor_border = color(260);
+        palette.selection_fg = color(261);
+        palette.selection_bg = color(262);
+        self.terminal.set_config(Arc::new(NativeConfiguration {
+            scrollback_rows: self.config.scrollback_rows,
+            palette,
+        }));
+        self.witness.palette_revision = revision;
+        Ok(())
     }
 
     pub fn set_font_revision(&mut self, revision: u64) -> Result<(), NativeTerminalError> {
@@ -1017,6 +1063,55 @@ mod tests {
         assert_eq!(
             terminal.set_font_revision(6),
             Err(NativeTerminalError::Stale)
+        );
+    }
+
+    #[test]
+    fn base_palette_is_the_configured_theme_under_transient_osc_overrides() {
+        let mut terminal = terminal();
+        let entry = |frame: &[u8], index: usize| -> [u8; 4] {
+            let at = u32::from_le_bytes(frame[152..156].try_into().unwrap()) as usize + index * 4;
+            frame[at..at + 4].try_into().unwrap()
+        };
+        let revision = |frame: &[u8]| u64::from_le_bytes(frame[72..80].try_into().unwrap());
+        let background = [0x14, 0x21, 0x3d, 0xff];
+        let mut theme = [9u8, 9, 9, 0xff].repeat(BASE_PALETTE_COLORS);
+        theme[4..8].copy_from_slice(&[0xcc, 0x33, 0x33, 0xff]);
+        theme[200 * 4..201 * 4].copy_from_slice(&[1, 2, 3, 0xff]);
+        theme[257 * 4..258 * 4].copy_from_slice(&background);
+        let before = terminal.capture_frame(None).unwrap();
+        assert_ne!(entry(&before, 257), background);
+
+        terminal.set_base_palette(&theme).unwrap();
+        let themed = terminal.capture_frame(None).unwrap();
+        assert!(revision(&themed) > revision(&before));
+        assert_eq!(entry(&themed, 1), [0xcc, 0x33, 0x33, 0xff]);
+        assert_eq!(entry(&themed, 200), [1, 2, 3, 0xff]);
+        assert_eq!(entry(&themed, 256), [9, 9, 9, 0xff]);
+        assert_eq!(entry(&themed, 257), background);
+        assert_eq!(entry(&themed, 262), [9, 9, 9, 0xff]);
+
+        // Applications querying the background see the theme.
+        terminal.feed(b"\x1b]11;?\x07").unwrap();
+        let mut bytes = [0u8; 128];
+        let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
+        let text = String::from_utf8_lossy(&bytes[..reply.bytes]).into_owned();
+        assert!(text.contains("rgb:1414/2121/3d3d"), "{:?}", text);
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
+
+        // An OSC override is transient; its reset returns to the theme.
+        terminal.feed(b"\x1b]11;rgb:00/00/00\x07").unwrap();
+        let overridden = terminal.capture_frame(None).unwrap();
+        assert_eq!(entry(&overridden, 257), [0, 0, 0, 0xff]);
+        terminal.feed(b"\x1b]111\x07").unwrap();
+        let reset = terminal.capture_frame(None).unwrap();
+        assert_eq!(entry(&reset, 257), background);
+
+        assert_eq!(
+            terminal.set_base_palette(&theme[..BASE_PALETTE_BYTES - 1]),
+            Err(NativeTerminalError::Invalid)
         );
     }
 

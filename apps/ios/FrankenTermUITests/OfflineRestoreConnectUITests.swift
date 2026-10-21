@@ -130,6 +130,34 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("echo FRANKEN-$((6*7))\n")
         waitFor("FRANKEN-42", in: terminal, timeout: 30, "a typed command must run in the remote shell")
         snapshot("6-command-output")
+
+        // The machine's theme is the terminal's palette: an empty area shows
+        // the theme background rather than the engine default.
+        if let expected = ProcessInfo.processInfo.environment["FT_UI_THEME_BACKGROUND"].flatMap(rgb) {
+            let shown = sample(terminal, x: 0.9, y: 0.45)
+            XCTAssertTrue(zip(shown, expected).allSatisfy { abs($0 - $1) <= 6 },
+                          "terminal background \(shown) must be the theme's \(expected)")
+        }
+    }
+
+    private func rgb(_ hex: String) -> [Int]? {
+        guard hex.count == 7, let value = Int(hex.dropFirst(), radix: 16) else { return nil }
+        return [value >> 16 & 0xFF, value >> 8 & 0xFF, value & 0xFF]
+    }
+
+    /// The sRGB color at a unit point (top-left origin) of an element's screenshot.
+    private func sample(_ element: XCUIElement, x: CGFloat, y: CGFloat) -> [Int] {
+        guard let image = element.screenshot().image.cgImage,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return [] }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let column = CGFloat(Int(x * CGFloat(image.width))), row = CGFloat(Int(y * CGFloat(image.height)))
+        pixel.withUnsafeMutableBytes { bytes in
+            let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                    space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            context?.draw(image, in: CGRect(x: -column, y: row + 1 - CGFloat(image.height),
+                                            width: CGFloat(image.width), height: CGFloat(image.height)))
+        }
+        return pixel.prefix(3).map(Int.init)
     }
 
     @MainActor

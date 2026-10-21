@@ -160,7 +160,7 @@ The simulator build excludes x86_64 (both artifacts ship arm64 slices only). An 
 1. Run an unprivileged loopback `sshd -D -e -f <config>` on 127.0.0.1 with a scratch ed25519 host key. Its `AuthorizedKeysFile` should list only a scratch client key.
 2. Seal a one-machine workspace for that host, port and user, including the client key, into a `.ftairgap`. Any exporter that produces FTAG works, as does a small `FTAG.seal` tool over FrankenTermKit. Note the transfer code it prints.
 3. Enroll simulated Face ID: `xcrun simctl spawn <udid> notifyutil -s com.apple.BiometricKit.enrollmentChanged 1` followed by `-p` of the same name. While the test runs, keep posting `com.apple.BiometricKit_Sim.pearl.match` every second or two so the signer's prompt is accepted.
-4. Run `TEST_RUNNER_FT_UI_AIRGAP_PATH=<file> TEST_RUNNER_FT_UI_AIRGAP_CODE=<code> TEST_RUNNER_FT_UI_WORKSPACE_NAME=<name> TEST_RUNNER_FT_UI_MACHINE_NAME=<name> xcodebuild test … -only-testing:FrankenTermUITests`. The result bundle keeps a screenshot of every step.
+4. Run `TEST_RUNNER_FT_UI_AIRGAP_PATH=<file> TEST_RUNNER_FT_UI_AIRGAP_CODE=<code> TEST_RUNNER_FT_UI_WORKSPACE_NAME=<name> TEST_RUNNER_FT_UI_MACHINE_NAME=<name> xcodebuild test … -only-testing:FrankenTermUITests`. Optionally also set `TEST_RUNNER_FT_UI_THEME_BACKGROUND=#RRGGBB` to the machine theme's background, and the journey test will check that the terminal renders in that color. The result bundle keeps a screenshot of every step.
 
 Release distribution must use the repository's DSR system after its native iOS lane is implemented. Development Rust work remains subject to RCH; the bounded shared-engine tests above still need that environment. The Apple package introduces no local Cargo fallback.
 

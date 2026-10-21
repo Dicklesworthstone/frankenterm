@@ -102,6 +102,16 @@ public final class NativeTerminalModel: TerminalSessionModel, @unchecked Sendabl
     public func setFontRevision(_ revision: UInt64) throws {
         try withHandle { try Self.check(ft_terminal_v1_set_font_revision($0, revision)) }
     }
+    /// The machine's theme becomes the configured palette; terminal OSC color
+    /// changes remain transient overrides. See Theme.terminalBasePalette.
+    public func setBasePalette(_ rgba: [UInt8]) throws {
+        guard rgba.count == Int(FT_TERMINAL_BASE_PALETTE_BYTES) else { throw TerminalModelError.invalid }
+        try withHandle { session in
+            try Self.check(rgba.withUnsafeBufferPointer {
+                ft_terminal_v1_set_base_palette(session, $0.baseAddress, UInt32(rgba.count))
+            })
+        }
+    }
 
     private static func encodeKey(_ key: TerminalHardwareKey, phase: TerminalKeyPhase,
                                   session: UInt64, capacity: Int) throws -> Data {

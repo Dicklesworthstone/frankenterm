@@ -101,6 +101,15 @@ uint32_t ft_terminal_v1_feed(uint64_t session, const uint8_t *bytes, uint32_t le
 uint32_t ft_terminal_v1_resize(uint64_t session, uint32_t columns, uint32_t rows,
                               uint32_t pixel_width, uint32_t pixel_height);
 uint32_t ft_terminal_v1_set_font_revision(uint64_t session, uint64_t revision);
+/* Replaces the configured base palette: the machine's theme. Exactly
+ * FT_TERMINAL_BASE_PALETTE_BYTES of sRGB R,G,B,A bytes for 256 indexed colors,
+ * then foreground, background, cursor foreground, cursor background, cursor
+ * border, selection foreground, selection background. A larger length is
+ * CAPACITY, any other is INVALID. Terminal OSC color changes remain transient
+ * overrides on top; their resets and color queries see this palette. Advances
+ * the frame palette revision. */
+#define FT_TERMINAL_BASE_PALETTE_BYTES 1052u
+uint32_t ft_terminal_v1_set_base_palette(uint64_t session, const uint8_t *rgba, uint32_t length);
 
 /* Pure mode-aware encoders. No terminal writer, echo, focus, or input state is
  * changed. Caller must serialize mode changes with admission of these bytes.

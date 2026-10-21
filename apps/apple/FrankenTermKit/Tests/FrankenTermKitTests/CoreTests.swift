@@ -611,6 +611,14 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(theme.indexedColor(232), "#080808"); XCTAssertEqual(theme.indexedColor(254), "#E4E4E4")
         XCTAssertEqual(theme.font?.family, "Example Mono"); XCTAssertEqual(theme.font?.pointSize, 15.5)
         XCTAssertEqual(theme.font?.variations["wght"], 450)
+        let palette = theme.terminalBasePalette
+        func entry(_ index: Int) -> [UInt8] { Array(palette[index * 4..<index * 4 + 4]) }
+        XCTAssertEqual(palette.count, 1052)
+        XCTAssertEqual(entry(0), [0x12, 0x34, 0x56, 0xFF]) // ANSI from the theme
+        XCTAssertEqual(entry(16), [0x12, 0x3A, 0xBC, 0xFF]) // explicit indexed override
+        XCTAssertEqual(entry(17), [0x00, 0x00, 0x5F, 0xFF]) // standard cube
+        XCTAssertEqual(entry(256), [0xFF, 0xFF, 0xFF, 0xFF]); XCTAssertEqual(entry(257), [0x10, 0x22, 0x3C, 0xFF])
+        XCTAssertEqual(entry(259), [0xAA, 0xBB, 0xCC, 0x80]); XCTAssertEqual(entry(262), [0x01, 0x02, 0x03, 0xFF])
         for invalid in ["0", "15", "016", "256", "-1"] {
             XCTAssertThrowsError(try WorkspaceDocument(data: changedWorkspace { workspace in
                 var themes = workspace["themes"] as! [[String: Any]]; themes[0]["indexed"] = [invalid: "#FFFFFF"]; workspace["themes"] = themes

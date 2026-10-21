@@ -38,6 +38,15 @@ final class MobileConnections {
 struct TerminalSessionTarget: Hashable {
     let workspaceID: UUID, revision: UUID
     let machineID: String, machineName: String, routeID: String, credentialID: String
+    /// The machine theme as the terminal's base palette, and its background.
+    let basePalette: [UInt8]?, background: String?
+
+    init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String, routeID: String,
+         credentialID: String, theme: WorkspaceDocument.Theme? = nil) {
+        self.workspaceID = workspaceID; self.revision = revision; self.machineID = machineID
+        self.machineName = machineName; self.routeID = routeID; self.credentialID = credentialID
+        basePalette = theme?.terminalBasePalette; background = theme?.background
+    }
 }
 
 /// Publishes each owned FTSF frame from the Rust model to the native view.
@@ -119,6 +128,7 @@ final class TerminalSessionController {
             let pump = try await connection.openTerminal(geometry: geometry)
             self.pump = pump
             let model = try NativeTerminalModel(source: pump.source, geometry: geometry)
+            if let palette = target.basePalette { try model.setBasePalette(palette) }
             let presenter = TerminalFramePresenter()
             presenter.onUnavailable = { [weak self] reason in
                 self?.fail("The display is unavailable (\(Self.describe(reason))).")
@@ -249,7 +259,7 @@ struct TerminalSessionScreen: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            (controller.target.background.map { Color(ftHex: $0) } ?? .black).ignoresSafeArea()
             TerminalHost(view: controller.terminal)
             switch controller.phase {
             case .idle, .connecting:
