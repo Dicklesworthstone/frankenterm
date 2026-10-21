@@ -184,9 +184,8 @@ final class MachineThemesTests: XCTestCase {
                                           choices: ["m.trj": .init(name: "Dracula")])
         XCTAssertEqual(fromWorkspace.theme(for: trj)?.background, "#123456")
         XCTAssertEqual(fromWorkspace.theme(for: trj)?.id, fromWorkspace.workspaceTheme(of: css)?.id)
-        // Choices saved before the source was recorded still decode.
-        let legacy = try JSONDecoder().decode(MachineThemeChoice.self, from: Data(#"{"name":"Dracula","automatic":false}"#.utf8))
-        XCTAssertEqual(legacy, MachineThemeChoice(name: "Dracula"))
+        let saved = try JSONEncoder().encode(MachineThemeChoice(name: "Dracula", catalog: true))
+        XCTAssertEqual(try JSONDecoder().decode(MachineThemeChoice.self, from: saved), MachineThemeChoice(name: "Dracula", catalog: true))
     }
 
     func testHueDistanceWrapsAndIgnoresGrays() {

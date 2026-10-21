@@ -65,12 +65,6 @@ public struct MachineThemeChoice: Codable, Equatable, Sendable {
     public init(name: String?, catalog: Bool = false, automatic: Bool = false) {
         self.name = name; self.catalog = catalog; self.automatic = automatic
     }
-    public init(from decoder: any Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        name = try values.decodeIfPresent(String.self, forKey: .name)
-        catalog = try values.decodeIfPresent(Bool.self, forKey: .catalog) ?? false
-        automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
-    }
 }
 
 /// What each machine of a workspace looks like on this phone.
