@@ -35,6 +35,8 @@ public protocol TerminalSessionModel: AnyObject, Sendable {
     func settleReply(sequence: UInt64, disposition: TerminalModelReplyDisposition) throws
     func captureFrame(viewportTop: Int64?) throws -> Data
     func setFontRevision(_ revision: UInt64) throws
+    /// See WorkspaceDocument.Theme.terminalBasePalette for the layout.
+    func setBasePalette(_ rgba: [UInt8]) throws
     /// Idempotent; finishes model ownership without replaying outstanding bytes.
     /// Failure must retain ownership for a later close attempt.
     func close() throws
@@ -59,7 +61,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
     public let queuedReplies: UInt64, droppedReplies: UInt64
     public let publishedFrames: UInt64, unavailableFrames: UInt64
     public let endOfOutput: Bool, closing: Bool, closed: Bool
-    public let waitingPresentationRequests: Int, waitingViewportRequests: Int
+    public let waitingPresentationRequests: Int, waitingViewportRequests: Int, waitingPaletteRequests: Int
 }
 
 /// One source-bound owner joins the real SSH session pump, canonical terminal,
@@ -77,7 +79,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private let coordinator: TerminalInputCoordinator
     private let delivery: any TerminalModelDelivery
     private var operationActive = false
-    private enum OperationKind { case consumer, keyboard, presentation, viewport }
+    private enum OperationKind: CaseIterable { case consumer, keyboard, presentation, viewport, palette }
     private struct WaitingOperation {
         let kind: OperationKind
         let continuation: CheckedContinuation<Void, Error>
@@ -107,7 +109,8 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
               publishedFrames: publishedFrames, unavailableFrames: unavailableFrames,
               endOfOutput: endOfOutput, closing: closing, closed: closed,
               waitingPresentationRequests: waitingOperations.filter { $0.kind == .presentation }.count,
-              waitingViewportRequests: waitingOperations.filter { $0.kind == .viewport }.count)
+              waitingViewportRequests: waitingOperations.filter { $0.kind == .viewport }.count,
+              waitingPaletteRequests: waitingOperations.filter { $0.kind == .palette }.count)
     }
 
     private func requireSource(_ source: TerminalSource) throws {
@@ -134,7 +137,8 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try Task.checkCancellation()
         guard !closing, !closed else { throw TerminalModelError.closed }
         if operationActive {
-            guard waitingOperations.count < 4, !waitingOperations.contains(where: { $0.kind == kind }) else {
+            guard waitingOperations.count < OperationKind.allCases.count,
+                  !waitingOperations.contains(where: { $0.kind == kind }) else {
                 throw TerminalModelError.busy
             }
             try await withCheckedThrowingContinuation { continuation in
@@ -327,6 +331,14 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         guard top != Int64.min else { throw TerminalModelError.invalid }
         try await acquireOperation(.viewport); defer { finishOperation() }
         viewportTop = top
+        if visible { try await publishFrame() }
+    }
+    /// Re-themes the terminal. Like a scroll, a request waits once behind
+    /// output instead of failing; the next frame carries the new palette.
+    public func setBasePalette(_ rgba: [UInt8], source: TerminalSource) async throws {
+        try requireSource(source)
+        try await acquireOperation(.palette); defer { finishOperation() }
+        try model.setBasePalette(rgba)
         if visible { try await publishFrame() }
     }
     public func setFontRevision(_ revision: UInt64, source: TerminalSource) async throws {

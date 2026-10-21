@@ -34,6 +34,7 @@ private final class VisibilityModel: TerminalSessionModel, @unchecked Sendable {
         lock.withLock { captures += 1; return Data("opaque-frame-\(feeds)".utf8) }
     }
     func setFontRevision(_ revision: UInt64) throws {}
+    func setBasePalette(_ rgba: [UInt8]) throws {}
     func close() throws { lock.withLock { closes += 1; reply = nil } }
 }
 

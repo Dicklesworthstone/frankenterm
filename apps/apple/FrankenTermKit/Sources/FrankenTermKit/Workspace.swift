@@ -861,7 +861,7 @@ public struct WorkspaceDocument: Sendable {
         return result
     }
 
-    private static func displayText(_ value: String, cap: Int) throws -> String {
+    static func displayText(_ value: String, cap: Int) throws -> String {
         guard !value.isEmpty, value.utf8.count <= cap,
               !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
         else { throw FTError.malformed("manifest.display_text") }

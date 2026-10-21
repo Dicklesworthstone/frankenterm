@@ -860,4 +860,40 @@ ssh = "jumped"
         assert_eq!(themes[0]["name"], "FrankenTerm Azure");
         assert!(themes.iter().all(|t| t["ansi"].as_array().unwrap().len() == 16));
     }
+
+    /// The app and Kit read these files; they must be what this code writes.
+    /// FT_WRITE_MOBILE_FIXTURES=1 rewrites them for review.
+    fn matches_file(relative: &str, expected: &[u8]) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative);
+        if std::env::var_os("FT_WRITE_MOBILE_FIXTURES").is_some() {
+            std::fs::write(&path, expected).unwrap();
+        }
+        let actual = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {}", path.display(), err));
+        assert!(
+            actual == expected,
+            "{} is stale; run this test with FT_WRITE_MOBILE_FIXTURES=1 and review the diff",
+            relative
+        );
+    }
+
+    #[test]
+    fn the_bundled_phone_theme_catalog_is_current() {
+        let mut bytes = serde_json::to_vec(&theme_catalog_json()).unwrap();
+        bytes.push(b'\n');
+        matches_file("apps/ios/FrankenTerm/ThemeCatalog.json", &bytes);
+    }
+
+    #[test]
+    fn the_kit_fixture_is_this_exporters_output() {
+        let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n";
+        let mut document = export(&inventory, INVENTORY.as_bytes(), None, &sources(Some(config)), &context())
+            .unwrap()
+            .document;
+        // The only per-run field.
+        document["bundle_id"] = json!("b.fixture");
+        let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
+        bytes.push(b'\n');
+        matches_file("fixtures/ios-airgap/machines-export.ftworkspace", &bytes);
+    }
 }

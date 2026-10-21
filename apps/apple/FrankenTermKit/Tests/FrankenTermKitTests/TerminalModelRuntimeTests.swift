@@ -139,6 +139,10 @@ private final class OwnedModelFixture: TerminalSessionModel, @unchecked Sendable
         lock.lock(); defer { lock.unlock() }
         events.append("font"); fontRevision = revision
     }
+    func setBasePalette(_ rgba: [UInt8]) {
+        lock.lock(); defer { lock.unlock() }
+        events.append("palette:\(rgba.count)")
+    }
     func close() throws {
         lock.lock(); defer { lock.unlock() }
         events.append("close"); closeCalls += 1
@@ -350,6 +354,39 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(model.snapshot().fed, Data([0x90, results.0 ? 0x91 : 0x92]))
         XCTAssertEqual(model.snapshot().captures, 3)
         XCTAssertEqual(model.snapshot().viewports, [nil, nil, -20], "the waiting request ran after the waiting consumer")
+        try await runtime.close()
+    }
+
+    func testPaletteChangeWaitsOnceBehindOutputAndRepublishesOnlyAVisibleTerminal() async throws {
+        let (coordinator, _, source) = try await source()
+        let hold = ModelRuntimeGate(), delivery = ModelRuntimeDelivery(hold: hold)
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery)
+        let palette = [UInt8](repeating: 9, count: 1052)
+        let receive = Task { try await runtime.receive(.init(output: Data([0x90])), source: source) }
+        await delivery.entered.wait()
+        // A theme picked while output is being published waits for it; a
+        // second pick in that window is refused, not queued behind the first.
+        let change = Task { try await runtime.setBasePalette(palette, source: source) }
+        while await runtime.accounting().waitingPaletteRequests == 0 { await Task.yield() }
+        do { try await runtime.setBasePalette(palette, source: source); XCTFail("Second palette change queued") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .busy) }
+        XCTAssertEqual(model.snapshot().events, ["feed", "capture"])
+        await hold.release()
+        try await receive.value
+        try await change.value
+        XCTAssertEqual(model.snapshot().events, ["feed", "capture", "palette:1052", "capture"],
+                       "the visible terminal shows the new palette at once")
+        let published = await delivery.snapshot().0
+        XCTAssertEqual(published.count, 2)
+
+        try await runtime.setVisible(false, source: source)
+        try await runtime.setBasePalette(palette, source: source)
+        XCTAssertEqual(model.snapshot().events.suffix(2), ["capture", "palette:1052"], "a hidden terminal is not captured")
+        let (_, _, other) = try await self.source()
+        do { try await runtime.setBasePalette(palette, source: other); XCTFail("Foreign source accepted") }
+        catch { XCTAssertEqual(error as? TerminalInputError, .stale) }
+        XCTAssertEqual(model.snapshot().events.filter { $0.hasPrefix("palette") }.count, 2)
         try await runtime.close()
     }
 
