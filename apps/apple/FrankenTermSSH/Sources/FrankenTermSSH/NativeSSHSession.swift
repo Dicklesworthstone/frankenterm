@@ -7,7 +7,7 @@ import Darwin
 import Glibc
 #endif
 
-public enum NativeSSHError: Error, Equatable, Sendable {
+public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
     case invalidInput, busy, closed, timedOut, invalidChallenge
     case native(Int32)
     case resolution(Int32), connection(Int32)
@@ -16,6 +16,37 @@ public enum NativeSSHError: Error, Equatable, Sendable {
     public var isConnectionFailure: Bool {
         if case let .native(code) = self { return code == FTSSH_IO }
         return false
+    }
+
+    /// The address never answered or could not be reached: nothing about
+    /// the machine's SSH server, host key or the user's key is known.
+    public var isUnreachable: Bool {
+        switch self {
+        case .timedOut, .resolution, .connection: true
+        default: false
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidInput: "The connection settings are not valid."
+        case .busy: "Another operation is already using this connection."
+        case .closed: "The connection is closed."
+        case .timedOut: "The machine didn't answer in time."
+        case .invalidChallenge: "The machine asked for authentication this app can't answer."
+        case let .resolution(code): "The machine's name couldn't be looked up (\(String(cString: gai_strerror(code))))."
+        case let .connection(code): "The machine couldn't be reached (\(String(cString: strerror(code))))."
+        case let .native(code):
+            switch Int(code) {
+            case FTSSH_IO: "The connection to the machine was lost."
+            case FTSSH_NEGOTIATION: "The machine's SSH server offers no encryption this app accepts."
+            case FTSSH_HOST_REJECTED: "The machine's host key changed during the connection."
+            case FTSSH_AUTH_REJECTED: "The machine didn't accept this key. Add its public key to the machine's authorized_keys."
+            case FTSSH_CLOSED: "The machine closed the connection."
+            case FTSSH_UNSUPPORTED: "The machine requires an SSH feature this app doesn't support."
+            default: "The SSH connection failed (code \(code))."
+            }
+        }
     }
 }
 

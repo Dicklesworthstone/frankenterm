@@ -5,8 +5,24 @@ import CryptoKit
 import Crypto
 #endif
 
-public enum SSHAuthenticationError: Error, Equatable, Sendable {
+public enum SSHAuthenticationError: Error, Equatable, Sendable, LocalizedError {
     case unavailable, busy, stale, denied, invalidChallenge, identityMismatch, unsupportedAlgorithm
+    /// The machine presented a host key other than the one saved for it.
+    case hostKeyMismatch
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable: "This machine's key isn't available on this device."
+        case .busy: "Another sign-in is already in progress."
+        case .stale: "This machine's saved settings changed. Open it again."
+        case .denied: "This route isn't ready to connect on this device."
+        case .invalidChallenge: "The machine sent a sign-in request this app can't answer."
+        case .identityMismatch: "The saved key doesn't match the key this machine expects."
+        case .unsupportedAlgorithm: "This key type isn't supported yet."
+        case .hostKeyMismatch:
+            "The machine's identity doesn't match the one saved from your Mac. If it was reinstalled, send it to this phone again from the Mac; otherwise someone may be intercepting the connection."
+        }
+    }
 }
 
 /// A bounded canonical public identity, never private material or authority to

@@ -5,6 +5,7 @@ import AVFoundation
 import UniformTypeIdentifiers
 import UIKit
 import FrankenTermKit
+import FrankenTermSSH
 import FrankenTermSSHIntegration
 
 @main
@@ -136,7 +137,51 @@ final class MobileWorkspaceModel {
             try await refreshWorkspaces(using: created, epoch: epoch)
             if active, pendingImport != nil { showRestore = true }
             updateLifecycle()
+            Task { await Self.connectSelfTestIfRequested(using: created) }
         } catch { report(error); bootstrapStarted = false }
+    }
+
+    /// `FT_CONNECT_SELF_TEST=1` reaches every saved route up to its host key,
+    /// four at a time, without a key or a prompt (WorkspaceRouteProbe), and
+    /// writes Documents/connect-self-test.txt.
+    private static func connectSelfTestIfRequested(using store: WorkspaceStore) async {
+        guard ProcessInfo.processInfo.environment["FT_CONNECT_SELF_TEST"] == "1" else { return }
+        var report = ["tailnet address: \(WorkspaceRouteNetwork.deviceTailnetAddress() ?? "none")"]
+        do {
+            for entry in try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport) {
+                let document = try entry.workspace.document()
+                report.append("workspace \(document.name): keys on device \(entry.credentialIDs.sorted())")
+                var lines: [Int: String] = [:]
+                for start in stride(from: 0, to: document.routes.count, by: 4) {
+                    await withTaskGroup(of: (Int, String).self) { group in
+                        for index in start..<min(start + 4, document.routes.count) {
+                            let route = document.routes[index]
+                            let readiness = entry.routes.first { $0.routeID == route.id }
+                            group.addTask {
+                                let probe = await WorkspaceRouteProbe.run(route: route, document: document)
+                                var line = "\(route.id) \(route.user)@\(route.host):\(route.port) \(probe.network)"
+                                line += " ready=\(readiness?.isLocallyReady ?? false) creds=\(readiness?.usableCredentialIDs ?? [])"
+                                if let issues = readiness?.issues, !issues.isEmpty { line += " issues=\(issues)" }
+                                if let peer = probe.peer {
+                                    line += " kex=\(peer.keyExchange) cipher=\(peer.outboundCipher)/\(peer.inboundCipher)"
+                                    line += " mac=\(peer.outboundMAC)/\(peer.inboundMAC) hostkey=\(peer.hostSignature)"
+                                }
+                                if let decision = probe.hostKey { line += " trust=\(decision)" }
+                                if let failure = probe.failure {
+                                    line += " FAILED \(failure): \((failure as? LocalizedError)?.errorDescription ?? "")"
+                                }
+                                return (index, line)
+                            }
+                        }
+                        for await (index, line) in group { lines[index] = line }
+                    }
+                }
+                report += lines.keys.sorted().compactMap { lines[$0] }
+            }
+        } catch { report.append("FAILED: \(error)") }
+        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        try? Data((report.joined(separator: "\n") + "\n").utf8)
+            .write(to: documents.appendingPathComponent("connect-self-test.txt"), options: .atomic)
     }
     func setActive(_ value: Bool) {
         active = value

@@ -742,6 +742,7 @@ public actor WorkspaceStore {
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
                 revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
                 requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
+            guard decision != .pinMismatch else { throw SSHAuthenticationError.hostKeyMismatch }
             guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
             return .init(storeOwner: sshAuthorizationOwner, account: binding.account,
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
