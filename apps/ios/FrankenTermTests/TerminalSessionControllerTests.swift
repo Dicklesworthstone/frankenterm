@@ -212,6 +212,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         await live.scene.close()
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty, "closing the scene must settle the connection through the manager")
+        await assertReleased(try XCTUnwrap(live.scene.sessions["alpha"]), connections: connections)
     }
 
     /// A shell that exits ends the session from inside the pump task; teardown
@@ -229,10 +230,12 @@ final class TerminalSessionControllerTests: XCTestCase {
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
         XCTAssertEqual(scene.navigation.navigation.machines.first?.panes.count, 0, "the ended source leaves navigation")
+        await assertReleased(first, connections: connections)
 
         let unacknowledged = try await connect(scene, "alpha")
         XCTAssertEqual(unacknowledged.phase, .needsReview, "the ended session's outcome must be reviewed first")
         XCTAssertTrue(unacknowledged.settled)
+        await assertReleased(unacknowledged, connections: connections)
 
         let second = try await connect(scene, "alpha", acknowledging: true)
         let again = try shown(second)
@@ -242,6 +245,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(output.contains("AGAIN-42"), "the acknowledged new session must run commands (output: \(output))")
         await scene.close()
         XCTAssertTrue(second.settled)
+        await assertReleased(second, connections: connections)
     }
 
     /// M1: two machines stay connected while the scene switches between them,
@@ -279,5 +283,86 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
         let remaining = await live.connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    private func assertReleased(_ controller: TerminalSessionController, connections: MobileConnections,
+                                file: StaticString = #filePath, line: UInt = #line) async {
+        XCTAssertTrue(controller.settled, file: file, line: line)
+        XCTAssertNil(controller.cleanupFailure, file: file, line: line)
+        let accounting = await connections.coordinator.accounting()
+        XCTAssertEqual(accounting.connections, 0, "source ownership leaked", file: file, line: line)
+        XCTAssertEqual(accounting.streams, 0, "responder focus leaked", file: file, line: line)
+        XCTAssertEqual(accounting.retainedRecords, 0, "final outcomes were not reconciled", file: file, line: line)
+        XCTAssertEqual(accounting.cleanupRecords, 0, file: file, line: line)
+        XCTAssertEqual(accounting.retainedBytes, 0, file: file, line: line)
+        XCTAssertEqual(accounting.inFlightBytes, 0, file: file, line: line)
+    }
+
+    /// No network, Keychain prompt, or live-server environment is needed for
+    /// these pre-start lifetime tests. The real manager remains disabled.
+    private func dormantScene() throws -> (MobileConnections, WorkspaceTerminalScene, TerminalSessionTarget) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-stop-" + UUID().uuidString)
+        let vault = SceneMemoryVault()
+        let store = WorkspaceStore(persistence: try FileWorkspacePersistence(directory: root.appendingPathComponent("store")),
+                                   vault: vault)
+        let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
+                                                signer: SceneMemorySigner(vault: vault))
+        let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "machine",
+            machineName: "Never connected", routeID: "route", credentialID: "key")
+        let machine = SceneMachine(id: "machine", name: "Never connected", target: target, unavailable: "", background: nil)
+        let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, workspaceName: "Dormant",
+            machines: [machine], initialMachineID: "machine", connections: connections)
+        return (connections, scene, target)
+    }
+
+    func testStopBeforeStartPermanentlyRetiresThisController() async throws {
+        let (connections, scene, target) = try dormantScene()
+        let controller = TerminalSessionController(target: target, connections: connections, focus: scene)
+        controller.requestStop()
+        await controller.stop()
+        await controller.start()
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertNil(controller.terminal)
+        await assertReleased(controller, connections: connections)
+        let pending = await connections.manager.pendingCount, records = try await connections.journal.records()
+        XCTAssertEqual(pending, 0)
+        XCTAssertTrue(records.isEmpty)
+        await scene.close()
+    }
+
+    func testConcurrentSceneClosesJoinAndPreventScheduledConnectionStartup() async throws {
+        let (connections, scene, _) = try dormantScene()
+        scene.connect("machine")
+        let controller = try XCTUnwrap(scene.sessions["machine"])
+        scene.requestClose()
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<16 { group.addTask { await scene.close() } }
+            await group.waitForAll()
+        }
+        await controller.retryCleanup()
+        await assertReleased(controller, connections: connections)
+        scene.connect("machine", acknowledging: true)
+        XCTAssertTrue(scene.sessions["machine"] === controller)
+        let records = try await connections.journal.records(), pending = await connections.manager.pendingCount
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testStoppingWhileStartupIsPendingJoinsBeforeReportingSettled() async throws {
+        let live = try await liveScene(), scene = live.scene
+        scene.connect("alpha")
+        let controller = try XCTUnwrap(scene.sessions["alpha"])
+        for _ in 0..<200 where controller.phase == .idle { await Task.yield() }
+        XCTAssertNotEqual(controller.phase, .idle)
+        scene.requestClose()
+        async let first: Void = scene.close()
+        async let second: Void = scene.close()
+        _ = await (first, second)
+        await assertReleased(controller, connections: live.connections)
+        let remaining = await live.connections.manager.connections(), pending = await live.connections.manager.pendingCount
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertEqual(pending, 0)
+        XCTAssertNotEqual(controller.phase, .live)
     }
 }
