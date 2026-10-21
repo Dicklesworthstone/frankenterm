@@ -36,8 +36,8 @@ use crate::renderable::{
     terminal_get_cursor_position, terminal_get_dimensions, RenderableDimensions,
     StableCursorPosition,
 };
-use frankenterm_term::screen::ScreenCoordinateWitness;
 pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorRow};
+use frankenterm_term::screen::ScreenCoordinateWitness;
 use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::convert::TryFrom;
 use std::ops::Range;
@@ -626,7 +626,9 @@ mod tests {
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{TerminalConfiguration, TerminalSize};
     use std::sync::Arc;
-    use termwiz::cell::{Blink, Cell, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
+    use termwiz::cell::{
+        Blink, Cell, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign,
+    };
     use termwiz::cellcluster::CellCluster;
     use termwiz::color::{ColorAttribute, SrgbaTuple};
     use termwiz::hyperlink::Hyperlink;

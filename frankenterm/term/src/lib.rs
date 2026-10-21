@@ -42,7 +42,9 @@
 //! The entrypoint to the crate is the [Terminal](terminal/struct.Terminal.html)
 //! struct.
 #[cfg(all(feature = "native-ffi", not(panic = "unwind")))]
-compile_error!("native-ffi requires panic=unwind so Rust panics cannot abort across the C boundary");
+compile_error!(
+    "native-ffi requires panic=unwind so Rust panics cannot abort across the C boundary"
+);
 
 use anyhow::Error;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};

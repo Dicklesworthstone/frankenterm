@@ -27,14 +27,14 @@ use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
 
+mod bounded_output;
 #[cfg(feature = "use_serde")]
 pub mod checkpoint;
-mod bounded_output;
+use bounded_output::BoundedOutputWriter;
 pub use bounded_output::{
     BoundedOutputDrain, BoundedOutputLimits, BoundedOutputSettlement, BoundedOutputStatus,
     BoundedReplyCopy, BoundedReplyDisposition, BoundedWriteResult,
 };
-use bounded_output::BoundedOutputWriter;
 mod image;
 mod iterm;
 mod keyboard;
@@ -662,7 +662,9 @@ enum ThreadedWriter {
     },
     /// Mobile/embedder path: a fixed ring drained by the caller. No thread,
     /// channel, callback retention or implicit downstream writer exists.
-    Bounded(BoundedOutputWriter),
+    /// Boxed so the desktop `Live` writer does not carry the ring's ~288-byte
+    /// inline state in every terminal (clippy::large_enum_variant).
+    Bounded(Box<BoundedOutputWriter>),
     #[cfg(feature = "use_serde")]
     Inert,
     Failed,
@@ -1063,7 +1065,7 @@ impl TerminalState {
             config,
             term_program,
             term_version,
-            ThreadedWriter::Bounded(writer),
+            ThreadedWriter::Bounded(Box::new(writer)),
             false,
         ))
     }
@@ -2367,9 +2369,12 @@ impl TerminalState {
             // OSC parsing has a separate retained-string cap. Bound metadata
             // retained by every cell as well, including arbitrary OSC 8
             // parameter names/values rather than just the URI.
-            link.params().iter().try_fold(link.uri().len(), |total, (key, value)| {
-                total.checked_add(key.len())?.checked_add(value.len())
-            }).is_some_and(|total| total <= 512)
+            link.params()
+                .iter()
+                .try_fold(link.uri().len(), |total, (key, value)| {
+                    total.checked_add(key.len())?.checked_add(value.len())
+                })
+                .is_some_and(|total| total <= 512)
         });
         self.pen.set_hyperlink(match link {
             Some(hyperlink) => Some(Arc::new(hyperlink)),
@@ -2392,7 +2397,9 @@ impl TerminalState {
                     res.push_str(&encoded_name);
                     res.push('=');
 
-                    let name = if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                    let name = if self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
+                    {
                         "xterm-256color"
                     } else {
                         &self.term_program
@@ -2418,7 +2425,8 @@ impl TerminalState {
                 }
 
                 _ => {
-                    let unavailable = self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText
+                    let unavailable = self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
                         && matches!(name.as_str(), "Ms" | "set_selection");
                     if let Some(value) = DB.raw(name).filter(|_| !unavailable) {
                         res.push_str("1+r");
@@ -2488,7 +2496,8 @@ impl TerminalState {
             }
             Device::RequestPrimaryDeviceAttributes => {
                 let mut ident = "\x1b[?65".to_string(); // Vt500
-                let native = self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText;
+                let native = self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText;
                 if !native {
                     ident.push_str(";4"); // Sixel graphics
                     ident.push_str(";18"); // windowing extensions
@@ -2544,7 +2553,8 @@ impl TerminalState {
             }
             Device::XtSmGraphics(g) => {
                 let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_))
-                    || self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText
+                    || self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
                 {
                     XtSmGraphics {
                         item: g.item,
@@ -4957,15 +4967,17 @@ mod tests {
     fn user_input_class_nests_and_is_restored_after_every_input_path() {
         let (mut terminal, output) = terminal_state_with_capture(false);
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
-        terminal.with_user_input(|terminal| -> std::io::Result<()> {
-            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            terminal.with_user_input(|terminal| -> std::io::Result<()> {
+        terminal
+            .with_user_input(|terminal| -> std::io::Result<()> {
+                assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+                terminal.with_user_input(|terminal| -> std::io::Result<()> {
+                    assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+                    Ok(())
+                })?;
                 assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
                 Ok(())
-            })?;
-            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            Ok(())
-        }).unwrap();
+            })
+            .unwrap();
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
 
         terminal

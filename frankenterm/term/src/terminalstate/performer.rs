@@ -619,9 +619,9 @@ impl<'a> Handler for Performer<'a> {
 
 impl<'a> Performer<'a> {
     pub fn new(state: &'a mut TerminalState) -> Self {
-        let native_work_remaining =
-            (state.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText)
-                .then_some(NATIVE_EXPANDED_WORK_BUDGET);
+        let native_work_remaining = (state.config.feature_profile()
+            == crate::config::TerminalFeatureProfile::NativeText)
+            .then_some(NATIVE_EXPANDED_WORK_BUDGET);
         Self {
             state,
             print: String::new(),
@@ -644,35 +644,50 @@ impl<'a> Performer<'a> {
         let rows = self.screen().physical_rows.max(1);
         let cost = match csi {
             CSI::Edit(Edit::Repeat(n)) => (*n as usize).saturating_mul(cols),
-            CSI::Edit(Edit::InsertCharacter(n) | Edit::DeleteCharacter(n)
-                | Edit::EraseCharacter(n)) => (*n as usize).min(cols).saturating_mul(cols),
+            CSI::Edit(
+                Edit::InsertCharacter(n) | Edit::DeleteCharacter(n) | Edit::EraseCharacter(n),
+            ) => (*n as usize).min(cols).saturating_mul(cols),
             CSI::Edit(Edit::ScrollLeft(n) | Edit::ScrollRight(n)) => (*n as usize)
-                .min(cols).saturating_mul(cols).saturating_mul(rows),
+                .min(cols)
+                .saturating_mul(cols)
+                .saturating_mul(rows),
             CSI::Edit(Edit::EraseInLine(_) | Edit::SelectiveEraseInLine(_)) => cols,
-            CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseScrollback)
-                | Edit::SelectiveEraseInDisplay(EraseInDisplay::EraseScrollback)) => {
-                cols.saturating_mul(self.screen().scrollback_rows())
-            }
+            CSI::Edit(
+                Edit::EraseInDisplay(EraseInDisplay::EraseScrollback)
+                | Edit::SelectiveEraseInDisplay(EraseInDisplay::EraseScrollback),
+            ) => cols.saturating_mul(self.screen().scrollback_rows()),
             CSI::Edit(Edit::SelectCharacterProtection(_)) => 0,
             CSI::Edit(_) => cols.saturating_mul(rows),
-            CSI::Cursor(Cursor::ForwardTabulation(n) | Cursor::BackwardTabulation(n)) => {
-                (*n as usize).min(cols.saturating_add(1)).saturating_mul(cols)
+            CSI::Cursor(Cursor::ForwardTabulation(n) | Cursor::BackwardTabulation(n)) => (*n
+                as usize)
+                .min(cols.saturating_add(1))
+                .saturating_mul(cols),
+            CSI::Cursor(Cursor::Left(n)) if self.reverse_wraparound_mode && self.dec_auto_wrap => {
+                *n as usize
             }
-            CSI::Cursor(Cursor::Left(n))
-                if self.reverse_wraparound_mode && self.dec_auto_wrap => *n as usize,
-            CSI::Cursor(Cursor::Left(_)) if self.cursor.x < self.left_and_right_margins.start => cols,
-            CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(code))
+            CSI::Cursor(Cursor::Left(_)) if self.cursor.x < self.left_and_right_margins.start => {
+                cols
+            }
+            CSI::Mode(
+                Mode::SetDecPrivateMode(DecPrivateMode::Code(code))
                 | Mode::ResetDecPrivateMode(DecPrivateMode::Code(code))
-                | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(code)))
-                if matches!(code,
-                    DecPrivateModeCode::Select132Columns
+                | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(code)),
+            ) if matches!(
+                code,
+                DecPrivateModeCode::Select132Columns
                     | DecPrivateModeCode::OptEnableAlternateScreen
                     | DecPrivateModeCode::EnableAlternateScreen
-                    | DecPrivateModeCode::ClearAndEnableAlternateScreen) => cols.saturating_mul(rows),
+                    | DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ) =>
+            {
+                cols.saturating_mul(rows)
+            }
             CSI::Device(device) if matches!(device.as_ref(), Device::SoftReset) => {
                 rows.saturating_mul(2)
             }
-            CSI::Window(window) if matches!(window.as_ref(), Window::ChecksumRectangularArea { .. }) => {
+            CSI::Window(window)
+                if matches!(window.as_ref(), Window::ChecksumRectangularArea { .. }) =>
+            {
                 cols.saturating_mul(rows)
             }
             _ => 0,
@@ -2194,7 +2209,9 @@ impl<'a> Performer<'a> {
             Action::Esc(esc) => self.esc_dispatch(esc),
             Action::CSI(csi) => self.csi_dispatch(csi),
             Action::Sixel(sixel) => {
-                if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                if self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText
+                {
                     return;
                 }
                 // FND-017: a sixel renders an image at the current cursor, so any
@@ -2211,7 +2228,9 @@ impl<'a> Performer<'a> {
             }
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
-                if self.config.feature_profile() == crate::config::TerminalFeatureProfile::NativeText {
+                if self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText
+                {
                     return;
                 }
                 self.flush_print();
@@ -2586,8 +2605,10 @@ impl<'a> Performer<'a> {
             let rows = self.screen().physical_rows;
             let cost = match esc {
                 Esc::Code(EscCode::DecScreenAlignmentDisplay) => cols.saturating_mul(rows),
-                Esc::Code(EscCode::FullReset) => rows.saturating_mul(2)
-                    .saturating_add(self.config.scrollback_size()).saturating_mul(cols),
+                Esc::Code(EscCode::FullReset) => rows
+                    .saturating_mul(2)
+                    .saturating_add(self.config.scrollback_size())
+                    .saturating_mul(cols),
                 _ => 0,
             };
             if !self.admit_native_work(cost) {
@@ -2927,7 +2948,9 @@ impl<'a> Performer<'a> {
                     self.writer.flush().ok();
                 }
                 ITermProprietary::File(image) => {
-                    if self.config.feature_profile() != crate::config::TerminalFeatureProfile::NativeText {
+                    if self.config.feature_profile()
+                        != crate::config::TerminalFeatureProfile::NativeText
+                    {
                         self.set_image(*image);
                     }
                 }

@@ -6,8 +6,8 @@
 //! owned full replacement in the explicit FTSF format. No Rust layout or borrowed
 //! terminal pointer crosses the language boundary.
 
-use crate::{Line, StableRowIndex, Terminal};
 use crate::config::GridEngine;
+use crate::{Line, StableRowIndex, Terminal};
 use frankenterm_bidi::Direction;
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -106,42 +106,75 @@ impl MirrorCell {
         }
     }
 
-    pub fn col(&self) -> usize { self.col }
-    pub fn width(&self) -> usize { self.width }
-    pub fn fg(&self) -> MirrorColor { self.fg }
-    pub fn bg(&self) -> MirrorColor { self.bg }
-    pub fn underline_color(&self) -> MirrorColor { self.underline_color }
+    pub fn col(&self) -> usize {
+        self.col
+    }
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    pub fn fg(&self) -> MirrorColor {
+        self.fg
+    }
+    pub fn bg(&self) -> MirrorColor {
+        self.bg
+    }
+    pub fn underline_color(&self) -> MirrorColor {
+        self.underline_color
+    }
     pub fn intensity(&self) -> Intensity {
         match (self.flags >> INTENSITY_SHIFT) & 3 {
-            1 => Intensity::Bold, 2 => Intensity::Half, _ => Intensity::Normal,
+            1 => Intensity::Bold,
+            2 => Intensity::Half,
+            _ => Intensity::Normal,
         }
     }
     pub fn underline(&self) -> Underline {
         match (self.flags >> UNDERLINE_SHIFT) & 7 {
-            1 => Underline::Single, 2 => Underline::Double, 3 => Underline::Curly,
-            4 => Underline::Dotted, 5 => Underline::Dashed, _ => Underline::None,
+            1 => Underline::Single,
+            2 => Underline::Double,
+            3 => Underline::Curly,
+            4 => Underline::Dotted,
+            5 => Underline::Dashed,
+            _ => Underline::None,
         }
     }
     pub fn blink(&self) -> Blink {
         match (self.flags >> BLINK_SHIFT) & 3 {
-            1 => Blink::Slow, 2 => Blink::Rapid, _ => Blink::None,
+            1 => Blink::Slow,
+            2 => Blink::Rapid,
+            _ => Blink::None,
         }
     }
-    pub fn italic(&self) -> bool { self.flags & ITALIC != 0 }
-    pub fn reverse(&self) -> bool { self.flags & REVERSE != 0 }
-    pub fn strikethrough(&self) -> bool { self.flags & STRIKETHROUGH != 0 }
-    pub fn invisible(&self) -> bool { self.flags & INVISIBLE != 0 }
-    pub fn overline(&self) -> bool { self.flags & OVERLINE != 0 }
+    pub fn italic(&self) -> bool {
+        self.flags & ITALIC != 0
+    }
+    pub fn reverse(&self) -> bool {
+        self.flags & REVERSE != 0
+    }
+    pub fn strikethrough(&self) -> bool {
+        self.flags & STRIKETHROUGH != 0
+    }
+    pub fn invisible(&self) -> bool {
+        self.flags & INVISIBLE != 0
+    }
+    pub fn overline(&self) -> bool {
+        self.flags & OVERLINE != 0
+    }
     pub fn vertical_align(&self) -> VerticalAlign {
         match (self.flags >> VALIGN_SHIFT) & 3 {
-            1 => VerticalAlign::SuperScript, 2 => VerticalAlign::SubScript,
+            1 => VerticalAlign::SuperScript,
+            2 => VerticalAlign::SubScript,
             _ => VerticalAlign::BaseLine,
         }
     }
-    pub fn has_image(&self) -> bool { self.flags & IMAGE != 0 }
+    pub fn has_image(&self) -> bool {
+        self.flags & IMAGE != 0
+    }
     pub fn semantic_type(&self) -> SemanticType {
         match (self.flags >> SEMANTIC_SHIFT) & 3 {
-            1 => SemanticType::Input, 2 => SemanticType::Prompt, _ => SemanticType::Output,
+            1 => SemanticType::Input,
+            2 => SemanticType::Prompt,
+            _ => SemanticType::Output,
         }
     }
 
@@ -152,11 +185,16 @@ impl MirrorCell {
             | ((attrs.vertical_align() as u32) << VALIGN_SHIFT)
             | ((attrs.semantic_type() as u32) << SEMANTIC_SHIFT);
         for (set, bit) in [
-            (attrs.italic(), ITALIC), (attrs.reverse(), REVERSE),
-            (attrs.strikethrough(), STRIKETHROUGH), (attrs.invisible(), INVISIBLE),
-            (attrs.overline(), OVERLINE), (attrs.has_image_attachments(), IMAGE),
+            (attrs.italic(), ITALIC),
+            (attrs.reverse(), REVERSE),
+            (attrs.strikethrough(), STRIKETHROUGH),
+            (attrs.invisible(), INVISIBLE),
+            (attrs.overline(), OVERLINE),
+            (attrs.has_image_attachments(), IMAGE),
         ] {
-            if set { flags |= bit; }
+            if set {
+                flags |= bit;
+            }
         }
         flags
     }
@@ -183,8 +221,14 @@ pub struct MirrorRow {
 impl MirrorRow {
     pub fn empty(stable: StableRowIndex, generation: u64) -> Self {
         Self {
-            stable, seqno: SEQ_ZERO, generation, cells: Vec::new(), text: String::new(),
-            links: Vec::new(), has_images: false, images: Vec::new(),
+            stable,
+            seqno: SEQ_ZERO,
+            generation,
+            cells: Vec::new(),
+            text: String::new(),
+            links: Vec::new(),
+            has_images: false,
+            images: Vec::new(),
         }
     }
 
@@ -200,7 +244,9 @@ impl MirrorRow {
             let link = match cell.attrs().hyperlink() {
                 None => 0,
                 Some(link) => {
-                    let index = row.links.iter()
+                    let index = row
+                        .links
+                        .iter()
                         .position(|known| Arc::ptr_eq(known, link) || **known == **link)
                         .unwrap_or_else(|| {
                             row.links.push(Arc::clone(link));
@@ -213,43 +259,74 @@ impl MirrorRow {
             row.text.push_str(cell.str());
             row.has_images |= converted.has_image();
             if let Some(images) = cell.attrs().images() {
-                row.images.extend(images.into_iter().map(|image| MirrorImage {
-                    col: cell.cell_index(), image,
-                }));
+                row.images
+                    .extend(images.into_iter().map(|image| MirrorImage {
+                        col: cell.cell_index(),
+                        image,
+                    }));
             }
             row.cells.push(converted);
         }
         row
     }
 
-    pub fn stable(&self) -> StableRowIndex { self.stable }
-    pub fn seqno(&self) -> SequenceNo { self.seqno }
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn cells(&self) -> &[MirrorCell] { &self.cells }
-    pub fn all_text(&self) -> &str { &self.text }
-    pub fn hyperlinks(&self) -> &[Arc<Hyperlink>] { &self.links }
-    pub fn has_images(&self) -> bool { self.has_images }
-    pub fn images(&self) -> &[MirrorImage] { &self.images }
-    pub fn always_recapture(&self) -> bool { self.has_images }
+    pub fn stable(&self) -> StableRowIndex {
+        self.stable
+    }
+    pub fn seqno(&self) -> SequenceNo {
+        self.seqno
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn cells(&self) -> &[MirrorCell] {
+        &self.cells
+    }
+    pub fn all_text(&self) -> &str {
+        &self.text
+    }
+    pub fn hyperlinks(&self) -> &[Arc<Hyperlink>] {
+        &self.links
+    }
+    pub fn has_images(&self) -> bool {
+        self.has_images
+    }
+    pub fn images(&self) -> &[MirrorImage] {
+        &self.images
+    }
+    pub fn always_recapture(&self) -> bool {
+        self.has_images
+    }
 
     pub fn text(&self, cell: &MirrorCell) -> &str {
-        cell.text_start.checked_add(cell.text_len)
-            .and_then(|end| self.text.get(cell.text_start..end)).unwrap_or("")
+        cell.text_start
+            .checked_add(cell.text_len)
+            .and_then(|end| self.text.get(cell.text_start..end))
+            .unwrap_or("")
     }
 
     pub fn hyperlink(&self, cell: &MirrorCell) -> Option<&Arc<Hyperlink>> {
-        cell.link.checked_sub(1).and_then(|index| self.links.get(index))
+        cell.link
+            .checked_sub(1)
+            .and_then(|index| self.links.get(index))
     }
 
     /// Rebuild attributes used by the existing desktop shaping path. Image
     /// payloads remain in the separate image list; wrapped state is not a style.
     pub fn cell_attributes(&self, cell: &MirrorCell) -> CellAttributes {
         let mut attrs = CellAttributes::default();
-        attrs.set_intensity(cell.intensity()).set_underline(cell.underline())
-            .set_blink(cell.blink()).set_italic(cell.italic()).set_reverse(cell.reverse())
-            .set_strikethrough(cell.strikethrough()).set_invisible(cell.invisible())
-            .set_overline(cell.overline()).set_semantic_type(cell.semantic_type())
-            .set_vertical_align(cell.vertical_align()).set_foreground(cell.fg().to_attribute())
+        attrs
+            .set_intensity(cell.intensity())
+            .set_underline(cell.underline())
+            .set_blink(cell.blink())
+            .set_italic(cell.italic())
+            .set_reverse(cell.reverse())
+            .set_strikethrough(cell.strikethrough())
+            .set_invisible(cell.invisible())
+            .set_overline(cell.overline())
+            .set_semantic_type(cell.semantic_type())
+            .set_vertical_align(cell.vertical_align())
+            .set_foreground(cell.fg().to_attribute())
             .set_background(cell.bg().to_attribute());
         if cell.underline_color() != MirrorColor::Default {
             attrs.set_underline_color(cell.underline_color().to_attribute());
@@ -261,20 +338,40 @@ impl MirrorRow {
     }
 
     pub fn clusters(&self) -> Vec<CellCluster> {
-        let attrs: Vec<_> = self.cells.iter().map(|cell| self.cell_attributes(cell)).collect();
-        let len = self.cells.last().map_or(0, |cell| cell.col() + cell.width());
-        CellCluster::make_cluster(len, self.cells.iter().zip(&attrs).map(|(cell, attrs)| {
-            CellRef::ClusterRef {
-                cell_index: cell.col(), text: self.text(cell), width: cell.width(), attrs,
-            }
-        }), None)
+        let attrs: Vec<_> = self
+            .cells
+            .iter()
+            .map(|cell| self.cell_attributes(cell))
+            .collect();
+        let len = self
+            .cells
+            .last()
+            .map_or(0, |cell| cell.col() + cell.width());
+        CellCluster::make_cluster(
+            len,
+            self.cells
+                .iter()
+                .zip(&attrs)
+                .map(|(cell, attrs)| CellRef::ClusterRef {
+                    cell_index: cell.col(),
+                    text: self.text(cell),
+                    width: cell.width(),
+                    attrs,
+                }),
+            None,
+        )
     }
 
     pub fn to_line(&self) -> Line {
         let mut line = Line::new(self.seqno);
         for cell in &self.cells {
-            line.set_cell_grapheme(cell.col(), self.text(cell), cell.width(),
-                self.cell_attributes(cell), self.seqno);
+            line.set_cell_grapheme(
+                cell.col(),
+                self.text(cell),
+                cell.width(),
+                self.cell_attributes(cell),
+                self.seqno,
+            );
         }
         line
     }
@@ -319,9 +416,14 @@ pub struct RenderFrameLimits {
 impl Default for RenderFrameLimits {
     fn default() -> Self {
         Self {
-            max_rows: 512, max_cols: 512, max_cells: 65_536,
-            max_text_bytes: 1024 * 1024, max_grapheme_bytes: 4096,
-            max_links: 4096, max_uri_bytes: 4096, max_frame_bytes: 8 * 1024 * 1024,
+            max_rows: 512,
+            max_cols: 512,
+            max_cells: 65_536,
+            max_text_bytes: 1024 * 1024,
+            max_grapheme_bytes: 4096,
+            max_links: 4096,
+            max_uri_bytes: 4096,
+            max_frame_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -389,7 +491,10 @@ fn safe_text(text: &str) -> bool {
 /// Count borrowed semantic cells before copying any text, hyperlink or image
 /// metadata. `attrs.images()` allocates; this path deliberately never calls it.
 fn count_frame(
-    lines: &[&Line], cols: usize, sequence: SequenceNo, limits: RenderFrameLimits,
+    lines: &[&Line],
+    cols: usize,
+    sequence: SequenceNo,
+    limits: RenderFrameLimits,
 ) -> Result<FrameCounts, RenderFrameError> {
     let mut counts = FrameCounts::default();
     for line in lines {
@@ -397,7 +502,8 @@ fn count_frame(
             return Err(RenderFrameError::InvalidWitness);
         }
         let (bidi_enabled, direction) = line.bidi_info();
-        if !line.is_single_width() || bidi_enabled
+        if !line.is_single_width()
+            || bidi_enabled
             || direction.direction() != Direction::LeftToRight
         {
             return Err(RenderFrameError::UnsupportedLineMode);
@@ -420,9 +526,12 @@ fn count_frame(
                 return Err(RenderFrameError::UnsupportedImage);
             }
             let flags = MirrorCell::flags_of(attrs);
-            if flags & !0x1_bfff != 0 || (flags & 3) > 2
-                || ((flags >> 2) & 7) > 5 || ((flags >> 5) & 3) > 2
-                || ((flags >> 12) & 3) > 2 || ((flags >> 15) & 3) > 2
+            if flags & !0x1_bfff != 0
+                || (flags & 3) > 2
+                || ((flags >> 2) & 7) > 5
+                || ((flags >> 5) & 3) > 2
+                || ((flags >> 12) & 3) > 2
+                || ((flags >> 15) & 3) > 2
             {
                 return Err(RenderFrameError::UnsupportedAttributes);
             }
@@ -439,7 +548,8 @@ fn count_frame(
                 counts.links = checked_add(counts.links, 1)?;
                 counts.uris = checked_add(counts.uris, uri.len())?;
             }
-            if counts.cells > limits.max_cells || counts.links > limits.max_links
+            if counts.cells > limits.max_cells
+                || counts.links > limits.max_links
                 || checked_add(counts.text, counts.uris)? > limits.max_text_bytes
             {
                 return Err(RenderFrameError::Capacity);
@@ -459,7 +569,11 @@ fn put_i64(bytes: &mut [u8], at: usize, value: i64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 fn put_count(bytes: &mut [u8], at: usize, value: usize) -> Result<(), RenderFrameError> {
-    put_u32(bytes, at, u32::try_from(value).map_err(|_| RenderFrameError::Capacity)?);
+    put_u32(
+        bytes,
+        at,
+        u32::try_from(value).map_err(|_| RenderFrameError::Capacity)?,
+    );
     Ok(())
 }
 fn put_color(bytes: &mut [u8], at: usize, color: MirrorColor) {
@@ -520,9 +634,16 @@ pub fn capture_terminal_frame(
     limits: RenderFrameLimits,
 ) -> Result<Vec<u8>, RenderFrameError> {
     let limits = limits.validate()?;
-    if witness.channel_id == [0; 16] || witness.transport_id == [0; 16]
-        || [witness.route_revision, witness.geometry_revision, witness.palette_revision,
-            witness.font_revision, witness.frame_revision].contains(&0)
+    if witness.channel_id == [0; 16]
+        || witness.transport_id == [0; 16]
+        || [
+            witness.route_revision,
+            witness.geometry_revision,
+            witness.palette_revision,
+            witness.font_revision,
+            witness.frame_revision,
+        ]
+        .contains(&0)
     {
         return Err(RenderFrameError::InvalidWitness);
     }
@@ -532,17 +653,22 @@ pub fn capture_terminal_frame(
     }
     let rows = screen.physical_rows;
     let cols = screen.physical_cols;
-    if rows == 0 || cols == 0 || rows > limits.max_rows || cols > limits.max_cols
+    if rows == 0
+        || cols == 0
+        || rows > limits.max_rows
+        || cols > limits.max_cols
         || checked_mul(rows, cols)? > limits.max_cells
     {
         return Err(RenderFrameError::InvalidGeometry);
     }
     let sequence = term.current_seqno();
-    if sequence == SequenceNo::MAX { return Err(RenderFrameError::SequenceExhausted); }
+    if sequence == SequenceNo::MAX {
+        return Err(RenderFrameError::SequenceExhausted);
+    }
     let live_first = screen.visible_row_to_stable_row(0);
     let first = viewport_top.unwrap_or(live_first);
-    let end = first.checked_add(StableRowIndex::try_from(rows)
-        .map_err(|_| RenderFrameError::InvalidGeometry)?)
+    let end = first
+        .checked_add(StableRowIndex::try_from(rows).map_err(|_| RenderFrameError::InvalidGeometry)?)
         .ok_or(RenderFrameError::InvalidGeometry)?;
     if first < screen.phys_to_stable_row_index(0) || first > live_first {
         return Err(RenderFrameError::UnresidentViewport);
@@ -552,74 +678,141 @@ pub fn capture_terminal_frame(
         return Err(RenderFrameError::UnresidentViewport);
     }
     let cursor = term.cursor_pos();
-    if cursor.x >= cols || cursor.y < 0 || usize::try_from(cursor.y).ok().is_none_or(|y| y >= rows) {
+    if cursor.x >= cols || cursor.y < 0 || usize::try_from(cursor.y).ok().is_none_or(|y| y >= rows)
+    {
         return Err(RenderFrameError::InvalidGeometry);
     }
     let cursor_stable = screen.visible_row_to_stable_row(cursor.y);
-    let cursor_width = screen.phys_line(screen.phys_row(cursor.y)).get_cell(cursor.x)
+    let cursor_width = screen
+        .phys_line(screen.phys_row(cursor.y))
+        .get_cell(cursor.x)
         .map_or(1, |cell| cell.width().clamp(1, 2).min(cols - cursor.x));
     let mut captured = Err(RenderFrameError::UnresidentViewport);
     // For admitted Legacy storage, with_phys_lines allocates only a bounded
     // rows-sized array of borrowed references; all variable cell/text/image
     // copying is after count_frame. Page's lazy views were rejected above.
     screen.with_phys_lines(physical, |lines| {
-        captured = encode_frame(term, witness, first, cursor_stable, cursor_width, lines, limits);
+        captured = encode_frame(
+            term,
+            witness,
+            first,
+            cursor_stable,
+            cursor_width,
+            lines,
+            limits,
+        );
     });
     captured
 }
 
 fn encode_frame(
-    term: &Terminal, witness: RenderFrameWitness, first: StableRowIndex,
-    cursor_stable: StableRowIndex, cursor_width: usize,
-    lines: &[&Line], limits: RenderFrameLimits,
+    term: &Terminal,
+    witness: RenderFrameWitness,
+    first: StableRowIndex,
+    cursor_stable: StableRowIndex,
+    cursor_width: usize,
+    lines: &[&Line],
+    limits: RenderFrameLimits,
 ) -> Result<Vec<u8>, RenderFrameError> {
     let rows = term.screen().physical_rows;
     let cols = term.screen().physical_cols;
-    if lines.len() != rows { return Err(RenderFrameError::UnresidentViewport); }
+    if lines.len() != rows {
+        return Err(RenderFrameError::UnresidentViewport);
+    }
     let counts = count_frame(lines, cols, term.current_seqno(), limits)?;
     let rows_at = RENDER_FRAME_HEADER_BYTES;
     let cells_at = checked_add(rows_at, checked_mul(rows, RENDER_FRAME_ROW_BYTES)?)?;
-    let links_at = checked_add(cells_at, checked_mul(counts.cells, RENDER_FRAME_CELL_BYTES)?)?;
-    let text_at = checked_add(links_at, checked_mul(counts.links, RENDER_FRAME_LINK_BYTES)?)?;
+    let links_at = checked_add(
+        cells_at,
+        checked_mul(counts.cells, RENDER_FRAME_CELL_BYTES)?,
+    )?;
+    let text_at = checked_add(
+        links_at,
+        checked_mul(counts.links, RENDER_FRAME_LINK_BYTES)?,
+    )?;
     let text_bytes = checked_add(counts.text, counts.uris)?;
     let palette_at = checked_add(text_at, text_bytes)?;
     let total = checked_add(palette_at, RENDER_FRAME_PALETTE_COLORS * 4)?;
-    if total > limits.max_frame_bytes { return Err(RenderFrameError::Capacity); }
+    if total > limits.max_frame_bytes {
+        return Err(RenderFrameError::Capacity);
+    }
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(total).map_err(|_| RenderFrameError::Allocation)?;
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| RenderFrameError::Allocation)?;
     bytes.resize(total, 0);
     bytes[0..4].copy_from_slice(b"FTSF");
     bytes[4..6].copy_from_slice(&RENDER_FRAME_VERSION.to_le_bytes());
     bytes[6..8].copy_from_slice(&(RENDER_FRAME_HEADER_BYTES as u16).to_le_bytes());
     put_count(&mut bytes, 8, total)?;
-    let flags = 1 | if term.get_reverse_video() { 2 } else { 0 }
+    let flags = 1
+        | if term.get_reverse_video() { 2 } else { 0 }
         | if term.is_alt_screen_active() { 4 } else { 0 }
         | if term.synchronized_output() { 8 } else { 0 };
     put_u32(&mut bytes, 12, flags);
     bytes[16..32].copy_from_slice(&witness.channel_id);
     bytes[32..48].copy_from_slice(&witness.transport_id);
     put_u64(&mut bytes, 48, witness.route_revision);
-    put_u64(&mut bytes, 56, u64::try_from(term.current_seqno()).map_err(|_| RenderFrameError::Capacity)?);
-    for (at, value) in [(64, witness.geometry_revision), (72, witness.palette_revision),
-        (80, witness.font_revision), (88, witness.frame_revision)] {
+    put_u64(
+        &mut bytes,
+        56,
+        u64::try_from(term.current_seqno()).map_err(|_| RenderFrameError::Capacity)?,
+    );
+    for (at, value) in [
+        (64, witness.geometry_revision),
+        (72, witness.palette_revision),
+        (80, witness.font_revision),
+        (88, witness.frame_revision),
+    ] {
         put_u64(&mut bytes, at, value);
     }
-    for (at, value) in [(96, rows), (100, cols), (128, rows), (132, counts.cells),
-        (136, text_bytes), (140, rows_at), (144, cells_at), (148, text_at),
-        (152, palette_at), (156, RENDER_FRAME_PALETTE_COLORS), (160, counts.links),
-        (164, links_at), (172, cursor_width)] {
+    for (at, value) in [
+        (96, rows),
+        (100, cols),
+        (128, rows),
+        (132, counts.cells),
+        (136, text_bytes),
+        (140, rows_at),
+        (144, cells_at),
+        (148, text_at),
+        (152, palette_at),
+        (156, RENDER_FRAME_PALETTE_COLORS),
+        (160, counts.links),
+        (164, links_at),
+        (172, cursor_width),
+    ] {
         put_count(&mut bytes, at, value)?;
     }
-    put_i64(&mut bytes, 104, i64::try_from(first).map_err(|_| RenderFrameError::InvalidGeometry)?);
-    put_i64(&mut bytes, 112, i64::try_from(cursor_stable).map_err(|_| RenderFrameError::InvalidGeometry)?);
+    put_i64(
+        &mut bytes,
+        104,
+        i64::try_from(first).map_err(|_| RenderFrameError::InvalidGeometry)?,
+    );
+    put_i64(
+        &mut bytes,
+        112,
+        i64::try_from(cursor_stable).map_err(|_| RenderFrameError::InvalidGeometry)?,
+    );
     let cursor = term.cursor_pos();
     put_count(&mut bytes, 120, cursor.x)?;
-    put_u32(&mut bytes, 124, match cursor.shape {
-        CursorShape::Default => 0, CursorShape::BlinkingBlock => 1, CursorShape::SteadyBlock => 2,
-        CursorShape::BlinkingUnderline => 3, CursorShape::SteadyUnderline => 4,
-        CursorShape::BlinkingBar => 5, CursorShape::SteadyBar => 6,
-    });
-    put_u32(&mut bytes, 168, u32::from(cursor.visibility == CursorVisibility::Visible));
+    put_u32(
+        &mut bytes,
+        124,
+        match cursor.shape {
+            CursorShape::Default => 0,
+            CursorShape::BlinkingBlock => 1,
+            CursorShape::SteadyBlock => 2,
+            CursorShape::BlinkingUnderline => 3,
+            CursorShape::SteadyUnderline => 4,
+            CursorShape::BlinkingBar => 5,
+            CursorShape::SteadyBar => 6,
+        },
+    );
+    put_u32(
+        &mut bytes,
+        168,
+        u32::from(cursor.visibility == CursorVisibility::Visible),
+    );
 
     let mut cell_index = 0;
     let mut text_index = 0;
@@ -627,12 +820,21 @@ fn encode_frame(
     let mut uri_index = counts.text;
     for (row, line) in lines.iter().enumerate() {
         let row_at = rows_at + row * RENDER_FRAME_ROW_BYTES;
-        let stable = first.checked_add(StableRowIndex::try_from(row)
-            .map_err(|_| RenderFrameError::InvalidGeometry)?)
+        let stable = first
+            .checked_add(
+                StableRowIndex::try_from(row).map_err(|_| RenderFrameError::InvalidGeometry)?,
+            )
             .ok_or(RenderFrameError::InvalidGeometry)?;
-        put_i64(&mut bytes, row_at, i64::try_from(stable).map_err(|_| RenderFrameError::InvalidGeometry)?);
-        put_u64(&mut bytes, row_at + 8,
-            u64::try_from(line.current_seqno()).map_err(|_| RenderFrameError::Capacity)?);
+        put_i64(
+            &mut bytes,
+            row_at,
+            i64::try_from(stable).map_err(|_| RenderFrameError::InvalidGeometry)?,
+        );
+        put_u64(
+            &mut bytes,
+            row_at + 8,
+            u64::try_from(line.current_seqno()).map_err(|_| RenderFrameError::Capacity)?,
+        );
         put_count(&mut bytes, row_at + 16, cell_index)?;
         let first_cell = cell_index;
         for cell in line.visible_cells() {
@@ -645,12 +847,19 @@ fn encode_frame(
                 uri_index += uri.len();
                 link_index += 1;
                 link_index
-            } else { 0 };
+            } else {
+                0
+            };
             // Exactly the same cell conversion as the desktop MirrorRow.
             let converted = MirrorCell::from_cell(cell, text_index, link);
             let at = cells_at + cell_index * RENDER_FRAME_CELL_BYTES;
-            for (offset, value) in [(0, converted.col), (4, converted.width),
-                (8, converted.text_start), (12, converted.text_len), (44, converted.link)] {
+            for (offset, value) in [
+                (0, converted.col),
+                (4, converted.width),
+                (8, converted.text_start),
+                (12, converted.text_len),
+                (44, converted.link),
+            ] {
                 put_count(&mut bytes, at + offset, value)?;
             }
             put_u32(&mut bytes, at + 16, converted.flags);
@@ -665,9 +874,17 @@ fn encode_frame(
         put_count(&mut bytes, row_at + 20, cell_index - first_cell)?;
     }
     let palette = term.palette();
-    let extras = [palette.foreground, palette.background, palette.cursor_fg, palette.cursor_bg,
-        palette.cursor_border, palette.selection_fg, palette.selection_bg,
-        palette.scrollbar_thumb, palette.split];
+    let extras = [
+        palette.foreground,
+        palette.background,
+        palette.cursor_fg,
+        palette.cursor_bg,
+        palette.cursor_border,
+        palette.selection_fg,
+        palette.selection_bg,
+        palette.scrollbar_thumb,
+        palette.split,
+    ];
     for (index, color) in palette.colors.0.iter().chain(extras.iter()).enumerate() {
         let at = palette_at + index * 4;
         bytes[at..at + 4].copy_from_slice(&rgba8(*color));
@@ -686,21 +903,40 @@ mod tests {
     #[derive(Debug)]
     struct Config;
     impl TerminalConfiguration for Config {
-        fn color_palette(&self) -> ColorPalette { ColorPalette::default() }
-        fn grid_engine(&self) -> GridEngine { GridEngine::Legacy }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn grid_engine(&self) -> GridEngine {
+            GridEngine::Legacy
+        }
     }
 
     fn terminal(rows: usize, cols: usize) -> Terminal {
         Terminal::new_bounded_output(
-            TerminalSize { rows, cols, pixel_width: cols * 8, pixel_height: rows * 16, dpi: 96 },
-            Arc::new(Config), "FrankenTerm", "render-frame-test", BoundedOutputLimits::default(),
-        ).unwrap()
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            },
+            Arc::new(Config),
+            "FrankenTerm",
+            "render-frame-test",
+            BoundedOutputLimits::default(),
+        )
+        .unwrap()
     }
 
     fn witness() -> RenderFrameWitness {
         RenderFrameWitness {
-            channel_id: [0x11; 16], transport_id: [0x22; 16], route_revision: 7,
-            geometry_revision: 3, palette_revision: 5, font_revision: 11, frame_revision: 13,
+            channel_id: [0x11; 16],
+            transport_id: [0x22; 16],
+            route_revision: 7,
+            geometry_revision: 3,
+            palette_revision: 5,
+            font_revision: 11,
+            frame_revision: 13,
         }
     }
 
@@ -720,7 +956,9 @@ mod tests {
     fn i64_at(bytes: &[u8], at: usize) -> i64 {
         i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
     }
-    fn cell_at(bytes: &[u8], index: usize) -> usize { u32_at(bytes, 144) as usize + index * 48 }
+    fn cell_at(bytes: &[u8], index: usize) -> usize {
+        u32_at(bytes, 144) as usize + index * 48
+    }
     fn cell_text(bytes: &[u8], index: usize) -> &str {
         let at = cell_at(bytes, index);
         let start = u32_at(bytes, 148) as usize + u32_at(bytes, at + 8) as usize;
@@ -746,11 +984,25 @@ mod tests {
         assert_eq!(cell_text(&bytes, 0), "A");
         let first = cell_at(&bytes, 0);
         assert_eq!(u32_at(&bytes, first + 16) & 3, 1, "bold");
-        assert_eq!((u32_at(&bytes, first + 20), u32_at(&bytes, first + 24)), (1, 1), "ANSI red");
+        assert_eq!(
+            (u32_at(&bytes, first + 20), u32_at(&bytes, first + 24)),
+            (1, 1),
+            "ANSI red"
+        );
         assert_eq!(cell_text(&bytes, 1), "界");
-        assert_eq!((u32_at(&bytes, cell_at(&bytes, 1)), u32_at(&bytes, cell_at(&bytes, 1) + 4)), (1, 2));
+        assert_eq!(
+            (
+                u32_at(&bytes, cell_at(&bytes, 1)),
+                u32_at(&bytes, cell_at(&bytes, 1) + 4)
+            ),
+            (1, 2)
+        );
         assert_eq!(cell_text(&bytes, 2), "e\u{301}");
-        assert_eq!(u32_at(&bytes, cell_at(&bytes, 2)), 3, "wide spacer is not a cell record");
+        assert_eq!(
+            u32_at(&bytes, cell_at(&bytes, 2)),
+            3,
+            "wide spacer is not a cell record"
+        );
         let row1 = 256 + 24;
         let second_row_first = u32_at(&bytes, row1 + 16) as usize;
         assert_eq!(cell_text(&bytes, second_row_first), "Z");
@@ -759,14 +1011,20 @@ mod tests {
         assert_eq!(&bytes[z + 24..z + 28], &[17, 34, 51, 255]);
         assert_eq!((i64_at(&bytes, 112), u32_at(&bytes, 120)), (1, 1));
         term.advance_bytes("\x1b[2Jreplaced");
-        assert_eq!(cell_text(&bytes, 0), "A", "an acquired frame owns its old text");
+        assert_eq!(
+            cell_text(&bytes, 0),
+            "A",
+            "an acquired frame owns its old text"
+        );
     }
 
     #[test]
     fn arbitrary_utf8_transport_boundaries_use_the_existing_parser() {
         let mut term = terminal(2, 10);
         let text = "A界🦀e\u{301}";
-        for byte in text.as_bytes() { term.advance_bytes([*byte]); }
+        for byte in text.as_bytes() {
+            term.advance_bytes([*byte]);
+        }
         let bytes = frame(&term);
         assert_eq!(cell_text(&bytes, 0), "A");
         assert_eq!(cell_text(&bytes, 1), "界");
@@ -781,12 +1039,17 @@ mod tests {
         let mut line = Line::new(1);
         line.set_cell_grapheme(0, &text, 1, CellAttributes::default(), 1);
         let row = MirrorRow::from_line(0, &line, 1);
-        assert_eq!(row.text(&row.cells()[0]), text, "old mirror truncated after 255 bytes");
+        assert_eq!(
+            row.text(&row.cells()[0]),
+            text,
+            "old mirror truncated after 255 bytes"
+        );
         assert_eq!(row.to_line().get_cell(0).unwrap().str(), text);
         let mut term = terminal(2, 8);
         term.increment_seqno();
         let sequence = term.current_seqno();
-        term.screen_mut().set_cell_grapheme(0, 0, &text, 1, CellAttributes::default(), sequence);
+        term.screen_mut()
+            .set_cell_grapheme(0, 0, &text, 1, CellAttributes::default(), sequence);
         let bytes = frame(&term);
         assert_eq!(cell_text(&bytes, 0), text);
         assert_eq!(u32_at(&bytes, cell_at(&bytes, 0) + 12), 601);
@@ -797,82 +1060,143 @@ mod tests {
         let mut term = terminal(2, 6);
         term.advance_bytes("\x1b]8;;https://example.test/a\x1b\\AB\x1b]8;;\x1b\\");
         let bytes = frame(&term);
-        assert_eq!(u32_at(&bytes, 160), 2, "one bounded URI entry per linked cell");
+        assert_eq!(
+            u32_at(&bytes, 160),
+            2,
+            "one bounded URI entry per linked cell"
+        );
         assert_eq!(u32_at(&bytes, cell_at(&bytes, 0) + 44), 1);
         assert_eq!(u32_at(&bytes, cell_at(&bytes, 1) + 44), 2);
         let links = u32_at(&bytes, 164) as usize;
         let pool = u32_at(&bytes, 148) as usize;
         let uri_start = u32_at(&bytes, links) as usize;
         let uri_len = u32_at(&bytes, links + 4) as usize;
-        assert_eq!(&bytes[pool + uri_start..pool + uri_start + uri_len], b"https://example.test/a");
+        assert_eq!(
+            &bytes[pool + uri_start..pool + uri_start + uri_len],
+            b"https://example.test/a"
+        );
         let last = cell_at(&bytes, u32_at(&bytes, 132) as usize - 1);
-        assert_eq!(uri_start, (u32_at(&bytes, last + 8) + u32_at(&bytes, last + 12)) as usize);
-        let mut limits = RenderFrameLimits::default();
-        limits.max_links = 1;
-        assert_eq!(capture_terminal_frame(&term, witness(), None, limits), Err(RenderFrameError::Capacity));
+        assert_eq!(
+            uri_start,
+            (u32_at(&bytes, last + 8) + u32_at(&bytes, last + 12)) as usize
+        );
+        let limits = RenderFrameLimits {
+            max_links: 1,
+            ..RenderFrameLimits::default()
+        };
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, limits),
+            Err(RenderFrameError::Capacity)
+        );
     }
 
     #[test]
     fn admission_checks_geometry_text_and_total_bytes_without_truncating() {
         let mut term = terminal(2, 10);
         term.advance_bytes("abcdefghij");
-        let mut limits = RenderFrameLimits::default();
-        limits.max_cells = 19;
-        assert_eq!(capture_terminal_frame(&term, witness(), None, limits), Err(RenderFrameError::InvalidGeometry));
+        let mut limits = RenderFrameLimits {
+            max_cells: 19,
+            ..RenderFrameLimits::default()
+        };
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, limits),
+            Err(RenderFrameError::InvalidGeometry)
+        );
         limits = RenderFrameLimits::default();
         limits.max_text_bytes = 5;
-        assert_eq!(capture_terminal_frame(&term, witness(), None, limits), Err(RenderFrameError::Capacity));
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, limits),
+            Err(RenderFrameError::Capacity)
+        );
         limits = RenderFrameLimits::default();
         limits.max_frame_bytes = 256;
-        assert_eq!(capture_terminal_frame(&term, witness(), None, limits), Err(RenderFrameError::Capacity));
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, limits),
+            Err(RenderFrameError::Capacity)
+        );
         let original = frame(&term);
         assert_eq!(cell_text(&original, 0), "a");
         limits = RenderFrameLimits::default();
         limits.max_rows = usize::MAX;
-        assert_eq!(capture_terminal_frame(&term, witness(), None, limits), Err(RenderFrameError::InvalidLimits));
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, limits),
+            Err(RenderFrameError::InvalidLimits)
+        );
     }
 
     #[test]
     fn unsupported_line_modes_and_images_fail_instead_of_changing_semantics() {
         let mut term = terminal(2, 8);
         term.advance_bytes("\x1b#6wide");
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::UnsupportedLineMode));
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::UnsupportedLineMode)
+        );
         let mut term = terminal(2, 8);
         term.increment_seqno();
         let sequence = term.current_seqno();
-        term.screen_mut().line_mut(0).set_bidi_enabled(true, sequence);
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::UnsupportedLineMode));
+        term.screen_mut()
+            .line_mut(0)
+            .set_bidi_enabled(true, sequence);
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::UnsupportedLineMode)
+        );
         let mut term = terminal(2, 8);
         term.increment_seqno();
         let sequence = term.current_seqno();
-        term.screen_mut().line_mut(0).set_direction(Direction::RightToLeft, false, sequence);
-        assert!(!term.screen().phys_line(0).bidi_info().0, "layout direction is independent of bidi");
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::UnsupportedLineMode));
+        term.screen_mut()
+            .line_mut(0)
+            .set_direction(Direction::RightToLeft, false, sequence);
+        assert!(
+            !term.screen().phys_line(0).bidi_info().0,
+            "layout direction is independent of bidi"
+        );
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::UnsupportedLineMode)
+        );
         use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
-        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![255; 4])));
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![255; 4],
+        )));
         let mut attrs = CellAttributes::default();
         attrs.attach_image(Box::new(ImageCell::with_z_index(
-            TextureCoordinate::new_f32(0.0, 0.0), TextureCoordinate::new_f32(1.0, 1.0),
-            image, 0, 0, 0, 0, 0, None, None,
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            image,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
         )));
         let mut term = terminal(2, 8);
         term.increment_seqno();
         let sequence = term.current_seqno();
-        term.screen_mut().set_cell(0, 0, &Cell::new(' ', attrs), sequence);
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::UnsupportedImage));
+        term.screen_mut()
+            .set_cell(0, 0, &Cell::new(' ', attrs), sequence);
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::UnsupportedImage)
+        );
     }
 
     #[test]
     fn future_row_sequences_are_rejected_before_capture() {
         let mut term = terminal(2, 8);
         let future = term.current_seqno() + 1;
-        term.screen_mut().line_mut(0).update_last_change_seqno(future);
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::InvalidWitness));
+        term.screen_mut()
+            .line_mut(0)
+            .update_last_change_seqno(future);
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::InvalidWitness)
+        );
         term.increment_seqno();
         let bytes = frame(&term);
         assert_eq!(u64_at(&bytes, 256 + 8), u64_at(&bytes, 56));
@@ -883,21 +1207,44 @@ mod tests {
         #[derive(Debug)]
         struct PageConfig;
         impl TerminalConfiguration for PageConfig {
-            fn color_palette(&self) -> ColorPalette { ColorPalette::default() }
-            fn grid_engine(&self) -> GridEngine { GridEngine::Page }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> GridEngine {
+                GridEngine::Page
+            }
         }
         let term = Terminal::new_bounded_output(
-            TerminalSize { rows: 2, cols: 8, pixel_width: 64, pixel_height: 32, dpi: 96 },
-            Arc::new(PageConfig), "FrankenTerm", "render-page-test", BoundedOutputLimits::default(),
-        ).unwrap();
+            TerminalSize {
+                rows: 2,
+                cols: 8,
+                pixel_width: 64,
+                pixel_height: 32,
+                dpi: 96,
+            },
+            Arc::new(PageConfig),
+            "FrankenTerm",
+            "render-page-test",
+            BoundedOutputLimits::default(),
+        )
+        .unwrap();
         assert_eq!(GridEngine::default(), GridEngine::Legacy);
         assert_eq!(term.screen().grid_engine(), GridEngine::Page);
-        assert_eq!(capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
-            Err(RenderFrameError::UnsupportedStorage));
-        assert_eq!(term.screen().grid_engine(), GridEngine::Page, "capture must not coerce storage");
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), None, RenderFrameLimits::default()),
+            Err(RenderFrameError::UnsupportedStorage)
+        );
+        assert_eq!(
+            term.screen().grid_engine(),
+            GridEngine::Page,
+            "capture must not coerce storage"
+        );
         let legacy = terminal(2, 8);
         assert_eq!(legacy.screen().grid_engine(), GridEngine::Legacy);
-        assert!(!frame(&legacy).is_empty(), "the default storage remains supported");
+        assert!(
+            !frame(&legacy).is_empty(),
+            "the default storage remains supported"
+        );
     }
 
     #[test]
@@ -911,10 +1258,14 @@ mod tests {
         assert_eq!(term.bounded_output_status().unwrap(), before);
         let mut invalid = witness();
         invalid.geometry_revision = 0;
-        assert_eq!(capture_terminal_frame(&term, invalid, None, RenderFrameLimits::default()),
-            Err(RenderFrameError::InvalidWitness));
-        assert_eq!(capture_terminal_frame(&term, witness(), Some(-1), RenderFrameLimits::default()),
-            Err(RenderFrameError::UnresidentViewport));
+        assert_eq!(
+            capture_terminal_frame(&term, invalid, None, RenderFrameLimits::default()),
+            Err(RenderFrameError::InvalidWitness)
+        );
+        assert_eq!(
+            capture_terminal_frame(&term, witness(), Some(-1), RenderFrameLimits::default()),
+            Err(RenderFrameError::UnresidentViewport)
+        );
     }
 
     #[test]

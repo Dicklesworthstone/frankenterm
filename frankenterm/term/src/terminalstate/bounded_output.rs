@@ -414,7 +414,11 @@ impl BoundedOutputWriter {
         if output.len() < unit.remaining {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        for (destination, source) in output.iter_mut().zip(self.bytes.iter()).take(unit.remaining) {
+        for (destination, source) in output
+            .iter_mut()
+            .zip(self.bytes.iter())
+            .take(unit.remaining)
+        {
             *destination = *source;
         }
         Ok(Some(BoundedReplyCopy {
@@ -444,7 +448,8 @@ impl BoundedOutputWriter {
             BoundedReplyDisposition::Accepted => self.status.accepted_through = sequence,
             BoundedReplyDisposition::Dropped => {
                 self.status.dropped_replies = self.status.dropped_replies.saturating_add(1);
-                self.status.dropped_reply_bytes = self.status.dropped_reply_bytes.saturating_add(bytes as u64);
+                self.status.dropped_reply_bytes =
+                    self.status.dropped_reply_bytes.saturating_add(bytes as u64);
             }
         }
         Ok(())
@@ -619,23 +624,45 @@ mod tests {
         for _ in 0..=writer.bytes.capacity() {
             let before = writer.status();
             let mut refused = [0xa5; 2];
-            assert_eq!(writer.copy_reply(&mut refused).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                writer.copy_reply(&mut refused).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
             assert_eq!(refused, [0xa5; 2]);
             let mut copied = [0; 3];
             let reply = writer.copy_reply(&mut copied).unwrap().unwrap();
             wrapped |= writer.bytes.as_slices().0.len() < reply.bytes;
             assert_eq!(&copied, b"abc");
             assert_eq!(writer.status(), before);
-            assert_eq!(writer.settle_reply(reply.sequence + 1, BoundedReplyDisposition::Accepted).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                writer
+                    .settle_reply(reply.sequence + 1, BoundedReplyDisposition::Accepted)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
             assert_eq!(writer.status(), before);
-            writer.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
-            assert_eq!(writer.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            writer
+                .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+                .unwrap();
+            assert_eq!(
+                writer
+                    .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
             writer.write_all(b"abc").unwrap();
             writer.flush().unwrap();
         }
-        assert!(wrapped, "a complete reply must be copied across both ring slices");
+        assert!(
+            wrapped,
+            "a complete reply must be copied across both ring slices"
+        );
         let reply = writer.copy_reply(&mut [0; 3]).unwrap().unwrap();
-        writer.settle_reply(reply.sequence, BoundedReplyDisposition::Dropped).unwrap();
+        writer
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Dropped)
+            .unwrap();
         assert_eq!(writer.status().dropped_replies, 1);
         assert_eq!(writer.status().dropped_reply_bytes, 3);
         assert_eq!(writer.status().pending_reply_bytes, 3);
@@ -647,12 +674,23 @@ mod tests {
         writer.write_all(b"reply").unwrap();
         writer.flush().unwrap();
         let sequence = writer.status().admitted_through;
-        writer.drain(2, |_, _| BoundedWriteResult::Accepted(2)).unwrap();
+        writer
+            .drain(2, |_, _| BoundedWriteResult::Accepted(2))
+            .unwrap();
         let before = writer.status();
         let mut output = [0xa5; 8];
-        assert_eq!(writer.copy_reply(&mut output).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            writer.copy_reply(&mut output).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(output, [0xa5; 8]);
-        assert_eq!(writer.settle_reply(sequence, BoundedReplyDisposition::Dropped).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            writer
+                .settle_reply(sequence, BoundedReplyDisposition::Dropped)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(writer.status(), before);
         assert_eq!(collect(&mut writer), b"ply");
     }
@@ -666,19 +704,23 @@ mod tests {
         input(&mut writer, b"tail").unwrap();
         let before = writer.status();
         assert_eq!(
-            writer.drain(3, |class, bytes| {
-                assert_eq!(class, WriteClass::UserInput);
-                assert_eq!(bytes, b"abc");
-                BoundedWriteResult::WouldBlock
-            }).unwrap(),
+            writer
+                .drain(3, |class, bytes| {
+                    assert_eq!(class, WriteClass::UserInput);
+                    assert_eq!(bytes, b"abc");
+                    BoundedWriteResult::WouldBlock
+                })
+                .unwrap(),
             BoundedOutputDrain::WouldBlock
         );
         assert_eq!(writer.status(), before);
         assert_eq!(
-            writer.drain(3, |_, bytes| {
-                assert_eq!(bytes, b"abc");
-                BoundedWriteResult::Accepted(2)
-            }).unwrap(),
+            writer
+                .drain(3, |_, bytes| {
+                    assert_eq!(bytes, b"abc");
+                    BoundedWriteResult::Accepted(2)
+                })
+                .unwrap(),
             BoundedOutputDrain::Accepted {
                 sequence: 1,
                 class: WriteClass::UserInput,
@@ -700,14 +742,26 @@ mod tests {
         let mut writer = BoundedOutputWriter::new(BoundedOutputLimits {
             input_units: 1,
             ..limits()
-        }).unwrap();
+        })
+        .unwrap();
         input(&mut writer, b"held").unwrap();
-        assert_eq!(input(&mut writer, b"later").unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        writer.drain(1, |_, _| BoundedWriteResult::Accepted(1)).unwrap();
-        assert_eq!(input(&mut writer, b"later").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            input(&mut writer, b"later").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        writer
+            .drain(1, |_, _| BoundedWriteResult::Accepted(1))
+            .unwrap();
+        assert_eq!(
+            input(&mut writer, b"later").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(collect(&mut writer), b"eld");
         input(&mut writer, &[b'x'; 32]).unwrap();
-        assert_eq!(input(&mut writer, b"y").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            input(&mut writer, b"y").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(collect(&mut writer), [b'x'; 32]);
         input(&mut writer, b"ok").unwrap();
         assert_eq!(collect(&mut writer), b"ok");
@@ -737,8 +791,14 @@ mod tests {
         let mut writer = writer();
         writer.set_class(WriteClass::UserInput);
         writer.write_all(&[b'a'; 30]).unwrap();
-        assert_eq!(writer.write_all(b"too much").unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            writer.write_all(b"too much").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            writer.flush().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(writer.status().pending_input_bytes, 0);
         assert_eq!(writer.status().pending_input_units, 0);
         assert_eq!(collect(&mut writer), b"");
@@ -753,12 +813,18 @@ mod tests {
         input(&mut writer, b"later").unwrap();
         writer.write_all(b"reply").unwrap();
         writer.flush().unwrap();
-        writer.drain(2, |_, _| BoundedWriteResult::Accepted(2)).unwrap();
+        writer
+            .drain(2, |_, _| BoundedWriteResult::Accepted(2))
+            .unwrap();
         let BoundedOutputDrain::Closed(settlement) = writer
             .drain(3, |_, bytes| {
                 assert_eq!(bytes, b"cde");
                 BoundedWriteResult::Failed
-            }).unwrap() else { panic!("failed sink must close"); };
+            })
+            .unwrap()
+        else {
+            panic!("failed sink must close");
+        };
         assert_eq!(settlement.first_remaining_sequence, Some(1));
         assert_eq!(settlement.first_remaining_accepted_prefix, 2);
         assert_eq!(settlement.accepted_through, 0);
@@ -766,9 +832,16 @@ mod tests {
         assert_eq!(settlement.definitely_not_accepted_input_bytes, 6);
         assert_eq!(settlement.definitely_not_accepted_reply_bytes, 5);
         assert_eq!(writer.close(), settlement);
-        assert_eq!(input(&mut writer, b"never").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(writer.drain(1, |_, _| panic!("closed sink must not run")).unwrap(),
-                   BoundedOutputDrain::Closed(settlement));
+        assert_eq!(
+            input(&mut writer, b"never").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            writer
+                .drain(1, |_, _| panic!("closed sink must not run"))
+                .unwrap(),
+            BoundedOutputDrain::Closed(settlement)
+        );
     }
 
     #[test]
@@ -776,8 +849,11 @@ mod tests {
         let mut invalid = writer();
         input(&mut invalid, b"abcdef").unwrap();
         let BoundedOutputDrain::Closed(settlement) = invalid
-            .drain(2, |_, _| BoundedWriteResult::Accepted(3)).unwrap()
-            else { panic!("invalid count must close"); };
+            .drain(2, |_, _| BoundedWriteResult::Accepted(3))
+            .unwrap()
+        else {
+            panic!("invalid count must close");
+        };
         assert_eq!(settlement.uncertain_input_bytes, 2);
         assert_eq!(settlement.definitely_not_accepted_input_bytes, 4);
 
@@ -787,10 +863,14 @@ mod tests {
         // embedding boundary's canonical recoverable-panic contract.
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = panicked.drain(3, |_, _| panic!("sink panic"));
-        })).is_err());
+        }))
+        .is_err());
         let BoundedOutputDrain::Closed(settlement) = panicked
-            .drain(3, |_, _| panic!("uncertain prefix must never be replayed")).unwrap()
-            else { panic!("panicked sink must close"); };
+            .drain(3, |_, _| panic!("uncertain prefix must never be replayed"))
+            .unwrap()
+        else {
+            panic!("panicked sink must close");
+        };
         assert_eq!(settlement.uncertain_input_bytes, 3);
         assert_eq!(settlement.definitely_not_accepted_input_bytes, 3);
     }
@@ -801,23 +881,29 @@ mod tests {
         let capacity = (writer.bytes.capacity(), writer.units.capacity());
         input(&mut writer, b"hold").unwrap();
         for _ in 0..200 {
-            for _ in 0..20 { writer.flush().unwrap(); }
+            for _ in 0..20 {
+                writer.flush().unwrap();
+            }
             input(&mut writer, b"a wrapped ring payload").unwrap();
             let mut prefix = Vec::new();
             while prefix.len() < 4 {
-                writer.drain(4 - prefix.len(), |_, bytes| {
-                    prefix.extend_from_slice(bytes);
-                    BoundedWriteResult::Accepted(bytes.len())
-                }).unwrap();
+                writer
+                    .drain(4 - prefix.len(), |_, bytes| {
+                        prefix.extend_from_slice(bytes);
+                        BoundedWriteResult::Accepted(bytes.len())
+                    })
+                    .unwrap();
             }
             assert_eq!(prefix, b"hold");
             input(&mut writer, b"hold").unwrap();
             let mut payload = Vec::new();
             while payload.len() < 22 {
-                writer.drain(22 - payload.len(), |_, bytes| {
-                    payload.extend_from_slice(bytes);
-                    BoundedWriteResult::Accepted(bytes.len())
-                }).unwrap();
+                writer
+                    .drain(22 - payload.len(), |_, bytes| {
+                        payload.extend_from_slice(bytes);
+                        BoundedWriteResult::Accepted(bytes.len())
+                    })
+                    .unwrap();
             }
             assert_eq!(payload, b"a wrapped ring payload");
             // The ring never becomes empty during this loop, so its front
@@ -837,30 +923,63 @@ mod tests {
         let mut writer = writer();
         input(&mut writer, &[b'x'; 21]).unwrap();
         writer.set_class(WriteClass::UserInput);
-        assert_eq!(writer.paste("ok", true, NewlineCanon::None).unwrap_err().kind(),
-                   io::ErrorKind::WouldBlock);
+        assert_eq!(
+            writer
+                .paste("ok", true, NewlineCanon::None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(collect(&mut writer), [b'x'; 21]);
-        writer.paste("界\r\nx\n", false, NewlineCanon::CarriageReturnAndLineFeed).unwrap();
+        writer
+            .paste("界\r\nx\n", false, NewlineCanon::CarriageReturnAndLineFeed)
+            .unwrap();
         assert_eq!(collect(&mut writer), "界\r\nx\r\n".as_bytes());
-        writer.paste("界\r\nx\n", true, NewlineCanon::CarriageReturnAndLineFeed).unwrap();
-        assert_eq!(collect(&mut writer), "\x1b[200~界\r\nx\n\x1b[201~".as_bytes());
+        writer
+            .paste("界\r\nx\n", true, NewlineCanon::CarriageReturnAndLineFeed)
+            .unwrap();
+        assert_eq!(
+            collect(&mut writer),
+            "\x1b[200~界\r\nx\n\x1b[201~".as_bytes()
+        );
         for text in ["x\x1b[201~bad", "x\u{9b}bad", "x\u{7f}bad", "x\0bad"] {
-            assert_eq!(writer.paste(text, true, NewlineCanon::None).unwrap_err().kind(),
-                       io::ErrorKind::InvalidInput);
+            assert_eq!(
+                writer
+                    .paste(text, true, NewlineCanon::None)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
             assert_eq!(collect(&mut writer), b"");
         }
-        assert_eq!(writer.paste(&"a".repeat(21), true, NewlineCanon::None).unwrap_err().kind(),
-                   io::ErrorKind::InvalidInput);
+        assert_eq!(
+            writer
+                .paste(&"a".repeat(21), true, NewlineCanon::None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(collect(&mut writer), b"");
     }
 
     #[test]
     fn invalid_limits_and_sequence_exhaustion_fail_without_admission() {
-        assert!(BoundedOutputWriter::new(BoundedOutputLimits { input_bytes: usize::MAX, ..limits() }).is_err());
-        assert!(BoundedOutputWriter::new(BoundedOutputLimits { maximum_drain_bytes: 0, ..limits() }).is_err());
+        assert!(BoundedOutputWriter::new(BoundedOutputLimits {
+            input_bytes: usize::MAX,
+            ..limits()
+        })
+        .is_err());
+        assert!(BoundedOutputWriter::new(BoundedOutputLimits {
+            maximum_drain_bytes: 0,
+            ..limits()
+        })
+        .is_err());
         let mut writer = writer();
         writer.status.admitted_through = u64::MAX;
-        assert_eq!(input(&mut writer, b"x").unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            input(&mut writer, b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert_eq!(writer.status().pending_input_bytes, 0);
         assert_eq!(collect(&mut writer), b"");
     }
@@ -868,26 +987,46 @@ mod tests {
     #[derive(Debug)]
     struct Config;
     impl TerminalConfiguration for Config {
-        fn scrollback_size(&self) -> usize { 8 }
-        fn color_palette(&self) -> ColorPalette { ColorPalette::default() }
-        fn canonicalize_pasted_newlines(&self) -> NewlineCanon { NewlineCanon::CarriageReturn }
+        fn scrollback_size(&self) -> usize {
+            8
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn canonicalize_pasted_newlines(&self) -> NewlineCanon {
+            NewlineCanon::CarriageReturn
+        }
     }
 
     fn terminal(limits: BoundedOutputLimits) -> Terminal {
         Terminal::new_bounded_output(
-            TerminalSize { rows: 4, cols: 20, pixel_width: 160, pixel_height: 64, dpi: 96 },
-            Arc::new(Config), "FrankenTerm", "test", limits,
-        ).unwrap()
+            TerminalSize {
+                rows: 4,
+                cols: 20,
+                pixel_width: 160,
+                pixel_height: 64,
+                dpi: 96,
+            },
+            Arc::new(Config),
+            "FrankenTerm",
+            "test",
+            limits,
+        )
+        .unwrap()
     }
 
     fn collect_terminal(terminal: &mut Terminal) -> Vec<u8> {
         let mut output = Vec::new();
         loop {
-            let result = terminal.drain_bounded_output(4096, |_, bytes| {
-                output.extend_from_slice(bytes);
-                BoundedWriteResult::Accepted(bytes.len())
-            }).unwrap();
-            if result == BoundedOutputDrain::Idle { break; }
+            let result = terminal
+                .drain_bounded_output(4096, |_, bytes| {
+                    output.extend_from_slice(bytes);
+                    BoundedWriteResult::Accepted(bytes.len())
+                })
+                .unwrap();
+            if result == BoundedOutputDrain::Idle {
+                break;
+            }
             assert!(matches!(result, BoundedOutputDrain::Accepted { .. }));
         }
         output
@@ -898,19 +1037,34 @@ mod tests {
         let mut terminal = terminal(limits());
         assert_eq!(terminal.writer.capacity(), 0);
         terminal.advance_bytes(b"hello\x1b[5n\x1b[?1h");
-        terminal.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+        terminal
+            .key_down(KeyCode::UpArrow, KeyModifiers::NONE)
+            .unwrap();
         terminal.send_paste("a\r\nb\n").unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"\x1b[0n\x1bOAa\rb\r");
-        assert_eq!(terminal.bounded_output_status().unwrap().accepted_through, 3);
-        assert_eq!(terminal.writer_barrier().wait(std::time::Duration::ZERO).unwrap_err().kind(),
-                   io::ErrorKind::Unsupported);
+        assert_eq!(
+            terminal.bounded_output_status().unwrap().accepted_through,
+            3
+        );
+        assert_eq!(
+            terminal
+                .writer_barrier()
+                .wait(std::time::Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[test]
     fn canonical_reply_flood_stays_bounded_and_never_starves_user_input() {
         let mut terminal = terminal(limits());
-        for _ in 0..100 { terminal.advance_bytes(b"\x1b[5n"); }
-        terminal.key_down(KeyCode::Char('x'), KeyModifiers::NONE).unwrap();
+        for _ in 0..100 {
+            terminal.advance_bytes(b"\x1b[5n");
+        }
+        terminal
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .unwrap();
         let status = terminal.bounded_output_status().unwrap();
         assert_eq!(status.pending_reply_bytes, 8);
         assert_eq!(status.pending_reply_units, 2);
@@ -926,11 +1080,15 @@ mod tests {
         assert!(terminal.send_paste("ok").is_err());
         assert_eq!(collect_terminal(&mut terminal), [b'x'; 21]);
         terminal.send_paste("ok").unwrap();
-        terminal.key_down(KeyCode::Char('!'), KeyModifiers::NONE).unwrap();
+        terminal
+            .key_down(KeyCode::Char('!'), KeyModifiers::NONE)
+            .unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"\x1b[200~ok\x1b[201~!");
         terminal.close_bounded_output().unwrap();
         assert!(terminal.send_paste("never").is_err());
-        assert!(terminal.key_down(KeyCode::Char('x'), KeyModifiers::NONE).is_err());
+        assert!(terminal
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_err());
     }
 
     fn mouse(kind: MouseEventKind, button: MouseButton) -> MouseEvent {
@@ -956,10 +1114,17 @@ mod tests {
         terminal.advance_bytes(b"\x1b[?1049h");
         // Default wheel speed emits three cursor keys (nine bytes). Earlier
         // flushes must not publish a prefix before the third key is refused.
-        assert!(terminal.mouse_event(mouse(MouseEventKind::Press, MouseButton::WheelUp(1))).is_err());
+        assert!(terminal
+            .mouse_event(mouse(MouseEventKind::Press, MouseButton::WheelUp(1)))
+            .is_err());
         assert_eq!(collect_terminal(&mut terminal), b"");
-        assert_eq!(terminal.bounded_output_status().unwrap().admitted_through, 0);
-        terminal.key_down(KeyCode::Char('x'), KeyModifiers::NONE).unwrap();
+        assert_eq!(
+            terminal.bounded_output_status().unwrap().admitted_through,
+            0
+        );
+        terminal
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"x");
     }
 
@@ -968,25 +1133,37 @@ mod tests {
         let mut terminal = terminal(limits());
         terminal.advance_bytes(b"\x1b[?1003h\x1b[?1006h");
         terminal.write_user_input(&[b'x'; 31]).unwrap();
-        assert!(terminal.mouse_event(mouse(MouseEventKind::Press, MouseButton::Left)).is_err());
+        assert!(terminal
+            .mouse_event(mouse(MouseEventKind::Press, MouseButton::Left))
+            .is_err());
         assert!(terminal.current_mouse_buttons.is_empty());
         collect_terminal(&mut terminal);
-        terminal.mouse_event(mouse(MouseEventKind::Press, MouseButton::Left)).unwrap();
+        terminal
+            .mouse_event(mouse(MouseEventKind::Press, MouseButton::Left))
+            .unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"\x1b[<0;2;2M");
 
         terminal.write_user_input(&[b'x'; 31]).unwrap();
-        assert!(terminal.mouse_event(mouse(MouseEventKind::Release, MouseButton::Left)).is_err());
+        assert!(terminal
+            .mouse_event(mouse(MouseEventKind::Release, MouseButton::Left))
+            .is_err());
         assert_eq!(terminal.current_mouse_buttons, vec![MouseButton::Left]);
         collect_terminal(&mut terminal);
-        terminal.mouse_event(mouse(MouseEventKind::Release, MouseButton::Left)).unwrap();
+        terminal
+            .mouse_event(mouse(MouseEventKind::Release, MouseButton::Left))
+            .unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"\x1b[<0;2;2m");
         assert!(terminal.current_mouse_buttons.is_empty());
 
         terminal.write_user_input(&[b'x'; 31]).unwrap();
-        assert!(terminal.mouse_event(mouse(MouseEventKind::Move, MouseButton::None)).is_err());
+        assert!(terminal
+            .mouse_event(mouse(MouseEventKind::Move, MouseButton::None))
+            .is_err());
         assert!(terminal.last_mouse_move.is_none());
         collect_terminal(&mut terminal);
-        terminal.mouse_event(mouse(MouseEventKind::Move, MouseButton::None)).unwrap();
+        terminal
+            .mouse_event(mouse(MouseEventKind::Move, MouseButton::None))
+            .unwrap();
         assert_eq!(collect_terminal(&mut terminal), b"\x1b[<35;2;2M");
     }
 
@@ -996,7 +1173,9 @@ mod tests {
         terminal.advance_bytes(b"\x1b[?1000h\x1b[?1006h\x1b[?1004h");
         terminal.try_bounded_focus_change(true).unwrap();
         collect_terminal(&mut terminal);
-        terminal.mouse_event(mouse(MouseEventKind::Press, MouseButton::Left)).unwrap();
+        terminal
+            .mouse_event(mouse(MouseEventKind::Press, MouseButton::Left))
+            .unwrap();
         collect_terminal(&mut terminal);
         terminal.write_user_input(&[b'x'; 21]).unwrap();
         // The release report fits alone, but release plus focus-out does not.

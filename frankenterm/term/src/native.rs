@@ -8,7 +8,9 @@
 
 use crate::color::ColorPalette;
 use crate::config::{GridEngine, NewlineCanon, Osc52WritePolicy, TerminalFeatureProfile};
-use crate::render::{capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness};
+use crate::render::{
+    capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness,
+};
 use crate::{
     BoundedOutputLimits, BoundedReplyCopy, BoundedReplyDisposition, KeyCode, KeyModifiers,
     StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
@@ -200,7 +202,9 @@ impl NativeTerminal {
         config.validate()?;
         let terminal = Terminal::new_bounded_output_with_parser_limit(
             config.size,
-            Arc::new(NativeConfiguration { scrollback_rows: config.scrollback_rows }),
+            Arc::new(NativeConfiguration {
+                scrollback_rows: config.scrollback_rows,
+            }),
             "FrankenTerm",
             env!("CARGO_PKG_VERSION"),
             BoundedOutputLimits {
@@ -235,7 +239,11 @@ impl NativeTerminal {
     }
 
     fn live(&self) -> Result<(), NativeTerminalError> {
-        if self.closed { Err(NativeTerminalError::Closed) } else { Ok(()) }
+        if self.closed {
+            Err(NativeTerminalError::Closed)
+        } else {
+            Ok(())
+        }
     }
 
     fn can_mutate(&self) -> Result<(), NativeTerminalError> {
@@ -250,16 +258,28 @@ impl NativeTerminal {
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), NativeTerminalError> {
         self.can_mutate()?;
-        if bytes.len() > MAX_FEED_BYTES { return Err(NativeTerminalError::Capacity); }
-        if bytes.is_empty() { return Ok(()); }
-        let palette = self.witness.palette_revision.checked_add(1)
+        if bytes.len() > MAX_FEED_BYTES {
+            return Err(NativeTerminalError::Capacity);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let palette = self
+            .witness
+            .palette_revision
+            .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
-        let dropped_replies = self.terminal.bounded_output_status()
-            .ok_or(NativeTerminalError::Invalid)?.dropped_replies;
+        let dropped_replies = self
+            .terminal
+            .bounded_output_status()
+            .ok_or(NativeTerminalError::Invalid)?
+            .dropped_replies;
         self.terminal.advance_bytes(bytes);
         if self.terminal.cell_grapheme_limit_exceeded()
             || self.terminal.native_execution_limit_exceeded()
-            || self.terminal.bounded_output_status()
+            || self
+                .terminal
+                .bounded_output_status()
                 .is_some_and(|status| status.closed || status.dropped_replies != dropped_replies)
         {
             self.poison();
@@ -275,8 +295,13 @@ impl NativeTerminal {
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), NativeTerminalError> {
         self.can_mutate()?;
         validate_geometry(size, self.config.scrollback_rows)?;
-        if size == self.config.size { return Ok(()); }
-        let revision = self.witness.geometry_revision.checked_add(1)
+        if size == self.config.size {
+            return Ok(());
+        }
+        let revision = self
+            .witness
+            .geometry_revision
+            .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
         self.terminal.resize(size);
         self.config.size = size;
@@ -284,7 +309,9 @@ impl NativeTerminal {
         Ok(())
     }
 
-    pub fn config(&self) -> NativeTerminalConfig { self.config }
+    pub fn config(&self) -> NativeTerminalConfig {
+        self.config
+    }
 
     pub fn set_font_revision(&mut self, revision: u64) -> Result<(), NativeTerminalError> {
         self.live()?;
@@ -312,7 +339,9 @@ impl NativeTerminal {
             return Err(NativeTerminalError::Invalid);
         }
         let key = hardware_key(usage)?;
-        if key.is_none() && characters.is_empty() { return Err(NativeTerminalError::Unsupported); }
+        if key.is_none() && characters.is_empty() {
+            return Err(NativeTerminalError::Unsupported);
+        }
         let mods = native_modifiers(modifiers);
         self.copy_encoding(output, |emit| {
             if let Some(key) = key {
@@ -328,13 +357,17 @@ impl NativeTerminal {
 
     pub fn encode_text(&self, text: &str, output: &mut [u8]) -> Result<usize, NativeTerminalError> {
         self.live()?;
-        if text.len() > MAX_TEXT_BYTES { return Err(NativeTerminalError::Capacity); }
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(NativeTerminalError::Capacity);
+        }
         self.copy_encoding(output, |emit| {
             let mut chars = text.chars().peekable();
             while let Some(character) = chars.next() {
                 let key = match character {
                     '\r' => {
-                        if chars.peek() == Some(&'\n') { chars.next(); }
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
                         KeyCode::Enter
                     }
                     '\n' => KeyCode::Enter,
@@ -354,12 +387,16 @@ impl NativeTerminal {
         emit: &mut dyn FnMut(&str) -> Result<(), NativeTerminalError>,
     ) -> Result<(), NativeTerminalError> {
         if phase != NativeKeyPhase::Up {
-            let encoded = self.terminal.encode_key(key, modifiers, true)
+            let encoded = self
+                .terminal
+                .encode_key(key, modifiers, true)
                 .map_err(|_| NativeTerminalError::Unsupported)?;
             emit(&encoded)?;
         }
         if matches!(phase, NativeKeyPhase::Up | NativeKeyPhase::Press) {
-            let encoded = self.terminal.encode_key(key, modifiers, false)
+            let encoded = self
+                .terminal
+                .encode_key(key, modifiers, false)
                 .map_err(|_| NativeTerminalError::Unsupported)?;
             emit(&encoded)?;
         }
@@ -369,13 +406,21 @@ impl NativeTerminal {
     fn copy_encoding(
         &self,
         output: &mut [u8],
-        encode: impl Fn(&mut dyn FnMut(&str) -> Result<(), NativeTerminalError>) -> Result<(), NativeTerminalError>,
+        encode: impl Fn(
+            &mut dyn FnMut(&str) -> Result<(), NativeTerminalError>,
+        ) -> Result<(), NativeTerminalError>,
     ) -> Result<usize, NativeTerminalError> {
-        if output.len() > MAX_INPUT_BYTES { return Err(NativeTerminalError::Invalid); }
+        if output.len() > MAX_INPUT_BYTES {
+            return Err(NativeTerminalError::Invalid);
+        }
         let mut length = 0usize;
         encode(&mut |part| {
-            length = length.checked_add(part.len()).ok_or(NativeTerminalError::Capacity)?;
-            if length > output.len() { return Err(NativeTerminalError::Capacity); }
+            length = length
+                .checked_add(part.len())
+                .ok_or(NativeTerminalError::Capacity)?;
+            if length > output.len() {
+                return Err(NativeTerminalError::Capacity);
+            }
             Ok(())
         })?;
         let mut offset = 0;
@@ -404,7 +449,11 @@ impl NativeTerminal {
             return Err(NativeTerminalError::Invalid);
         }
         let bracketed = self.terminal.bracketed_paste_enabled();
-        let canon = if bracketed { NewlineCanon::None } else { NewlineCanon::CarriageReturn };
+        let canon = if bracketed {
+            NewlineCanon::None
+        } else {
+            NewlineCanon::CarriageReturn
+        };
         let mut bytes = 0usize;
         canon.for_each_chunk(text, |chunk| bytes += chunk.len());
         if bytes > output.len() || bytes + (if bracketed { 12 } else { 0 }) > MAX_INPUT_BYTES {
@@ -419,10 +468,17 @@ impl NativeTerminal {
         Ok(NativePreparedPaste { bytes, bracketed })
     }
 
-    pub fn copy_reply(&mut self, output: &mut [u8]) -> Result<Option<BoundedReplyCopy>, NativeTerminalError> {
+    pub fn copy_reply(
+        &mut self,
+        output: &mut [u8],
+    ) -> Result<Option<BoundedReplyCopy>, NativeTerminalError> {
         self.live()?;
-        if self.pending_reply.is_some() { return Err(NativeTerminalError::Busy); }
-        if output.len() > MAX_REPLY_BYTES { return Err(NativeTerminalError::Invalid); }
+        if self.pending_reply.is_some() {
+            return Err(NativeTerminalError::Busy);
+        }
+        if output.len() > MAX_REPLY_BYTES {
+            return Err(NativeTerminalError::Invalid);
+        }
         let copied = self.terminal.copy_bounded_reply(output)?;
         self.pending_reply = copied.map(|reply| reply.sequence);
         Ok(copied)
@@ -434,31 +490,48 @@ impl NativeTerminal {
         disposition: BoundedReplyDisposition,
     ) -> Result<(), NativeTerminalError> {
         self.live()?;
-        if self.pending_reply != Some(sequence) { return Err(NativeTerminalError::Stale); }
+        if self.pending_reply != Some(sequence) {
+            return Err(NativeTerminalError::Stale);
+        }
         self.terminal.settle_bounded_reply(sequence, disposition)?;
         self.pending_reply = None;
         Ok(())
     }
 
-    pub fn capture_frame(&mut self, viewport_top: Option<i64>) -> Result<Vec<u8>, NativeTerminalError> {
+    pub fn capture_frame(
+        &mut self,
+        viewport_top: Option<i64>,
+    ) -> Result<Vec<u8>, NativeTerminalError> {
         self.live()?;
-        let revision = self.witness.frame_revision.checked_add(1)
+        let revision = self
+            .witness
+            .frame_revision
+            .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
-        let viewport = viewport_top.map(StableRowIndex::try_from).transpose()
+        let viewport = viewport_top
+            .map(StableRowIndex::try_from)
+            .transpose()
             .map_err(|_| NativeTerminalError::Invalid)?;
         let mut witness = self.witness;
         witness.frame_revision = revision;
-        let frame = capture_terminal_frame(&self.terminal, witness, viewport, RenderFrameLimits {
-            max_grapheme_bytes: MAX_CELL_GRAPHEME_BYTES,
-            max_uri_bytes: 512,
-            ..RenderFrameLimits::default()
-        })?;
+        let frame = capture_terminal_frame(
+            &self.terminal,
+            witness,
+            viewport,
+            RenderFrameLimits {
+                max_grapheme_bytes: MAX_CELL_GRAPHEME_BYTES,
+                max_uri_bytes: 512,
+                ..RenderFrameLimits::default()
+            },
+        )?;
         self.witness = witness;
         Ok(frame)
     }
 
     pub fn close(&mut self) -> Result<(), NativeTerminalError> {
-        if self.pending_reply.is_some() { return Err(NativeTerminalError::Busy); }
+        if self.pending_reply.is_some() {
+            return Err(NativeTerminalError::Busy);
+        }
         self.poison();
         Ok(())
     }
@@ -472,10 +545,18 @@ impl NativeTerminal {
 
 fn native_modifiers(bits: u32) -> KeyModifiers {
     let mut modifiers = KeyModifiers::NONE;
-    if bits & 1 != 0 { modifiers |= KeyModifiers::SHIFT; }
-    if bits & 2 != 0 { modifiers |= KeyModifiers::CTRL; }
-    if bits & 4 != 0 { modifiers |= KeyModifiers::ALT; }
-    if bits & 8 != 0 { modifiers |= KeyModifiers::SUPER; }
+    if bits & 1 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if bits & 2 != 0 {
+        modifiers |= KeyModifiers::CTRL;
+    }
+    if bits & 4 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if bits & 8 != 0 {
+        modifiers |= KeyModifiers::SUPER;
+    }
     // Caps Lock is already reflected in UIKit's layout-resolved characters.
     // The canonical termwiz Modifiers type has no caps-lock protocol flag.
     modifiers
@@ -549,7 +630,11 @@ mod tests {
 
     fn config() -> NativeTerminalConfig {
         NativeTerminalConfig {
-            size: TerminalSize { rows: 3, cols: 12, ..TerminalSize::default() },
+            size: TerminalSize {
+                rows: 3,
+                cols: 12,
+                ..TerminalSize::default()
+            },
             scrollback_rows: 8,
             channel_id: [1; 16],
             transport_id: [2; 16],
@@ -558,7 +643,9 @@ mod tests {
         }
     }
 
-    fn terminal() -> NativeTerminal { NativeTerminal::new(config()).unwrap() }
+    fn terminal() -> NativeTerminal {
+        NativeTerminal::new(config()).unwrap()
+    }
 
     #[test]
     fn pure_canonical_key_encoding_respects_modes_and_preserves_pending_reply() {
@@ -566,19 +653,34 @@ mod tests {
         terminal.feed(b"\x1b[6n").unwrap();
         let before = terminal.terminal.bounded_output_status().unwrap();
         let mut bytes = [0u8; 128];
-        let count = terminal.encode_key(0x52, 0, NativeKeyPhase::Press, "", &mut bytes).unwrap();
+        let count = terminal
+            .encode_key(0x52, 0, NativeKeyPhase::Press, "", &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[A");
         assert_eq!(terminal.terminal.bounded_output_status().unwrap(), before);
         terminal.feed(b"\x1b[?1h").unwrap();
-        let count = terminal.encode_key(0x52, 0, NativeKeyPhase::Down, "", &mut bytes).unwrap();
+        let count = terminal
+            .encode_key(0x52, 0, NativeKeyPhase::Down, "", &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1bOA");
         let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
         assert_eq!(&bytes[..reply.bytes], b"\x1b[1;1R");
-        assert_eq!(terminal.copy_reply(&mut bytes), Err(NativeTerminalError::Busy));
+        assert_eq!(
+            terminal.copy_reply(&mut bytes),
+            Err(NativeTerminalError::Busy)
+        );
         assert_eq!(terminal.close(), Err(NativeTerminalError::Busy));
-        assert_eq!(terminal.settle_reply(reply.sequence + 1, BoundedReplyDisposition::Accepted), Err(NativeTerminalError::Stale));
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
-        assert_eq!(terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted), Err(NativeTerminalError::Stale));
+        assert_eq!(
+            terminal.settle_reply(reply.sequence + 1, BoundedReplyDisposition::Accepted),
+            Err(NativeTerminalError::Stale)
+        );
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
+        assert_eq!(
+            terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted),
+            Err(NativeTerminalError::Stale)
+        );
         assert_eq!(terminal.copy_reply(&mut bytes).unwrap(), None);
     }
 
@@ -588,18 +690,31 @@ mod tests {
         terminal.feed(b"\x1b[>11u\x1b[?u").unwrap();
         let before = terminal.terminal.bounded_output_status().unwrap();
         let mut bytes = [0; 128];
-        let count = terminal.encode_key(0x13, 8, NativeKeyPhase::Down, "p", &mut bytes).unwrap();
+        let count = terminal
+            .encode_key(0x13, 8, NativeKeyPhase::Down, "p", &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[112;9u");
-        let count = terminal.encode_key(0x13, 8, NativeKeyPhase::Up, "p", &mut bytes).unwrap();
+        let count = terminal
+            .encode_key(0x13, 8, NativeKeyPhase::Up, "p", &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[112;9:3u");
-        let count = terminal.encode_key(0x13, 8, NativeKeyPhase::Press, "p", &mut bytes).unwrap();
+        let count = terminal
+            .encode_key(0x13, 8, NativeKeyPhase::Press, "p", &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[112;9u\x1b[112;9:3u");
         assert_eq!(terminal.terminal.bounded_output_status().unwrap(), before);
         let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
         assert_eq!(&bytes[..reply.bytes], b"\x1b[?11u");
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
         terminal.feed(b"\x1b[<u").unwrap();
-        assert_eq!(terminal.encode_key(0x13, 8, NativeKeyPhase::Up, "p", &mut bytes).unwrap(), 0);
+        assert_eq!(
+            terminal
+                .encode_key(0x13, 8, NativeKeyPhase::Up, "p", &mut bytes)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -612,9 +727,19 @@ mod tests {
         let count = terminal.encode_text("a\nb\r\nc", &mut bytes).unwrap();
         assert_eq!(&bytes[..count], b"a\r\nb\r\nc");
         let mut refused = [0xa5; 2];
-        assert_eq!(terminal.encode_text("abc", &mut refused), Err(NativeTerminalError::Capacity));
+        assert_eq!(
+            terminal.encode_text("abc", &mut refused),
+            Err(NativeTerminalError::Capacity)
+        );
         assert_eq!(refused, [0xa5; 2]);
-        assert_eq!(terminal.terminal.bounded_output_status().unwrap().pending_input_bytes, 0);
+        assert_eq!(
+            terminal
+                .terminal
+                .bounded_output_status()
+                .unwrap()
+                .pending_input_bytes,
+            0
+        );
     }
 
     #[test]
@@ -629,9 +754,19 @@ mod tests {
         assert!(prepared.bracketed);
         assert_eq!(&bytes[..prepared.bytes], b"a\r\nb\nc");
         let before = bytes;
-        assert_eq!(terminal.prepare_paste("unsafe\x1b[201~", &mut bytes), Err(NativeTerminalError::Invalid));
+        assert_eq!(
+            terminal.prepare_paste("unsafe\x1b[201~", &mut bytes),
+            Err(NativeTerminalError::Invalid)
+        );
         assert_eq!(bytes, before);
-        assert_eq!(terminal.terminal.bounded_output_status().unwrap().pending_input_bytes, 0);
+        assert_eq!(
+            terminal
+                .terminal
+                .bounded_output_status()
+                .unwrap()
+                .pending_input_bytes,
+            0
+        );
     }
 
     #[test]
@@ -651,10 +786,21 @@ mod tests {
     fn combining_mark_growth_is_bounded_across_feed_calls_and_closes_model() {
         let mut terminal = terminal();
         terminal.feed(b"a").unwrap();
-        for _ in 0..127 { terminal.feed("\u{301}".as_bytes()).unwrap(); }
-        assert_eq!(terminal.feed("\u{301}".as_bytes()), Err(NativeTerminalError::Capacity));
-        assert_eq!(terminal.feed(b"must not resume"), Err(NativeTerminalError::Closed));
-        assert_eq!(terminal.capture_frame(None), Err(NativeTerminalError::Closed));
+        for _ in 0..127 {
+            terminal.feed("\u{301}".as_bytes()).unwrap();
+        }
+        assert_eq!(
+            terminal.feed("\u{301}".as_bytes()),
+            Err(NativeTerminalError::Capacity)
+        );
+        assert_eq!(
+            terminal.feed(b"must not resume"),
+            Err(NativeTerminalError::Closed)
+        );
+        assert_eq!(
+            terminal.capture_frame(None),
+            Err(NativeTerminalError::Closed)
+        );
         terminal.close().unwrap();
         terminal.close().unwrap();
     }
@@ -666,21 +812,39 @@ mod tests {
         // then join that cell without an intervening feed. b has no NFC acute
         // composition, so the resulting 257 UTF-8 bytes exceed the 256 cap.
         let bytes = format!("b{}", "\u{301}".repeat(128));
-        assert_eq!(terminal.feed(bytes.as_bytes()), Err(NativeTerminalError::Capacity));
-        assert_eq!(terminal.capture_frame(None), Err(NativeTerminalError::Closed));
+        assert_eq!(
+            terminal.feed(bytes.as_bytes()),
+            Err(NativeTerminalError::Capacity)
+        );
+        assert_eq!(
+            terminal.capture_frame(None),
+            Err(NativeTerminalError::Closed)
+        );
     }
 
     #[test]
     fn expansive_u32_repeat_is_refused_before_work_and_later_handlers_are_inert() {
         let mut terminal = terminal();
         terminal.feed(b"a").unwrap();
-        assert_eq!(terminal.feed(b"\x1b[4294967295b\nignored\x1b[31m\x1b[6n"),
-            Err(NativeTerminalError::Capacity));
+        assert_eq!(
+            terminal.feed(b"\x1b[4294967295b\nignored\x1b[31m\x1b[6n"),
+            Err(NativeTerminalError::Capacity)
+        );
         assert!(terminal.terminal.native_execution_limit_exceeded());
         assert_eq!(terminal.terminal.cursor_pos().x, 1);
         assert_eq!(terminal.terminal.cursor_pos().y, 0);
-        assert_eq!(terminal.terminal.bounded_output_status().unwrap().admitted_through, 0);
-        assert_eq!(terminal.capture_frame(None), Err(NativeTerminalError::Closed));
+        assert_eq!(
+            terminal
+                .terminal
+                .bounded_output_status()
+                .unwrap()
+                .admitted_through,
+            0
+        );
+        assert_eq!(
+            terminal.capture_frame(None),
+            Err(NativeTerminalError::Closed)
+        );
         assert_eq!(terminal.feed(b"retry"), Err(NativeTerminalError::Closed));
     }
 
@@ -688,7 +852,10 @@ mod tests {
     fn reverse_wrap_count_cannot_hold_the_native_registry_for_u32_iterations() {
         let mut terminal = terminal();
         terminal.feed(b"\x1b[?45h").unwrap();
-        assert_eq!(terminal.feed(b"\x1b[4294967295D"), Err(NativeTerminalError::Capacity));
+        assert_eq!(
+            terminal.feed(b"\x1b[4294967295D"),
+            Err(NativeTerminalError::Capacity)
+        );
         assert_eq!(terminal.terminal.cursor_pos().x, 0);
         assert_eq!(terminal.terminal.cursor_pos().y, 0);
         assert!(terminal.terminal.native_execution_limit_exceeded());
@@ -702,7 +869,10 @@ mod tests {
         assert!(separate.capture_frame(None).is_ok());
 
         let mut combined = terminal();
-        assert_eq!(combined.feed(b"a\x1b[4096b\x1b[4096b"), Err(NativeTerminalError::Capacity));
+        assert_eq!(
+            combined.feed(b"a\x1b[4096b\x1b[4096b"),
+            Err(NativeTerminalError::Capacity)
+        );
         assert!(combined.terminal.native_execution_limit_exceeded());
     }
 
@@ -710,9 +880,17 @@ mod tests {
     fn idempotent_u32_insert_tab_and_keyboard_pop_match_geometry_bounded_execution() {
         let mut huge = terminal();
         let mut bounded = terminal();
-        huge.feed(b"abcdef\x1b[1G\x1b[4294967295@\x1b[4294967295I\x1b[4294967295Z\x1b[<4294967295u").unwrap();
-        bounded.feed(b"abcdef\x1b[1G\x1b[12@\x1b[12I\x1b[12Z\x1b[<128u").unwrap();
-        assert_eq!(huge.capture_frame(None).unwrap(), bounded.capture_frame(None).unwrap());
+        huge.feed(
+            b"abcdef\x1b[1G\x1b[4294967295@\x1b[4294967295I\x1b[4294967295Z\x1b[<4294967295u",
+        )
+        .unwrap();
+        bounded
+            .feed(b"abcdef\x1b[1G\x1b[12@\x1b[12I\x1b[12Z\x1b[<128u")
+            .unwrap();
+        assert_eq!(
+            huge.capture_frame(None).unwrap(),
+            bounded.capture_frame(None).unwrap()
+        );
         assert_eq!(huge.terminal.cursor_pos().x, 0);
         assert!(!huge.terminal.native_execution_limit_exceeded());
     }
@@ -732,7 +910,10 @@ mod tests {
             assert!(input.len() <= MAX_FEED_BYTES);
             assert_eq!(terminal.feed(&input), Err(NativeTerminalError::Capacity));
             assert!(terminal.terminal.native_execution_limit_exceeded());
-            assert_eq!(terminal.capture_frame(None), Err(NativeTerminalError::Closed));
+            assert_eq!(
+                terminal.capture_frame(None),
+                Err(NativeTerminalError::Closed)
+            );
         }
     }
 
@@ -748,29 +929,56 @@ mod tests {
     fn parser_reply_overflow_closes_instead_of_silently_losing_a_reply() {
         let mut terminal = terminal();
         terminal.feed(b"\x1b[6n").unwrap();
-        let reply = terminal.copy_reply(&mut [0; MAX_REPLY_BYTES]).unwrap().unwrap();
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Dropped).unwrap();
+        let reply = terminal
+            .copy_reply(&mut [0; MAX_REPLY_BYTES])
+            .unwrap()
+            .unwrap();
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Dropped)
+            .unwrap();
         // An explicit downstream refusal is already settled; it does not
         // become a new parser admission failure during an unrelated feed.
         terminal.feed(b"still live").unwrap();
-        assert_eq!(terminal.feed(&b"\x1b[6n".repeat(129)), Err(NativeTerminalError::Capacity));
-        assert_eq!(terminal.copy_reply(&mut [0; MAX_REPLY_BYTES]), Err(NativeTerminalError::Closed));
-        assert_eq!(terminal.capture_frame(None), Err(NativeTerminalError::Closed));
+        assert_eq!(
+            terminal.feed(&b"\x1b[6n".repeat(129)),
+            Err(NativeTerminalError::Capacity)
+        );
+        assert_eq!(
+            terminal.copy_reply(&mut [0; MAX_REPLY_BYTES]),
+            Err(NativeTerminalError::Closed)
+        );
+        assert_eq!(
+            terminal.capture_frame(None),
+            Err(NativeTerminalError::Closed)
+        );
     }
 
     #[test]
     fn native_text_profile_refuses_image_execution_and_clipboard_capability() {
         let mut terminal = terminal();
-        terminal.feed(b"\x1b[c\x1bPq~\x1b\\\x1b_Ga=T,f=32,s=1,v=1;AAAAAA==\x1b\\").unwrap();
+        terminal
+            .feed(b"\x1b[c\x1bPq~\x1b\\\x1b_Ga=T,f=32,s=1,v=1;AAAAAA==\x1b\\")
+            .unwrap();
         let mut bytes = [0; MAX_REPLY_BYTES];
         let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
         assert_eq!(&bytes[..reply.bytes], b"\x1b[?65;22c");
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
         terminal.feed(b"\x1bP+q4D73\x1b\\").unwrap();
         let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
         assert_eq!(&bytes[..reply.bytes], b"\x1bP0+r4D73\x1b\\");
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Dropped).unwrap();
-        assert_eq!(terminal.terminal.bounded_output_status().unwrap().dropped_replies, 1);
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Dropped)
+            .unwrap();
+        assert_eq!(
+            terminal
+                .terminal
+                .bounded_output_status()
+                .unwrap()
+                .dropped_replies,
+            1
+        );
         assert!(terminal.capture_frame(None).is_ok());
     }
 
@@ -791,8 +999,14 @@ mod tests {
         assert_eq!(first, old);
         assert_eq!(u64::from_le_bytes(second[64..72].try_into().unwrap()), 2);
         assert_eq!(u64::from_le_bytes(second[80..88].try_into().unwrap()), 7);
-        assert!(u64::from_le_bytes(second[72..80].try_into().unwrap()) > u64::from_le_bytes(first[72..80].try_into().unwrap()));
-        assert_eq!(terminal.set_font_revision(6), Err(NativeTerminalError::Stale));
+        assert!(
+            u64::from_le_bytes(second[72..80].try_into().unwrap())
+                > u64::from_le_bytes(first[72..80].try_into().unwrap())
+        );
+        assert_eq!(
+            terminal.set_font_revision(6),
+            Err(NativeTerminalError::Stale)
+        );
     }
 
     #[test]
@@ -801,11 +1015,17 @@ mod tests {
         config.size.rows = 256;
         config.size.cols = 256;
         config.scrollback_rows = 0;
-        assert!(matches!(NativeTerminal::new(config), Err(NativeTerminalError::Capacity)));
+        assert!(matches!(
+            NativeTerminal::new(config),
+            Err(NativeTerminalError::Capacity)
+        ));
         config.size.rows = 128;
         assert!(NativeTerminal::new(config).is_ok());
         config.scrollback_rows = 1;
-        assert!(matches!(NativeTerminal::new(config), Err(NativeTerminalError::Capacity)));
+        assert!(matches!(
+            NativeTerminal::new(config),
+            Err(NativeTerminalError::Capacity)
+        ));
     }
 
     #[test]
@@ -813,10 +1033,18 @@ mod tests {
         let mut terminal = terminal();
         terminal.capture_frame(Some(0)).unwrap();
         terminal.feed(b"row\r\n".repeat(32).as_slice()).unwrap();
-        assert_eq!(terminal.capture_frame(Some(0)), Err(NativeTerminalError::ViewportUnavailable));
+        assert_eq!(
+            terminal.capture_frame(Some(0)),
+            Err(NativeTerminalError::ViewportUnavailable)
+        );
         terminal.feed(b"live\x1b[6n").unwrap();
-        let reply = terminal.copy_reply(&mut [0; MAX_REPLY_BYTES]).unwrap().unwrap();
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+        let reply = terminal
+            .copy_reply(&mut [0; MAX_REPLY_BYTES])
+            .unwrap()
+            .unwrap();
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
         assert!(terminal.capture_frame(None).is_ok());
     }
 }

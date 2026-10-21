@@ -283,9 +283,9 @@ impl TerminalState {
         // The bounded writer admits all reports from this event together.
         // If admission fails, preserve the logical button/motion state so a
         // deliberate retry cannot lose a release or suppress an unsent move.
-        let previous = self.bounded_output_status().map(|_| {
-            (self.current_mouse_buttons.clone(), self.last_mouse_move)
-        });
+        let previous = self
+            .bounded_output_status()
+            .map(|_| (self.current_mouse_buttons.clone(), self.last_mouse_move));
         let result = self.with_user_input(|term| match event {
             MouseEvent {
                 kind: MouseEventKind::Press,

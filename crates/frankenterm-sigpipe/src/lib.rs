@@ -769,11 +769,17 @@ mod tests {
     fn native_hook_suppresses_recovered_payloads_and_preserves_host_policy() {
         const PROBE_ENV: &str = "FT_NATIVE_PANIC_HOOK_PROBE";
         if std::env::var_os(PROBE_ENV).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-                .args(["--exact", "tests::native_hook_suppresses_recovered_payloads_and_preserves_host_policy", "--nocapture"])
-                .env(PROBE_ENV, "1")
-                .output()
-                .expect("isolated native panic-hook probe");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "tests::native_hook_suppresses_recovered_payloads_and_preserves_host_policy",
+                "--nocapture",
+            ])
+            .env(PROBE_ENV, "1")
+            .output()
+            .expect("isolated native panic-hook probe");
             assert!(output.status.success(), "isolated panic-hook probe failed");
             assert!(!String::from_utf8_lossy(&output.stderr).contains("private-native-payload"));
             return;
@@ -782,11 +788,17 @@ mod tests {
         // cannot replace it or observe a temporary host policy.
         let calls = std::sync::Arc::new(AtomicU64::new(0));
         let observer = std::sync::Arc::clone(&calls);
-        std::panic::set_hook(Box::new(move |_| { observer.fetch_add(1, Ordering::Relaxed); }));
+        std::panic::set_hook(Box::new(move |_| {
+            observer.fetch_add(1, Ordering::Relaxed);
+        }));
         install_recoverable_boundary_hook_once();
         install_recoverable_boundary_hook_once();
-        assert!(catch_recoverable(RecoverablePanicSite::NativeTerminalBridge,
-            || panic!("private-native-payload")).is_err());
+        assert!(
+            catch_recoverable(RecoverablePanicSite::NativeTerminalBridge, || panic!(
+                "private-native-payload"
+            ))
+            .is_err()
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         // Test-only unmarked catch proves the original host hook still runs.
         assert!(std::panic::catch_unwind(|| panic!("host-policy-probe")).is_err());

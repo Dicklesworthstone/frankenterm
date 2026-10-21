@@ -23,7 +23,7 @@ use crate::native::{
 use crate::{BoundedReplyDisposition, TerminalSize};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::convert::TryFrom;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::panic::AssertUnwindSafe;
 use std::sync::{LazyLock, Mutex};
 
@@ -98,15 +98,27 @@ struct Registry {
 }
 
 impl Registry {
-    fn new() -> Self { Self { slots: std::array::from_fn(|_| Slot::default()) } }
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Slot::default()),
+        }
+    }
 
     fn index(&self, handle: u64, frame: bool) -> Result<usize, Error> {
-        if (handle & FRAME_KIND != 0) != frame { return Err(Error::Stale); }
+        if (handle & FRAME_KIND != 0) != frame {
+            return Err(Error::Stale);
+        }
         let index = (handle & 15) as usize;
         let generation = (handle & !FRAME_KIND) >> 4;
         let slot = &self.slots[index];
-        let expected = if frame { slot.frame_generation } else { slot.generation };
-        if generation == 0 || generation != expected || slot.terminal.is_none()
+        let expected = if frame {
+            slot.frame_generation
+        } else {
+            slot.generation
+        };
+        if generation == 0
+            || generation != expected
+            || slot.terminal.is_none()
             || (frame && slot.frame.is_none())
         {
             return Err(Error::Stale);
@@ -120,7 +132,10 @@ impl Registry {
     }
 
     fn resident_cells_except(&self, excluded: Option<usize>) -> Result<usize, Error> {
-        self.slots.iter().enumerate().filter(|(index, _)| Some(*index) != excluded)
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != excluded)
             .try_fold(0usize, |total, (_, slot)| {
                 total.checked_add(slot.charged_cells).ok_or(Error::Capacity)
             })
@@ -132,8 +147,15 @@ impl Registry {
         if cells > MAX_TOTAL_RESIDENT_CELLS - self.resident_cells_except(None)? {
             return Err(Error::Capacity);
         }
-        let index = self.slots.iter().position(|slot| slot.terminal.is_none() && slot.charged_cells == 0
-            && slot.generation < MAX_GENERATION).ok_or(Error::Capacity)?;
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.terminal.is_none()
+                    && slot.charged_cells == 0
+                    && slot.generation < MAX_GENERATION
+            })
+            .ok_or(Error::Capacity)?;
         // Construction completes before the generation/slot becomes visible.
         let terminal = NativeTerminal::new(config)?;
         let slot = &mut self.slots[index];
@@ -154,9 +176,16 @@ impl Registry {
         resize: impl FnOnce(&mut NativeTerminal, TerminalSize) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let index = self.index(handle, false)?;
-        let mut proposed = self.slots[index].terminal.as_ref().ok_or(Error::Stale)?.config();
+        let mut proposed = self.slots[index]
+            .terminal
+            .as_ref()
+            .ok_or(Error::Stale)?
+            .config();
         if proposed.size == size {
-            return resize(self.slots[index].terminal.as_mut().ok_or(Error::Stale)?, size);
+            return resize(
+                self.slots[index].terminal.as_mut().ok_or(Error::Stale)?,
+                size,
+            );
         }
         proposed.size = size;
         let cells = proposed.resident_cell_budget()?;
@@ -172,10 +201,16 @@ impl Registry {
         let slot = &mut self.slots[index];
         slot.charged_cells = reservation;
         match resize(slot.terminal.as_mut().ok_or(Error::Stale)?, size) {
-            Ok(()) => { slot.charged_cells = cells; Ok(()) }
+            Ok(()) => {
+                slot.charged_cells = cells;
+                Ok(())
+            }
             // NativeTerminal returns ordinary resize errors only before
             // mutating the model. A panic skips this arm and keeps reservation.
-            Err(error) => { slot.charged_cells = old_charge; Err(error) }
+            Err(error) => {
+                slot.charged_cells = old_charge;
+                Err(error)
+            }
         }
     }
 
@@ -196,19 +231,32 @@ impl Registry {
     fn acquire_frame(&mut self, handle: u64, viewport: Option<i64>) -> Result<(u64, u32), Error> {
         let index = self.index(handle, false)?;
         let slot = &mut self.slots[index];
-        if slot.frame.is_some() { return Err(Error::Busy); }
-        if slot.frame_generation == MAX_GENERATION { return Err(Error::SequenceExhausted); }
-        let frame = slot.terminal.as_mut().ok_or(Error::Stale)?.capture_frame(viewport)?;
+        if slot.frame.is_some() {
+            return Err(Error::Busy);
+        }
+        if slot.frame_generation == MAX_GENERATION {
+            return Err(Error::SequenceExhausted);
+        }
+        let frame = slot
+            .terminal
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .capture_frame(viewport)?;
         let length = u32::try_from(frame.len()).map_err(|_| Error::Capacity)?;
         slot.frame_generation += 1;
         slot.frame = Some(frame);
-        Ok((FRAME_KIND | (slot.frame_generation << 4) | index as u64, length))
+        Ok((
+            FRAME_KIND | (slot.frame_generation << 4) | index as u64,
+            length,
+        ))
     }
 
     fn copy_frame(&self, handle: u64, offset: usize, output: &mut [u8]) -> Result<usize, Error> {
         let index = self.index(handle, true)?;
         let frame = self.slots[index].frame.as_ref().ok_or(Error::Stale)?;
-        if offset > frame.len() || output.len() > MAX_FRAME_BYTES { return Err(Error::Invalid); }
+        if offset > frame.len() || output.len() > MAX_FRAME_BYTES {
+            return Err(Error::Invalid);
+        }
         let count = output.len().min(frame.len() - offset);
         output[..count].copy_from_slice(&frame[offset..offset + count]);
         Ok(count)
@@ -222,37 +270,44 @@ impl Registry {
 
     fn poison(&mut self, handle: u64) {
         if let Ok(index) = self.index(handle, handle & FRAME_KIND != 0) {
-            if let Some(terminal) = self.slots[index].terminal.as_mut() { terminal.poison(); }
+            if let Some(terminal) = self.slots[index].terminal.as_mut() {
+                terminal.poison();
+            }
         }
     }
 }
 
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::new()));
 
-fn boundary(
-    owner: Option<u64>,
-    operation: impl FnOnce(&mut Registry) -> Result<(), Error>,
-) -> u32 {
+fn boundary(owner: Option<u64>, operation: impl FnOnce(&mut Registry) -> Result<(), Error>) -> u32 {
     frankenterm_sigpipe::install_recoverable_boundary_hook_once();
     // The guard lives outside catch_recoverable, so a caught operation panic
     // does not poison the mutex or force unrelated sessions to fail. It does
     // poison the affected model, whose future state must not be trusted.
-    let mut registry = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match catch_recoverable(RecoverablePanicSite::NativeTerminalBridge,
-                            AssertUnwindSafe(|| operation(&mut registry))) {
+    let mut registry = REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match catch_recoverable(
+        RecoverablePanicSite::NativeTerminalBridge,
+        AssertUnwindSafe(|| operation(&mut registry)),
+    ) {
         Ok(Ok(())) => 0,
         Ok(Err(error)) => error as u32,
         Err(_) => {
-            if let Some(owner) = owner { registry.poison(owner); }
+            if let Some(owner) = owner {
+                registry.poison(owner);
+            }
             Error::Panic as u32
         }
     }
 }
 
 fn check_pointer<T>(pointer: *const T) -> Result<(), Error> {
-    if pointer.is_null() || (pointer as usize) % align_of::<T>() != 0 {
+    if pointer.is_null() || !pointer.is_aligned() {
         Err(Error::Invalid)
-    } else { Ok(()) }
+    } else {
+        Ok(())
+    }
 }
 
 /// SAFETY: pointer is valid writable storage for T, unique with respect to
@@ -260,26 +315,44 @@ fn check_pointer<T>(pointer: *const T) -> Result<(), Error> {
 /// require the caller's prior value to have been initialized.
 unsafe fn output_scalar<T>(pointer: *mut T, value: T) -> Result<(), Error> {
     check_pointer(pointer)?;
-    unsafe { pointer.write(value); }
+    unsafe {
+        pointer.write(value);
+    }
     Ok(())
 }
 
 /// SAFETY: the caller guarantees this initialized, immutable byte range is
 /// valid for this call. Only its length/null preconditions can be checked here.
-unsafe fn input_bytes<'a>(pointer: *const u8, length: u32, maximum: usize) -> Result<&'a [u8], Error> {
+unsafe fn input_bytes<'a>(
+    pointer: *const u8,
+    length: u32,
+    maximum: usize,
+) -> Result<&'a [u8], Error> {
     let length = length as usize;
-    if length > maximum { return Err(Error::Capacity); }
-    if length == 0 { return Ok(&[]); }
+    if length > maximum {
+        return Err(Error::Capacity);
+    }
+    if length == 0 {
+        return Ok(&[]);
+    }
     check_pointer(pointer)?;
     Ok(unsafe { std::slice::from_raw_parts(pointer, length) })
 }
 
 /// SAFETY: the caller guarantees this initialized byte range is exclusively
 /// writable for this call and does not overlap inputs or scalar outputs.
-unsafe fn output_bytes<'a>(pointer: *mut u8, capacity: u32, maximum: usize) -> Result<&'a mut [u8], Error> {
+unsafe fn output_bytes<'a>(
+    pointer: *mut u8,
+    capacity: u32,
+    maximum: usize,
+) -> Result<&'a mut [u8], Error> {
     let capacity = capacity as usize;
-    if capacity > maximum { return Err(Error::Capacity); }
-    if capacity == 0 { return Ok(&mut []); }
+    if capacity > maximum {
+        return Err(Error::Capacity);
+    }
+    if capacity == 0 {
+        return Ok(&mut []);
+    }
     check_pointer(pointer)?;
     Ok(unsafe { std::slice::from_raw_parts_mut(pointer, capacity) })
 }
@@ -290,24 +363,35 @@ fn utf8(bytes: &[u8]) -> Result<&str, Error> {
 
 fn phase(value: u32) -> Result<NativeKeyPhase, Error> {
     match value {
-        0 => Ok(NativeKeyPhase::Down), 1 => Ok(NativeKeyPhase::Repeated),
-        2 => Ok(NativeKeyPhase::Up), 3 => Ok(NativeKeyPhase::Press),
+        0 => Ok(NativeKeyPhase::Down),
+        1 => Ok(NativeKeyPhase::Repeated),
+        2 => Ok(NativeKeyPhase::Up),
+        3 => Ok(NativeKeyPhase::Press),
         _ => Err(Error::Invalid),
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ft_terminal_v1_create(config: *const FtTerminalV1Config, session: *mut u64) -> u32 {
+pub unsafe extern "C" fn ft_terminal_v1_create(
+    config: *const FtTerminalV1Config,
+    session: *mut u64,
+) -> u32 {
     boundary(None, |registry| {
-        unsafe { output_scalar(session, 0)?; }
+        unsafe {
+            output_scalar(session, 0)?;
+        }
         check_pointer(config)?;
         // Read only the version/size prefix before accepting the full layout.
         let version = unsafe { std::ptr::addr_of!((*config).abi_version).read() };
         let size = unsafe { std::ptr::addr_of!((*config).struct_size).read() };
-        if version != 1 || size != 80 { return Err(Error::Invalid); }
+        if version != 1 || size != 80 {
+            return Err(Error::Invalid);
+        }
         let config = unsafe { config.read() }.validate()?;
         let handle = registry.create(config)?;
-        unsafe { output_scalar(session, handle)?; }
+        unsafe {
+            output_scalar(session, handle)?;
+        }
         Ok(())
     })
 }
@@ -331,110 +415,188 @@ pub unsafe extern "C" fn ft_terminal_v1_feed(session: u64, bytes: *const u8, len
 }
 
 #[no_mangle]
-pub extern "C" fn ft_terminal_v1_resize(session: u64, columns: u32, rows: u32,
-                                         pixel_width: u32, pixel_height: u32) -> u32 {
-    boundary(Some(session), |registry| registry.resize(session, geometry(columns, rows, pixel_width, pixel_height)))
+pub extern "C" fn ft_terminal_v1_resize(
+    session: u64,
+    columns: u32,
+    rows: u32,
+    pixel_width: u32,
+    pixel_height: u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        registry.resize(session, geometry(columns, rows, pixel_width, pixel_height))
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn ft_terminal_v1_set_font_revision(session: u64, revision: u64) -> u32 {
-    boundary(Some(session), |registry| registry.session(session)?.set_font_revision(revision))
+    boundary(Some(session), |registry| {
+        registry.session(session)?.set_font_revision(revision)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ft_terminal_v1_encode_key(
-    session: u64, usage: u32, modifiers: u32, phase_value: u32,
-    characters: *const u8, characters_length: u32, output: *mut u8,
-    capacity: u32, written: *mut u32,
+    session: u64,
+    usage: u32,
+    modifiers: u32,
+    phase_value: u32,
+    characters: *const u8,
+    characters_length: u32,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
 ) -> u32 {
     boundary(Some(session), |registry| {
-        unsafe { output_scalar(written, 0)?; }
+        unsafe {
+            output_scalar(written, 0)?;
+        }
         let phase = phase(phase_value)?;
         let characters = utf8(unsafe { input_bytes(characters, characters_length, 256)? })?;
         let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
-        let count = registry.session(session)?.encode_key(usage, modifiers, phase, characters, output)?;
-        unsafe { output_scalar(written, count as u32)?; }
-        Ok(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ft_terminal_v1_encode_text(
-    session: u64, text: *const u8, length: u32, output: *mut u8, capacity: u32, written: *mut u32,
-) -> u32 {
-    boundary(Some(session), |registry| {
-        unsafe { output_scalar(written, 0)?; }
-        let text = utf8(unsafe { input_bytes(text, length, MAX_TEXT_BYTES)? })?;
-        let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
-        let count = registry.session(session)?.encode_text(text, output)?;
-        unsafe { output_scalar(written, count as u32)?; }
-        Ok(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ft_terminal_v1_prepare_paste(
-    session: u64, text: *const u8, length: u32, output: *mut u8,
-    capacity: u32, written: *mut u32, flags: *mut u32,
-) -> u32 {
-    boundary(Some(session), |registry| {
-        unsafe { output_scalar(written, 0)?; output_scalar(flags, 0)?; }
-        let text = utf8(unsafe { input_bytes(text, length, MAX_INPUT_BYTES)? })?;
-        let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
-        let prepared = registry.session(session)?.prepare_paste(text, output)?;
-        unsafe { output_scalar(written, prepared.bytes as u32)?; output_scalar(flags, u32::from(prepared.bracketed))?; }
-        Ok(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ft_terminal_v1_reply_copy(
-    session: u64, output: *mut u8, capacity: u32, length: *mut u32, sequence: *mut u64,
-) -> u32 {
-    boundary(Some(session), |registry| {
-        unsafe { output_scalar(length, 0)?; output_scalar(sequence, 0)?; }
-        let output = unsafe { output_bytes(output, capacity, MAX_REPLY_BYTES)? };
-        if let Some(reply) = registry.session(session)?.copy_reply(output)? {
-            unsafe { output_scalar(length, reply.bytes as u32)?; output_scalar(sequence, reply.sequence)?; }
+        let count = registry
+            .session(session)?
+            .encode_key(usage, modifiers, phase, characters, output)?;
+        unsafe {
+            output_scalar(written, count as u32)?;
         }
         Ok(())
     })
 }
 
 #[no_mangle]
-pub extern "C" fn ft_terminal_v1_reply_settle(session: u64, sequence: u64, disposition: u32) -> u32 {
+pub unsafe extern "C" fn ft_terminal_v1_encode_text(
+    session: u64,
+    text: *const u8,
+    length: u32,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(written, 0)?;
+        }
+        let text = utf8(unsafe { input_bytes(text, length, MAX_TEXT_BYTES)? })?;
+        let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
+        let count = registry.session(session)?.encode_text(text, output)?;
+        unsafe {
+            output_scalar(written, count as u32)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_terminal_v1_prepare_paste(
+    session: u64,
+    text: *const u8,
+    length: u32,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+    flags: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(written, 0)?;
+            output_scalar(flags, 0)?;
+        }
+        let text = utf8(unsafe { input_bytes(text, length, MAX_INPUT_BYTES)? })?;
+        let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
+        let prepared = registry.session(session)?.prepare_paste(text, output)?;
+        unsafe {
+            output_scalar(written, prepared.bytes as u32)?;
+            output_scalar(flags, u32::from(prepared.bracketed))?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_terminal_v1_reply_copy(
+    session: u64,
+    output: *mut u8,
+    capacity: u32,
+    length: *mut u32,
+    sequence: *mut u64,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(length, 0)?;
+            output_scalar(sequence, 0)?;
+        }
+        let output = unsafe { output_bytes(output, capacity, MAX_REPLY_BYTES)? };
+        if let Some(reply) = registry.session(session)?.copy_reply(output)? {
+            unsafe {
+                output_scalar(length, reply.bytes as u32)?;
+                output_scalar(sequence, reply.sequence)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_terminal_v1_reply_settle(
+    session: u64,
+    sequence: u64,
+    disposition: u32,
+) -> u32 {
     boundary(Some(session), |registry| {
         let disposition = match disposition {
             0 => BoundedReplyDisposition::Accepted,
             1 => BoundedReplyDisposition::Dropped,
             _ => return Err(Error::Invalid),
         };
-        registry.session(session)?.settle_reply(sequence, disposition)
+        registry
+            .session(session)?
+            .settle_reply(sequence, disposition)
     })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ft_terminal_v1_frame_acquire(
-    session: u64, viewport_top: i64, frame: *mut u64, length: *mut u32,
+    session: u64,
+    viewport_top: i64,
+    frame: *mut u64,
+    length: *mut u32,
 ) -> u32 {
     boundary(Some(session), |registry| {
-        unsafe { output_scalar(frame, 0)?; output_scalar(length, 0)?; }
-        let viewport = if viewport_top == i64::MIN { None } else { Some(viewport_top) };
+        unsafe {
+            output_scalar(frame, 0)?;
+            output_scalar(length, 0)?;
+        }
+        let viewport = if viewport_top == i64::MIN {
+            None
+        } else {
+            Some(viewport_top)
+        };
         let (handle, count) = registry.acquire_frame(session, viewport)?;
-        unsafe { output_scalar(frame, handle)?; output_scalar(length, count)?; }
+        unsafe {
+            output_scalar(frame, handle)?;
+            output_scalar(length, count)?;
+        }
         Ok(())
     })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ft_terminal_v1_frame_copy(
-    frame: u64, offset: u32, output: *mut u8, capacity: u32, written: *mut u32,
+    frame: u64,
+    offset: u32,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
 ) -> u32 {
     boundary(Some(frame), |registry| {
-        unsafe { output_scalar(written, 0)?; }
+        unsafe {
+            output_scalar(written, 0)?;
+        }
         let output = unsafe { output_bytes(output, capacity, MAX_FRAME_BYTES)? };
         let count = registry.copy_frame(frame, offset as usize, output)?;
-        unsafe { output_scalar(written, count as u32)?; }
+        unsafe {
+            output_scalar(written, count as u32)?;
+        }
         Ok(())
     })
 }
@@ -450,9 +612,18 @@ mod tests {
 
     fn config() -> FtTerminalV1Config {
         FtTerminalV1Config {
-            abi_version: 1, struct_size: 80, columns: 12, rows: 3,
-            pixel_width: 120, pixel_height: 60, scrollback_rows: 8, reserved: 0,
-            channel_id: [1; 16], transport_id: [2; 16], route_revision: 1, font_revision: 1,
+            abi_version: 1,
+            struct_size: 80,
+            columns: 12,
+            rows: 3,
+            pixel_width: 120,
+            pixel_height: 60,
+            scrollback_rows: 8,
+            reserved: 0,
+            channel_id: [1; 16],
+            transport_id: [2; 16],
+            route_revision: 1,
+            font_revision: 1,
         }
     }
 
@@ -470,7 +641,10 @@ mod tests {
         assert_ne!(frame, next_frame);
         registry.release(first).unwrap();
         assert_eq!(registry.release(first), Err(Error::Stale));
-        assert_eq!(registry.copy_frame(next_frame, 0, &mut [0; 4]), Err(Error::Stale));
+        assert_eq!(
+            registry.copy_frame(next_frame, 0, &mut [0; 4]),
+            Err(Error::Stale)
+        );
         let next = registry.create(config().validate().unwrap()).unwrap();
         assert_ne!(first, next);
         assert!(matches!(registry.session(first), Err(Error::Stale)));
@@ -490,7 +664,10 @@ mod tests {
         registry.copy_frame(frame, 0, &mut after).unwrap();
         assert_eq!(before, after);
         let mut refused = [0xa5; 4];
-        assert_eq!(registry.copy_frame(frame, length as usize + 1, &mut refused), Err(Error::Invalid));
+        assert_eq!(
+            registry.copy_frame(frame, length as usize + 1, &mut refused),
+            Err(Error::Invalid)
+        );
         assert_eq!(refused, [0xa5; 4]);
         registry.release(session).unwrap();
     }
@@ -500,13 +677,31 @@ mod tests {
         let mut registry = Registry::new();
         let session = registry.create(config().validate().unwrap()).unwrap();
         registry.session(session).unwrap().feed(b"\x1b[6n").unwrap();
-        let reply = registry.session(session).unwrap().copy_reply(&mut [0; 64]).unwrap().unwrap();
+        let reply = registry
+            .session(session)
+            .unwrap()
+            .copy_reply(&mut [0; 64])
+            .unwrap()
+            .unwrap();
         assert_eq!(registry.session(session).unwrap().close(), Err(Error::Busy));
         registry.release(session).unwrap();
         let replacement = registry.create(config().validate().unwrap()).unwrap();
         assert_ne!(session, replacement);
-        assert_eq!(registry.session(replacement).unwrap().copy_reply(&mut [0; 64]).unwrap(), None);
-        assert_eq!(registry.session(replacement).unwrap().settle_reply(reply.sequence, BoundedReplyDisposition::Accepted), Err(Error::Stale));
+        assert_eq!(
+            registry
+                .session(replacement)
+                .unwrap()
+                .copy_reply(&mut [0; 64])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            registry
+                .session(replacement)
+                .unwrap()
+                .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted),
+            Err(Error::Stale)
+        );
     }
 
     #[test]
@@ -517,13 +712,19 @@ mod tests {
         large.size.cols = 512;
         large.scrollback_rows = 0;
         let sessions: Vec<_> = (0..4).map(|_| registry.create(large).unwrap()).collect();
-        assert_eq!(registry.create(config().validate().unwrap()), Err(Error::Capacity));
+        assert_eq!(
+            registry.create(config().validate().unwrap()),
+            Err(Error::Capacity)
+        );
         registry.release(sessions[0]).unwrap();
         let small = registry.create(config().validate().unwrap()).unwrap();
         registry.create(config().validate().unwrap()).unwrap();
         // 60 rows plus 8 history rows at 512 cols fits this session exactly,
         // but not the aggregate budget with the other small session retained.
-        assert_eq!(registry.resize(small, geometry(512, 60, 0, 0)), Err(Error::Capacity));
+        assert_eq!(
+            registry.resize(small, geometry(512, 60, 0, 0)),
+            Err(Error::Capacity)
+        );
     }
 
     #[cfg(panic = "unwind")]
@@ -534,15 +735,22 @@ mod tests {
         let index = registry.index(session, false).unwrap();
         let old_charge = registry.slots[index].charged_cells;
         let size = geometry(24, 6, 240, 120);
-        let result = catch_recoverable(RecoverablePanicSite::NativeTerminalBridge,
-            AssertUnwindSafe(|| registry.resize_with(session, size, |terminal, size| {
-                terminal.resize(size)?;
-                panic!("resize ownership settlement probe");
-            })));
+        let result = catch_recoverable(
+            RecoverablePanicSite::NativeTerminalBridge,
+            AssertUnwindSafe(|| {
+                registry.resize_with(session, size, |terminal, size| {
+                    terminal.resize(size)?;
+                    panic!("resize ownership settlement probe");
+                })
+            }),
+        );
         assert!(result.is_err());
         registry.poison(session);
         let new_charge = (2 * size.rows + 8) * size.cols;
-        assert_eq!(registry.resident_cells_except(None).unwrap(), old_charge + new_charge);
+        assert_eq!(
+            registry.resident_cells_except(None).unwrap(),
+            old_charge + new_charge
+        );
         assert_eq!(registry.slots[index].charged_cells, old_charge + new_charge);
         registry.release(session).unwrap();
         assert_eq!(registry.resident_cells_except(None).unwrap(), 0);
@@ -556,20 +764,43 @@ mod tests {
         // SAFETY: every pointer refers to a live uniquely borrowed local with
         // the exact declared range; byte arrays are initialized and disjoint.
         unsafe {
-            assert_eq!(ft_terminal_v1_create(&invalid, &mut session), Error::Invalid as u32);
+            assert_eq!(
+                ft_terminal_v1_create(&invalid, &mut session),
+                Error::Invalid as u32
+            );
             assert_eq!(session, 0);
             assert_eq!(ft_terminal_v1_create(&config(), &mut session), 0);
             let mut output = [0xa5; 64];
             let mut written = 9;
-            assert_eq!(ft_terminal_v1_encode_text(session, [0xff].as_ptr(), 1,
-                output.as_mut_ptr(), output.len() as u32, &mut written), Error::Invalid as u32);
+            assert_eq!(
+                ft_terminal_v1_encode_text(
+                    session,
+                    [0xff].as_ptr(),
+                    1,
+                    output.as_mut_ptr(),
+                    output.len() as u32,
+                    &mut written
+                ),
+                Error::Invalid as u32
+            );
             assert_eq!(written, 0);
             assert_eq!(output, [0xa5; 64]);
-            assert_eq!(ft_terminal_v1_feed(session, std::ptr::null(), 1), Error::Invalid as u32);
+            assert_eq!(
+                ft_terminal_v1_feed(session, std::ptr::null(), 1),
+                Error::Invalid as u32
+            );
             assert_eq!(ft_terminal_v1_feed(session, std::ptr::null(), 0), 0);
         }
-        assert_eq!(boundary(Some(session), |_| -> Result<(), Error> { panic!("native boundary probe") }), Error::Panic as u32);
-        assert_eq!(ft_terminal_v1_set_font_revision(session, 2), Error::Closed as u32);
+        assert_eq!(
+            boundary(Some(session), |_| -> Result<(), Error> {
+                panic!("native boundary probe")
+            }),
+            Error::Panic as u32
+        );
+        assert_eq!(
+            ft_terminal_v1_set_font_revision(session, 2),
+            Error::Closed as u32
+        );
         assert_eq!(ft_terminal_v1_release(session), 0);
         assert_eq!(ft_terminal_v1_release(session), Error::Stale as u32);
     }
