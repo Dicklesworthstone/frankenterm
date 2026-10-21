@@ -38,12 +38,20 @@ public enum TerminalTransportWrite: Equatable, Sendable {
 
 public protocol TerminalByteTransport: AnyObject, Sendable {
     var identity: TerminalConnectionIdentity { get }
+    /// A bounded, synchronous notification, not a write or a Task per event.
+    /// A session driver uses it to interrupt its idle socket wait. Implementations
+    /// must coalesce notifications and must not reenter the coordinator.
+    func inputAvailable()
     /// Must neither block a cooperative executor nor enqueue into an unbounded
     /// downstream writer. Consume/copy only the returned prefix before returning.
     func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite
     /// Must interrupt outstanding I/O and settle ownership before returning.
     /// Closing one channel must not terminate unrelated channels or remote mux PTYs.
     func close() async
+}
+
+public extension TerminalByteTransport {
+    func inputAvailable() {}
 }
 
 public struct TerminalInputLimits: Sendable {
@@ -115,6 +123,12 @@ public struct TerminalInputOutcome: Equatable, Sendable {
     public let acceptedOriginalBytes: Int
     public let acceptedCleanupBytes: Int
     public let disposition: TerminalInputDisposition
+}
+/// Content-free, non-consuming prefix. A delivery failure leaves the original
+/// records charged to their source until an explicit acknowledgement succeeds.
+public struct TerminalOutcomeBatch: Sendable {
+    fileprivate let source: TerminalSource
+    public let outcomes: [TerminalInputOutcome]
 }
 public enum TerminalDrainResult: Equatable, Sendable {
     case idle, busy, wouldBlock, progressed(Int), connectionClosed
@@ -348,6 +362,7 @@ public actor TerminalInputCoordinator {
         let receipt = TerminalInputReceipt(owner: owner, serial: try nextSerial(), source: connection.source)
         connection.queue.append(Operation(receipt, kind, Data(bytes), pastePayload: pastePayload,
                                           bracketed: bracketed, inputCharge: inputCharge, cleanupCharge: cleanupCharge))
+        connection.transport.inputAvailable()
         return receipt
     }
 
@@ -360,6 +375,7 @@ public actor TerminalInputCoordinator {
         operation.cancelRequested = true
         if connection.inFlight == receipt.serial { return .pendingWrite }
         applyCancellation(operation, in: connection)
+        connection.transport.inputAvailable()
         return .cancelled
     }
     private func applyCancellation(_ operation: Operation, in connection: Connection) {
@@ -480,6 +496,19 @@ public actor TerminalInputCoordinator {
         let connection = try connection(source, active: false)
         invalidate(connection)
         await closeTransport(connection)
+    }
+    public func pendingOutcomes(_ source: TerminalSource, maximum: Int = 64) throws -> TerminalOutcomeBatch {
+        guard (1...256).contains(maximum) else { throw TerminalInputError.invalidLimits }
+        let connection = try connection(source, active: false)
+        return TerminalOutcomeBatch(source: source, outcomes: Array(connection.outcomes.prefix(maximum)))
+    }
+    /// Acknowledgement is local metadata delivery, never replay or remote-effect
+    /// authority. A stale/foreign batch cannot consume a newer source's records.
+    public func acknowledgeOutcomes(_ batch: TerminalOutcomeBatch) throws {
+        let connection = try connection(batch.source, active: false)
+        guard !batch.outcomes.isEmpty,
+              connection.outcomes.starts(with: batch.outcomes) else { throw TerminalInputError.stale }
+        connection.outcomes.removeFirst(batch.outcomes.count)
     }
     /// Consuming content-free outcomes releases record slots, never authorizes a
     /// retry. Callers must preserve any required uncertainty UI/journal separately.
