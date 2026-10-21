@@ -81,6 +81,10 @@ public actor NativeOpticalPresentation {
         let request = try RecipientRequest(text: text)
         return try symbol(image: Self.image(raster: FixedQRCode(recipientRequest: request).raster()))
     }
+    /// The unlock code frame (see TransferCodeFrame), in the transfer's geometry.
+    public func codeSymbol(text: String) throws -> QRCodeSymbol {
+        try symbol(image: Self.image(raster: FixedQRCode(transferCodeFrame: text).raster()))
+    }
     private func symbol(image: CGImage) throws -> QRCodeSymbol {
         let bytes = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(bytes, UTType.png.identifier as CFString, 1, nil) else { throw FTError.storage }

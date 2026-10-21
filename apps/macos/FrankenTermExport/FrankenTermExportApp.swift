@@ -88,7 +88,6 @@ private actor MacExportEngine {
     private var decisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     private var keys: [PrivateKeyRecord] = []
     private var exportedEnvelope: Data?
-    private var transferCode: TransferCode?
     private var sender: OpticalSender?
 
     private func fingerprint(_ key: PrivateKeyRecord) -> String {
@@ -101,7 +100,7 @@ private actor MacExportEngine {
                      review: try selection.review(decisions: decisions, loadedFingerprints: loaded),
                      identityReferences: identityReferences)
     }
-    func invalidateExport() { exportedEnvelope = nil; transferCode = nil; sender = nil }
+    func invalidateExport() { exportedEnvelope = nil; sender = nil }
     private func retireKeyRequest() {
         if let pending = pendingKeyInstallation {
             keys = pending.previousKeys; decisions = pending.previousDecisions
@@ -398,21 +397,17 @@ private actor MacExportEngine {
         }
         try Task.checkCancellation()
         let optical = try OpticalSender(envelope: envelope, using: crypto)
-        exportedEnvelope = envelope; transferCode = code; sender = optical
-        let digest = optical.identity.envelopeDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        exportedEnvelope = envelope; sender = optical
+        let digest = optical.identity.envelopeDigest
         return .init(comparison: FTAG.comparison(envelope, using: crypto), pages: optical.identity.pageCount,
                      bytes: envelope.count, protection: protection, recipientComparison: recipientComparison,
-                     codeFrame: code.map { "FTCODE1:\(digest):\($0.reveal(using: crypto))" })
+                     codeFrame: code.map { TransferCodeFrame.text(envelopeDigest: digest, code: $0.reveal(using: crypto)) })
     }
     func next(repairPage: Int?) throws -> String {
         guard var active = sender else { throw FTError.stale }
         let text = try active.next(repairPage: repairPage, using: crypto)
         sender = active
         return text
-    }
-    func code() throws -> String {
-        guard exportedEnvelope != nil, let transferCode else { throw FTError.stale }
-        return transferCode.reveal(using: crypto)
     }
     func encryptedEnvelope() throws -> Data {
         guard let exportedEnvelope else { throw FTError.stale }
@@ -461,7 +456,6 @@ private final class MacExportModel {
     var keyUnlockRequest: SourceKeyUnlockRequest?
     var prepared: MacExportEngine.Prepared?
     var symbol: QRCodeSymbol?
-    var revealedCode: String?
     var message: String?
     var busy = false
     var playing = false
@@ -511,7 +505,7 @@ private final class MacExportModel {
         prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
     }
     private func invalidatePrepared() {
-        pause(); revealedCode = nil; prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
+        pause(); prepared = nil; approveSelectedKeys = false; emitted = 0; repairPage = -1
         playWhenPrepared = false
     }
     private func retireSourceKeyPrompt() {
@@ -796,7 +790,7 @@ private final class MacExportModel {
         let recipient = mode == .recipient ? recipientRequest : nil
         let digest = mode == .recipient ? confirmedRecipientDigest : nil
         retireSourceKeyPrompt()
-        pause(); revealedCode = nil; prepared = nil; emitted = 0; repairPage = -1
+        pause(); prepared = nil; emitted = 0; repairPage = -1
         let token = generation
         perform { [self] operation in
             do {
@@ -839,27 +833,32 @@ private final class MacExportModel {
             }
         }
     }
+    /// Plays while the window is open, focused or not: the person is looking
+    /// at their phone, and often clicked another window to get there.
     func play() {
-        guard !busy, prepared != nil, foreground else { return }
-        pause(); revealedCode = nil; playing = true
+        guard !busy, prepared != nil, windowOpen else { return }
+        pause(); playing = true
         let token = generation
         awake = ProcessInfo.processInfo.beginActivity(options: [.idleDisplaySleepDisabled], reason: "Display encrypted workspace QR transfer")
         playback = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, self.playing, self.generation == token, self.foreground else { break }
+                guard let self, self.playing, self.generation == token, self.windowOpen else { break }
                 do {
                     // Every sixth symbol carries the unlock code, so a phone
                     // that collects the pages has the code too.
-                    let text: String
-                    if let frame = self.prepared?.codeFrame, self.emitted % 6 == 5 { text = frame }
-                    else { text = try await self.engine.next(repairPage: self.repairPage < 0 ? nil : self.repairPage) }
-                    let image = try await self.renderer.symbol(text: text)
-                    guard !Task.isCancelled, self.playing, self.generation == token, self.foreground else { break }
+                    let image: QRCodeSymbol
+                    if let frame = self.prepared?.codeFrame, self.emitted % 6 == 5 {
+                        image = try await self.renderer.codeSymbol(text: frame)
+                    } else {
+                        let text = try await self.engine.next(repairPage: self.repairPage < 0 ? nil : self.repairPage)
+                        image = try await self.renderer.symbol(text: text)
+                    }
+                    guard !Task.isCancelled, self.playing, self.generation == token, self.windowOpen else { break }
                     self.symbol = image; self.emitted += 1
                     try await Task.sleep(for: .milliseconds(1000 / self.rate))
                 } catch is CancellationError { break }
                 catch {
-                    guard !Task.isCancelled, self.generation == token, self.foreground else { break }
+                    guard !Task.isCancelled, self.generation == token, self.windowOpen else { break }
                     self.pause(); self.report(error); break
                 }
             }
@@ -869,19 +868,12 @@ private final class MacExportModel {
         generation = UUID(); playback?.cancel(); playback = nil; playing = false; symbol = nil
         if let awake { ProcessInfo.processInfo.endActivity(awake); self.awake = nil }
     }
-    func revealCode() {
-        guard !busy, prepared?.protection == .code, foreground else { return }
-        // Remove the QR and invalidate in-flight raster work BEFORE requesting code.
-        pause(); revealedCode = nil
-        let token = generation
-        perform { [self] operation in
-            let value = try await engine.code()
-            try requireCurrentWork(operation)
-            guard foreground, generation == token else { return }
-            revealedCode = value
-        }
+    /// Done sending: the window goes back to the machines.
+    func stopSending() {
+        guard !busy else { return }
+        invalidatePrepared()
+        perform { [self] _ in await engine.invalidateExport() }
     }
-    func concealCode() { revealedCode = nil }
     func openExport(isActive: Bool) {
         windowOpen = true
         setForeground(isActive)
@@ -893,7 +885,9 @@ private final class MacExportModel {
     func setForeground(_ value: Bool) {
         foreground = value && windowOpen
         if !foreground {
-            pause(); revealedCode = nil; cancelRecipientScan()
+            // The animation keeps playing (see play()); the camera and key
+            // prompts belong to the focused window only.
+            cancelRecipientScan()
             if let token = sourceKeyOperation {
                 work?.cancel(); retireSourceKeyPrompt()
                 // The bounded worker checks cancellation before installing its
@@ -904,7 +898,7 @@ private final class MacExportModel {
     }
     func saveEncryptedFile() {
         guard !busy, prepared != nil else { return }
-        pause(); revealedCode = nil
+        pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Workspace.ftairgap"
         let recipientOnly = prepared?.protection == .recipient
         panel.message = recipientOnly
@@ -922,7 +916,7 @@ private final class MacExportModel {
     func savePublicWorkspace() {
         guard !busy, sourceSheet == nil, selection != nil else { return }
         cancelRecipientScan()
-        pause(); revealedCode = nil
+        pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Workspace.ftworkspace"
         panel.message = "Save selected hosts, groups, public identities, and trust policy without private keys. The document is unencrypted. Check its file comparison value on your phone before importing. Choose a new filename."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
@@ -934,7 +928,7 @@ private final class MacExportModel {
     }
     func saveAnimation() {
         guard !busy, prepared != nil else { return }
-        pause(); revealedCode = nil
+        pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-QR.apng"
         panel.allowedContentTypes = [.png]; panel.allowsOtherFileTypes = true
         let recipientOnly = prepared?.protection == .recipient
@@ -953,7 +947,7 @@ private final class MacExportModel {
     }
     func saveVideo() {
         guard !busy, prepared != nil else { return }
-        pause(); revealedCode = nil
+        pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-QR.mp4"
         panel.allowedContentTypes = [.mpeg4Movie]
         let recipientOnly = prepared?.protection == .recipient
@@ -1071,81 +1065,33 @@ private struct MacExportView: View {
     @Bindable var model: MacExportModel
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack {
-                    Label("FrankenTerm", systemImage: "terminal.fill").font(.largeTitle.bold())
-                    Spacer()
-                    Button("Load This Mac's Machines") { model.loadThisMac() }.disabled(model.busy)
-                    Button("Import SSH Config…") { model.chooseSSHConfiguration() }.disabled(model.busy)
-                    Button("Open Workspace…") { model.chooseWorkspace() }.disabled(model.busy)
-                }
-                Text("Offline workspace transfer").font(.title2).foregroundStyle(.secondary)
-                if let document = model.document {
-                    exportChoices(document)
-                } else {
-                    ContentUnavailableView("Choose a workspace", systemImage: "rectangle.3.group",
-                        description: Text("This Mac's FrankenTerm machines load automatically, with the keys their routes use. You can also open a .ftworkspace document, or import selected hosts from an SSH config with their public identities and known_hosts policy."))
-                }
-                if let prepared = model.prepared {
-                    HStack {
-                        Text("On your iPhone, open FrankenTerm, tap Restore, and point the camera here. It unlocks by itself.")
-                            .font(.headline)
-                        Spacer()
-                        Text("\(prepared.pages) pages · \(prepared.bytes) bytes").font(.caption).foregroundStyle(.secondary)
-                    }
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 20).fill(.white)
-                        if let code = model.revealedCode {
-                            VStack(spacing: 18) {
-                                Label("Private transfer code", systemImage: "key.fill").font(.headline)
-                                Text(verbatim: code).font(.system(.title2, design: .monospaced).bold()).textSelection(.disabled)
-                                Text("Enter on the phone. Do not record this together with the QR animation.").multilineTextAlignment(.center)
-                                Button("Hide Code") { model.concealCode() }
-                            }.foregroundStyle(.black).padding(30)
-                        } else if let symbol = model.symbol {
-                            PixelPerfectQRCode(symbol: symbol).padding(16)
-                        } else {
-                            VStack(spacing: 12) {
-                                Image(systemName: "qrcode").font(.system(size: 70))
-                                Text("Animation paused").font(.headline)
-                                Text("Scan using FrankenTerm’s Restore from Animated QR on your iPhone.").font(.callout)
-                            }.foregroundStyle(.black).padding(24)
+        Group {
+            if model.prepared != nil {
+                sending
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        HStack {
+                            Label("FrankenTerm", systemImage: "terminal.fill").font(.largeTitle.bold())
+                            Spacer()
+                            Menu("Other Sources") {
+                                Button("Reload This Mac's Machines") { model.loadThisMac() }
+                                Button("Import SSH Config…") { model.chooseSSHConfiguration() }
+                                Button("Open Workspace…") { model.chooseWorkspace() }
+                            }.fixedSize().disabled(model.busy)
                         }
-                    }.frame(height: 470).overlay { RoundedRectangle(cornerRadius: 20).stroke(.gray.opacity(0.3)) }
-                    HStack {
-                        Button(model.playing ? "Pause" : "Play QR Animation") { if model.playing { model.pause() } else { model.play() } }
-                            .buttonStyle(.borderedProminent).disabled(model.busy)
-                        if prepared.protection == .code {
-                            Button("Show Code") { model.revealCode() }.disabled(model.busy)
-                                .help("Only if the iPhone asks you to type it: the animation already carries it.")
+                        if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
+                        if let document = model.document {
+                            exportChoices(document)
+                        } else if model.busy {
+                            ProgressView("Loading this Mac's machines…").frame(maxWidth: .infinity)
                         } else {
-                            Label("Only the confirmed iPhone", systemImage: "iphone.and.arrow.forward").font(.caption)
+                            ContentUnavailableView("No machines loaded", systemImage: "rectangle.3.group",
+                                description: Text("This Mac's FrankenTerm machines load automatically. Use Other Sources to open a workspace or SSH config instead."))
                         }
-                        Picker("Symbols/second", selection: $model.rate) { Text("3").tag(3); Text("5").tag(5); Text("10").tag(10) }.frame(width: 155)
-                    }
-                    HStack {
-                        Picker("Repair", selection: $model.repairPage) {
-                            Text("All pages").tag(-1)
-                            ForEach(0..<prepared.pages, id: \.self) { Text("Page \($0 + 1)").tag($0) }
-                        }.frame(width: 210)
-                        Spacer()
-                        Text("\(model.emitted) symbols emitted; receiver progress is shown on the phone.").font(.caption)
-                    }
-                    HStack {
-                        Button("Save Encrypted File…") { model.saveEncryptedFile() }.disabled(model.busy)
-                        Button("Save Verified MP4…") { model.saveVideo() }.disabled(model.busy)
-                        Button("Save Verified QR Animation…") { model.saveAnimation() }.disabled(model.busy)
-                        if model.busy { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
-                    }
-                    Text("MP4 video and lossless APNG animation reuse this package’s encrypted bytes. Each saved recording has a finite repair set; live playback can generate more. "
-                         + (prepared.protection == .recipient
-                            ? "No transfer code is generated. The iPhone must retain its active request key to open any saved file or recording."
-                            : "The transfer code is never included in exported media."))
-                        .font(.caption).foregroundStyle(.secondary)
+                    }.padding(28)
                 }
-                if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
-            }.padding(28)
+            }
         }.frame(minWidth: 760, minHeight: 680)
             .sheet(item: $model.sourceSheet) { sheet in
                 Group {
@@ -1159,6 +1105,35 @@ private struct MacExportView: View {
             .onAppear { model.openExport(isActive: scenePhase == .active) }
             .onChange(of: scenePhase, initial: true) { _, phase in model.setForeground(phase == .active) }
             .onDisappear { model.closeExport() }
+    }
+
+    /// While sending, the window is the animation: nothing to read, choose or type.
+    private var sending: some View {
+        VStack(spacing: 18) {
+            Text("Point your iPhone's camera at this").font(.largeTitle.bold())
+            Text("In FrankenTerm on the iPhone, tap Get Machines from My Mac.").font(.title3).foregroundStyle(.secondary)
+            ZStack {
+                RoundedRectangle(cornerRadius: 20).fill(.white)
+                if let symbol = model.symbol {
+                    PixelPerfectQRCode(symbol: symbol).padding(20)
+                } else {
+                    ProgressView().controlSize(.large)
+                }
+            }.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let message = model.message { Text(verbatim: message).font(.callout).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button("Done") { model.stopSending() }.controlSize(.large).keyboardShortcut(.defaultAction)
+                Spacer()
+            }.overlay(alignment: .trailing) {
+                Menu {
+                    Button("Save Encrypted File…") { model.saveEncryptedFile() }
+                    Button("Save as MP4 Video…") { model.saveVideo() }
+                    Button("Save as QR Animation…") { model.saveAnimation() }
+                } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).fixedSize().disabled(model.busy)
+            }
+        }.padding(28)
     }
 
     private func recipientCamera(scanID: UUID) -> some View {
@@ -1207,6 +1182,61 @@ private struct MacExportView: View {
 
     @ViewBuilder
     private func exportChoices(_ source: WorkspaceDocument) -> some View {
+        if let selection = model.selection, let review = model.exportReview {
+            sendSummary(selection, review)
+        }
+        DisclosureGroup("Details: groups, keys and host trust") {
+            VStack(alignment: .leading, spacing: 20) { exportDetails(source) }.padding(.top, 10)
+        }
+    }
+
+    /// The whole job at a glance: these machines, in their colors, and one button.
+    @ViewBuilder
+    private func sendSummary(_ selection: WorkspaceExportSelection, _ review: WorkspaceExportSelection.Review) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Send your machines to your iPhone").font(.title.bold())
+                Text("\(selection.orderedMachines.count) machines and \(review.includedIdentityCount) keys from \(selection.workspace.name)")
+                    .font(.title3).foregroundStyle(.secondary)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
+                ForEach(selection.orderedMachines) { machine in
+                    let theme = selection.workspace.themes.first { $0.id == machine.themeID }
+                    HStack(spacing: 8) {
+                        Circle().fill(Color(ftExportHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
+                        Text(verbatim: machine.name).lineLimit(1).foregroundStyle(Color(ftExportHex: theme?.foreground ?? "#FFFFFF"))
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 10)
+                    .background(Color(ftExportHex: theme?.background ?? "#1C1C1E"), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(ftExportHex: theme?.accent ?? "#888888").opacity(0.45)))
+                }
+            }
+            if !review.canPrepare {
+                Label(review.pendingIdentityCount + review.missingApprovedKeyCount == 1
+                      ? "One key needs your attention under Details."
+                      : "\(review.pendingIdentityCount + review.missingApprovedKeyCount) keys need your attention under Details.",
+                      systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+            HStack(spacing: 14) {
+                Button {
+                    model.sendToPhone()
+                } label: {
+                    Label("Send to iPhone", systemImage: "iphone.and.arrow.forward")
+                        .font(.title3.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
+                }.buttonStyle(.borderedProminent).controlSize(.extraLarge).keyboardShortcut(.defaultAction)
+                    .disabled(model.busy || !review.canPrepare || !model.destinationReady)
+                if model.busy { ProgressView().controlSize(.small) }
+            }
+            Text("Your keys travel inside the animation. Anyone who films this screen while it plays could read them.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(22).frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    @ViewBuilder
+    private func exportDetails(_ source: WorkspaceDocument) -> some View {
         GroupBox("Choose groups") {
             VStack(alignment: .leading, spacing: 12) {
                 Text(verbatim: source.name).font(.headline)
@@ -1286,19 +1316,7 @@ private struct MacExportView: View {
                     }
                     Text("The phone evaluates its existing identities, reviewed host trust, and transport support separately. Required policies remain enforced after restoring a narrower workspace.")
                         .font(.caption).foregroundStyle(.secondary)
-                    HStack {
-                        Button {
-                            model.sendToPhone()
-                        } label: {
-                            Label("Send to iPhone", systemImage: "iphone.and.arrow.forward").font(.title3.bold()).padding(.horizontal, 8)
-                        }.buttonStyle(.borderedProminent).controlSize(.large)
-                            .disabled(model.busy || !review.canPrepare || !model.destinationReady)
-                        if model.busy { ProgressView().controlSize(.small) }
-                        Spacer()
-                        Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
-                    }
-                    Text("Sends \(review.includedIdentityCount) private keys with the machines. Anyone who films this screen while the animation plays could read them.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Clear Loaded Material", role: .destructive) { model.clear() }.disabled(model.busy)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
         }
@@ -1537,5 +1555,16 @@ private struct PixelPerfectQRCode: NSViewRepresentable {
             context.interpolationQuality = .none; context.setShouldAntialias(false)
             context.draw(image, in: CGRect(x: x, y: y, width: size, height: size))
         }
+    }
+}
+
+private extension Color {
+    /// A theme color from a workspace document (`#RRGGBB` or `#RRGGBBAA`).
+    init(ftExportHex hex: String) {
+        let raw = String(hex.dropFirst())
+        let number = UInt64(raw, radix: 16) ?? 0
+        let rgba = raw.count == 8 ? number : (number << 8) | 255
+        self.init(.sRGB, red: Double((rgba >> 24) & 255) / 255, green: Double((rgba >> 16) & 255) / 255,
+                  blue: Double((rgba >> 8) & 255) / 255, opacity: Double(rgba & 255) / 255)
     }
 }

@@ -46,6 +46,13 @@ public struct FixedQRCode: Sendable {
         try self.init(alphanumericText: recipientRequest.text, profile: .ftqr1)
     }
 
+    /// The unlock code frame a code-protected animation interleaves, in the
+    /// same geometry; only text that parses as one is accepted.
+    public init(transferCodeFrame text: String) throws {
+        guard TransferCodeFrame.parse(text) != nil else { throw FTError.malformed("qr.code_frame") }
+        try self.init(alphanumericText: text, profile: .ftqr1)
+    }
+
     private init(alphanumericText text: String, profile: FixedQRCodeProfile) throws {
         guard text.utf8.count <= profile.maximumTextBytes else { throw FTError.limit("qr.profile_capacity") }
         // Reject byte-mode inputs, embedded NULs, and case changes instead of

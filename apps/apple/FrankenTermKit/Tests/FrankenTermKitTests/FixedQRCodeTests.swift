@@ -92,6 +92,25 @@ final class FixedQRCodeTests: XCTestCase {
         }
     }
 
+    /// The animation carries the unlock code as one more FTQR1 symbol, so it
+    /// must fit the profile's alphanumeric alphabet (a lowercase digest once
+    /// stopped every animation at its first code frame) and unlock the transfer.
+    func testTheCodeFrameIsAProfileSymbolThatUnlocksItsTransfer() throws {
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let exported = try FTAG.seal(archive, using: crypto)
+        let sender = try OpticalSender(envelope: exported.envelope, using: crypto)
+        let frame = TransferCodeFrame.text(envelopeDigest: sender.identity.envelopeDigest,
+                                           code: exported.code.reveal(using: crypto))
+        try assertFormatIsQ(FixedQRCode(transferCodeFrame: frame))
+        XCTAssertThrowsError(try FixedQRCode(transferCodeFrame: "FTCODE1:not a frame"))
+        let parsed = try XCTUnwrap(TransferCodeFrame.parse(frame))
+        XCTAssertEqual(parsed.digestPrefix, TransferCodeFrame.digestPrefix(sender.identity.envelopeDigest))
+        let code = try TransferCode(entered: parsed.code, using: crypto)
+        XCTAssertEqual(try FTAG.open(exported.envelope, code: code, using: crypto).workspace.raw, archive.workspace.raw)
+        XCTAssertNil(TransferCodeFrame.parse("FTQR1/" + frame))
+        XCTAssertNil(TransferCodeFrame.parse("FTCODE1:SHORT:CODE"))
+    }
+
     func testIndependentDecoderFixturesCoverMaximumFramesAndACompleteWorkspace() throws {
         var cases: [DecoderCase] = []
         for side in [113, 226, 452, 1024] {

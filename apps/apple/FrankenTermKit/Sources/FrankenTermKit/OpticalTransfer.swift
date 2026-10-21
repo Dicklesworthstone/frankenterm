@@ -248,6 +248,28 @@ public struct OpticalFrame: Sendable {
     }
 }
 
+/// The unlock code as one more frame of a code-protected animation, so the
+/// phone needs nothing typed: `FTCODE1:<first 8 bytes of the envelope digest
+/// in hex>:<revealed code>`. Uppercase throughout, because the FTQR1 profile
+/// encodes only the QR alphanumeric alphabet. Anyone who films the animation
+/// gets the code with the pages; the operator chose that over typing it.
+public enum TransferCodeFrame {
+    public static func digestPrefix(_ envelopeDigest: Data) -> String { Data(envelopeDigest.prefix(8)).ftHex }
+
+    public static func text(envelopeDigest: Data, code: String) -> String {
+        "FTCODE1:\(digestPrefix(envelopeDigest)):\(code)"
+    }
+
+    /// The digest prefix and code, or nil for any other text.
+    public static func parse(_ text: String) -> (digestPrefix: String, code: String)? {
+        guard text.hasPrefix("FTCODE1:"), text.utf8.count <= FTLimit.qrText else { return nil }
+        let parts = text.dropFirst(8).split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2, parts[0].count == 16, parts[0].allSatisfy(\.isHexDigit),
+              !parts[1].isEmpty, parts[1].utf8.count <= 128 else { return nil }
+        return (parts[0].uppercased(), parts[1])
+    }
+}
+
 public struct OpticalSender: Sendable {
     public let identity: OpticalFrame.Identity
     private let pages: [URPageEncoder], pageDigests: [Data]

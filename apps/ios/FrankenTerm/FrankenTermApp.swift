@@ -315,11 +315,9 @@ final class MobileWorkspaceModel {
     }
     /// The unlock code the Mac's animation carries (`FTCODE1:<digest>:<code>`),
     /// bound to the transfer whose envelope digest starts with that prefix.
-    @ObservationIgnored private var scannedCode: (digest: String, code: String)?
-
-    private static func digestPrefix(_ digest: Data) -> String {
-        digest.prefix(8).map { String(format: "%02x", $0) }.joined()
-    }
+    @ObservationIgnored private var scannedCode: (digestPrefix: String, code: String)?
+    /// Each automatic step runs once per transfer or review.
+    @ObservationIgnored private var automaticSteps = Set<String>()
 
     /// The transfer moves on by itself: the transfer in view is the one to
     /// collect, and the code its animation carries unlocks it. Nothing to tap
@@ -328,11 +326,25 @@ final class MobileWorkspaceModel {
         guard !busy, active, showRestore, let state, !state.isSuspended else { return }
         switch state.phase {
         case .candidate:
-            guard let digest = state.identity?.envelopeDigest else { return }
+            guard let digest = state.identity?.envelopeDigest, automaticSteps.insert("select:\(digest.ftHex)").inserted else { return }
             run { restore, state in try await restore.selectCandidate(generation: state.generation, digest: digest) }
+        case .review:
+            // A restore that asks nothing saves itself; replacing a saved
+            // workspace stops here for its questions. Once per review: a
+            // failed save shows why instead of retrying.
+            guard let review = state.review, state.source != .workspaceDocument,
+                  !(review.requiresSourceAssociation || review.requiresSecurityApproval
+                    || review.removesMachines || review.isRollback),
+                  automaticSteps.insert("commit:\(review.token)").inserted else { return }
+            let token = review.token
+            run { restore, state in
+                try await restore.commit(reviewToken: token, generation: state.generation, sourceAndContentsConfirmed: true,
+                                         allowMachineRemoval: false, allowRollback: false,
+                                         associateWithExistingWorkspace: false, securityChangesConfirmed: false)
+            }
         case .locked where state.encryptionMode == .code:
             guard let scanned = scannedCode, let digest = state.identity?.envelopeDigest,
-                  scanned.digest == Self.digestPrefix(digest) else { return }
+                  scanned.digestPrefix == TransferCodeFrame.digestPrefix(digest) else { return }
             scannedCode = nil
             let code = scanned.code
             run { restore, state in try await restore.unlock(enteredCode: code, generation: state.generation) }
@@ -349,11 +361,9 @@ final class MobileWorkspaceModel {
     /// At most eight bounded strings wait on one consumer. No task-per-frame fanout.
     func observed(_ text: String) {
         if text.hasPrefix("FTCODE1:") {
-            let parts = text.dropFirst(8).split(separator: ":", maxSplits: 1).map(String.init)
-            guard active, showRestore, parts.count == 2, parts[0].count == 16, !parts[1].isEmpty,
-                  parts[1].utf8.count <= 128 else { return }
-            if scannedCode?.digest != parts[0] || scannedCode?.code != parts[1] {
-                scannedCode = (parts[0], parts[1])
+            guard active, showRestore, let frame = TransferCodeFrame.parse(text) else { return }
+            if scannedCode?.digestPrefix != frame.digestPrefix || scannedCode?.code != frame.code {
+                scannedCode = frame
                 advanceAutomatically()
             }
             return
@@ -502,44 +512,23 @@ struct MobileWorkspaceRoot: View {
     var body: some View {
         ZStack {
             NavigationStack {
-                List {
-                    Section {
-                        Label("Your machines. Your colors.", systemImage: "terminal.fill").font(.title2.bold()).padding(.vertical, 8)
-                        Text("Restore your Mac workspace from an encrypted transfer or a public workspace file. Included private keys go into this device’s protected Keychain.")
-                            .foregroundStyle(.secondary)
-                        Button { model.requestCamera() } label: {
-                            Label("Restore from Animated QR", systemImage: "qrcode.viewfinder")
-                        }.disabled(model.state == nil)
-                        Button { model.requestRecipient() } label: {
-                            Label("Encrypt Only for This Phone", systemImage: "iphone.and.arrow.forward")
-                        }.disabled(model.state == nil || model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
-                        Button { chooseFile = true } label: { Label("Open Workspace File", systemImage: "doc.badge.arrow.up") }
-                            .disabled(model.state == nil || model.busy)
+                Group {
+                    if model.workspaces.isEmpty { firstRun } else { savedWorkspaces }
+                }
+                .navigationTitle("FrankenTerm")
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Menu {
+                            Button { model.requestCamera() } label: { Label("Scan My Mac", systemImage: "qrcode.viewfinder") }
+                            Button { chooseFile = true } label: { Label("Open a Workspace File", systemImage: "doc") }
+                            Button { model.requestRecipient() } label: {
+                                Label("Encrypt Only for This Phone", systemImage: "lock.iphone")
+                            }.disabled(model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
+                        } label: { Image(systemName: "plus") }
+                            .disabled(model.state == nil)
+                            .accessibilityLabel("Add machines")
                     }
-                    Section("Saved workspaces") {
-                        if model.workspaces.isEmpty { Text("No workspace restored yet.").foregroundStyle(.secondary) }
-                        ForEach(model.workspaces) { saved in
-                            if let document = try? saved.document() {
-                                NavigationLink { MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model) } label: {
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(verbatim: document.name).font(.headline).lineLimit(1)
-                                        if let available = model.availableCredentials[saved.id] {
-                                            Text("\(document.machines.count) machines · \(available.count) available key references · Connect later")
-                                                .font(.caption).foregroundStyle(.secondary)
-                                        } else {
-                                            Text("\(document.machines.count) machines · Key availability needs protected storage")
-                                                .font(.caption).foregroundStyle(.secondary)
-                                        }
-                                    }.padding(.vertical, 4)
-                                }
-                            }
-                        }
-                    }
-                    Section {
-                        Text("Development build: offline workspace restoration and direct SSH terminals (Connect on a restored machine). Persistent FrankenTerm mux sessions are not integrated yet.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                }.navigationTitle("FrankenTerm")
+                }
             }
             if !model.active { Color(.systemBackground).ignoresSafeArea().overlay { Label("FrankenTerm", systemImage: "lock.shield").font(.title2) } }
         }
@@ -558,6 +547,46 @@ struct MobileWorkspaceRoot: View {
         .alert("FrankenTerm", isPresented: Binding(get: { !model.showRestore && model.message != nil }, set: { if !$0 { model.message = nil } })) {
             Button("OK") { model.message = nil }
         } message: { Text(verbatim: model.message ?? "") }
+    }
+
+    /// Nothing saved yet: one sentence and one button.
+    private var firstRun: some View {
+        VStack(spacing: 28) {
+            Spacer()
+            Image(systemName: "laptopcomputer.and.iphone")
+                .font(.system(size: 72, weight: .light)).symbolRenderingMode(.hierarchical).foregroundStyle(.tint)
+            VStack(spacing: 10) {
+                Text("Bring your machines over").font(.title.bold())
+                Text("On your Mac, open FrankenTerm Export and click Send to iPhone. Then scan it here.")
+                    .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            Spacer()
+            Button { model.requestCamera() } label: {
+                Label("Scan My Mac", systemImage: "qrcode.viewfinder")
+                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
+            }.buttonStyle(.borderedProminent).controlSize(.large)
+                .disabled(model.state == nil || model.requestingCameraAccess)
+        }.padding(24).padding(.bottom, 12)
+    }
+
+    private var savedWorkspaces: some View {
+        List(model.workspaces) { saved in
+            if let document = try? saved.document() {
+                NavigationLink { MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model) } label: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(verbatim: document.name).font(.headline).lineLimit(1)
+                        HStack(spacing: 5) {
+                            ForEach(document.machines.prefix(12)) { machine in
+                                let theme = model.machineThemes(saved.id, document: document)?.theme(for: machine)
+                                    ?? document.themes.first { $0.id == machine.themeID }
+                                Circle().fill(Color(ftHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
+                            }
+                            Text("\(document.machines.count) machines").font(.caption).foregroundStyle(.secondary).padding(.leading, 4)
+                        }
+                    }.padding(.vertical, 6)
+                }
+            }
+        }
     }
 }
 
@@ -612,7 +641,13 @@ struct OfflineRestoreSheet: View {
                             if [.idle, .candidate, .collecting, .locked].contains(state.phase), model.cameraRequested, !state.isSuspended {
                                 if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
                                     OpticalCamera(onCode: model.observed, onError: model.report)
-                                        .frame(height: 290).clipShape(RoundedRectangle(cornerRadius: 20))
+                                        .frame(maxWidth: .infinity).frame(height: 380)
+                                        .clipShape(RoundedRectangle(cornerRadius: 24))
+                                        .overlay(alignment: .bottom) {
+                                            Label("Point at the animation on your Mac", systemImage: "viewfinder")
+                                                .font(.footnote.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 7)
+                                                .background(.ultraThinMaterial, in: Capsule()).padding(14)
+                                        }
                                 } else {
                                     Text("Camera scanning is unavailable. Allow Camera access in Settings or open an already-local .ftairgap file.")
                                 }
@@ -632,18 +667,12 @@ struct OfflineRestoreSheet: View {
                                     model.run { restore, state in try await restore.reviewWorkspaceDocument(generation: state.generation) }
                                 }.buttonStyle(.borderedProminent)
                             case .preparingReview, .committing:
-                                ProgressView(state.phase == .committing ? "Saving protected workspace…" : "Preparing review…")
+                                ProgressView(state.phase == .committing ? "Saving your machines…" : "Unlocking…")
+                                    .frame(maxWidth: .infinity).padding(.vertical, 24)
                             case .review:
                                 if let review = state.review { reviewSummary(review) }
                             case .complete:
-                                Label("Your machines are on this phone", systemImage: "checkmark.circle.fill").font(.headline)
-                                if let receipt = state.receipt {
-                                    if !receipt.missingCredentialIDs.isEmpty {
-                                        Text("\(receipt.missingCredentialIDs.count) keys were not included, so their machines cannot connect yet.")
-                                    }
-                                    if receipt.cleanupPending { Text("The workspace is saved. Cleanup will be reconciled when storage is available.") }
-                                }
-                                Button("Done") { model.setRestoreVisible(false) }.buttonStyle(.borderedProminent).controlSize(.large)
+                                completeContent(state)
                             case .recoveryRequired:
                                 Text("The save may have completed. Check the saved result before attempting another import.")
                                 Button("Reconcile Saved Workspace") {
@@ -651,15 +680,17 @@ struct OfflineRestoreSheet: View {
                                 }.buttonStyle(.borderedProminent)
                             }
                             }
-                            if ![.committing, .preparingReview, .recoveryRequired].contains(state.phase) {
-                                Button("Start a Different Transfer", role: .destructive) {
+                            if [.locked, .documentReady, .review].contains(state.phase)
+                                || (state.phase == .idle && state.recipientRequest != nil) {
+                                Button("Start Over", role: .destructive) {
                                     code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
                                     associateWithExistingWorkspace = false; securityChangesConfirmed = false
                                     model.resetRestore()
                                 }
                             }
-                            if model.busy { ProgressView() }
                         }.padding(24).disabled(model.busy)
+                            .animation(.smooth, value: state.phase)
+                            .sensoryFeedback(.success, trigger: state.phase == .complete)
                     }
                 } else { ProgressView("Opening protected workspace…") }
             }.navigationTitle("Restore").navigationBarTitleDisplayMode(.inline)
@@ -686,6 +717,37 @@ struct OfflineRestoreSheet: View {
             code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
             associateWithExistingWorkspace = false; securityChangesConfirmed = false
         }
+    }
+
+    /// The payoff: what arrived, in its colors, and one way out.
+    @ViewBuilder private func completeContent(_ state: OfflineRestoreStatus) -> some View {
+        let document = try? state.receipt?.workspace.document()
+        VStack(spacing: 18) {
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 64)).foregroundStyle(.green)
+                .symbolEffect(.bounce, value: state.phase)
+            Text(document.map { "\($0.machines.count) machines added" } ?? "Machines added").font(.title2.bold())
+            if let document {
+                VStack(spacing: 8) {
+                    ForEach(document.machines) { machine in
+                        let theme = document.themes.first { $0.id == machine.themeID }
+                        HStack(spacing: 10) {
+                            Circle().fill(Color(ftHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
+                            Text(verbatim: machine.name).foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF")).lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(Color(ftHex: theme?.background ?? "#1C1C1E"), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+            }
+            if let receipt = state.receipt, !receipt.missingCredentialIDs.isEmpty {
+                Text("\(receipt.missingCredentialIDs.count) keys were not included, so their machines cannot connect yet.")
+                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            Button { model.setRestoreVisible(false) } label: {
+                Text("Done").font(.headline).frame(maxWidth: .infinity).padding(.vertical, 6)
+            }.buttonStyle(.borderedProminent).controlSize(.large)
+        }.frame(maxWidth: .infinity)
     }
 
     @ViewBuilder private func idleContent(_ state: OfflineRestoreStatus) -> some View {
