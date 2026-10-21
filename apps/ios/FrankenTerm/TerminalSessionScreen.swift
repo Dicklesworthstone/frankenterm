@@ -53,25 +53,42 @@ final class MobileConnections {
     fileprivate func releaseCleanup(_ id: UUID) { pendingCleanup[id] = nil }
 }
 
-/// The exact route a user chose to open. Credential choice follows the route's
-/// ordered references that are available on this device.
+/// One ready direct-SSH route to a machine, with the key it uses: the first of
+/// the route's ordered references available on this device.
+struct TerminalSessionRoute: Hashable {
+    let id: String, credentialID: String, host: String, port: UInt16
+}
+
+/// A machine to open and its ready routes, the chosen or preferred one first.
 struct TerminalSessionTarget: Hashable {
     let workspaceID: UUID, revision: UUID
-    let machineID: String, machineName: String, routeID: String, credentialID: String
+    let machineID: String, machineName: String
+    /// Never empty.
+    let routes: [TerminalSessionRoute]
     /// The machine theme as the terminal's base palette, and its background.
     let basePalette: [UInt8]?, background: String?
 
-    init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String, routeID: String,
-         credentialID: String, theme: WorkspaceDocument.Theme? = nil) {
+    init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String,
+         routes: [TerminalSessionRoute], theme: WorkspaceDocument.Theme? = nil) {
+        precondition(!routes.isEmpty, "a session target needs a route")
         self.workspaceID = workspaceID; self.revision = revision; self.machineID = machineID
-        self.machineName = machineName; self.routeID = routeID; self.credentialID = credentialID
+        self.machineName = machineName; self.routes = routes
         basePalette = theme?.terminalBasePalette; background = theme?.background
     }
 
-    /// The same route under another theme.
+    /// The same routes under another theme.
     func wearing(_ theme: WorkspaceDocument.Theme) -> TerminalSessionTarget {
         .init(workspaceID: workspaceID, revision: revision, machineID: machineID, machineName: machineName,
-              routeID: routeID, credentialID: credentialID, theme: theme)
+              routes: routes, theme: theme)
+    }
+
+    /// The order to try the routes in: those this device can reach now first
+    /// (see WorkspaceRouteNetwork.isLikelyReachable), each group in the
+    /// machine's own order.
+    func attemptOrder() -> [TerminalSessionRoute] {
+        let reachable = routes.map { WorkspaceRouteNetwork.isLikelyReachable($0.host) }
+        return routes.indices.filter { reachable[$0] }.map { routes[$0] }
+            + routes.indices.filter { !reachable[$0] }.map { routes[$0] }
     }
 
     /// Whether light chrome reads better over this background: its relative
@@ -156,11 +173,16 @@ final class TerminalSessionController {
         /// An earlier session on this machine left input with an unknown
         /// outcome; a new shell waits for the user's acknowledgement (plan 11.8).
         case needsReview
+        /// No route reached a signed-in connection, so no shell started and
+        /// nothing was sent.
+        case couldNotConnect(WorkspaceConnectionHelp)
         case ended(String)
         case failed(String)
     }
     let id = UUID()
     private(set) var phase: Phase = .idle
+    /// The route being tried, then the one connected.
+    private(set) var route: TerminalSessionRoute
     private(set) var terminal: NativeTerminalView?
     /// True only after every owned cleanup operation actually succeeds.
     private(set) var settled = false
@@ -232,7 +254,11 @@ final class TerminalSessionController {
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
         self.target = target; self.connections = connections; self.focus = focus
         basePalette = target.basePalette
+        route = target.routes[0]
     }
+
+    /// "Machine · Route", for labels that leave the session.
+    private var destination: String { "\(target.machineName) · Machine \(target.machineID) · Route \(route.id)" }
 
     /// Re-themes the terminal. Before the model exists, startup applies the
     /// latest palette; after, one change at a time reaches the runtime and
@@ -272,7 +298,7 @@ final class TerminalSessionController {
         terminal?.input.retire()
         let history = history
         let inspection = TerminalHistoryInspection(runtime: runtime, source: source,
-            destination: "\(target.machineName) · Machine \(target.machineID) · Route \(target.routeID)",
+            destination: destination,
             prepare: { await history?.waitUntilSettled() }) { [weak self] id, bookmark, failure in
                 guard let self, self.historyInspection?.id == id else { return }
                 self.historyInspection = nil
@@ -397,9 +423,7 @@ final class TerminalSessionController {
                 try await connections.journal.resolve(record)
             }
             try checkStarting()
-            let connection = try await connections.manager.connect(workspaceID: target.workspaceID,
-                expectedRevision: target.revision, machineID: target.machineID, routeID: target.routeID,
-                credentialID: target.credentialID, confirmedByUser: true)
+            let connection = try await connectFirstReachable()
             self.connection = connection
             try checkStarting()
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
@@ -429,7 +453,7 @@ final class TerminalSessionController {
             try checkStarting()
             presenter.view = view
             let clipboard = try NativeTerminalClipboardController(terminal: view,
-                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(target.routeID)")
+                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)")
             self.clipboard = clipboard; presenter.clipboard = clipboard
             clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
             let source = pump.source
@@ -484,9 +508,45 @@ final class TerminalSessionController {
             }
         } catch TerminalSessionJournalError.reviewRequired {
             if !stopped { phase = .needsReview }
+        } catch let failure as ConnectFailure {
+            if !stopped { phase = .couldNotConnect(failure.help) }
         } catch {
             if !stopped { phase = .failed(Self.describe(error)) }
         }
+    }
+
+    private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp }
+
+    /// Tries the machine's routes in attempt order and moves on only while an
+    /// address never answers. A refused key or a changed host key ends the
+    /// attempt with its own explanation; no other route is tried after it.
+    private func connectFirstReachable() async throws -> WorkspaceSSHConnection {
+        let onTailnet = WorkspaceRouteNetwork.deviceTailnetAddress() != nil
+        let device = "this \(UIDevice.current.model)"
+        var unreachable: [WorkspaceConnectionHelp] = []
+        for candidate in target.attemptOrder() {
+            try checkStarting()
+            route = candidate
+            do {
+                return try await connections.manager.connect(workspaceID: target.workspaceID,
+                    expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
+                    credentialID: candidate.credentialID, confirmedByUser: true)
+            } catch let error as NativeSSHError where error.isUnreachable {
+                if let help = WorkspaceConnectionHelp(failure: error, machine: target.machineName, host: candidate.host,
+                                                      port: candidate.port, onTailnet: onTailnet, device: device) {
+                    unreachable.append(help)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch TerminalSessionJournalError.reviewRequired {
+                throw TerminalSessionJournalError.reviewRequired
+            } catch {
+                throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                                                 message: Self.describe(error), remedy: .none))
+            }
+        }
+        throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)
+            ?? .init(title: "Couldn't connect to \(target.machineName)", message: "No route answered.", remedy: .none))
     }
 
     /// The desktop's default terminal font, bundled with its license, when it
@@ -681,8 +741,7 @@ final class TerminalSessionController {
                     let document = try await runtime.captureOutputDocument(source: runtime.source)
                     if retainEndedOutput {
                         retainedOutput = TerminalRetainedOutput(source: runtime.source,
-                            destination: "\(target.machineName) · Machine \(target.machineID) · Route \(target.routeID)",
-                            document: document)
+                            destination: destination, document: document)
                     }
                 } catch {
                     if retainEndedOutput { retainedOutputFailure = Self.describe(error) }

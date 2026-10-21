@@ -33,6 +33,19 @@ public enum WorkspaceStorageSelfTest {
                         let read = try vault.publicIdentity(account: binding.account)
                         report.append(read?.fingerprint == identity.fingerprint ? "ok: read back" : "FAILED: read back a different key")
                     } catch { report.append("FAILED: read back: \(describe(error))") }
+                    // A connection's key selection, which must not prompt.
+                    let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+                        credentialAlgorithms: [identity.algorithm], hostKeyAlgorithms: [identity.algorithm])
+                    for issue in try await store.loadWithReadiness(support: support).flatMap({ $0.routes.flatMap(\.issues) }) {
+                        report.append("route not ready: \(issue.message)")
+                    }
+                    do {
+                        let authorization = try await store.authorizeSSHAuthentication(workspaceID: saved.id,
+                            expectedRevision: saved.revision, routeID: "route", credentialID: binding.credentialID,
+                            presentedHostKey: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support)
+                        let blob = try await AppleSSHCredentialSigner().publicIdentity(requestID: UUID(), authorization: authorization)
+                        report.append(blob == identity.blob ? "ok: signer selects the key" : "FAILED: signer selected a different key")
+                    } catch { report.append("FAILED: signer: \(describe(error))") }
                     do { try vault.remove(account: binding.account); report.append("ok: removed") }
                     catch { report.append("FAILED: remove: \(describe(error))") }
                 }
@@ -77,7 +90,7 @@ public enum WorkspaceStorageSelfTest {
                           "preferred_route_ref": "route", "auto_connect": false]],
             "routes": [["id": "route", "mode": "direct_ssh", "host": "127.0.0.1", "port": 22, "user": "self-test",
                         "credential_refs": ["key"], "authentication_methods": ["publickey"],
-                        "host_trust_ref": "trust", "jump_routes": []]],
+                        "host_trust_ref": "trust", "jump_routes": [], "session_creation": "on_select"]],
             "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
                              "requirement": "matching_private_key", "private_material": "not_included"]],
             "host_trust": [["id": "trust", "host": "127.0.0.1", "port": 22, "revoked_keys": [],

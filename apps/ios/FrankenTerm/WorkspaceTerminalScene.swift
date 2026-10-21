@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import Observation
 import FrankenTermKit
+import FrankenTermSSHIntegration
 
 /// One machine of a live workspace scene, in the group's order. `target` is
 /// nil when none of its direct-SSH routes is ready on this device.
@@ -99,6 +100,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         foreground = active
         if active { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
+        // Back from turning Tailscale on: try the machine that needed it.
+        if active, let id = selectedMachineID, case .couldNotConnect(let help) = sessions[id]?.phase,
+           help.remedy == .turnOnTailscale, WorkspaceRouteNetwork.deviceTailnetAddress() != nil {
+            connect(id)
+        }
     }
 
     /// Synchronously seal every scene-owned responder before scheduling joins.
@@ -334,9 +340,14 @@ struct WorkspaceTerminalScreen: View {
         if let session = scene.sessions[machine.id] {
             switch session.phase {
             case .idle, .connecting:
-                ProgressView("Connecting to \(machine.name)…").tint(.white).foregroundStyle(.white)
+                ProgressView {
+                    Text("Connecting to \(machine.name)…")
+                    Text(verbatim: Self.via(session.route)).font(.caption).foregroundStyle(.white.opacity(0.7))
+                }.tint(.white).foregroundStyle(.white)
             case .live:
                 EmptyView()
+            case let .couldNotConnect(help):
+                connectionHelp(help) { scene.connect(machine.id) }
             case .needsReview:
                 notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
                        message: "A previous session may have left remote effects whose outcome is unknown.",
@@ -355,6 +366,53 @@ struct WorkspaceTerminalScreen: View {
             notice(symbol: "network.slash", title: "Not available here", message: machine.unavailable,
                    uncertain: false, enabled: false, action: nil) {}
         }
+    }
+
+    /// "over Tailscale · 100.91.120.17", naming how the route travels.
+    static func via(_ route: TerminalSessionRoute) -> String {
+        switch WorkspaceRouteNetwork(host: route.host) {
+        case .tailnet: "over Tailscale · \(route.host)"
+        case .localNetwork: "on the local network · \(route.host)"
+        case .internet: route.host
+        }
+    }
+
+    /// Nothing ran, so there is no session to review: the reason, the one
+    /// change that fixes it, and Try Again.
+    private func connectionHelp(_ help: WorkspaceConnectionHelp, retry: @escaping () -> Void) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: help.remedy == .turnOnTailscale ? "network.badge.shield.half.filled" : "wifi.exclamationmark")
+                .font(.system(size: 40)).symbolRenderingMode(.hierarchical)
+            Text(verbatim: help.title).font(.title3.bold()).multilineTextAlignment(.center)
+            Text(verbatim: help.message).font(.callout).multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(0.85))
+            switch help.remedy {
+            case .turnOnTailscale:
+                Button("Open Tailscale", systemImage: "arrow.up.forward.app") { Self.openTailscale() }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                Button("Try Again", systemImage: "arrow.clockwise", action: retry).buttonStyle(.bordered)
+                Text("FrankenTerm tries again on its own when you come back with Tailscale on.")
+                    .font(.caption).multilineTextAlignment(.center).foregroundStyle(.white.opacity(0.7))
+            case .allowLocalNetwork:
+                Button("Try Again", systemImage: "arrow.clockwise", action: retry)
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                Button("Open Settings", systemImage: "gear") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }.buttonStyle(.bordered)
+            case .none:
+                Button("Try Again", systemImage: "arrow.clockwise", action: retry)
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+            }
+        }.padding(24).frame(maxWidth: 420).foregroundStyle(.white)
+            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 20)).padding()
+            .accessibilityElement(children: .contain)
+    }
+
+    /// The Tailscale app when it is installed, otherwise its App Store page.
+    static func openTailscale() {
+        guard let app = URL(string: "tailscale://"),
+              let store = URL(string: "https://apps.apple.com/app/id1470499037") else { return }
+        UIApplication.shared.open(app) { opened in if !opened { UIApplication.shared.open(store) } }
     }
 
     /// Every way out of a session states that its last input may or may not

@@ -10,8 +10,14 @@ public struct WorkspaceVaultError: LocalizedError, Equatable, Sendable {
     public let operation: String
     public let status: OSStatus
     public var errorDescription: String? {
-        let detail = (SecCopyErrorMessageString(status, nil) as String?) ?? "unknown status"
-        return "The Keychain refused to \(operation) a private key (\(status): \(detail))."
+        switch status {
+        case errSecUserCanceled: return "Face ID or the passcode was cancelled, so the key wasn't used."
+        case errSecAuthFailed: return "Face ID or the passcode didn't succeed, so the key wasn't used."
+        case errSecInteractionNotAllowed: return "The key can't be used while this device is locked."
+        default:
+            let detail = (SecCopyErrorMessageString(status, nil) as String?) ?? "unknown status"
+            return "The Keychain refused to \(operation) a private key (\(status): \(detail))."
+        }
     }
     static func check(_ status: OSStatus, _ operation: String) throws {
         guard status != errSecSuccess else { return }
@@ -219,31 +225,17 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                 Self.worker.queue.async {
                     let result = Result<Data, Error> {
                         try Self.worker.check(requestID)
-                        if case .publicIdentity = operation {
-                            let metadataContext = LAContext(); metadataContext.interactionNotAllowed = true
-                            defer { metadataContext.invalidate() }
-                            var query = try AppleWorkspaceVault().query(account: authorization.account)
-                            query[kSecMatchLimit as String] = kSecMatchLimitOne
-                            query[kSecReturnAttributes as String] = true
-                            query[kSecUseAuthenticationContext as String] = metadataContext
-                            var item: CFTypeRef?
-                            let status = SecItemCopyMatching(query as CFDictionary, &item)
-                            try Self.worker.check(requestID)
-                            guard status == errSecSuccess, let attributes = item as? [String: Any] else {
-                                throw SSHAuthenticationError.denied
-                            }
-                            let metadata = try AppleWorkspaceVault.metadata(attributes: attributes)
-                            guard metadata.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
-                            if let identity = metadata.identity {
-                                guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
-                                    throw SSHAuthenticationError.identityMismatch
-                                }
-                                return identity.blob
-                            }
-                            // An identity imported before public metadata existed
-                            // stays usable. Obtain its public half on the same
-                            // bounded user-presence worker; never export the key.
+                        // The public half is in the account's details item,
+                        // which never prompts. Only a signature opens the
+                        // user-presence key item (see AppleWorkspaceVault).
+                        guard let identity = try AppleWorkspaceVault().publicIdentity(account: authorization.account) else {
+                            throw SSHAuthenticationError.unavailable
                         }
+                        guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
+                            throw SSHAuthenticationError.identityMismatch
+                        }
+                        guard case .signature(let challenge) = operation else { return identity.blob }
+                        guard identity.blob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
                         let context = LAContext()
                         context.localizedReason = "Use your SSH identity for \(authorization.user)@\(authorization.host):\(authorization.port)."
                         context.touchIDAuthenticationAllowableReuseDuration = 0
@@ -252,36 +244,21 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         var query = try AppleWorkspaceVault().query(account: authorization.account)
                         query[kSecMatchLimit as String] = kSecMatchLimitOne
                         query[kSecReturnData as String] = true
-                        query[kSecReturnAttributes as String] = true
                         query[kSecUseAuthenticationContext as String] = context
                         var item: CFTypeRef?
                         let status = SecItemCopyMatching(query as CFDictionary, &item)
                         try Self.worker.check(requestID)
-                        guard status == errSecSuccess, let attributes = item as? [String: Any],
-                              var container = attributes[kSecValueData as String] as? Data,
-                              !container.isEmpty, container.count <= FTLimit.key else {
-                            throw SSHAuthenticationError.denied
+                        try WorkspaceVaultError.check(status, "use")
+                        guard var container = item as? Data, !container.isEmpty, container.count <= FTLimit.key else {
+                            throw FTError.storage
                         }
                         // Foundation and Security may retain other copies. This
                         // clears the owned buffer, not a forensic-erasure promise.
                         defer { container.resetBytes(in: 0..<container.count) }
-                        let metadata = try AppleWorkspaceVault.metadata(attributes: attributes)
-                        guard metadata.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
-                        let value: Data
-                        switch operation {
-                        case .publicIdentity:
-                            let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container)
-                            guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
-                                throw SSHAuthenticationError.identityMismatch
-                            }
-                            guard metadata.identity.map({ $0 == identity }) ?? true else { throw SSHAuthenticationError.identityMismatch }
-                            value = identity.blob
-                        case .signature(let challenge):
-                            guard metadata.identity.map({ $0.blob == challenge.publicBlob }) ?? true else {
-                                throw SSHAuthenticationError.identityMismatch
-                            }
-                            value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
+                        guard try SSHUserAuthenticationSigner.publicIdentity(privateContainer: container) == identity else {
+                            throw SSHAuthenticationError.identityMismatch
                         }
+                        let value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
                         try Self.worker.check(requestID)
                         return value
                     }

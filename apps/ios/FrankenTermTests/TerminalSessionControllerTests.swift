@@ -106,7 +106,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         await connections.setActive(true)
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
-                machineID: id, machineName: id.capitalized, routeID: "route-\(id)", credentialID: "key"),
+                machineID: id, machineName: id.capitalized,
+                routes: [.init(id: "route-\(id)", credentialID: "key", host: "127.0.0.1", port: port)]),
                 unavailable: "", theme: nil)
         }
         let scene = try WorkspaceTerminalScene(workspaceID: installed.id, workspaceName: "Scene", machines: machines,
@@ -679,7 +680,7 @@ final class TerminalSessionControllerTests: XCTestCase {
                                                 journalIdentifier: "scene-stop-test-" + UUID().uuidString,
                                                 signer: SceneMemorySigner(vault: vault))
         let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "machine",
-            machineName: "Never connected", routeID: "route", credentialID: "key")
+            machineName: "Never connected", routes: [.init(id: "route", credentialID: "key", host: "127.0.0.1", port: 22)])
         let machine = SceneMachine(id: "machine", name: "Never connected", target: target, unavailable: "", theme: nil)
         let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, workspaceName: "Dormant",
             machines: [machine], initialMachineID: "machine", connections: connections)
@@ -726,7 +727,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let journal = connections.journal
         func scope() throws -> TerminalSessionScope {
             try .init(workspaceID: target.workspaceID, workspaceRevision: target.revision,
-                      machineID: target.machineID, routeID: target.routeID,
+                      machineID: target.machineID, routeID: target.routes[0].id,
                       transportID: UUID(), channelID: UUID())
         }
         let firstEpoch = try await journal.beginCreation(scope: scope())

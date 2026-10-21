@@ -60,6 +60,31 @@ public enum WorkspaceRouteNetwork: Sendable, Equatable {
         }
         return nil
     }
+
+    /// Whether this device has a path to the address right now: always on the
+    /// internet, with Tailscale up for the tailnet, and from an interface on
+    /// the same IPv4 subnet for a private address. A .local name or private
+    /// IPv6 address cannot be judged, so it counts as reachable.
+    public static func isLikelyReachable(_ host: String) -> Bool {
+        switch WorkspaceRouteNetwork(host: host) {
+        case .internet: return true
+        case .tailnet: return deviceTailnetAddress() != nil
+        case .localNetwork:
+            var target = in_addr()
+            guard inet_pton(AF_INET, host, &target) == 1 else { return true }
+            var list: UnsafeMutablePointer<ifaddrs>?
+            guard getifaddrs(&list) == 0, let first = list else { return true }
+            defer { freeifaddrs(list) }
+            for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+                guard let address = entry.pointee.ifa_addr, let mask = entry.pointee.ifa_netmask,
+                      Int32(address.pointee.sa_family) == AF_INET else { continue }
+                let own = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+                let bits = mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+                if bits != 0, own & bits == target.s_addr & bits { return true }
+            }
+            return false
+        }
+    }
 }
 
 /// What a connection that never reached its machine means for the user, and
@@ -68,6 +93,10 @@ public enum WorkspaceRouteNetwork: Sendable, Equatable {
 public struct WorkspaceConnectionHelp: Sendable, Equatable {
     public enum Remedy: Sendable, Equatable { case turnOnTailscale, allowLocalNetwork, none }
     public let title: String, message: String, remedy: Remedy
+
+    public init(title: String, message: String, remedy: Remedy) {
+        self.title = title; self.message = message; self.remedy = remedy
+    }
 
     /// `device` names this device in the text, such as "this iPhone".
     public init?(failure: any Error, machine: String, host: String, port: UInt16,

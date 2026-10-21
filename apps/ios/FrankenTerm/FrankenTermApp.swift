@@ -1313,19 +1313,18 @@ private struct MachineWorkspaceView: View {
                   unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
                   theme: theme)
         }
-        func target(_ route: String, _ credential: String) -> TerminalSessionTarget {
-            .init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
-                  machineName: machine.name, routeID: route, credentialID: credential, theme: theme)
-        }
-        if let chosen { return scene(target(chosen.route, chosen.credential)) }
-        var seen = Set<String>()
-        for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
+        // Every ready direct-SSH route, the chosen one, then the preferred one, first.
+        var seen = Set<String>(), routes: [TerminalSessionRoute] = []
+        for id in [chosen?.route, machine.preferredRouteID].compactMap({ $0 }) + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
                   local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
-                  let credential = route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
-            return scene(target(id, credential))
+                  let credential = id == chosen?.route ? chosen?.credential
+                      : route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
+            routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port))
         }
-        return scene(nil)
+        guard !routes.isEmpty else { return scene(nil) }
+        return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
+                           machineName: machine.name, routes: routes, theme: theme))
     }
 }
 
