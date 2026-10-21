@@ -142,7 +142,18 @@ swift test --package-path apps/apple/FrankenTermKit -j 2
 
 This Linux command uses pinned Swift Crypto for the production HPKE path and OpenSSL for independent deterministic RFC and source-key oracles. Ordinary recipient integration tests therefore exercise the maintained adapter rather than a different test-only implementation. Apple products use CryptoKit and CommonCrypto and never resolve or link the Linux-only dependencies. Source-key tests use independent `ssh-keygen` encrypted/clear pairs for both supported ciphers and every supported family, 64 independently generated padding variants, published bcrypt vectors, and NIST AES-CTR vectors. `AppleOpenSSHSourceKeyTests`, `AppleOpticalPresentationTests`, and `AppleOpticalVideoTests` are intentionally Apple-only and are **not** included in the Linux result. The native source-key suite checks the actual CryptoKit/CommonCrypto boundary; the four video tests cover decoded pixels/timing/reconstruction, cancellation and reuse, refusal of an existing destination, and a destination created during encoding.
 
-The Xcode project and Info.plist passed structural parsing; both application Swift files, native video source/tests and native terminal rendering/input files passed syntax parsing. **No Apple SDK type-check, native app build, Metal shader execution, Keychain/device test, camera capture, APNG/MP4 codec run, or performance qualification was available in this session.** Those are still required. A parser pass or Linux conditional build does not establish that the Apple-only branches compile. Run the native package tests and both app schemes on the repository's authorized Mac build environment, then exercise a passcode-enabled iPhone with the debugger detached for lifecycle tests.
+**Native Apple verification** (macOS 26.1, Xcode 26.1.1, Swift 6.2.1, iOS 26.1 simulator; first run 2026-10-20). Both apps build: `FrankenTerm` for the iOS Simulator and `FrankenTermExport` for macOS. On macOS, `swift test` passes the whole Kit suite including the Apple-only suites above (real H.264 encode, Vision decode, CryptoKit/CommonCrypto). On the iOS Simulator, `xcodebuild test -scheme FrankenTermKit` passes everything except five optical decode tests that skip because Vision cannot create an inference context in the Simulator (they run on macOS and devices). The UIKit input and navigation suites pass there. `FrankenTermTerminal` links the real Rust engine and its tests pass on macOS and the iOS Simulator. `FrankenTermSSH` passes its XCTests on the iOS Simulator and its loopback interop scripts on macOS. The hosted `FrankenTermTests` target draws a real Rust frame through `NativeTerminalRenderView` inside the app and checks glyph orientation. Not yet run: a physical device, Keychain prompts with a passcode, camera capture, performance.
+
+Native artifacts are built locally on a Mac (RCH workers cannot link Apple targets) and are gitignored:
+
+```sh
+scripts/build-apple-terminal-xcframework.sh   # frankenterm-term native-ffi -> FrankenTermTerminal/Artifacts
+scripts/build-apple-ssh-xcframework.sh        # libssh2 + OpenSSL (Cargo.lock-pinned sources) -> FrankenTermSSH/Artifacts
+xcodebuild test -project apps/apple/FrankenTerm.xcodeproj -scheme FrankenTerm \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+```
+
+The simulator build excludes x86_64 (both artifacts ship arm64 slices only). An Apple-host build of FrankenTermSSH or FrankenTermTerminal deletes their tracked `Package.resolved` (its pins are Linux-only); restore it rather than committing the deletion.
 
 Release distribution must use the repository's DSR system after its native iOS lane is implemented. Development Rust work remains subject to RCH; the bounded shared-engine tests above still need that environment. The Apple package introduces no local Cargo fallback.
 
