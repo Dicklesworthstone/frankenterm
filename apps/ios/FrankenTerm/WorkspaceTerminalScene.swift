@@ -58,10 +58,15 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !closed, let target = machines.first(where: { $0.id == machineID })?.target else { return }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
+        let reviewed: [TerminalSessionRecord]
+        if acknowledging {
+            guard let current = sessions[machineID], current.recoveryReviewReady else { return }
+            reviewed = current.recoveryRecords
+        } else { reviewed = [] }
         let controller = TerminalSessionController(target: target, connections: connections, focus: self)
         sessions[machineID] = controller
         controller.setPresentationVisible(foreground && machineID == selectedMachineID)
-        Task { await controller.start(acknowledgingEarlierSessions: acknowledging) }
+        Task { await controller.start(reviewingEarlierSessions: reviewed) }
     }
 
     /// Re-establishes the keyboard after its input generation ended (dismissed
@@ -256,7 +261,7 @@ struct WorkspaceTerminalScreen: View {
                 EmptyView()
             case .needsReview:
                 notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
-                       message: "A previous session here ended before everything typed in it had a known outcome.",
+                       message: "A previous session may have left remote effects whose outcome is unknown.",
                        uncertain: true, enabled: session.settled, cleanup: session) { scene.connect(machine.id, acknowledging: true) }
             case let .ended(message):
                 notice(symbol: "checkmark.circle", title: "Session ended", message: message, uncertain: true,
@@ -284,8 +289,58 @@ struct WorkspaceTerminalScreen: View {
             Text(title).font(.headline)
             Text(verbatim: message).multilineTextAlignment(.center).font(.callout)
             if uncertain {
-                Text("Commands typed just before it ended may or may not have run. Nothing is sent again automatically; check the machine before repeating one.")
+                Text("The session marker does not prove that a particular command was sent or executed. Nothing is sent again automatically; check the machine before repeating a command.")
                     .multilineTextAlignment(.center).font(.caption)
+            }
+            if uncertain, let cleanup {
+                if cleanup.recoveryLoading {
+                    ProgressView("Reading saved session history…")
+                } else if let failure = cleanup.recoveryFailure {
+                    Text("Saved session history is unavailable: \(failure)")
+                        .multilineTextAlignment(.center).font(.caption)
+                    Button("Retry Session Review") { Task { await cleanup.refreshRecoveryReview() } }
+                        .buttonStyle(.bordered)
+                } else if !cleanup.recoveryRecords.isEmpty {
+                    DisclosureGroup("Review \(cleanup.recoveryRecords.count) saved session records") {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 14) {
+                                ForEach(cleanup.recoveryRecords) { record in
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text(verbatim: "Route \(record.scope.routeID) · Session \(record.id.uuidString.prefix(8))")
+                                            .font(.caption.bold())
+                                        Text(verbatim: "Workspace revision \(record.scope.workspaceRevision.uuidString)")
+                                            .font(.caption2)
+                                        if record.inputEvidence.isEmpty {
+                                            Text("Only the session-start marker is available. It does not establish whether any input was sent.")
+                                        }
+                                        if record.inputEvidence.contains(.transportAccepted) {
+                                            Text("Some input crossed the SSH transport. This does not confirm that the remote program processed it.")
+                                        }
+                                        if record.inputEvidence.contains(.acceptedPrefix) {
+                                            Text("Some input or cleanup bytes were accepted. Their remote effects remain unconfirmed.")
+                                        }
+                                        if record.inputEvidence.contains(.unknownTransportOutcome) {
+                                            Text("Some in-flight input has an unknown transport outcome.")
+                                        }
+                                        if record.inputEvidence.contains(.knownUnsent) {
+                                            Text("Some input was confirmed unsent. Other operations may still have had an effect.")
+                                        }
+                                        if !record.canResolve {
+                                            Text("An active owner must finish this session's local cleanup before it can be acknowledged.")
+                                        }
+                                    }.font(.caption)
+                                }
+                            }
+                        }.frame(maxHeight: 220)
+                    }.font(.caption)
+                    Text("Starting a new session acknowledges these saved records. It does not confirm or repeat their remote effects.")
+                        .multilineTextAlignment(.center).font(.caption)
+                }
+                if cleanup.settled, !cleanup.recoveryReviewReady, !cleanup.recoveryLoading,
+                   cleanup.recoveryFailure == nil {
+                    Button("Refresh Session Review") { Task { await cleanup.refreshRecoveryReview() } }
+                        .buttonStyle(.bordered)
+                }
             }
             if cleanup?.interruptedInput == true {
                 Text("Some input was interrupted. Nothing will be replayed automatically.")
@@ -298,7 +353,8 @@ struct WorkspaceTerminalScreen: View {
             }
             if let action {
                 Button(action, systemImage: action == "Connect" ? "terminal" : "arrow.clockwise", action: perform)
-                    .buttonStyle(.borderedProminent).disabled(!enabled)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!enabled || (uncertain && cleanup?.recoveryReviewReady != true))
             }
         }.padding(24).foregroundStyle(.white)
             .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16)).padding()

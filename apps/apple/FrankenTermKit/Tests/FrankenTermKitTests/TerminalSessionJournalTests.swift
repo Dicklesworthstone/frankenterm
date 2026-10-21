@@ -54,7 +54,7 @@ final class TerminalSessionJournalTests: XCTestCase {
         XCTAssertEqual(try row?.text("transport"), connection.transportID.uuidString)
         XCTAssertEqual(try row?.text("channel"), connection.channelID.uuidString)
         XCTAssertEqual(Set(try XCTUnwrap(row).keys), ["id", "revision", "workspace", "workspace_revision",
-            "machine", "route", "transport", "channel", "process", "owner", "state"])
+            "machine", "route", "transport", "channel", "process", "owner", "state", "input_evidence"])
         XCTAssertNil(disk.bytes(.journal))
         let records = try await journal.records()
         XCTAssertEqual(records.map(\.scope), [connection])
@@ -272,14 +272,14 @@ final class TerminalSessionJournalTests: XCTestCase {
         let bytes = try XCTUnwrap(original.bytes(.catalog))
         let text = try XCTUnwrap(String(data: bytes, encoding: .utf8))
         var root = try StrictJSON.decode(bytes).object()
-        root["version"] = .number("2")
+        root["version"] = .number("3")
         let future = try StrictJSON.encode(.object(root))
-        root["version"] = .number("1")
+        root["version"] = .number("2")
         let rows = try XCTUnwrap(root["records"]).array()
         root["records"] = .array(rows + rows)
         let repeated = try StrictJSON.encode(.object(root))
-        let duplicateKey = Data(text.replacingOccurrences(of: "\"version\":1",
-                                                          with: "\"version\":1,\"version\":1").utf8)
+        let duplicateKey = Data(text.replacingOccurrences(of: "\"version\":2",
+                                                          with: "\"version\":2,\"version\":2").utf8)
         for corrupt in [Data("{".utf8), future, repeated, duplicateKey] {
             let disk = StoreTestPersistence(); disk.seed(corrupt, slot: .catalog)
             let journal = try TerminalSessionJournal(persistence: disk)

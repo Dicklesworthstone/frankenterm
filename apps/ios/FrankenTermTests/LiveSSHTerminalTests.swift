@@ -76,9 +76,12 @@ private final class MemorySigner: WorkspaceSSHSigning, @unchecked Sendable {
 @MainActor
 private final class ViewDelivery: TerminalModelDelivery {
     let view: NativeTerminalRenderView
+    private let connection: WorkspaceSSHConnection
     private(set) var frames = 0
     private(set) var text = ""
-    init(view: NativeTerminalRenderView) { self.view = view }
+    init(view: NativeTerminalRenderView, connection: WorkspaceSSHConnection) {
+        self.view = view; self.connection = connection
+    }
 
     func present(_ presentation: TerminalModelPresentation, source: TerminalSource) async throws {
         guard case let .frame(bytes) = presentation else { return }
@@ -91,7 +94,9 @@ private final class ViewDelivery: TerminalModelDelivery {
         frames += 1
         try view.submit(bytes, source: source)
     }
-    func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {}
+    func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {
+        try await connection.recordInput(outcomes, source: source)
+    }
 
     /// Bounded poll: true once a delivered frame shows `needle`.
     func waitFor(_ needle: String, seconds: Int) async -> Bool {
@@ -151,7 +156,8 @@ final class LiveSSHTerminalTests: XCTestCase {
             support: .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
                            credentialAlgorithms: [identity.algorithm], hostKeyAlgorithms: [host.algorithm]))
         await broker.resume()
-        let journal = try TerminalSessionJournal(directory: root.appendingPathComponent("journal"))
+        let journal = try TerminalSessionJournal(directory: root.appendingPathComponent("journal"),
+            identifier: "live-ssh-test-" + UUID().uuidString)
         let coordinator = try TerminalInputCoordinator()
         let manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal, coordinator: coordinator)
         await manager.resume()
@@ -169,7 +175,7 @@ final class LiveSSHTerminalTests: XCTestCase {
         view.frame = CGRect(x: 0, y: 0, width: min(window.bounds.width, 402), height: 340)
         window.addSubview(view)
         defer { view.removeFromSuperview() }
-        let delivery = ViewDelivery(view: view)
+        let delivery = ViewDelivery(view: view, connection: connection)
         let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery)
         let run = Task { try await pump.run(consumer: runtime) }
 
@@ -194,7 +200,18 @@ final class LiveSSHTerminalTests: XCTestCase {
         _ = try await coordinator.submit(focus, encodedBytes: Data("exit\r".utf8))
         let ended = try await run.value
         XCTAssertEqual(ended, .peerOutputEnded)
+        try? await manager.close(connectionID: connection.id)
+        try await coordinator.suspend(focus)
+        try await pump.reconcileStoppedOutcomes { outcomes, source in
+            try await connection.recordInput(outcomes, source: source)
+        }
+        try await connection.prepareInputSettlement(source: pump.source)
+        try await coordinator.retire(pump.source)
+        try await runtime.close()
         try await manager.close(connectionID: connection.id)
         XCTAssertGreaterThan(delivery.frames, 0)
+        let history = try await journal.records()
+        XCTAssertTrue(history.first?.inputEvidence.contains(.transportAccepted) == true)
+        XCTAssertTrue(history.first?.canResolve == true)
     }
 }

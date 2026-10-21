@@ -261,9 +261,23 @@ public final class WorkspaceSSHConnection: Sendable {
             pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight), source: source)
     }
 
+    /// Durably record the exact content-free outcome batch before acknowledging
+    /// it to the pump. This never accepts, retries, or replays terminal bytes.
+    public func recordInput(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {
+        try await native.recordInput(outcomes, source: source)
+    }
+
+    /// After joining the pump, responder cleanup and final outcome delivery,
+    /// retain proof of complete input settlement before coordinator.retire.
+    /// A later close publishes that proof and can retry a failed journal write.
+    public func prepareInputSettlement(source: TerminalSource) async throws {
+        try await native.prepareInputSettlement(source: source)
+    }
+
     /// Call when the pump ends, including EOF/error. Closing preserves unresolved
-    /// remote state. The scene separately joins its consumer and reconciles the
-    /// published source's outcomes; manager.close also releases its admission slot.
+    /// remote state. A published source must settle its responders and outcomes
+    /// before journal publication can succeed. Native I/O closes immediately;
+    /// manager.close releases its admission slot only after durable settlement.
     public func close() async throws { try await native.closeAndRecordInterruption() }
     fileprivate func sealAdmission() async { await native.sealAdmission() }
     fileprivate func validateForPublication() async throws { try await native.validateForPublication() }
