@@ -381,6 +381,33 @@ end
             lua.create_function(|_, ()| Ok(crate::running_under_wsl()))?,
         )?;
 
+        // The machine inventory beside this config (machines.toml) as plain
+        // tables, or nil when there is none; a path argument reads another
+        // file. Editing the inventory reloads the config like the file itself.
+        let inventory_dir = config_dir.to_path_buf();
+        wezterm_mod.set(
+            "machines",
+            lua.create_function(move |lua, path: Option<String>| {
+                let path = path
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| inventory_dir.join(crate::machines::FILE_NAME));
+                if !path.exists() {
+                    return Ok(Value::Nil);
+                }
+                add_to_config_reload_watch_list(
+                    lua,
+                    std::iter::once(path.to_string_lossy().into_owned()).collect(),
+                )?;
+                let inventory = crate::machines::MachineInventory::load(&path)
+                    .map_err(|err| mlua::Error::external(format!("{:#}", err)))?;
+                let context = crate::machines::InventoryContext {
+                    directory: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                    home: crate::HOME_DIR.clone(),
+                };
+                Ok(Value::Table(machines_table(lua, &inventory, &context)?))
+            })?,
+        )?;
+
         wezterm_mod.set(
             "default_wsl_domains",
             lua.create_function(|_, ()| Ok(crate::WslDomain::default_domains()))?,
@@ -1349,6 +1376,151 @@ fn utf16_to_utf8(_: &Lua, text: mlua::LuaString) -> mlua::Result<String> {
     .map_err(mlua::Error::external)
 }
 
+/// `frankenterm.machines()`: the inventory in the shapes a config uses —
+/// `colors` is a WezTerm `colors` table, `routes` keep their order, and each
+/// mux route carries the `proxy_command` argv for a unix domain.
+fn machines_table(
+    lua: &Lua,
+    inventory: &crate::machines::MachineInventory,
+    context: &crate::machines::InventoryContext,
+) -> mlua::Result<Table> {
+    use crate::machines::{MachineRoute, RouteTarget};
+    let strings = |values: &[String]| -> mlua::Result<Table> {
+        let table = lua.create_table()?;
+        for (index, value) in values.iter().enumerate() {
+            table.set(index + 1, value.as_str())?;
+        }
+        Ok(table)
+    };
+    let hexes = |values: &[crate::machines::Rgba]| -> mlua::Result<Table> {
+        let table = lua.create_table()?;
+        for (index, value) in values.iter().enumerate() {
+            table.set(index + 1, value.hex())?;
+        }
+        Ok(table)
+    };
+
+    let result = lua.create_table()?;
+    let workspace = lua.create_table()?;
+    workspace.set("id", inventory.workspace_id.as_str())?;
+    workspace.set("name", inventory.workspace_name.as_str())?;
+    result.set("workspace", workspace)?;
+    result.set("default_group", inventory.default_group.as_str())?;
+    let groups = lua.create_table()?;
+    for (index, group) in inventory.groups.iter().enumerate() {
+        let table = lua.create_table()?;
+        table.set("id", group.id.as_str())?;
+        table.set("name", group.name.as_str())?;
+        table.set("machines", strings(&group.machines)?)?;
+        groups.set(index + 1, table)?;
+    }
+    result.set("groups", groups)?;
+    let order: Vec<String> = inventory.machines.iter().map(|m| m.id.clone()).collect();
+    result.set("order", strings(&order)?)?;
+
+    let machines = lua.create_table()?;
+    for machine in &inventory.machines {
+        let table = lua.create_table()?;
+        table.set("id", machine.id.as_str())?;
+        table.set("name", machine.name.as_str())?;
+        table.set("short_label", machine.short_label.as_deref())?;
+        table.set("icon", machine.icon.as_deref())?;
+        table.set("cwd", machine.cwd.as_deref())?;
+        table.set("tags", strings(&machine.tags)?)?;
+        let theme = &machine.theme;
+        table.set("accent", theme.accent.hex())?;
+        let theme_table = lua.create_table()?;
+        theme_table.set("name", theme.name.as_str())?;
+        theme_table.set("automatic", theme.automatic)?;
+        table.set("theme", theme_table)?;
+
+        let palette = &theme.palette;
+        let colors = lua.create_table()?;
+        colors.set("foreground", palette.foreground.hex())?;
+        colors.set("background", palette.background.hex())?;
+        colors.set("cursor_fg", palette.cursor_fg.hex())?;
+        colors.set("cursor_bg", palette.cursor_bg.hex())?;
+        colors.set("cursor_border", palette.cursor_border.hex())?;
+        colors.set("selection_fg", palette.selection_fg.hex())?;
+        colors.set("selection_bg", palette.selection_bg.hex())?;
+        colors.set("ansi", hexes(&palette.ansi[..8])?)?;
+        colors.set("brights", hexes(&palette.ansi[8..])?)?;
+        if !palette.indexed.is_empty() {
+            let indexed = lua.create_table()?;
+            for (index, color) in &palette.indexed {
+                indexed.set(*index, color.hex())?;
+            }
+            colors.set("indexed", indexed)?;
+        }
+        table.set("colors", colors)?;
+        if let Some(gradient) = &theme.background_gradient {
+            let value = lua.create_table()?;
+            value.set("colors", hexes(&gradient.colors)?)?;
+            value.set("angle", gradient.angle)?;
+            value.set("opacity", gradient.opacity)?;
+            table.set("background_gradient", value)?;
+        }
+        if let Some(font) = &theme.font {
+            let value = lua.create_table()?;
+            value.set("family", font.family.as_str())?;
+            value.set("size", font.size)?;
+            table.set("font", value)?;
+        }
+
+        let routes = lua.create_table()?;
+        for (index, route) in machine.routes.iter().enumerate() {
+            let value = lua.create_table()?;
+            value.set("id", route.id())?;
+            match route {
+                MachineRoute::Ssh { target, .. } => {
+                    value.set("kind", "ssh")?;
+                    match target {
+                        RouteTarget::Alias(alias) => value.set("alias", alias.as_str())?,
+                        RouteTarget::Direct {
+                            host,
+                            user,
+                            port,
+                            identity_files,
+                        } => {
+                            value.set("host", host.as_str())?;
+                            value.set("user", user.as_str())?;
+                            value.set("port", *port)?;
+                            let expanded: Vec<String> = identity_files
+                                .iter()
+                                .map(|file| context.expand(file).to_string_lossy().into_owned())
+                                .collect();
+                            value.set("identity_files", strings(&expanded)?)?;
+                        }
+                    }
+                }
+                MachineRoute::FrankenTermMux {
+                    id,
+                    via,
+                    socket,
+                    relay,
+                } => {
+                    value.set("kind", "frankenterm_mux")?;
+                    value.set("via", strings(via)?)?;
+                    value.set("socket", socket.as_deref())?;
+                    value.set("relay", relay.as_deref())?;
+                    if let Some(argv) = machine.mux_proxy_command(id, context) {
+                        let argv = strings(&argv)?;
+                        if table.get::<Value>("mux_proxy_command")?.is_nil() {
+                            table.set("mux_proxy_command", argv.clone())?;
+                        }
+                        value.set("proxy_command", argv)?;
+                    }
+                }
+            }
+            routes.set(index + 1, value)?;
+        }
+        table.set("routes", routes)?;
+        machines.set(machine.id.as_str(), table)?;
+    }
+    result.set("machines", machines)?;
+    Ok(result)
+}
+
 pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlua::Result<()> {
     let mut watch_paths: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
     watch_paths.extend_from_slice(&args);
@@ -1426,6 +1598,81 @@ mod test {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn machines_reads_the_inventory_beside_the_config_and_watches_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_file = dir.path().join("frankenterm.lua");
+        let lua = make_lua_context(&config_file)?;
+        let missing: Value = lua.load("return frankenterm.machines()").eval()?;
+        assert!(missing.is_nil(), "no inventory is nil, so a config can fall back");
+
+        std::fs::write(
+            dir.path().join(crate::machines::FILE_NAME),
+            r##"
+version = 1
+[machines.trj]
+name = "Threadripper"
+[machines.trj.theme.colors]
+background = "#0a0e14"
+ansi = ["#000000","#ff0000","#00ff00","#ffff00","#0000ff","#ff00ff","#00ffff","#ffffff"]
+[machines.trj.theme.colors.indexed]
+"16" = "#123456"
+[[machines.trj.routes]]
+id = "ts"
+host = "100.91.120.17"
+user = "ubuntu"
+identity_file = "/keys/trj"
+[[machines.trj.routes]]
+id = "mux"
+kind = "frankenterm_mux"
+via = "ts"
+socket = "/run/user/1000/frankenterm/sock"
+[machines.css]
+[[machines.css.routes]]
+id = "ssh"
+ssh = "css"
+"##,
+        )?;
+        let (name, background, red, indexed, order, theme, mux, alias, automatic): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+        ) = lua
+            .load(
+                r#"
+                local m = frankenterm.machines()
+                local trj = m.machines.trj
+                return trj.name, trj.colors.background, trj.colors.ansi[2], trj.colors.indexed[16],
+                    table.concat(m.order, ','), trj.theme.name, table.concat(trj.mux_proxy_command, ' '),
+                    m.machines.css.routes[1].alias, m.machines.css.theme.automatic
+            "#,
+            )
+            .eval()?;
+        assert_eq!(name, "Threadripper");
+        assert_eq!(background, "#0A0E14");
+        assert_eq!(red, "#FF0000");
+        assert_eq!(indexed, "#123456");
+        assert_eq!(order, "css,trj", "with no groups, machines read by id");
+        assert_eq!(theme, "trj");
+        assert!(mux.ends_with("ubuntu@100.91.120.17 nc -N -U /run/user/1000/frankenterm/sock"), "{}", mux);
+        assert!(mux.starts_with("ssh -i /keys/trj -o ConnectTimeout=10"), "{}", mux);
+        assert_eq!(alias, "css");
+        assert!(automatic);
+        let watched: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
+        assert!(watched.iter().any(|p| p.ends_with(crate::machines::FILE_NAME)), "{:?}", watched);
+
+        std::fs::write(dir.path().join(crate::machines::FILE_NAME), "version = 1\n[machines.a]\n")?;
+        let err = lua.load("return frankenterm.machines()").exec().expect_err("no routes");
+        assert!(err.to_string().contains("machines.a.routes"), "{}", err);
+        Ok(())
     }
 
     #[test]
