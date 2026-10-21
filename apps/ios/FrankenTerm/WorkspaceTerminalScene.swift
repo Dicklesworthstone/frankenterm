@@ -204,6 +204,28 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 }
 
+/// Builds the live scene once, when its screen is actually shown. A
+/// NavigationLink evaluates its destination on every redraw of the page that
+/// holds it, so constructing the scene there built and dropped one per redraw.
+struct LiveWorkspaceView: View {
+    let initialMachineID: String
+    let makeScene: @MainActor () throws -> WorkspaceTerminalScene
+    @State private var scene: WorkspaceTerminalScene?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID) }
+            else if failed { Text("These machines could not be opened together.").padding() }
+            else { Color.black.ignoresSafeArea() }
+        }
+        .onAppear {
+            guard scene == nil, !failed else { return }
+            do { scene = try makeScene() } catch { failed = true }
+        }
+    }
+}
+
 /// The live workspace: the selected machine's terminal under a machine/pane
 /// rail, or that machine's connect, progress, review or ended card.
 struct WorkspaceTerminalScreen: View {

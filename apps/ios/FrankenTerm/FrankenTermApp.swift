@@ -1024,13 +1024,13 @@ private struct MachineWorkspaceView: View {
     /// The live scene over this group's machines in their order. The chosen
     /// route opens first; any other machine can connect through its first
     /// ready direct-SSH route, preferred route first.
-    @ViewBuilder private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState,
-                                            initial: String, route: String, credential: String) -> some View {
-        let scene = try? WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
-            machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },
-            initialMachineID: initial, connections: connections)
-        if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initial) }
-        else { Text("These machines could not be opened together.").padding() }
+    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState,
+                               initial: String, route: String, credential: String) -> some View {
+        LiveWorkspaceView(initialMachineID: initial) {
+            try WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
+                machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },
+                initialMachineID: initial, connections: connections)
+        }
     }
 
     private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
