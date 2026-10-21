@@ -81,6 +81,7 @@ mod keys;
 pub mod lua;
 pub mod machines;
 pub mod meta;
+pub mod mobile_export;
 pub mod migrate;
 mod scheme_data;
 mod serial;

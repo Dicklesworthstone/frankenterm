@@ -1523,6 +1523,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bitflags 2.13.2",
  "chrono",
  "colorgrad",
@@ -1539,6 +1540,7 @@ dependencies = [
  "frankenterm-ssh",
  "frankenterm-term",
  "fs2",
+ "hmac",
  "hostname",
  "lazy_static",
  "libc",
@@ -1554,6 +1556,8 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "shlex",
  "tempfile",
  "termwiz 0.24.0",
