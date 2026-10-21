@@ -889,16 +889,13 @@ private final class NativeTerminalFrameBuilder {
             var point = CGPoint(x: -left, y: -bottom)
             CTFontDrawGlyphs(font, &glyph, &point, 1, context)
         }
-        // Core Graphics glyph coordinates increase upward; atlas coordinates
-        // increase downward, as the canonical text shader's offset contract does.
-        var flipped = [UInt8](repeating: 0, count: pixels.count)
-        for row in 0..<height {
-            flipped.replaceSubrange(row * rowBytes..<(row + 1) * rowBytes,
-                with: pixels[(height - row - 1) * rowBytes..<(height - row) * rowBytes])
-        }
+        // Core Graphics user space increases upward, but a bitmap context stores
+        // its TOP row first, so `pixels` is already in the atlas's downward row
+        // order (the canonical text shader's offset contract). Flipping it here
+        // drew every glyph upside down (observed in the first Metal render).
         let position = try color ? colorShelf.reserve(width: width, height: height) : grayShelf.reserve(width: width, height: height)
         let texture = color ? resources.color : resources.gray
-        flipped.withUnsafeBytes { bytes in
+        pixels.withUnsafeBytes { bytes in
             texture.replace(region: MTLRegionMake2D(position.0, position.1, width, height), mipmapLevel: 0,
                 withBytes: bytes.baseAddress!, bytesPerRow: width * bpp)
         }
