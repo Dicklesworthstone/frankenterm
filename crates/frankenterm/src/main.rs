@@ -1753,6 +1753,23 @@ SEE ALSO:
         command: StorageCommands,
     },
 
+    /// The machine inventory (machines.toml) and its iPhone export
+    #[command(after_help = r#"EXAMPLES:
+    ft mobile init css trj ts1        Start machines.toml from SSH config hosts, each in its own theme
+    ft mobile show                    The machines, resolved themes and routes
+    ft mobile export --check          Report what the phone would get, write nothing
+    ft mobile export -o fleet.ftworkspace
+    ft mobile export --group fleet -o fleet.ftworkspace
+    ft mobile themes -o ThemeCatalog.json
+
+The inventory lives beside frankenterm.lua (~/.config/frankenterm/machines.toml).
+Exports carry public keys and known_hosts pins only, never a private key; seal
+keys for the phone with the Mac companion."#)]
+    Mobile {
+        #[command(subcommand)]
+        command: MobileCommands,
+    },
+
     /// Backup and restore commands
     #[command(after_help = r#"EXAMPLES:
     ft backup export                  Export a backup to .ft/backups/
@@ -8140,6 +8157,45 @@ enum ConfigProfileCommands {
         /// Custom config path
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MobileCommands {
+    /// Start a machine inventory from SSH config hosts, each in its own theme
+    Init {
+        /// Host aliases from ~/.ssh/config (default: every concrete Host)
+        hosts: Vec<String>,
+        /// Inventory to create (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
+    /// Show the resolved inventory: machines, themes and routes
+    Show {
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
+    /// Write the iPhone workspace document for the inventory
+    Export {
+        /// Only this group's machines
+        #[arg(long)]
+        group: Option<String>,
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// Where to write the .ftworkspace (default: standard output)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+        /// Report what would be exported without writing it
+        #[arg(long)]
+        check: bool,
+    },
+    /// Write every theme the iPhone can offer (the app bundles this catalog)
+    Themes {
+        /// Where to write the catalog (default: standard output)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
     },
 }
 
@@ -49872,6 +49928,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         return Ok(());
     }
 
+    // The machine inventory and its phone export read only the FrankenTerm
+    // config directory and SSH files: no ft config, workspace, logging or mux.
+    if let Some(Commands::Mobile { command }) = command.as_ref() {
+        return handle_mobile_command(command);
+    }
+
     // Incident recovery through a pinned older client must not depend on the
     // current config, workspace database, logging, font setup, or mux client.
     // Dispatch it before all of those surfaces so an explicit compatible
@@ -70315,6 +70377,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             handle_storage_command(command)?;
         }
 
+        Some(Commands::Mobile { .. }) => {
+            unreachable!("mobile is dispatched before workspace initialization")
+        }
+
         Some(Commands::Backup { command }) => {
             handle_backup_command(command, &layout, &workspace_root).await?;
         }
@@ -76081,6 +76147,126 @@ fn handle_learn_command(
 }
 
 /// Handle `ft storage` subcommands.
+fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
+    use ::config::machines::{self, InventoryContext, MachineInventory, MachineRoute, RouteTarget};
+    use ::config::mobile_export;
+
+    fn write_output(output: Option<&Path>, bytes: &[u8]) -> anyhow::Result<()> {
+        match output {
+            Some(path) => {
+                std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("wrote {}", path.display());
+            }
+            None => std::io::Write::write_all(&mut std::io::stdout(), bytes)?,
+        }
+        Ok(())
+    }
+    let context_for = |path: &Path| InventoryContext {
+        directory: path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        home: ::config::HOME_DIR.clone(),
+    };
+    let inventory_path = |explicit: &Option<PathBuf>| explicit.clone().unwrap_or_else(machines::default_path);
+
+    match command {
+        MobileCommands::Init { hosts, inventory } => {
+            let path = inventory_path(inventory);
+            if path.exists() {
+                anyhow::bail!(
+                    "{} already exists; edit it, or pass --inventory for a new file",
+                    path.display()
+                );
+            }
+            let hosts = if hosts.is_empty() {
+                mobile_export::ssh_config_hosts(&::config::HOME_DIR)
+            } else {
+                hosts.clone()
+            };
+            if hosts.is_empty() {
+                anyhow::bail!("no hosts given and no concrete Host entries in ~/.ssh/config");
+            }
+            let text = machines::inventory_template(&hosts);
+            // Never write an inventory that would not load.
+            MachineInventory::parse(&text, &context_for(&path))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_output(Some(&path), text.as_bytes())?;
+            eprintln!("{} machines, each in its own theme", hosts.len());
+        }
+        MobileCommands::Show { inventory } => {
+            let path = inventory_path(inventory);
+            let context = context_for(&path);
+            let inventory = MachineInventory::load(&path)?;
+            println!("{} ({})", inventory.workspace_name, path.display());
+            for group in &inventory.groups {
+                let marker = if group.id == inventory.default_group { " (default)" } else { "" };
+                println!("group {}{}: {}", group.id, marker, group.machines.join(", "));
+            }
+            for machine in &inventory.machines {
+                let theme = &machine.theme;
+                println!(
+                    "{} \"{}\": theme {}{} (accent {}, background {})",
+                    machine.id,
+                    machine.name,
+                    theme.name,
+                    if theme.automatic { ", automatic" } else { "" },
+                    theme.accent,
+                    theme.palette.background
+                );
+                for route in &machine.routes {
+                    match route {
+                        MachineRoute::Ssh { id, target: RouteTarget::Alias(alias) } => {
+                            println!("  {}: ssh alias {}", id, alias)
+                        }
+                        MachineRoute::Ssh {
+                            id,
+                            target: RouteTarget::Direct { host, user, port, .. },
+                        } => println!("  {}: ssh {}@{}:{}", id, user, host, port.unwrap_or(22)),
+                        MachineRoute::FrankenTermMux { id, .. } => {
+                            let command = machine
+                                .mux_proxy_command(id, &context)
+                                .map(|argv| argv.join(" "))
+                                .unwrap_or_default();
+                            println!("  {}: mux via {}", id, command)
+                        }
+                    }
+                }
+            }
+        }
+        MobileCommands::Export {
+            group,
+            inventory,
+            output,
+            check,
+        } => {
+            let path = inventory_path(inventory);
+            let source = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let context = context_for(&path);
+            let inventory = MachineInventory::load(&path)?;
+            let sources = mobile_export::SshSources::from_disk(&inventory, &context);
+            let export = mobile_export::export(&inventory, &source, group.as_deref(), &sources, &context)?;
+            for note in &export.notes {
+                eprintln!("note: {}", note);
+            }
+            eprintln!("{} machines and {} SSH routes for the phone", export.machines, export.routes);
+            if !*check {
+                let mut bytes = serde_json::to_vec_pretty(&export.document)?;
+                bytes.push(b'\n');
+                write_output(output.as_deref(), &bytes)?;
+            }
+        }
+        MobileCommands::Themes { output } => {
+            let mut bytes = serde_json::to_vec(&mobile_export::theme_catalog_json())?;
+            bytes.push(b'\n');
+            write_output(output.as_deref(), &bytes)?;
+        }
+    }
+    Ok(())
+}
+
 fn handle_storage_command(command: StorageCommands) -> anyhow::Result<()> {
     match command {
         StorageCommands::Advise {

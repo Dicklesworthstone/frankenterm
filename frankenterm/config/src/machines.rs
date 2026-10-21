@@ -1191,6 +1191,55 @@ fn parse_routes(path: &str, value: Option<&toml::Value>) -> Result<Vec<MachineRo
     Ok(routes)
 }
 
+/// A first inventory for SSH config host aliases: one machine per alias, in
+/// one group, each pinned to its own distinct theme. Pinned explicitly rather
+/// than left automatic, so adding a machine later never recolours another.
+pub fn inventory_template(aliases: &[String]) -> String {
+    let mut ids: Vec<String> = Vec::new();
+    for alias in aliases {
+        let mut id: String = alias
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+            .collect();
+        id = id.trim_start_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+        id.truncate(40);
+        if id.is_empty() {
+            id = "machine".to_string();
+        }
+        let base = id.clone();
+        let mut n = 2;
+        while ids.contains(&id) {
+            id = format!("{}-{}", base, n);
+            n += 1;
+        }
+        ids.push(id);
+    }
+    let quoted = |text: &str| format!("{:?}", text);
+    let mut text = String::from(
+        "# FrankenTerm machine inventory: read by the desktop config\n\
+         # (frankenterm.machines()), `ft mobile export` and the phone.\n\
+         # Each machine names a theme: a FrankenTerm hue theme, any built-in\n\
+         # scheme, or a .toml scheme file; [machines.<id>.theme.colors] overrides it.\n\
+         # A machine with no theme table gets an unused hue theme automatically.\n\n\
+         version = 1\ndefault_group = \"machines\"\n\n[groups.machines]\nname = \"Machines\"\nmachines = [",
+    );
+    text.push_str(&ids.iter().map(|id| quoted(id)).collect::<Vec<_>>().join(", "));
+    text.push_str("]\n");
+    for (index, (id, alias)) in ids.iter().zip(aliases).enumerate() {
+        text.push_str(&format!(
+            "\n[machines.{}]\nname = {}\n\n[machines.{}.theme]\nscheme = {}\n\n[[machines.{}.routes]]\nid = \"ssh\"\nssh = {}\n",
+            id,
+            quoted(alias),
+            id,
+            quoted(&distinct_theme_name(index)),
+            id,
+            quoted(alias)
+        ));
+    }
+    text
+}
+
 /// The SSH options the desktop has always used for its mux proxies.
 const MUX_SSH_OPTIONS: [&str; 5] = [
     "ConnectTimeout=10",
@@ -1549,6 +1598,23 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
                 Ok(_) => panic!("accepted:\n{}", text),
             }
         }
+    }
+
+    #[test]
+    fn a_first_inventory_pins_a_distinct_theme_to_every_host() {
+        let aliases: Vec<String> = ["css", "Trj", "my host", "css"].iter().map(|s| s.to_string()).collect();
+        let text = inventory_template(&aliases);
+        let inventory = parse(&text).unwrap();
+        let ids: Vec<&str> = inventory.machines.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["css", "trj", "my-host", "css-2"]);
+        let names: BTreeSet<&str> = inventory.machines.iter().map(|m| m.theme.name.as_str()).collect();
+        assert_eq!(names.len(), 4);
+        assert!(inventory.machines.iter().all(|m| !m.theme.automatic), "pinned, not automatic");
+        assert_eq!(inventory.machines[2].name, "my host");
+        assert_eq!(
+            inventory.machines[1].routes,
+            vec![MachineRoute::Ssh { id: "ssh".into(), target: RouteTarget::Alias("Trj".into()) }]
+        );
     }
 
     #[test]

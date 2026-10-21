@@ -124,6 +124,14 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<frankenterm_ssh::
     Some(resolver)
 }
 
+/// The concrete `Host` aliases in the user's SSH config, without patterns.
+pub fn ssh_config_hosts(home: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    alias_resolver(Some(&text), home)
+        .map(|resolver| resolver.enumerate_hosts())
+        .unwrap_or_default()
+}
+
 fn split_paths(value: Option<&String>, context: &InventoryContext) -> Vec<PathBuf> {
     value
         .map(|text| text.split_whitespace().map(|p| context.expand(p)).collect())
