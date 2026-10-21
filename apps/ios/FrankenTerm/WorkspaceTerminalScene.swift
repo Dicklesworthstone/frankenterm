@@ -33,6 +33,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored let navigation: TerminalNavigationCoordinator
     @ObservationIgnored private var bindings: [String: TerminalKeyboardNavigationBinding] = [:]
     @ObservationIgnored private var closed = false
+    @ObservationIgnored private var foreground = true
     @ObservationIgnored private var closing: Task<Void, Never>?
 
     init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
@@ -58,6 +59,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         if let current = sessions[machineID], !current.settled { return }
         let controller = TerminalSessionController(target: target, connections: connections, focus: self)
         sessions[machineID] = controller
+        controller.setPresentationVisible(foreground && machineID == selectedMachineID)
         Task { await controller.start(acknowledgingEarlierSessions: acknowledging) }
     }
 
@@ -72,7 +74,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func setForeground(_ active: Bool) {
         guard !closed else { return }
+        foreground = active
         if active { navigation.resume() } else { navigation.suspend() }
+        updatePresentationVisibility()
     }
 
     /// Synchronously seal every scene-owned responder before scheduling joins.
@@ -114,9 +118,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private func navigationChanged() {
         let selection = navigation.navigation.selection
         if selectedMachineID != selection?.machineID { selectedMachineID = selection?.machineID }
+        updatePresentationVisibility()
         guard navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
         sessions[selection.machineID]?.install(keyboard)
+    }
+
+    private func updatePresentationVisibility() {
+        for (machineID, controller) in sessions {
+            controller.setPresentationVisible(!closed && foreground && machineID == selectedMachineID)
+        }
     }
 
     /// Navigation refuses overlapping transactions; a gesture in flight ends
@@ -204,7 +215,10 @@ struct WorkspaceTerminalScreen: View {
         .toolbarBackground(background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(machine?.background) ? .dark : .light, for: .navigationBar)
-        .task { scene.connect(initialMachineID) }
+        .task {
+            scene.setForeground(scenePhase == .active)
+            scene.connect(initialMachineID)
+        }
         .onDisappear {
             let retiring = scene
             retiring.requestClose()

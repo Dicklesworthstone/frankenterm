@@ -62,6 +62,7 @@ public final class NativeTerminalRenderView: MTKView {
     private var active = true
     private var retired = false
     private var needsPreparation = false
+    private var waitingForResources = false
     private var failedRevision: UInt64?
     private var lastSize = CGSize.zero
     private var lastScale: CGFloat = 0
@@ -97,6 +98,8 @@ public final class NativeTerminalRenderView: MTKView {
             name: UIScene.willDeactivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(sceneActivated(_:)),
             name: UIScene.didActivateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(resourcesBecameAvailable),
+            name: NativeTerminalGPUReservation.availabilityNotification, object: nil)
     }
     @available(*, unavailable)
     public required init(coder: NSCoder) { fatalError("Use init(source:bundle:configuration:)") }
@@ -134,8 +137,10 @@ public final class NativeTerminalRenderView: MTKView {
     public func setSceneActive(_ active: Bool) {
         guard !retired, self.active != active else { return }
         self.active = active
+        worker.setActive(active)
         if active { requestPreparation() }
         else {
+            waitingForResources = false
             blinkTimer?.invalidate(); blinkTimer = nil
             displayLink?.isPaused = true
             discardPrepared()
@@ -153,7 +158,7 @@ public final class NativeTerminalRenderView: MTKView {
         blinkTimer?.invalidate(); blinkTimer = nil
         displayLink?.invalidate(); displayLink = nil; displayLifetime = nil
         discardPrepared()
-        worker.retire()
+        worker.setActive(false)
         onCaretUnavailable?()
         onCaret = nil; onCaretUnavailable = nil; onAppearance = nil; onViewportChange = nil; onFailure = nil
     }
@@ -196,8 +201,13 @@ public final class NativeTerminalRenderView: MTKView {
               window != nil, drawableSize.width > 0, drawableSize.height > 0,
               drawableSize.width <= 16384, drawableSize.height <= 16384,
               pending != nil || latest != nil else { return }
+        // A busy GPU budget is transient pressure, not a broken terminal. Keep
+        // one latest snapshot and wait for actual resource retirement. Recheck
+        // here as well as on wake so a release before the callback is not lost.
+        guard !waitingForResources || NativeTerminalGPUReservation.hasCapacity else { return }
         do {
             guard let lease = try slots.acquire() else { return }
+            waitingForResources = false
             let packet = pending; pending = nil
             let retained = latest
             let generation = preparationGeneration
@@ -229,6 +239,10 @@ public final class NativeTerminalRenderView: MTKView {
                                 if case let .unrenderable(_, error) = result {
                                     self.failedRevision = semantic.revision
                                     self.onCaretUnavailable?(); self.fail(error)
+                                } else if case .waitingForResources = result {
+                                    self.waitingForResources = true
+                                    self.needsPreparation = true
+                                    self.onCaretUnavailable?()
                                 }
                             }
                             if self.pending != nil { self.needsPreparation = true }
@@ -372,6 +386,10 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     private func fail(_ error: Error) { onFailure?((error as? TerminalRenderError) ?? .unavailable) }
+    @objc private func resourcesBecameAvailable() {
+        guard active, !retired, waitingForResources else { return }
+        requestPreparation()
+    }
     @objc private func applicationDeactivated() { setSceneActive(false) }
     @objc private func applicationActivated() { setSceneActive(window?.windowScene?.activationState == .foregroundActive) }
     @objc private func sceneDeactivated(_ note: Notification) {
@@ -512,21 +530,22 @@ private final class NativeTerminalResources: @unchecked Sendable {
 
 /// Six complete slot sets across all scenes bound these allocations to about
 /// 50 MiB. A slot retained by an unfinished command still consumes its permit.
-private final class NativeTerminalGPUReservation: @unchecked Sendable {
-    private final class Ledger: @unchecked Sendable {
-        let lock = NSLock()
-        var slots = 0
+private enum NativeTerminalResourceError: Error { case temporarilyUnavailable }
+
+private final class NativeTerminalGPUReservation: Sendable {
+    static let availabilityNotification = Notification.Name("org.frankenterm.terminal.gpu-resources-available")
+    private static let budget = TerminalRenderResourceBudget(maximumResources: 6) {
+        // The budget coalesces release bursts and calls this on MainActor.
+        NotificationCenter.default.post(name: availabilityNotification, object: nil)
     }
-    private static let ledger = Ledger()
-    private let admitted: Bool
+    private let lease: TerminalRenderResourceBudget.Lease
+    static var hasCapacity: Bool { budget.hasCapacity }
     init() throws {
-        admitted = Self.ledger.lock.withLock {
-            guard Self.ledger.slots < 6 else { return false }
-            Self.ledger.slots += 1; return true
+        guard let lease = Self.budget.acquire() else {
+            throw NativeTerminalResourceError.temporarilyUnavailable
         }
-        guard admitted else { throw TerminalRenderError.capacity }
+        self.lease = lease
     }
-    deinit { if admitted { Self.ledger.lock.withLock { Self.ledger.slots -= 1 } } }
 }
 
 private struct NativePreparedTerminalFrame: @unchecked Sendable {
@@ -545,11 +564,14 @@ private struct NativePreparedTerminalFrame: @unchecked Sendable {
 private enum NativeTerminalPreparationResult: Sendable {
     case ready(NativePreparedTerminalFrame)
     case synchronized(TerminalRenderFrame)
+    case inactive(TerminalRenderFrame)
+    case waitingForResources(TerminalRenderFrame)
     case unrenderable(TerminalRenderFrame, TerminalRenderError)
     var semantic: TerminalRenderFrame {
         switch self {
         case let .ready(value): value.semantic
-        case let .synchronized(value), let .unrenderable(value, _): value
+        case let .synchronized(value), let .inactive(value), let .waitingForResources(value),
+             let .unrenderable(value, _): value
         }
     }
 }
@@ -558,8 +580,24 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
     private let queue = DispatchQueue(label: "org.frankenterm.terminal.render", qos: .userInteractive)
     private let device: any MTLDevice
     private var resources: [Int: NativeTerminalResources] = [:]
+    private let activityLock = NSLock()
+    private var active = true, releaseQueued = false
     init(device: any MTLDevice) { self.device = device }
-    func retire() { queue.async { [self] in resources.removeAll() } }
+    func setActive(_ active: Bool) {
+        let release = activityLock.withLock {
+            self.active = active
+            guard !active, !releaseQueued else { return false }
+            releaseQueued = true; return true
+        }
+        if release {
+            queue.async { [self] in
+                activityLock.withLock { releaseQueued = false }
+                // Cache ownership only. Prepared results and submitted GPU
+                // commands keep their exact resources/permits until completion.
+                resources.removeAll()
+            }
+        }
+    }
     func enqueue(packet: Data?, retained: TerminalRenderFrame?, source: TerminalSource,
                  lease: TerminalRenderSlots.Lease, generation: UInt64, viewport: SIMD2<Int>,
                  scale: Double, configuration: NativeTerminalRenderConfiguration, blinkPhase: UInt64,
@@ -576,6 +614,12 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
                     } else if let retained { frame = retained }
                     else { throw TerminalRenderError.unavailable }
                     guard frame.rows * frame.columns <= 65536 else { throw TerminalRenderError.capacity }
+                    guard activityLock.withLock({ active }) else {
+                        // A coalesced eviction may precede this queued job.
+                        // Do not repopulate an inactive surface's cache afterward.
+                        resources.removeAll()
+                        completion(.success(.inactive(frame))); return
+                    }
                     if frame.flags & 8 != 0 { completion(.success(.synchronized(frame))); return }
                     do {
                         guard frame.fontRevision == configuration.fontRevision else { throw TerminalRenderError.staleFrame }
@@ -589,6 +633,14 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
                             configuration: configuration, scale: scale, viewport: viewport, blinkPhase: blinkPhase)
                             .build(lease: lease, generation: generation)
                         completion(.success(.ready(result)))
+                    } catch NativeTerminalResourceError.temporarilyUnavailable {
+                        // Another slot may be cached but idle while this slot
+                        // needs allocation. Drop cache references so our own
+                        // idle permits cannot deadlock the shared budget. A
+                        // submitted frame still owns its resources until its
+                        // real completion, which supplies the availability wake.
+                        resources.removeAll()
+                        completion(.success(.waitingForResources(frame)))
                     } catch {
                         completion(.success(.unrenderable(frame, (error as? TerminalRenderError) ?? .unavailable)))
                     }

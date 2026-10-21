@@ -82,6 +82,9 @@ struct TerminalSessionTarget: Hashable {
 private final class TerminalFramePresenter: TerminalModelDelivery {
     let source: TerminalSource
     weak var view: NativeTerminalView?
+    // The scene fences delivery synchronously, before the model actor applies
+    // its hide. An already-captured obsolete frame cannot restart hidden work.
+    var acceptsFrames = false
     var onUnavailable: ((TerminalRenderError) -> Void)?
     var onInterruptedInput: (() -> Void)?
     private var reportedInterruptedInput = false
@@ -89,6 +92,7 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
 
     func present(_ presentation: TerminalModelPresentation, source: TerminalSource) async throws {
         guard source == self.source else { throw TerminalInputError.stale }
+        guard acceptsFrames else { return }
         switch presentation {
         case let .frame(bytes): try view?.submit(bytes, source: source)
         case let .unavailable(reason): onUnavailable?(reason)
@@ -157,12 +161,28 @@ final class TerminalSessionController {
     @ObservationIgnored private var runObserver: Task<Void, Never>?
     @ObservationIgnored private var cleanup: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var presenter: TerminalFramePresenter?
+    @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
+    @ObservationIgnored private var presentationVisible = true
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
     @ObservationIgnored private var lastViewportRevision: UInt64 = 0
     @ObservationIgnored private var stopped = false
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
         self.target = target; self.connections = connections; self.focus = focus
+    }
+
+    /// Keep consuming this source's bytes/replies while it is offscreen, but
+    /// stop allocating snapshots and preparing GPU frames. The scene owns this
+    /// policy; changing presentation never changes the keyboard destination.
+    func setPresentationVisible(_ visible: Bool) {
+        let visible = visible && !stopped
+        presentationVisible = visible
+        presenter?.acceptsFrames = visible
+        terminal?.renderer.setSceneActive(visible)
+        if let presentation, !presentation.isRetired {
+            do { try presentation.request(visible, source: presentation.source) }
+            catch { fail(Self.describe(error)) }
+        }
     }
 
     /// Installs only the source-matching keyboard published by navigation.
@@ -229,7 +249,8 @@ final class TerminalSessionController {
             unadoptedModel = model
             if let palette = target.basePalette { try model.setBasePalette(palette) }
             let coordinator = connections.coordinator
-            let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: presenter)
+            let runtime = TerminalModelRuntime(model: model, coordinator: coordinator,
+                                               delivery: presenter, initiallyVisible: false)
             self.runtime = runtime; unadoptedModel = nil
             guard let focus else { throw TerminalKeyboardError.unavailable }
             attached = true
@@ -256,8 +277,13 @@ final class TerminalSessionController {
                 self.focus?.inputRetired(machineID: self.target.machineID)
             }
             phase = .live
-            view.setSceneActive(true)
-            view.requestKeyboard(true)
+            let presentation = TerminalPresentationVisibility(source: source, initiallyVisible: false) { visible, source in
+                try await runtime.setVisible(visible, source: source)
+            }
+            self.presentation = presentation
+            presentation.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            setPresentationVisible(presentationVisible)
+            view.requestKeyboard(presentationVisible)
             let run = Task {
                 try await pump.run(consumer: runtime) { geometry, appliedSource in
                     // Retirement can race the MainActor hop after the pump's
@@ -328,6 +354,9 @@ final class TerminalSessionController {
     }
 
     private func sealLocalOwnership() {
+        presentationVisible = false
+        presenter?.acceptsFrames = false
+        presentation?.retire()
         terminal?.retire()
         keyboard?.suspend()
         resize?.retire()
@@ -400,6 +429,10 @@ final class TerminalSessionController {
         }
         if let run { _ = await run.result }
         run = nil; runObserver = nil
+        if let presentation {
+            await presentation.waitUntilSettled()
+            self.presentation = nil
+        }
         if let resize { await resize.waitUntilSettled(); self.resize = nil }
         if attached, let source = pump?.source {
             do {
