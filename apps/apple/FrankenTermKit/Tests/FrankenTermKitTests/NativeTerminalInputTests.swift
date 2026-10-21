@@ -38,6 +38,10 @@ private final class NativeInputDelegate: NSObject, UITextInputDelegate {
     func textDidChange(_ textInput: (any UITextInput)?) { calls.append("textDidChange") }
     func selectionWillChange(_ textInput: (any UITextInput)?) { calls.append("selectionWillChange") }
     func selectionDidChange(_ textInput: (any UITextInput)?) { calls.append("selectionDidChange") }
+    // Required since iOS 18.4; the terminal input view publishes no conversation context.
+    func conversationContext(_ context: UIConversationContext?, didChange textInput: (any UITextInput)?) {
+        calls.append("conversationContextDidChange")
+    }
 }
 
 /// These tests require the real UIKit SDK. Linux deliberately excludes them;

@@ -146,11 +146,29 @@ import CoreGraphics
 import ImageIO
 import Vision
 
+/// Vision's barcode detector cannot create its inference context in the iOS
+/// Simulator (VNErrorDomain internal error "Could not create inference
+/// context"), so optical decode tests cannot run there. Skip only on that exact
+/// simulator failure; on macOS and devices the same error still fails the test.
+func skipIfSimulatorLacksVisionBarcodeInference() throws {
+    #if targetEnvironment(simulator)
+    guard let context = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 8,
+                                  space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue),
+          let probe = context.makeImage() else { return }
+    do {
+        try VNImageRequestHandler(cgImage: probe, options: [:]).perform([VNDetectBarcodesRequest()])
+    } catch let error as NSError where error.domain == VNErrorDomain && error.code == VNErrorCode.internalError.rawValue {
+        throw XCTSkip("Vision barcode inference is unavailable in the iOS Simulator (\(error.localizedDescription)); run on macOS or a device")
+    }
+    #endif
+}
+
 /// These execute only with an Apple SDK. Linux fixtures qualify the portable
 /// matrix/raster; they do not claim to qualify Vision, a camera, or H.264.
 @MainActor
 final class AppleFixedQRCodeTests: XCTestCase {
     func testNativeTransferAndRecipientPNGsHaveIdenticalGeometryAndDecode() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let renderer = NativeOpticalPresentation()
         let transfers = [
             (try await renderer.symbol(text: FixedQRFixtures.transfer), FixedQRFixtures.transfer),

@@ -95,6 +95,7 @@ import Vision
 @MainActor
 final class AppleOpticalPresentationTests: XCTestCase {
     func testNativeQRAndSavedAnimationDecodeBackIntoTheSameEnvelope() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let crypto = AppleCryptography()
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
         let exported = try FTAG.seal(archive, using: crypto)

@@ -88,6 +88,7 @@ final class AppleOpticalVideoTests: XCTestCase {
     /// FTAG pads plaintext to 4096-byte multiples, so even a 20-byte archive is a
     /// multipart page: every systematic part plus ceil(n/2)+16 repair parts.
     func testH264MoviesHoldEverySymbolForExactlyTenSixAndThreeFrames() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let root = try directory(), encrypted = try source(bytes: 20)
         let renderer = NativeOpticalVideo()
         let sender = try OpticalSender(envelope: encrypted.envelope, using: crypto)
@@ -109,6 +110,7 @@ final class AppleOpticalVideoTests: XCTestCase {
     }
 
     func testMultipartWorkspaceMovieReconstructsAndNeverOverwritesAnExistingFile() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let root = try directory(), renderer = NativeOpticalVideo()
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
         let exported = try FTAG.seal(archive, using: crypto)
@@ -132,6 +134,7 @@ final class AppleOpticalVideoTests: XCTestCase {
     }
 
     func testCancellationRetiresTheCandidateAndAllowsAFreshExport() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let root = try directory(), renderer = NativeOpticalVideo(), encrypted = try source(bytes: 40000)
         let cancelledURL = root.appendingPathComponent("cancelled.mp4")
         let task = Task { try await renderer.save(source: encrypted, to: cancelledURL, symbolsPerSecond: 3) }
