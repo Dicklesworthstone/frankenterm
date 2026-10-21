@@ -49,18 +49,17 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     @MainActor
     private func restore(_ app: XCUIApplication, _ inputs: Inputs) {
         XCUIDevice.shared.system.open(URL(fileURLWithPath: inputs.path))
-        let field = app.secureTextFields["Transfer code"]
-        XCTAssertTrue(field.waitForExistence(timeout: 20), "the opened package must reach the transfer-code step")
+        // A file carries no code frame, so the code is typed once.
+        let typeCode = app.buttons["Type the code instead"]
+        XCTAssertTrue(typeCode.waitForExistence(timeout: 20), "the opened package must reach the unlock step")
         snapshot("1-package-collected")
+        typeCode.tap()
+        let field = app.secureTextFields["Transfer code"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
         field.tap(); field.typeText(inputs.code)
-        app.buttons["Decrypt and Review"].tap()
+        app.buttons["Unlock"].tap()
 
-        let approve = app.switches["I verified the comparison value on my Mac and approve these settings, trust records, and keys."]
-        XCTAssertTrue(approve.waitForExistence(timeout: 20), "decryption must reach the review step")
-        snapshot("2-review")
-        if approve.value as? String != "1" { approve.switches.firstMatch.exists ? approve.switches.firstMatch.tap() : approve.tap() }
-        app.buttons["Restore Offline"].tap()
-
+        // A first restore asks nothing, so it saves itself after unlocking.
         let done = app.buttons["Done"]
         XCTAssertTrue(done.waitForExistence(timeout: 30), "the restore must publish")
         snapshot("3-restored")
