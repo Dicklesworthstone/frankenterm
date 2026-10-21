@@ -21,7 +21,10 @@ public actor WorkspaceNativeSSHConnection {
     private var opening: Task<TerminalSessionPump, Error>?
     private var openingAttempted = false, sourcePublished = false, closed = false
     private var shutdown: Task<Void, Never>?
+    private var settlement: (id: UUID, task: Task<Void, Error>)?
     private var journalEpoch: (journal: TerminalSessionJournal, epoch: TerminalSessionEpoch)?
+    private var inputSource: TerminalSource?
+    private var inputSeal: TerminalInputSeal?
 
     private init(transport: WorkspaceNativeSSHTransport, peer: NativeSSHPeer, scope: TerminalSessionScope) {
         self.transport = transport; self.peer = peer; identity = transport.identity
@@ -169,10 +172,17 @@ public actor WorkspaceNativeSSHConnection {
         try await validateCurrent()
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
         attached = pump
-        do { try await validateCurrent() }
+        do {
+            if let retained = journalEpoch {
+                try await retained.journal.bindInput(epoch: retained.epoch, to: pump.source)
+                inputSource = pump.source
+            }
+            try await validateCurrent()
+        }
         catch {
             try? await pump.disconnect()
-            try? await coordinator.retire(pump.source)
+            // The outer opening owner joins this task and caches any bound
+            // input seal before retiring this unpublished source.
             throw error
         }
         return pump
@@ -197,6 +207,24 @@ public actor WorkspaceNativeSSHConnection {
         try await requestResize(geometry)
     }
 
+    /// Persist only metadata from this exact source before the pump acknowledges
+    /// its outcome batch. The retained epoch remains usable after native close
+    /// while the scene joins and reconciles its final consumer work.
+    func recordInput(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {
+        guard source == inputSource, outcomes.allSatisfy({ $0.receipt.source == source }),
+              let retained = journalEpoch else { throw TerminalInputError.stale }
+        try await retained.journal.recordInput(outcomes, epoch: retained.epoch)
+    }
+
+    /// Cache the coordinator's immutable proof before the scene retires its
+    /// source. A later protected-storage failure can retry publication without
+    /// retaining a closed coordinator slot or minting from a retired source.
+    func prepareInputSettlement(source: TerminalSource) async throws {
+        guard source == inputSource, closed, let coordinator else { throw TerminalInputError.stale }
+        guard inputSeal == nil else { return }
+        inputSeal = try await coordinator.mintSeal(for: source)
+    }
+
     /// Stop input before joining any prompts, opening operation, or native I/O.
     /// Managers can seal every owned source first, then join their closes. This
     /// barrier does not itself wait for native teardown or forget its journal.
@@ -219,7 +247,8 @@ public actor WorkspaceNativeSSHConnection {
     /// Join native teardown and any in-progress creation before retiring its
     /// epoch. A marker that arrives during close is included in this same join.
     /// On storage failure the epoch remains owned for retry; another shell is
-    /// never authorized. Repeated or concurrent closes share one native job.
+    /// never authorized. Concurrent closes share native teardown and the same
+    /// settlement attempt; only a failed settlement may start a fresh retry.
     public func closeAndRecordInterruption() async throws {
         await sealAdmission()
         let task: Task<Void, Never>
@@ -236,18 +265,43 @@ public actor WorkspaceNativeSSHConnection {
             shutdown = task
         }
         await task.value
+        let attempt: (id: UUID, task: Task<Void, Error>)
+        if let existing = settlement { attempt = existing }
+        else {
+            attempt = (UUID(), Task { try await self.settleAfterNativeShutdown() })
+            settlement = attempt
+        }
+        do { try await attempt.task.value }
+        catch {
+            // Another waiter on this failed attempt must not erase a newer
+            // retry. A successful task remains retained as the close result.
+            if settlement?.id == attempt.id { settlement = nil }
+            throw error
+        }
+    }
+
+    private func settleAfterNativeShutdown() async throws {
         if !sourcePublished, let pump = attached, let coordinator {
             // A task result may have been completed but refused by the outer
             // cancellation/closed check before its source reached the caller.
-            // No responder or consumer can own this unpublished source.
+            // No responder or consumer can own this unpublished source. This
+            // retained settlement job alone may retire it across actor awaits.
             try? await pump.disconnect()
-            try? await coordinator.retire(pump.source)
+            if inputSource == pump.source { try await prepareInputSettlement(source: pump.source) }
+            try await coordinator.retire(pump.source)
         }
         attached = nil
-        // Keep this outside the once-only native close task: it must observe a
-        // late marker and retry a previously failed protected-storage write.
+        // A failed settlement can retry protected-storage publication after
+        // source retirement; its immutable seal remains owned by this object.
         if let retained = journalEpoch {
-            try await retained.journal.markInterrupted(epoch: retained.epoch)
+            if let source = inputSource {
+                // Published responders and outcomes must settle first. Refusing
+                // here retains both the epoch and the manager's admission slot;
+                // native teardown has already joined and cannot reopen.
+                try await prepareInputSettlement(source: source)
+                guard let inputSeal else { throw TerminalInputError.unavailable }
+                _ = try await retained.journal.sealInput(epoch: retained.epoch, boundary: inputSeal)
+            } else { try await retained.journal.markInterrupted(epoch: retained.epoch) }
             if journalEpoch?.epoch.id == retained.epoch.id { journalEpoch = nil }
         }
     }
@@ -268,10 +322,16 @@ public actor WorkspaceNativeSSHConnection {
 
     deinit {
         let pump = attached, transport = self.transport, retained = journalEpoch
+        let source = inputSource, seal = inputSeal
         Task {
             if let pump { try? await pump.disconnect() }
             await transport.close()
-            if let retained { try? await retained.journal.markInterrupted(epoch: retained.epoch) }
+            if let retained {
+                if let seal { _ = try? await retained.journal.sealInput(epoch: retained.epoch, boundary: seal) }
+                else if source == nil { try? await retained.journal.markInterrupted(epoch: retained.epoch) }
+                // A bound source without proof retains its durable uncertainty;
+                // deinitialization cannot invent completed input settlement.
+            }
         }
     }
 }

@@ -52,28 +52,40 @@ private final class ProbePersistence: WorkspacePersistence, @unchecked Sendable 
     func removeJournal() throws { lock.lock(); defer { lock.unlock() }; slots[.journal] = nil }
 }
 
-/// Park the first real journal write immediately before durable publication.
-/// No fake completion is returned: release lets FileWorkspacePersistence perform
-/// its actual atomic write and directory fsync, including after cancellation.
+/// Park a real creation write or the first catalog read after its publication,
+/// which is the source-binding boundary. Release performs the actual file I/O,
+/// including its atomic write and directory fsync after cancellation.
 private final class ParkedJournalPersistence: WorkspacePersistence, @unchecked Sendable {
+    enum Boundary: Sendable { case creationWrite, inputBindingRead }
     private let file: FileWorkspacePersistence
+    private let boundary: Boundary
     private let condition = NSCondition()
-    private var armed = true, parked = false, released = false
+    private var armed = true, parked = false, released = false, wroteCatalog = false
     private var observer: CheckedContinuation<Void, Never>?
-    init(directory: URL) throws { file = try FileWorkspacePersistence(directory: directory) }
+    init(directory: URL, boundary: Boundary = .creationWrite) throws {
+        file = try FileWorkspacePersistence(directory: directory); self.boundary = boundary
+    }
     func withExclusiveAccess<T>(_ body: () throws -> T) throws -> T { try file.withExclusiveAccess(body) }
-    func read(_ slot: WorkspaceStorageSlot, limit: Int) throws -> Data? { try file.read(slot, limit: limit) }
+    func read(_ slot: WorkspaceStorageSlot, limit: Int) throws -> Data? {
+        condition.lock()
+        if boundary == .inputBindingRead && wroteCatalog && slot == .catalog { parkWhileLocked() }
+        condition.unlock()
+        return try file.read(slot, limit: limit)
+    }
     func removeJournal() throws { try file.removeJournal() }
     func write(_ data: Data, to slot: WorkspaceStorageSlot) throws {
         condition.lock()
-        if armed && slot == .catalog {
-            armed = false; parked = true
-            let observer = self.observer; self.observer = nil
-            condition.unlock(); observer?.resume(); condition.lock()
-            while !released { condition.wait() }
-        }
+        if boundary == .creationWrite && slot == .catalog { parkWhileLocked() }
         condition.unlock()
         try file.write(data, to: slot)
+        if slot == .catalog { condition.lock(); wroteCatalog = true; condition.unlock() }
+    }
+    private func parkWhileLocked() {
+        guard armed else { return }
+        armed = false; parked = true
+        let observer = self.observer; self.observer = nil
+        condition.unlock(); observer?.resume(); condition.lock()
+        while !released { condition.wait() }
     }
     func waitUntilParked() async {
         await withCheckedContinuation { continuation in
@@ -84,6 +96,24 @@ private final class ParkedJournalPersistence: WorkspacePersistence, @unchecked S
     }
     func release() {
         condition.lock(); released = true; condition.broadcast(); condition.unlock()
+    }
+}
+
+/// A real synchronized file store with one injected publication failure. This
+/// exercises owner retry after source retirement without simulating SSH I/O.
+private final class FailedJournalPublication: WorkspacePersistence, @unchecked Sendable {
+    private let file: FileWorkspacePersistence
+    private let lock = NSLock()
+    private var armed = false
+    init(directory: URL) throws { file = try FileWorkspacePersistence(directory: directory) }
+    func failNextWrite() { lock.lock(); armed = true; lock.unlock() }
+    func withExclusiveAccess<T>(_ body: () throws -> T) throws -> T { try file.withExclusiveAccess(body) }
+    func read(_ slot: WorkspaceStorageSlot, limit: Int) throws -> Data? { try file.read(slot, limit: limit) }
+    func removeJournal() throws { try file.removeJournal() }
+    func write(_ data: Data, to slot: WorkspaceStorageSlot) throws {
+        lock.lock(); let fail = armed && slot == .catalog; if fail { armed = false }; lock.unlock()
+        if fail { throw WorkspaceProbeError.unexpected }
+        try file.write(data, to: slot)
     }
 }
 
@@ -249,16 +279,20 @@ private func exerciseShell(_ session: NativeSSHSession) async throws -> Int {
 
 private actor ManagedConsumer: TerminalSessionConsumer {
     let source: TerminalSource
+    private let connection: WorkspaceSSHConnection
     private var output = Data()
     private var outcomes: [TerminalInputOutcome] = []
     private var ended = false
-    init(source: TerminalSource) { self.source = source }
+    init(source: TerminalSource, connection: WorkspaceSSHConnection) {
+        self.source = source; self.connection = connection
+    }
     func receive(_ update: TerminalSessionUpdate, source: TerminalSource) async throws {
         guard source == self.source, !ended, output.count + update.output.count <= 256 else { throw WorkspaceProbeError.invalid }
         output += update.output; ended = update.endOfOutput
     }
     func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {
         guard source == self.source, self.outcomes.count + outcomes.count <= 2 else { throw WorkspaceProbeError.invalid }
+        try await connection.recordInput(outcomes, source: source)
         self.outcomes += outcomes
     }
     func waitForGreeting() async throws {
@@ -279,8 +313,13 @@ private actor ManagedConsumer: TerminalSessionConsumer {
 
 private func exerciseManagedConnection(store: WorkspaceStore, installed: InstalledWorkspace,
     broker: SSHAuthenticationBroker, directory: URL,
-    host: Data) async throws -> Int {
-    let journal = try TerminalSessionJournal(directory: directory), coordinator = try TerminalInputCoordinator()
+    host: Data, failFinalPublication: Bool = false) async throws -> Int {
+    let identifier = "workspace-probe-" + UUID().uuidString
+    let fault = try failFinalPublication ? FailedJournalPublication(directory: directory) : nil
+    let journal: TerminalSessionJournal
+    if let fault { journal = try TerminalSessionJournal(persistence: fault) }
+    else { journal = try TerminalSessionJournal(directory: directory, identifier: identifier) }
+    let coordinator = try TerminalInputCoordinator()
     let manager = WorkspaceSSHConnectionManager(store: store, broker: broker,
         journal: journal, coordinator: coordinator)
     do {
@@ -333,7 +372,8 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             throw WorkspaceProbeError.unexpected
         } catch NativeSSHError.busy {}
         guard await !connection.isClosed else { throw WorkspaceProbeError.invalid }
-        let consumer = ManagedConsumer(source: pump.source)
+        try await mustFail { try await connection.prepareInputSettlement(source: pump.source) }
+        let consumer = ManagedConsumer(source: pump.source, connection: connection)
         let run = Task { try await pump.run(consumer: consumer) }
         let watchdog = Task {
             do { try await Task.sleep(for: .seconds(7)); pump.requestStop() } catch {}
@@ -349,17 +389,40 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             try await consumer.verify(receipt: receipt, payload: payload)
             // EOF alone does not erase uncertain remote effects or release the
             // connection owner's epoch. Explicit local teardown retires it.
-            guard try await journal.records().first?.state == .creationStarted else { throw WorkspaceProbeError.invalid }
-            try await manager.close(connectionID: connection.id)
+            let delivered = try await journal.records()
+            guard delivered.first?.state == .creationStarted,
+                  delivered.first?.inputEvidence.contains(.transportAccepted) == true,
+                  delivered.first?.inputEvidence.contains(.acceptedPrefix) == true else { throw WorkspaceProbeError.invalid }
+            // Native close cannot make the epoch reviewable while the scene
+            // still owns a responder. The manager retains its admission slot.
+            try await mustFail { try await manager.close(connectionID: connection.id) }
+            guard WorkspaceNetworkActivity.shared.accounting().connections == 0,
+                  await manager.connections().count == 1,
+                  try await journal.records().first?.canResolve == false else { throw WorkspaceProbeError.invalid }
             try await mustFail { _ = try await coordinator.submit(focus, encodedBytes: Data("late".utf8)) }
             try await coordinator.suspend(focus)
+            try await pump.reconcileStoppedOutcomes { outcomes, source in
+                try await connection.recordInput(outcomes, source: source)
+            }
+            try await connection.prepareInputSettlement(source: pump.source)
             try await coordinator.retire(pump.source)
+            if let fault {
+                fault.failNextWrite()
+                try await mustFail { try await manager.close(connectionID: connection.id) }
+                guard await coordinator.accounting().connections == 0,
+                      WorkspaceNetworkActivity.shared.accounting().connections == 0,
+                      await manager.connections().count == 1,
+                      try await journal.records().first?.canResolve == true else { throw WorkspaceProbeError.invalid }
+            }
+            try await manager.close(connectionID: connection.id)
             let closed = await coordinator.accounting(), records = try await journal.records()
             guard closed.connections == 0, closed.streams == 0, closed.retainedBytes == 0,
                   closed.retainedRecords == 0, closed.inFlightBytes == 0,
                   WorkspaceNetworkActivity.shared.accounting().connections == 0,
                   records.count == 1, records[0].state == .interrupted, records[0].requiresReview,
-                  records[0].canResolve, await manager.connections().isEmpty else { throw WorkspaceProbeError.invalid }
+                  records[0].canResolve, records[0].inputEvidence.contains(.transportAccepted),
+                  records[0].inputEvidence.contains(.acceptedPrefix),
+                  await manager.connections().isEmpty else { throw WorkspaceProbeError.invalid }
             do {
                 _ = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
                     machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true)
@@ -368,7 +431,9 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             guard NativeSSHConnector.accounting().resolvingHosts == 0,
                   NativeSSHConnector.accounting().connectingSockets == 0 else { throw WorkspaceProbeError.invalid }
             try await journal.resolve(records[0])
-            let reopened = try TerminalSessionJournal(directory: directory)
+            let reopened: TerminalSessionJournal
+            if let fault { reopened = try TerminalSessionJournal(persistence: fault) }
+            else { reopened = try TerminalSessionJournal(directory: directory, identifier: identifier) }
             let recovered = try await reopened.records()
             guard recovered.count == 1, recovered[0].state == .acknowledged, !recovered[0].requiresReview,
                   await manager.connections().isEmpty, await manager.pendingCount == 0 else { throw WorkspaceProbeError.invalid }
@@ -443,6 +508,62 @@ private func exerciseCloseDuringCreation(store: WorkspaceStore, installed: Insta
     }
 }
 
+private func exerciseConcurrentCloseDuringBinding(store: WorkspaceStore, installed: InstalledWorkspace,
+    broker: SSHAuthenticationBroker, directory: URL) async throws {
+    let persistence = try ParkedJournalPersistence(directory: directory, boundary: .inputBindingRead)
+    let journal = try TerminalSessionJournal(persistence: persistence), coordinator = try TerminalInputCoordinator()
+    let manager = WorkspaceSSHConnectionManager(store: store, broker: broker,
+        journal: journal, coordinator: coordinator)
+    await manager.resume()
+    let connection = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
+        machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true,
+        connectionTimeout: .seconds(5), authenticationTimeout: .seconds(6))
+    let opening = Task { try await connection.openTerminal(geometry: .init(columns: 80, rows: 24)) }
+    await persistence.waitUntilParked()
+    let managedClose = Task { try await manager.close(connectionID: connection.id) }
+    // Direct closes deliberately bypass the manager's existing job coalescing.
+    // The failed opening wrapper is another independent native close caller.
+    let closes = (0..<8).map { _ in Task { try await connection.close() } }
+    do {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await !connection.isClosed {
+            guard ContinuousClock.now < deadline else { throw WorkspaceProbeError.unexpected }
+            await Task.yield()
+        }
+        let parked = await coordinator.accounting()
+        guard parked.connections == 1, parked.streams == 0, parked.retainedBytes == 0,
+              parked.retainedRecords == 0, parked.inFlightBytes == 0,
+              await manager.connections().count == 1 else { throw WorkspaceProbeError.invalid }
+        persistence.release()
+        try await mustFail { _ = try await opening.value }
+        try await managedClose.value
+        for close in closes { try await close.value }
+        // Successful retirement remains idempotent after its source disappears.
+        try await connection.close()
+        try await manager.close(connectionID: connection.id)
+        let accounting = await coordinator.accounting(), records = try await journal.records()
+        guard accounting.connections == 0, accounting.streams == 0,
+              accounting.retainedBytes == 0, accounting.retainedRecords == 0,
+              accounting.inFlightBytes == 0, await manager.connections().isEmpty,
+              await manager.pendingCount == 0,
+              WorkspaceNetworkActivity.shared.accounting().connections == 0,
+              records.count == 1, records[0].scope == connection.scope,
+              records[0].state == .interrupted, records[0].canResolve,
+              records[0].requiresReview, records[0].inputEvidence.isEmpty else {
+            throw WorkspaceProbeError.invalid
+        }
+        try await mustFail { _ = try await connection.openTerminal(geometry: .init(columns: 80, rows: 24)) }
+        await manager.suspend()
+    } catch {
+        persistence.release()
+        _ = try? await opening.value
+        _ = try? await managedClose.value
+        for close in closes { _ = try? await close.value }
+        await manager.suspend()
+        throw error
+    }
+}
+
 @main
 private enum WorkspaceProbe {
     static func main() async throws {
@@ -468,14 +589,18 @@ private enum WorkspaceProbe {
         let signer = ProbeSigner(vault: vault, held: delayed.contains(mode))
         let broker = SSHAuthenticationBroker(store: store, signer: signer, support: support)
         await broker.resume()
-        if mode == "managed" || mode == "managedClose" {
+        if mode == "managed" || mode == "managedClose" || mode == "managedFinalWriteFailure" || mode == "managedBindingClose" {
             guard let path = request["journalDirectory"] else { throw WorkspaceProbeError.invalid }
             let directory = URL(fileURLWithPath: path, isDirectory: true), bytes: Int
-            if mode == "managed" {
+            if mode == "managed" || mode == "managedFinalWriteFailure" {
                 bytes = try await exerciseManagedConnection(store: store, installed: installed, broker: broker,
-                    directory: directory, host: hostBlob)
-            } else {
+                    directory: directory, host: hostBlob, failFinalPublication: mode == "managedFinalWriteFailure")
+            } else if mode == "managedClose" {
                 try await exerciseCloseDuringCreation(store: store, installed: installed, broker: broker,
+                    directory: directory)
+                bytes = 0
+            } else {
+                try await exerciseConcurrentCloseDuringBinding(store: store, installed: installed, broker: broker,
                     directory: directory)
                 bytes = 0
             }

@@ -101,6 +101,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
             transferID: Data(repeating: 9, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
+                                                journalIdentifier: "scene-test-" + UUID().uuidString,
                                                 signer: SceneMemorySigner(vault: vault))
         await connections.setActive(true)
         let machines = ["alpha", "beta"].map { id in
@@ -118,6 +119,12 @@ final class TerminalSessionControllerTests: XCTestCase {
     @discardableResult
     private func connect(_ scene: WorkspaceTerminalScene, _ machine: String,
                          acknowledging: Bool = false) async throws -> TerminalSessionController {
+        if acknowledging, let current = scene.sessions[machine] {
+            for _ in 0..<200 where !current.recoveryReviewReady {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            XCTAssertTrue(current.recoveryReviewReady, "a new session must use the exact displayed history")
+        }
         scene.connect(machine, acknowledging: acknowledging)
         let session = try XCTUnwrap(scene.sessions[machine])
         for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
@@ -216,6 +223,12 @@ final class TerminalSessionControllerTests: XCTestCase {
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty, "closing the scene must settle the connection through the manager")
         await assertReleased(try XCTUnwrap(live.scene.sessions["alpha"]), connections: connections)
+        let history = try await connections.journal.records()
+        let record = try XCTUnwrap(history.first)
+        XCTAssertEqual(record.state, .interrupted)
+        XCTAssertTrue(record.canResolve)
+        XCTAssertTrue(record.inputEvidence.contains(.transportAccepted))
+        XCTAssertTrue(record.inputEvidence.mayHaveRemoteEffect)
     }
 
     /// A shell that exits ends the session from inside the pump task; teardown
@@ -506,6 +519,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let store = WorkspaceStore(persistence: try FileWorkspacePersistence(directory: root.appendingPathComponent("store")),
                                    vault: vault)
         let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
+                                                journalIdentifier: "scene-stop-test-" + UUID().uuidString,
                                                 signer: SceneMemorySigner(vault: vault))
         let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "machine",
             machineName: "Never connected", routeID: "route", credentialID: "key")
@@ -546,6 +560,41 @@ final class TerminalSessionControllerTests: XCTestCase {
         let records = try await connections.journal.records(), pending = await connections.manager.pendingCount
         XCTAssertTrue(records.isEmpty)
         XCTAssertEqual(pending, 0)
+    }
+
+    /// A new or changed record after review must remain unresolved. A generic
+    /// confirmation must never reread and acknowledge unseen session history.
+    func testNewSessionActionCannotAcknowledgeRecordsCreatedAfterReview() async throws {
+        let (connections, scene, target) = try dormantScene()
+        let journal = connections.journal
+        func scope() throws -> TerminalSessionScope {
+            try .init(workspaceID: target.workspaceID, workspaceRevision: target.revision,
+                      machineID: target.machineID, routeID: target.routeID,
+                      transportID: UUID(), channelID: UUID())
+        }
+        let firstEpoch = try await journal.beginCreation(scope: scope())
+        try await journal.markInterrupted(epoch: firstEpoch)
+        let first = try await connect(scene, "machine")
+        for _ in 0..<200 where !first.recoveryReviewReady { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(first.recoveryReviewReady)
+        let displayed = try XCTUnwrap(first.recoveryRecords.first)
+        XCTAssertTrue(displayed.inputEvidence.isEmpty)
+
+        // Another explicit owner resolves the first record and creates a new
+        // session while the original review is still visible on this scene.
+        try await journal.resolve(displayed)
+        let unseen = try await journal.beginCreation(scope: scope())
+        try await journal.markInterrupted(epoch: unseen)
+        let attempted = try await connect(scene, "machine", acknowledging: true)
+        XCTAssertFalse(attempted === first)
+        XCTAssertEqual(attempted.phase, .failed(TerminalSessionController.describe(TerminalSessionJournalError.staleReview)))
+        for _ in 0..<200 where !attempted.recoveryReviewReady { try await Task.sleep(for: .milliseconds(20)) }
+        let records = try await journal.records()
+        XCTAssertEqual(records.first(where: { $0.id == unseen.id })?.state, .interrupted)
+        XCTAssertEqual(attempted.recoveryRecords.map(\.id), [unseen.id])
+        let pending = await connections.manager.pendingCount
+        XCTAssertEqual(pending, 0, "stale review must fail before connection admission")
+        await scene.close()
     }
 
     func testStoppingWhileStartupIsPendingJoinsBeforeReportingSettled() async throws {

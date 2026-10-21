@@ -97,7 +97,7 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
         host = fixture.public_blob(ec.generate_private_key(ec.SECP256R1())) if mode == "wrongPin" else server.host_blob
         pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
         request = {"pem": pem.decode()}
-        if mode in ["managed", "managedClose"]:
+        if mode in ["managed", "managedClose", "managedFinalWriteFailure", "managedBindingClose"]:
             # Keep the tiny public journal artifact for failed-run diagnosis.
             directory = Path(tempfile.mkdtemp(prefix="frankenterm-workspace-ssh-journal-"))
             request["journalDirectory"] = str(directory)
@@ -116,21 +116,30 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
             self.assertTrue(server.done.wait(2), "SSH server retained a closed connection")
             offered = [event[1] for event in server.events if event[0] == "authentication"]
             side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
-            if mode in ["io", "foreignCancel", "managed"]:
+            if mode in ["io", "foreignCancel", "managed", "managedFinalWriteFailure"]:
                 self.assertEqual(offered, [0, 1], "libssh must validate the production signature")
                 self.assertEqual(side_effects, ["channel", "pty", "shell"])
                 self.assertEqual(server.received, "protected workspace → actual SSH 🦀\r\nEND-SESSION\r".encode())
                 self.assertEqual(result["bytes"], len(server.received))
                 self.assertEqual(result["signs"], 1)
-                if mode == "managed":
+                if mode in ["managed", "managedFinalWriteFailure"]:
                     self.assertEqual(server.events.creation_observations, 3)
                     self.assertIn(("resize", 132, 42), server.events)
                     self.assertNotIn(("resize", 160, 50), server.events)
                     journal = (directory / "catalog.json").read_bytes()
                     records = json.loads(journal)["records"]
                     self.assertEqual([record["state"] for record in records], ["acknowledged"])
+                    self.assertEqual(records[0]["input_evidence"] & 3, 3)
                     for forbidden in [b"localhost", b"operator", b"PRIVATE KEY", b"END-SESSION", public]:
                         self.assertNotIn(forbidden, journal)
+            elif mode == "managedBindingClose":
+                self.assertEqual(offered, [0, 1])
+                self.assertEqual(side_effects, ["channel", "pty", "shell"])
+                self.assertEqual(server.events.creation_observations, 3)
+                self.assertEqual(result["signs"], 1)
+                records = json.loads((directory / "catalog.json").read_bytes())["records"]
+                self.assertEqual([record["state"] for record in records], ["interrupted"])
+                self.assertEqual(records[0]["input_evidence"], 0)
             elif mode in ["beforeShellRevocation", "managedClose"]:
                 self.assertEqual(offered, [0, 1])
                 self.assertEqual(side_effects, [], "a revoked or retired connection must not create a channel or PTY")
@@ -149,7 +158,7 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
                 self.assertEqual(offered, [], "untrusted or stale identity must not even be offered")
                 self.assertEqual(side_effects, [])
                 self.assertEqual(result["signs"], 0)
-            if mode not in ["io", "foreignCancel", "managed"]:
+            if mode not in ["io", "foreignCancel", "managed", "managedFinalWriteFailure"]:
                 self.assertEqual(result["bytes"], 0)
                 self.assertEqual(server.received, b"")
         finally:
@@ -191,8 +200,14 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
     def test_managed_connection_persists_creation_before_remote_shell_and_blocks_replay(self):
         self.run_probe("managed")
 
+    def test_closed_source_retries_failed_journal_publication_without_retaining_input_or_replaying(self):
+        self.run_probe("managedFinalWriteFailure")
+
     def test_suspension_joins_parked_creation_without_reviving_old_grants_or_overriding_resume(self):
         self.run_probe("managedClose")
+
+    def test_concurrent_close_retires_unpublished_source_once_after_binding_settles(self):
+        self.run_probe("managedBindingClose")
 
 
 if __name__ == "__main__":

@@ -169,12 +169,19 @@ terminal input/output, private keys, hostnames or content-derived hashes.
 
 An unresolved record blocks another creation for the same installed workspace and
 machine, even after a route or revision changes. Passing the journal to the native
-connection factory checks that record before DNS. `markInterrupted(epoch:)` keeps
-the uncertainty visible after local close; SSH EOF is not proof that a remote
-process exited. After relaunch, records become available for deliberate recovery
-review. `resolve(_:)` requires a fresh journal-issued record and refuses an active
-creation. No stored marker authorizes reconnection or replay. The default bounds
-are 64 unresolved and 32 acknowledged records; only acknowledged history is pruned.
+connection factory checks that record before DNS. Before the pump is published,
+the journal binds its exact input source to the creation epoch. `recordInput`
+persists only a bounded union of transport observations, never commands, paste
+contents or replay instructions. A coordinator-issued `TerminalInputSeal` proves
+local input settlement before `sealInput` records interruption; an opening that
+never bound input uses `markInterrupted` after native close. Neither transport
+acceptance nor SSH EOF proves remote execution or process exit. After relaunch,
+records become available for deliberate recovery review. `resolve(_:)` requires
+the exact displayed journal-issued record and refuses active or changed history.
+The default bounds are 64 unresolved and 32 acknowledged records; only
+acknowledged history is pruned. File-backed journals anchor their identity outside
+the catalog (device-only Keychain on Apple), so missing history cannot silently
+authorize a replacement shell.
 
 `WorkspaceSSHConnectionManager` is the app-owned entry point shared by scenes.
 Construct it with the workspace store, foreground broker, dedicated journal,
@@ -201,11 +208,21 @@ exact owner. `invalidate(workspaceID:)` closes affected owners after reimport,
 revocation or policy changes, while native I/O also checks current durable policy.
 
 Use `manager.close(connectionID:)` when the pump ends, including EOF/error. The
-native owner joins any in-progress opening task, observes an epoch arriving during
-close, retires unpublished sources, and only then records interruption. Storage
-failure preserves the epoch and the manager's closed owner for a later explicit
-close retry. The scene separately joins consumer delivery and reconciles the
-published source's retained input outcomes. The native owner's compatibility
+native owner closes I/O and joins an in-progress opening task. Concurrent closes
+share native shutdown and the subsequent unpublished-source retirement/journal
+settlement attempt. For a published source, the scene must join its consumer and
+all keyboard/focus streams, persist retained outcomes through
+`connection.recordInput(_:source:)`, and call
+`connection.prepareInputSettlement(source:)` **before** retiring the coordinator
+source. That method caches the source-wide seal; it refuses while admission,
+streams, writes or outcomes remain active. An early close can therefore stop I/O
+while retaining the manager's settlement owner for the scene's final close.
+
+Once input settles, the final close publishes its journal evidence. Storage
+failure preserves the exact epoch and cached seal for a later close retry, even
+after the source has been retired. Retrying never creates a shell or replays
+input. The live iOS controller performs this sequence, and its presenter persists
+each outcome batch before acknowledging delivery. The native owner's compatibility
 durability-callback overload remains available for custom integrations, which
 retain responsibility for their own markers and recovery.
 
@@ -341,7 +358,7 @@ and rejects a skipped or undiscovered test. Its synthetic memory-backed vault us
 the real production signer; native Keychain prompts and device durability remain
 separate qualification work.
 
-The optional `WorkspaceSSHProbe` adds eighteen real exchanges to those eight
+The optional `WorkspaceSSHProbe` adds twenty real exchanges to those eight
 scenarios. These cover all four client-key families, independently generated
 OpenSSH full-block padding, canonical hostname handling, delayed credential/host
 revocation and reimport, cancellation while signing, and rejection before shell
@@ -351,6 +368,16 @@ request. A parked journal write proves suspension joins late publication without
 creating a shell or leaking a source, and a newer resume remains effective. The
 managed echo flow also checks exact terminal bytes, retained outcomes, duplicate
 creation refusal, explicit review, network exclusion and nonfatal resize busy.
+Its input evidence is durable before outcome acknowledgement, and an active
+responder prevents final settlement even after native I/O closes. A final-write
+failure then retries successfully after coordinator source retirement without
+replaying input or retaining native resources. Another flow parks journal binding
+after actual shell creation and overlaps opening-failure cleanup, manager close
+and eight direct closes; every close succeeds, one unpublished source retires,
+and the server observes exactly one shell with no terminal input. Together the
+workspace harness passed 28 exchanges across 12 test methods. The ordinary SSH
+package suite passed 40 cases, with its live-server entry point skipped there
+and exercised by the harness; both Swift builds treated warnings as errors.
 
 ```sh
 swift test --only-use-versions-from-resolved-file -j 2 -Xswiftc -warnings-as-errors

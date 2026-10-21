@@ -23,11 +23,12 @@ final class MobileConnections {
 
     /// `signer` defaults to the protected Keychain signer; tests inject one.
     init(store: WorkspaceStore, journalDirectory: URL,
+         journalIdentifier: String = "primary",
          signer: any WorkspaceSSHSigning = AppleSSHCredentialSigner()) throws {
         let broker = SSHAuthenticationBroker(store: store, signer: signer,
                                              support: WorkspaceNativeSSHAuthentication.routeSupport)
         coordinator = try TerminalInputCoordinator()
-        journal = try TerminalSessionJournal(directory: journalDirectory)
+        journal = try TerminalSessionJournal(directory: journalDirectory, identifier: journalIdentifier)
         manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal, coordinator: coordinator)
     }
 
@@ -81,6 +82,7 @@ struct TerminalSessionTarget: Hashable {
 @MainActor
 private final class TerminalFramePresenter: TerminalModelDelivery {
     let source: TerminalSource
+    private let connection: WorkspaceSSHConnection
     weak var view: NativeTerminalView?
     weak var clipboard: NativeTerminalClipboardController?
     // The scene fences delivery synchronously, before the model actor applies
@@ -89,7 +91,9 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
     var onUnavailable: ((TerminalRenderError) -> Void)?
     var onInterruptedInput: (() -> Void)?
     private var reportedInterruptedInput = false
-    init(source: TerminalSource) { self.source = source }
+    init(source: TerminalSource, connection: WorkspaceSSHConnection) {
+        self.source = source; self.connection = connection
+    }
 
     func present(_ presentation: TerminalModelPresentation, source: TerminalSource) async throws {
         guard source == self.source else { throw TerminalInputError.stale }
@@ -107,6 +111,10 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
     func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {
         guard source == self.source, outcomes.count <= 64,
               outcomes.allSatisfy({ $0.receipt.source == source }) else { throw TerminalInputError.stale }
+        // The exact journal epoch outlives native close. Publish content-free
+        // evidence before the pump can acknowledge this batch, including final
+        // cleanup outcomes delivered after the view has retired.
+        try await connection.recordInput(outcomes, source: source)
         if !reportedInterruptedInput, outcomes.contains(where: {
             switch $0.disposition {
             case .connectionLost, .definitelyNotWritten, .cancelledAfterPrefix: true
@@ -150,7 +158,34 @@ final class TerminalSessionController {
     private(set) var cleanupFailure: String?
     private(set) var interruptedInput = false
     private(set) var interactionProblem: String?
+    private(set) var recoveryRecords: [TerminalSessionRecord] = []
+    private(set) var recoveryFailure: String?
+    private(set) var recoveryLoading = false
+    private(set) var recoveryLoaded = false
     let target: TerminalSessionTarget
+
+    var recoveryReviewReady: Bool {
+        settled && recoveryLoaded && !recoveryLoading && recoveryRecords.allSatisfy(\.canResolve)
+    }
+
+    /// These exact immutable snapshots are shown before a new-session action.
+    /// A late outcome or another owner changing history invalidates resolution;
+    /// a click never acknowledges newly discovered, unseen records.
+    func refreshRecoveryReview() async {
+        guard !recoveryLoading else { return }
+        recoveryLoading = true; recoveryLoaded = false; recoveryFailure = nil
+        defer { recoveryLoading = false }
+        do {
+            recoveryRecords = try await connections.journal.records().filter {
+                $0.requiresReview && $0.scope.workspaceID == target.workspaceID
+                    && $0.scope.machineID == target.machineID
+            }
+            recoveryLoaded = true
+        } catch {
+            recoveryRecords = []
+            recoveryFailure = Self.describe(error)
+        }
+    }
 
     @ObservationIgnored private let connections: MobileConnections
     @ObservationIgnored private var connection: WorkspaceSSHConnection?
@@ -234,10 +269,10 @@ final class TerminalSessionController {
 
     /// The retained startup task owns partially constructed resources. Teardown
     /// cancels and joins it; a late connection/view cannot outlive a settled UI.
-    func start(acknowledgingEarlierSessions: Bool = false) async {
+    func start(reviewingEarlierSessions: [TerminalSessionRecord] = []) async {
         guard phase == .idle, !stopped else { return }
         phase = .connecting
-        let job = Task { await self.performStart(acknowledgingEarlierSessions: acknowledgingEarlierSessions) }
+        let job = Task { await self.performStart(reviewingEarlierSessions: reviewingEarlierSessions) }
         startup = job
         await withTaskCancellationHandler { await job.value } onCancel: { job.cancel() }
         if Task.isCancelled { requestStop() }
@@ -251,16 +286,15 @@ final class TerminalSessionController {
 
     /// Never calls teardown: teardown must be able to join this task without a
     /// self-join. Retain each resource BEFORE the next cancellation check/await.
-    private func performStart(acknowledgingEarlierSessions: Bool) async {
+    private func performStart(reviewingEarlierSessions: [TerminalSessionRecord]) async {
         do {
             try checkStarting()
-            if acknowledgingEarlierSessions {
-                let journal = connections.journal
-                for record in try await journal.records() where record.requiresReview && record.canResolve
-                    && record.scope.workspaceID == target.workspaceID && record.scope.machineID == target.machineID {
-                    try checkStarting()
-                    try await journal.resolve(record)
-                }
+            for record in reviewingEarlierSessions {
+                guard record.requiresReview, record.canResolve,
+                      record.scope.workspaceID == target.workspaceID,
+                      record.scope.machineID == target.machineID else { throw TerminalSessionJournalError.staleReview }
+                try checkStarting()
+                try await connections.journal.resolve(record)
             }
             try checkStarting()
             let connection = try await connections.manager.connect(workspaceID: target.workspaceID,
@@ -272,7 +306,7 @@ final class TerminalSessionController {
             let pump = try await connection.openTerminal(geometry: geometry)
             self.pump = pump
             try checkStarting()
-            let presenter = TerminalFramePresenter(source: pump.source)
+            let presenter = TerminalFramePresenter(source: pump.source, connection: connection)
             presenter.onUnavailable = { [weak self] reason in
                 self?.fail("The display is unavailable (\(Self.describe(reason))).")
             }
@@ -468,6 +502,7 @@ final class TerminalSessionController {
 
     private func performTeardown() async {
         cleanupFailure = nil
+        recoveryLoaded = false
         // Interrupt an already-published native connection promptly. Startup may
         // still be in openTerminal/view creation; it never joins this cleanup.
         if let connection { try? await connections.manager.close(connectionID: connection.id) }
@@ -476,8 +511,9 @@ final class TerminalSessionController {
         sealLocalOwnership()
         var failure: Error?
         if let connection {
-            do { try await connections.manager.close(connectionID: connection.id); self.connection = nil }
-            catch { failure = error }
+            // Native I/O stops now; a bound epoch deliberately refuses final
+            // publication until responders and outcome delivery have joined.
+            try? await connections.manager.close(connectionID: connection.id)
         }
         if let pump {
             do { try await pump.disconnect() } catch { failure = failure ?? error }
@@ -517,6 +553,8 @@ final class TerminalSessionController {
                     guard let presenter else { throw TerminalInputError.unavailable }
                     try await presenter.receive(records, source: source)
                 }
+                guard let connection else { throw TerminalInputError.unavailable }
+                try await connection.prepareInputSettlement(source: pump.source)
                 try await coordinator.retire(pump.source)
                 self.pump = nil
             } catch { failure = failure ?? error }
@@ -529,6 +567,13 @@ final class TerminalSessionController {
             do { try model.close(); unadoptedModel = nil }
             catch { failure = failure ?? error }
         }
+        if let connection {
+            // A cached seal survives source retirement. A protected-storage
+            // error keeps this exact owner for retry, without recreating a shell
+            // or retaining an otherwise settled coordinator source.
+            do { try await connections.manager.close(connectionID: connection.id); self.connection = nil }
+            catch { failure = failure ?? error }
+        }
         if let failure {
             cleanupFailure = Self.describe(failure)
             connections.retainForCleanup(self)
@@ -538,6 +583,7 @@ final class TerminalSessionController {
             settled = true
             connections.releaseCleanup(id)
         }
+        await refreshRecoveryReview()
     }
 }
 
