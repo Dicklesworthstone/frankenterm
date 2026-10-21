@@ -21,6 +21,8 @@
         A1000000000000000000000E = {isa = PBXBuildFile; productRef = A9000000000000000000000B; };
         A1000000000000000000000F = {isa = PBXBuildFile; productRef = A9000000000000000000000C; };
         A10000000000000000000010 = {isa = PBXBuildFile; fileRef = A2000000000000000000000A; };
+        A10000000000000000000011 = {isa = PBXBuildFile; fileRef = A2000000000000000000000B; };
+        A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A2000000000000000000000C; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
@@ -35,6 +37,8 @@
         A20000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NativeTerminalRenderTests.swift; path = ../ios/FrankenTermTests/NativeTerminalRenderTests.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
         A20000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LiveSSHTerminalTests.swift; path = ../ios/FrankenTermTests/LiveSSHTerminalTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionControllerTests.swift; path = ../ios/FrankenTermTests/TerminalSessionControllerTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionScreen.swift; path = ../ios/FrankenTerm/TerminalSessionScreen.swift; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
@@ -43,7 +47,7 @@
         A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000E, A1000000000000000000000F,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
-        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008,); name = Products; sourceTree = "<group>"; };
         A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
@@ -102,9 +106,9 @@
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-        A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
-        A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D, A10000000000000000000012,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXTargetDependency section */
         A7000000000000000000000B = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000A; };
@@ -114,7 +118,7 @@
             CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; SWIFT_VERSION = 6.0;
             SWIFT_STRICT_CONCURRENCY = complete; SWIFT_OPTIMIZATION_LEVEL = "-Onone";
             GCC_PREPROCESSOR_DEFINITIONS = ("DEBUG=1", "$(inherited)",); SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
-            DEBUG_INFORMATION_FORMAT = dwarf; ONLY_ACTIVE_ARCH = YES;
+            DEBUG_INFORMATION_FORMAT = dwarf; ONLY_ACTIVE_ARCH = YES; ENABLE_TESTABILITY = YES;
         }; };
         AB0000000000000000000002 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
             CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; SWIFT_VERSION = 6.0;

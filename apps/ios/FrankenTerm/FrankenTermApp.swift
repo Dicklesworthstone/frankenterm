@@ -28,6 +28,9 @@ final class MobileWorkspaceModel {
     var requestingCameraAccess = false
     var offlineModeBlocked = false
     @ObservationIgnored private var store: WorkspaceStore?
+    /// Live direct-SSH services (TerminalSessionScreen.swift), created with the store.
+    @ObservationIgnored private(set) var connections: MobileConnections?
+    @ObservationIgnored private var connectionLifecycle: Task<Void, Never>?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
     private var pendingImport: PendingFileImport?
@@ -106,6 +109,11 @@ final class MobileWorkspaceModel {
                                       vault: AppleWorkspaceVault())
             }.value
             store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
+            if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                connections = try MobileConnections(store: created,
+                    journalDirectory: support.appendingPathComponent("FrankenTermSessions", isDirectory: true))
+                updateConnectionLifecycle()
+            }
             try await refreshWorkspaces(using: created, epoch: epoch)
             if active, pendingImport != nil { showRestore = true }
             updateLifecycle()
@@ -120,6 +128,17 @@ final class MobileWorkspaceModel {
             if busy { pendingImport?.needsExplicitRetry = true }
         } else if pendingImport != nil { showRestore = true }
         updateLifecycle()
+        updateConnectionLifecycle()
+    }
+    /// Serialized so a quick background/foreground pair reaches the connection
+    /// manager in order; it seals and settles live sessions when inactive.
+    private func updateConnectionLifecycle() {
+        guard let connections else { return }
+        let prior = connectionLifecycle, value = active
+        connectionLifecycle = Task {
+            await prior?.value
+            await connections.setActive(value)
+        }
     }
     func setRestoreVisible(_ value: Bool) {
         showRestore = value
@@ -412,7 +431,7 @@ struct MobileWorkspaceRoot: View {
                         }
                     }
                     Section {
-                        Text("Development build: offline transfer and workspace restoration. Live SSH sessions and the Rust/Metal terminal are not integrated yet.")
+                        Text("Development build: offline workspace restoration and direct SSH terminals (Connect on a restored machine). Persistent FrankenTerm mux sessions are not integrated yet.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }.navigationTitle("FrankenTerm")
@@ -917,7 +936,7 @@ private struct MachineWorkspaceView: View {
                         HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
                         HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
                         Label("Restored offline", systemImage: "checkmark.shield")
-                        Text("Inspect the saved routes and their local requirements below. This build has no live terminal transport, and no remote session has been started.").font(.callout)
+                        Text("Inspect the saved routes and their local requirements below. Nothing connects until you tap Connect on a ready direct SSH route; the pinned host key is verified before any key is offered.").font(.callout)
                         ForEach(machine.routeIDs, id: \.self) { id in
                             if let route = document.routes.first(where: { $0.id == id }) {
                                 VStack(alignment: .leading, spacing: 10) {
@@ -943,6 +962,18 @@ private struct MachineWorkspaceView: View {
                                     }
                                     if !route.jumpRoutes.isEmpty {
                                         Text("\(route.jumpRoutes.count) configured jump routes and their own dependencies must also be ready.").font(.caption)
+                                    }
+                                    if route.mode == "direct_ssh", let connections = model.connections,
+                                       let local = model.localPolicies[workspaceID],
+                                       local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
+                                       let credential = route.credentialIDs.first(where: local.credentialIDs.contains) {
+                                        NavigationLink {
+                                            TerminalSessionScreen(controller: TerminalSessionController(target: .init(
+                                                workspaceID: workspaceID, revision: local.workspace.revision,
+                                                machineID: machine.id, machineName: machine.name, routeID: id,
+                                                credentialID: credential), connections: connections))
+                                        } label: { Label("Connect", systemImage: "terminal") }
+                                            .buttonStyle(.borderedProminent)
                                     }
                                 }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
                                     .background(Color(ftHex: theme?.accent ?? "#3B82F6").opacity(0.14), in: RoundedRectangle(cornerRadius: 16))
