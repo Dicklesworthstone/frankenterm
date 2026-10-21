@@ -199,7 +199,7 @@ final class LiveSSHTerminalTests: XCTestCase {
 
         _ = try await coordinator.submit(focus, encodedBytes: Data("exit\r".utf8))
         let ended = try await run.value
-        XCTAssertEqual(ended, .peerOutputEnded)
+        XCTAssertEqual(ended, .completed(.init(remoteExit: nil, channelClosed: true)))
         try? await manager.close(connectionID: connection.id)
         try await coordinator.suspend(focus)
         try await pump.reconcileStoppedOutcomes { outcomes, source in

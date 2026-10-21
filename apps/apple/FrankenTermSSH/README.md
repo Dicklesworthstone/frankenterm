@@ -49,7 +49,11 @@ interpret EAGAIN from libssh2 itself as permission to replace its pending buffer
 `accepted_bytes` is local adapter admission; `channel_accepted_bytes` is libssh2's
 reported payload acceptance. Neither is command execution or remote PTY delivery.
 A close can leave the difference uncertain and authorizes no replay. Terminal EOF
-is exposed separately and does not fabricate an exit status of zero.
+is exposed separately and does not fabricate an exit status of zero. After EOF,
+`ftssh_completion_step` advances channel-close processing with a 32 KiB receive quantum
+per call and copies a bounded signal name or nonzero UInt32 exit status. The
+pinned libssh2 initializes its exit-status field to zero without exposing a
+received flag: an actual zero and an absent status therefore both remain unknown.
 
 Custom allocation caps bound libssh2 allocations, including allocator overhead
 and replacement overlap, to a caller-selected 64 KiB–4 MiB per handle and 16 MiB
@@ -96,8 +100,8 @@ identity can be offered. A typed, exact-bound user-authentication challenge is
 supplied to the signer, then policy is rechecked before signature submission,
 authentication publication and explicit PTY/shell creation. The optional integration
 product supplies `WorkspaceNativeSSHAuthentication` for the existing workspace
-broker and protected public-key discovery. The offline application does not yet
-enable connections.
+broker and protected public-key discovery. The iOS live workspace uses this
+adapter for its explicitly selected direct-SSH connections.
 
 Authentication and shell creation use finite ContinuousClock deadlines. A stale
 expiry callback cannot close a later operation. Cancellation or expiry invalidates
@@ -112,7 +116,13 @@ terminal, and complete a requested resize. Admission wakes an idle service call.
 A service readiness timeout reports `waitExpired` while preserving the exact
 connection and pending bytes; a quiet terminal is not disconnected automatically.
 Cancellation, native failure and explicit close remain separate from idle expiry.
-EOF does not fabricate process completion or remote command success.
+After EOF, new writes are refused and the actor gives channel-close/status
+evidence a two-second absolute deadline. Readiness waits yield normally; receive
+budget exhaustion yields cooperatively rather than extending that deadline.
+`NativeSSHCompletion` reports observed closure separately from an optional
+nonzero status or signal. EOF-only expiry stays unconfirmed, and neither zero
+nor absent status becomes a success claim. Cancellation and transport loss
+remain distinct from this completion result.
 
 Socket waits use DispatchSource readiness and one timer, not periodic polling.
 Each registration owns a duplicated fd until every cancellation handler settles,
@@ -294,8 +304,10 @@ delivered and then acknowledged; a failed consumer retains its batch and bounded
 accounting charge. Cancellation closes coordinator admission even while delivery
 is suspended, aborts native I/O and joins the wake child. Completion of `run`
 additionally joins its already-owned consumer work. A callback can request stop
-but must not await that same run task. After final peer output EOF the attachment
-ends without inventing an exit code or automatically creating another shell.
+but must not await that same run task. The native attachment maps completion to
+`TerminalSessionEnd.completed`; the final consumer update carries the same
+evidence after all output chunks. Transports without completion metadata retain
+the older `.peerOutputEnded` result. Neither path creates another shell.
 
 ## Hostname and dual-stack connection establishment
 
@@ -330,6 +342,15 @@ execution, jump hosts, automatic reconnect, permission UI or session routing.
 Those remain separate features with explicit authority and continuity contracts.
 
 ## Combined Swift validation
+
+The current package run executes **41 tests: 40 pass and one live-server entry
+point skips**, with warnings as errors. Independent libssh harnesses separately
+pass **12 native-driver methods, 13 Swift interop methods, 12 workspace methods
+and 8 legacy-pump methods**. The completion scenarios cover delayed status after
+EOF, full UInt32 nonzero status, signal, reported zero, absent status, bounded
+EOF-only expiry, transport reset, cancellation, receive-budget exhaustion and
+post-EOF admission refusal. The C adapter compiles with
+`-std=c11 -Wall -Wextra -Werror`; stats ABI guard bytes include `received_bytes`.
 
 Ten Swift XCTest cases pass with warnings-as-errors, including 64 repeated
 concurrent-close cycles with fd accounting, stalled handshakes, cancellation,

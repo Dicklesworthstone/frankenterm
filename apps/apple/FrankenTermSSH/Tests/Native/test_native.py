@@ -5,13 +5,16 @@ Requires test-only Python cryptography and the system libssh server library.
 No real key files, network destinations, subprocess shells or agents are used.
 """
 import base64
+import array
 import ctypes as C
 import ctypes.util
+import fcntl
 import select
 import socket
 import struct
 import sys
 import threading
+import termios
 import time
 import unittest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -30,6 +33,7 @@ def bind(lib, name, result, *args):
 for name, result, args in [
     ("ssh_init", I, []), ("ssh_new", P, []), ("ssh_free", None, [P]),
     ("ssh_disconnect", None, [P]), ("ssh_set_blocking", None, [P, I]),
+    ("ssh_send_ignore", I, [P, C.c_char_p]),
     ("ssh_bind_new", P, []), ("ssh_bind_free", None, [P]),
     ("ssh_bind_options_set", I, [P, I, P]), ("ssh_bind_accept_fd", I, [P, P, I]),
     ("ssh_handle_key_exchange", I, [P]), ("ssh_set_auth_methods", None, [P, I]),
@@ -49,13 +53,20 @@ for name, result, args in [
     ("ssh_channel_read_nonblocking", I, [P, P, C.c_uint32, I]),
     ("ssh_channel_write", I, [P, P, C.c_uint32]), ("ssh_channel_write_stderr", I, [P, P, C.c_uint32]),
     ("ssh_channel_send_eof", I, [P]), ("ssh_channel_close", I, [P]), ("ssh_channel_free", None, [P]),
+    ("ssh_channel_request_send_exit_status", I, [P, I]),
+    ("ssh_channel_request_send_exit_signal", I, [P, C.c_char_p, I, C.c_char_p, C.c_char_p]),
 ]:
     bind(SERVER, name, result, *args)
 SERVER.ssh_init()
 
 class Stats(C.Structure):
     _fields_ = [("allocated", Z), ("peak", Z), ("pending", Z),
-                ("accepted", C.c_uint64), ("written", C.c_uint64), ("error", I)]
+                ("accepted", C.c_uint64), ("written", C.c_uint64), ("error", I),
+                ("received", C.c_uint64)]
+
+class Completion(C.Structure):
+    _fields_ = [("kind", I), ("channel_closed", I), ("exit_status", C.c_uint32),
+                ("signal", C.c_char * 65)]
 
 for name, result, args in [
     ("ftssh_create", I, [I, Z, C.POINTER(P)]), ("ftssh_handshake", I, [P]),
@@ -66,6 +77,7 @@ for name, result, args in [
     ("ftssh_begin_shell", I, [P, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32]), ("ftssh_shell_step", I, [P]),
     ("ftssh_admit_write", I, [P, P, Z]), ("ftssh_flush_write", I, [P]),
     ("ftssh_read", I, [P, P, Z, C.POINTER(Z)]),
+    ("ftssh_completion_step", I, [P, C.POINTER(Completion)]),
     ("ftssh_resize", I, [P, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32]),
     ("ftssh_directions", I, [P]), ("ftssh_descriptor", I, [P]),
     ("ftssh_get_stats", I, [P, C.POINTER(Stats)]), ("ftssh_close", I, [P]), ("ftssh_destroy", I, [C.POINTER(P)]),
@@ -105,11 +117,15 @@ def signature(key, data):
 
 
 class LoopbackServer:
-    def __init__(self, key, reject=False, family=socket.AF_INET):
+    def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown"):
         self.public = public_blob(key)
         self.host_key = ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.reject = reject
+        self.completion = completion
+        self.output_eof = threading.Event()
+        self.control_flood_ready = threading.Event()
+        self.release_completion = threading.Event()
         self.events, self.received, self.errors = [], bytearray(), []
         self.stop = threading.Event()
         self.done = threading.Event()
@@ -218,7 +234,36 @@ class LoopbackServer:
                     if n > 0:
                         pending = pending[n:]
                 if bytes(self.received).endswith(b"END-SESSION\r") and not pending:
-                    SERVER.ssh_channel_send_eof(channel)
+                    SERVER.ssh_set_blocking(session, 1)
+                    if SERVER.ssh_channel_send_eof(channel) != 0:
+                        raise RuntimeError("test EOF send failed")
+                    self.output_eof.set()
+                    if self.completion == "controlFlood":
+                        if not self.release_completion.wait(5):
+                            raise RuntimeError("test control flood was never released")
+                        for _ in range(32):
+                            if SERVER.ssh_send_ignore(session, b"x" * 8192) != 0:
+                                raise RuntimeError("test control flood send failed")
+                        self.control_flood_ready.set()
+                    if self.completion in ["delayedStatus", "resetAfterEOF"] and not self.release_completion.wait(5):
+                        raise RuntimeError("test delayed completion was never released")
+                    if self.completion in ["status7", "delayedStatus", "statusWithoutClose", "status0", "highStatus"]:
+                        code = {"status0": 0, "highStatus": -1}.get(self.completion, 7)
+                        if SERVER.ssh_channel_request_send_exit_status(channel, code) != 0:
+                            raise RuntimeError("test exit status send failed")
+                    elif self.completion == "signalTERM":
+                        if SERVER.ssh_channel_request_send_exit_signal(channel, b"TERM", 0, b"", b"") != 0:
+                            raise RuntimeError("test exit signal send failed")
+                    if self.completion == "resetAfterEOF":
+                        self.control.shutdown(socket.SHUT_RDWR)
+                    elif self.completion in ["eofOnly", "statusWithoutClose", "controlFlood"]:
+                        SERVER.ssh_set_blocking(session, 0)
+                        while not self.stop.is_set():
+                            if SERVER.ssh_channel_read_nonblocking(channel, buffer, len(buffer), 0) == -1:
+                                break
+                            self.stop.wait(0.01)
+                    elif SERVER.ssh_channel_close(channel) != 0:
+                        raise RuntimeError("test channel close failed")
                     return
                 self.stop.wait(0.001)
         except Exception as e:
@@ -238,6 +283,7 @@ class LoopbackServer:
 
     def close(self):
         self.stop.set()
+        self.release_completion.set()
         if self.control:
             try:
                 self.control.shutdown(socket.SHUT_RDWR)
@@ -269,9 +315,9 @@ class NativeSSHTests(unittest.TestCase):
         for server in self.servers:
             server.close()
 
-    def start(self, key=None, reject=False, family=socket.AF_INET):
+    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown"):
         key = key or ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        server = LoopbackServer(key, reject, family)
+        server = LoopbackServer(key, reject, family, completion)
         self.servers.append(server)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -366,6 +412,104 @@ class NativeSSHTests(unittest.TestCase):
                 self.assertEqual(stats.accepted, len(payload))
                 self.assertEqual(stats.written, len(payload))
                 self.assertLessEqual(stats.peak, 2 * 1024 * 1024)
+
+    def test_remote_completion_preserves_nonzero_signal_and_unknown_zero(self):
+        for mode, kind, code, signal in [("status7", 1, 7, b""), ("highStatus", 1, 0xffffffff, b""),
+                                         ("signalTERM", 2, 0, b"TERM"), ("status0", 0, 0, b""),
+                                         ("unknown", 0, 0, b""), ("delayedStatus", 1, 7, b"")]:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(completion=mode)
+                self.assertEqual(self.authenticate(handle, server, key), 0)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                evidence = Completion()
+                self.assertEqual(DRIVER.ftssh_completion_step(handle, C.byref(evidence)), -1001)
+                payload = b"final output before completion\r\nEND-SESSION\r"
+                self.assertEqual(DRIVER.ftssh_admit_write(handle, payload, len(payload)), 0)
+                received, eof = bytearray(), False
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    self.assertIn(DRIVER.ftssh_flush_write(handle), (0, 1))
+                    out, count = C.create_string_buffer(19), Z()
+                    result = DRIVER.ftssh_read(handle, out, len(out), C.byref(count))
+                    self.assertIn(result, (0, 1, 3))
+                    received += out.raw[:count.value]
+                    if result == 3:
+                        eof = True
+                        break
+                    self.wait(handle)
+                self.assertTrue(eof)
+                self.assertEqual(received, b"ready\r\nstderr\r\n" + payload)
+                if mode == "delayedStatus":
+                    self.assertTrue(server.output_eof.is_set())
+                    self.assertEqual(DRIVER.ftssh_completion_step(handle, C.byref(evidence)), 1)
+                    self.assertEqual((evidence.kind, evidence.channel_closed), (0, 0))
+                    server.release_completion.set()
+                closed = False
+                while time.monotonic() < deadline:
+                    result = DRIVER.ftssh_completion_step(handle, C.byref(evidence))
+                    self.assertIn(result, (0, 1, 4))
+                    if result == 0:
+                        closed = True
+                        break
+                    if result == 1:
+                        self.wait(handle)
+                self.assertTrue(closed)
+                self.assertEqual((evidence.kind, evidence.exit_status, evidence.signal, evidence.channel_closed),
+                                 (kind, code, signal, 1))
+
+    def test_stats_abi_keeps_guard_bytes_and_reports_received_traffic(self):
+        class GuardedStats(C.Structure):
+            _fields_ = [("before", C.c_uint64), ("stats", Stats), ("after", C.c_uint64)]
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        guarded = GuardedStats()
+        guarded.before = 0x123456789abcdef0
+        guarded.after = 0xfedcba9876543210
+        pointer = C.cast(C.byref(guarded, GuardedStats.stats.offset), C.POINTER(Stats))
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, pointer), 0)
+        self.assertEqual(guarded.before, 0x123456789abcdef0)
+        self.assertEqual(guarded.after, 0xfedcba9876543210)
+        self.assertGreater(guarded.stats.received, 0)
+
+    def test_completion_control_flood_yields_after_bounded_receive_quantum(self):
+        handle, server, key = self.start(completion="controlFlood")
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        payload = b"END-SESSION\r"
+        self.assertEqual(DRIVER.ftssh_admit_write(handle, payload, len(payload)), 0)
+        deadline, eof = time.monotonic() + 5, False
+        while time.monotonic() < deadline:
+            self.assertIn(DRIVER.ftssh_flush_write(handle), (0, 1))
+            out, count = C.create_string_buffer(256), Z()
+            result = DRIVER.ftssh_read(handle, out, len(out), C.byref(count))
+            self.assertIn(result, (0, 1, 3))
+            if result == 3:
+                eof = True
+                break
+            self.wait(handle)
+        self.assertTrue(eof)
+        server.release_completion.set()
+        self.assertTrue(server.control_flood_ready.wait(2))
+        # Prove the receive quantum is already available before measuring it;
+        # a successful server send alone does not prove network arrival.
+        queued = array.array("i", [0])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            fcntl.ioctl(DRIVER.ftssh_descriptor(handle), termios.FIONREAD, queued, True)
+            if queued[0] >= 65536:
+                break
+            server.stop.wait(0.001)
+        self.assertGreaterEqual(queued[0], 65536)
+        before, after, evidence = Stats(), Stats(), Completion()
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(before)), 0)
+        started = time.monotonic()
+        self.assertEqual(DRIVER.ftssh_completion_step(handle, C.byref(evidence)), 4)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(after)), 0)
+        self.assertLessEqual(after.received - before.received, 32768)
+        self.assertEqual((evidence.kind, evidence.channel_closed), (0, 0))
 
     def test_host_mismatch_stops_before_any_authentication(self):
         handle, server, key = self.start()

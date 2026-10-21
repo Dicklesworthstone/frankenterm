@@ -59,7 +59,8 @@ public final class NativeSSHTerminalChannel: TerminalSessionTransport, Sendable 
                                         pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight)
         }
         // Empty idle-expiry/local-work events are not EOF or transport failures.
-        return TerminalSessionUpdate(output: update.output, endOfOutput: update.endOfOutput, resized: resized)
+        return TerminalSessionUpdate(output: update.output, endOfOutput: update.endOfOutput, resized: resized,
+                                     completion: update.completion?.terminalCompletion)
     }
     public func wakeService() async { await session.wakeService(channelID: identity.channelID) }
     public func close() async { inputSignal.finish(); await session.close() }

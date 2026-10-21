@@ -245,11 +245,11 @@ private final class PassiveClipboardTextView: UITextView {
 /// selection menu / hardware Copy command. No cut, paste, share or URL detector
 /// is installed on this read-only snapshot. Tests inject a non-system writer.
 @MainActor
-final class NativeTerminalCopyTextView: UITextView {
+public final class NativeTerminalCopyTextView: UITextView {
     private var document: TerminalCopyDocument?
     private let writer: @MainActor (String) -> Void
-    var onFailure: (@MainActor (Error) -> Void)?
-    init(document: TerminalCopyDocument, writer: @escaping @MainActor (String) -> Void = { text in
+    public var onFailure: (@MainActor (Error) -> Void)?
+    public init(document: TerminalCopyDocument, writer: @escaping @MainActor (String) -> Void = { text in
         UIPasteboard.general.setItems([["public.utf8-plain-text": text]],
             options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
     }) {
@@ -262,14 +262,14 @@ final class NativeTerminalCopyTextView: UITextView {
         accessibilityLabel = "Captured terminal output"
     }
     @available(*, unavailable)
-    required init?(coder: NSCoder) { nil }
-    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+    public required init?(coder: NSCoder) { nil }
+    public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard document != nil else { return false }
         if action == #selector(copy(_:)) { return selectedRange.length > 0 }
         if action == #selector(selectAll(_:)) { return !text.isEmpty }
         return false
     }
-    override func copy(_ sender: Any?) {
+    public override func copy(_ sender: Any?) {
         guard let document else { return }
         do {
             let range = try document.normalizedRange(selectedRange)
@@ -278,7 +278,7 @@ final class NativeTerminalCopyTextView: UITextView {
             writer(value)
         } catch { onFailure?(error) }
     }
-    func clearSnapshot() { document = nil; text = ""; onFailure = nil }
+    public func clearSnapshot() { document = nil; text = ""; onFailure = nil }
 }
 
 /// Only one outstanding full-frame decode across the process, including work

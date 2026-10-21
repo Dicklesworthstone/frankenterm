@@ -239,16 +239,23 @@ final class TerminalSessionControllerTests: XCTestCase {
         let first = try await connect(scene, "alpha")
         let terminal = try shown(first)
         defer { terminal.removeFromSuperview() }
-        try await type("exit", into: terminal)
+        try await type("printf 'FINAL-%s\\n' $((6*7)); exit", into: terminal)
         for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
-        XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.peerOutputEnded)))
+        XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.completed(.init(remoteExit: nil, channelClosed: true)))))
         XCTAssertTrue(first.settled, "teardown after a remote exit must finish")
+        let retained = try XCTUnwrap(first.retainedOutput, "the ended session keeps its received live viewport")
+        XCTAssertEqual(retained.source, terminal.source)
+        XCTAssertTrue(retained.document.text.contains("FINAL-42"), "final remote output survives model disposal")
+        XCTAssertLessThanOrEqual(retained.document.utf8Bytes, 128 * 1024)
+        XCTAssertNil(first.retainedOutputFailure)
+        XCTAssertFalse(terminal.input.isEditable, "retained output carries no keyboard authority")
         let remaining = await connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
         XCTAssertEqual(scene.navigation.navigation.machines.first?.panes.count, 0, "the ended source leaves navigation")
         await assertReleased(first, connections: connections)
 
         let unacknowledged = try await connect(scene, "alpha")
+        XCTAssertNil(first.retainedOutput, "replacing a controller releases its volatile output")
         XCTAssertEqual(unacknowledged.phase, .needsReview, "the ended session's outcome must be reviewed first")
         XCTAssertTrue(unacknowledged.settled)
         await assertReleased(unacknowledged, connections: connections)
@@ -420,6 +427,59 @@ final class TerminalSessionControllerTests: XCTestCase {
         let bottom = try await rows(of: terminal) { $0.contains("HIST-\(count)") }
         XCTAssertTrue(bottom.contains("HIST-\(count)"), "the shell printed its lines (screen: \(bottom))")
         XCTAssertFalse(bottom.contains("HIST-1"), "the first lines scrolled off the screen")
+    }
+
+    /// Search uses the canonical retained rows, fences a late same-machine
+    /// keyboard handoff, and returns to the original view without sending text.
+    func testHistorySearchRevealsRetainedRowsAndReturnsWithoutHiddenInput() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await printHistory(into: terminal, count: 80)
+        let inspection = try XCTUnwrap(session.inspectHistory())
+        XCTAssertEqual(inspection.source, terminal.source)
+        XCTAssertTrue(session.clipboardIsPresenting)
+        XCTAssertFalse(terminal.input.isEditable)
+
+        // A navigation handoff admitted just before the sheet opened can
+        // publish later. Its new responder must not become live underneath it.
+        await scene.owner.joinSealed()
+        try await scene.navigation.activateSelection()
+        XCTAssertFalse(scene.owner.keyboard?.acceptsInput == true)
+        XCTAssertFalse(terminal.input.isEditable)
+
+        inspection.query = "HIST-3"
+        inspection.search()
+        await inspection.waitUntilSettled()
+        XCTAssertNil(inspection.failure)
+        XCTAssertEqual(terminal.renderer.admittedFrame?.isLive, true, "reading search pages never moves the viewport")
+        let result = try XCTUnwrap(inspection.result)
+        let match = try XCTUnwrap(result.matches.first { $0.excerpt.trimmingCharacters(in: .whitespaces) == "HIST-3" })
+        inspection.reveal(match)
+        await inspection.waitUntilSettled()
+        XCTAssertNil(inspection.failure)
+        XCTAssertTrue(try XCTUnwrap(inspection.preview).text.contains("HIST-3"))
+        let selected = try await rows(of: terminal) { $0.contains("HIST-3") }
+        XCTAssertTrue(selected.contains("HIST-3"))
+
+        await inspection.close(restoreViewport: false)
+        XCTAssertNil(session.historyInspection)
+        XCTAssertNotNil(session.historyReturnBookmark)
+        XCTAssertFalse(terminal.input.isEditable, "Show in Terminal does not automatically grant a keyboard")
+        session.returnFromHistorySearch()
+        for _ in 0..<200 where session.historyReturning { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertFalse(session.historyReturning)
+        XCTAssertNil(session.interactionProblem)
+        _ = try await rows(of: terminal) { $0.contains("HIST-80") }
+        XCTAssertEqual(terminal.renderer.admittedFrame?.isLive, true)
+        await scene.activateKeyboard()
+        try await type("echo SEARCHED-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "SEARCHED-42")
+        XCTAssertEqual(output, "SEARCHED-42\n", "explicit keyboard activation still targets the original source")
+        await scene.close()
+        XCTAssertNil(session.retainedOutput, "closing a workspace drops volatile output")
+        await assertReleased(session, connections: live.connections)
     }
 
     /// Scrollback: earlier output scrolls back into view and stays put while

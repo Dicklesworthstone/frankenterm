@@ -171,6 +171,11 @@ final class TerminalSessionController {
     private(set) var recoveryFailure: String?
     private(set) var recoveryLoading = false
     private(set) var recoveryLoaded = false
+    private(set) var historyInspection: TerminalHistoryInspection?
+    private(set) var historyReturnBookmark: TerminalHistoryBookmark?
+    private(set) var historyReturning = false
+    private(set) var retainedOutput: TerminalRetainedOutput?
+    private(set) var retainedOutputFailure: String?
     let target: TerminalSessionTarget
 
     var recoveryReviewReady: Bool {
@@ -220,6 +225,9 @@ final class TerminalSessionController {
     @ObservationIgnored private var basePalette: [UInt8]?
     @ObservationIgnored private var appliedPalette: [UInt8]?
     @ObservationIgnored private var paletteChange: Task<Void, Never>?
+    @ObservationIgnored private var historyReturn: Task<Void, Never>?
+    @ObservationIgnored private var retainedCaptureAttempted = false
+    @ObservationIgnored private var retainEndedOutput = true
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
         self.target = target; self.connections = connections; self.focus = focus
@@ -242,16 +250,66 @@ final class TerminalSessionController {
         }
     }
 
-    var clipboardIsPresenting: Bool { clipboard?.isPresenting == true }
+    var clipboardIsPresenting: Bool {
+        clipboard?.isPresenting == true || historyInspection != nil || historyReturning
+    }
     func inspectOutput() {
-        guard !stopped, phase == .live, presentationVisible else { return }
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
         interactionProblem = nil; clipboard?.requestCopy()
     }
     func paste() {
-        guard !stopped, phase == .live, presentationVisible else { return }
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
         interactionProblem = nil; clipboard?.requestPaste()
     }
     func dismissInteractionProblem() { interactionProblem = nil }
+
+    /// The owner is captured by the sheet, never looked up again through a
+    /// possibly different selected machine when that sheet is dismissed.
+    func inspectHistory() -> TerminalHistoryInspection? {
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+              let runtime, let source = pump?.source else { return nil }
+        interactionProblem = nil
+        terminal?.input.retire()
+        let history = history
+        let inspection = TerminalHistoryInspection(runtime: runtime, source: source,
+            destination: "\(target.machineName) · Machine \(target.machineID) · Route \(target.routeID)",
+            prepare: { await history?.waitUntilSettled() }) { [weak self] id, bookmark, failure in
+                guard let self, self.historyInspection?.id == id else { return }
+                self.historyInspection = nil
+                if !self.stopped, self.presentationVisible {
+                    self.historyReturnBookmark = bookmark
+                    if let failure { self.interactionProblem = "The earlier viewing position could not be restored: \(failure)" }
+                }
+            }
+        historyInspection = inspection
+        return inspection
+    }
+
+    func returnFromHistorySearch() {
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+              historyReturn == nil, let bookmark = historyReturnBookmark, let runtime,
+              bookmark.source == pump?.source else { return }
+        historyReturnBookmark = nil; historyReturning = true
+        terminal?.input.retire()
+        let history = history
+        historyReturn = Task { [weak self] in
+            guard let self else { return }
+            await history?.waitUntilSettled()
+            do { try await runtime.restoreHistoryBookmark(bookmark, source: bookmark.source) }
+            catch {
+                if !self.stopped, self.presentationVisible {
+                    self.interactionProblem = "The earlier viewing position could not be restored: \(Self.describe(error))"
+                }
+            }
+            self.historyReturning = false; self.historyReturn = nil
+        }
+    }
+
+    /// Closing a workspace or replacing its ended controller releases plaintext
+    /// and prevents an in-flight teardown from capturing it again afterwards.
+    func discardRetainedOutput() {
+        retainEndedOutput = false; retainedOutput = nil; retainedOutputFailure = nil
+    }
 
     private func inputFailed(_ error: Error) {
         // Rejected local text is not a transport failure. In particular an
@@ -274,7 +332,11 @@ final class TerminalSessionController {
         let visible = visible && !stopped
         presentationVisible = visible
         clipboard?.setActive(visible)
-        if !visible { interactionProblem = nil }
+        if !visible {
+            interactionProblem = nil
+            historyInspection?.retire()
+            historyReturn?.cancel(); historyReturnBookmark = nil
+        }
         presenter?.acceptsFrames = visible
         terminal?.renderer.setSceneActive(visible)
         if let presentation, !presentation.isRetired {
@@ -289,6 +351,14 @@ final class TerminalSessionController {
               terminal.input.session !== keyboard else { return }
         guard keyboard.originalFocus.source == pump?.source else {
             fail("The selected keyboard belongs to another terminal."); return
+        }
+        // An activation may have started before a read-only sheet opened and
+        // completed its handoff afterwards. Seal that newly published responder
+        // before it can acquire hardware input behind the inspection surface.
+        guard !clipboardIsPresenting else {
+            keyboard.suspend()
+            focus?.inputRetired(machineID: target.machineID)
+            return
         }
         do {
             try terminal.replaceInputSession(keyboard)
@@ -433,10 +503,19 @@ final class TerminalSessionController {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
-    /// Output EOF is not proof that the remote process exited, so no reason
-    /// claims a shell's fate.
+    /// Only a reported nonzero exit code or signal describes remote termination.
+    /// libssh2 cannot distinguish a reported zero from an absent exit status.
     static func describe(_ end: TerminalSessionEnd) -> String {
         switch end {
+        case let .completed(completion):
+            switch completion.remoteExit {
+            case let .exitStatus(status): "The remote program reported exit status \(status)."
+            case let .signal(signal): "The remote program reported termination by signal \(signal)."
+            case nil:
+                completion.channelClosed
+                    ? "The machine closed this session's channel; a usable remote exit status was not reported."
+                    : "The machine ended its output; channel closure and remote process status remain unconfirmed."
+            }
         case .peerOutputEnded: "The machine closed this session's output; remote process status is unknown."
         case .cancelled: "This device closed the session, for example when FrankenTerm left the foreground."
         case .disconnected: "The connection to the machine was lost."
@@ -464,7 +543,7 @@ final class TerminalSessionController {
     }
 
     private func selectHistory(_ top: Int64?) {
-        guard !stopped, phase == .live, let history else { return }
+        guard !stopped, phase == .live, !clipboardIsPresenting, let history else { return }
         do { try history.request(top: top, source: history.source) }
         catch { fail(Self.describe(error)) }
     }
@@ -472,6 +551,9 @@ final class TerminalSessionController {
     private func sealLocalOwnership() {
         presentationVisible = false
         clipboard?.retire()
+        historyInspection?.retire()
+        historyReturn?.cancel(); historyReturnBookmark = nil
+        paletteChange?.cancel()
         interactionProblem = nil
         presenter?.acceptsFrames = false
         presentation?.retire()
@@ -560,6 +642,9 @@ final class TerminalSessionController {
         }
         if let resize { await resize.waitUntilSettled(); self.resize = nil }
         if let history { await history.waitUntilSettled(); self.history = nil }
+        if let inspection = historyInspection { await inspection.waitUntilSettled(); historyInspection = nil }
+        if let historyReturn { await historyReturn.value; self.historyReturn = nil; historyReturning = false }
+        if let paletteChange { await paletteChange.value; self.paletteChange = nil }
         if attached, let source = pump?.source {
             do {
                 // A live scene removes the exact binding and joins its sealed
@@ -590,6 +675,19 @@ final class TerminalSessionController {
             } catch { failure = failure ?? error }
         }
         if let runtime, !attached {
+            if retainEndedOutput, !retainedCaptureAttempted {
+                retainedCaptureAttempted = true
+                do {
+                    let document = try await runtime.captureOutputDocument(source: runtime.source)
+                    if retainEndedOutput {
+                        retainedOutput = TerminalRetainedOutput(source: runtime.source,
+                            destination: "\(target.machineName) · Machine \(target.machineID) · Route \(target.routeID)",
+                            document: document)
+                    }
+                } catch {
+                    if retainEndedOutput { retainedOutputFailure = Self.describe(error) }
+                }
+            }
             do { try await runtime.close(); self.runtime = nil }
             catch { failure = failure ?? error }
         }

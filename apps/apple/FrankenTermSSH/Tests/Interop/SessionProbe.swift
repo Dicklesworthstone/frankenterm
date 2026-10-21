@@ -125,7 +125,7 @@ private func runPump(session: NativeSSHSession, mode: String) async throws {
             let first = try await coordinator.submit(focus, encodedBytes: payload)
             let last = try await coordinator.submit(focus, encodedBytes: finish)
             let reason = try await run.value
-            guard reason == .peerOutputEnded else { throw ProbeFailure.invalid }
+            guard reason == .completed(.init(remoteExit: nil, channelClosed: true)) else { throw ProbeFailure.invalid }
             try await consumer.verify(output: greeting + payload + finish, receipts: [first,last], resize: size)
             let remaining = try await coordinator.pendingOutcomes(attachment.source)
             guard remaining.outcomes.isEmpty else { throw ProbeFailure.invalid }
@@ -142,6 +142,80 @@ private func runPump(session: NativeSSHSession, mode: String) async throws {
         _ = try? await run.value
         throw error
     }
+}
+
+private func runCompletion(session: NativeSSHSession, mode: String) async throws {
+    let payload = Data(String(repeating: "ordered final output é🦀\r\n", count: 3000).utf8)
+        + Data("END-SESSION\r".utf8)
+    let expected = Data("ready\r\nstderr\r\n".utf8) + payload
+    var admitted = 0, output = Data(), final: NativeSSHCompletion?
+    var notified = false
+    let started = ContinuousClock.now
+    do {
+        while final == nil {
+            guard started.duration(to: .now) < .seconds(8) else { throw ProbeFailure.unexpected }
+            if admitted < payload.count {
+                let chunk = payload.subdata(in: admitted..<min(admitted + 4096, payload.count))
+                if case .accepted(let count) = try await session.admit(chunk) { admitted += count }
+            }
+            let event = try await session.service(timeout: .milliseconds(80))
+            output += event.output
+            guard event.output.count <= 16_384, output.count <= expected.count else { throw ProbeFailure.invalid }
+            if event.waitExpired, output == expected, !notified {
+                notified = true
+                guard try await session.admit(Data("must remain unsent after EOF".utf8)) == .wouldBlock else {
+                    throw ProbeFailure.invalid
+                }
+                if mode == "completionDelayedStatus" || mode == "completionReset" {
+                    emit(["event": "waitingForCompletion", "mode": mode])
+                } else if mode == "completionCancel" {
+                    let waiting = Task { try await session.service(timeout: .seconds(5)) }
+                    waiting.cancel()
+                    try await mustReject { _ = try await waiting.value }
+                    await session.close()
+                    let stats = try await session.accounting()
+                    guard stats.allocatedBytes == 0, admitted == payload.count else { throw ProbeFailure.invalid }
+                    emit(["event": "done", "mode": mode, "bytes": payload.count, "origin": "cancelled", "closed": true])
+                    return
+                }
+            }
+            if event.endOfOutput {
+                guard let completion = event.completion else { throw ProbeFailure.invalid }
+                final = completion
+            }
+        }
+    } catch let error as NativeSSHError where mode == "completionReset" && error.isConnectionFailure {
+        guard notified, admitted == payload.count, output == expected else { throw ProbeFailure.invalid }
+        await session.close()
+        guard try await session.accounting().allocatedBytes == 0 else { throw ProbeFailure.invalid }
+        emit(["event": "done", "mode": mode, "bytes": payload.count, "origin": "transportLost", "closed": true])
+        return
+    }
+    guard let final, admitted == payload.count, output == expected else { throw ProbeFailure.invalid }
+    let expectedExit: NativeSSHRemoteExit?
+    switch mode {
+    case "completionStatus7", "completionDelayedStatus", "completionStatusWithoutClose": expectedExit = .exitStatus(7)
+    case "completionHighStatus": expectedExit = .exitStatus(UInt32.max)
+    case "completionSignal": expectedExit = .signal("TERM")
+    case "completionUnknown", "completionZero", "completionEOFOnly": expectedExit = nil
+    default: throw ProbeFailure.invalid
+    }
+    let expectsClose = mode != "completionEOFOnly" && mode != "completionStatusWithoutClose"
+    guard final.remoteExit == expectedExit, final.channelClosed == expectsClose,
+          started.duration(to: .now) < .seconds(5) else { throw ProbeFailure.invalid }
+    if mode == "completionDelayedStatus", !notified { throw ProbeFailure.invalid }
+    try await mustReject { _ = try await session.admit(Data("late input must be refused".utf8)) }
+    await session.close()
+    guard try await session.accounting().allocatedBytes == 0 else { throw ProbeFailure.invalid }
+    var result: [String: Any] = ["event": "done", "mode": mode, "bytes": payload.count,
+        "origin": "remoteCompletion", "closed": true, "channelClosed": final.channelClosed, "exitKind": "unknown"]
+    if let reported = final.remoteExit {
+        switch reported {
+        case .exitStatus(let code): result["exitKind"] = "status"; result["exitStatus"] = code
+        case .signal(let name): result["exitKind"] = "signal"; result["signal"] = name
+        }
+    }
+    emit(result)
 }
 
 private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
@@ -208,6 +282,7 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
                   let publicKey = Data(base64Encoded: args[3]) else { throw ProbeFailure.invalid }
             let mode = args[4]
             let transfersBytes = ["io", "idle", "connect", "wake", "pump", "pumpCancel"].contains(mode)
+                || mode.hasPrefix("completion")
             let session: NativeSSHSession
             if mode == "connect" {
                 guard endpoint > 0, endpoint <= 65535 else { throw ProbeFailure.invalid }
@@ -228,6 +303,10 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
             }
             if mode == "pump" || mode == "pumpCancel" {
                 try await runPump(session: session, mode: mode)
+                return
+            }
+            if mode.hasPrefix("completion") {
+                try await runCompletion(session: session, mode: mode)
                 return
             }
             var received = Data()

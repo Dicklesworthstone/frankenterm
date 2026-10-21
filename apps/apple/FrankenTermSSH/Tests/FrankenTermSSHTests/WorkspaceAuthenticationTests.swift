@@ -361,7 +361,7 @@ final class WorkspaceAuthenticationTests: XCTestCase {
                     let watchdog = Task { try await Task.sleep(for: .seconds(10)); pump.requestStop() }
                     defer { watchdog.cancel() }
                     let result = try await run.value, summary = await sink.summary()
-                    XCTAssertEqual(result, .peerOutputEnded)
+                    XCTAssertEqual(result, .completed(.init(remoteExit: nil, channelClosed: true)))
                     XCTAssertEqual(summary.0, owner.identity)
                     XCTAssertEqual(summary.1, Data("ready\r\nstderr\r\n".utf8) + bytes)
                     XCTAssertTrue(summary.2)

@@ -184,7 +184,7 @@ private actor ProbeConsumer: TerminalSessionConsumer {
             _ = try await coordinator.submit(returned, encodedBytes: ending)
             expected += ending
             let end = try await run.value, summary = await sink.summary()
-            try require(end == .peerOutputEnded && summary.0 == expected && summary.3)
+            try require(end == .completed(.init(remoteExit: nil, channelClosed: true)) && summary.0 == expected && summary.3)
             try require(summary.2?.columns == 132 && summary.2?.rows == 42)
             let stats = try await session.accounting()
             try require(stats.locallyAcceptedBytes == expected.count - 15 && stats.channelAcceptedBytes == expected.count - 15)

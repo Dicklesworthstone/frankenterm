@@ -415,4 +415,225 @@ final class TerminalHistoryRuntimeTests: XCTestCase {
         let accounting = await large.runtime.accounting(); XCTAssertFalse(accounting.closing)
         try await large.runtime.close()
     }
+
+    func testInspectionSearchRevealAndDoneRestoreTheOriginalViewportExactlyOnce() async throws {
+        let h = try await harness()
+        try await h.runtime.setViewport(top: 101, source: h.source)
+        var preparations = 0
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: { preparations += 1 }, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "error"
+        inspection.search()
+        await inspection.waitUntilSettled()
+        XCTAssertEqual(preparations, 1)
+        XCTAssertEqual(inspection.result?.matches.map(\.row), [102, 100])
+        XCTAssertNil(inspection.failure)
+        let before = await h.delivery.presented()
+        XCTAssertEqual(before.map(\.viewportFirst), [101], "search does not change the shown viewport")
+
+        let match = try XCTUnwrap(inspection.result?.matches.last)
+        inspection.reveal(match)
+        await inspection.waitUntilSettled()
+        XCTAssertEqual(inspection.selectedMatchID, match.id)
+        XCTAssertEqual(inspection.preview?.text, "old error\nmiddle")
+        let selected = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertEqual(selected.viewportTop, 100)
+
+        await inspection.close()
+        await inspection.close(restoreViewport: false)
+        let returned = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertEqual(returned.viewportTop, 101)
+        XCTAssertEqual(closes.count, 1)
+        XCTAssertEqual(closes.first?.0, inspection.id)
+        XCTAssertNil(closes.first?.1); XCTAssertNil(closes.first?.2)
+        XCTAssertFalse(inspection.isPresented); XCTAssertFalse(inspection.isBusy)
+        XCTAssertTrue(inspection.query.isEmpty)
+        XCTAssertNil(inspection.result); XCTAssertNil(inspection.preview); XCTAssertNil(inspection.previewID)
+        XCTAssertNil(inspection.selectedMatchID)
+        let sent = await h.transport.bytes(); XCTAssertTrue(sent.isEmpty)
+        try await h.runtime.close()
+    }
+
+    func testInspectionKeepsARevealedMatchAndReturnsOnlyItsOriginalBookmark() async throws {
+        let h = try await harness()
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "old error"; inspection.search()
+        await inspection.waitUntilSettled()
+        inspection.reveal(try XCTUnwrap(inspection.result?.matches.first))
+        await inspection.waitUntilSettled()
+        await inspection.close(restoreViewport: false)
+        let retained = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertEqual(retained.viewportTop, 100, "Show in Terminal preserves the validated selection")
+        XCTAssertEqual(closes.count, 1); XCTAssertNil(closes.first?.2)
+        let original = try XCTUnwrap(closes.first?.1)
+        XCTAssertEqual(original.source, h.source); XCTAssertNil(original.viewportTop)
+        try await h.runtime.receive(.init(output: Data("later".utf8)), source: h.source)
+        try await h.runtime.restoreHistoryBookmark(original, source: h.source)
+        let returned = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertNil(returned.viewportTop, "the returned bookmark follows live output")
+        let captures = h.model.activity().captures.count
+        inspection.search(); inspection.retire(); await inspection.close()
+        XCTAssertEqual(h.model.activity().captures.count, captures, "a closed owner never starts another read")
+        XCTAssertEqual(closes.count, 1)
+        try await h.runtime.close()
+    }
+
+    func testInspectionRepeatedRevealReplacesTheImmutablePreviewWhenContextChanges() async throws {
+        let h = try await harness()
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { _, _, _ in })
+        inspection.query = "old error"; inspection.search()
+        await inspection.waitUntilSettled()
+        let match = try XCTUnwrap(inspection.result?.matches.first)
+        inspection.reveal(match); await inspection.waitUntilSettled()
+        let first = try XCTUnwrap(inspection.previewID)
+        XCTAssertEqual(inspection.preview?.text, "old error\nmiddle")
+        h.model.replace(1, with: Row("later context"))
+        inspection.reveal(match); await inspection.waitUntilSettled()
+        XCTAssertEqual(inspection.selectedMatchID, match.id)
+        XCTAssertEqual(inspection.preview?.text, "old error\nlater context")
+        XCTAssertNotEqual(inspection.previewID, first, "updated context must replace the native view's immutable copy document")
+        await inspection.close()
+        XCTAssertNil(inspection.previewID)
+        try await h.runtime.close()
+    }
+
+    func testInspectionLeavesExpiredResultContextVisibleAndDoesNotRetargetIt() async throws {
+        let h = try await harness()
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { _, _, _ in })
+        inspection.query = "old error"; inspection.search()
+        await inspection.waitUntilSettled()
+        let match = try XCTUnwrap(inspection.result?.matches.first)
+        h.model.replace(0, with: Row("unrelated"), preserveSequence: true)
+        inspection.reveal(match)
+        await inspection.waitUntilSettled()
+        XCTAssertEqual(inspection.failure, TerminalHistorySearchError.staleResult.errorDescription)
+        XCTAssertEqual(inspection.result?.matches.first?.id, match.id)
+        XCTAssertEqual(inspection.result?.matches.first?.excerpt, match.excerpt)
+        XCTAssertNil(inspection.preview); XCTAssertNil(inspection.selectedMatchID)
+        let stillLive = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertNil(stillLive.viewportTop)
+        let frames = await h.delivery.presented(); XCTAssertTrue(frames.isEmpty)
+        await inspection.close()
+        try await h.runtime.close()
+    }
+
+    func testInspectionReportsAnExpiredReturnBookmarkWithoutSelectingAnotherRow() async throws {
+        let h = try await harness()
+        try await h.runtime.setViewport(top: 101, source: h.source)
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "old error"; inspection.search()
+        await inspection.waitUntilSettled()
+        inspection.reveal(try XCTUnwrap(inspection.result?.matches.first))
+        await inspection.waitUntilSettled()
+        h.model.replace(1, with: Row("replacement"))
+        await inspection.close()
+        let selected = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertEqual(selected.viewportTop, 100)
+        XCTAssertEqual(closes.count, 1); XCTAssertNil(closes.first?.1)
+        XCTAssertEqual(closes.first?.2, TerminalHistorySearchError.staleResult.errorDescription)
+        XCTAssertFalse(inspection.isPresented)
+        try await h.runtime.close()
+    }
+
+    func testInspectionCancellationKeepsTheOnlyReaderSlotUntilTheModelSettles() async throws {
+        let hold = HistoryRuntimeGate(), h = try await harness(hold: hold)
+        let receive = Task { try await h.runtime.receive(.init(output: Data("arrived".utf8)), source: h.source) }
+        await h.delivery.entered.wait()
+        var preparations = 0
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: { preparations += 1 }, onClose: { _, _, _ in })
+        inspection.query = "error"; inspection.search()
+        while await h.runtime.accounting().waitingHistoryRequests == 0 { await Task.yield() }
+        inspection.cancelSearch()
+        inspection.query = "middle"; inspection.search()
+        XCTAssertTrue(inspection.isBusy, "cancellation cannot release an operation still waiting on the model")
+        XCTAssertEqual(preparations, 1, "repeated submission cannot create another reader")
+        let queued = await h.runtime.accounting()
+        XCTAssertEqual(queued.waitingHistoryRequests, 1)
+        await hold.release(); try await receive.value
+        await inspection.waitUntilSettled()
+        XCTAssertFalse(inspection.isBusy); XCTAssertNil(inspection.result); XCTAssertNil(inspection.failure)
+        inspection.search(); await inspection.waitUntilSettled()
+        XCTAssertEqual(preparations, 2)
+        XCTAssertEqual(inspection.result?.matches.map(\.row), [101])
+        await inspection.close()
+        try await h.runtime.close()
+    }
+
+    func testInspectionRetiredBeforePresentationNeverStartsWorkOrReturnsAuthority() async throws {
+        let h = try await harness()
+        var preparations = 0
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: { preparations += 1 }, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "error"; inspection.retire()
+        XCTAssertFalse(inspection.isPresented, "a sheet mounted later can immediately observe retirement")
+        XCTAssertTrue(inspection.isUnavailable); XCTAssertTrue(inspection.query.isEmpty)
+        inspection.search(); inspection.retire()
+        await inspection.waitUntilSettled(); await inspection.close(restoreViewport: false)
+        XCTAssertEqual(preparations, 0); XCTAssertTrue(h.model.activity().captures.isEmpty)
+        XCTAssertEqual(closes.count, 1); XCTAssertEqual(closes.first?.0, inspection.id)
+        XCTAssertNil(closes.first?.1); XCTAssertNil(closes.first?.2)
+        XCTAssertNil(inspection.result); XCTAssertNil(inspection.preview); XCTAssertFalse(inspection.isBusy)
+        try await h.runtime.close()
+    }
+
+    func testInspectionRetirementClearsImmediatelyAndJoinsACancelledCanonicalRead() async throws {
+        let hold = HistoryRuntimeGate(), h = try await harness(hold: hold)
+        let receive = Task { try await h.runtime.receive(.init(output: Data("arrived".utf8)), source: h.source) }
+        await h.delivery.entered.wait()
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "error"; inspection.search()
+        while await h.runtime.accounting().waitingHistoryRequests == 0 { await Task.yield() }
+        let captures = h.model.activity().captures.count
+        inspection.retire()
+        XCTAssertFalse(inspection.isPresented); XCTAssertTrue(inspection.isUnavailable)
+        XCTAssertTrue(inspection.query.isEmpty); XCTAssertNil(inspection.result); XCTAssertNil(inspection.preview)
+        var joined = false
+        let join = Task { await inspection.waitUntilSettled(); joined = true }
+        await Task.yield()
+        XCTAssertFalse(joined); XCTAssertTrue(inspection.isBusy); XCTAssertTrue(closes.isEmpty)
+        inspection.search(); inspection.retire()
+        await hold.release(); try await receive.value; await join.value
+        XCTAssertTrue(joined); XCTAssertFalse(inspection.isBusy)
+        XCTAssertEqual(closes.count, 1); XCTAssertNil(closes.first?.1); XCTAssertNil(closes.first?.2)
+        XCTAssertNil(inspection.result); XCTAssertNil(inspection.preview); XCTAssertNil(inspection.failure)
+        XCTAssertEqual(h.model.activity().captures.count, captures, "cancelled work cannot repopulate the retired inspection")
+        try await h.runtime.close()
+        XCTAssertTrue(h.model.activity().closed)
+    }
+
+    func testInspectionDoneJoinsCancelledRevealThenRestoresTheOriginalLiveViewport() async throws {
+        let hold = HistoryRuntimeGate(), h = try await harness(hold: hold)
+        var closes: [(UUID, TerminalHistoryBookmark?, String?)] = []
+        let inspection = TerminalHistoryInspection(runtime: h.runtime, source: h.source, destination: "Machine",
+            prepare: {}, onClose: { closes.append(($0, $1, $2)) })
+        inspection.query = "old error"; inspection.search()
+        await inspection.waitUntilSettled()
+        inspection.reveal(try XCTUnwrap(inspection.result?.matches.first))
+        await h.delivery.entered.wait()
+        var closed = false
+        let close = Task { await inspection.close(); closed = true }
+        while !inspection.isClosing { await Task.yield() }
+        XCTAssertFalse(closed); XCTAssertTrue(inspection.isBusy)
+        let revealed = await h.delivery.presented()
+        XCTAssertEqual(revealed.map(\.viewportFirst), [100])
+        await hold.release(); await close.value
+        let frames = await h.delivery.presented()
+        XCTAssertEqual(frames.map(\.viewportFirst), [100, 102], "a cancelled publication still needs its original position restored")
+        let original = try await h.runtime.captureHistoryBookmark(source: h.source)
+        XCTAssertNil(original.viewportTop)
+        XCTAssertTrue(closed); XCTAssertFalse(inspection.isBusy); XCTAssertNil(inspection.preview)
+        XCTAssertEqual(closes.count, 1); XCTAssertNil(closes.first?.1); XCTAssertNil(closes.first?.2)
+        try await h.runtime.close()
+    }
 }

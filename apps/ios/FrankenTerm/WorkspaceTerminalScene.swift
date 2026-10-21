@@ -75,6 +75,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             guard let current = sessions[machineID], current.recoveryReviewReady else { return }
             reviewed = current.recoveryRecords
         } else { reviewed = [] }
+        sessions[machineID]?.discardRetainedOutput()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self)
         sessions[machineID] = controller
         controller.setPresentationVisible(foreground && machineID == selectedMachineID)
@@ -105,7 +106,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !closed else { return }
         closed = true
         navigation.suspend()
-        for controller in sessions.values { controller.requestStop() }
+        for controller in sessions.values {
+            controller.discardRetainedOutput()
+            controller.requestStop()
+        }
     }
 
     /// Concurrent callers join the same cleanup, not an early closed flag.
@@ -253,6 +257,8 @@ struct WorkspaceTerminalScreen: View {
     var themes: SceneThemeSource? = nil
     @Environment(\.scenePhase) private var scenePhase
     @State private var pickingTheme = false
+    @State private var historyInspection: TerminalHistoryInspection?
+    @State private var retainedOutput: TerminalRetainedOutput?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -276,8 +282,17 @@ struct WorkspaceTerminalScreen: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if let session = scene.selectedSession, session.phase == .live {
+                    if session.historyReturnBookmark != nil {
+                        Button("Return to Previous View", systemImage: "arrow.uturn.backward") { session.returnFromHistorySearch() }
+                            .disabled(session.clipboardIsPresenting)
+                    }
+                    Button("Search Output", systemImage: "magnifyingglass") { historyInspection = session.inspectHistory() }
+                        .disabled(session.clipboardIsPresenting)
+                        .accessibilityIdentifier("terminal.history.open")
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
+                        .disabled(session.clipboardIsPresenting)
                     Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
+                        .disabled(session.clipboardIsPresenting)
                 }
                 if themes != nil, machine != nil {
                     Button("Theme", systemImage: "paintpalette") { pickingTheme = true }
@@ -295,6 +310,8 @@ struct WorkspaceTerminalScreen: View {
             }
         }
         .toolbarBackground(background, for: .navigationBar)
+        .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
+        .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
         .task {
@@ -302,11 +319,15 @@ struct WorkspaceTerminalScreen: View {
             scene.connect(initialMachineID)
         }
         .onDisappear {
+            historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             let retiring = scene
             retiring.requestClose()
             Task { await retiring.close() }
         }
-        .onChange(of: scenePhase) { _, phase in scene.setForeground(phase == .active) }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { historyInspection?.retire(); historyInspection = nil; retainedOutput = nil }
+            scene.setForeground(phase == .active)
+        }
     }
 
     @ViewBuilder private func card(for machine: SceneMachine) -> some View {
@@ -337,7 +358,7 @@ struct WorkspaceTerminalScreen: View {
     }
 
     /// Every way out of a session states that its last input may or may not
-    /// have run; the only action is an informed, explicit new session.
+    /// have run. Inspecting retained output never creates a new session.
     private func notice(symbol: String, title: String, message: String, uncertain: Bool, enabled: Bool,
                         action: String? = "Start New Session", cleanup: TerminalSessionController? = nil,
                         perform: @escaping () -> Void) -> some View {
@@ -345,6 +366,14 @@ struct WorkspaceTerminalScreen: View {
             Image(systemName: symbol).font(.largeTitle)
             Text(title).font(.headline)
             Text(verbatim: message).multilineTextAlignment(.center).font(.callout)
+            if let output = cleanup?.retainedOutput {
+                Button("View Retained Output", systemImage: "doc.text.magnifyingglass") { retainedOutput = output }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("terminal.retained.open")
+            } else if let failure = cleanup?.retainedOutputFailure {
+                Text("A complete received viewport could not be retained: \(failure)")
+                    .multilineTextAlignment(.center).font(.caption)
+            }
             if uncertain {
                 Text("The session marker does not prove that a particular command was sent or executed. Nothing is sent again automatically; check the machine before repeating a command.")
                     .multilineTextAlignment(.center).font(.caption)

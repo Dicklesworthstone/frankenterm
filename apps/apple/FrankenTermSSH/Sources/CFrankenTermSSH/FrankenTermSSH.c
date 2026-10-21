@@ -39,6 +39,8 @@ struct ftssh_session {
     uint8_t write_buffer[FTSSH_WRITE_CAPACITY];
     size_t write_length, write_offset;
     uint64_t accepted, written, received;
+    size_t receive_budget;
+    int limited_receive, output_eof;
 };
 typedef union { max_align_t alignment; size_t size; } allocation_header;
 static _Atomic size_t global_allocated;
@@ -96,8 +98,15 @@ static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length,
 static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, int flags, void **abstract) {
     ftssh_session *s = *abstract;
     if(s->closing) return -ECONNRESET;
+    if(s->limited_receive) {
+        if(!s->receive_budget) return -EAGAIN;
+        if(length > s->receive_budget) length = s->receive_budget;
+    }
     ssize_t result = recv(fd, data, length, flags);
-    if(result > 0 && (uint64_t)result <= UINT64_MAX - s->received) s->received += (uint64_t)result;
+    if(result > 0) {
+        if(s->limited_receive) s->receive_budget -= (size_t)result;
+        if((uint64_t)result <= UINT64_MAX - s->received) s->received += (uint64_t)result;
+    }
     return result < 0 ? -errno : result;
 }
 static int fail(ftssh_session *s, int code) {
@@ -363,8 +372,52 @@ int ftssh_read(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length) 
     ssize_t count = libssh2_channel_read_ex(s->channel, 0, (char *)out, capacity);
     if(count == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
     if(count < 0 || (size_t)count > capacity) return fail(s, FTSSH_IO);
-    if(count == 0) return libssh2_channel_eof(s->channel) ? FTSSH_EOF : FTSSH_AGAIN;
+    if(count == 0) {
+        if(!libssh2_channel_eof(s->channel)) return FTSSH_AGAIN;
+        s->output_eof = 1; return FTSSH_EOF;
+    }
     *length = (size_t)count; return FTSSH_OK;
+}
+static int copy_completion(ftssh_session *s, ftssh_completion *out) {
+    size_t length = 0;
+    int rc = libssh2_channel_get_exit_signal(s->channel, NULL, &length, NULL, NULL, NULL, NULL);
+    if(rc) return fail(s, FTSSH_IO);
+    if(length && length < sizeof(out->signal)) {
+        char *name = NULL;
+        rc = libssh2_channel_get_exit_signal(s->channel, &name, &length, NULL, NULL, NULL, NULL);
+        if(rc || !name) return fail(s, FTSSH_IO);
+        int printable = 1;
+        for(size_t i = 0; i < length; i++) {
+            if((unsigned char)name[i] < 33 || (unsigned char)name[i] > 126) printable = 0;
+        }
+        if(printable) {
+            memcpy(out->signal, name, length); out->signal[length] = 0;
+            out->kind = FTSSH_EXIT_SIGNAL;
+        }
+        libssh2_free(s->ssh, name);
+    }
+    uint32_t status = (uint32_t)libssh2_channel_get_exit_status(s->channel);
+    if(out->kind == FTSSH_EXIT_UNKNOWN && status != 0) {
+        out->kind = FTSSH_EXIT_STATUS; out->exit_status = status;
+    }
+    return FTSSH_OK;
+}
+int ftssh_completion_step(ftssh_session *s, ftssh_completion *out) {
+    int rc = check(s, LIVE); if(rc) return rc;
+    if(!out) return FTSSH_INVALID;
+    memset(out, 0, sizeof(*out));
+    if(!s->output_eof) return FTSSH_STATE;
+    /* wait_closed otherwise reads until EAGAIN; cap each call even if a hostile
+     * peer continuously sends control traffic. No new buffer or timer is owned
+     * here. Existing libssh2 allocation limits also bound already buffered data. */
+    s->limited_receive = 1; s->receive_budget = 32768;
+    rc = libssh2_channel_wait_closed(s->channel);
+    int exhausted = s->receive_budget == 0;
+    s->limited_receive = 0;
+    if(rc != 0 && rc != LIBSSH2_ERROR_EAGAIN) return fail(s, FTSSH_IO);
+    int copied = copy_completion(s, out); if(copied) return copied;
+    if(rc == 0) { out->channel_closed = 1; return FTSSH_OK; }
+    return exhausted ? FTSSH_YIELD : FTSSH_AGAIN;
 }
 int ftssh_resize(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint32_t h) {
     int rc = check(s, LIVE); if(rc) return rc;

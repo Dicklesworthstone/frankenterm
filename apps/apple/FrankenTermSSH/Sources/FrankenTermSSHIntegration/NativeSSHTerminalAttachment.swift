@@ -102,7 +102,8 @@ private final class NativeSSHTerminalTransport: TerminalSessionTransport, Sendab
             try TerminalSessionGeometry(columns: $0.columns, rows: $0.rows,
                                         pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight)
         }
-        return .init(output: update.output, endOfOutput: update.endOfOutput, resized: resized)
+        return .init(output: update.output, endOfOutput: update.endOfOutput, resized: resized,
+                     completion: update.completion?.terminalCompletion)
     }
     func wakeService() async {
         do { try await session.wakeService(driver: driver) }
@@ -117,4 +118,16 @@ private final class NativeSSHTerminalTransport: TerminalSessionTransport, Sendab
         await session.close()
     }
     func accounting() async throws -> NativeSSHAccounting { try await session.accounting() }
+}
+
+extension NativeSSHCompletion {
+    var terminalCompletion: TerminalSessionCompletion {
+        let reported: TerminalRemoteExit? = remoteExit.map {
+            switch $0 {
+            case .exitStatus(let code): return .exitStatus(code)
+            case .signal(let name): return .signal(name)
+            }
+        }
+        return .init(remoteExit: reported, channelClosed: channelClosed)
+    }
 }

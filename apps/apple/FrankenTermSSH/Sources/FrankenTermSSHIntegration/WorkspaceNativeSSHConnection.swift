@@ -396,7 +396,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try TerminalSessionGeometry(columns: $0.columns, rows: $0.rows,
                                             pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight)
             }
-            return .init(output: event.output, endOfOutput: event.endOfOutput, resized: geometry)
+            return .init(output: event.output, endOfOutput: event.endOfOutput, resized: geometry,
+                         completion: event.completion?.terminalCompletion)
         } catch {
             // Only a failure that precedes any owner's close is a lost
             // connection; after one, a socket error is that close's effect.

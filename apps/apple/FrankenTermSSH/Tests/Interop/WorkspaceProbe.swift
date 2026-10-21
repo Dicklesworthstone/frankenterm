@@ -397,7 +397,7 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             let focus = try await coordinator.changeFocus(stream, to: pump.source)
             let payload = Data("protected workspace → actual SSH 🦀\r\nEND-SESSION\r".utf8)
             let receipt = try await coordinator.submit(focus, encodedBytes: payload)
-            guard try await run.value == .peerOutputEnded else { throw WorkspaceProbeError.invalid }
+            guard try await run.value == .completed(.init(remoteExit: nil, channelClosed: true)) else { throw WorkspaceProbeError.invalid }
             try await consumer.verify(receipt: receipt, payload: payload)
             // EOF alone does not erase uncertain remote effects or release the
             // connection owner's epoch. Explicit local teardown retires it.

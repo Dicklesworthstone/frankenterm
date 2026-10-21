@@ -16,6 +16,7 @@ extern "C" {
 typedef struct ftssh_session ftssh_session;
 enum {
     FTSSH_OK = 0, FTSSH_AGAIN = 1, FTSSH_SIGNATURE_NEEDED = 2, FTSSH_EOF = 3,
+    FTSSH_YIELD = 4,
     FTSSH_INVALID = -1000, FTSSH_STATE = -1001, FTSSH_LIMIT = -1002,
     FTSSH_IO = -1003, FTSSH_NEGOTIATION = -1004, FTSSH_HOST_REJECTED = -1005,
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
@@ -30,6 +31,13 @@ typedef struct {
     /* Bytes read from the server's socket, including SSH-level replies. */
     uint64_t received_bytes;
 } ftssh_stats;
+
+enum { FTSSH_EXIT_UNKNOWN = 0, FTSSH_EXIT_STATUS = 1, FTSSH_EXIT_SIGNAL = 2 };
+typedef struct {
+    int kind, channel_closed;
+    uint32_t exit_status;
+    char signal[65];
+} ftssh_completion;
 
 /* On success consumes this connected SOCK_STREAM descriptor. On failure leaves
  * it owned by the caller, but may have set O_NONBLOCK/FD_CLOEXEC/SO_NOSIGPIPE.
@@ -71,6 +79,17 @@ int ftssh_admit_write(ftssh_session *session, const uint8_t *bytes, size_t lengt
 /* Retains the exact write pointer and length across libssh2 EAGAIN. */
 int ftssh_flush_write(ftssh_session *session);
 int ftssh_read(ftssh_session *session, uint8_t *output, size_t capacity, size_t *length);
+/* Only after read returned EOF with all buffered output drained. Make bounded
+ * nonblocking progress toward remote channel closure without sending EOF or
+ * CLOSE ourselves. OK means observed channel closure; AGAIN waits for readiness;
+ * YIELD means the receive quantum was consumed and the owner should yield then
+ * retry. On each non-error return, completion contains the evidence available.
+ * The owner supplies a finite overall deadline: remote exit status is optional.
+ * libssh2 cannot distinguish reported zero from absent status. Both stay UNKNOWN;
+ * never turn UNKNOWN into successful process completion. Signal names are bounded
+ * printable ASCII. Neither exit evidence nor channel close proves input effects.
+ */
+int ftssh_completion_step(ftssh_session *session, ftssh_completion *completion);
 /* No acknowledged geometry exists in ordinary SSH. Success means the local
  * window-change request completed. Resume the same request after AGAIN. */
 int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,

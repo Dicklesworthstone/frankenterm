@@ -52,14 +52,34 @@ public struct TerminalSessionGeometry: Equatable, Sendable {
     }
 }
 
+/// Evidence reported by the peer, never a command replay or input-effect ACK.
+public enum TerminalRemoteExit: Equatable, Sendable {
+    case exitStatus(UInt32)
+    case signal(String)
+}
+
+public struct TerminalSessionCompletion: Equatable, Sendable {
+    /// nil means unavailable. Some backends cannot distinguish a reported zero
+    /// from an absent exit status; callers must not render that as success.
+    public let remoteExit: TerminalRemoteExit?
+    /// False means output EOF was drained but the bounded wait for channel
+    /// closure expired. EOF alone never proves that the remote process stopped.
+    public let channelClosed: Bool
+    public init(remoteExit: TerminalRemoteExit?, channelClosed: Bool) {
+        self.remoteExit = remoteExit; self.channelClosed = channelClosed
+    }
+}
+
 public struct TerminalSessionUpdate: Sendable {
     public let output: Data
     public let endOfOutput: Bool
+    public let completion: TerminalSessionCompletion?
     /// Ordinary SSH window change has no server geometry acknowledgement. This
     /// is only the transport's local completion, still bound to this source.
     public let resized: TerminalSessionGeometry?
-    public init(output: Data, endOfOutput: Bool = false, resized: TerminalSessionGeometry? = nil) {
-        self.output = output; self.endOfOutput = endOfOutput; self.resized = resized
+    public init(output: Data, endOfOutput: Bool = false, resized: TerminalSessionGeometry? = nil,
+                completion: TerminalSessionCompletion? = nil) {
+        self.output = output; self.endOfOutput = endOfOutput; self.resized = resized; self.completion = completion
     }
 }
 
@@ -104,6 +124,9 @@ public enum TerminalSessionEnd: Equatable, Sendable {
     /// Client policy ends this attachment after peer output EOF. This is NOT an
     /// exit code, process-completion proof, or a promise the remote PTY survives.
     case peerOutputEnded
+    /// Delivered only after the consumer has applied all final received output.
+    /// Local cancellation and transport loss keep their separate origins.
+    case completed(TerminalSessionCompletion)
 }
 
 /// Joins the real transport and input coordinator. There is one bounded pump and
@@ -260,7 +283,7 @@ public actor TerminalSessionPump {
             catch is TerminalTransportError { return Task.isCancelled ? .cancelled : .disconnected }
             catch { return signal.isFinished || Task.isCancelled ? .cancelled : .transportFailed }
             // A corrupt adapter cannot push an oversized receive into the parser.
-            guard update.output.count <= 16_384 else { return .transportFailed }
+            guard update.output.count <= 16_384, update.completion == nil || update.endOfOutput else { return .transportFailed }
             if signal.isFinished || Task.isCancelled { return .cancelled }
             if !update.output.isEmpty || update.resized != nil || update.endOfOutput {
                 do {
@@ -273,7 +296,9 @@ public actor TerminalSessionPump {
             if signal.isFinished || Task.isCancelled { return .cancelled }
             // Deliver all final bytes first. Stop this attachment deliberately;
             // never turn repeated native EOF into a busy loop or an exit(0) claim.
-            if update.endOfOutput { return .peerOutputEnded }
+            if update.endOfOutput {
+                return update.completion.map(TerminalSessionEnd.completed) ?? .peerOutputEnded
+            }
         }
         return .cancelled
     }

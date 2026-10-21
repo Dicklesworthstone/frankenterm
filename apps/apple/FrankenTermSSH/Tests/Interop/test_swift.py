@@ -25,7 +25,13 @@ spec.loader.exec_module(fixture)
 class SwiftInteropTests(unittest.TestCase):
     def run_probe(self, mode, key=None):
         key = key or ed25519.Ed25519PrivateKey.generate()
-        server = fixture.LoopbackServer(key)
+        completion_modes = {"completionStatus7": "status7", "completionHighStatus": "highStatus",
+                            "completionSignal": "signalTERM", "completionUnknown": "unknown",
+                            "completionZero": "status0", "completionEOFOnly": "eofOnly",
+                            "completionStatusWithoutClose": "statusWithoutClose",
+                            "completionDelayedStatus": "delayedStatus", "completionReset": "resetAfterEOF",
+                            "completionCancel": "eofOnly"}
+        server = fixture.LoopbackServer(key, completion=completion_modes.get(mode, "unknown"))
         sock = None
         if mode == "connect":
             endpoint, inherited = server.address[1], []
@@ -72,11 +78,32 @@ class SwiftInteropTests(unittest.TestCase):
                 elif event["event"] == "done":
                     completed = event
                     break
+                elif event["event"] == "waitingForCompletion":
+                    self.assertIn(mode, ["completionDelayedStatus", "completionReset"])
+                    self.assertTrue(server.output_eof.is_set())
+                    server.release_completion.set()
                 else:
                     self.fail(event)
             self.assertIsNotNone(completed, "Swift integration did not finish before its outer deadline")
             self.assertEqual(process.wait(timeout=3), 0, process.stderr.read(8192).decode(errors="replace"))
-            if mode in ["io", "idle", "connect", "wake", "pump", "pumpCancel"]:
+            if mode in completion_modes:
+                self.assertEqual(len(server.received), completed["bytes"])
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+                self.assertEqual([e[0] for e in server.events if e[0] in ["channel", "pty", "shell"]],
+                                 ["channel", "pty", "shell"])
+                if mode in ["completionReset", "completionCancel"]:
+                    self.assertEqual(completed["origin"], "transportLost" if mode == "completionReset" else "cancelled")
+                else:
+                    self.assertEqual(completed["origin"], "remoteCompletion")
+                    self.assertEqual(completed["channelClosed"], mode not in ["completionEOFOnly", "completionStatusWithoutClose"])
+                    if mode in ["completionStatus7", "completionDelayedStatus", "completionStatusWithoutClose", "completionHighStatus"]:
+                        self.assertEqual(completed["exitKind"], "status")
+                        self.assertEqual(completed["exitStatus"], 0xffffffff if mode == "completionHighStatus" else 7)
+                    elif mode == "completionSignal":
+                        self.assertEqual((completed["exitKind"], completed["signal"]), ("signal", "TERM"))
+                    else:
+                        self.assertEqual(completed["exitKind"], "unknown")
+            elif mode in ["io", "idle", "connect", "wake", "pump", "pumpCancel"]:
                 self.assertEqual(len(server.received), completed["bytes"])
                 if mode != "pumpCancel":
                     self.assertIn(("resize", 132, 42), server.events)
@@ -130,6 +157,24 @@ class SwiftInteropTests(unittest.TestCase):
 
     def test_final_validation_and_pre_shell_revocation_prevent_side_effect(self):
         for mode in ["cancelFinalValidation", "revokeBeforeShell"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode)
+
+    def test_typed_completion_distinguishes_reported_evidence_and_unknown_zero(self):
+        for mode in ["completionStatus7", "completionHighStatus", "completionSignal", "completionUnknown", "completionZero"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode)
+
+    def test_eof_is_half_close_and_waits_for_delayed_remote_status(self):
+        self.run_probe("completionDelayedStatus")
+
+    def test_eof_without_channel_close_has_bounded_completion_wait(self):
+        for mode in ["completionEOFOnly", "completionStatusWithoutClose"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode)
+
+    def test_loss_and_cancellation_during_completion_keep_their_local_origins(self):
+        for mode in ["completionReset", "completionCancel"]:
             with self.subTest(mode=mode):
                 self.run_probe(mode)
 

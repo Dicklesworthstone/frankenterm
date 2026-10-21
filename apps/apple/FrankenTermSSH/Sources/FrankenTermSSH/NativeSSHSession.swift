@@ -110,10 +110,22 @@ public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), w
 /// output or a library packet is still pending; unavailable means this
 /// platform cannot prove a probe would not be left half sent.
 public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unavailable }
+public enum NativeSSHRemoteExit: Sendable, Equatable {
+    case exitStatus(UInt32)
+    case signal(String)
+}
+public struct NativeSSHCompletion: Sendable, Equatable {
+    /// A zero getter result in libssh2 cannot establish that a status was sent.
+    /// Both absent status and reported zero therefore remain nil here.
+    public let remoteExit: NativeSSHRemoteExit?
+    /// False means drained output EOF followed by expiry of the bounded wait.
+    public let channelClosed: Bool
+}
 public struct NativeSSHServiceEvent: Sendable {
     /// At most 16 KiB; consume through the canonical terminal before asking again.
     public let output: Data
     public let endOfOutput: Bool
+    public let completion: NativeSSHCompletion?
     /// A readiness interval expired without discarding channel state or queued
     /// bytes. An idle terminal is not a dead connection. Keepalive/failure policy
     /// belongs to the session owner, which can explicitly close the connection.
@@ -151,6 +163,9 @@ public actor NativeSSHSession {
     private var identity: NativeSSHIdentity?
     private var requestedResize: NativeSSHGeometry?
     private var outputEnded = false
+    private var completionDeadline: ContinuousClock.Instant?
+    private var observedRemoteExit: NativeSSHRemoteExit?
+    private var completion: NativeSSHCompletion?
     private var driver: NativeSSHDriver?
     private var legacyChannelID: UUID?
     private enum ChannelAuthorization {
@@ -278,11 +293,14 @@ public actor NativeSSHSession {
     }
     private func admit(_ bytes: Data, authorized: ChannelAuthorization) throws -> NativeSSHWriteAdmission {
         try Task.checkCancellation()
-        guard phase == .live else { throw NativeSSHError.closed }
+        guard phase == .live, completion == nil else { throw NativeSSHError.closed }
         try requireDriver(authorized)
         guard !bytes.isEmpty, bytes.count <= Self.maximumWriteBytes else { throw NativeSSHError.invalidInput }
         channelDriven = true
-        if requestedResize != nil { return .wouldBlock }
+        // This owner ends an output-EOF attachment after bounded metadata
+        // settlement. Do not accept new bytes into an undriven native slot;
+        // the coordinator retains them as unsent on their original source.
+        if requestedResize != nil || outputEnded { return .wouldBlock }
         let result = bytes.withUnsafeBytes {
             ftssh_admit_write(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
         }
@@ -296,7 +314,7 @@ public actor NativeSSHSession {
     /// the server to reply, which advances `receivedBytes`. The owner decides
     /// how many silent intervals mean the server is gone. Call at least 2 s apart.
     package func keepalive(driver: NativeSSHDriver) throws -> NativeSSHKeepalive {
-        guard phase == .live else { throw NativeSSHError.closed }
+        guard phase == .live, completion == nil else { throw NativeSSHError.closed }
         try requireDriver(.driver(driver))
         guard operation == nil else { throw NativeSSHError.busy }
         let result = ftssh_keepalive(native.pointer)
@@ -316,9 +334,9 @@ public actor NativeSSHSession {
     }
     private func requestResize(_ geometry: NativeSSHGeometry, authorized: ChannelAuthorization) throws {
         try Task.checkCancellation()
-        guard phase == .live else { throw NativeSSHError.closed }
+        guard phase == .live, completion == nil else { throw NativeSSHError.closed }
         try requireDriver(authorized)
-        guard requestedResize == nil else { throw NativeSSHError.busy }
+        guard requestedResize == nil, !outputEnded else { throw NativeSSHError.busy }
         channelDriven = true; requestedResize = geometry; waiter?.wake()
     }
 
@@ -373,8 +391,10 @@ public actor NativeSSHSession {
     }
 
     /// One bounded receive/pump call at a time; admit and close remain available
-    /// during readiness waits. At EOF return final bytes first; no exit status is
-    /// invented. A readiness timeout preserves the connection and exact pending
+    /// during readiness waits. At EOF consume optional completion evidence for
+    /// at most two seconds, using readiness and bounded native work. Final bytes
+    /// are delivered first; absent/ambiguous exit status is never invented.
+    /// A readiness timeout preserves the connection and exact pending
     /// writes; cancellation explicitly aborts this owner, not an unrelated pane.
     public func service(timeout: Duration = .seconds(120), channelID: UUID? = nil) async throws -> NativeSSHServiceEvent {
         try await service(timeout: timeout, authorized: .legacy(channelID))
@@ -394,6 +414,40 @@ public actor NativeSSHSession {
             return try await withTaskCancellationHandler {
                 while true {
                     try current(token, deadline)
+                    if let completion { return try completedEvent(completion) }
+                    if outputEnded {
+                        var evidence = ftssh_completion()
+                        let result = ftssh_completion_step(native.pointer, &evidence)
+                        guard result == FTSSH_OK || result == FTSSH_AGAIN || result == FTSSH_YIELD else {
+                            throw NativeSSHError.native(result)
+                        }
+                        if evidence.kind == FTSSH_EXIT_STATUS {
+                            observedRemoteExit = .exitStatus(evidence.exit_status)
+                        } else if evidence.kind == FTSSH_EXIT_SIGNAL {
+                            let name = withUnsafeBytes(of: evidence.signal) {
+                                String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
+                            }
+                            observedRemoteExit = .signal(name)
+                        }
+                        guard let completionDeadline else { throw NativeSSHError.invalidInput }
+                        if result == FTSSH_OK || ContinuousClock.now >= completionDeadline {
+                            let final = NativeSSHCompletion(remoteExit: observedRemoteExit, channelClosed: result == FTSSH_OK)
+                            completion = final
+                            return try completedEvent(final)
+                        }
+                        if result == FTSSH_YIELD { await Task.yield(); continue }
+                        do { try await ready(directions: ftssh_directions(native.pointer), deadline: min(deadline, completionDeadline)) }
+                        catch NativeSSHError.timedOut {
+                            if phase == .live, operation == token, !Task.isCancelled,
+                               ContinuousClock.now >= completionDeadline {
+                                let final = NativeSSHCompletion(remoteExit: observedRemoteExit, channelClosed: false)
+                                completion = final
+                                return try completedEvent(final)
+                            }
+                            throw NativeSSHError.timedOut
+                        }
+                        continue
+                    }
                     let before = try accounting()
                     let flush = ftssh_flush_write(native.pointer)
                     guard flush == FTSSH_OK || flush == FTSSH_AGAIN else { throw NativeSSHError.native(flush) }
@@ -405,19 +459,20 @@ public actor NativeSSHSession {
                         else { try requireAgain(result); directions |= ftssh_directions(native.pointer) }
                     }
                     var output = Data(count: 16384), count = 0
-                    let result = outputEnded ? Int32(FTSSH_EOF) : output.withUnsafeMutableBytes {
+                    let result = output.withUnsafeMutableBytes {
                         ftssh_read(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, 16384, &count)
                     }
                     guard result == FTSSH_OK || result == FTSSH_AGAIN || result == FTSSH_EOF else { throw NativeSSHError.native(result) }
                     output.count = count
-                    if result == FTSSH_EOF { outputEnded = true }
+                    if result == FTSSH_EOF { outputEnded = true; completionDeadline = .now + .seconds(2) }
                     if result == FTSSH_AGAIN { directions |= ftssh_directions(native.pointer) }
                     let after = try accounting()
-                    if count > 0 || outputEnded || resized != nil || serviceWakePending
+                    if count > 0 || resized != nil || serviceWakePending
                         || before.pendingWriteBytes != after.pendingWriteBytes {
                         serviceWakePending = false
-                        return .init(output: output, endOfOutput: outputEnded, waitExpired: false, resized: resized, accounting: after)
+                        return .init(output: output, endOfOutput: false, completion: nil, waitExpired: false, resized: resized, accounting: after)
                     }
+                    if outputEnded { continue }
                     try await ready(directions: directions, deadline: deadline)
                 }
             } onCancel: { [weak self] in Task { await self?.close() } }
@@ -425,8 +480,14 @@ public actor NativeSSHSession {
             guard phase == .live, operation == token, !Task.isCancelled else {
                 await close(); throw NativeSSHError.closed
             }
-            return .init(output: Data(), endOfOutput: outputEnded, waitExpired: true, resized: nil, accounting: try accounting())
+            return .init(output: Data(), endOfOutput: false, completion: nil, waitExpired: true, resized: nil, accounting: try accounting())
         } catch { await close(); throw error }
+    }
+
+    private func completedEvent(_ completion: NativeSSHCompletion) throws -> NativeSSHServiceEvent {
+        serviceWakePending = false
+        return .init(output: Data(), endOfOutput: true, completion: completion, waitExpired: false,
+                     resized: nil, accounting: try accounting())
     }
 
     public func accounting() throws -> NativeSSHAccounting {

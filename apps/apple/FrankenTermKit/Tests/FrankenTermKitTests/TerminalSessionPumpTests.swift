@@ -298,6 +298,52 @@ final class TerminalSessionPumpTests: XCTestCase {
         XCTAssertTrue(stats.0.isEmpty)
     }
 
+    func testRemoteCompletionWaitsForFinalConsumerAndPreservesExactEvidence() async throws {
+        for completion in [TerminalSessionCompletion(remoteExit: .exitStatus(7), channelClosed: true),
+                           .init(remoteExit: .signal("TERM"), channelClosed: true),
+                           .init(remoteExit: nil, channelClosed: true),
+                           .init(remoteExit: nil, channelClosed: false)] {
+            let (_, transport, pump, _) = try await setup()
+            let release = SessionTestGate(), sink = PumpConsumer(outputHold: release)
+            await transport.inject(.init(output: Data("final received bytes".utf8), endOfOutput: true,
+                                         completion: completion))
+            let run = Task { try await pump.run(consumer: sink) }
+            await sink.outputEntered.wait()
+            let before = await transport.stats()
+            XCTAssertEqual(before.2, 0, "remote completion must not retire a suspended final consumer")
+            await release.release()
+            let end = try await run.value, delivered = await sink.stats(), closed = await transport.stats()
+            XCTAssertEqual(end, .completed(completion))
+            XCTAssertEqual(delivered.0, Data("final received bytes".utf8))
+            XCTAssertTrue(delivered.3)
+            XCTAssertEqual(closed.1, 1)
+            XCTAssertEqual(closed.2, 1)
+        }
+    }
+
+    func testCancellationDuringFinalDeliveryDoesNotBecomeRemoteCompletion() async throws {
+        let (_, transport, pump, _) = try await setup()
+        let release = SessionTestGate(), sink = PumpConsumer(outputHold: release)
+        await transport.inject(.init(output: Data("last".utf8), endOfOutput: true,
+                                     completion: .init(remoteExit: .exitStatus(7), channelClosed: true)))
+        let run = Task { try await pump.run(consumer: sink) }
+        await sink.outputEntered.wait()
+        pump.requestStop()
+        await release.release()
+        let end = try await run.value
+        XCTAssertEqual(end, .cancelled)
+    }
+
+    func testCompletionWithoutFinalOutputBoundaryIsRejected() async throws {
+        let (_, transport, pump, _) = try await setup()
+        await transport.inject(.init(output: Data("invalid".utf8),
+                                     completion: .init(remoteExit: .exitStatus(7), channelClosed: true)))
+        let sink = PumpConsumer(), end = try await pump.run(consumer: sink)
+        XCTAssertEqual(end, .transportFailed)
+        let received = await sink.stats()
+        XCTAssertTrue(received.0.isEmpty)
+    }
+
     func testCancellationJoinsNativeCloseAndAlreadyOwnedConsumer() async throws {
         let closeRelease = SessionTestGate(), consumerRelease = SessionTestGate()
         let coordinator = try TerminalInputCoordinator(), transport = try PumpTransport(closeRelease: closeRelease)
