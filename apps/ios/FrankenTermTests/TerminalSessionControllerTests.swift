@@ -129,6 +129,15 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTFail("the native input view never became editable")
     }
 
+    func testChromeContrastFollowsTheThemeBackground() {
+        XCTAssertTrue(TerminalSessionTarget.isDark(nil))
+        XCTAssertTrue(TerminalSessionTarget.isDark("#14213D"))
+        XCTAssertTrue(TerminalSessionTarget.isDark("#10223C80"))
+        XCTAssertFalse(TerminalSessionTarget.isDark("#FFFFFF"))
+        XCTAssertFalse(TerminalSessionTarget.isDark("#FCA311"))
+        XCTAssertFalse(TerminalSessionTarget.isDark("#808080"))
+    }
+
     func testSceneControllerTypesThroughTheNativeKeyboardAndResizesThePTY() async throws {
         let scene = try await liveScene(), outPath = scene.outPath, connections = scene.connections
         let controller = TerminalSessionController(target: scene.target, connections: connections)

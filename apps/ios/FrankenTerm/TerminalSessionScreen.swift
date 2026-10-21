@@ -47,6 +47,18 @@ struct TerminalSessionTarget: Hashable {
         self.machineName = machineName; self.routeID = routeID; self.credentialID = credentialID
         basePalette = theme?.terminalBasePalette; background = theme?.background
     }
+
+    /// Whether light chrome reads better over this background: its relative
+    /// luminance is below 0.179, where black and white text contrast equally.
+    /// No theme means the black default.
+    static func isDark(_ hex: String?) -> Bool {
+        guard let hex, let value = UInt32(hex.dropFirst().prefix(6), radix: 16) else { return true }
+        func linear(_ shift: UInt32) -> Double {
+            let component = Double(value >> shift & 0xFF) / 255
+            return component <= 0.04045 ? component / 12.92 : pow((component + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0) < 0.179
+    }
 }
 
 /// Publishes each owned FTSF frame from the Rust model to the native view.
@@ -258,8 +270,9 @@ struct TerminalSessionScreen: View {
     @State var controller: TerminalSessionController
 
     var body: some View {
+        let background = controller.target.background.map { Color(ftHex: $0) } ?? .black
         ZStack {
-            (controller.target.background.map { Color(ftHex: $0) } ?? .black).ignoresSafeArea()
+            background.ignoresSafeArea()
             TerminalHost(view: controller.terminal)
             switch controller.phase {
             case .idle, .connecting:
@@ -277,6 +290,10 @@ struct TerminalSessionScreen: View {
         }
         .navigationTitle(controller.target.machineName)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(background, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(TerminalSessionTarget.isDark(controller.target.background) ? .dark : .light,
+                            for: .navigationBar)
         .task { await controller.start() }
         .onDisappear { Task { await controller.stop() } }
     }
