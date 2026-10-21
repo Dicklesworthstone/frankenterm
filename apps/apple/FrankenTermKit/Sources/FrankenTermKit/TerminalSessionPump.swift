@@ -109,7 +109,8 @@ public actor TerminalSessionPump {
     private let transport: any TerminalSessionTransport
     private let coordinator: TerminalInputCoordinator
     private let signal: TerminalSessionSignal
-    private var started = false
+    private var started = false, finished = false
+    private var finalizing = false, reconciling = false
     private let writesPerTurn = 8
 
     private init(source: TerminalSource, transport: any TerminalSessionTransport,
@@ -135,11 +136,51 @@ public actor TerminalSessionPump {
         try await coordinator.disconnect(source)
     }
 
+    /// Explicit final metadata delivery after the sole run has settled (or an
+    /// attachment was stopped before run). Refuse overlapping reconciliation and
+    /// live consumers rather than consuming records that they still own.
+    ///
+    /// A throwing delivery retains its exact unacknowledged prefix. Successful
+    /// delivery is acknowledged even if cancellation races its return. Retrying
+    /// this method can only redeliver metadata, NEVER input bytes; partial delivery
+    /// effects must be idempotent. The session's durable uncertainty marker is
+    /// independent and is not cleared here. Retire responder focus separately,
+    /// then coordinator.retire(source) only after this operation succeeds.
+    @discardableResult
+    public func reconcileStoppedOutcomes(
+        deliver: @Sendable ([TerminalInputOutcome], TerminalSource) async throws -> Void
+    ) async throws -> Int {
+        try Task.checkCancellation()
+        guard signal.isFinished, !started || finished, !reconciling else {
+            throw TerminalInputError.unavailable
+        }
+        finalizing = true; reconciling = true
+        defer { reconciling = false }
+        try await coordinator.disconnect(source)
+        var delivered = 0
+        // Admission is closed and the sole writer has joined. The ledger can
+        // only shrink; its configured per-source record cap bounds this loop.
+        while true {
+            try Task.checkCancellation()
+            let batch = try await coordinator.pendingOutcomes(source)
+            guard !batch.outcomes.isEmpty else { return delivered }
+            try await deliver(batch.outcomes, source)
+            try await coordinator.acknowledgeOutcomes(batch)
+            delivered += batch.outcomes.count
+        }
+    }
+
     /// Exactly one run; focus and responder generations remain owned by the
     /// coordinator/UI. This does not retire their handles or discard outcomes.
-    public func run(consumer: any TerminalSessionConsumer) async throws -> TerminalSessionEnd {
-        guard !started else { throw TerminalInputError.unavailable }
+    /// onResizeApplied runs only after the canonical consumer has applied the
+    /// ordered update, even when its viewport is hidden. It is not a peer ACK.
+    /// Keep the callback bounded; never await this pump's run/close from it.
+    public func run(consumer: any TerminalSessionConsumer,
+                    onResizeApplied: (@Sendable (TerminalSessionGeometry, TerminalSource) async throws -> Void)? = nil)
+        async throws -> TerminalSessionEnd {
+        guard !started, !finalizing else { throw TerminalInputError.unavailable }
         started = true
+        defer { finished = true }
         let result = await withTaskCancellationHandler {
             await withTaskGroup(of: Void.self, returning: TerminalSessionEnd.self) { group in
                 let signal = self.signal, transport = self.transport
@@ -152,7 +193,7 @@ public actor TerminalSessionPump {
                     do { try await coordinator.disconnect(source) }
                     catch { await transport.close() }
                 }
-                let reason = await self.drive(consumer: consumer)
+                let reason = await self.drive(consumer: consumer, onResizeApplied: onResizeApplied)
                 signal.finish()
                 // Invalidate admission before any further await. Existing queued
                 // work receives its real disposition on its original source.
@@ -167,7 +208,9 @@ public actor TerminalSessionPump {
         return result
     }
 
-    private func drive(consumer: any TerminalSessionConsumer) async -> TerminalSessionEnd {
+    private func drive(consumer: any TerminalSessionConsumer,
+                       onResizeApplied: (@Sendable (TerminalSessionGeometry, TerminalSource) async throws -> Void)?)
+        async -> TerminalSessionEnd {
         while !signal.isFinished && !Task.isCancelled {
             do {
                 // Fairness: an input flood cannot indefinitely starve terminal
@@ -209,8 +252,12 @@ public actor TerminalSessionPump {
             guard update.output.count <= 16_384 else { return .transportFailed }
             if signal.isFinished || Task.isCancelled { return .cancelled }
             if !update.output.isEmpty || update.resized != nil || update.endOfOutput {
-                do { try await consumer.receive(update, source: source) }
-                catch { return signal.isFinished || Task.isCancelled ? .cancelled : .consumerFailed }
+                do {
+                    try await consumer.receive(update, source: source)
+                    if !signal.isFinished, !Task.isCancelled, let geometry = update.resized {
+                        try await onResizeApplied?(geometry, source)
+                    }
+                } catch { return signal.isFinished || Task.isCancelled ? .cancelled : .consumerFailed }
             }
             if signal.isFinished || Task.isCancelled { return .cancelled }
             // Deliver all final bytes first. Stop this attachment deliberately;
