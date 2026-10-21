@@ -38,8 +38,8 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
     /// Keychain, which needs a keychain-entitled process. An unhosted package
     /// test process has none (errSecMissingEntitlement), so it skips here; the
     /// app-hosted FrankenTermTests compiles this same file and runs it with one.
-    override func setUp() async throws {
-        try await super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         #if canImport(Security)
         let probe: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "org.frankenterm.tests.keychain-probe",

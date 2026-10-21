@@ -62,6 +62,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
     public let publishedFrames: UInt64, unavailableFrames: UInt64
     public let endOfOutput: Bool, closing: Bool, closed: Bool
     public let waitingPresentationRequests: Int, waitingViewportRequests: Int, waitingPaletteRequests: Int
+    public let waitingHistoryRequests: Int
 }
 
 /// One source-bound owner joins the real SSH session pump, canonical terminal,
@@ -79,7 +80,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private let coordinator: TerminalInputCoordinator
     private let delivery: any TerminalModelDelivery
     private var operationActive = false
-    private enum OperationKind: CaseIterable { case consumer, keyboard, presentation, viewport, palette }
+    private enum OperationKind: CaseIterable { case consumer, keyboard, presentation, viewport, palette, history }
     private struct WaitingOperation {
         let kind: OperationKind
         let continuation: CheckedContinuation<Void, Error>
@@ -94,6 +95,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private var visible = true
     private var visibilityGeneration = UUID()
     private var viewportTop: Int64?
+    private let historyOwner = UUID()
     private var queuedReplies: UInt64 = 0, droppedReplies: UInt64 = 0
     private var publishedFrames: UInt64 = 0, unavailableFrames: UInt64 = 0
 
@@ -110,7 +112,8 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
               endOfOutput: endOfOutput, closing: closing, closed: closed,
               waitingPresentationRequests: waitingOperations.filter { $0.kind == .presentation }.count,
               waitingViewportRequests: waitingOperations.filter { $0.kind == .viewport }.count,
-              waitingPaletteRequests: waitingOperations.filter { $0.kind == .palette }.count)
+              waitingPaletteRequests: waitingOperations.filter { $0.kind == .palette }.count,
+              waitingHistoryRequests: waitingOperations.filter { $0.kind == .history }.count)
     }
 
     private func requireSource(_ source: TerminalSource) throws {
@@ -332,6 +335,119 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try await acquireOperation(.viewport); defer { finishOperation() }
         viewportTop = top
         if visible { try await publishFrame() }
+    }
+
+    /// Read-only canonical history for a bounded search. Each page owns one
+    /// model transaction and releases it before the search scans or requests
+    /// another page, so output and keyboard work can continue between pages.
+    /// Capturing never changes the selected viewport or publishes a frame.
+    public func captureSearchPage(top: Int64?, source: TerminalSource) async throws
+        -> TerminalSearchPage<TerminalSource> {
+        try requireSource(source)
+        guard top != Int64.min else { throw TerminalHistorySearchError.invalidPage }
+        try await acquireOperation(.history); defer { finishOperation() }
+        return try searchPage(top: top)
+    }
+
+    /// Capture after the UI has joined any prior scroll request. The result is
+    /// intentionally not Codable: a restored app has no authority to reuse it.
+    public func captureHistoryBookmark(source: TerminalSource) async throws -> TerminalHistoryBookmark {
+        try requireSource(source)
+        try await acquireOperation(.history); defer { finishOperation() }
+        let page = try searchPage(top: viewportTop)
+        return TerminalHistoryBookmark(source: source, viewportTop: viewportTop, owner: historyOwner,
+            geometryRevision: page.geometryRevision, alternateScreen: page.alternateScreen,
+            rowSequence: page.rows[0].sequence)
+    }
+
+    /// Validate the exact match and select its viewport in the SAME canonical
+    /// transaction. A stale result cannot move the viewport to unrelated text.
+    /// This operation admits no input and never requests a remote resize.
+    public func revealSearchMatch(_ match: TerminalHistoryMatch<TerminalSource>, source: TerminalSource) async throws {
+        try requireSource(source)
+        guard match.source == source else { throw TerminalHistorySearchError.staleResult }
+        try await acquireOperation(.viewport); defer { finishOperation() }
+        let live = try searchPage(top: nil)
+        guard match.row >= live.first,
+              match.row <= live.live + Int64(live.rows.count - 1) else {
+            throw TerminalHistorySearchError.staleResult
+        }
+        let top = min(match.row, live.live)
+        let page: TerminalSearchPage<TerminalSource>
+        do { page = top == live.top ? live : try searchPage(top: top) }
+        catch TerminalHistorySearchError.unavailable { throw TerminalHistorySearchError.staleResult }
+        try TerminalHistorySearch.validate(match, in: page)
+        try Task.checkCancellation()
+        viewportTop = top
+        if visible { try await publishFrame() }
+    }
+
+    /// Return to the pre-search position only while its canonical anchors still
+    /// identify it. Expiry is explicit; callers may offer Return to Live as a
+    /// separate deliberate action instead of silently selecting another row.
+    public func restoreHistoryBookmark(_ bookmark: TerminalHistoryBookmark, source: TerminalSource) async throws {
+        try requireSource(source)
+        guard bookmark.source == source, bookmark.owner == historyOwner else {
+            throw TerminalHistorySearchError.staleResult
+        }
+        try await acquireOperation(.viewport); defer { finishOperation() }
+        let page: TerminalSearchPage<TerminalSource>
+        do { page = try searchPage(top: bookmark.viewportTop) }
+        catch TerminalHistorySearchError.unavailable { throw TerminalHistorySearchError.staleResult }
+        guard page.geometryRevision == bookmark.geometryRevision,
+              page.alternateScreen == bookmark.alternateScreen,
+              bookmark.viewportTop == nil || page.rows[0].sequence == bookmark.rowSequence else {
+            throw TerminalHistorySearchError.staleResult
+        }
+        try Task.checkCancellation()
+        viewportTop = bookmark.viewportTop
+        if visible { try await publishFrame() }
+    }
+
+    /// A bounded copy of the latest received live viewport, useful after EOF
+    /// and before close destroys the canonical model. Set liveViewport to false
+    /// to copy the selected history viewport for a search preview. Neither mode
+    /// navigates or publishes a frame. It is not the entire
+    /// transcript, a claim that Metal presented it, or restored input authority.
+    /// Concealed cells are suppressed by TerminalCopyDocument. Incomplete
+    /// synchronized output is refused, just like the live Copy action.
+    public func captureOutputDocument(source: TerminalSource, liveViewport: Bool = true) async throws -> TerminalCopyDocument {
+        try requireSource(source)
+        try await acquireOperation(.history); defer { finishOperation() }
+        let top = liveViewport ? nil : viewportTop
+        let frame = try decodedHistoryFrame(top: top)
+        guard frame.flags & 8 == 0 else { throw TerminalClipboardError.unavailable }
+        if let expected = top ?? frame.history?.live, frame.viewportFirst != expected {
+            throw TerminalHistorySearchError.invalidPage
+        }
+        return try TerminalCopyDocument(rows: frame.lines.map { row in
+            row.cells.map { .init(column: $0.column, width: $0.width, text: $0.text, concealed: $0.invisible) }
+        }, columns: frame.columns)
+    }
+
+    private func searchPage(top: Int64?) throws -> TerminalSearchPage<TerminalSource> {
+        let page = try TerminalSearchPage(frame: decodedHistoryFrame(top: top))
+        guard page.top == (top ?? page.live) else { throw TerminalHistorySearchError.invalidPage }
+        return page
+    }
+
+    private func decodedHistoryFrame(top: Int64?) throws -> TerminalRenderFrame {
+        do {
+            let bytes = try model.captureFrame(viewportTop: top)
+            guard !bytes.isEmpty else { throw TerminalHistorySearchError.invalidPage }
+            guard bytes.count <= 8 * 1024 * 1024 else { throw TerminalHistorySearchError.capacity }
+            return try TerminalRenderFrame.decode(bytes, expectedSource: source)
+        } catch TerminalModelError.viewportUnavailable {
+            throw TerminalHistorySearchError.unavailable
+        } catch TerminalModelError.unsupported {
+            throw TerminalHistorySearchError.unavailable
+        } catch TerminalModelError.capacity {
+            throw TerminalHistorySearchError.capacity
+        } catch TerminalRenderError.capacity {
+            throw TerminalHistorySearchError.capacity
+        } catch is TerminalRenderError {
+            throw TerminalHistorySearchError.invalidPage
+        }
     }
     /// Re-themes the terminal. Like a scroll, a request waits once behind
     /// output instead of failing; the next frame carries the new palette.
