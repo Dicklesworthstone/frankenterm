@@ -106,6 +106,126 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         do { try await body(); XCTFail("Expected an authentication refusal", file: file, line: line) }
         catch {}
     }
+    private func waitUntilQueued(_ count: Int, broker: SSHAuthenticationBroker,
+                                 file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while ContinuousClock.now < deadline {
+            if await broker.queuedRequests == count { return }
+            await Task.yield()
+        }
+        XCTFail("Authentication requests did not reach the expected bounded queue", file: file, line: line)
+    }
+
+    func testConcurrentIdentityLookupsUseOneProtectedWorkerInFIFOOrder() async throws {
+        let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container, delayIdentity: true)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        func lookup() -> Task<WorkspaceSSHIdentity, Error> {
+            Task { try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID()) }
+        }
+        let first = lookup()
+        await signer.waitUntilStarted()
+        let second = lookup()
+        await waitUntilQueued(1, broker: broker)
+        let third = lookup()
+        await waitUntilQueued(2, broker: broker)
+        XCTAssertEqual(signer.calls, 1)
+        signer.finish()
+        _ = try await first.value
+        await signer.waitUntilStarted()
+        XCTAssertEqual(signer.calls, 2)
+        let waiting = await broker.queuedRequests
+        XCTAssertEqual(waiting, 1)
+        signer.finish()
+        _ = try await second.value
+        await signer.waitUntilStarted()
+        XCTAssertEqual(signer.calls, 3)
+        signer.finish()
+        _ = try await third.value
+        let busy = await broker.isBusy
+        XCTAssertFalse(busy)
+    }
+
+    func testQueuedCancellationNeverUnlocksOrOvertakesActiveSignature() async throws {
+        let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        let current = try await prepare(broker, f)
+        let signing = Task { try await broker.confirm(requestID: current.id) }
+        await signer.waitUntilStarted()
+        let cancelled = Task { try await self.prepare(broker, f) }
+        await waitUntilQueued(1, broker: broker)
+        let transport = UUID()
+        let retired = Task { try await self.prepare(broker, f, transportID: transport) }
+        await waitUntilQueued(2, broker: broker)
+        cancelled.cancel()
+        await expectFailure { _ = try await cancelled.value }
+        await broker.cancel(transportID: transport)
+        await expectFailure { _ = try await retired.value }
+        let waiting = await broker.queuedRequests
+        XCTAssertEqual(waiting, 0)
+        XCTAssertEqual(signer.calls, 1); XCTAssertEqual(signer.cancellations, 0)
+        signer.finish()
+        _ = try await signing.value
+    }
+
+    func testSuspensionRetiresEveryQueuedRequestAndNeverResumesTheirPrompt() async throws {
+        let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        let current = try await prepare(broker, f)
+        let signing = Task { try await broker.confirm(requestID: current.id) }
+        await signer.waitUntilStarted()
+        let waiting = Task { try await self.prepare(broker, f) }
+        await waitUntilQueued(1, broker: broker)
+        await broker.suspend(); await broker.resume()
+        await expectFailure { _ = try await waiting.value }
+        await expectFailure { _ = try await self.prepare(broker, f) }
+        signer.finish()
+        await expectFailure { _ = try await signing.value }
+        XCTAssertEqual(signer.calls, 1)
+        let next = try await prepare(broker, f)
+        await broker.cancel(requestID: next.id)
+    }
+
+    func testQueuedAuthorityIsRecheckedAfterWaitingBeforeAnyPrivateKeyAccess() async throws {
+        let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container, delayIdentity: true)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+        await broker.resume()
+        let active = Task { try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID()) }
+        await signer.waitUntilStarted()
+        let queued = Task { try await self.prepare(broker, f) }
+        await waitUntilQueued(1, broker: broker)
+        try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.pin)
+        signer.finish()
+        await expectFailure { _ = try await active.value }
+        await expectFailure { _ = try await queued.value }
+        XCTAssertEqual(signer.calls, 1)
+        let busy = await broker.isBusy
+        XCTAssertFalse(busy)
+    }
+
+    func testQueueCapacityAndAbandonedRequestDeadlineRemainBounded() async throws {
+        let f = try await fixture()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: support)
+        await broker.resume()
+        let abandoned = try await prepare(broker, f)
+        var waiting: [Task<SSHAuthenticationRequest, Error>] = []
+        for count in 1...32 {
+            waiting.append(Task { try await self.prepare(broker, f) })
+            await waitUntilQueued(count, broker: broker)
+        }
+        await expectFailure { _ = try await self.prepare(broker, f) }
+        await broker.expireRequests(at: ContinuousClock.now + .seconds(61))
+        for request in waiting { await expectFailure { _ = try await request.value } }
+        await expectFailure { _ = try await broker.confirm(requestID: abandoned.id) }
+        let count = await broker.queuedRequests, busy = await broker.isBusy
+        XCTAssertEqual(count, 0); XCTAssertFalse(busy)
+        let fresh = try await prepare(broker, f)
+        _ = try await broker.confirm(requestID: fresh.id)
+    }
 
     func testForegroundExplicitOneUseRequestPreservesAllTransportBindings() async throws {
         let f = try await fixture()

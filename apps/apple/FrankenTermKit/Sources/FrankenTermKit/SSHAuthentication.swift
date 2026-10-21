@@ -220,10 +220,15 @@ public struct SSHAuthenticationSignature: Sendable, CustomDebugStringConvertible
 public actor SSHAuthenticationBroker {
     private struct Pending {
         let id: UUID, transportID: UUID
+        let foregroundGeneration: UUID
         let expires: ContinuousClock.Instant
         var authorization: WorkspaceSSHAuthorization?
         var challenge: SSHUserAuthenticationChallenge?
         var preparing = true, signing = false, cancelled = false
+    }
+    private struct Waiting {
+        let request: Pending
+        let continuation: CheckedContinuation<Void, Error>
     }
     private let store: WorkspaceStore
     private let signer: any WorkspaceSSHSigning
@@ -232,10 +237,14 @@ public actor SSHAuthenticationBroker {
     private var foregroundGeneration = UUID()
     private var foreground = false
     private var pending: Pending?
+    private var waiting: [Waiting] = []
+    private var deadlineTask: Task<Void, Never>?
+    private let maximumQueuedRequests = 32
 
     public init(store: WorkspaceStore, signer: any WorkspaceSSHSigning, support: WorkspaceDocument.RouteSupport) {
         self.store = store; self.signer = signer; self.support = support
     }
+    deinit { deadlineTask?.cancel() }
     public func resume() {
         if !foreground { foregroundGeneration = UUID() }
         foreground = true
@@ -243,9 +252,105 @@ public actor SSHAuthenticationBroker {
     public func suspend() {
         foreground = false
         foregroundGeneration = UUID()
+        let retired = waiting; waiting.removeAll()
+        for waiter in retired { waiter.continuation.resume(throwing: SSHAuthenticationError.stale) }
         if let id = pending?.id { cancel(requestID: id) }
     }
     public var isBusy: Bool { pending != nil }
+    public var queuedRequests: Int { waiting.count }
+
+    /// One protected operation owns the signer, with a bounded FIFO shared by
+    /// all scenes and connections. Waiting never opens a second prompt. The
+    /// original foreground epoch and a 60-second lifetime cover both waiting
+    /// and confirmation; queued work is never carried across suspend/resume.
+    private func acquireWorker(transportID: UUID) async throws -> UUID {
+        try requireForeground()
+        expireRequests()
+        guard pending?.cancelled != true,
+              pending?.transportID != transportID,
+              !waiting.contains(where: { $0.request.transportID == transportID }) else {
+            throw SSHAuthenticationError.busy
+        }
+        let request = Pending(id: UUID(), transportID: transportID,
+            foregroundGeneration: foregroundGeneration, expires: ContinuousClock.now + .seconds(60))
+        if pending == nil {
+            pending = request; scheduleDeadline()
+            return request.id
+        }
+        guard waiting.count < maximumQueuedRequests else { throw SSHAuthenticationError.busy }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                waiting.append(.init(request: request, continuation: continuation))
+                scheduleDeadline()
+            }
+        } onCancel: {
+            Task { await self.cancelWaiting(requestID: request.id) }
+        }
+        do { try checkCurrent(request.id); return request.id }
+        catch { releaseWorker(request.id); throw error }
+    }
+
+    private func cancelWaiting(requestID: UUID) {
+        if let index = waiting.firstIndex(where: { $0.request.id == requestID }) {
+            waiting.remove(at: index).continuation.resume(throwing: CancellationError())
+        } else { cancel(requestID: requestID) }
+    }
+
+    private func releaseWorker(_ id: UUID) {
+        guard pending?.id == id else { return }
+        pending = nil
+        promoteWaiting()
+    }
+
+    private func promoteWaiting() {
+        guard pending == nil else { return }
+        while !waiting.isEmpty {
+            let waiter = waiting.removeFirst()
+            guard foreground, waiter.request.foregroundGeneration == foregroundGeneration,
+                  ContinuousClock.now < waiter.request.expires else {
+                waiter.continuation.resume(throwing: SSHAuthenticationError.stale)
+                continue
+            }
+            // Reserve before resuming: a newly arriving request cannot overtake
+            // this waiter or acquire a second signer while its actor task wakes.
+            pending = waiter.request
+            waiter.continuation.resume()
+            break
+        }
+        scheduleDeadline()
+    }
+
+    /// The single watchdog also retires an abandoned prepared request, so it
+    /// cannot indefinitely block every other machine. Native signing resources
+    /// remain reserved after cancellation until their actual worker settles.
+    func expireRequests(at now: ContinuousClock.Instant = .now) {
+        var retained: [Waiting] = []
+        for waiter in waiting {
+            if !foreground || waiter.request.foregroundGeneration != foregroundGeneration || now >= waiter.request.expires {
+                waiter.continuation.resume(throwing: SSHAuthenticationError.stale)
+            } else { retained.append(waiter) }
+        }
+        waiting = retained
+        if let selected = pending, !selected.cancelled, now >= selected.expires { cancel(requestID: selected.id) }
+        promoteWaiting()
+    }
+
+    private func scheduleDeadline() {
+        guard deadlineTask == nil else { return }
+        let deadlines = waiting.map(\.request.expires) + (pending.flatMap { $0.cancelled ? nil : $0.expires }.map { [$0] } ?? [])
+        guard let deadline = deadlines.min() else { return }
+        deadlineTask = Task { [weak self] in
+            do { try await ContinuousClock().sleep(until: deadline) }
+            catch { return }
+            await self?.deadlineReached()
+        }
+    }
+    private func deadlineReached() {
+        deadlineTask = nil
+        expireRequests()
+        scheduleDeadline()
+    }
 
     /// Admission check before DNS/TCP. It grants no host or credential authority.
     public func requireForeground() throws {
@@ -282,13 +387,10 @@ public actor SSHAuthenticationBroker {
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                                presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID) async throws -> WorkspaceSSHIdentity {
-        guard foreground else { throw SSHAuthenticationError.unavailable }
-        if let old = pending, !old.preparing, !old.signing, ContinuousClock.now >= old.expires { pending = nil }
-        guard pending == nil else { throw SSHAuthenticationError.busy }
-        try Task.checkCancellation()
-        let id = UUID()
-        pending = Pending(id: id, transportID: transportID, expires: ContinuousClock.now + .seconds(60))
-        defer { if pending?.id == id { pending = nil } }
+        _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
+        let id = try await acquireWorker(transportID: transportID)
+        defer { releaseWorker(id) }
+        try checkCurrent(id)
         let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
             presentedHostKey: presentedHostKey, support: support)
@@ -321,23 +423,23 @@ public actor SSHAuthenticationBroker {
     }
 
     public func cancel(transportID: UUID) {
+        if let index = waiting.firstIndex(where: { $0.request.transportID == transportID }) {
+            waiting.remove(at: index).continuation.resume(throwing: SSHAuthenticationError.stale)
+        }
         if let selected = pending, selected.transportID == transportID { cancel(requestID: selected.id) }
     }
 
     public func prepare(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                         presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
                         sessionIdentifier: Data, publicBlob: Data) async throws -> SSHAuthenticationRequest {
-        guard foreground else { throw SSHAuthenticationError.unavailable }
-        if let old = pending, !old.preparing, !old.signing, ContinuousClock.now >= old.expires { pending = nil }
-        guard pending == nil else { throw SSHAuthenticationError.busy }
-        try Task.checkCancellation()
         // Bound input before retaining it across the first suspension point.
+        _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
         guard [32, 48, 64].contains(sessionIdentifier.count), (1...512).contains(publicBlob.count) else {
             throw SSHAuthenticationError.invalidChallenge
         }
-        let id = UUID()
-        pending = Pending(id: id, transportID: transportID, expires: ContinuousClock.now + .seconds(60))
+        let id = try await acquireWorker(transportID: transportID)
         do {
+            try checkCurrent(id)
             let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
                 presentedHostKey: presentedHostKey, support: support)
@@ -350,7 +452,7 @@ public actor SSHAuthenticationBroker {
             pending?.authorization = authorization; pending?.challenge = challenge; pending?.preparing = false
             return .init(id: id, transportID: transportID, authorization: authorization)
         } catch {
-            if pending?.id == id { pending = nil }
+            releaseWorker(id)
             throw error
         }
     }
@@ -362,7 +464,7 @@ public actor SSHAuthenticationBroker {
         guard let selected = pending, !selected.signing, let authorization = selected.authorization,
               let challenge = selected.challenge else { throw SSHAuthenticationError.stale }
         pending?.signing = true
-        defer { if pending?.id == requestID { pending = nil } }
+        defer { releaseWorker(requestID) }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(requestID)
         let signer = self.signer
@@ -384,11 +486,12 @@ public actor SSHAuthenticationBroker {
             signer.cancel(requestID: requestID)
             // Keep the sole worker reservation until confirm settles. Resume
             // cannot start another prompt while cancelled native I/O still owns it.
-        } else { pending = nil }
+        } else { releaseWorker(requestID) }
     }
     private func checkCurrent(_ id: UUID) throws {
         try Task.checkCancellation()
         if let selected = pending, selected.id == id, ContinuousClock.now >= selected.expires { cancel(requestID: id) }
-        guard foreground, pending?.id == id, pending?.cancelled == false else { throw SSHAuthenticationError.stale }
+        guard foreground, pending?.foregroundGeneration == foregroundGeneration,
+              pending?.id == id, pending?.cancelled == false else { throw SSHAuthenticationError.stale }
     }
 }
