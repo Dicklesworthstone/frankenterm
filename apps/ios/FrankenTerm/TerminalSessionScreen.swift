@@ -82,6 +82,7 @@ struct TerminalSessionTarget: Hashable {
 private final class TerminalFramePresenter: TerminalModelDelivery {
     let source: TerminalSource
     weak var view: NativeTerminalView?
+    weak var clipboard: NativeTerminalClipboardController?
     // The scene fences delivery synchronously, before the model actor applies
     // its hide. An already-captured obsolete frame cannot restart hidden work.
     var acceptsFrames = false
@@ -94,7 +95,9 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
         guard source == self.source else { throw TerminalInputError.stale }
         guard acceptsFrames else { return }
         switch presentation {
-        case let .frame(bytes): try view?.submit(bytes, source: source)
+        case let .frame(bytes):
+            try view?.submit(bytes, source: source)
+            try clipboard?.receiveFrame(bytes, source: source)
         case let .unavailable(reason): onUnavailable?(reason)
         }
     }
@@ -146,6 +149,7 @@ final class TerminalSessionController {
     private(set) var settled = false
     private(set) var cleanupFailure: String?
     private(set) var interruptedInput = false
+    private(set) var interactionProblem: String?
     let target: TerminalSessionTarget
 
     @ObservationIgnored private let connections: MobileConnections
@@ -161,6 +165,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var runObserver: Task<Void, Never>?
     @ObservationIgnored private var cleanup: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var presenter: TerminalFramePresenter?
+    @ObservationIgnored private var clipboard: NativeTerminalClipboardController?
     @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
     @ObservationIgnored private var presentationVisible = true
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
@@ -171,12 +176,39 @@ final class TerminalSessionController {
         self.target = target; self.connections = connections; self.focus = focus
     }
 
+    var clipboardIsPresenting: Bool { clipboard?.isPresenting == true }
+    func inspectOutput() {
+        guard !stopped, phase == .live, presentationVisible else { return }
+        interactionProblem = nil; clipboard?.requestCopy()
+    }
+    func paste() {
+        guard !stopped, phase == .live, presentationVisible else { return }
+        interactionProblem = nil; clipboard?.requestPaste()
+    }
+    func dismissInteractionProblem() { interactionProblem = nil }
+
+    private func inputFailed(_ error: Error) {
+        // Rejected local text is not a transport failure. In particular an
+        // oversized/unsafe clipboard must not tear down a working SSH session.
+        switch error as? TerminalInputError {
+        case .capacity:
+            interactionProblem = "Input was not accepted because a local text or buffer limit was reached. No rejected input will be sent automatically."
+        case .unsafePaste:
+            interactionProblem = "The clipboard contains terminal control characters and was not pasted."
+        case .emptyInput:
+            interactionProblem = "There is no text to paste."
+        default: fail(Self.describe(error))
+        }
+    }
+
     /// Keep consuming this source's bytes/replies while it is offscreen, but
     /// stop allocating snapshots and preparing GPU frames. The scene owns this
     /// policy; changing presentation never changes the keyboard destination.
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
+        clipboard?.setActive(visible)
+        if !visible { interactionProblem = nil }
         presenter?.acceptsFrames = visible
         terminal?.renderer.setSceneActive(visible)
         if let presentation, !presentation.isRetired {
@@ -261,6 +293,10 @@ final class TerminalSessionController {
             terminal = view
             try checkStarting()
             presenter.view = view
+            let clipboard = try NativeTerminalClipboardController(terminal: view,
+                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(target.routeID)")
+            self.clipboard = clipboard; presenter.clipboard = clipboard
+            clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
             let source = pump.source
             let resize = TerminalViewportResize(source: source, initial: geometry) { geometry in
                 do {
@@ -271,9 +307,10 @@ final class TerminalSessionController {
             self.resize = resize
             resize.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
-            view.onFailure = { [weak self] error in self?.fail(Self.describe(error)) }
+            view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
                 guard let self else { return }
+                self.clipboard?.inputRetired()
                 self.focus?.inputRetired(machineID: self.target.machineID)
             }
             phase = .live
@@ -355,6 +392,8 @@ final class TerminalSessionController {
 
     private func sealLocalOwnership() {
         presentationVisible = false
+        clipboard?.retire()
+        interactionProblem = nil
         presenter?.acceptsFrames = false
         presentation?.retire()
         terminal?.retire()
@@ -429,6 +468,10 @@ final class TerminalSessionController {
         }
         if let run { _ = await run.result }
         run = nil; runObserver = nil
+        if let clipboard {
+            await clipboard.waitUntilSettled()
+            presenter?.clipboard = nil; self.clipboard = nil
+        }
         if let presentation {
             await presentation.waitUntilSettled()
             self.presentation = nil

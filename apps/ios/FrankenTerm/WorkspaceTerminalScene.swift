@@ -50,6 +50,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
+    var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
 
     /// Opens a session for a machine, replacing one that ended. Acknowledging
     /// records that the user read the earlier session's unknown outcome.
@@ -66,9 +67,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Re-establishes the keyboard after its input generation ended (dismissed
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
     func activateKeyboard() async {
-        guard !closed, navigation.phase == .inactive, let selection = navigation.navigation.selection,
+        guard !closed, selectedSession?.clipboardIsPresenting != true,
+              navigation.phase == .inactive, let selection = navigation.navigation.selection,
               selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
         await owner.joinSealed()
+        guard !closed, foreground, navigation.navigation.selection == selection,
+              selectedSession?.clipboardIsPresenting != true else { return }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
 
@@ -210,8 +214,24 @@ struct WorkspaceTerminalScreen: View {
             WorkspaceCanvasHost(scene: scene, terminal: machine.flatMap { scene.sessions[$0.id]?.terminal })
             if let machine { card(for: machine) }
         }
+        .overlay(alignment: .bottom) {
+            if let session = scene.selectedSession, let problem = session.interactionProblem {
+                VStack(spacing: 8) {
+                    Text(verbatim: problem).font(.callout)
+                    Button("Dismiss") { session.dismissInteractionProblem() }
+                }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
+            }
+        }
         .navigationTitle(machine?.name ?? scene.workspaceName)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if let session = scene.selectedSession, session.phase == .live {
+                    Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
+                    Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
+                }
+            }
+        }
         .toolbarBackground(background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(machine?.background) ? .dark : .light, for: .navigationBar)
@@ -308,7 +328,7 @@ private final class WorkspaceCanvasView: UIView {
         var top = safeAreaLayoutGuide.topAnchor
         do {
             let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
-                                                                permitsCanvasNavigation: { true })
+                permitsCanvasNavigation: { [weak scene] in scene?.selectedSession?.clipboardIsPresenting != true })
             controls.onFailure = { [weak scene] error in scene?.report(error) }
             controls.translatesAutoresizingMaskIntoConstraints = false
             addSubview(controls)
