@@ -417,6 +417,8 @@ struct OfflineRestoreSheet: View {
     @State private var confirmed = false
     @State private var allowRemoval = false
     @State private var allowRollback = false
+    @State private var associateWithExistingWorkspace = false
+    @State private var securityChangesConfirmed = false
     @State private var repairPage = 0
     @State private var chooseFile = false
     var body: some View {
@@ -568,6 +570,10 @@ struct OfflineRestoreSheet: View {
                                         Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                                     }
                                     ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
+                                    if let changes = review.changeReview {
+                                        WorkspaceReplacementReview(changes: changes,
+                                            existingName: review.existingWorkspaceName ?? review.document.name)
+                                    }
                                     if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
                                     ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
                                         VStack(alignment: .leading) {
@@ -587,6 +593,19 @@ struct OfflineRestoreSheet: View {
                                     Toggle(state.source == .workspaceDocument
                                            ? "I recognize this source and approve the reviewed settings and host trust."
                                            : "I verified the comparison value on my Mac and approve these settings, trust records, and keys.", isOn: $confirmed)
+                                    if review.requiresSourceAssociation {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            Label("This export claims a saved workspace", systemImage: "arrow.triangle.branch").font(.headline)
+                                            Text("Matching workspace IDs and successful decryption do not prove the same Mac created this export. Continue only after verifying its source. This will replace the saved workspace shown above; cancel to keep it.")
+                                                .font(.callout)
+                                            Toggle("I associate this source with the saved workspace and approve replacing its settings.",
+                                                   isOn: $associateWithExistingWorkspace)
+                                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                                    }
+                                    if review.requiresSecurityApproval {
+                                        Toggle("I reviewed and approve the highlighted connection, credential, and host-trust changes.",
+                                               isOn: $securityChangesConfirmed)
+                                    }
                                     if review.removesMachines { Toggle("Replace this workspace even though some existing machines are removed.", isOn: $allowRemoval) }
                                     if review.isRollback {
                                         VStack(alignment: .leading, spacing: 8) {
@@ -599,11 +618,16 @@ struct OfflineRestoreSheet: View {
                                     Text("No connection or remote command will run. A device passcode is required for private-key storage.").font(.footnote).foregroundStyle(.secondary)
                                     Button("Restore Offline") {
                                         let token = review.token, consent = confirmed, removal = allowRemoval, rollback = allowRollback
+                                        let association = associateWithExistingWorkspace, security = securityChangesConfirmed
                                         model.run { restore, state in
                                             try await restore.commit(reviewToken: token, generation: state.generation,
-                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal, allowRollback: rollback)
+                                                                     sourceAndContentsConfirmed: consent, allowMachineRemoval: removal, allowRollback: rollback,
+                                                                     associateWithExistingWorkspace: association, securityChangesConfirmed: security)
                                         }
-                                    }.buttonStyle(.borderedProminent).disabled(!confirmed || (review.removesMachines && !allowRemoval) || (review.isRollback && !allowRollback))
+                                    }.buttonStyle(.borderedProminent).disabled(!confirmed || (review.removesMachines && !allowRemoval)
+                                        || (review.isRollback && !allowRollback)
+                                        || (review.requiresSourceAssociation && !associateWithExistingWorkspace)
+                                        || (review.requiresSecurityApproval && !securityChangesConfirmed))
                                 }
                             case .complete:
                                 Label("Restored offline — Connect later", systemImage: "checkmark.shield.fill").font(.headline)
@@ -622,6 +646,7 @@ struct OfflineRestoreSheet: View {
                             if ![.committing, .preparingReview, .recoveryRequired].contains(state.phase) {
                                 Button("Start a Different Transfer", role: .destructive) {
                                     code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
+                                    associateWithExistingWorkspace = false; securityChangesConfirmed = false
                                     model.resetRestore()
                                 }
                             }
@@ -639,9 +664,20 @@ struct OfflineRestoreSheet: View {
             case .failure(let error): model.report(error)
             }
         }
-        .onChange(of: model.active) { _, active in if !active { code = ""; confirmed = false; allowRemoval = false; allowRollback = false } }
-        .onChange(of: model.state?.review?.token) { _, _ in confirmed = false; allowRemoval = false; allowRollback = false }
-        .onDisappear { code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false }
+        .onChange(of: model.active) { _, active in
+            if !active {
+                code = ""; confirmed = false; allowRemoval = false; allowRollback = false
+                associateWithExistingWorkspace = false; securityChangesConfirmed = false
+            }
+        }
+        .onChange(of: model.state?.review?.token) { _, _ in
+            confirmed = false; allowRemoval = false; allowRollback = false
+            associateWithExistingWorkspace = false; securityChangesConfirmed = false
+        }
+        .onDisappear {
+            code = ""; confirmed = false; allowRemoval = false; allowRollback = false; model.cameraRequested = false
+            associateWithExistingWorkspace = false; securityChangesConfirmed = false
+        }
     }
     private func title(_ phase: OfflineRestorePhase) -> String {
         switch phase {
@@ -688,6 +724,47 @@ private struct RecipientRequestCard: View {
             } catch is CancellationError { }
             catch { failed = true }
         }
+    }
+}
+
+@MainActor
+private struct WorkspaceReplacementReview: View {
+    let changes: WorkspaceChangeReview
+    let existingName: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Changes to your saved workspace").font(.headline)
+            Text(verbatim: existingName).font(.subheadline)
+            if changes.changes.isEmpty {
+                Text("The public workspace settings are unchanged. The export identity and available private keys may differ.")
+                    .font(.callout)
+            } else {
+                Text("\(changes.changes.count) changed fields · \(changes.securityChanges.count) affect connection or trust policy")
+                    .font(.callout)
+                DisclosureGroup("Review every previous and incoming value") {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(Array(changes.changes.enumerated()), id: \.offset) { _, change in
+                            VStack(alignment: .leading, spacing: 5) {
+                                if change.affectsSecurity {
+                                    Label("Connection or trust change", systemImage: "exclamationmark.shield").font(.caption.bold())
+                                }
+                                Text(verbatim: "\(change.entity.title) · \(change.entityID)").font(.caption.bold())
+                                Text(verbatim: change.fieldTitle).font(.caption)
+                                Text("Saved value").font(.caption2).foregroundStyle(.secondary)
+                                Text(verbatim: WorkspaceChangeReview.Change.description(of: change.previous))
+                                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                                Text("Incoming value").font(.caption2).foregroundStyle(.secondary)
+                                Text(verbatim: WorkspaceChangeReview.Change.description(of: change.incoming))
+                                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                            Divider()
+                        }
+                    }.padding(.top, 8)
+                }
+            }
+            Text("Previously accepted local revocations and mandatory host-trust requirements remain in force.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 

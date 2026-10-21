@@ -29,7 +29,8 @@ final class WorkspaceHostTrustTests: XCTestCase {
                          replacing previous: InstalledWorkspace? = nil, allowRollback: Bool = false) async throws -> InstalledWorkspace {
         try await store.install(archive, envelopeDigest: Data(repeating: identity, count: 32),
             transferID: Data(repeating: identity, count: 16), expectedRevision: previous?.revision,
-            sourceAndContentsConfirmed: true, allowHistoricalRollback: allowRollback).workspace
+            sourceAndContentsConfirmed: true, allowHistoricalRollback: allowRollback,
+            securityChangesConfirmed: previous != nil, associateWithExistingWorkspace: previous != nil).workspace
     }
 
     private func addRevocation(_ workspace: inout [String: Any]) {

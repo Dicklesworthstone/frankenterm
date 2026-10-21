@@ -27,6 +27,7 @@ public protocol WorkspaceCredentialVault: Sendable {
 
 public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
     case reviewRequired, staleReview, removalNeedsApproval, revokedIdentity
+    case sourceReplacementNeedsApproval, securityChangesNeedApproval
     case conflictingExport, rollbackNeedsApproval, importHistoryFull
     case corruptStore, busy, recoveryRequired
     public static var immutableExportConflict: Self { .conflictingExport }
@@ -35,6 +36,8 @@ public enum WorkspaceStoreError: Error, Equatable, Sendable, LocalizedError {
         case .reviewRequired: return "Confirm the source, comparison value, and import contents first."
         case .staleReview: return "The saved workspace changed. Review the import again."
         case .removalNeedsApproval: return "This import removes machines. Explicit replacement approval is required."
+        case .sourceReplacementNeedsApproval: return "This source claims an existing workspace. Explicitly associate this reviewed export with that saved workspace before replacing it."
+        case .securityChangesNeedApproval: return "Review and explicitly approve the connection, credential, or host-trust changes before replacing this workspace."
         case .revokedIdentity: return "This import includes a locally revoked identity."
         case .conflictingExport: return "This export reuses a previously accepted bundle or transfer ID with different contents. Create a new export on the source."
         case .rollbackNeedsApproval: return "This is an earlier accepted export. Review and approve restoring its older settings."
@@ -81,6 +84,8 @@ public struct WorkspaceReimportReview: Sendable {
     public let preservedHostRevocationCount: Int
     public let preservedHostRequirementCount: Int
     public let firstAcceptedRevision: UUID?
+    public let changeReview: WorkspaceChangeReview?
+    public let requiresSourceAssociation: Bool
 }
 
 public struct WorkspaceImportAssessment: Sendable {
@@ -90,6 +95,11 @@ public struct WorkspaceImportAssessment: Sendable {
     public let removesMachines: Bool
     public let preservedHostRevocationCount: Int
     public let preservedHostRequirementCount: Int
+    public let changeReview: WorkspaceChangeReview?
+    /// Encryption and copied namespace IDs do not authenticate a new source.
+    /// A previously accepted immutable export already has a local association;
+    /// restoring that older export still needs the independent rollback review.
+    public let requiresSourceAssociation: Bool
 }
 
 /// One revision-consistent snapshot of actual protected-key availability and
@@ -305,7 +315,8 @@ public actor WorkspaceStore {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             let document = archive.workspace
-            let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog)
+            let review = try assessment(document, envelopeDigest: envelopeDigest, transferID: transferID, catalog: catalog,
+                                        portability: archive.portability)
             var identities = Set(try reusableCredentialAccounts(for: document, preferredWorkspace: review.existingWorkspace,
                                                                catalog: catalog).keys)
             let included = Set(archive.keys.map(\.credentialID))
@@ -340,16 +351,21 @@ public actor WorkspaceStore {
                          isRollback: review.requiresRollbackApproval,
                          preservedHostRevocationCount: review.preservedHostRevocationCount,
                          preservedHostRequirementCount: review.preservedHostRequirementCount,
-                         firstAcceptedRevision: review.firstAcceptedRevision)
+                         firstAcceptedRevision: review.firstAcceptedRevision,
+                         changeReview: review.changeReview, requiresSourceAssociation: review.requiresSourceAssociation)
         }
     }
 
     public func install(_ archive: AirGapArchive, envelopeDigest: Data, transferID: Data,
                         expectedRevision: UUID?, sourceAndContentsConfirmed: Bool,
-                        allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool = false) throws -> WorkspaceImportReceipt {
+                        allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool = false,
+                        securityChangesConfirmed: Bool = false,
+                        associateWithExistingWorkspace: Bool = false) throws -> WorkspaceImportReceipt {
         try install(archive, envelopeDigest: envelopeDigest, expectedRevision: expectedRevision,
                     sourceAndContentsConfirmed: sourceAndContentsConfirmed, allowMachineRemoval: allowMachineRemoval,
-                    allowRollback: allowHistoricalRollback, transferID: transferID)
+                    allowRollback: allowHistoricalRollback, transferID: transferID,
+                    securityChangesConfirmed: securityChangesConfirmed,
+                    associateWithExistingWorkspace: associateWithExistingWorkspace)
     }
 
     /// The approval is a local UI decision, never a flag decoded from a package.
@@ -357,7 +373,8 @@ public actor WorkspaceStore {
     public func install(_ archive: AirGapArchive, envelopeDigest: Data,
                         expectedRevision: UUID?, sourceAndContentsConfirmed: Bool,
                         allowMachineRemoval: Bool = false, allowRollback: Bool = false,
-                        transferID: Data? = nil) throws -> WorkspaceImportReceipt {
+                        transferID: Data? = nil, securityChangesConfirmed: Bool = false,
+                        associateWithExistingWorkspace: Bool = false) throws -> WorkspaceImportReceipt {
         guard sourceAndContentsConfirmed, envelopeDigest.count == 32 else { throw WorkspaceStoreError.reviewRequired }
         try validateIdentity(envelopeDigest, transferID: transferID)
         try Task.checkCancellation()
@@ -384,9 +401,22 @@ public actor WorkspaceStore {
                 throw WorkspaceStoreError.revokedIdentity
             }
             if let old {
-                let oldIDs = Set(try old.document().machines.map(\.id))
+                let previous = try old.document()
+                let oldIDs = Set(previous.machines.map(\.id))
                 guard allowMachineRemoval || oldIDs.isSubset(of: Set(document.machines.map(\.id))) else {
                     throw WorkspaceStoreError.removalNeedsApproval
+                }
+                guard associateWithExistingWorkspace || acceptedImport(document, catalog: catalog) != nil else {
+                    throw WorkspaceStoreError.sourceReplacementNeedsApproval
+                }
+                // Recompute under the storage lease. A review of a cosmetic
+                // update must never authorize a different security replacement.
+                let changes = try WorkspaceChangeReview(previous: previous, incoming: document,
+                    previousPortability: old.findings.map {
+                        .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason)
+                    }, incomingPortability: archive.portability)
+                guard securityChangesConfirmed || !changes.requiresSecurityApproval else {
+                    throw WorkspaceStoreError.securityChangesNeedApproval
                 }
             } else if catalog.workspaces.count >= 32 { throw FTError.limit("store.workspaces") }
 
@@ -778,7 +808,7 @@ public actor WorkspaceStore {
     }
 
     private func assessment(_ document: WorkspaceDocument, envelopeDigest: Data, transferID: Data?,
-                            catalog: Catalog) throws -> WorkspaceImportAssessment {
+                            catalog: Catalog, portability: [AirGapArchive.Portability] = []) throws -> WorkspaceImportAssessment {
         let old = try matchingWorkspace(document, in: catalog)
         let rollback = try checkHistory(document, digest: envelopeDigest, transferID: transferID, old: old, catalog: catalog)
         let oldIDs = try old.map { Set(try $0.document().machines.map(\.id)) } ?? []
@@ -786,7 +816,14 @@ public actor WorkspaceStore {
         return .init(existingWorkspace: old, firstAcceptedRevision: acceptedImport(document, catalog: catalog)?.firstAcceptedRevision,
                      requiresRollbackApproval: rollback, removesMachines: !oldIDs.isSubset(of: Set(document.machines.map(\.id))),
                      preservedHostRevocationCount: revoked.values.reduce(0) { $0 + $1.count },
-                     preservedHostRequirementCount: catalog.hostRequirements.filter { $0.workspaceID == old?.id }.count)
+                     preservedHostRequirementCount: catalog.hostRequirements.filter { $0.workspaceID == old?.id }.count,
+                     changeReview: try old.map { saved in
+                         try WorkspaceChangeReview(previous: saved.document(), incoming: document,
+                             previousPortability: saved.findings.map {
+                                 .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason)
+                             }, incomingPortability: portability)
+                     },
+                     requiresSourceAssociation: old != nil && acceptedImport(document, catalog: catalog) == nil)
     }
 
     private func checkHistory(_ document: WorkspaceDocument, digest: Data, transferID: Data?,

@@ -220,7 +220,7 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
                                              keys: [], using: crypto)
         let replaced = try await f.store.install(replacement, envelopeDigest: Data(repeating: 4, count: 32),
             transferID: Data(repeating: 5, count: 16), expectedRevision: f.installed.revision,
-            sourceAndContentsConfirmed: true).workspace
+            sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
         XCTAssertNotEqual(replaced.revision, f.installed.revision)
         signer.finish()
         await expectFailure { _ = try await task.value }

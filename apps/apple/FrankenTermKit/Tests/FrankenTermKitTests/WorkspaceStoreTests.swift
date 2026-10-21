@@ -154,6 +154,72 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(repeated.workspace.revision, first.workspace.revision)
         XCTAssertEqual(vault.creates, 1)
     }
+    func testCopiedNamespaceAndChangedConnectionNeedSeparateExplicitApprovalsBeforeStaging() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let original = try archive(), first = try await store.install(original, envelopeDigest: digest,
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        let incoming = try workspaceArchive(id: "work", bundleID: "claimed-replacement") { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["user"] = "another-account"; routes[0]["authentication_methods"] = ["publickey", "password"]
+            workspace["routes"] = routes
+        }
+        let incomingDigest = Data(repeating: 92, count: 32)
+        let review = try await store.previewImport(incoming, envelopeDigest: incomingDigest)
+        XCTAssertTrue(review.assessment.requiresSourceAssociation)
+        XCTAssertTrue(try XCTUnwrap(review.assessment.changeReview).requiresSecurityApproval)
+        XCTAssertEqual(review.assessment.existingWorkspace?.revision, first.workspace.revision)
+        let before = disk.bytes(.catalog)
+        do {
+            _ = try await store.install(incoming, envelopeDigest: incomingDigest, expectedRevision: first.workspace.revision,
+                sourceAndContentsConfirmed: true, securityChangesConfirmed: true)
+            XCTFail("copied namespace replaced a workspace without a reviewed source association")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .sourceReplacementNeedsApproval) }
+        do {
+            _ = try await store.install(incoming, envelopeDigest: incomingDigest, expectedRevision: first.workspace.revision,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true)
+            XCTFail("source association approved a changed connection policy")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .securityChangesNeedApproval) }
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 1)
+        let accepted = try await store.install(incoming, envelopeDigest: incomingDigest, expectedRevision: first.workspace.revision,
+            sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+        XCTAssertEqual(try accepted.workspace.document().routes[0].user, "another-account")
+        XCTAssertEqual(accepted.workspace.id, first.workspace.id); XCTAssertTrue(accepted.workspace.connectLater)
+        XCTAssertEqual(accepted.workspace.bindings[0].account, first.workspace.bindings[0].account)
+        let replay = try await store.previewImport(incoming, envelopeDigest: incomingDigest)
+        XCTAssertFalse(replay.assessment.requiresSourceAssociation)
+        XCTAssertTrue(try XCTUnwrap(replay.assessment.changeReview).changes.isEmpty)
+    }
+    func testRemovingArchiveOnlyRequiredConditionIsAReviewedSecurityChange() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let blocked = try AirGapArchive(workspace: original.workspace, keys: original.keys,
+            portability: [.init(entityID: "route", setting: "proxy_command", disposition: 1,
+                                reason: "Required executable proxy is not available on this phone.")], using: crypto)
+        let first = try await store.install(blocked, envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true)
+        let next = try AirGapArchive(workspace: original.workspace.reissuingBundle(id: "policy-removed"), keys: [], using: crypto)
+        let nextDigest = Data(repeating: 93, count: 32)
+        let review = try await store.previewImport(next, envelopeDigest: nextDigest, support: supportedIdentityProfile)
+        let changes = try XCTUnwrap(review.assessment.changeReview)
+        XCTAssertEqual(changes.changes.count, 1)
+        let condition = try XCTUnwrap(changes.securityChanges.first)
+        XCTAssertEqual(condition.entity, .portability); XCTAssertEqual(condition.entityID, "route")
+        XCTAssertEqual(condition.field, "proxy_command"); XCTAssertNil(condition.incoming)
+        XCTAssertEqual(try condition.previous?.object()["disposition"]?.uint(), 1)
+        let before = disk.bytes(.catalog)
+        do {
+            _ = try await store.install(next, envelopeDigest: nextDigest, expectedRevision: first.workspace.revision,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true)
+            XCTFail("an unchanged manifest hid removal of an archive-only security blocker")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .securityChangesNeedApproval) }
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 1)
+        let accepted = try await store.install(next, envelopeDigest: nextDigest, expectedRevision: first.workspace.revision,
+            sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+        let readiness = try await store.routeReadiness(workspaceID: accepted.workspace.id, support: supportedIdentityProfile)
+        XCTAssertEqual(readiness.first?.isLocallyReady, true)
+        XCTAssertTrue(accepted.workspace.connectLater)
+    }
     func testSameBackupCanRestoreAMissingKeyWithoutDuplicatingLiveKeys() async throws {
         let persistence = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: persistence, vault: vault), archive = try archive()
@@ -357,7 +423,8 @@ final class WorkspaceStoreTests: XCTestCase {
             disk.configure(fault)
             do {
                 _ = try await store.install(replacement, envelopeDigest: Data(repeating: 34, count: 32),
-                    transferID: Data(repeating: 34, count: 16), expectedRevision: source.workspace.revision, sourceAndContentsConfirmed: true)
+                    transferID: Data(repeating: 34, count: 16), expectedRevision: source.workspace.revision, sourceAndContentsConfirmed: true,
+                    securityChangesConfirmed: true, associateWithExistingWorkspace: true)
                 XCTFail("source replacement publication fault was not exercised")
             } catch {}
             let reopened = WorkspaceStore(persistence: disk, vault: vault)
@@ -374,7 +441,8 @@ final class WorkspaceStoreTests: XCTestCase {
                 workspace["credentials"] = credentials
             }
             _ = try await reopened.install(removeShared, envelopeDigest: Data(repeating: 35, count: 32),
-                expectedRevision: shared.workspace.revision, sourceAndContentsConfirmed: true)
+                expectedRevision: shared.workspace.revision, sourceAndContentsConfirmed: true,
+                securityChangesConfirmed: true, associateWithExistingWorkspace: true)
             XCTAssertEqual(vault.count, published ? 0 : 1)
         }
     }
@@ -433,7 +501,8 @@ final class WorkspaceStoreTests: XCTestCase {
             persistence.configure(fault)
             do {
                 _ = try await store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
-                                            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                            securityChangesConfirmed: true, associateWithExistingWorkspace: true)
                 XCTFail("write fault not exercised")
             } catch {}
             let saved = try await store.load()
@@ -462,7 +531,8 @@ final class WorkspaceStoreTests: XCTestCase {
         persistence.configureWriteAndRecoveryFailure()
         do {
             _ = try await store.install(replacement, envelopeDigest: Data(repeating: 9, count: 32),
-                                        expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                        expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                        securityChangesConfirmed: true, associateWithExistingWorkspace: true)
             XCTFail("failed durability reaffirmation was ignored")
         } catch { XCTAssertEqual(error as? WorkspaceStoreError, .recoveryRequired) }
         XCTAssertEqual(vault.count, 1, "readable new bytes do not authorize deleting the old key")
@@ -502,7 +572,8 @@ final class WorkspaceStoreTests: XCTestCase {
         let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil, sourceAndContentsConfirmed: true)
         let changed = try AirGapArchive(workspace: original.workspace.reissuingBundle(id: "newer"), keys: original.keys, using: crypto)
         let newer = try await store.install(changed, envelopeDigest: Data(repeating: 9, count: 32),
-                                            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                            associateWithExistingWorkspace: true)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let preview = try await reopened.preview(original.workspace, envelopeDigest: digest)
         XCTAssertTrue(preview.isRollback); XCTAssertEqual(preview.expectedRevision, newer.workspace.revision)
@@ -573,7 +644,8 @@ final class WorkspaceStoreTests: XCTestCase {
         try await store.revokeHostLocally(workspaceID: first.workspace.id, trustID: trust.id, key: key)
         let changed = try AirGapArchive(workspace: original.workspace.reissuingBundle(id: "cosmetic-update"), keys: [], using: crypto)
         let next = try await store.install(changed, envelopeDigest: Data(repeating: 9, count: 32),
-                                           expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                           expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                           associateWithExistingWorkspace: true)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let preview = try await reopened.preview(original.workspace, envelopeDigest: digest)
         XCTAssertEqual(preview.preservedHostRevocationCount, 1)
@@ -595,7 +667,8 @@ final class WorkspaceStoreTests: XCTestCase {
         let first = try await store.install(denied, envelopeDigest: digest, expectedRevision: nil, sourceAndContentsConfirmed: true)
         let changed = try AirGapArchive(workspace: original.workspace.reissuingBundle(id: "empty-revocations"), keys: [], using: crypto)
         let next = try await store.install(changed, envelopeDigest: Data(repeating: 8, count: 32),
-                                           expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                           expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                           securityChangesConfirmed: true, associateWithExistingWorkspace: true)
         let revoked = try await store.revokedHostKeys(workspaceID: next.workspace.id)
         let scope = original.workspace.hostTrust[0].canonicalTrustScope
         XCTAssertEqual(revoked[scope], Set(original.workspace.hostTrust[0].pins))
@@ -636,7 +709,7 @@ final class WorkspaceStoreTests: XCTestCase {
                                             expectedRevision: nil, sourceAndContentsConfirmed: true)
         let second = try await store.install(archive(keys: false, bundleID: "next-bundle"),
             envelopeDigest: Data(repeating: 8, count: 32), transferID: Data(repeating: 2, count: 16),
-            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+            expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault), before = persistence.bytes(.catalog)
         for (candidate, candidateDigest, candidateTransfer) in [
             (try archive(), Data(repeating: 9, count: 32), Data(repeating: 3, count: 16)),
@@ -688,7 +761,8 @@ final class WorkspaceStoreTests: XCTestCase {
         let first = try await store.install(original, envelopeDigest: digest, transferID: transferID,
                                             expectedRevision: nil, sourceAndContentsConfirmed: true)
         let second = try await store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
-            transferID: Data(repeating: 2, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+            transferID: Data(repeating: 2, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+            associateWithExistingWorkspace: true)
         let before = persistence.bytes(.catalog)
         do {
             _ = try await store.install(original, envelopeDigest: digest, transferID: transferID,
@@ -728,7 +802,8 @@ final class WorkspaceStoreTests: XCTestCase {
             persistence.configure(fault)
             do {
                 _ = try await store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
-                    transferID: Data(repeating: 2, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                    transferID: Data(repeating: 2, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                    associateWithExistingWorkspace: true)
                 XCTFail("publication fault was not exercised")
             } catch {}
             let reopened = WorkspaceStore(persistence: persistence, vault: vault), saved = try await reopened.load()
@@ -825,7 +900,8 @@ final class WorkspaceStoreTests: XCTestCase {
                                             expectedRevision: nil, sourceAndContentsConfirmed: true)
         let nextDigest = Data(repeating: 20, count: 32), nextTransfer = Data(repeating: 21, count: 16)
         let second = try await store.install(replacement, envelopeDigest: nextDigest, transferID: nextTransfer,
-                                             expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+                                             expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+                                             associateWithExistingWorkspace: true)
         let fingerprint = original.workspace.credentials[0].fingerprint
         let accepted = [
             versionTwoAcceptance(original.workspace, digest: digest, transferID: transferID, revision: first.workspace.revision),
@@ -889,7 +965,8 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(migrated.credentialIDs, ["key"])
         let removedPolicy = try archive(keys: false, bundleID: "removed-policy")
         let next = try await reopened.install(removedPolicy, envelopeDigest: Data(repeating: 22, count: 32),
-            transferID: Data(repeating: 23, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true)
+            transferID: Data(repeating: 23, count: 16), expectedRevision: first.workspace.revision, sourceAndContentsConfirmed: true,
+            securityChangesConfirmed: true, associateWithExistingWorkspace: true)
         let relaunched = WorkspaceStore(persistence: persistence, vault: vault)
         let snapshots = try await relaunched.loadWithLocalPolicy()
         let current = try XCTUnwrap(snapshots.first), currentDocument = try current.workspace.document()
@@ -911,7 +988,8 @@ final class WorkspaceStoreTests: XCTestCase {
         let preview = try await relaunched.preview(denied.workspace, envelopeDigest: digest, transferID: transferID)
         XCTAssertEqual(preview.preservedHostRevocationCount, 1); XCTAssertEqual(preview.preservedHostRequirementCount, 2)
         let restored = try await relaunched.install(denied, envelopeDigest: digest, transferID: transferID,
-            expectedRevision: next.workspace.revision, sourceAndContentsConfirmed: true, allowHistoricalRollback: true)
+            expectedRevision: next.workspace.revision, sourceAndContentsConfirmed: true, allowHistoricalRollback: true,
+            securityChangesConfirmed: true)
         let required = try await relaunched.requiredHostCapabilities(workspaceID: restored.workspace.id)
         XCTAssertEqual(required[scope], requirements)
         XCTAssertEqual(vault.creates, 1)

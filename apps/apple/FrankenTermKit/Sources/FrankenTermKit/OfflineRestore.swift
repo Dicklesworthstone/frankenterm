@@ -36,6 +36,10 @@ public struct OfflineRestoreReview: Sendable {
     public let preservedHostRequirementCount: Int
     public let firstAcceptedRevision: UUID?
     public let routeReadiness: [WorkspaceDocument.RouteReadiness]
+    public let existingWorkspaceName: String?
+    public let changeReview: WorkspaceChangeReview?
+    public let requiresSourceAssociation: Bool
+    public var requiresSecurityApproval: Bool { changeReview?.requiresSecurityApproval == true }
     public var requiresRollbackApproval: Bool { isRollback }
 }
 
@@ -268,7 +272,9 @@ public actor OfflineRestore<C: AirGapCryptography> {
                            preservedHostRevocationCount: prior.preservedHostRevocationCount,
                            preservedHostRequirementCount: prior.preservedHostRequirementCount,
                            firstAcceptedRevision: prior.firstAcceptedRevision,
-                           routeReadiness: preview.routes)
+                           routeReadiness: preview.routes,
+                           existingWorkspaceName: try prior.existingWorkspace?.document().name,
+                           changeReview: prior.changeReview, requiresSourceAssociation: prior.requiresSourceAssociation)
             phase = .review
             return status()
         } catch {
@@ -282,19 +288,29 @@ public actor OfflineRestore<C: AirGapCryptography> {
     /// expected saved revision. No approval can be decoded out of a QR payload.
     @discardableResult
     public func commit(reviewToken: UUID, generation token: UUID, sourceAndContentsConfirmed: Bool,
-                       allowMachineRemoval: Bool = false, allowRollback: Bool = false) async throws -> OfflineRestoreStatus {
+                       allowMachineRemoval: Bool = false, allowRollback: Bool = false,
+                       associateWithExistingWorkspace: Bool = false,
+                       securityChangesConfirmed: Bool = false) async throws -> OfflineRestoreStatus {
         try check(token)
         guard sourceAndContentsConfirmed else { throw WorkspaceStoreError.reviewRequired }
         guard phase == .review, let review, review.token == reviewToken, let archive, let digest = importDigest else { throw FTError.stale }
         guard !review.removesMachines || allowMachineRemoval else { throw WorkspaceStoreError.removalNeedsApproval }
         guard !review.isRollback || allowRollback else { throw WorkspaceStoreError.rollbackNeedsApproval }
+        guard !review.requiresSourceAssociation || associateWithExistingWorkspace else {
+            throw WorkspaceStoreError.sourceReplacementNeedsApproval
+        }
+        guard !review.requiresSecurityApproval || securityChangesConfirmed else {
+            throw WorkspaceStoreError.securityChangesNeedApproval
+        }
         phase = .committing
         pendingNamespace = (archive.workspace.exporterID, archive.workspace.id)
         self.archive = nil; self.review = nil
         do {
             let result = try await store.install(archive, envelopeDigest: digest,
                 expectedRevision: review.expectedRevision, sourceAndContentsConfirmed: true, allowMachineRemoval: allowMachineRemoval,
-                allowRollback: allowRollback, transferID: identity?.transferID)
+                allowRollback: allowRollback, transferID: identity?.transferID,
+                securityChangesConfirmed: securityChangesConfirmed,
+                associateWithExistingWorkspace: associateWithExistingWorkspace)
             receipt = result; phase = .complete
             envelope = nil; documentData = nil; receiver = nil; candidate = nil; pendingNamespace = nil
             retireRecipientSession()
@@ -302,6 +318,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
         } catch {
             if let reason = error as? WorkspaceStoreError,
                [.reviewRequired, .staleReview, .removalNeedsApproval, .rollbackNeedsApproval,
+                .sourceReplacementNeedsApproval, .securityChangesNeedApproval,
                 .conflictingExport, .importHistoryFull, .revokedIdentity].contains(reason) {
                 pendingNamespace = nil; phase = reviewFallback
                 throw error
@@ -315,9 +332,13 @@ public actor OfflineRestore<C: AirGapCryptography> {
 
     @discardableResult
     public func commit(reviewToken: UUID, generation token: UUID, sourceAndContentsConfirmed: Bool,
-                       allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool) async throws -> OfflineRestoreStatus {
+                       allowMachineRemoval: Bool = false, allowHistoricalRollback: Bool,
+                       associateWithExistingWorkspace: Bool = false,
+                       securityChangesConfirmed: Bool = false) async throws -> OfflineRestoreStatus {
         try await commit(reviewToken: reviewToken, generation: token, sourceAndContentsConfirmed: sourceAndContentsConfirmed,
-                         allowMachineRemoval: allowMachineRemoval, allowRollback: allowHistoricalRollback)
+                         allowMachineRemoval: allowMachineRemoval, allowRollback: allowHistoricalRollback,
+                         associateWithExistingWorkspace: associateWithExistingWorkspace,
+                         securityChangesConfirmed: securityChangesConfirmed)
     }
 
     @discardableResult

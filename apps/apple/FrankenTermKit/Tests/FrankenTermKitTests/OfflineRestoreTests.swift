@@ -259,7 +259,8 @@ final class OfflineRestoreTests: XCTestCase {
             state = try await restore.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
             let review = try XCTUnwrap(state.review)
             XCTAssertFalse(review.isRollback)
-            _ = try await restore.commit(reviewToken: review.token, generation: state.generation, sourceAndContentsConfirmed: true)
+            _ = try await restore.commit(reviewToken: review.token, generation: state.generation, sourceAndContentsConfirmed: true,
+                                         associateWithExistingWorkspace: true)
             state = try await restore.reset()
         }
         XCTAssertEqual(vault.creates, 1, "reissuing a bundle reuses the existing canonical identity")
@@ -350,7 +351,7 @@ final class OfflineRestoreTests: XCTestCase {
         ready = try await review(replacement, using: restore)
         XCTAssertFalse(try XCTUnwrap(ready.review).requiresRollbackApproval)
         let second = try await restore.commit(reviewToken: XCTUnwrap(ready.review).token, generation: ready.generation,
-                                              sourceAndContentsConfirmed: true)
+                                              sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true)
         let secondRevision = try XCTUnwrap(second.receipt).workspace.revision
         ready = try await review(original, using: restore)
         let rollback = try XCTUnwrap(ready.review)
@@ -440,5 +441,103 @@ final class OfflineRestoreTests: XCTestCase {
             let reset = try await restore.reset()
             XCTAssertEqual(reset.phase, .idle)
         }
+    }
+
+    private func changedDocument(bundleID: String, user: String) throws -> Data {
+        var root = try StrictJSON.decode(sampleManifest(bundleID: bundleID)).object()
+        var workspace = try root.required("workspace").object()
+        var routes = try workspace.required("routes").array()
+        var route = try routes[0].object()
+        route["user"] = .string(user); routes[0] = .object(route)
+        workspace["routes"] = .array(routes); root["workspace"] = .object(workspace)
+        return try StrictJSON.encode(.object(root))
+    }
+
+    func testReimportShowsExactOldAndNewValuesAndRequiresIndependentReplacementConsents() async throws {
+        let (restore, store, disk, vault) = environment()
+        var state = await restore.status()
+        state = try await restore.acceptWorkspaceDocument(sampleManifest(), generation: state.generation)
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+                                        sourceAndContentsConfirmed: true)
+        let first = try XCTUnwrap(state.receipt).workspace
+        state = try await restore.reset()
+        state = try await restore.acceptWorkspaceDocument(changedDocument(bundleID: "replacement", user: "reviewed-account"),
+                                                         generation: state.generation)
+        let review = try XCTUnwrap(state.review)
+        XCTAssertEqual(review.existingWorkspaceName, "Machines")
+        XCTAssertTrue(review.requiresSourceAssociation); XCTAssertTrue(review.requiresSecurityApproval)
+        let change = try XCTUnwrap(review.changeReview?.changes.first { $0.entity == .route && $0.field == "user" })
+        XCTAssertEqual(change.previous, .string("operator")); XCTAssertEqual(change.incoming, .string("reviewed-account"))
+        let before = disk.bytes(.catalog)
+        do {
+            _ = try await restore.commit(reviewToken: review.token, generation: state.generation,
+                sourceAndContentsConfirmed: true, securityChangesConfirmed: true)
+            XCTFail("general source consent replaced a claimed existing namespace")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .sourceReplacementNeedsApproval) }
+        do {
+            _ = try await restore.commit(reviewToken: review.token, generation: state.generation,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true)
+            XCTFail("namespace association approved changed authentication details")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .securityChangesNeedApproval) }
+        let waiting = await restore.status()
+        XCTAssertEqual(waiting.phase, .review); XCTAssertEqual(waiting.review?.token, review.token)
+        XCTAssertEqual(disk.bytes(.catalog), before); XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, 0)
+        let committed = try await restore.commit(reviewToken: review.token, generation: state.generation,
+            sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true, securityChangesConfirmed: true)
+        XCTAssertEqual(committed.phase, .complete)
+        let loaded = try await store.load(), saved = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(saved.id, first.id); XCTAssertNotEqual(saved.revision, first.revision)
+        XCTAssertEqual(try saved.document().routes[0].user, "reviewed-account"); XCTAssertTrue(saved.connectLater)
+    }
+
+    func testReplacementConsentCannotFollowAnotherDocumentOrAChangedSavedRevision() async throws {
+        let (restore, store, disk, _) = environment()
+        var state = await restore.status()
+        state = try await restore.acceptWorkspaceDocument(sampleManifest(), generation: state.generation)
+        state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+                                        sourceAndContentsConfirmed: true)
+        let first = try XCTUnwrap(state.receipt).workspace
+        state = try await restore.reset()
+        state = try await restore.acceptWorkspaceDocument(changedDocument(bundleID: "first-candidate", user: "reviewed-account"),
+                                                         generation: state.generation)
+        let oldReview = try XCTUnwrap(state.review), oldGeneration = state.generation
+        state = try await restore.reset()
+        state = try await restore.acceptWorkspaceDocument(changedDocument(bundleID: "different-candidate", user: "different-account"),
+                                                         generation: state.generation)
+        let currentReview = try XCTUnwrap(state.review), before = disk.bytes(.catalog)
+        do {
+            _ = try await restore.commit(reviewToken: oldReview.token, generation: state.generation,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true, securityChangesConfirmed: true)
+            XCTFail("a confirmation for other bytes authorized the current candidate")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+        do {
+            _ = try await restore.commit(reviewToken: currentReview.token, generation: oldGeneration,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true, securityChangesConfirmed: true)
+            XCTFail("an earlier generation authorized replacement")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+        XCTAssertEqual(disk.bytes(.catalog), before)
+
+        // Another scene completes its own reviewed replacement while this sheet
+        // remains open. The old→new diff is now stale even though its token fits.
+        let parallel = try WorkspaceDocument(data: changedDocument(bundleID: "parallel-export", user: "parallel-account"))
+        let parallelArchive = try AirGapArchive(workspace: parallel, keys: [], using: crypto)
+        let replacement = try await store.install(parallelArchive,
+            envelopeDigest: PublicWorkspaceIdentity.digest(data: parallel.raw, using: crypto),
+            expectedRevision: first.revision, sourceAndContentsConfirmed: true,
+            securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+        let afterParallel = disk.bytes(.catalog)
+        do {
+            _ = try await restore.commit(reviewToken: currentReview.token, generation: state.generation,
+                sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true, securityChangesConfirmed: true)
+            XCTFail("approval based on an old saved revision replaced another scene's work")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        XCTAssertEqual(disk.bytes(.catalog), afterParallel); XCTAssertNil(disk.bytes(.journal))
+        state = await restore.status()
+        XCTAssertEqual(state.phase, .documentReady); XCTAssertNil(state.review)
+        state = try await restore.reviewWorkspaceDocument(generation: state.generation)
+        XCTAssertEqual(state.review?.expectedRevision, replacement.workspace.revision)
+        let refreshedChange = try XCTUnwrap(state.review?.changeReview?.changes.first { $0.entity == .route && $0.field == "user" })
+        XCTAssertEqual(refreshedChange.previous, .string("parallel-account"))
+        XCTAssertEqual(refreshedChange.incoming, .string("different-account"))
     }
 }

@@ -99,4 +99,104 @@ final class WorkspacePolicyTests: XCTestCase {
                        ["build-route", "first-hop"])
         XCTAssertEqual(WorkspacePortabilityPolicy.blockedRouteIDs(in: document, requiredEntityIDs: ["build-route"]), ["build-route"])
     }
+
+    private func edited(_ original: WorkspaceDocument, _ edit: (inout [String: Any]) throws -> Void) throws -> WorkspaceDocument {
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: original.raw) as? [String: Any])
+        try edit(&root)
+        return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+    }
+
+    func testReimportComparisonMatchesStableEntitiesAcrossSerializationReorder() throws {
+        let original = try workspace()
+        let reordered = try edited(original) { root in
+            root["bundle_id"] = "new-immutable-export"
+            var value = try XCTUnwrap(root["workspace"] as? [String: Any])
+            for section in ["groups", "machines", "routes", "credentials", "host_trust", "themes"] {
+                value[section] = Array(try XCTUnwrap(value[section] as? [[String: Any]]).reversed())
+            }
+            root["workspace"] = value
+        }
+        let review = try WorkspaceChangeReview(previous: original, incoming: reordered)
+        XCTAssertTrue(review.changes.isEmpty)
+        XCTAssertFalse(review.requiresSecurityApproval)
+    }
+
+    func testReimportPreviewExposesEndpointAccountMethodKeyAndTrustChanges() throws {
+        let original = try workspace()
+        let changed = try edited(original) { root in
+            var value = try XCTUnwrap(root["workspace"] as? [String: Any])
+            var routes = try XCTUnwrap(value["routes"] as? [[String: Any]])
+            routes[0]["host"] = "replacement.example.invalid"
+            routes[0]["user"] = "another-account"
+            routes[0]["port"] = 2222
+            routes[0]["authentication_methods"] = ["publickey", "password"]
+            routes[0]["credential_refs"] = ["alternative-key", "shared-key"]
+            routes[0]["jump_routes"] = [] as [String]
+            value["routes"] = routes
+            var trusts = try XCTUnwrap(value["host_trust"] as? [[String: Any]])
+            trusts[0]["host"] = "replacement.example.invalid"; trusts[0]["port"] = 2222
+            trusts[0]["pins"] = [["algorithm": "ssh-ed25519", "fingerprint": "SHA256:" + String(repeating: "A", count: 43)]]
+            value["host_trust"] = trusts
+            // The fallback route shares the endpoint's trust record.
+            routes[1]["host"] = "replacement.example.invalid"; routes[1]["port"] = 2222
+            value["routes"] = routes
+            root["workspace"] = value
+        }
+        let review = try WorkspaceChangeReview(previous: original, incoming: changed)
+        XCTAssertTrue(review.requiresSecurityApproval)
+        let routeChanges = review.changes.filter { $0.entity == .route && $0.entityID == "build-route" }
+        XCTAssertEqual(Set(routeChanges.map(\.field)), ["host", "port", "user", "authentication_methods", "credential_refs", "jump_routes"])
+        XCTAssertTrue(routeChanges.allSatisfy(\.affectsSecurity))
+        let user = try XCTUnwrap(routeChanges.first { $0.field == "user" })
+        XCTAssertEqual(user.previous, .string("operator")); XCTAssertEqual(user.incoming, .string("another-account"))
+        let keys = try XCTUnwrap(routeChanges.first { $0.field == "credential_refs" })
+        XCTAssertEqual(keys.previous, .array([.string("shared-key"), .string("alternative-key")]))
+        XCTAssertEqual(keys.incoming, .array([.string("alternative-key"), .string("shared-key")]))
+        XCTAssertTrue(review.securityChanges.contains { $0.entity == .hostTrust && $0.field == "pins" })
+    }
+
+    func testNavigationReorderAndRenameStaySeparateFromMembershipAndAutoConnectChanges() throws {
+        let original = try workspace()
+        let cosmetic = try edited(original) { root in
+            var value = try XCTUnwrap(root["workspace"] as? [String: Any])
+            var groups = try XCTUnwrap(value["groups"] as? [[String: Any]])
+            groups[0]["machine_order"] = ["gpu", "build"]; value["groups"] = groups
+            var machines = try XCTUnwrap(value["machines"] as? [[String: Any]])
+            machines[0]["name"] = "Build renamed"; value["machines"] = machines
+            root["workspace"] = value
+        }
+        let harmless = try WorkspaceChangeReview(previous: original, incoming: cosmetic)
+        XCTAssertEqual(harmless.changes.count, 2); XCTAssertFalse(harmless.requiresSecurityApproval)
+        let changed = try edited(cosmetic) { root in
+            var value = try XCTUnwrap(root["workspace"] as? [String: Any])
+            var groups = try XCTUnwrap(value["groups"] as? [[String: Any]])
+            groups[0]["machine_order"] = ["gpu", "build", "archive"]
+            groups[0]["auto_connect"] = true; value["groups"] = groups
+            root["workspace"] = value
+        }
+        let security = try WorkspaceChangeReview(previous: cosmetic, incoming: changed)
+        XCTAssertEqual(Set(security.securityChanges.map(\.field)), ["machine_order", "auto_connect"])
+    }
+
+    func testReviewRetainsExactLargeNumbersAndRejectsDifferentNamespace() throws {
+        let original = try workspace()
+        var before = try StrictJSON.decode(original.raw).object()
+        var source = try before.required("source").object()
+        source["export_sequence"] = .number("9007199254740993"); before["source"] = .object(source)
+        let old = try WorkspaceDocument(data: StrictJSON.encode(.object(before)))
+        source["export_sequence"] = .number("9007199254740994"); before["source"] = .object(source)
+        let new = try WorkspaceDocument(data: StrictJSON.encode(.object(before)))
+        let review = try WorkspaceChangeReview(previous: old, incoming: new)
+        let change = try XCTUnwrap(review.changes.first)
+        XCTAssertEqual(review.changes.count, 1)
+        XCTAssertEqual(WorkspaceChangeReview.Change.description(of: change.previous), "9007199254740993")
+        XCTAssertEqual(WorkspaceChangeReview.Change.description(of: change.incoming), "9007199254740994")
+        let foreign = try edited(new) { root in
+            var value = try XCTUnwrap(root["source"] as? [String: Any])
+            value["exporter_id"] = "a-different-mac"; root["source"] = value
+        }
+        XCTAssertThrowsError(try WorkspaceChangeReview(previous: original, incoming: foreign)) {
+            XCTAssertEqual($0 as? FTError, .malformed("workspace.review_namespace"))
+        }
+    }
 }
