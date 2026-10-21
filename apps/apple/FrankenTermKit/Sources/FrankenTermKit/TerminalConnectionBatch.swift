@@ -4,6 +4,26 @@ public enum TerminalConnectionBatchError: Error, Equatable, Sendable {
     case invalidLimits, capacity, duplicateRequest, retired, cleanupIncomplete
 }
 
+/// Order the already-approved subset using the full navigation ring, even when
+/// the selected machine is already connected and therefore absent from it.
+public enum TerminalConnectionOrder {
+    public static func prioritize<ID: Hashable>(_ inventory: [ID], selected: ID?,
+                                                including approved: Set<ID>) throws -> [ID] {
+        guard inventory.count <= 128, approved.count <= 128 else { throw TerminalConnectionBatchError.capacity }
+        let known = Set(inventory)
+        guard known.count == inventory.count else { throw TerminalConnectionBatchError.duplicateRequest }
+        guard approved.isSubset(of: known) else { throw TerminalConnectionBatchError.capacity }
+        var candidates: [ID] = []
+        if let selected, let index = inventory.firstIndex(of: selected) {
+            candidates = [selected, inventory[(index + 1) % inventory.count],
+                          inventory[(index + inventory.count - 1) % inventory.count]]
+        }
+        candidates += inventory
+        var remaining = approved
+        return candidates.filter { remaining.remove($0) != nil }
+    }
+}
+
 /// A bounded, foreground-owned batch of explicit connection requests. A ready
 /// value is owned here until take transfers it to a terminal owner, or close
 /// joins its disposal. This type never opens a shell, retries an attempt, changes

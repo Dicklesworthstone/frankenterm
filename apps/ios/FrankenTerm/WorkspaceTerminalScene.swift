@@ -13,6 +13,18 @@ struct SceneMachine: Identifiable {
     let theme: WorkspaceDocument.Theme?
 }
 
+/// A frozen list of exact routes presented before any group DNS/authentication.
+/// This review never grants permission to create a PTY or resolve old effects.
+struct GroupConnectionReview: Identifiable {
+    struct Request: Identifiable, Sendable {
+        let target: TerminalSessionTarget
+        let route: TerminalSessionRoute
+        var id: String { target.machineID }
+    }
+    let id = UUID()
+    let requests: [Request]
+}
+
 /// Keeps one live direct-SSH session per connected machine of a workspace and
 /// gives the scene's single keyboard to exactly the selected machine. Every
 /// switch, from the rail, a menu, a two-finger swipe or a new connection, goes
@@ -30,6 +42,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
     private(set) var problem: String?
+    private(set) var groupStates: [String: MobileConnectionBatch.State] = [:]
+    private(set) var groupFailures: [String: String] = [:]
+    private(set) var groupBusy = false
+    private(set) var groupReady = 0
+    private(set) var groupClosing = false
 
     @ObservationIgnored let connections: MobileConnections
     @ObservationIgnored let owner: TerminalKeyboardNavigationOwner
@@ -38,6 +55,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored private var closed = false
     @ObservationIgnored private var foreground = true
     @ObservationIgnored private var closing: Task<Void, Never>?
+    @ObservationIgnored private var group: MobileConnectionBatch?
+    @ObservationIgnored private var groupClose: Task<Void, Never>?
+    @ObservationIgnored private var groupApprovals: [String: GroupConnectionReview.Request] = [:]
+    @ObservationIgnored private var pendingGroupReview: UUID?
 
     init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
          connections: MobileConnections) throws {
@@ -56,6 +77,123 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
 
+    var canPrepareGroup: Bool {
+        !closed && foreground && !groupClosing && group?.isRetired != true
+            && pendingGroupReview == nil && (navigation.phase == .ready || navigation.phase == .inactive)
+            && selectedSession?.clipboardIsPresenting != true
+            && !sessions.values.contains(where: { $0.phase == .connecting || $0.phase == .idle })
+            && machines.contains(where: { canPrepare($0.id) })
+    }
+    private func canPrepare(_ machineID: String) -> Bool {
+        guard sessions[machineID] == nil,
+              machines.first(where: { $0.id == machineID })?.target != nil else { return false }
+        switch groupStates[machineID] {
+        case nil, .failed, .cancelled: return true
+        default: return false
+        }
+    }
+
+    func reviewGroupConnections() -> GroupConnectionReview? {
+        guard canPrepareGroup else { return nil }
+        do {
+            let eligible = Set(machines.filter { canPrepare($0.id) }.map(\.id))
+            let order = try TerminalConnectionOrder.prioritize(machines.map(\.id),
+                selected: selectedMachineID, including: eligible)
+            let requests = order.compactMap { id -> GroupConnectionReview.Request? in
+                guard let target = machines.first(where: { $0.id == id })?.target,
+                      let route = target.attemptOrder().first else { return nil }
+                return .init(target: target, route: route)
+            }
+            guard !requests.isEmpty else { return nil }
+            let review = GroupConnectionReview(requests: requests)
+            pendingGroupReview = review.id
+            // No hardware typing behind the review sheet. Returning to the
+            // terminal uses the existing explicit keyboard activation path.
+            selectedSession?.terminal?.input.retire()
+            return review
+        } catch { report(error); return nil }
+    }
+    func cancelGroupReview(id: UUID? = nil) {
+        if id == nil || pendingGroupReview == id { pendingGroupReview = nil }
+    }
+
+    func connectGroup(_ review: GroupConnectionReview) {
+        guard !closed, foreground, pendingGroupReview == review.id,
+              groupClose == nil, group?.isRetired != true else { return }
+        pendingGroupReview = nil
+        guard !review.requests.isEmpty, review.requests.count <= 128,
+              Set(review.requests.map(\.id)).count == review.requests.count,
+              review.requests.allSatisfy({ request in
+                  canPrepare(request.id) && machines.first(where: { $0.id == request.id })?.target == request.target
+                      && request.target.routes.contains(request.route)
+              }) else {
+            report(WorkspaceSSHConnectionError.stale); return
+        }
+        do {
+            let batch: MobileConnectionBatch
+            if let existing = group { batch = existing }
+            else {
+                let manager = connections.manager
+                // Leave one of the manager's three attempt slots for an
+                // individually selected terminal. Its global cap still applies.
+                batch = try MobileConnectionBatch(maximumConcurrent: 2, connect: { [weak self] id in
+                    guard let self, !self.closed, self.foreground,
+                          self.sessions[id] == nil, let request = self.groupApprovals[id] else {
+                        throw WorkspaceSSHConnectionError.stale
+                    }
+                    // Freeze before the first suspension. Only the reviewed
+                    // endpoint is attempted; no fallback, shell or focus change.
+                    let target = request.target, route = request.route
+                    let connection = try await manager.connect(workspaceID: target.workspaceID,
+                        expectedRevision: target.revision, machineID: target.machineID,
+                        routeID: route.id, credentialID: route.credentialID, confirmedByUser: true)
+                    // Return even when cancellation races success: the batch
+                    // must receive ownership so it can join exact native cleanup.
+                    return PreparedTerminalConnection(connection: connection, route: route)
+                }, dispose: { prepared in
+                    try await manager.close(connectionID: prepared.connection.id)
+                })
+                try connections.registerGroup(batch)
+                group = batch
+                batch.onChange = { [weak self, weak batch] in
+                    guard let self, let batch, self.group === batch else { return }
+                    self.groupStates = batch.states
+                    self.groupBusy = batch.isBusy; self.groupReady = batch.readyCount
+                }
+                batch.onFailure = { [weak self] id, error in
+                    self?.groupFailures[id] = String(TerminalSessionController.describe(error).prefix(512))
+                }
+            }
+            for request in review.requests {
+                groupApprovals[request.id] = request; groupFailures[request.id] = nil
+            }
+            try batch.enqueue(review.requests.map(\.id))
+        } catch { report(error) }
+    }
+
+    func cancelQueuedConnections() { group?.cancelPending() }
+    func dismissProblem() { problem = nil }
+
+    /// Ready transports are not resurrected across deactivation. The app-owned
+    /// registry retains failures even after this scene disappears.
+    func closePreparedConnections() {
+        guard let group else { return }
+        group.retire()
+        guard groupClose == nil else { return }
+        groupClosing = true
+        let connections = self.connections
+        groupClose = Task { [weak self] in
+            let finished = await connections.closeGroup(group)
+            guard let self else { return }
+            if self.group === group, finished {
+                self.group = nil; self.groupApprovals.removeAll()
+            }
+            self.groupClose = nil
+            self.groupClosing = false
+            if !finished { self.problem = "Some prepared connections still need local cleanup. Retry closing prepared connections." }
+        }
+    }
+
     /// Shows a machine in another theme: its chrome at once, and its
     /// terminal from the next frame. A later session starts in it.
     func applyTheme(_ theme: WorkspaceDocument.Theme, to machineID: String) {
@@ -67,7 +205,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Opens a session for a machine, replacing one that ended. Acknowledging
     /// records that the user read the earlier session's unknown outcome.
     func connect(_ machineID: String, acknowledging: Bool = false) {
-        guard !closed, var target = machines.first(where: { $0.id == machineID })?.target else { return }
+        guard !closed, foreground, pendingGroupReview == nil,
+              var target = machines.first(where: { $0.id == machineID })?.target else { return }
+        switch groupStates[machineID] {
+        case .queued, .connecting, .closing, .cleanupFailed: return
+        default: break
+        }
         if let theme = themes[machineID] { target = target.wearing(theme) }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
@@ -77,7 +220,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             reviewed = current.recoveryRecords
         } else { reviewed = [] }
         sessions[machineID]?.discardRetainedOutput()
-        let controller = TerminalSessionController(target: target, connections: connections, focus: self)
+        let prepared = group?.take(machineID)
+        let controller = TerminalSessionController(target: target, connections: connections, focus: self, prepared: prepared)
         sessions[machineID] = controller
         controller.setPresentationVisible(foreground && machineID == selectedMachineID)
         Task { await controller.start(reviewingEarlierSessions: reviewed) }
@@ -86,11 +230,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Re-establishes the keyboard after its input generation ended (dismissed
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
     func activateKeyboard() async {
-        guard !closed, selectedSession?.clipboardIsPresenting != true,
+        guard !closed, pendingGroupReview == nil, selectedSession?.clipboardIsPresenting != true,
               navigation.phase == .inactive, let selection = navigation.navigation.selection,
               selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
         await owner.joinSealed()
-        guard !closed, foreground, navigation.navigation.selection == selection,
+        guard !closed, foreground, pendingGroupReview == nil, navigation.navigation.selection == selection,
               selectedSession?.clipboardIsPresenting != true else { return }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
@@ -98,6 +242,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func setForeground(_ active: Bool) {
         guard !closed else { return }
         foreground = active
+        if !active { pendingGroupReview = nil; closePreparedConnections() }
+        else if group?.isRetired == true { closePreparedConnections() }
         if active { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
         // Back from turning Tailscale on: try the machine that needed it, once
@@ -121,6 +267,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func requestClose() {
         guard !closed else { return }
         closed = true
+        pendingGroupReview = nil
+        closePreparedConnections()
         navigation.suspend()
         for controller in sessions.values {
             controller.discardRetainedOutput()
@@ -137,6 +285,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let job = Task {
             for controller in controllers { await controller.stop() }
             await navigation.joinSuspension()
+            if let groupClose = self.groupClose { await groupClose.value }
         }
         closing = job
         await job.value
@@ -159,9 +308,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private func navigationChanged() {
         let selection = navigation.navigation.selection
         if selectedMachineID != selection?.machineID { selectedMachineID = selection?.machineID }
+        if let selectedMachineID { group?.promote(selectedMachineID) }
         updatePresentationVisibility()
         guard navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
+        guard pendingGroupReview == nil else { owner.seal(); return }
         sessions[selection.machineID]?.install(keyboard)
     }
 
@@ -275,6 +426,7 @@ struct WorkspaceTerminalScreen: View {
     @State private var pickingTheme = false
     @State private var historyInspection: TerminalHistoryInspection?
     @State private var retainedOutput: TerminalRetainedOutput?
+    @State private var groupReview: GroupConnectionReview?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -291,12 +443,33 @@ struct WorkspaceTerminalScreen: View {
                     Text(verbatim: problem).font(.callout)
                     Button("Dismiss") { session.dismissInteractionProblem() }
                 }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
+            } else if let problem = scene.problem {
+                VStack(spacing: 8) {
+                    Text(verbatim: problem).font(.callout)
+                    Button("Dismiss") { scene.dismissProblem() }
+                }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
             }
         }
         .navigationTitle(machine?.name ?? scene.workspaceName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    Button("Authenticate Remaining Machines…", systemImage: "network") {
+                        groupReview = scene.reviewGroupConnections()
+                    }.disabled(!scene.canPrepareGroup)
+                    if scene.groupBusy {
+                        Button("Cancel Pending Authentication", systemImage: "stop.circle") { scene.cancelQueuedConnections() }
+                    }
+                    if scene.groupReady > 0 || scene.groupStates.values.contains(.cleanupFailed) {
+                        Button("Close Unopened Connections", systemImage: "xmark.circle") { scene.closePreparedConnections() }
+                    }
+                    Text("\(scene.groupReady) authenticated without a terminal")
+                    if scene.groupBusy { Text("Group connection work is in progress") }
+                } label: {
+                    Label("Group Connections", systemImage: "network")
+                }
+                .accessibilityIdentifier("terminal.group.connections")
                 if let session = scene.selectedSession, session.phase == .live {
                     if session.historyReturnBookmark != nil {
                         Button("Return to Previous View", systemImage: "arrow.uturn.backward") { session.returnFromHistorySearch() }
@@ -328,6 +501,40 @@ struct WorkspaceTerminalScreen: View {
         .toolbarBackground(background, for: .navigationBar)
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
+        .sheet(item: $groupReview) { review in
+            NavigationStack {
+                List {
+                    Section {
+                        Text("Authenticate to these machines using their imported SSH identities. Keychain approval may be requested for each connection.")
+                        Text("No shells or commands will be started. Choose Open Terminal on a machine afterwards. Existing terminals and keyboard destinations stay unchanged.")
+                        Text("Two group attempts run at once, leaving room for a foreground connection. The app's existing 16-connection limit still applies. A rejected route is reported, not retried automatically.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Section("Reviewed Routes") {
+                        ForEach(review.requests) { request in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(verbatim: request.target.machineName).font(.headline)
+                                Text(verbatim: "\(request.route.host):\(request.route.port)").font(.callout)
+                                Text(verbatim: "Machine \(request.id) · Route \(request.route.id) · Identity \(request.route.credentialID)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("Connect Group")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { scene.cancelGroupReview(id: review.id); groupReview = nil }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Authenticate \(review.requests.count)") {
+                            scene.connectGroup(review); groupReview = nil
+                        }.accessibilityIdentifier("terminal.group.confirm")
+                    }
+                }
+                .onDisappear { scene.cancelGroupReview(id: review.id) }
+            }
+        }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
         .task {
@@ -336,12 +543,16 @@ struct WorkspaceTerminalScreen: View {
         }
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
+            groupReview = nil; scene.cancelGroupReview()
             let retiring = scene
             retiring.requestClose()
             Task { await retiring.close() }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { historyInspection?.retire(); historyInspection = nil; retainedOutput = nil }
+            if phase != .active {
+                historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
+                groupReview = nil; scene.cancelGroupReview()
+            }
             scene.setForeground(phase == .active)
         }
     }
@@ -370,8 +581,24 @@ struct WorkspaceTerminalScreen: View {
                        enabled: session.settled, cleanup: session) { scene.connect(machine.id, acknowledging: true) }
             }
         } else if machine.target != nil {
-            notice(symbol: "terminal", title: "Not connected", message: "Swipe the rail to return to a connected machine.",
-                   uncertain: false, enabled: true, action: "Connect") { scene.connect(machine.id) }
+            switch scene.groupStates[machine.id] {
+            case .queued, .connecting:
+                notice(symbol: "network", title: scene.groupStates[machine.id] == .queued ? "Queued for authentication" : "Authenticating…",
+                       message: "No terminal will be opened until you request one. Group Connections can cancel pending attempts.",
+                       uncertain: false, enabled: false, action: nil) {}
+            case .ready:
+                notice(symbol: "checkmark.shield", title: "Authenticated — no terminal opened",
+                       message: "Open a new terminal using this prepared connection. Current host and credential policy will be checked again.",
+                       uncertain: false, enabled: true, action: "Open Terminal") { scene.connect(machine.id) }
+            case .closing, .cleanupFailed:
+                notice(symbol: "hourglass", title: "Closing prepared connection",
+                       message: scene.groupFailures[machine.id] ?? "Native connection work must settle before another attempt.",
+                       uncertain: false, enabled: false, action: nil) {}
+            default:
+                notice(symbol: "terminal", title: "Not connected",
+                       message: scene.groupFailures[machine.id] ?? "Swipe the rail to return to a connected machine.",
+                       uncertain: false, enabled: true, action: "Connect") { scene.connect(machine.id) }
+            }
         } else {
             notice(symbol: "network.slash", title: "Not available here", message: machine.unavailable,
                    uncertain: false, enabled: false, action: nil) {}
