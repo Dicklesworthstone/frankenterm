@@ -23,12 +23,13 @@ use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, EvictPaneWarmScrollbackV1,
-    EvictPaneWarmScrollbackV1Response, GetCodecVersion, GetCodecVersionResponse, GetLines,
-    GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
-    GetSemanticZonesResponse, InputSerial, LineReadLayout, ListPanes, ListPanesResponse,
-    MoveFloatingPane, OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos,
-    PduWireRole, RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId,
+    EvictPaneWarmScrollbackV1Response, GetClientList, GetClientListResponse, GetCodecVersion,
+    GetCodecVersionResponse, GetLines, GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges,
+    GetPaneRenderChangesResponse, GetPaneTieredScrollbackStatusesV1,
+    GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones, GetSemanticZonesResponse,
+    InputSerial, LineReadLayout, ListPanes, ListPanesResponse, MoveFloatingPane,
+    OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos, PduWireRole,
+    RemoveFloatingPane, Resize, SelectStackPane, SendKeyDown, SendPaste, SetClientId,
     SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer,
     SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse, UpdatePaneConstraints,
     WriteToPane,
@@ -3634,6 +3635,49 @@ impl DirectMuxClient {
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
             other => self.unexpected_response("UnitResponse", &other, true),
+        }
+    }
+
+    /// Send one key press using an explicit capability context.
+    ///
+    /// This is the GUI's input path: the server encodes the key for the
+    /// pane's own modes (application cursor keys, keypad mode, the kitty
+    /// keyboard protocol), so a remote client never needs to mirror them.
+    pub async fn send_key_down_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        event: termwiz::input::KeyEvent,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        let input_serial = InputSerial::try_now().ok_or(DirectMuxError::InputSerialExhausted)?;
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::SendKeyDown(SendKeyDown {
+                    pane_id: pane_id as usize,
+                    event,
+                    input_serial,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => self.unexpected_response("UnitResponse", &other, true),
+        }
+    }
+
+    /// List the mux's connected clients (focused pane, workspace, last input)
+    /// using an explicit capability context.
+    pub async fn get_client_list_with_cx(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<GetClientListResponse, DirectMuxError> {
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetClientList(GetClientList))
+            .await?;
+        match response {
+            Pdu::GetClientListResponse(payload) => Ok(payload),
+            other => self.unexpected_response("GetClientListResponse", &other, true),
         }
     }
 
@@ -10318,6 +10362,85 @@ mod tests {
             assert_eq!(saw_write.1, b"hello".to_vec());
             assert_eq!(saw_paste.0, 78);
             assert_eq!(saw_paste.1, "paste me");
+        });
+    }
+
+    /// Key presses travel as `SendKeyDown` (the GUI's input PDU) with a fresh,
+    /// strictly increasing input serial, and the client list decodes the
+    /// focused pane the mobile attach helper uses to pick its first pane.
+    #[test]
+    fn send_key_down_and_client_list_with_cx_roundtrip() {
+        use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let keys = Arc::new(StdMutex::new(Vec::new()));
+            let seen_keys = Arc::clone(&keys);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::SendKeyDown(request) => {
+                        seen_keys.lock().unwrap().push((
+                            request.pane_id,
+                            request.event,
+                            request.input_serial,
+                        ));
+                        Pdu::UnitResponse(UnitResponse {})
+                    }
+                    Pdu::GetClientList(_) => {
+                        let mut gui = mux::client::ClientInfo::new(Arc::new(ClientId::new()));
+                        gui.focused_pane_id = Some(4);
+                        gui.active_workspace = Some("default".to_string());
+                        Pdu::GetClientListResponse(GetClientListResponse { clients: vec![gui] })
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .expect("connect with cx");
+            let enter = KeyEvent {
+                key: KeyCode::Enter,
+                modifiers: Modifiers::NONE,
+            };
+            let ctrl_c = KeyEvent {
+                key: KeyCode::Char('c'),
+                modifiers: Modifiers::CTRL,
+            };
+            client
+                .send_key_down_with_cx(&cx, 9, enter.clone())
+                .await
+                .expect("send enter");
+            client
+                .send_key_down_with_cx(&cx, 9, ctrl_c.clone())
+                .await
+                .expect("send ctrl-c");
+            let listed = client
+                .get_client_list_with_cx(&cx)
+                .await
+                .expect("client list");
+            assert_eq!(listed.clients.len(), 1);
+            assert_eq!(listed.clients[0].focused_pane_id, Some(4));
+            assert_eq!(
+                listed.clients[0].active_workspace.as_deref(),
+                Some("default")
+            );
+
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let keys = keys.lock().unwrap();
+            assert_eq!(keys.len(), 2, "both key presses reach the server");
+            assert_eq!((keys[0].0, &keys[0].1), (9, &enter));
+            assert_eq!((keys[1].0, &keys[1].1), (9, &ctrl_c));
+            assert!(!keys[0].2.is_empty(), "a key press carries an input serial");
+            assert!(
+                keys[0].2 < keys[1].2,
+                "input serials order successive key presses"
+            );
         });
     }
 
