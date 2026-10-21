@@ -11,10 +11,12 @@ import FrankenTermTerminal
 // engine (NativeTerminalModel) -> NativeTerminalRenderView (Metal).
 //
 // Only the Keychain vault and its LocalAuthentication-gated signer are replaced
-// by an in-memory stand-in: the Simulator cannot satisfy the user-presence ACL
-// without a device passcode (device qualification is ft-ios-native-app-v7gxu.2).
-// Signatures still come from the production SSHUserAuthenticationSigner, and the
-// store persists through the real FileWorkspacePersistence.
+// by an in-memory stand-in. The production AppleWorkspaceVault does store and
+// read metadata in the Simulator, but each signature needs an interactive
+// user-presence approval that an unattended test cannot give (device
+// qualification is ft-ios-native-app-v7gxu.2). Signatures still come from the
+// production SSHUserAuthenticationSigner, and the store persists through the
+// real FileWorkspacePersistence.
 //
 // Live endpoint, supplied by the operator through xcodebuild's TEST_RUNNER_
 // environment prefix (disposable keys; skipped when absent):
