@@ -1099,7 +1099,7 @@ impl TerminfoRenderer {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, not(target_os = "ios")))]
 mod test {
     use super::*;
     use crate::caps::ProbeHints;

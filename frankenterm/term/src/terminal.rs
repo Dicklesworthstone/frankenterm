@@ -806,6 +806,7 @@ fn kitty_image_reads_outside_journal(image: &frankenterm_escape_parser::apc::Kit
     }
 }
 
+#[cfg(feature = "use_serde")]
 impl InertTerminal {
     pub(crate) fn from_restored_state(
         state: TerminalState,

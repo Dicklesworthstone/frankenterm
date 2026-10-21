@@ -1,6 +1,7 @@
 //! An abstraction over a terminal device
 
 use crate::caps::probed::ProbeCapabilities;
+#[cfg(not(target_os = "ios"))]
 use crate::caps::Capabilities;
 use crate::input::InputEvent;
 use crate::surface::Change;
@@ -14,17 +15,35 @@ use serde::Deserialize;
 #[cfg(feature = "use_serde")]
 use serde::Serialize;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
 pub mod buffered;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 pub use self::unix::{UnixTerminal, UnixTerminalWaker as TerminalWaker};
 #[cfg(windows)]
 pub use self::windows::{WindowsTerminal, WindowsTerminalWaker as TerminalWaker};
+
+/// iOS has no controlling tty, so termwiz provides no `Terminal` device there.
+/// Embedders that implement `Terminal` themselves still return a waker; this
+/// one has nothing to wake and matches the other platforms' waker API.
+#[cfg(target_os = "ios")]
+#[derive(Clone, Default)]
+pub struct TerminalWaker;
+
+#[cfg(target_os = "ios")]
+impl TerminalWaker {
+    pub fn noop() -> Self {
+        Self
+    }
+
+    pub fn wake(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Represents the size of the terminal screen.
 /// The number of rows and columns of character cells are expressed.
@@ -112,7 +131,7 @@ pub trait Terminal {
 /// Ideally you wouldn't reference `SystemTerminal` in consuming
 /// code.  This type is exposed for convenience if you are doing
 /// something unusual and want easier access to the constructors.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 pub type SystemTerminal = UnixTerminal;
 #[cfg(windows)]
 pub type SystemTerminal = WindowsTerminal;
@@ -126,10 +145,13 @@ pub type SystemTerminal = WindowsTerminal;
 /// If you have a more advanced use case you will want to look to the
 /// constructors for `UnixTerminal` and `WindowsTerminal` and call whichever
 /// one is most suitable for your needs.
+#[cfg(not(target_os = "ios"))]
 pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
     SystemTerminal::new(caps)
 }
 
+// Used by the tty devices, none of which exist on iOS.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub(crate) fn cast<T: NumCast + Display + Copy, U: NumCast>(n: T) -> Result<U> {
     num_traits::cast(n).ok_or_else(|| format_err!("{} is out of bounds for this system", n))
 }
