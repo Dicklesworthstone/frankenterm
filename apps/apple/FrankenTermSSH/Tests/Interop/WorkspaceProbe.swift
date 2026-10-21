@@ -311,6 +311,18 @@ private actor ManagedConsumer: TerminalSessionConsumer {
     }
 }
 
+/// The durable journal a relaunch would reopen. Apple anchors its history in
+/// the data-protection Keychain, which this unsigned command-line probe cannot
+/// use (errSecMissingEntitlement); the app-hosted FrankenTermTests cover that
+/// anchor. Here the same catalog files persist without it.
+private func durableJournal(directory: URL, identifier: String) throws -> TerminalSessionJournal {
+    #if canImport(Security)
+    try TerminalSessionJournal(persistence: FileWorkspacePersistence(directory: directory))
+    #else
+    try TerminalSessionJournal(directory: directory, identifier: identifier)
+    #endif
+}
+
 private func exerciseManagedConnection(store: WorkspaceStore, installed: InstalledWorkspace,
     broker: SSHAuthenticationBroker, directory: URL,
     host: Data, failFinalPublication: Bool = false) async throws -> Int {
@@ -318,7 +330,7 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
     let fault = try failFinalPublication ? FailedJournalPublication(directory: directory) : nil
     let journal: TerminalSessionJournal
     if let fault { journal = try TerminalSessionJournal(persistence: fault) }
-    else { journal = try TerminalSessionJournal(directory: directory, identifier: identifier) }
+    else { journal = try durableJournal(directory: directory, identifier: identifier) }
     let coordinator = try TerminalInputCoordinator()
     let manager = WorkspaceSSHConnectionManager(store: store, broker: broker,
         journal: journal, coordinator: coordinator)
@@ -433,7 +445,7 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             try await journal.resolve(records[0])
             let reopened: TerminalSessionJournal
             if let fault { reopened = try TerminalSessionJournal(persistence: fault) }
-            else { reopened = try TerminalSessionJournal(directory: directory, identifier: identifier) }
+            else { reopened = try durableJournal(directory: directory, identifier: identifier) }
             let recovered = try await reopened.records()
             guard recovered.count == 1, recovered[0].state == .acknowledged, !recovered[0].requiresReview,
                   await manager.connections().isEmpty, await manager.pendingCount == 0 else { throw WorkspaceProbeError.invalid }
