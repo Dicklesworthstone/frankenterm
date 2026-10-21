@@ -98,9 +98,11 @@ public struct MachineThemes: Sendable {
     /// Choices that give no two machines the same look, for a workspace the
     /// user has not themed: every machine that looks like an earlier one gets
     /// the first distinct catalog theme no machine uses, preferring hues at
-    /// least 22 degrees from every accent in use. Choices that still apply,
-    /// the user's or earlier automatic ones, are kept, so a machine added
-    /// later never recolors one that is already distinct.
+    /// least 22 degrees from every accent in use. The user's choices are
+    /// kept, and so are earlier automatic ones while still needed, so a
+    /// machine added later never recolors one that is already distinct; an
+    /// automatic choice goes once the workspace's own theme tells the
+    /// machine apart (say, after the desktop gave it one).
     public func distinguishingMachines() -> [String: MachineThemeChoice] {
         var result = choices
         var used: [WorkspaceDocument.Theme] = []
@@ -108,6 +110,12 @@ public struct MachineThemes: Sendable {
             used.contains { $0.name == theme.name || ($0.background == theme.background && $0.accent == theme.accent) }
         }
         for machine in document.machines {
+            let own = workspaceTheme(of: machine)
+            if hasLiveChoice(machine), choices[machine.id]?.automatic == true, let own, !looksUsed(own) {
+                result[machine.id] = nil
+                used.append(own)
+                continue
+            }
             let current = theme(for: machine)
             if hasLiveChoice(machine) || current.map(looksUsed) != true {
                 if let current { used.append(current) }

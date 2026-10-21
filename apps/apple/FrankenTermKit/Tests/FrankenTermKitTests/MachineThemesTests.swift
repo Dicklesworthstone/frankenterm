@@ -160,6 +160,17 @@ final class MachineThemesTests: XCTestCase {
         XCTAssertEqual(later["m.dark"]?.name, first.name, "the newcomer takes the first free theme")
     }
 
+    func testAutomaticChoicesGoOnceTheWorkspaceTellsMachinesApart() throws {
+        let catalog = try catalog()
+        let automatic = MachineThemes(document: try lookalikes(), catalog: catalog, choices: [:]).distinguishingMachines()
+        XCTAssertEqual(automatic.count, 2)
+        // The desktop now exports a distinct theme for every machine.
+        let picked = MachineThemeChoice(name: "Dracula")
+        var kept = automatic; kept["m.trj"] = picked
+        let choices = MachineThemes(document: try export(), catalog: catalog, choices: kept).distinguishingMachines()
+        XCTAssertEqual(choices, ["m.trj": picked], "automatic picks give way to the workspace; the user's pick stays")
+    }
+
     func testHueDistanceWrapsAndIgnoresGrays() {
         XCTAssertEqual(MachineThemes.hueDistance("#FF0000", "#0000FF"), 120, accuracy: 0.5)
         XCTAssertEqual(MachineThemes.hueDistance("#FF0010", "#FF1000"), 7.5, accuracy: 0.5)
