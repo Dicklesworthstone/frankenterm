@@ -85,7 +85,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         var reviewed = false
         let deadline = Date().addingTimeInterval(60)
         while !terminal.exists, Date() < deadline {
-            if !reviewed, review.exists {
+            // The action enables once the saved session records are loaded.
+            if !reviewed, review.exists, review.isEnabled {
                 XCTAssertTrue(app.staticTexts["Earlier session on this machine"].exists)
                 snapshot("4b-earlier-session-review")
                 review.tap(); app.tap(); reviewed = true
@@ -265,8 +266,10 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.activate()
         let again = app.buttons["Start New Session"]
         XCTAssertTrue(again.waitForExistence(timeout: 15), "a session closed by backgrounding must offer a new one")
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "may or may not have run")).firstMatch.exists)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Nothing is sent again automatically")).firstMatch.exists)
         snapshot("9-after-background")
+        let ready = expectation(for: NSPredicate(format: "isEnabled == true"), evaluatedWith: again)
+        XCTAssertEqual(XCTWaiter().wait(for: [ready], timeout: 15), .completed, "the reviewed new session becomes available")
         again.tap()
         app.tap()
         // The ended view stays visible until its successor replaces it; the
@@ -309,7 +312,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         let review = app.buttons["Start New Session"]
         let deadline = Date().addingTimeInterval(60)
         while !app.keyboards.firstMatch.exists, Date() < deadline {
-            if review.exists { review.tap(); app.tap() }
+            if review.exists, review.isEnabled { review.tap(); app.tap() }
             usleep(250_000)
         }
         XCTAssertTrue(app.keyboards.firstMatch.exists, "the second session must take the keyboard")

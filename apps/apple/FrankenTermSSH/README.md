@@ -119,7 +119,20 @@ Each registration owns a duplicated fd until every cancellation handler settles,
 preventing stale readiness callbacks from targeting a reused descriptor. One
 shared readiness queue serves all sessions. Concurrent close calls await the same
 cleanup. The application still owns foreground/network permission, route policy,
-keepalive/reconnect decisions, durable uncertainty markers, and terminal binding.
+reconnect decisions, durable uncertainty markers, and terminal binding.
+
+`keepalive` sends one liveness probe, a keepalive request that asks the server to
+reply; `receivedBytes` counts every byte read from the server, replies included.
+libssh2 binds a partly sent packet to its caller's buffer and refuses all other
+packets until that buffer is resent, and its keepalive buffer is a stack frame.
+So the probe is sent only when no write, resize or library packet is pending and
+the socket buffer has room for the whole packet (`SO_NWRITE`, or `SIOCOUTQ` on
+Linux); otherwise it is deferred. If a packet is still pending afterward, the
+session fails rather than block later input. `WorkspaceSSHLiveness` is the
+connection policy: after each quiet interval (10 s standard) it probes, and after
+two further silent intervals it closes the connection and the session ends as
+disconnected. A socket failure that precedes any owner's close also ends as
+disconnected, not as a local close.
 
 ## Imported workspace authentication and connection ownership
 
