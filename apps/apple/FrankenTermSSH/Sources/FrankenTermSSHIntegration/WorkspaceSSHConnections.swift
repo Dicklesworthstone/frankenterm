@@ -14,6 +14,29 @@ public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedEr
     }
 }
 
+/// How a live connection notices that its server stopped answering: a dropped
+/// or changed network, a sleeping or hung host. After each `interval` with no
+/// bytes from the server the connection sends one keepalive that asks for a
+/// reply; once `missedReplies` further intervals pass in silence it closes and
+/// its session ends as disconnected (about interval x (missedReplies + 1)).
+/// A live server answers every probe, so an idle terminal is never ended.
+public struct WorkspaceSSHLiveness: Sendable, Equatable {
+    public let interval: Duration, missedReplies: Int
+    /// About 30 seconds from the last byte to a reported loss.
+    public static let standard = WorkspaceSSHLiveness(checkedInterval: .seconds(10), missedReplies: 2)
+
+    /// libssh2 sends at most one keepalive per 2 s, the shortest interval.
+    public init(interval: Duration, missedReplies: Int) throws {
+        guard interval >= .seconds(2), interval <= .seconds(120), (1...10).contains(missedReplies) else {
+            throw NativeSSHError.invalidInput
+        }
+        self.init(checkedInterval: interval, missedReplies: missedReplies)
+    }
+    private init(checkedInterval: Duration, missedReplies: Int) {
+        interval = checkedInterval; self.missedReplies = missedReplies
+    }
+}
+
 /// One app-owned manager shared by scenes. It admits at most three attempts and
 /// sixteen retained owners, with one owner per installed workspace and machine.
 /// Networking starts disabled. Imported preferences and row selection do not
@@ -28,6 +51,7 @@ public actor WorkspaceSSHConnectionManager {
     private let store: WorkspaceStore, broker: SSHAuthenticationBroker
     private let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator
     private let networkActivity: WorkspaceNetworkActivity
+    private let liveness: WorkspaceSSHLiveness
     private var foreground = false, requestedForeground = false, mustSuspend = false
     private var lifecycle = UUID()
     private var transition: Task<Void, Never>?
@@ -38,9 +62,9 @@ public actor WorkspaceSSHConnectionManager {
 
     public init(store: WorkspaceStore, broker: SSHAuthenticationBroker,
                 journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator,
-                networkActivity: WorkspaceNetworkActivity = .shared) {
+                networkActivity: WorkspaceNetworkActivity = .shared, liveness: WorkspaceSSHLiveness = .standard) {
         self.store = store; self.broker = broker; self.journal = journal
-        self.coordinator = coordinator; self.networkActivity = networkActivity
+        self.coordinator = coordinator; self.networkActivity = networkActivity; self.liveness = liveness
     }
 
     public func resume() async {
@@ -133,13 +157,14 @@ public actor WorkspaceSSHConnectionManager {
         }
         let generation = lifecycle, attemptID = UUID()
         let store = self.store, broker = self.broker, journal = self.journal
-        let coordinator = self.coordinator, networkActivity = self.networkActivity
+        let coordinator = self.coordinator, networkActivity = self.networkActivity, liveness = self.liveness
         let task = Task<WorkspaceSSHConnection, Error> {
             let native = try await WorkspaceNativeSSHConnection.connect(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, machineID: machineID, routeID: routeID,
                 credentialID: credentialID, confirmedByUser: confirmedByUser,
                 store: store, broker: broker, journal: journal, networkActivity: networkActivity,
-                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout)
+                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
+                liveness: liveness)
             do {
                 try Task.checkCancellation()
                 return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator)

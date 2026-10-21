@@ -9,6 +9,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
+#endif
 
 #if LIBSSH2_VERSION_NUM < 0x010b01
 #error "FrankenTerm native SSH requires libssh2 1.11.1 or later"
@@ -34,7 +38,7 @@ struct ftssh_session {
     uint32_t geometry[4], resize_geometry[4];
     uint8_t write_buffer[FTSSH_WRITE_CAPACITY];
     size_t write_length, write_offset;
-    uint64_t accepted, written;
+    uint64_t accepted, written, received;
 };
 typedef union { max_align_t alignment; size_t size; } allocation_header;
 static _Atomic size_t global_allocated;
@@ -93,6 +97,7 @@ static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, in
     ftssh_session *s = *abstract;
     if(s->closing) return -ECONNRESET;
     ssize_t result = recv(fd, data, length, flags);
+    if(result > 0 && (uint64_t)result <= UINT64_MAX - s->received) s->received += (uint64_t)result;
     return result < 0 ? -errno : result;
 }
 static int fail(ftssh_session *s, int code) {
@@ -323,6 +328,8 @@ int ftssh_shell_step(ftssh_session *s) {
     if(s->phase == SHELL) {
         rc = result(s, libssh2_channel_process_startup(s->channel, "shell", 5, NULL, 0), FTSSH_CHANNEL);
         if(rc) return rc;
+        /* ftssh_keepalive probes ask for a reply; libssh2 treats 1 as 2 s. */
+        libssh2_keepalive_config(s->ssh, 1, 1);
         s->phase = LIVE; return FTSSH_OK;
     }
     return check(s, LIVE);
@@ -370,6 +377,37 @@ int ftssh_resize(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint32_t 
     if(rc == FTSSH_OK) { memcpy(s->geometry, requested, sizeof(requested)); s->resize_pending = 0; }
     return rc;
 }
+/* Bytes accepted by the kernel but not yet sent, or -1 when unknown. */
+static int unsent_socket_bytes(int fd) {
+    int queued = 0;
+#if defined(SO_NWRITE)
+    socklen_t length = sizeof(queued);
+    if(getsockopt(fd, SOL_SOCKET, SO_NWRITE, &queued, &length)) return -1;
+#elif defined(SIOCOUTQ)
+    if(ioctl(fd, SIOCOUTQ, &queued)) return -1;
+#else
+    return -1;
+#endif
+    return queued;
+}
+int ftssh_keepalive(ftssh_session *s) {
+    int rc = check(s, LIVE); if(rc) return rc;
+    /* libssh2 binds a partly sent packet to the caller's buffer and refuses any
+     * other packet until that exact buffer is resent; its keepalive buffer is
+     * its own stack frame. Send only when nothing is pending and the whole
+     * packet fits in the socket buffer, so it cannot be left half sent. */
+    if(s->write_length || s->resize_pending ||
+       (libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND)) return FTSSH_AGAIN;
+    int capacity = 0, queued = unsent_socket_bytes(s->fd);
+    socklen_t length = sizeof(capacity);
+    if(queued < 0 || getsockopt(s->fd, SOL_SOCKET, SO_SNDBUF, &capacity, &length)) return FTSSH_UNSUPPORTED;
+    if(capacity - queued < 4096) return FTSSH_AGAIN;
+    int next = 0;
+    if(libssh2_keepalive_send(s->ssh, &next)) return fail(s, FTSSH_IO);
+    /* Still pending despite the room checked above: fail rather than block input. */
+    if(libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) return fail(s, FTSSH_IO);
+    return FTSSH_OK;
+}
 int ftssh_directions(ftssh_session *s) {
     if(!s || !s->ssh || s->phase >= FAILED) return 0;
     int directions = libssh2_session_block_directions(s->ssh);
@@ -379,7 +417,8 @@ int ftssh_directions(ftssh_session *s) {
 int ftssh_descriptor(ftssh_session *s) { return s ? s->fd : -1; }
 int ftssh_get_stats(ftssh_session *s, ftssh_stats *out) {
     if(!s || !out) return FTSSH_INVALID;
-    *out = (ftssh_stats){s->allocated, s->peak, s->write_length - s->write_offset, s->accepted, s->written, s->terminal_error};
+    *out = (ftssh_stats){s->allocated, s->peak, s->write_length - s->write_offset, s->accepted, s->written,
+                         s->terminal_error, s->received};
     return FTSSH_OK;
 }
 int ftssh_close(ftssh_session *s) {

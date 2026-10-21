@@ -39,7 +39,8 @@ public actor WorkspaceNativeSSHConnection {
                                journal: TerminalSessionJournal? = nil,
                                networkActivity: WorkspaceNetworkActivity = .shared,
                                connectionTimeout: Duration = .seconds(15),
-                               authenticationTimeout: Duration = .seconds(60)) async throws -> WorkspaceNativeSSHConnection {
+                               authenticationTimeout: Duration = .seconds(60),
+                               liveness: WorkspaceSSHLiveness = .standard) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         try Task.checkCancellation()
         let foreground = try await broker.foregroundLease()
@@ -86,7 +87,7 @@ public actor WorkspaceNativeSSHConnection {
                 machineID: machineID, routeID: routeID, transportID: session.transportID,
                 channelID: session.channelID)
             let transport = WorkspaceNativeSSHTransport(session: session, identity: identity, broker: broker,
-                foreground: foreground, networkLease: lease, authority: authority)
+                foreground: foreground, networkLease: lease, authority: authority, liveness: liveness)
             return WorkspaceNativeSSHConnection(transport: transport, peer: peer, scope: scope)
         } catch {
             await session.close()
@@ -290,12 +291,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var networkLease: WorkspaceNetworkLease?
     private var closed = false
     private var shutdown: Task<Void, Never>?
+    private let liveness: WorkspaceSSHLiveness
+    private var probing = true, lastReceived: UInt64 = 0, silentIntervals = 0
 
     init(session: NativeSSHSession, identity: TerminalConnectionIdentity, broker: SSHAuthenticationBroker,
          foreground: SSHForegroundLease, networkLease: WorkspaceNetworkLease,
-         authority: WorkspaceNativeSSHAuthentication) {
+         authority: WorkspaceNativeSSHAuthentication, liveness: WorkspaceSSHLiveness) {
         self.session = session; self.identity = identity; self.broker = broker
         self.foreground = foreground; self.networkLease = networkLease; self.authority = authority
+        self.liveness = liveness
     }
 
     func openShell(geometry: NativeSSHGeometry) async throws {
@@ -325,14 +329,30 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         do {
             try await validateForeground()
             guard let driver else { throw NativeSSHError.closed }
-            let event = try await session.service(driver: driver)
+            let event = try await session.service(timeout: liveness.interval, driver: driver)
             try await validateForeground()
+            try await checkLiveness(event, driver: driver)
             let geometry = try event.resized.map {
                 try TerminalSessionGeometry(columns: $0.columns, rows: $0.rows,
                                             pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight)
             }
             return .init(output: event.output, endOfOutput: event.endOfOutput, resized: geometry)
         } catch { await close(); throw error }
+    }
+
+    /// Any byte from the server proves it is reachable. Each idle interval
+    /// without one sends a probe that a live server must answer; silence
+    /// through `missedReplies` further intervals means it is not answering.
+    /// A deferred probe counts too: outbound has stayed blocked a whole interval.
+    private func checkLiveness(_ event: NativeSSHServiceEvent, driver: NativeSSHDriver) async throws {
+        guard probing else { return }
+        if event.accounting.receivedBytes != lastReceived {
+            lastReceived = event.accounting.receivedBytes; silentIntervals = 0
+        }
+        guard event.waitExpired else { return }
+        silentIntervals += 1
+        guard silentIntervals <= liveness.missedReplies else { throw TerminalTransportError.peerUnresponsive }
+        if try await session.keepalive(driver: driver) == .unavailable { probing = false }
     }
 
     func requestResize(_ geometry: NativeSSHGeometry) async throws {

@@ -95,9 +95,15 @@ public struct NativeSSHAccounting: Sendable, Equatable {
     public let allocatedBytes: Int, peakAllocatedBytes: Int, pendingWriteBytes: Int
     public let locallyAcceptedBytes: UInt64, channelAcceptedBytes: UInt64
     public let terminalError: Int32
+    /// Bytes read from the server, including replies to keepalive probes.
+    public let receivedBytes: UInt64
 }
 
 public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), wouldBlock }
+/// The result of one liveness probe. A deferred probe sent nothing because
+/// output or a library packet is still pending; unavailable means this
+/// platform cannot prove a probe would not be left half sent.
+public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unavailable }
 public struct NativeSSHServiceEvent: Sendable {
     /// At most 16 KiB; consume through the canonical terminal before asking again.
     public let output: Data
@@ -280,6 +286,20 @@ public actor NativeSSHSession {
         return .accepted(bytes.count)
     }
 
+    /// One liveness probe between service turns: a keepalive request that asks
+    /// the server to reply, which advances `receivedBytes`. The owner decides
+    /// how many silent intervals mean the server is gone. Call at least 2 s apart.
+    package func keepalive(driver: NativeSSHDriver) throws -> NativeSSHKeepalive {
+        guard phase == .live else { throw NativeSSHError.closed }
+        try requireDriver(.driver(driver))
+        guard operation == nil else { throw NativeSSHError.busy }
+        let result = ftssh_keepalive(native.pointer)
+        if result == FTSSH_OK { return .sent }
+        if result == FTSSH_AGAIN { return .deferred }
+        if result == FTSSH_UNSUPPORTED { return .unavailable }
+        throw NativeSSHError.native(result)
+    }
+
     /// One pending immutable resize. Retry after its service completion, rather
     /// than overwriting a request that libssh2 has partially transmitted.
     public func requestResize(_ geometry: NativeSSHGeometry, channelID: UUID? = nil) throws {
@@ -407,7 +427,8 @@ public actor NativeSSHSession {
         let stats = try native.accounting()
         return .init(allocatedBytes: stats.allocated_bytes, peakAllocatedBytes: stats.peak_allocated_bytes,
                      pendingWriteBytes: stats.pending_write_bytes, locallyAcceptedBytes: stats.accepted_bytes,
-                     channelAcceptedBytes: stats.channel_accepted_bytes, terminalError: stats.terminal_error)
+                     channelAcceptedBytes: stats.channel_accepted_bytes, terminalError: stats.terminal_error,
+                     receivedBytes: stats.received_bytes)
     }
 
     /// Immediate native invalidation precedes every suspension point. Concurrent

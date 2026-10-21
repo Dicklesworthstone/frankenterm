@@ -27,6 +27,8 @@ typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
     uint64_t accepted_bytes, channel_accepted_bytes;
     int terminal_error;
+    /* Bytes read from the server's socket, including SSH-level replies. */
+    uint64_t received_bytes;
 } ftssh_stats;
 
 /* On success consumes this connected SOCK_STREAM descriptor. On failure leaves
@@ -73,6 +75,13 @@ int ftssh_read(ftssh_session *session, uint8_t *output, size_t capacity, size_t 
  * window-change request completed. Resume the same request after AGAIN. */
 int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,
                   uint32_t pixel_width, uint32_t pixel_height);
+/* Liveness probe for a live shell: one keepalive request that asks the server
+ * to reply, so a responsive server's bytes advance received_bytes. Call at
+ * least 2 s apart. AGAIN means nothing was sent (a write, resize or library
+ * packet is pending, or the socket buffer is nearly full); UNSUPPORTED means
+ * the platform cannot report queued socket bytes. Never leaves a half-sent
+ * packet that would block later writes: if one remains, the session fails. */
+int ftssh_keepalive(ftssh_session *session);
 int ftssh_directions(ftssh_session *session);
 int ftssh_descriptor(ftssh_session *session);
 int ftssh_get_stats(ftssh_session *session, ftssh_stats *result);
