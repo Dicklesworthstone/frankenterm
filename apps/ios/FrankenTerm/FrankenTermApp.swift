@@ -232,6 +232,42 @@ final class MobileWorkspaceModel {
         workspaces = snapshot.map(\.workspace)
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
+        // A first import, or new machines in a replaced one: machines that
+        // look alike get distinct themes before anything shows them.
+        for saved in workspaces {
+            if let document = try? saved.document(), let themes = machineThemes(saved.id, document: document) {
+                setThemeChoices(themes.distinguishingMachines(), for: saved.id)
+            }
+        }
+    }
+
+    /// Every theme a machine can wear, bundled from `ft mobile themes`.
+    static let themeCatalog: ThemeCatalog? = Bundle.main.url(forResource: "ThemeCatalog", withExtension: "json")
+        .flatMap { try? Data(contentsOf: $0) }.flatMap { try? ThemeCatalog(data: $0) }
+    /// Bumped on every theme change so views read the choices again.
+    private(set) var themeRevision = 0
+    private static func themeKey(_ workspaceID: UUID) -> String { "machine-themes.\(workspaceID.uuidString)" }
+
+    /// This phone's theme choices for a workspace's machines. They are not
+    /// secret, so they live in user defaults, not the protected store.
+    func themeChoices(_ workspaceID: UUID) -> [String: MachineThemeChoice] {
+        _ = themeRevision
+        guard let data = UserDefaults.standard.data(forKey: Self.themeKey(workspaceID)) else { return [:] }
+        return (try? JSONDecoder().decode([String: MachineThemeChoice].self, from: data)) ?? [:]
+    }
+    func machineThemes(_ workspaceID: UUID, document: WorkspaceDocument) -> MachineThemes? {
+        Self.themeCatalog.map { MachineThemes(document: document, catalog: $0, choices: themeChoices(workspaceID)) }
+    }
+    /// The user's pick; nil returns the machine to the workspace's own theme.
+    func chooseTheme(_ name: String?, machineID: String, workspaceID: UUID) {
+        var choices = themeChoices(workspaceID)
+        choices[machineID] = MachineThemeChoice(name: name)
+        setThemeChoices(choices, for: workspaceID)
+    }
+    private func setThemeChoices(_ choices: [String: MachineThemeChoice], for workspaceID: UUID) {
+        guard choices != themeChoices(workspaceID), let data = try? JSONEncoder().encode(choices) else { return }
+        UserDefaults.standard.set(data, forKey: Self.themeKey(workspaceID))
+        themeRevision += 1
     }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
         let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
@@ -919,8 +955,15 @@ private struct MachineWorkspaceView: View {
     @Bindable var model: MobileWorkspaceModel
     @State private var selection = ""
     @State private var groupID = ""
+    @State private var themeMachineID: String?
     private var document: WorkspaceDocument {
         (try? model.workspaces.first(where: { $0.id == workspaceID })?.document()) ?? initialDocument
+    }
+    /// The machine's theme on this phone: the user's pick, an automatic
+    /// distinct one, or the workspace's.
+    private func theme(for machine: WorkspaceDocument.Machine) -> WorkspaceDocument.Theme? {
+        model.machineThemes(workspaceID, document: document)?.theme(for: machine)
+            ?? document.themes.first { $0.id == machine.themeID }
     }
     private var machines: [WorkspaceDocument.Machine] {
         let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
@@ -931,11 +974,17 @@ private struct MachineWorkspaceView: View {
     var body: some View {
         TabView(selection: $selection) {
             ForEach(machines) { machine in
-                let theme = document.themes.first { $0.id == machine.themeID }
+                let theme = theme(for: machine)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         HStack { Image(systemName: "desktopcomputer"); Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2) }
                         HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }.frame(height: 24).clipShape(Capsule())
+                        if MobileWorkspaceModel.themeCatalog != nil {
+                            Button { themeMachineID = machine.id } label: {
+                                Label(theme.map { "Theme: \($0.name)" } ?? "Choose Theme", systemImage: "paintpalette")
+                            }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                                .accessibilityIdentifier("machine.theme")
+                        }
                         Label("Restored offline", systemImage: "checkmark.shield")
                         Text("Inspect the saved routes and their local requirements below. Nothing connects until you tap Connect on a ready direct SSH route; the pinned host key is verified before any key is offered.").font(.callout)
                         ForEach(machine.routeIDs, id: \.self) { id in
@@ -1000,6 +1049,14 @@ private struct MachineWorkspaceView: View {
                     .tag(machine.id)
             }
         }.tabViewStyle(.page(indexDisplayMode: .always))
+            .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
+                if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
+                   let themes = model.machineThemes(workspaceID, document: document) {
+                    MachineThemePicker(machine: machine, themes: themes) { name in
+                        model.chooseTheme(name, machineID: id, workspaceID: workspaceID)
+                    }
+                }
+            }
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
             .onAppear { if selection.isEmpty { selection = document.initialMachineID } }
             .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in
@@ -1026,7 +1083,10 @@ private struct MachineWorkspaceView: View {
     /// ready direct-SSH route, preferred route first.
     private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState,
                                initial: String, route: String, credential: String) -> some View {
-        LiveWorkspaceView(initialMachineID: initial) {
+        let themes = SceneThemeSource(
+            themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
+            choose: { [model, workspaceID] machineID, name in model.chooseTheme(name, machineID: machineID, workspaceID: workspaceID) })
+        return LiveWorkspaceView(initialMachineID: initial, themes: themes) {
             try WorkspaceTerminalScene(workspaceID: workspaceID, workspaceName: document.name,
                 machines: machines.map { sceneMachine($0, local: local, chosen: $0.id == initial ? (route, credential) : nil) },
                 initialMachineID: initial, connections: connections)
@@ -1035,11 +1095,11 @@ private struct MachineWorkspaceView: View {
 
     private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
                               chosen: (route: String, credential: String)?) -> SceneMachine {
-        let theme = document.themes.first { $0.id == machine.themeID }
+        let theme = theme(for: machine)
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
                   unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
-                  background: theme?.background)
+                  theme: theme)
         }
         func target(_ route: String, _ credential: String) -> TerminalSessionTarget {
             .init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,

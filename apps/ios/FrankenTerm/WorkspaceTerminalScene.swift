@@ -9,7 +9,7 @@ struct SceneMachine: Identifiable {
     let id: String, name: String
     let target: TerminalSessionTarget?
     let unavailable: String
-    let background: String?
+    let theme: WorkspaceDocument.Theme?
 }
 
 /// Keeps one live direct-SSH session per connected machine of a workspace and
@@ -24,6 +24,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     let workspaceName: String
     let machines: [SceneMachine]
     private(set) var sessions: [String: TerminalSessionController] = [:]
+    /// Each machine's theme now; a pick in the scene changes it live.
+    private(set) var themes: [String: WorkspaceDocument.Theme] = [:]
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
     private(set) var problem: String?
@@ -39,6 +41,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
          connections: MobileConnections) throws {
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
+        themes = Dictionary(uniqueKeysWithValues: machines.compactMap { machine in machine.theme.map { (machine.id, $0) } })
         owner = try TerminalKeyboardNavigationOwner(coordinator: connections.coordinator, sceneID: UUID(),
                                                     workspaceID: workspaceID.uuidString, bindings: [])
         let empty = try machines.map { try TerminalNavigationMachine(id: $0.id, name: $0.name, panes: []) }
@@ -54,8 +57,17 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// Opens a session for a machine, replacing one that ended. Acknowledging
     /// records that the user read the earlier session's unknown outcome.
+    /// Shows a machine in another theme: its chrome at once, and its
+    /// terminal from the next frame. A later session starts in it.
+    func applyTheme(_ theme: WorkspaceDocument.Theme, to machineID: String) {
+        guard !closed, machines.contains(where: { $0.id == machineID }) else { return }
+        themes[machineID] = theme
+        sessions[machineID]?.applyPalette(theme.terminalBasePalette)
+    }
+
     func connect(_ machineID: String, acknowledging: Bool = false) {
-        guard !closed, let target = machines.first(where: { $0.id == machineID })?.target else { return }
+        guard !closed, var target = machines.first(where: { $0.id == machineID })?.target else { return }
+        if let theme = themes[machineID] { target = target.wearing(theme) }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
         let reviewed: [TerminalSessionRecord]
@@ -207,15 +219,22 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 /// Builds the live scene once, when its screen is actually shown. A
 /// NavigationLink evaluates its destination on every redraw of the page that
 /// holds it, so constructing the scene there built and dropped one per redraw.
+/// How a live scene reads and records theme picks; the workspace owns them.
+struct SceneThemeSource {
+    let themes: @MainActor () -> MachineThemes?
+    let choose: @MainActor (_ machineID: String, _ name: String?) -> Void
+}
+
 struct LiveWorkspaceView: View {
     let initialMachineID: String
+    var themes: SceneThemeSource? = nil
     let makeScene: @MainActor () throws -> WorkspaceTerminalScene
     @State private var scene: WorkspaceTerminalScene?
     @State private var failed = false
 
     var body: some View {
         Group {
-            if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID) }
+            if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID, themes: themes) }
             else if failed { Text("These machines could not be opened together.").padding() }
             else { Color.black.ignoresSafeArea() }
         }
@@ -231,11 +250,14 @@ struct LiveWorkspaceView: View {
 struct WorkspaceTerminalScreen: View {
     @State var scene: WorkspaceTerminalScene
     let initialMachineID: String
+    var themes: SceneThemeSource? = nil
     @Environment(\.scenePhase) private var scenePhase
+    @State private var pickingTheme = false
 
     var body: some View {
         let machine = scene.selectedMachine
-        let background = machine?.background.map { Color(ftHex: $0) } ?? .black
+        let backgroundHex = machine.flatMap { scene.themes[$0.id]?.background }
+        let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
         ZStack {
             background.ignoresSafeArea()
             WorkspaceCanvasHost(scene: scene, terminal: machine.flatMap { scene.sessions[$0.id]?.terminal })
@@ -257,11 +279,24 @@ struct WorkspaceTerminalScreen: View {
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
                     Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
                 }
+                if themes != nil, machine != nil {
+                    Button("Theme", systemImage: "paintpalette") { pickingTheme = true }
+                        .accessibilityIdentifier("scene.theme")
+                }
+            }
+        }
+        .sheet(isPresented: $pickingTheme) {
+            if let themes, let id = machine?.id, let current = themes.themes(),
+               let documentMachine = current.document.machines.first(where: { $0.id == id }) {
+                MachineThemePicker(machine: documentMachine, themes: current) { name in
+                    themes.choose(id, name)
+                    if let theme = themes.themes()?.theme(for: documentMachine) { scene.applyTheme(theme, to: id) }
+                }
             }
         }
         .toolbarBackground(background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(TerminalSessionTarget.isDark(machine?.background) ? .dark : .light, for: .navigationBar)
+        .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
         .task {
             scene.setForeground(scenePhase == .active)
             scene.connect(initialMachineID)

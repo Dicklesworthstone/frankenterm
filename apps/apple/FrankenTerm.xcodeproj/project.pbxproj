@@ -29,6 +29,8 @@
         A10000000000000000000016 = {isa = PBXBuildFile; fileRef = A20000000000000000000011; };
         A10000000000000000000017 = {isa = PBXBuildFile; fileRef = A20000000000000000000012; };
         A10000000000000000000018 = {isa = PBXBuildFile; fileRef = A20000000000000000000013; };
+        A10000000000000000000019 = {isa = PBXBuildFile; fileRef = A20000000000000000000014; };
+        A1000000000000000000001A = {isa = PBXBuildFile; fileRef = A20000000000000000000015; };
 /* End PBXBuildFile section */
 /* Begin PBXContainerItemProxy section */
         A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
@@ -54,6 +56,8 @@
         A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
         A2000000000000000000000F = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = Pragmasevka-LICENSE.md; path = ../ios/FrankenTerm/Fonts/Pragmasevka-LICENSE.md; sourceTree = SOURCE_ROOT; };
         A20000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = text; name = NerdFonts-LICENSE.txt; path = ../ios/FrankenTerm/Fonts/NerdFonts-LICENSE.txt; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = text.json; name = ThemeCatalog.json; path = ../ios/FrankenTerm/ThemeCatalog.json; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MachineThemePicker.swift; path = ../ios/FrankenTerm/MachineThemePicker.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
         A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
@@ -62,7 +66,7 @@
         A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000E, A1000000000000000000000F,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
-        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000011, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A20000000000000000000012, A20000000000000000000013, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000011, A20000000000000000000015, A20000000000000000000014, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A20000000000000000000012, A20000000000000000000013, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008, A2000000000000000000000E,); name = Products; sourceTree = "<group>"; };
         A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A, A2000000000000000000000F, A20000000000000000000010,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
@@ -127,7 +131,7 @@
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015, A10000000000000000000019,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXShellScriptBuildPhase section */
@@ -140,7 +144,7 @@
         };
 /* End PBXShellScriptBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-        A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011, A10000000000000000000016,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011, A10000000000000000000016, A1000000000000000000001A,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D, A10000000000000000000012, A10000000000000000000017, A10000000000000000000018,); runOnlyForDeploymentPostprocessing = 0; };

@@ -107,7 +107,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized, routeID: "route-\(id)", credentialID: "key"),
-                unavailable: "", background: nil)
+                unavailable: "", theme: nil)
         }
         let scene = try WorkspaceTerminalScene(workspaceID: installed.id, workspaceName: "Scene", machines: machines,
                                                initialMachineID: "alpha", connections: connections)
@@ -572,7 +572,7 @@ final class TerminalSessionControllerTests: XCTestCase {
                                                 signer: SceneMemorySigner(vault: vault))
         let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "machine",
             machineName: "Never connected", routeID: "route", credentialID: "key")
-        let machine = SceneMachine(id: "machine", name: "Never connected", target: target, unavailable: "", background: nil)
+        let machine = SceneMachine(id: "machine", name: "Never connected", target: target, unavailable: "", theme: nil)
         let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, workspaceName: "Dormant",
             machines: [machine], initialMachineID: "machine", connections: connections)
         return (connections, scene, target)

@@ -68,6 +68,12 @@ struct TerminalSessionTarget: Hashable {
         basePalette = theme?.terminalBasePalette; background = theme?.background
     }
 
+    /// The same route under another theme.
+    func wearing(_ theme: WorkspaceDocument.Theme) -> TerminalSessionTarget {
+        .init(workspaceID: workspaceID, revision: revision, machineID: machineID, machineName: machineName,
+              routeID: routeID, credentialID: credentialID, theme: theme)
+    }
+
     /// Whether light chrome reads better over this background: its relative
     /// luminance is below 0.179, where black and white text contrast equally.
     /// No theme means the black default.
@@ -210,9 +216,30 @@ final class TerminalSessionController {
     @ObservationIgnored private var history: TerminalHistorySelection<TerminalSource>?
     @ObservationIgnored private var lastViewportRevision: UInt64 = 0
     @ObservationIgnored private var stopped = false
+    /// The palette the terminal should show, and the one its model has.
+    @ObservationIgnored private var basePalette: [UInt8]?
+    @ObservationIgnored private var appliedPalette: [UInt8]?
+    @ObservationIgnored private var paletteChange: Task<Void, Never>?
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
         self.target = target; self.connections = connections; self.focus = focus
+        basePalette = target.basePalette
+    }
+
+    /// Re-themes the terminal. Before the model exists, startup applies the
+    /// latest palette; after, one change at a time reaches the runtime and
+    /// the last pick wins.
+    func applyPalette(_ palette: [UInt8]) {
+        basePalette = palette
+        guard paletteChange == nil else { return }
+        paletteChange = Task { [weak self] in
+            while let self, !self.stopped, let runtime = self.runtime, let source = self.pump?.source,
+                  let wanted = self.basePalette, wanted != self.appliedPalette {
+                do { try await runtime.setBasePalette(wanted, source: source); self.appliedPalette = wanted }
+                catch { break }
+            }
+            self?.paletteChange = nil
+        }
     }
 
     var clipboardIsPresenting: Bool { clipboard?.isPresenting == true }
@@ -317,7 +344,7 @@ final class TerminalSessionController {
             self.presenter = presenter
             let model = try NativeTerminalModel(source: pump.source, geometry: geometry)
             unadoptedModel = model
-            if let palette = target.basePalette { try model.setBasePalette(palette) }
+            if let palette = basePalette { try model.setBasePalette(palette); appliedPalette = palette }
             let coordinator = connections.coordinator
             let runtime = TerminalModelRuntime(model: model, coordinator: coordinator,
                                                delivery: presenter, initiallyVisible: false)
