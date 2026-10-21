@@ -284,6 +284,7 @@ ft config import <path> [--dry-run] [--replace] [--yes]
 ft mobile init [<ssh-alias>...] [--inventory <path>]
 ft mobile show [--inventory <path>]
 ft mobile export [--group <id>] [--inventory <path>] [-o <file.ftworkspace>] [--check]
+ft mobile source [--inventory <path>]
 ft mobile themes [-o <path>]
 ```
 
@@ -296,8 +297,12 @@ distinct hue themes no other machine uses. `init` writes a first inventory from
 `~/.ssh/config`, each host pinned to its own theme, and refuses to overwrite.
 `export` writes the iPhone workspace (direct SSH routes, public-key references
 and `known_hosts` pins; never private keys) and reports on stderr what stayed
-behind, such as mux routes and ProxyJump hosts. `themes` writes the catalog the
-iPhone app bundles.
+behind, such as mux routes and ProxyJump hosts. `source` prints what the Mac
+companion loads at launch: that workspace for every group plus the private-key
+file behind each credential (the identities the desktop's ssh uses, OpenSSH's
+defaults when a route names none), as paths only. The companion bundles the
+same output as the `frankenterm-machines` helper. `themes` writes the catalog
+the iPhone app bundles.
 
 An applied remote `--install-ft` requires a caller-chosen stable transaction ID;
 reuse that exact ID after timeout or lost acknowledgement. The current command
