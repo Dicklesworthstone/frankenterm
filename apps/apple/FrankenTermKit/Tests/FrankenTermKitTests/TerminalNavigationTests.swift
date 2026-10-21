@@ -72,7 +72,7 @@ final class TerminalNavigationTests: XCTestCase {
         let tab = UUID(), old = try pane("same title", id: tab)
         let replacement = try pane("same title", id: tab), other = try pane()
         var navigation = try TerminalNavigation(machines: [machine("A", [old, other]), machine("B")])
-        let original = try XCTUnwrap(navigation.selection)
+        let original = try XCTUnwrap(navigation.viewWitness)
         try navigation.remember(.init(topRow: -90, fontPointSize: 18), for: original)
         let pending = try XCTUnwrap(navigation.plan(paneID: other.id))
         XCTAssertTrue(try navigation.replaceInventory([machine("A", [replacement, other]), machine("B")]))
@@ -132,7 +132,7 @@ final class TerminalNavigationTests: XCTestCase {
     func testViewportIsLocalExactSourcePreference() throws {
         let a = try pane(), b = try pane()
         var navigation = try TerminalNavigation(machines: [machine("A", [a, b])])
-        let first = try XCTUnwrap(navigation.selection)
+        let first = try XCTUnwrap(navigation.viewWitness)
         let view = try TerminalNavigationViewport(topRow: -400, fontPointSize: 21)
         try navigation.remember(view, for: first)
         try move(&navigation, .pane)
@@ -141,6 +141,12 @@ final class TerminalNavigationTests: XCTestCase {
         XCTAssertNil(navigation.viewport(for: b.id))
         try move(&navigation, .pane)
         XCTAssertEqual(navigation.viewport(for: try XCTUnwrap(navigation.selection?.paneID)), view)
+        XCTAssertThrowsError(try navigation.remember(.init(topRow: -1), for: first))
+        let current = try XCTUnwrap(navigation.viewWitness)
+        try navigation.remember(.init(topRow: -22), for: current)
+        XCTAssertEqual(navigation.viewport(for: a.id)?.topRow, -22)
+        try navigation.invalidatePlans()
+        XCTAssertThrowsError(try navigation.remember(.init(), for: current))
         for size in [Double.nan, .infinity, -1, 0, 49] {
             XCTAssertThrowsError(try TerminalNavigationViewport(fontPointSize: size))
         }

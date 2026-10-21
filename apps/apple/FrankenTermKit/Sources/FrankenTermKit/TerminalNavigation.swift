@@ -64,6 +64,13 @@ public struct TerminalNavigationViewport: Equatable, Sendable {
 public enum TerminalNavigationAxis: Equatable, Sendable { case machine, pane }
 public enum TerminalNavigationDirection: Equatable, Sendable { case previous, next }
 
+/// A local viewport callback belongs to one exact visit, not just a pane ID.
+/// Leaving and returning to the same pane must not revive an old pan/zoom result.
+public struct TerminalNavigationViewWitness: Equatable, Sendable {
+    fileprivate let owner: UUID, topology: UInt64, focus: UInt64
+    public let selection: TerminalNavigationSelection
+}
+
 /// An immutable preview. Only commit AFTER the source-bound keyboard handoff
 /// succeeds. A visual preview grants no input, resize, or connection authority.
 public struct TerminalNavigationPlan: Equatable, Sendable {
@@ -170,6 +177,13 @@ public struct TerminalNavigation: Sendable {
         return plan(.init(machineID: machine.id, paneID: paneID),
                     axis: selection?.machineID == machine.id ? .pane : .machine)
     }
+    /// Explicitly activate a selected view after suspension or a failed handoff.
+    /// This still requires a new source-bound focus barrier; it never reconnects.
+    public func activationPlan() -> TerminalNavigationPlan? {
+        guard let selection else { return nil }
+        return .init(owner: owner, topology: topology, focus: focus, source: selection,
+                     destination: selection, axis: .pane, wraps: false)
+    }
     public func plan(axis: TerminalNavigationAxis, direction: TerminalNavigationDirection,
                      wrap: Bool = true) throws -> TerminalNavigationPlan? {
         guard let selection, let machineIndex = machines.firstIndex(where: { $0.id == selection.machineID }) else {
@@ -214,10 +228,13 @@ public struct TerminalNavigation: Sendable {
         return plan.destination
     }
 
-    /// A delayed pan/zoom callback cannot overwrite another pane's preferences.
+    public var viewWitness: TerminalNavigationViewWitness? {
+        selection.map { .init(owner: owner, topology: topology, focus: focus, selection: $0) }
+    }
+    /// A delayed pan/zoom callback cannot overwrite a newer visit's preferences.
     public mutating func remember(_ viewport: TerminalNavigationViewport,
-                                  for selected: TerminalNavigationSelection) throws {
-        guard selected == selection, let pane = selected.paneID else { throw TerminalNavigationError.stale }
+                                  for witness: TerminalNavigationViewWitness) throws {
+        guard witness == viewWitness, let pane = witness.selection.paneID else { throw TerminalNavigationError.stale }
         viewports[pane] = viewport
     }
     public func viewport(for pane: TerminalNavigationPaneID) -> TerminalNavigationViewport? { viewports[pane] }
@@ -277,4 +294,148 @@ public struct TerminalNavigationGesture: Sendable {
         return (axis, projected < 0 ? .next : .previous)
     }
     public mutating func cancel() { state = .cancelled }
+}
+
+/// A prepared local focus handoff, not a remote controller lease. The focus
+/// owner must keep input closed until publish, and retain exact cleanup ownership
+/// if suspension or inventory changes invalidate this preparation.
+public struct TerminalNavigationPreparation: Equatable, Sendable {
+    public let id: UUID
+    public let destination: TerminalNavigationSelection
+    public init(id: UUID = UUID(), destination: TerminalNavigationSelection) {
+        self.id = id; self.destination = destination
+    }
+}
+
+@MainActor
+public protocol TerminalNavigationFocusOwner: AnyObject {
+    var currentSelection: TerminalNavigationSelection? { get }
+    func prepare(_ destination: TerminalNavigationSelection) async throws -> TerminalNavigationPreparation
+    /// Synchronous publication: there must be no suspension between the last
+    /// navigation-token check and publishing the new keyboard/visible identity.
+    /// Do not invoke client callbacks or reenter navigation inside publish.
+    func publish(_ preparation: TerminalNavigationPreparation) throws
+    func abandon(_ preparation: TerminalNavigationPreparation) async
+    /// Synchronously stop input. joinSealed waits for its bounded owned cleanup.
+    func seal()
+    func joinSealed() async
+}
+
+/// A scene's sole asynchronous navigation owner. The model cannot be mutated
+/// externally. A gesture and picker use the same prepare/check/publish path.
+/// Neither a delayed handoff nor a stale scene callback can publish a destination.
+@MainActor
+public final class TerminalNavigationCoordinator {
+    public enum Phase: Equatable, Sendable { case suspended, inactive, ready, switching, retiring }
+    public private(set) var navigation: TerminalNavigation
+    public var onChange: (@MainActor () -> Void)?
+    private let focusOwner: any TerminalNavigationFocusOwner
+    private var foreground = false
+    private var operation: (id: UUID, task: Task<Void, Error>)?
+    private var cleanup: (id: UUID, task: Task<Void, Never>)?
+    private var observers: [UUID: @MainActor () -> Void] = [:]
+
+    public init(navigation: TerminalNavigation, focusOwner: any TerminalNavigationFocusOwner) {
+        self.navigation = navigation; self.focusOwner = focusOwner
+    }
+    public var phase: Phase {
+        if !foreground { return .suspended }
+        if operation != nil { return .switching }
+        if cleanup != nil { return .retiring }
+        return navigation.selection != nil && focusOwner.currentSelection == navigation.selection ? .ready : .inactive
+    }
+    /// Resuming never reconnects or automatically activates a keyboard.
+    public func resume() { foreground = true; changed() }
+    public func observe(_ action: @escaping @MainActor () -> Void) throws -> UUID {
+        guard observers.count < 16 else { throw TerminalNavigationError.capacity }
+        let id = UUID(); observers[id] = action; return id
+    }
+    public func removeObserver(_ id: UUID) { observers[id] = nil }
+    private func changed() {
+        onChange?()
+        for action in Array(observers.values) { action() }
+    }
+    public func suspend() {
+        foreground = false
+        try? navigation.invalidatePlans()
+        operation?.task.cancel(); focusOwner.seal()
+        startCleanup(); changed()
+    }
+    public func joinSuspension() async {
+        let pending = operation?.task, cleanup = self.cleanup?.task
+        if let pending { _ = await pending.result }
+        if let cleanup { await cleanup.value }
+    }
+    private func startCleanup() {
+        guard cleanup == nil else { return }
+        let id = UUID(), focusOwner = self.focusOwner
+        let task = Task { [weak self] in
+            await focusOwner.joinSealed()
+            guard let self, self.cleanup?.id == id else { return }
+            self.cleanup = nil; self.changed()
+        }
+        cleanup = (id, task)
+    }
+
+    public func replaceInventory(_ machines: [TerminalNavigationMachine]) throws {
+        // Validate atomically before changing any live input or pending task.
+        var replacement = navigation
+        let disappeared = try replacement.replaceInventory(machines)
+        let topologyChanged = replacement.machines != navigation.machines
+        navigation = replacement
+        if disappeared || topologyChanged && operation != nil {
+            operation?.task.cancel(); focusOwner.seal(); startCleanup()
+        }
+        changed()
+    }
+    public func remember(_ viewport: TerminalNavigationViewport,
+                         for witness: TerminalNavigationViewWitness) throws {
+        try navigation.remember(viewport, for: witness)
+    }
+    public func activateSelection() async throws {
+        guard let plan = navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
+        try await perform(plan)
+    }
+    public func perform(_ plan: TerminalNavigationPlan) async throws {
+        guard foreground else { throw TerminalNavigationError.unavailable }
+        guard operation == nil, cleanup == nil else { throw TerminalNavigationError.busy }
+        try navigation.validate(plan)
+        try Task.checkCancellation()
+        let id = UUID()
+        let task = Task { try await self.execute(plan) }
+        operation = (id, task); changed()
+        defer {
+            if operation?.id == id { operation = nil; changed() }
+        }
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: { task.cancel() }
+    }
+    private func execute(_ plan: TerminalNavigationPlan) async throws {
+        var prepared: TerminalNavigationPreparation?
+        do {
+            try Task.checkCancellation()
+            let candidate = try await focusOwner.prepare(plan.destination)
+            prepared = candidate
+            try Task.checkCancellation()
+            guard foreground, candidate.destination == plan.destination else { throw TerminalNavigationError.stale }
+            try navigation.validate(plan)
+            // Precompute the model commit so a sequence/resource failure cannot
+            // happen after the focus owner publishes input. No await in this block.
+            var committed = navigation
+            try committed.commit(plan)
+            try focusOwner.publish(candidate)
+            navigation = committed
+            prepared = nil
+        } catch {
+            if let prepared { await focusOwner.abandon(prepared) }
+            // A failed pre-barrier composition/cleanup admission can preserve the
+            // original keyboard. Do not discard its draft merely for that error.
+            // Cancellation/suspension, however, must seal even a late result.
+            if Task.isCancelled || !foreground {
+                focusOwner.seal(); await focusOwner.joinSealed()
+            }
+            throw error
+        }
+    }
 }
