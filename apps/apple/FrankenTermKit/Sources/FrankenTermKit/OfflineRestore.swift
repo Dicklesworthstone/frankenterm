@@ -67,6 +67,8 @@ public struct OfflineRestoreStatus: Sendable {
 public actor OfflineRestore<C: AirGapCryptography> {
     private let crypto: C
     private let store: WorkspaceStore
+    private let networkActivity: WorkspaceNetworkActivity
+    private var offlineLease: WorkspaceNetworkLease?
     private var generation = UUID()
     private var phase = OfflineRestorePhase.idle
     private var suspended = false
@@ -84,7 +86,18 @@ public actor OfflineRestore<C: AirGapCryptography> {
     private var receipt: WorkspaceImportReceipt?
     private var pendingNamespace: (exporter: String, workspace: String)?
 
-    public init(using crypto: C, store: WorkspaceStore) { self.crypto = crypto; self.store = store }
+    public init(using crypto: C, store: WorkspaceStore,
+                networkActivity: WorkspaceNetworkActivity = .shared) {
+        self.crypto = crypto; self.store = store; self.networkActivity = networkActivity
+    }
+
+    /// Call before presenting a scanner or reading the selected local file.
+    /// Existing connections must be closed deliberately by their owners; entering
+    /// restore never disconnects a shell on the user's behalf.
+    public func enterOfflineMode() throws {
+        try Task.checkCancellation()
+        if offlineLease == nil { offlineLease = try networkActivity.beginOfflineRestore() }
+    }
 
     private var importDigest: Data? { identity?.envelopeDigest ?? documentDigest }
     private var reviewFallback: OfflineRestorePhase { source == .workspaceDocument ? .documentReady : .locked }
@@ -132,6 +145,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
     public func resumeRecipientRequest(generation token: UUID) throws -> OfflineRestoreStatus {
         try Task.checkCancellation()
         guard suspended, generation == token, recipientSession != nil else { throw FTError.stale }
+        try enterOfflineMode()
         suspended = false; generation = UUID()
         return status()
     }
@@ -256,6 +270,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
     }
 
     private func prepareReview(_ decoded: AirGapArchive, generation token: UUID) async throws -> OfflineRestoreStatus {
+        let lease = try check(token)
+        defer { withExtendedLifetime(lease) {} }
         guard let digest = importDigest else { throw FTError.stale }
         phase = .preparingReview
         do {
@@ -291,7 +307,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
                        allowMachineRemoval: Bool = false, allowRollback: Bool = false,
                        associateWithExistingWorkspace: Bool = false,
                        securityChangesConfirmed: Bool = false) async throws -> OfflineRestoreStatus {
-        try check(token)
+        let lease = try check(token)
+        defer { withExtendedLifetime(lease) {} }
         guard sourceAndContentsConfirmed else { throw WorkspaceStoreError.reviewRequired }
         guard phase == .review, let review, review.token == reviewToken, let archive, let digest = importDigest else { throw FTError.stale }
         guard !review.removesMachines || allowMachineRemoval else { throw WorkspaceStoreError.removalNeedsApproval }
@@ -343,7 +360,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
 
     @discardableResult
     public func reconcile(generation token: UUID) async throws -> OfflineRestoreStatus {
-        try check(token)
+        let lease = try check(token)
+        defer { withExtendedLifetime(lease) {} }
         guard phase == .recoveryRequired, let digest = importDigest, let pendingNamespace else { throw FTError.stale }
         // Reserve the transition across the store await, fencing concurrent resets.
         phase = .committing
@@ -360,10 +378,12 @@ public actor OfflineRestore<C: AirGapCryptography> {
 
     /// Keeps ciphertext progress, but clears decrypted review and retires every
     /// pre-suspension observation token. A commit already owned by storage settles.
+    /// Backgrounding retains offline exclusion. Explicit dismissal releases this
+    /// actor's lease; awaited storage work retains its own reference to settlement.
     @discardableResult
     public func suspend(discardRecipientRequest: Bool = false) -> OfflineRestoreStatus {
         suspended = true; generation = UUID(); archive = nil; review = nil
-        if discardRecipientRequest { retireRecipientSession() }
+        if discardRecipientRequest { retireRecipientSession(); offlineLease = nil }
         if [.review, .preparingReview].contains(phase) { phase = reviewFallback }
         return status()
     }
@@ -417,8 +437,12 @@ public actor OfflineRestore<C: AirGapCryptography> {
         recipientSession?.retire()
         recipientSession = nil
     }
-    private func check(_ token: UUID) throws {
+    @discardableResult
+    private func check(_ token: UUID) throws -> WorkspaceNetworkLease {
         try Task.checkCancellation()
         guard !suspended, generation == token else { throw FTError.stale }
+        try enterOfflineMode()
+        guard let offlineLease else { throw FTError.stale }
+        return offlineLease
     }
 }

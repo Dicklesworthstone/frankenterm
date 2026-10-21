@@ -26,6 +26,7 @@ final class MobileWorkspaceModel {
     var active = false { didSet { updateIdleTimer() } }
     var busy = false
     var requestingCameraAccess = false
+    var offlineModeBlocked = false
     @ObservationIgnored private var store: WorkspaceStore?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
@@ -64,25 +65,32 @@ final class MobileWorkspaceModel {
     func requestCamera() {
         guard active, !busy, !requestingCameraAccess, state?.requiresRecipientResume != true else { return }
         if !showRestore { setRestoreVisible(true) }
-        guard DataScannerViewController.isSupported else {
-            message = "This device does not support the native scanner. Open a local encrypted file instead."
-            return
-        }
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-        if status == .authorized { cameraRequested = true; return }
-        guard status == .notDetermined else {
-            message = "Camera access is denied or restricted. Allow it in Settings or use a local encrypted file."
-            return
-        }
         requestingCameraAccess = true
+        let ticket = epoch, pendingLifecycle = lifecycle
         Task { [weak self] in
-            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            // Offline admission precedes both the camera permission prompt and
+            // scanner creation, including the root screen's one-tap entry.
+            await pendingLifecycle?.value
             guard let self else { return }
-            self.requestingCameraAccess = false
+            defer { self.requestingCameraAccess = false }
+            guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked,
+                  self.state?.isSuspended == false else { return }
+            guard DataScannerViewController.isSupported else {
+                self.message = "This device does not support the native scanner. Open a local encrypted file instead."
+                return
+            }
+            let status = AVCaptureDevice.authorizationStatus(for: .video)
+            if status == .authorized { self.cameraRequested = true; return }
+            guard status == .notDetermined else {
+                self.message = "Camera access is denied or restricted. Allow it in Settings or use a local encrypted file."
+                return
+            }
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
             guard self.showRestore else { return }
             // The permission sheet can deactivate the scene. Do not restart a
             // camera in an inactive scene or after the restore sheet was closed.
-            if granted, self.active { self.cameraRequested = true }
+            if granted, self.active, self.epoch == ticket, !self.offlineModeBlocked,
+               self.state?.isSuspended == false { self.cameraRequested = true }
             else if granted { self.message = "Camera access is ready. Tap Open Camera or Resume Camera when you return." }
             else { self.message = "Camera access was not granted. The local encrypted-file import is still available." }
         }
@@ -118,8 +126,13 @@ final class MobileWorkspaceModel {
         // A just-dismissed request may already be retired. Re-present only the
         // status returned by the serialized lifecycle transition.
         state = nil
-        if !value { cameraRequested = false; pendingImport = nil }
+        if !value { cameraRequested = false; pendingImport = nil; offlineModeBlocked = false }
         updateLifecycle(discardRecipientRequest: !value)
+    }
+    func retryOfflineMode() {
+        guard active, showRestore, !busy else { return }
+        message = nil
+        updateLifecycle()
     }
     func requestRecipient() {
         guard active, !busy else { return }
@@ -153,8 +166,21 @@ final class MobileWorkspaceModel {
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
         lifecycle = Task { [weak self] in
             await prior?.value
-            let next = visible ? await restore.resume() : await restore.suspend(discardRecipientRequest: discardRecipientRequest)
+            let next: OfflineRestoreStatus
+            do {
+                if visible {
+                    try await restore.enterOfflineMode()
+                    next = await restore.resume()
+                } else { next = await restore.suspend(discardRecipientRequest: discardRecipientRequest) }
+            } catch {
+                let paused = await restore.suspend()
+                guard let self, self.epoch == ticket else { return }
+                self.cameraRequested = false; self.offlineModeBlocked = true
+                self.state = paused; self.report(error)
+                return
+            }
             guard let self, self.epoch == ticket else { return }
+            self.offlineModeBlocked = false
             self.state = next
             if visible { self.startObservations(restore: restore) }
             if self.active, let store = self.store {
@@ -233,7 +259,7 @@ final class MobileWorkspaceModel {
                 self.busy = false
                 self.openPendingFileIfReady()
             }
-            guard self.active, self.epoch == ticket else { return }
+            guard self.active, self.epoch == ticket, !self.offlineModeBlocked else { return }
             do {
                 let current = await restore.status()
                 let result = try await action(restore, current)
@@ -339,6 +365,7 @@ final class MobileWorkspaceModel {
             } else { message = error.localizedDescription }
         }
         else if let error = error as? WorkspaceStoreError { message = error.localizedDescription }
+        else if let error = error as? WorkspaceNetworkError { message = error.localizedDescription }
         else if !(error is CancellationError) { message = "The operation could not finish. Your existing workspace was not replaced without a completed import. Check saved workspaces before retrying." }
     }
 }
@@ -425,6 +452,16 @@ struct OfflineRestoreSheet: View {
         NavigationStack {
             Group {
                 if !model.active { ContentUnavailableView("Locked", systemImage: "lock.shield", description: Text("Return to FrankenTerm to continue.")) }
+                else if model.offlineModeBlocked {
+                    ContentUnavailableView {
+                        Label("Offline Restore Paused", systemImage: "network.slash")
+                    } description: {
+                        Text(model.message ?? "Close active connections before restoring. Cancel to keep your connections open.")
+                    } actions: {
+                        Button("Retry Offline Restore") { model.retryOfflineMode() }.buttonStyle(.borderedProminent)
+                        Button("Cancel Restore") { model.setRestoreVisible(false) }
+                    }
+                }
                 else if let state = model.state {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
