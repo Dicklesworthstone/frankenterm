@@ -316,11 +316,12 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         await broker.resume()
         let wrong = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
             fingerprint: "SHA256:ERERERERERERERERERERERERERERERERERERERERERE")
-        await expectFailure {
+        do {
             _ = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
                 routeID: "route", credentialID: "key", presentedHostKey: wrong, transportID: UUID(),
                 sessionIdentifier: Data(repeating: 9, count: 32), publicBlob: f.key.publicBlob)
-        }
+            XCTFail("An unpinned host key was accepted")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .hostKeyMismatch) }
         let passwordOnly = try await fixture { workspace in
             var routes = workspace["routes"] as! [[String: Any]]
             routes[0]["authentication_methods"] = ["password"]
