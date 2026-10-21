@@ -27,6 +27,17 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
 
+LIVE_TEST = "FrankenTermSSHTests.WorkspaceAuthenticationTests/testLiveImportedWorkspaceAuthenticationAndPTY"
+
+
+def xctest_command():
+    """SwiftPM emits an executable test product on Linux and a loadable .xctest
+    bundle directory on Apple platforms, which runs through `xcrun xctest`."""
+    if os.path.isdir(TEST_BUNDLE):
+        return ["xcrun", "xctest", "-XCTest", LIVE_TEST, TEST_BUNDLE]
+    return [TEST_BUNDLE, LIVE_TEST]
+
+
 class WorkspaceInteropTests(unittest.TestCase):
     def test_imported_workspace_through_real_transport(self):
         for mode in ["success", "wrong-host", "revoked", "revoke-before-shell",
@@ -38,12 +49,12 @@ class WorkspaceInteropTests(unittest.TestCase):
                     environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(server.address[1]),
                                        FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(server.host_blob).decode(),
                                        FT_WORKSPACE_SSH_TEST_MODE=mode)
-                    result = subprocess.run([TEST_BUNDLE,
-                        "FrankenTermSSHTests.WorkspaceAuthenticationTests/testLiveImportedWorkspaceAuthenticationAndPTY"],
-                        env=environment, capture_output=True, text=True, timeout=20)
+                    result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=20)
+                    # macOS xctest reports its summary on stderr; Linux on stdout.
+                    output = result.stdout + result.stderr
                     self.assertEqual(result.returncode, 0, result.stdout[-12000:] + result.stderr[-12000:])
-                    self.assertIn("Executed 1 test", result.stdout)
-                    self.assertNotIn("skipped", result.stdout.lower())
+                    self.assertIn("Executed 1 test", output)
+                    self.assertNotIn("skipped", output.lower())
                     authentication = [event[1] for event in server.events if event[0] == "authentication"]
                     self.assertEqual(authentication, [] if mode in ["wrong-host", "revoked"] else [0, 1])
                     self.assertEqual(any(event[0] == "shell" for event in server.events),

@@ -146,7 +146,9 @@ public struct SSHWorkspaceSource: Sendable {
     /// tokens, environment variables, named-user tildes or unsupported glob syntax
     /// remain visible required omissions; no executable resolution is attempted.
     public static func loadUserConfiguration(_ url: URL,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> SSHWorkspaceSource {
+        // NSHomeDirectory exists on every platform (homeDirectoryForCurrentUser is
+        // unavailable in iOS, where this shared package also compiles).
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) throws -> SSHWorkspaceSource {
         guard url.isFileURL, homeDirectory.isFileURL else { throw FTError.malformed("ssh.include_path") }
         #if os(macOS) || os(iOS)
         let access = url.startAccessingSecurityScopedResource()

@@ -167,8 +167,16 @@ final class SessionTests: XCTestCase, @unchecked Sendable {
         let key = string(Data("ssh-ed25519".utf8)) + string(Data(repeating: 7, count: 32))
         let identity = try NativeSSHIdentity(user: "operator", publicKey: key)
         let sid = Data(repeating: 9, count: 32)
-        let bytes = string(sid) + Data([50]) + string(Data("operator".utf8)) + string(Data("ssh-connection".utf8))
-            + string(Data("publickey".utf8)) + Data([1]) + string(Data("ssh-ed25519".utf8)) + string(key)
+        // Built incrementally: one eight-term `Data +` chain exceeds the Apple SDK
+        // type checker's time limit.
+        var bytes = string(sid)
+        bytes.append(Data([50]))
+        bytes.append(string(Data("operator".utf8)))
+        bytes.append(string(Data("ssh-connection".utf8)))
+        bytes.append(string(Data("publickey".utf8)))
+        bytes.append(Data([1]))
+        bytes.append(string(Data("ssh-ed25519".utf8)))
+        bytes.append(string(key))
         let id = UUID()
         let challenge = try NativeSSHChallenge(bytes: bytes, transportID: id, identity: identity)
         XCTAssertEqual(challenge.transportID, id)
