@@ -200,6 +200,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         let output = try await hostFile(outPath, containing: "FRANKEN-42")
         XCTAssertTrue(output.contains("FRANKEN-42"), "the remote shell never ran the typed command (output: \(output))")
         let size = output.split(separator: "\n").first.map(String.init) ?? ""
+        let dimensions = size.split(separator: " ").compactMap { Int($0) }
+        XCTAssertEqual(dimensions.count, 2, "stty must report rows and columns (output: \(output))")
+        XCTAssertTrue(dimensions.allSatisfy { $0 > 0 }, size)
         XCTAssertNotEqual(size, "24 80", "the PTY must follow the view's viewport, not the provisional 80x24")
 
         let format = UIGraphicsImageRendererFormat(); format.scale = 2
@@ -284,6 +287,103 @@ final class TerminalSessionControllerTests: XCTestCase {
         let remaining = await live.connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// The rendered screen once it shows `marker` (or after ~10 s).
+    private func screen(_ terminal: NativeTerminalView, containing marker: String) async throws -> String {
+        var text = ""
+        for _ in 0..<200 where !text.contains(marker) {
+            try await Task.sleep(for: .milliseconds(50))
+            text = terminal.renderer.accessibilityValue ?? ""
+        }
+        return text
+    }
+
+    /// The first view of `type` inside `root` matching `match`, waiting up to ~5 s.
+    private func subview<T: UIView>(_ type: T.Type, in root: UIView,
+                                    where match: @escaping (T) -> Bool = { _ in true }) async throws -> T {
+        func search(_ view: UIView) -> T? {
+            if let found = view as? T, match(found) { return found }
+            return view.subviews.lazy.compactMap(search).first
+        }
+        for _ in 0..<100 {
+            if let found = search(root) { return found }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return try XCTUnwrap(search(root), "no \(T.self) appeared")
+    }
+
+    private func tap(_ title: String, in root: UIView) async throws {
+        try await subview(UIButton.self, in: root) { $0.configuration?.title == title }.sendActions(for: .touchUpInside)
+    }
+
+    /// Select Output freezes the received viewport the shell drew, copies it
+    /// from the panel, and returning to the terminal gives it a working keyboard.
+    func testSelectOutputShowsTheShellsOutputAndCopiesIt() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo CLIP-$((6*7))", into: terminal)
+        let drawn = try await screen(terminal, containing: "CLIP-42")
+        XCTAssertTrue(drawn.contains("CLIP-42"), "the shell's output must be drawn first (screen: \(drawn))")
+
+        UIPasteboard.general.string = "unrelated"
+        session.inspectOutput()
+        let captured = try await subview(UITextView.self, in: terminal) { $0.accessibilityLabel == "Captured terminal output" }
+        XCTAssertTrue(session.clipboardIsPresenting)
+        XCTAssertTrue(captured.text.contains("CLIP-42"), "the panel shows the received viewport (text: \(captured.text ?? ""))")
+        XCTAssertFalse(terminal.input.isEditable, "the hidden shell accepts no input while output is inspected")
+        try await tap("Select All", in: terminal)
+        try await tap("Copy Selection", in: terminal)
+        XCTAssertTrue(UIPasteboard.general.string?.contains("CLIP-42") == true, "Copy Selection writes the selected output")
+        try await tap("Done", in: terminal)
+        XCTAssertFalse(session.clipboardIsPresenting)
+        XCTAssertNil(captured.window, "Done removes the panel")
+
+        await scene.activateKeyboard()
+        try await type("echo BACK-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "BACK-42")
+        XCTAssertTrue(output.contains("BACK-42"), "the terminal takes input again after inspection (output: \(output))")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    /// Paste shows the exact clipboard text bound to this terminal. Cancel sends
+    /// nothing; confirmation sends it once, without a Return.
+    func testReviewedPasteIsSentOnlyOnConfirmationAndAddsNoReturn() async throws {
+        let live = try await liveScene(), scene = live.scene, path = live.outPath
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo READY-$((40+2)) > \(path)", into: terminal)
+        _ = try await hostFile(path, containing: "READY-42")
+
+        let cancelled = "echo CANCELLED-$((40+2)) >> \(path)"
+        UIPasteboard.general.string = cancelled
+        session.paste()
+        let preview = try await subview(UITextView.self, in: terminal) { $0.accessibilityLabel == "Text to paste" }
+        XCTAssertEqual(preview.text, cancelled)
+        try await tap("Cancel", in: terminal)
+        XCTAssertFalse(session.clipboardIsPresenting)
+        try await type("echo AFTER-$((40+2)) >> \(path)", into: terminal)
+        let afterCancel = try await hostFile(path, containing: "AFTER-42")
+        XCTAssertEqual(afterCancel.split(separator: "\n"), ["READY-42", "AFTER-42"], "a cancelled paste sends nothing")
+
+        let confirmed = "echo PASTE-$((40+2)) >> \(path)"
+        UIPasteboard.general.string = confirmed
+        session.paste()
+        _ = try await subview(UITextView.self, in: terminal) { $0.accessibilityLabel == "Text to paste" && $0.text == confirmed }
+        try await tap("Paste to This Terminal", in: terminal)
+        XCTAssertFalse(session.clipboardIsPresenting)
+        try await Task.sleep(for: .seconds(2))
+        let unsubmitted = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        XCTAssertFalse(unsubmitted.contains("PASTE-42"), "a paste adds no Return, so the line has not run")
+        terminal.input.insertText("\n")
+        let submitted = try await hostFile(path, containing: "PASTE-42")
+        XCTAssertEqual(submitted.split(separator: "\n"), ["READY-42", "AFTER-42", "PASTE-42"], "the pasted line runs once")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     private func assertReleased(_ controller: TerminalSessionController, connections: MobileConnections,

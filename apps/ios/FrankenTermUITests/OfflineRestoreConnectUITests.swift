@@ -138,6 +138,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
             XCTAssertTrue(zip(shown, expected).allSatisfy { abs($0 - $1) <= 6 },
                           "terminal background \(shown) must be the theme's \(expected)")
         }
+
+        // The toolbar's Select Output shows the received viewport as read-only text.
+        app.buttons["Select Output"].tap()
+        let captured = app.textViews["Captured terminal output"]
+        XCTAssertTrue(captured.waitForExistence(timeout: 10), "Select Output must show the captured viewport")
+        XCTAssertTrue((captured.value as? String ?? "").contains("FRANKEN-42"), "the capture holds the shell's output")
+        snapshot("6b-select-output")
+        app.buttons["Done"].tap()
+        XCTAssertTrue(captured.waitForNonExistence(timeout: 5), "Done returns to the terminal")
     }
 
     private func rgb(_ hex: String) -> [Int]? {
@@ -278,7 +287,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         snapshot("11-second-machine")
         connect.tap()
         app.tap() // lets the interruption monitor handle a Face ID alert
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 60), "the second session must take the keyboard")
+        // A simulator that ran this test before holds the second machine's
+        // earlier session too; its review comes first.
+        let review = app.buttons["Start New Session"]
+        let deadline = Date().addingTimeInterval(60)
+        while !app.keyboards.firstMatch.exists, Date() < deadline {
+            if review.exists { review.tap(); app.tap() }
+            usleep(250_000)
+        }
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "the second session must take the keyboard")
         let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
         app.typeText("export FT_WHO=second; echo WHO-$FT_WHO-$((2+2))\n")
         waitFor("WHO-second-4", in: screen, timeout: 30, "the second machine's shell must run")
