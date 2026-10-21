@@ -46,6 +46,7 @@ public struct TerminalSessionRecord: Identifiable, Hashable, Sendable {
     public let id: UUID
     public let scope: TerminalSessionScope
     public let state: TerminalSessionRecordState
+    public let inputEvidence: TerminalInputEvidence
     public let canResolve: Bool
     public var requiresReview: Bool { state != .acknowledged }
     fileprivate let revision: UUID
@@ -55,7 +56,7 @@ public struct TerminalSessionRecord: Identifiable, Hashable, Sendable {
 public enum TerminalSessionJournalError: Error, Equatable, Sendable, LocalizedError {
     case invalidScope, invalidLimits, wrongNamespace, corruptStore, busy
     case capacity, reviewRequired, activeSession, staleReview, invalidEpoch
-    case recoveryRequired
+    case recoveryRequired, historyMissing
 
     public var errorDescription: String? {
         switch self {
@@ -70,6 +71,7 @@ public enum TerminalSessionJournalError: Error, Equatable, Sendable, LocalizedEr
         case .staleReview: return "Session history changed. Review the current record again."
         case .invalidEpoch: return "This session marker belongs to another owner."
         case .recoveryRequired: return "Session history storage needs recovery. Do not assume the operation was rolled back."
+        case .historyMissing: return "Protected session history is missing. Recover the existing history before creating another session."
         }
     }
 }
@@ -89,9 +91,11 @@ private enum TerminalSessionProcess {
 ///
 /// After authentication, call beginCreation immediately before the first remote
 /// shell/exec request. Failure returns no epoch and forbids that request. Once
-/// returned, an epoch must remain owned until admission is sealed and native
-/// connection teardown has joined; then call markInterrupted, including on
-/// cancellation and ordinary close. The scene separately retains and joins its
+/// returned, bindInput associates the admitted source with the durable epoch.
+/// The owner records content-free outcomes and uses a coordinator-minted seal
+/// only after admission, streams, writes, delivery and native close have joined.
+/// An epoch that never bound input can instead call markInterrupted after close.
+/// The scene separately retains and joins its
 /// pump consumer and outcome delivery. There is no implicit "clean" close: SSH
 /// delivery and local close cannot prove which remote effects occurred.
 ///
@@ -108,6 +112,7 @@ public actor TerminalSessionJournal {
         let process: UUID
         let owner: UUID
         var state: TerminalSessionRecordState
+        var inputEvidence: TerminalInputEvidence
     }
     private struct Catalog {
         let id: UUID
@@ -132,6 +137,14 @@ public actor TerminalSessionJournal {
     private let issuer = UUID()
     private var catalogID: UUID?
     private var active: Set<UUID> = []
+    private var boundSources: [UUID: TerminalSource] = [:]
+    /// A genuine coordinator seal retires the owner even if its final catalog
+    /// write fails. This owner can then offer explicit recovery review without
+    /// forgetting the durable creation marker or needing the lost factory task.
+    private var sealed: Set<UUID> = []
+    /// Retain failed final publications until their owner retries. These are
+    /// bounded content-free observations, never native sources or I/O tasks.
+    private var pendingSeals: [UUID: TerminalInputEvidence] = [:]
     /// A failed write can publish a marker without ever issuing permission.
     /// Only its originating owner knows it is safe to resolve in this process.
     private var unissued: Set<UUID> = []
@@ -146,9 +159,9 @@ public actor TerminalSessionJournal {
     /// The directory is exclusively for session history. Do not use the
     /// workspace catalog directory; both stores intentionally reject each other.
     public init(directory: URL, maximumUnresolved: Int = 64,
-                maximumResolved: Int = 32) throws {
+                maximumResolved: Int = 32, identifier: String = "primary") throws {
         try Self.validateLimits(maximumUnresolved, maximumResolved)
-        self.persistence = try FileWorkspacePersistence(directory: directory)
+        self.persistence = try FileTerminalSessionHistoryPersistence(directory: directory, identifier: identifier)
         self.maximumUnresolved = maximumUnresolved; self.maximumResolved = maximumResolved
         self.process = TerminalSessionProcess.id
     }
@@ -176,9 +189,11 @@ public actor TerminalSessionJournal {
             }) else { throw TerminalSessionJournalError.reviewRequired }
             guard catalog.entries.filter({ $0.state != .acknowledged }).count < maximumUnresolved
             else { throw TerminalSessionJournalError.capacity }
+            guard boundSources.count < Self.hardUnresolvedLimit + Self.hardResolvedLimit
+            else { throw TerminalSessionJournalError.capacity }
             try Task.checkCancellation()
             let entry = Entry(id: UUID(), revision: UUID(), scope: scope,
-                              process: process, owner: issuer, state: .creationStarted)
+                              process: process, owner: issuer, state: .creationStarted, inputEvidence: [])
             catalog.entries.append(entry)
             trimResolved(&catalog)
             do { try save(catalog) }
@@ -199,6 +214,7 @@ public actor TerminalSessionJournal {
     /// retried with the same epoch and never authorize another shell.
     public func markInterrupted(epoch: TerminalSessionEpoch) throws {
         guard epoch.issuer == issuer else { throw TerminalSessionJournalError.invalidEpoch }
+        guard boundSources[epoch.id] == nil else { throw TerminalSessionJournalError.activeSession }
         // Retirement is local and irrevocable, even if protected storage is
         // unavailable. A creationStarted marker remains conservatively blocked
         // until this write can succeed or a later process explicitly reviews it.
@@ -222,12 +238,111 @@ public actor TerminalSessionJournal {
     /// records are reviewable uncertainty, never restored live authority.
     public func records() throws -> [TerminalSessionRecord] {
         try transaction {
-            try load().entries.map {
-                TerminalSessionRecord(id: $0.id, scope: $0.scope, state: $0.state,
-                                      canResolve: canResolve($0), revision: $0.revision,
-                                      reviewer: issuer)
-            }
+            try load().entries.map(snapshot)
         }
+    }
+
+    /// Called after attaching the authenticated channel and before opening any
+    /// keyboard or model-reply admission. The pre-shell marker is already
+    /// durable; this local association is not restorable connection authority.
+    /// Failed validation never leaves a partially bound epoch.
+    public func bindInput(epoch: TerminalSessionEpoch, to source: TerminalSource) throws {
+        guard epoch.issuer == issuer, active.contains(epoch.id), !sealed.contains(epoch.id),
+              Self.matches(source.identity, epoch.scope),
+              boundSources[epoch.id] == nil || boundSources[epoch.id] == source else {
+            throw TerminalSessionJournalError.invalidEpoch
+        }
+        try transaction {
+            let catalog = try load()
+            guard let entry = catalog.entries.first(where: { $0.id == epoch.id }),
+                  entry.owner == issuer, entry.process == process, entry.scope == epoch.scope,
+                  entry.state == .creationStarted else { throw TerminalSessionJournalError.invalidEpoch }
+        }
+        boundSources[epoch.id] = source
+    }
+
+    /// Publish only a bounded union of transport observations, never payloads,
+    /// operation IDs or payload hashes. A retained batch may be retried after a
+    /// failed write; the union and unchanged revision make duplicates harmless.
+    /// The coarse creation marker protects crash gaps between these updates.
+    public func recordInput(_ outcomes: [TerminalInputOutcome], epoch: TerminalSessionEpoch) throws {
+        guard epoch.issuer == issuer, active.contains(epoch.id), !sealed.contains(epoch.id),
+              let source = boundSources[epoch.id] else { throw TerminalSessionJournalError.invalidEpoch }
+        let evidence = try TerminalInputEvidence.observations(outcomes, source: source)
+        try transaction {
+            var catalog = try load()
+            guard let index = catalog.entries.firstIndex(where: { $0.id == epoch.id }) else {
+                throw TerminalSessionJournalError.invalidEpoch
+            }
+            let entry = catalog.entries[index]
+            guard entry.owner == issuer, entry.process == process, entry.scope == epoch.scope,
+                  entry.state == .creationStarted else { throw TerminalSessionJournalError.invalidEpoch }
+            let combined = entry.inputEvidence.union(evidence)
+            guard combined != entry.inputEvidence else { return }
+            catalog.entries[index].inputEvidence = combined
+            catalog.entries[index].revision = UUID()
+            try save(catalog)
+        }
+    }
+
+    /// A source-wide witness proves that admission and every producer/consumer
+    /// have retired. It also conservatively retains accepted/unknown evidence
+    /// if a consumer consumed its in-memory outcomes without publishing them.
+    /// Local closure never proves that remote shell or input effects are absent.
+    /// Repeating this operation with the same epoch/witness returns a fresh exact
+    /// review; explicit acknowledgement is the only path to a resolved record.
+    public func sealInput(epoch: TerminalSessionEpoch, boundary: TerminalInputSeal) throws -> TerminalSessionRecord {
+        guard epoch.issuer == issuer, let source = boundSources[epoch.id], source == boundary.source,
+              Self.matches(source.identity, epoch.scope) else { throw TerminalSessionJournalError.invalidEpoch }
+        active.remove(epoch.id)
+        sealed.insert(epoch.id)
+        var observed = pendingSeals[epoch.id] ?? []
+        if boundary.hasAcceptedBytes { observed.insert(.acceptedPrefix) }
+        if boundary.hasUnknownTransportOutcome { observed.insert(.unknownTransportOutcome) }
+        pendingSeals[epoch.id] = observed
+        return try transaction {
+            var catalog = try load()
+            guard let index = catalog.entries.firstIndex(where: { $0.id == epoch.id }) else {
+                // Only acknowledged entries can be pruned from this validated
+                // catalog. A failed final publication may outlive that pruning;
+                // it must not keep an already closed owner's source alive.
+                let result = TerminalSessionRecord(id: epoch.id, scope: epoch.scope, state: .acknowledged,
+                    inputEvidence: observed, canResolve: false, revision: UUID(), reviewer: issuer)
+                pendingSeals[epoch.id] = nil; boundSources[epoch.id] = nil; sealed.remove(epoch.id)
+                return result
+            }
+            let entry = catalog.entries[index]
+            guard entry.owner == issuer, entry.process == process, entry.scope == epoch.scope else {
+                throw TerminalSessionJournalError.invalidEpoch
+            }
+            if entry.state == .acknowledged {
+                let result = snapshot(entry); pendingSeals[epoch.id] = nil; return result
+            }
+            let evidence = entry.inputEvidence.union(observed)
+            pendingSeals[epoch.id] = evidence
+            if entry.state != .interrupted || entry.inputEvidence != evidence {
+                catalog.entries[index].state = .interrupted
+                catalog.entries[index].inputEvidence = evidence
+                catalog.entries[index].revision = UUID()
+                try save(catalog)
+            }
+            let result = snapshot(catalog.entries[index])
+            pendingSeals[epoch.id] = nil
+            return result
+        }
+    }
+
+    private static func matches(_ identity: TerminalConnectionIdentity, _ scope: TerminalSessionScope) -> Bool {
+        identity.workspaceID == scope.workspaceID.uuidString && identity.machineID == scope.machineID
+            && identity.routeID == scope.routeID && identity.transportID == scope.transportID
+            && identity.channelID == scope.channelID
+    }
+
+    private func snapshot(_ entry: Entry) -> TerminalSessionRecord {
+        TerminalSessionRecord(id: entry.id, scope: entry.scope, state: entry.state,
+                              inputEvidence: entry.inputEvidence.union(pendingSeals[entry.id] ?? []),
+                              canResolve: canResolve(entry),
+                              revision: entry.revision, reviewer: issuer)
     }
 
     /// Separately records the user's explicit acknowledgement of possible
@@ -242,9 +357,12 @@ public actor TerminalSessionJournal {
                   catalog.entries[index].revision == reviewed.revision,
                   catalog.entries[index].scope == reviewed.scope,
                   catalog.entries[index].state == reviewed.state,
+                  catalog.entries[index].inputEvidence.union(pendingSeals[reviewed.id] ?? []) == reviewed.inputEvidence,
                   reviewed.requiresReview else { throw TerminalSessionJournalError.staleReview }
             guard canResolve(catalog.entries[index]) else { throw TerminalSessionJournalError.activeSession }
+            guard reviewed.canResolve else { throw TerminalSessionJournalError.staleReview }
             catalog.entries[index].state = .acknowledged
+            catalog.entries[index].inputEvidence = reviewed.inputEvidence
             catalog.entries[index].revision = UUID()
             trimResolved(&catalog)
             try save(catalog)
@@ -255,7 +373,7 @@ public actor TerminalSessionJournal {
     private func canResolve(_ entry: Entry) -> Bool {
         guard entry.state != .acknowledged, !active.contains(entry.id) else { return false }
         return entry.state == .interrupted || entry.process != process
-            || (entry.owner == issuer && unissued.contains(entry.id))
+            || (entry.owner == issuer && (unissued.contains(entry.id) || sealed.contains(entry.id)))
     }
 
     private static func validateLimits(_ unresolved: Int, _ resolved: Int) throws {
@@ -297,8 +415,9 @@ public actor TerminalSessionJournal {
             guard object["format"] == .string(Self.format) else {
                 throw TerminalSessionJournalError.wrongNamespace
             }
+            let version = try object.required("version").uint()
             guard Set(object.keys) == ["format", "version", "id", "records"],
-                  try object.required("version").uint() == 1 else {
+                  version == 1 || version == 2 else {
                 throw TerminalSessionJournalError.corruptStore
             }
             let id = try Self.uuid(object, "id")
@@ -311,17 +430,27 @@ public actor TerminalSessionJournal {
             var entries: [Entry] = []
             for value in values {
                 let fields = try value.object()
-                guard Set(fields.keys) == ["id", "revision", "workspace", "workspace_revision",
-                    "machine", "route", "transport", "channel", "process", "owner", "state"],
+                var keys: Set<String> = ["id", "revision", "workspace", "workspace_revision",
+                    "machine", "route", "transport", "channel", "process", "owner", "state"]
+                if version == 2 { keys.insert("input_evidence") }
+                guard Set(fields.keys) == keys,
                       let state = TerminalSessionRecordState(rawValue: try fields.text("state"))
                 else { throw TerminalSessionJournalError.corruptStore }
+                var evidence: TerminalInputEvidence = []
+                if version == 2 {
+                    guard let raw = UInt8(exactly: try fields.required("input_evidence").uint()) else {
+                        throw TerminalSessionJournalError.corruptStore
+                    }
+                    evidence = TerminalInputEvidence(rawValue: raw)
+                    guard evidence.isValid else { throw TerminalSessionJournalError.corruptStore }
+                }
                 let scope = try TerminalSessionScope(workspaceID: Self.uuid(fields, "workspace"),
                     workspaceRevision: Self.uuid(fields, "workspace_revision"),
                     machineID: fields.text("machine"), routeID: fields.text("route"),
                     transportID: Self.uuid(fields, "transport"), channelID: Self.uuid(fields, "channel"))
                 let entry = try Entry(id: Self.uuid(fields, "id"), revision: Self.uuid(fields, "revision"),
                                       scope: scope, process: Self.uuid(fields, "process"),
-                                      owner: Self.uuid(fields, "owner"), state: state)
+                                      owner: Self.uuid(fields, "owner"), state: state, inputEvidence: evidence)
                 guard ids.insert(entry.id).inserted else { throw TerminalSessionJournalError.corruptStore }
                 if state == .acknowledged { resolved += 1 }
                 else {
@@ -338,6 +467,9 @@ public actor TerminalSessionJournal {
         catch { throw TerminalSessionJournalError.corruptStore }
         catalogID = catalog.id
         unissued.formIntersection(catalog.entries.filter { $0.state != .acknowledged }.map(\.id))
+        let retained = Set(catalog.entries.map(\.id))
+        sealed.formIntersection(retained)
+        boundSources = boundSources.filter { retained.contains($0.key) || pendingSeals[$0.key] != nil }
         return catalog
     }
 
@@ -358,11 +490,12 @@ public actor TerminalSessionJournal {
                 "transport": .string(entry.scope.transportID.uuidString),
                 "channel": .string(entry.scope.channelID.uuidString),
                 "process": .string(entry.process.uuidString), "owner": .string(entry.owner.uuidString),
-                "state": .string(entry.state.rawValue)
+                "state": .string(entry.state.rawValue),
+                "input_evidence": .number(String(entry.inputEvidence.rawValue))
             ])
         }
         let bytes = try StrictJSON.encode(.object([
-            "format": .string(Self.format), "version": .number("1"),
+            "format": .string(Self.format), "version": .number("2"),
             "id": .string(catalog.id.uuidString), "records": .array(records)
         ]))
         guard bytes.count <= Self.maximumBytes else { throw TerminalSessionJournalError.capacity }

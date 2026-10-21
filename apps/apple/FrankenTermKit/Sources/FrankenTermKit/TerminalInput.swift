@@ -90,6 +90,18 @@ public struct TerminalSource: Hashable, Sendable {
     fileprivate let owner: UUID, serial: UInt64
     public let identity: TerminalConnectionIdentity
 }
+/// A source-wide settlement witness, minted only after admission, every stream,
+/// all writes/cleanup/outcomes, and native close have finished. It grants no
+/// replay authority and cannot be constructed by an external session owner.
+public struct TerminalInputSeal: Sendable {
+    public let source: TerminalSource
+    public let hasAcceptedBytes: Bool
+    public let hasUnknownTransportOutcome: Bool
+    fileprivate init(source: TerminalSource, hasAcceptedBytes: Bool, hasUnknownTransportOutcome: Bool) {
+        self.source = source; self.hasAcceptedBytes = hasAcceptedBytes
+        self.hasUnknownTransportOutcome = hasUnknownTransportOutcome
+    }
+}
 public struct TerminalFocus: Equatable, Sendable {
     fileprivate let owner: UUID, stream: UUID
     public let sceneID: UUID, generation: UInt64
@@ -170,6 +182,7 @@ public actor TerminalInputCoordinator {
         var outcomes: [TerminalInputOutcome] = []
         var inFlight: UInt64?
         var inFlightBytes = 0
+        var hasAcceptedBytes = false, hasUnknownTransportOutcome = false
         init(_ source: TerminalSource, _ transport: any TerminalByteTransport) {
             self.source = source; self.transport = transport
         }
@@ -402,6 +415,8 @@ public actor TerminalInputCoordinator {
         if tail.isEmpty { finish(operation, in: connection, disposition: .cancelledAfterPrefix) }
     }
     private func finish(_ operation: Operation, in connection: Connection, disposition: TerminalInputDisposition) {
+        connection.hasAcceptedBytes = connection.hasAcceptedBytes || operation.acceptedOriginal > 0 || operation.acceptedCleanup > 0
+        if case .connectionLost(leasedTailUnknown: true) = disposition { connection.hasUnknownTransportOutcome = true }
         connection.outcomes.append(TerminalInputOutcome(receipt: operation.receipt, kind: operation.kind,
             originalBytes: operation.originalBytes, acceptedOriginalBytes: operation.acceptedOriginal,
             acceptedCleanupBytes: operation.acceptedCleanup, disposition: disposition))
@@ -534,6 +549,16 @@ public actor TerminalInputCoordinator {
         guard connection.closed, connection.inFlight == nil, connection.queue.isEmpty, connection.outcomes.isEmpty,
               !streams.values.contains(where: { $0.focus.source == source }) else { throw TerminalInputError.unavailable }
         sources[source.serial] = nil
+    }
+    public func mintSeal(for source: TerminalSource) throws -> TerminalInputSeal {
+        let connection = try connection(source, active: false)
+        guard !connection.active, connection.closed, connection.inFlight == nil,
+              connection.queue.isEmpty, connection.outcomes.isEmpty,
+              !streams.values.contains(where: { $0.focus.source == source }) else {
+            throw TerminalInputError.unavailable
+        }
+        return TerminalInputSeal(source: source, hasAcceptedBytes: connection.hasAcceptedBytes,
+                                 hasUnknownTransportOutcome: connection.hasUnknownTransportOutcome)
     }
     public func accounting() -> TerminalInputAccounting {
         TerminalInputAccounting(connections: sources.count, streams: streams.count,
