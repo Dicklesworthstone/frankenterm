@@ -286,9 +286,20 @@ final class TerminalSessionController {
         if let connection { try? await connections.manager.close(connectionID: connection.id) }
         if joiningRun, let run { await run.value }
         try? await runtime?.close()
-        if let source = pump?.source {
+        if let pump {
+            let source = pump.source
             if attached { await focus?.detach(machineID: target.machineID, source: source) }
-            try? await connections.coordinator.retire(source)
+            // Final input outcomes are delivered before the source is retired;
+            // retiring first would discard their dispositions.
+            do {
+                let presenter = self.presenter
+                try await pump.reconcileStoppedOutcomes { outcomes, source in
+                    try await presenter?.receive(outcomes, source: source)
+                }
+                try? await connections.coordinator.retire(source)
+            } catch {
+                if case .live = phase { phase = .failed(Self.describe(error)) }
+            }
         }
         connection = nil; runtime = nil; attached = false; run = nil
         settled = true
