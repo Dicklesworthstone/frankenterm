@@ -12,15 +12,22 @@
 use crate::machines::{
     InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget,
 };
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
-use std::path::{Path, PathBuf};
+use std::io::{ErrorKind, Read};
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
+
+const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_FILES: usize = 64;
+const MAX_SOURCE_LINES: usize = 16_384;
+const UNRESOLVED_POLICY: &str = "ssh_config.unresolved_policy";
 
 /// Stable across exports, so a new export replaces the phone's earlier one.
 pub const EXPORTER_ID: &str = "frankenterm.machines";
@@ -65,12 +72,91 @@ fn default_identities(context: &InventoryContext) -> Vec<PathBuf> {
 pub struct SshSources {
     /// `~/.ssh/config`, used only for `ssh = "alias"` routes.
     pub config: Option<String>,
-    /// `known_hosts` contents by path, for every file a route may name.
-    pub known_hosts: BTreeMap<PathBuf, String>,
+    /// System configuration follows user configuration. Unknown system policy
+    /// must not disappear merely because an alias was defined by the user.
+    pub system_config: KnownHostsSource,
+    /// Every effective trust source, including absence and failed reads. An
+    /// omitted entry is unresolved, never evidence that a file did not exist.
+    pub known_hosts: BTreeMap<PathBuf, KnownHostsSource>,
     /// The known_hosts files of a direct route (OpenSSH's defaults).
     pub default_known_hosts: Vec<PathBuf>,
     /// `.pub` contents by path; a route's identity `x` reads `x.pub`.
     pub public_keys: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KnownHostsSource {
+    Present(String),
+    Missing,
+    Unavailable,
+}
+
+/// Read one immutable, regular local source within its allocation budget.
+/// In particular, a permission error or an oversized revocation file must not
+/// be converted into the same state as ENOENT.
+fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return KnownHostsSource::Missing,
+        Err(_) => return KnownHostsSource::Unavailable,
+    };
+    let before = match file.metadata() {
+        Ok(value) if value.is_file() && value.len() <= limit as u64 => value,
+        _ => return KnownHostsSource::Unavailable,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (before.uid() != 0 && before.uid() != nix::unistd::Uid::current().as_raw())
+            || before.mode() & 0o022 != 0
+        {
+            return KnownHostsSource::Unavailable;
+        }
+    }
+    let mut bytes = Vec::new();
+    if (&file)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > limit
+        || bytes.len() as u64 != before.len()
+    {
+        return KnownHostsSource::Unavailable;
+    }
+    let after = match file.metadata() {
+        Ok(value) => value,
+        Err(_) => return KnownHostsSource::Unavailable,
+    };
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return KnownHostsSource::Unavailable;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
+            return KnownHostsSource::Unavailable;
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) if text.lines().count() <= MAX_SOURCE_LINES => KnownHostsSource::Present(text),
+        _ => KnownHostsSource::Unavailable,
+    }
+}
+
+fn default_known_hosts(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".ssh/known_hosts"),
+        home.join(".ssh/known_hosts2"),
+        PathBuf::from("/etc/ssh/ssh_known_hosts"),
+        PathBuf::from("/etc/ssh/ssh_known_hosts2"),
+    ]
 }
 
 impl SshSources {
@@ -79,10 +165,16 @@ impl SshSources {
     /// absent; the export reports what that leaves unusable.
     pub fn from_disk(inventory: &MachineInventory, context: &InventoryContext) -> Self {
         let ssh = context.home.join(".ssh");
-        let read = |path: &Path| std::fs::read_to_string(path).ok();
-        let config = read(&ssh.join("config"));
-        let resolver = alias_resolver(config.as_deref(), &context.home);
-        let default_known_hosts = vec![ssh.join("known_hosts"), ssh.join("known_hosts2")];
+        let config = match read_source(&ssh.join("config"), MAX_SOURCE_BYTES) {
+            KnownHostsSource::Present(text) => Some(text),
+            _ => None,
+        };
+        let system_config = read_source(
+            Path::new("/etc/ssh/ssh_config"),
+            MAX_SOURCE_BYTES.saturating_sub(config.as_ref().map_or(0, String::len)),
+        );
+        let resolver = alias_resolver_with_system(config.as_deref(), &system_config, &context.home);
+        let default_known_hosts = default_known_hosts(&context.home);
         let mut known_files: BTreeSet<PathBuf> = default_known_hosts.iter().cloned().collect();
         let mut identities = BTreeSet::new();
         for machine in &inventory.machines {
@@ -102,36 +194,264 @@ impl SshSources {
                         ..
                     } => {
                         if let Some(resolver) = resolver.as_ref() {
-                            let options = resolver.for_host(alias);
+                            let options = resolver.config.for_host(alias);
                             identities.extend(split_paths(options.get("identityfile"), context));
-                            known_files
-                                .extend(split_paths(options.get("userknownhostsfile"), context));
+                            known_files.extend(resolver.trust_files(&options).0);
                         }
                     }
                     MachineRoute::FrankenTermMux { .. } => {}
                 }
             }
         }
+        let mut remaining = MAX_SOURCE_BYTES;
+        let mut remaining_lines = MAX_SOURCE_LINES;
+        let known_hosts = known_files
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut source = if index < MAX_SOURCE_FILES {
+                    read_source(&path, remaining)
+                } else {
+                    KnownHostsSource::Unavailable
+                };
+                if let KnownHostsSource::Present(text) = &source {
+                    remaining -= text.len();
+                    let lines = text.lines().count();
+                    if lines > remaining_lines {
+                        source = KnownHostsSource::Unavailable;
+                    } else {
+                        remaining_lines -= lines;
+                    }
+                }
+                (path, source)
+            })
+            .collect();
         Self {
             config,
-            known_hosts: known_files
-                .into_iter()
-                .filter_map(|path| read(&path).map(|text| (path, text)))
-                .collect(),
+            system_config,
+            known_hosts,
             default_known_hosts,
             public_keys: identities
                 .into_iter()
                 .filter_map(|path| {
                     let public = public_key_path(&path);
-                    read(&public).map(|text| (public, text))
+                    match read_source(&public, 64 * 1024) {
+                        KnownHostsSource::Present(text) => Some((public, text)),
+                        _ => None,
+                    }
                 })
                 .collect(),
         }
     }
 }
 
-fn alias_resolver(config: Option<&str>, home: &Path) -> Option<frankenterm_ssh::Config> {
+struct AliasResolver {
+    config: frankenterm_ssh::Config,
+    trust_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
+    incomplete: bool,
+}
+
+impl AliasResolver {
+    fn trust_files(&self, options: &frankenterm_ssh::ConfigMap) -> (Vec<PathBuf>, bool) {
+        let mut files = Vec::new();
+        let mut incomplete = self.incomplete;
+        for keyword in ["userknownhostsfile", "globalknownhostsfile"] {
+            match options
+                .get(keyword)
+                .and_then(|token| self.trust_lists.get(token))
+            {
+                Some(Some(paths)) => {
+                    for path in paths {
+                        if !files.contains(path) {
+                            files.push(path.clone());
+                        }
+                    }
+                }
+                _ => incomplete = true,
+            }
+        }
+        (files, incomplete)
+    }
+}
+
+fn directive(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let split = line
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(line.len());
+    let (keyword, value) = line.split_at(split);
+    Some((
+        keyword,
+        value.trim_start().strip_prefix('=').unwrap_or(value).trim(),
+    ))
+}
+
+/// Bounded OpenSSH word syntax for passive export. Unlike the general resolver,
+/// this discards inline comments before Host matching and keeps quoted spaces.
+/// Escapes and single quotes stay unsupported instead of changing their meaning.
+fn configuration_words(value: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for character in value.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '#' if !quoted && !started => break,
+            '\\' | '\'' | '\0' => return None,
+            value if value.is_ascii_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            value => {
+                word.push(value);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn known_host_paths(value: &str, home: &Path) -> Option<Vec<PathBuf>> {
+    // This bounded profile supports literal absolute paths and ~/ paths,
+    // including double-quoted spaces. It never expands environment, percent
+    // tokens, glob patterns, named-user homes, or relative inventory paths.
+    let words = configuration_words(value)?;
+    if words.len() == 1 && words[0].eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    if words.is_empty() || words.len() > 16 {
+        return None;
+    }
+    words
+        .into_iter()
+        .map(|word| {
+            if word.len() > 4096
+                || word.contains(['%', '$', '*', '?', '[', ']'])
+                || word.eq_ignore_ascii_case("none")
+            {
+                return None;
+            }
+            let path = match word.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(word),
+            };
+            (path.is_absolute() && !path.components().any(|c| c == Component::ParentDir))
+                .then_some(path)
+        })
+        .collect()
+}
+
+fn alias_resolver_with_system(
+    config: Option<&str>,
+    system: &KnownHostsSource,
+    home: &Path,
+) -> Option<AliasResolver> {
+    let mut combined = config?.to_string();
+    // A separate file starts in unconditional context; it does not inherit the
+    // final user Host stanza. Values already assigned by the user still win.
+    combined.push_str("\nHost *\n");
+    if let KnownHostsSource::Present(text) = system {
+        combined.push_str(text);
+    }
+    let mut resolver = alias_resolver(Some(&combined), home)?;
+    if matches!(system, KnownHostsSource::Unavailable) {
+        resolver.incomplete = true;
+    }
+    Some(resolver)
+}
+
+fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     let text = config?;
+    if text.len() > MAX_SOURCE_BYTES || text.lines().count() > MAX_SOURCE_LINES {
+        return None;
+    }
+    let mut trust_lists = BTreeMap::new();
+    let mut passive = String::new();
+    let mut incomplete = false;
+    for line in text.lines() {
+        if let Some((keyword, value)) = directive(line) {
+            match keyword.to_ascii_lowercase().as_str() {
+                "include" => {
+                    // The general resolver's Include reader is unbounded and
+                    // cannot prove the selected file context. Preserve the gap
+                    // as a mandatory policy, without opening another file.
+                    incomplete = true;
+                    continue;
+                }
+                "match" => {
+                    incomplete = true;
+                    passive.push_str("Host __frankenterm_unresolved_match__\n");
+                    continue;
+                }
+                "userknownhostsfile" | "globalknownhostsfile" => {
+                    let token = format!("__frankenterm_known_hosts_{}__", trust_lists.len());
+                    trust_lists.insert(token.clone(), known_host_paths(value, home));
+                    passive.push_str(&format!("{} {}\n", keyword, token));
+                    continue;
+                }
+                _ => {}
+            }
+            // The general resolver does not remove inline comments or accept
+            // whitespace before an optional '=' consistently. Normalize those
+            // before it can turn a comment's '*' into a matching Host pattern.
+            match configuration_words(value) {
+                Some(mut words)
+                    if !words.is_empty()
+                        && words.iter().all(|word| {
+                            !word.is_empty() && !word.chars().any(char::is_whitespace)
+                        }) =>
+                {
+                    if keyword.eq_ignore_ascii_case("host") {
+                        // The general matcher returns at its first positive
+                        // match. OpenSSH requires ANY matching negation to win.
+                        words.sort_by_key(|word| !word.starts_with('!'));
+                    }
+                    if keyword.eq_ignore_ascii_case("certificatefile")
+                        && words.iter().any(|word| !word.eq_ignore_ascii_case("none"))
+                    {
+                        // CertificateFile is additive, unlike the resolver's
+                        // scalar map. A preceding `none` must not hide a later
+                        // certificate candidate or imply ordinary key parity.
+                        passive.push_str("frankenterm_required_certificate yes\n");
+                    }
+                    passive.push_str(&format!("{} {}\n", keyword, words.join(" ")));
+                }
+                _ => {
+                    incomplete = true;
+                    if keyword.eq_ignore_ascii_case("host") {
+                        passive.push_str("Host __frankenterm_unresolved_match__\n");
+                    }
+                }
+            }
+        }
+    }
+    // Opaque lists keep the general resolver's first-assignment semantics
+    // without allowing its quote stripping or token expansion to change paths.
+    passive.push_str("Host *\n");
+    let defaults = default_known_hosts(home);
+    for (keyword, paths) in [
+        ("userknownhostsfile", defaults[..2].to_vec()),
+        ("globalknownhostsfile", defaults[2..].to_vec()),
+    ] {
+        let token = format!("__frankenterm_known_hosts_{}__", trust_lists.len());
+        trust_lists.insert(token.clone(), Some(paths));
+        passive.push_str(&format!("{} {}\n", keyword, token));
+    }
     let mut resolver = frankenterm_ssh::Config::new();
     // A passive export never runs a local command to evaluate `Match exec`,
     // and expands `~`/`%d` against this home and no other environment value.
@@ -139,21 +459,40 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<frankenterm_ssh::
     let mut environment = frankenterm_ssh::ConfigMap::new();
     environment.insert("HOME".to_string(), home.to_string_lossy().into_owned());
     resolver.assign_environment(environment);
-    resolver.add_config_string(text);
-    Some(resolver)
+    resolver.add_config_string(&passive);
+    Some(AliasResolver {
+        config: resolver,
+        trust_lists,
+        incomplete,
+    })
 }
 
 /// The concrete `Host` aliases in the user's SSH config, without patterns.
 pub fn ssh_config_hosts(home: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    let text = match read_source(&home.join(".ssh/config"), MAX_SOURCE_BYTES) {
+        KnownHostsSource::Present(text) => text,
+        _ => return Vec::new(),
+    };
     alias_resolver(Some(&text), home)
-        .map(|resolver| resolver.enumerate_hosts())
+        .map(|resolver| {
+            resolver
+                .config
+                .enumerate_hosts()
+                .into_iter()
+                .filter(|host| host != "__frankenterm_unresolved_match__")
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn split_paths(value: Option<&String>, context: &InventoryContext) -> Vec<PathBuf> {
     value
-        .map(|text| text.split_whitespace().map(|p| context.expand(p)).collect())
+        .map(|text| {
+            text.split_whitespace()
+                .filter(|path| !path.eq_ignore_ascii_case("none"))
+                .map(|path| context.expand(path))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -176,12 +515,17 @@ pub struct PublicKey {
 
 impl PublicKey {
     pub fn parse_line(line: &str) -> Option<Self> {
+        if line.len() > 64 * 1024 {
+            return None;
+        }
         let mut words = line.split_whitespace();
         let algorithm = words.next()?.to_string();
         let blob = STANDARD.decode(words.next()?).ok()?;
         // The blob starts with its own algorithm name; a mismatch is not a key.
         let name_length = u32::from_be_bytes(blob.get(..4)?.try_into().ok()?) as usize;
-        if blob.get(4..4 + name_length)? != algorithm.as_bytes() {
+        if name_length > 128
+            || blob.get(4..4usize.checked_add(name_length)?)? != algorithm.as_bytes()
+        {
             return None;
         }
         Some(Self { algorithm, blob })
@@ -203,6 +547,8 @@ pub struct HostKeys {
     pub revoked: Vec<PublicKey>,
     /// `@cert-authority` entries matched: the phone cannot use them.
     pub certificate_authorities: usize,
+    /// A malformed or unsupported record may contain a required denial.
+    pub unresolved_entries: usize,
 }
 
 /// OpenSSH matching: port 22 uses the bare name, other ports `[name]:port`;
@@ -213,7 +559,15 @@ pub fn host_keys(known_hosts: &str, host: &str, port: u16) -> HostKeys {
     } else {
         format!("[{}]:{}", host.to_ascii_lowercase(), port)
     };
+    host_keys_for_lookup(known_hosts, &name, &name)
+}
+
+fn host_keys_for_lookup(known_hosts: &str, name: &str, canonical_name: &str) -> HostKeys {
     let mut keys = HostKeys::default();
+    if known_hosts.len() > MAX_SOURCE_BYTES || known_hosts.lines().count() > MAX_SOURCE_LINES {
+        keys.unresolved_entries = 1;
+        return keys;
+    }
     for line in known_hosts.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -228,19 +582,33 @@ pub fn host_keys(known_hosts: &str, host: &str, port: u16) -> HostKeys {
             let marker = first;
             first = match words.next() {
                 Some(word) => word,
-                None => continue,
+                None => {
+                    keys.unresolved_entries += 1;
+                    continue;
+                }
             };
             Some(marker)
         } else {
             None
         };
-        if !patterns_match(first, &name) {
+        // A malformed hash cannot establish that a revocation applies to some
+        // other endpoint. Keep it as an unresolved mandatory source policy.
+        if first.contains('|') && !valid_hashed_host(first) {
+            keys.unresolved_entries += 1;
+            continue;
+        }
+        if !patterns_match(first, name)
+            && !(marker.is_some() && patterns_match(first, canonical_name))
+        {
             continue;
         }
         let rest: Vec<&str> = words.collect();
         let key = match PublicKey::parse_line(&rest.join(" ")) {
             Some(key) => key,
-            None => continue,
+            None => {
+                keys.unresolved_entries += 1;
+                continue;
+            }
         };
         match marker {
             None => {
@@ -253,13 +621,27 @@ pub fn host_keys(known_hosts: &str, host: &str, port: u16) -> HostKeys {
                     keys.revoked.push(key)
                 }
             }
-            Some(_) => keys.certificate_authorities += 1,
+            Some("@cert-authority") => keys.certificate_authorities += 1,
+            Some(_) => keys.unresolved_entries += 1,
         }
     }
     // A revoked key is never also a pin.
     let revoked = keys.revoked.clone();
     keys.pins.retain(|key| !revoked.contains(key));
     keys
+}
+
+fn valid_hashed_host(field: &str) -> bool {
+    let parts: Vec<&str> = field.split('|').collect();
+    parts.len() == 4
+        && parts[0].is_empty()
+        && parts[1] == "1"
+        && parts[2..].iter().all(|part| {
+            STANDARD
+                .decode(part)
+                .ok()
+                .is_some_and(|bytes| bytes.len() == 20 && STANDARD.encode(bytes) == *part)
+        })
 }
 
 fn patterns_match(field: &str, name: &str) -> bool {
@@ -291,6 +673,31 @@ fn patterns_match(field: &str, name: &str) -> bool {
         }
     }
     matched
+}
+
+fn canonical_host(host: &str) -> String {
+    let value = host
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(host);
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V6(address)) => address
+            .to_ipv4_mapped()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| address.to_string()),
+        Ok(address) => address.to_string(),
+        Err(_) => value
+            .strip_suffix('.')
+            .unwrap_or(value)
+            .to_ascii_lowercase(),
+    }
+}
+
+fn endpoint_trust_scope(endpoint: &Endpoint) -> (String, u16) {
+    (
+        canonical_host(endpoint.host_key_alias.as_deref().unwrap_or(&endpoint.host)),
+        endpoint.port,
+    )
 }
 
 /// `*` and `?` wildcards over bytes, as OpenSSH's match_pattern.
@@ -384,6 +791,7 @@ struct Endpoint {
     identities: Vec<PathBuf>,
     host_key_alias: Option<String>,
     known_hosts: Vec<PathBuf>,
+    unresolved_policy: bool,
 }
 
 fn resolve_endpoint(
@@ -391,7 +799,7 @@ fn resolve_endpoint(
     route: &str,
     target: &RouteTarget,
     sources: &SshSources,
-    resolver: Option<&frankenterm_ssh::Config>,
+    resolver: Option<&AliasResolver>,
     context: &InventoryContext,
     notes: &mut Vec<ExportNote>,
 ) -> Option<Endpoint> {
@@ -419,6 +827,7 @@ fn resolve_endpoint(
             },
             host_key_alias: None,
             known_hosts: sources.default_known_hosts.clone(),
+            unresolved_policy: false,
         }),
         RouteTarget::Alias(alias) => {
             let resolver = match resolver {
@@ -431,7 +840,7 @@ fn resolve_endpoint(
                     return None;
                 }
             };
-            let options = resolver.for_host(alias);
+            let options = resolver.config.for_host(alias);
             for unsupported in ["proxyjump", "proxycommand"] {
                 if options.get(unsupported).is_some_and(|v| v != "none") {
                     note(
@@ -489,23 +898,153 @@ fn resolve_endpoint(
                 );
                 return None;
             }
+            let (known_hosts, mut unresolved_policy) = resolver.trust_files(&options);
+            if unresolved_policy {
+                note(notes, "the SSH source has unavailable system configuration, unresolved Include/Match conditions, or unsupported passive syntax or trust-file lists; this route remains blocked on the phone".into());
+            }
+            // Do not silently substitute the phone's defaults for mandatory
+            // source trust, revocation, or algorithm constraints. These are
+            // preserved by a required-capability marker in the document itself.
+            for keyword in [
+                "revokedhostkeys",
+                "knownhostscommand",
+                "hostkeyalgorithms",
+                "casignaturealgorithms",
+                "required_rsasize",
+                "requiredrsasize",
+                "pubkeyacceptedalgorithms",
+                "pubkeyacceptedkeytypes",
+                "kexalgorithms",
+                "ciphers",
+                "macs",
+                "verifyhostkeydns",
+                "checkhostip",
+                "canonicalizehostname",
+                "pubkeyauthentication",
+                "preferredauthentications",
+                "certificatefile",
+                "frankenterm_required_certificate",
+                "refuseconnection",
+            ] {
+                if let Some(value) = options.get(keyword) {
+                    let disabled = match keyword {
+                        "revokedhostkeys" | "knownhostscommand" | "certificatefile" => {
+                            value.eq_ignore_ascii_case("none")
+                        }
+                        "verifyhostkeydns"
+                        | "checkhostip"
+                        | "canonicalizehostname"
+                        | "refuseconnection" => value.eq_ignore_ascii_case("no"),
+                        "pubkeyauthentication" => value.eq_ignore_ascii_case("yes"),
+                        "preferredauthentications" => value == "publickey",
+                        _ => false,
+                    };
+                    if !disabled {
+                        unresolved_policy = true;
+                        note(
+                            notes,
+                            format!(
+                                "{} requires policy the phone cannot enforce; this route remains blocked",
+                                keyword
+                            ),
+                        );
+                    }
+                }
+            }
             Some(Endpoint {
                 host,
                 port,
                 user,
                 identities: split_paths(options.get("identityfile"), context),
                 host_key_alias: options.get("hostkeyalias").cloned(),
-                known_hosts: {
-                    let files = split_paths(options.get("userknownhostsfile"), context);
-                    if files.is_empty() {
-                        sources.default_known_hosts.clone()
-                    } else {
-                        files
-                    }
-                },
+                known_hosts,
+                unresolved_policy,
             })
         }
     }
+}
+
+/// Resolve one route's positive trust separately from the inventory-wide
+/// denial union. A group filter may discard a route, never its same-scope
+/// revocations or unresolved mandatory trust policy.
+fn endpoint_keys(
+    machine: &Machine,
+    route: &str,
+    endpoint: &Endpoint,
+    sources: &SshSources,
+    notes: &mut Vec<ExportNote>,
+) -> (HostKeys, bool) {
+    let note = |notes: &mut Vec<ExportNote>, message: String| {
+        notes.push(ExportNote {
+            machine: machine.id.clone(),
+            route: Some(route.to_string()),
+            message,
+        });
+    };
+    // OpenSSH uses HostKeyAlias verbatim, even for a non-default port.
+    // Only ordinary host lookups receive the [host]:port wrapper.
+    let lookup_name = |host: &str| {
+        if endpoint.host_key_alias.is_some() || endpoint.port == 22 {
+            host.to_ascii_lowercase()
+        } else {
+            format!("[{}]:{}", host.to_ascii_lowercase(), endpoint.port)
+        }
+    };
+    let lookup = lookup_name(endpoint.host_key_alias.as_deref().unwrap_or(&endpoint.host));
+    let canonical_lookup = lookup_name(&endpoint_trust_scope(endpoint).0);
+    let mut keys = HostKeys::default();
+    let mut unresolved_policy = endpoint.unresolved_policy;
+    for file in &endpoint.known_hosts {
+        match sources.known_hosts.get(file) {
+            Some(KnownHostsSource::Present(text)) => {
+                let found = host_keys_for_lookup(text, &lookup, &canonical_lookup);
+                for key in found.pins {
+                    if !keys.pins.contains(&key) {
+                        keys.pins.push(key);
+                    }
+                }
+                for key in found.revoked {
+                    if !keys.revoked.contains(&key) {
+                        keys.revoked.push(key);
+                    }
+                }
+                keys.certificate_authorities += found.certificate_authorities;
+                keys.unresolved_entries += found.unresolved_entries;
+            }
+            Some(KnownHostsSource::Missing) => {}
+            Some(KnownHostsSource::Unavailable) | None => {
+                unresolved_policy = true;
+                note(
+                    notes,
+                    format!(
+                        "known-hosts source {} could not be read safely; its trust and revocations are unresolved and this route remains blocked",
+                        file.display()
+                    ),
+                );
+            }
+        }
+    }
+    if keys.certificate_authorities > 0 || keys.unresolved_entries > 0 {
+        unresolved_policy = true;
+        note(notes, "known_hosts contains a matching certificate authority, unsupported marker, or unresolved record; this route remains blocked".into());
+    }
+    let revoked = keys.revoked.clone();
+    keys.pins.retain(|key| !revoked.contains(key));
+    if keys.pins.is_empty() {
+        note(
+            notes,
+            format!(
+                "no host key for {} in known_hosts{}; review the source trust policy before connecting",
+                lookup,
+                if keys.certificate_authorities > 0 {
+                    " (only a certificate authority, which the phone cannot use)"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    (keys, unresolved_policy)
 }
 
 /// The phone's workspace for the inventory, or for one group of it.
@@ -517,18 +1056,24 @@ pub fn export(
     context: &InventoryContext,
 ) -> anyhow::Result<MobileExport> {
     let groups: Vec<_> = match group {
-        Some(id) => vec![inventory
-            .groups
-            .iter()
-            .find(|g| g.id == id)
-            .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?],
+        Some(id) => vec![
+            inventory
+                .groups
+                .iter()
+                .find(|g| g.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?,
+        ],
         None => inventory.groups.iter().collect(),
     };
     let wanted: BTreeSet<&str> = groups
         .iter()
         .flat_map(|g| g.machines.iter().map(String::as_str))
         .collect();
-    let resolver = alias_resolver(sources.config.as_deref(), &context.home);
+    let resolver = alias_resolver_with_system(
+        sources.config.as_deref(),
+        &sources.system_config,
+        &context.home,
+    );
     let mut notes = Vec::new();
     let (mut machines, mut routes, mut credentials, mut trusts, mut themes) = (
         Vec::new(),
@@ -539,6 +1084,53 @@ pub fn export(
     );
     let mut exported = BTreeSet::new();
     let mut identity_files = BTreeMap::new();
+    let mut trust_scopes = BTreeMap::new();
+    let mut revoked_by_scope: BTreeMap<(String, u16), Vec<PublicKey>> = BTreeMap::new();
+    let mut unresolved_scopes = BTreeSet::new();
+    let mut resolved_routes = BTreeMap::new();
+
+    // Collect denials before applying the selected group. Positive pins remain
+    // route-specific, but omitting another machine is not permission to forget
+    // a revocation or required policy for the same host-key identity.
+    for machine in &inventory.machines {
+        for route in &machine.routes {
+            let MachineRoute::Ssh { id, target } = route else {
+                continue;
+            };
+            let mut route_notes = Vec::new();
+            if let Some(endpoint) = resolve_endpoint(
+                machine,
+                id,
+                target,
+                sources,
+                resolver.as_ref(),
+                context,
+                &mut route_notes,
+            ) {
+                let (keys, unresolved) =
+                    endpoint_keys(machine, id, &endpoint, sources, &mut route_notes);
+                let scope = endpoint_trust_scope(&endpoint);
+                let revoked = revoked_by_scope.entry(scope.clone()).or_default();
+                for key in &keys.revoked {
+                    if !revoked.contains(key) {
+                        revoked.push(key.clone());
+                    }
+                }
+                if unresolved {
+                    unresolved_scopes.insert(scope);
+                }
+                if wanted.contains(machine.id.as_str()) {
+                    resolved_routes.insert((machine.id.clone(), id.clone()), (endpoint, keys));
+                }
+            }
+            if wanted.contains(machine.id.as_str()) {
+                notes.extend(route_notes);
+            }
+        }
+    }
+    for revoked in revoked_by_scope.values_mut() {
+        revoked.sort_by_key(PublicKey::fingerprint);
+    }
 
     for machine in inventory
         .machines
@@ -548,25 +1140,18 @@ pub fn export(
         let mut route_ids = Vec::new();
         let mut mux = 0;
         for route in &machine.routes {
-            let (route_name, target) = match route {
-                MachineRoute::Ssh { id, target } => (id, target),
+            let route_name = match route {
+                MachineRoute::Ssh { id, .. } => id,
                 MachineRoute::FrankenTermMux { .. } => {
                     mux += 1;
                     continue;
                 }
             };
-            let endpoint = match resolve_endpoint(
-                machine,
-                route_name,
-                target,
-                sources,
-                resolver.as_ref(),
-                context,
-                &mut notes,
-            ) {
-                Some(endpoint) => endpoint,
-                None => continue,
-            };
+            let (endpoint, keys) =
+                match resolved_routes.remove(&(machine.id.clone(), route_name.clone())) {
+                    Some(resolved) => resolved,
+                    None => continue,
+                };
             let mut credential_ids = Vec::new();
             let defaults = default_identities(context);
             for identity in &endpoint.identities {
@@ -634,63 +1219,24 @@ pub fn export(
                             .into(),
                 });
             }
-            let lookup = endpoint
-                .host_key_alias
-                .clone()
-                .unwrap_or_else(|| endpoint.host.clone());
-            let mut keys = HostKeys::default();
-            for file in &endpoint.known_hosts {
-                if let Some(text) = sources.known_hosts.get(file) {
-                    let found = host_keys(text, &lookup, endpoint.port);
-                    for key in found.pins {
-                        if !keys.pins.contains(&key) {
-                            keys.pins.push(key);
-                        }
-                    }
-                    for key in found.revoked {
-                        if !keys.revoked.contains(&key) {
-                            keys.revoked.push(key);
-                        }
-                    }
-                    keys.certificate_authorities += found.certificate_authorities;
-                }
-            }
-            let revoked = keys.revoked.clone();
-            keys.pins.retain(|key| !revoked.contains(key));
-            if keys.pins.is_empty() {
-                notes.push(ExportNote {
-                    machine: machine.id.clone(),
-                    route: Some(route_name.clone()),
-                    message: format!(
-                        "no host key for {} in known_hosts{}; connect once with ssh from this Mac, then export again",
-                        lookup,
-                        if keys.certificate_authorities > 0 { " (only a certificate authority, which the phone cannot use)" } else { "" }
-                    ),
-                });
-            }
-            let trust_key = format!(
-                "{}:{}:{}",
-                endpoint.host,
-                endpoint.port,
-                endpoint.host_key_alias.as_deref().unwrap_or("")
-            );
-            let trust_id = format!("h.{}", short_digest(&trust_key));
-            trusts.entry(trust_id.clone()).or_insert_with(|| {
-                let pin = |key: &PublicKey| json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()});
-                let mut trust = json!({
-                    "id": trust_id,
-                    "host": endpoint.host,
-                    "port": endpoint.port,
-                    "claimed_source": "known_hosts",
-                    "pins": keys.pins.iter().map(pin).collect::<Vec<_>>(),
-                    "revoked_keys": keys.revoked.iter().map(pin).collect::<Vec<_>>(),
-                });
-                if let Some(alias) = &endpoint.host_key_alias {
-                    trust["host_key_alias"] = json!(alias);
-                }
-                trust
-            });
             let id = format!("r.{}.{}", machine.id, route_name);
+            // Trust belongs to the route's selected file policy. Sharing an
+            // endpoint must never borrow another route's positive allowlist.
+            let trust_id = format!("h.{}", short_digest(&id));
+            trust_scopes.insert(trust_id.clone(), endpoint_trust_scope(&endpoint));
+            let pin = |key: &PublicKey| json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()});
+            let mut trust = json!({
+                "id": trust_id,
+                "host": endpoint.host,
+                "port": endpoint.port,
+                "claimed_source": "known_hosts",
+                "pins": keys.pins.iter().map(pin).collect::<Vec<_>>(),
+                "revoked_keys": [],
+            });
+            if let Some(alias) = &endpoint.host_key_alias {
+                trust["host_key_alias"] = json!(alias);
+            }
+            trusts.insert(trust_id.clone(), trust);
             let mut record = json!({
                 "id": id,
                 "mode": "direct_ssh",
@@ -741,6 +1287,33 @@ pub fn export(
         }
         machines.push(record);
         exported.insert(machine.id.clone());
+    }
+
+    // Denials and unresolved required trust are monotonic for one canonical
+    // host-key scope, across every selected route and source spelling. Apply
+    // them after collecting all routes, independently of inventory order.
+    for (trust_id, trust) in &mut trusts {
+        let scope = &trust_scopes[trust_id];
+        if let Some(revoked) = revoked_by_scope.get(scope) {
+            let fingerprints: BTreeSet<String> =
+                revoked.iter().map(PublicKey::fingerprint).collect();
+            trust["pins"].as_array_mut().unwrap().retain(|pin| {
+                !pin["fingerprint"]
+                    .as_str()
+                    .is_some_and(|value| fingerprints.contains(value))
+            });
+            trust["revoked_keys"] = json!(
+                revoked
+                    .iter()
+                    .map(|key| {
+                        json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()})
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        if unresolved_scopes.contains(scope) {
+            trust["required_capabilities"] = json!([UNRESOLVED_POLICY]);
+        }
     }
 
     let group_records: Vec<Value> = groups
@@ -939,18 +1512,24 @@ mod tests {
             PathBuf::from("/home/me/.ssh/trj_ed25519.pub"),
             format!("ssh-ed25519 {} trj", ED25519),
         );
-        let mut known_hosts = BTreeMap::new();
+        let defaults = default_known_hosts(&context().home);
+        let mut known_hosts: BTreeMap<PathBuf, KnownHostsSource> = defaults
+            .iter()
+            .cloned()
+            .map(|path| (path, KnownHostsSource::Missing))
+            .collect();
         known_hosts.insert(
             PathBuf::from("/home/me/.ssh/known_hosts"),
-            format!(
+            KnownHostsSource::Present(format!(
                 "100.91.120.17 ssh-ed25519 {}\ncss.example ssh-ed25519 {}\n",
                 ED25519, ED25519
-            ),
+            )),
         );
         SshSources {
             config: config.map(str::to_string),
+            system_config: KnownHostsSource::Missing,
             known_hosts,
-            default_known_hosts: vec![PathBuf::from("/home/me/.ssh/known_hosts")],
+            default_known_hosts: defaults,
             public_keys,
         }
     }
@@ -1041,9 +1620,11 @@ ssh = "jumped"
         assert_eq!(routes[0]["credential_refs"], routes[1]["credential_refs"]);
         let trust = workspace["host_trust"].as_array().unwrap();
         assert_eq!(trust.len(), 2);
-        assert!(trust
-            .iter()
-            .all(|t| t["pins"].as_array().unwrap().len() == 1));
+        assert!(
+            trust
+                .iter()
+                .all(|t| t["pins"].as_array().unwrap().len() == 1)
+        );
 
         let theme = &workspace["themes"][0];
         assert_eq!(theme["background"], "#0A0E14");
@@ -1214,6 +1795,602 @@ ssh = "bad"
         assert!(super::export(&inventory, b"x", Some("nope"), &bare, &context()).is_err());
     }
 
+    const TRUST_INVENTORY: &str = r#"
+version = 1
+default_group = "fleet"
+[groups.fleet]
+machines = ["left", "right"]
+[machines.left]
+[[machines.left.routes]]
+id = "ssh"
+ssh = "left"
+[machines.right]
+[[machines.right.routes]]
+id = "ssh"
+ssh = "right"
+"#;
+
+    fn trust_export(sources: &SshSources) -> MobileExport {
+        let inventory = MachineInventory::parse(TRUST_INVENTORY, &context()).unwrap();
+        export(
+            &inventory,
+            TRUST_INVENTORY.as_bytes(),
+            None,
+            sources,
+            &context(),
+        )
+        .unwrap()
+    }
+
+    fn route_trust<'a>(export: &'a MobileExport, route: &str) -> &'a Value {
+        let workspace = &export.document["workspace"];
+        let route = workspace["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["id"] == route)
+            .unwrap();
+        workspace["host_trust"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["id"] == route["host_trust_ref"])
+            .unwrap()
+    }
+
+    fn supply(sources: &mut SshSources, path: &str, text: String) {
+        sources
+            .known_hosts
+            .insert(PathBuf::from(path), KnownHostsSource::Present(text));
+    }
+
+    fn write_source(path: &Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn route_allowlists_stay_separate_and_later_revocations_reach_every_same_scope_route() {
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n User u\n UserKnownHostsFile /trust/left\n GlobalKnownHostsFile none\nHost right\n HostName box\n User u\n UserKnownHostsFile /trust/right\n GlobalKnownHostsFile none\n",
+        ));
+        let mut other_blob = STANDARD.decode(ED25519).unwrap();
+        *other_blob.last_mut().unwrap() ^= 1;
+        let other = STANDARD.encode(other_blob);
+        let other_fingerprint = PublicKey::parse_line(&format!("ssh-ed25519 {}", other))
+            .unwrap()
+            .fingerprint();
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("box ssh-ed25519 {}\n", other),
+        );
+        let before = trust_export(&sources);
+        let left = route_trust(&before, "r.left.ssh");
+        let right = route_trust(&before, "r.right.ssh");
+        assert_ne!(left["id"], right["id"]);
+        assert_eq!(left["pins"][0]["fingerprint"], FINGERPRINT);
+        assert_eq!(right["pins"][0]["fingerprint"], other_fingerprint);
+        assert_eq!(left["pins"].as_array().unwrap().len(), 1);
+        assert_eq!(right["pins"].as_array().unwrap().len(), 1);
+
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!(
+                "box ssh-ed25519 {}\n@revoked box ssh-ed25519 {}\n",
+                other, ED25519
+            ),
+        );
+        let after = trust_export(&sources);
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            let trust = route_trust(&after, route);
+            assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
+        }
+        assert!(
+            route_trust(&after, "r.left.ssh")["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            route_trust(&after, "r.right.ssh")["pins"][0]["fingerprint"],
+            other_fingerprint
+        );
+
+        let mut inventory = MachineInventory::parse(TRUST_INVENTORY, &context()).unwrap();
+        inventory.machines.reverse();
+        let reversed = export(
+            &inventory,
+            TRUST_INVENTORY.as_bytes(),
+            None,
+            &sources,
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(
+            after.document["workspace"]["host_trust"],
+            reversed.document["workspace"]["host_trust"]
+        );
+    }
+
+    #[test]
+    fn group_selection_keeps_denials_from_unselected_routes_without_borrowing_pins() {
+        let inventory_text = format!(
+            "{}\n[groups.only_left]\nmachines = [\"left\"]\n",
+            TRUST_INVENTORY
+        );
+        let inventory = MachineInventory::parse(&inventory_text, &context()).unwrap();
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n User u\n UserKnownHostsFile /trust/left\n GlobalKnownHostsFile none\nHost right\n HostName box\n User u\n UserKnownHostsFile /trust/right\n GlobalKnownHostsFile none\n",
+        ));
+        supply(&mut sources, "/trust/left", String::new());
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        let only_left = |sources: &SshSources| {
+            export(
+                &inventory,
+                inventory_text.as_bytes(),
+                Some("only_left"),
+                sources,
+                &context(),
+            )
+            .unwrap()
+        };
+        let unconfigured = only_left(&sources);
+        assert_eq!(unconfigured.machines, 1);
+        assert_eq!(unconfigured.routes, 1);
+        assert!(
+            route_trust(&unconfigured, "r.left.ssh")["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an unselected route cannot contribute positive pins"
+        );
+
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("@revoked box ssh-ed25519 {}\n", ED25519),
+        );
+        let denied = only_left(&sources);
+        let trust = route_trust(&denied, "r.left.ssh");
+        assert!(trust["pins"].as_array().unwrap().is_empty());
+        assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
+
+        sources
+            .known_hosts
+            .insert(PathBuf::from("/trust/right"), KnownHostsSource::Unavailable);
+        let incomplete = only_left(&sources);
+        assert_eq!(
+            route_trust(&incomplete, "r.left.ssh")["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn embedded_hashes_are_literal_paths_and_only_word_boundary_hashes_start_comments() {
+        let config = "Host * # unrelated * patterns\n HostName box\n User u\n UserKnownHostsFile /trust/keys#revocations \"/trust/#quoted\" # /trust/ignored\n GlobalKnownHostsFile none\n";
+        let resolver = alias_resolver(Some(config), &context().home).unwrap();
+        assert_eq!(
+            resolver.trust_files(&resolver.config.for_host("left")),
+            (
+                vec![
+                    PathBuf::from("/trust/keys#revocations"),
+                    PathBuf::from("/trust/#quoted")
+                ],
+                false
+            )
+        );
+        let mut sources = sources(Some(config));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/keys#revocations",
+            format!("@revoked box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/#quoted",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        let export = trust_export(&sources);
+        let trust = route_trust(&export, "r.left.ssh");
+        assert!(trust["pins"].as_array().unwrap().is_empty());
+        assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
+        assert!(trust["required_capabilities"].is_null());
+        assert_eq!(
+            split_paths(Some(&"none ~/.ssh/allowed NONE".to_string()), &context()),
+            vec![PathBuf::from("/home/me/.ssh/allowed")],
+            "IdentityFile none is never a key path"
+        );
+    }
+
+    #[test]
+    fn effective_user_and_global_lists_keep_quotes_first_assignment_and_none() {
+        let resolver = alias_resolver(Some("Host left\n UserKnownHostsFile \"~/trust keys\" /trust/second\n GlobalKnownHostsFile = /trust/global\n UserKnownHostsFile /trust/ignored\nHost right\n UserKnownHostsFile NONE\n GlobalKnownHostsFile none\nHost *\n UserKnownHostsFile /trust/fallback\n GlobalKnownHostsFile /trust/ignored-global\n"), &context().home).unwrap();
+        let (left, incomplete) = resolver.trust_files(&resolver.config.for_host("left"));
+        assert!(!incomplete);
+        assert_eq!(
+            left,
+            [
+                PathBuf::from("/home/me/trust keys"),
+                PathBuf::from("/trust/second"),
+                PathBuf::from("/trust/global")
+            ]
+        );
+        assert_eq!(
+            resolver.trust_files(&resolver.config.for_host("right")),
+            (Vec::new(), false)
+        );
+        for list in [
+            "none /trust/a",
+            "relative",
+            "${HOME}/trust",
+            "%d/trust",
+            "~other/trust",
+            "/trust/../other",
+            "\"/unterminated",
+        ] {
+            assert!(
+                known_host_paths(list, &context().home).is_none(),
+                "{}",
+                list
+            );
+        }
+
+        let mut sources = sources(Some(
+            "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/user\n GlobalKnownHostsFile /trust/global\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/user",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/global",
+            format!("@revoked box ssh-ed25519 {}\n", ED25519),
+        );
+        let export = trust_export(&sources);
+        assert!(
+            route_trust(&export, "r.left.ssh")["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            route_trust(&export, "r.left.ssh")["revoked_keys"][0]["fingerprint"],
+            FINGERPRINT
+        );
+
+        sources.config = Some("Host *\n HostName 100.91.120.17\n User u\n UserKnownHostsFile none\n GlobalKnownHostsFile none\n".into());
+        let disabled = trust_export(&sources);
+        assert!(
+            route_trust(&disabled, "r.left.ssh")["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "none must not restore default files"
+        );
+        assert!(route_trust(&disabled, "r.left.ssh")["required_capabilities"].is_null());
+    }
+
+    #[test]
+    fn unavailable_or_unsupplied_trust_is_blocked_but_observed_absence_is_not() {
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n User u\n UserKnownHostsFile /trust/unavailable\n GlobalKnownHostsFile /trust/pins\nHost right\n HostName BOX.\n User u\n UserKnownHostsFile none\n GlobalKnownHostsFile /trust/pins\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/pins",
+            format!("* ssh-ed25519 {}\n", ED25519),
+        );
+        let path = PathBuf::from("/trust/unavailable");
+        for state in [
+            None,
+            Some(KnownHostsSource::Unavailable),
+            Some(KnownHostsSource::Missing),
+        ] {
+            let blocked = state != Some(KnownHostsSource::Missing);
+            sources.known_hosts.remove(&path);
+            if let Some(state) = state {
+                sources.known_hosts.insert(path.clone(), state);
+            }
+            let export = trust_export(&sources);
+            for route in ["r.left.ssh", "r.right.ssh"] {
+                let trust = route_trust(&export, route);
+                assert_eq!(trust["pins"][0]["fingerprint"], FINGERPRINT);
+                assert_eq!(
+                    trust["required_capabilities"] == json!([UNRESOLVED_POLICY]),
+                    blocked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_host_key_alias_is_verbatim_at_nondefault_ports_and_denials_canonicalize() {
+        let mut sources = sources(Some(
+            "Host left\n HostName one.example\n User u\n Port 2222\n HostKeyAlias shared\n UserKnownHostsFile /trust/left\n GlobalKnownHostsFile none\nHost right\n HostName two.example\n User u\n Port 2222\n HostKeyAlias SHARED.\n UserKnownHostsFile /trust/right\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("shared ssh-ed25519 {}\n", ED25519),
+        );
+        supply(&mut sources, "/trust/right", String::new());
+        let before = trust_export(&sources);
+        assert_eq!(
+            route_trust(&before, "r.left.ssh")["pins"][0]["fingerprint"],
+            FINGERPRINT
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("@revoked shared ssh-ed25519 {}\n", ED25519),
+        );
+        let after = trust_export(&sources);
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            assert_eq!(
+                route_trust(&after, route)["revoked_keys"][0]["fingerprint"],
+                FINGERPRINT
+            );
+            assert!(
+                route_trust(&after, route)["pins"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            canonical_host("[2001:0db8:0:0:0:0:0:1]"),
+            canonical_host("2001:db8::1")
+        );
+        assert_eq!(
+            canonical_host("::ffff:192.0.2.1"),
+            canonical_host("192.0.2.1")
+        );
+    }
+
+    #[test]
+    fn malformed_trust_and_required_source_policies_survive_as_document_blockers() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        for policy in [
+            "RevokedHostKeys /trust/revoked",
+            "KnownHostsCommand /bin/false",
+            "HostKeyAlgorithms ssh-ed25519",
+            "CheckHostIP yes",
+            "VerifyHostKeyDNS yes",
+            "PubkeyAuthentication no",
+            "PreferredAuthentications password",
+            "CertificateFile /trust/user-cert.pub",
+            "CertificateFile none\n CertificateFile /trust/user-cert.pub",
+            "RefuseConnection yes",
+            "Match exec \"touch /must-not-execute\"",
+            "Include /must-not-read",
+        ] {
+            let mut sources = sources(Some(&format!("{}{}\n", base, policy)));
+            supply(
+                &mut sources,
+                "/trust/keys",
+                format!("box ssh-ed25519 {}\n", ED25519),
+            );
+            let export = trust_export(&sources);
+            assert_eq!(
+                route_trust(&export, "r.left.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY]),
+                "{}",
+                policy
+            );
+        }
+        for invalid in [
+            format!("@cert-authority box ssh-ed25519 {}", ED25519),
+            format!("@unknown box ssh-ed25519 {}", ED25519),
+            "@revoked box ssh-ed25519 !!!".into(),
+            format!("@revoked |2|bad|hash ssh-ed25519 {}", ED25519),
+        ] {
+            let mut sources = sources(Some(base));
+            supply(
+                &mut sources,
+                "/trust/keys",
+                format!("box ssh-ed25519 {}\n{}\n", ED25519, invalid),
+            );
+            assert_eq!(
+                route_trust(&trust_export(&sources), "r.left.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY]),
+                "{}",
+                invalid
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_disk_reads_distinguish_missing_from_unsafe_or_oversized_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("known_hosts");
+        assert_eq!(read_source(&file, 8), KnownHostsSource::Missing);
+        assert_eq!(
+            read_source(directory.path(), 8),
+            KnownHostsSource::Unavailable
+        );
+        write_source(&file, b"contents");
+        assert_eq!(
+            read_source(&file, 8),
+            KnownHostsSource::Present("contents".into())
+        );
+        assert_eq!(read_source(&file, 7), KnownHostsSource::Unavailable);
+        write_source(&file, [0xff]);
+        assert_eq!(read_source(&file, 8), KnownHostsSource::Unavailable);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let link = directory.path().join("linked_hosts");
+            symlink(&file, &link).unwrap();
+            assert_eq!(read_source(&link, 8), KnownHostsSource::Unavailable);
+            write_source(&file, b"contents");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert_eq!(read_source(&file, 8), KnownHostsSource::Unavailable);
+        }
+    }
+
+    #[test]
+    fn disk_snapshot_loads_effective_quoted_user_and_global_revocation_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let global = directory.path().join("global trust");
+        write_source(
+            &home.join("trust pins"),
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        write_source(&global, format!("@revoked box ssh-ed25519 {}\n", ED25519));
+        write_source(
+            &home.join(".ssh/config"),
+            format!(
+                "Host *\n HostName box\n User u\n UserKnownHostsFile \"~/trust pins\"\n GlobalKnownHostsFile \"{}\"\n",
+                global.display()
+            ),
+        );
+        let context = InventoryContext {
+            directory: directory.path().to_path_buf(),
+            home,
+        };
+        let inventory = MachineInventory::parse(TRUST_INVENTORY, &context).unwrap();
+        let snapshot = SshSources::from_disk(&inventory, &context);
+        assert!(matches!(
+            snapshot.known_hosts.get(&global),
+            Some(KnownHostsSource::Present(_))
+        ));
+        let export = export(
+            &inventory,
+            TRUST_INVENTORY.as_bytes(),
+            None,
+            &snapshot,
+            &context,
+        )
+        .unwrap();
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            let trust = route_trust(&export, route);
+            assert!(trust["pins"].as_array().unwrap().is_empty());
+            assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
+        }
+    }
+
+    #[test]
+    fn inline_comments_and_equals_do_not_expand_a_host_match_or_change_its_endpoint() {
+        let text = "Host left # *\n HostName = left.example # not right\n UserKnownHostsFile /trust/left\nHost right\n HostName=right.example\n UserKnownHostsFile = /trust/right # /trust/left\nHost *\n User u\n GlobalKnownHostsFile none\n";
+        let resolver = alias_resolver(Some(text), &context().home).unwrap();
+        let right = resolver.config.for_host("right");
+        assert_eq!(
+            right.get("hostname").map(String::as_str),
+            Some("right.example")
+        );
+        assert_eq!(
+            resolver.trust_files(&right),
+            (vec![PathBuf::from("/trust/right")], false)
+        );
+        let mut sources = sources(Some(text));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("* ssh-ed25519 {}\n", ED25519),
+        );
+        supply(&mut sources, "/trust/right", String::new());
+        let export = trust_export(&sources);
+        let right = route_trust(&export, "r.right.ssh");
+        assert_eq!(right["host"], "right.example");
+        assert!(right["pins"].as_array().unwrap().is_empty());
+        assert!(right["required_capabilities"].is_null());
+
+        let negated = alias_resolver(Some("Host * !right\n HostName left.example\n UserKnownHostsFile /trust/left\nHost right\n HostName right.example\n UserKnownHostsFile /trust/right\nHost *\n GlobalKnownHostsFile none\n"), &context().home).unwrap();
+        let right = negated.config.for_host("right");
+        assert_eq!(
+            right.get("hostname").map(String::as_str),
+            Some("right.example")
+        );
+        assert_eq!(
+            negated.trust_files(&right),
+            (vec![PathBuf::from("/trust/right")], false)
+        );
+    }
+
+    #[test]
+    fn system_policy_follows_user_assignment_and_cannot_disappear_when_unreadable() {
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n UserKnownHostsFile /trust/pins\n GlobalKnownHostsFile none\nHost right\n HostName box\n UserKnownHostsFile /trust/pins\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/pins",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        supply(
+            &mut sources,
+            "/trust/system",
+            format!("@revoked box ssh-ed25519 {}\n", ED25519),
+        );
+        sources.system_config =
+            KnownHostsSource::Present("User u\n GlobalKnownHostsFile /trust/system\n".into());
+        let resolver = alias_resolver_with_system(
+            sources.config.as_deref(),
+            &sources.system_config,
+            &context().home,
+        )
+        .unwrap();
+        assert_eq!(
+            resolver.trust_files(&resolver.config.for_host("left")),
+            (vec![PathBuf::from("/trust/pins")], false)
+        );
+        assert_eq!(
+            resolver.trust_files(&resolver.config.for_host("right")),
+            (
+                vec![PathBuf::from("/trust/pins"), PathBuf::from("/trust/system")],
+                false
+            )
+        );
+        let export = trust_export(&sources);
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            assert_eq!(
+                route_trust(&export, route)["revoked_keys"][0]["fingerprint"],
+                FINGERPRINT
+            );
+        }
+        for system in [
+            KnownHostsSource::Unavailable,
+            KnownHostsSource::Present("Host *\n RevokedHostKeys /trust/revoked\n".into()),
+            KnownHostsSource::Present("Include /etc/ssh/ssh_config.d/*\n".into()),
+        ] {
+            sources.system_config = system;
+            let export = trust_export(&sources);
+            assert_eq!(
+                route_trust(&export, "r.left.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY])
+            );
+        }
+    }
+
     #[test]
     fn the_theme_catalog_lists_distinct_themes_then_every_builtin() {
         let catalog = theme_catalog_json();
@@ -1224,9 +2401,11 @@ ssh = "bad"
         );
         assert!(themes.len() > 1000);
         assert_eq!(themes[0]["name"], "FrankenTerm Azure");
-        assert!(themes
-            .iter()
-            .all(|t| t["ansi"].as_array().unwrap().len() == 16));
+        assert!(
+            themes
+                .iter()
+                .all(|t| t["ansi"].as_array().unwrap().len() == 16)
+        );
     }
 
     /// The app and Kit read these files; they must be what this code writes.

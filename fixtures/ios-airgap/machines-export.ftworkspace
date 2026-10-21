@@ -33,8 +33,21 @@
     "host_trust": [
       {
         "claimed_source": "known_hosts",
+        "host": "100.91.120.17",
+        "id": "h.727e8dda692b557fa6e50fe5",
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256:0QMmKpubmKjdQYS8jbWmzKi7cvVkxacRPLyJX118Too"
+          }
+        ],
+        "port": 22,
+        "revoked_keys": []
+      },
+      {
+        "claimed_source": "known_hosts",
         "host": "css.example",
-        "id": "h.3d79019276b3b6ceb9f8bc8d",
+        "id": "h.72a712ba587e91a0c8d6c2f5",
         "pins": [
           {
             "algorithm": "ssh-ed25519",
@@ -47,21 +60,8 @@
       {
         "claimed_source": "known_hosts",
         "host": "jumped",
-        "id": "h.7403fe4ddeec73faea6eeb3a",
+        "id": "h.d48b13425a68110a55a35d82",
         "pins": [],
-        "port": 22,
-        "revoked_keys": []
-      },
-      {
-        "claimed_source": "known_hosts",
-        "host": "100.91.120.17",
-        "id": "h.9b3435ff6e699c2b27dd8f3f",
-        "pins": [
-          {
-            "algorithm": "ssh-ed25519",
-            "fingerprint": "SHA256:0QMmKpubmKjdQYS8jbWmzKi7cvVkxacRPLyJX118Too"
-          }
-        ],
         "port": 22,
         "revoked_keys": []
       }
@@ -117,7 +117,7 @@
           "c.07899bb8cd6ceb021207a823"
         ],
         "host": "100.91.120.17",
-        "host_trust_ref": "h.9b3435ff6e699c2b27dd8f3f",
+        "host_trust_ref": "h.727e8dda692b557fa6e50fe5",
         "id": "r.trj.tailscale",
         "jump_routes": [],
         "mode": "direct_ssh",
@@ -133,7 +133,7 @@
           "c.07899bb8cd6ceb021207a823"
         ],
         "host": "css.example",
-        "host_trust_ref": "h.3d79019276b3b6ceb9f8bc8d",
+        "host_trust_ref": "h.72a712ba587e91a0c8d6c2f5",
         "id": "r.css.ssh",
         "jump_routes": [],
         "mode": "direct_ssh",
@@ -147,7 +147,7 @@
         ],
         "credential_refs": [],
         "host": "jumped",
-        "host_trust_ref": "h.7403fe4ddeec73faea6eeb3a",
+        "host_trust_ref": "h.d48b13425a68110a55a35d82",
         "id": "r.dark.ssh",
         "jump_routes": [],
         "mode": "direct_ssh",
