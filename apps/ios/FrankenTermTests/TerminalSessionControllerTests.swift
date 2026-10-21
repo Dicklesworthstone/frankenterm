@@ -460,6 +460,54 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// A theme picked while connected re-themes the live terminal from its
+    /// next frame, keeps the screen, and is the palette a new session starts in.
+    func testAThemePickedWhileConnectedRethemesTheLiveTerminal() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo THEMED-$((40+2))", into: terminal)
+        _ = try await rows(of: terminal) { self.shows($0, "THEMED-42") }
+        let before = try XCTUnwrap(terminal.renderer.admittedFrame)
+
+        let catalog = try XCTUnwrap(MobileWorkspaceModel.themeCatalog, "the app bundles its theme catalog")
+        let dracula = try XCTUnwrap(catalog.theme(named: "Dracula"))
+        let base = dracula.terminalBasePalette
+        func entry(_ index: Int) -> TerminalRenderRGBA {
+            .init(base[index * 4], base[index * 4 + 1], base[index * 4 + 2], base[index * 4 + 3])
+        }
+        XCTAssertNotEqual(before.palette[257], entry(257), "the unthemed terminal is not already Dracula")
+        scene.applyTheme(dracula, to: "alpha")
+        XCTAssertEqual(scene.themes["alpha"]?.name, "Dracula", "the chrome follows at once")
+        for _ in 0..<200 where terminal.renderer.admittedFrame?.palette[257] != entry(257) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let after = try XCTUnwrap(terminal.renderer.admittedFrame)
+        XCTAssertEqual(after.palette[257], entry(257), "background")
+        XCTAssertEqual(after.palette[256], entry(256), "foreground")
+        XCTAssertEqual(after.palette[1], entry(1), "ANSI red")
+        XCTAssertGreaterThan(after.paletteRevision, before.paletteRevision)
+        let screen = try await rows(of: terminal) { _ in true }
+        XCTAssertTrue(shows(screen, "THEMED-42"), "re-theming keeps the screen (screen: \(screen))")
+
+        // The shell is still live, and a program asking for the background
+        // (OSC 11) is told the new theme's. The raw read takes whatever the
+        // reply holds within a second, whichever terminator it uses.
+        try await type("stty -echo -icanon min 0 time 10; printf '\\033]11;?\\033\\\\'; r=$(dd bs=128 count=1 2>/dev/null);"
+                       + " stty sane; echo \"${r#*;}\" > \(live.outPath)", into: terminal)
+        let reply = try await hostFile(live.outPath, containing: "rgb:")
+        let hex = dracula.background.dropFirst()
+        let expected = stride(from: 0, to: 6, by: 2).map { offset -> String in
+            let pair = hex.dropFirst(offset).prefix(2).lowercased()
+            return pair + pair
+        }.joined(separator: "/")
+        let shown = try await rows(of: terminal) { _ in true }
+        XCTAssertTrue(reply.contains("rgb:\(expected)"), "OSC 11 reports \(expected): \(reply) (screen: \(shown))")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// M1: switching machines keeps each one's place in its history.
     func testEachMachineKeepsItsHistoryPositionAcrossSwitches() async throws {
         let live = try await liveScene(), scene = live.scene
