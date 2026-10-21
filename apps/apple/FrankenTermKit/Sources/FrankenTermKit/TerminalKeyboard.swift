@@ -105,6 +105,16 @@ public protocol TerminalKeyboardEncoding: Sendable {
     /// The UI must never choose a bracket flag or implement an ANSI fallback.
     func preparePaste(_ text: String, source: TerminalSource, maximumBytes: Int) async throws -> TerminalPreparedPaste
 }
+
+/// Optional model ownership spanning canonical encoding and the coordinator's
+/// local admission. The existing keyboard pump is the only caller; this creates
+/// no input queue or per-event task. The callback may encode and use the input
+/// coordinator, but must not drive the terminal model or await its shutdown.
+/// Implementations must release ownership on success, error and cancellation.
+public protocol TerminalKeyboardTransactions: TerminalKeyboardEncoding {
+    func withInputTransaction<Value: Sendable>(source: TerminalSource,
+        operation: @Sendable () async throws -> Value) async throws -> Value
+}
 public struct TerminalPreparedPaste: Sendable, CustomDebugStringConvertible {
     public let text: String
     public let bracketed: Bool
@@ -142,7 +152,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     public var acceptsInput: Bool { phase == .active }
     public var acceptsPaste: Bool { acceptsInput && !document.isMarked && encoder.supportsPaste }
 
-    private enum Event {
+    private enum Event: Sendable {
         case beginComposition, commitComposition(String), text(String), key(TerminalHardwareKey, TerminalKeyPhase)
         case paste(TerminalPasteReview)
         var charge: Int {
@@ -269,7 +279,18 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
         try Task.checkCancellation()
         guard phase == .active || phase == .handingOff else { throw TerminalKeyboardError.unavailable }
     }
+    private func withEncodingTransaction<Value: Sendable>(
+        _ operation: @MainActor @Sendable () async throws -> Value) async throws -> Value {
+        if let transactions = encoder as? any TerminalKeyboardTransactions,
+           let source = originalFocus.source {
+            return try await transactions.withInputTransaction(source: source) { try await operation() }
+        }
+        return try await operation()
+    }
     private func process(_ event: Event) async throws {
+        try await withEncodingTransaction { try await self.processEvent(event) }
+    }
+    private func processEvent(_ event: Event) async throws {
         try checkLivePump()
         var receipt: TerminalInputReceipt?
         switch event {
@@ -359,11 +380,13 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             if let worker { await worker.value }
             guard phase == .handingOff else { throw TerminalKeyboardError.blocked }
             try Task.checkCancellation()
-            let keys = held.values.sorted { $0.usage < $1.usage }
-            let cleanup = keys.isEmpty ? Data() : try await encode(.releaseAll(keys), maximum: 1024)
-            try Task.checkCancellation()
-            guard phase == .handingOff else { throw TerminalKeyboardError.unavailable }
-            let next = try await coordinator.changeFocus(focus, to: source, cleanup: cleanup)
+            let next = try await withEncodingTransaction { [self] in
+                let keys = held.values.sorted { $0.usage < $1.usage }
+                let cleanup = keys.isEmpty ? Data() : try await encode(.releaseAll(keys), maximum: 1024)
+                try Task.checkCancellation()
+                guard phase == .handingOff else { throw TerminalKeyboardError.unavailable }
+                return try await coordinator.changeFocus(focus, to: source, cleanup: cleanup)
+            }
             // The actor operation may have linearized before suspension. Keep
             // ownership of its result so shutdown can retire the actual token.
             focus = next; held.removeAll()
@@ -414,15 +437,22 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             if let oldTransition { _ = try? await oldTransition.value }
             // A blocked head was never admitted; release it at explicit discard.
             if flight != nil { if discarded < UInt64.max { discarded += 1 }; flight = nil }
-            var cleanup = Data()
-            let keys = held.values.sorted { $0.usage < $1.usage }
-            if !keys.isEmpty {
-                do { cleanup = try await encode(.releaseAll(keys), maximum: 1024) }
-                catch { lastFailure = .encoding }
-            }
             do {
-                if try await !coordinator.suspend(focus, cleanup: cleanup) { lastFailure = .capacity }
-            } catch { lastFailure = .blocked }
+                try await withEncodingTransaction { [self] in
+                    var cleanup = Data()
+                    let keys = held.values.sorted { $0.usage < $1.usage }
+                    if !keys.isEmpty {
+                        do { cleanup = try await encode(.releaseAll(keys), maximum: 1024) }
+                        catch { lastFailure = .encoding }
+                    }
+                    if try await !coordinator.suspend(focus, cleanup: cleanup) { lastFailure = .capacity }
+                }
+            } catch {
+                // Model shutdown may prevent a new encoding transaction. The
+                // exact focus must still retire, without inventing cleanup.
+                lastFailure = .blocked
+                _ = try? await coordinator.suspend(focus)
+            }
             held.removeAll(); composition = nil; ownsFocus = false; phase = .retired
             notifyStateChange()
         }
