@@ -33,6 +33,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored let navigation: TerminalNavigationCoordinator
     @ObservationIgnored private var bindings: [String: TerminalKeyboardNavigationBinding] = [:]
     @ObservationIgnored private var closed = false
+    @ObservationIgnored private var closing: Task<Void, Never>?
 
     init(workspaceID: UUID, workspaceName: String, machines: [SceneMachine], initialMachineID: String,
          connections: MobileConnections) throws {
@@ -74,22 +75,36 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         if active { navigation.resume() } else { navigation.suspend() }
     }
 
-    /// Closes every session of the scene; their journal records stay for review.
-    func close() async {
+    /// Synchronously seal every scene-owned responder before scheduling joins.
+    func requestClose() {
         guard !closed else { return }
         closed = true
         navigation.suspend()
-        for controller in sessions.values { await controller.stop() }
-        await navigation.joinSuspension()
+        for controller in sessions.values { controller.requestStop() }
+    }
+
+    /// Concurrent callers join the same cleanup, not an early closed flag.
+    /// A subsequent call retries failed settlements; it never reopens a shell.
+    func close() async {
+        requestClose()
+        if let closing { await closing.value; return }
+        let controllers = Array(sessions.values), navigation = self.navigation
+        let job = Task {
+            for controller in controllers { await controller.stop() }
+            await navigation.joinSuspension()
+        }
+        closing = job
+        await job.value
+        closing = nil
     }
 
     func report(_ error: any Error) {
         problem = TerminalSessionController.describe(error)
     }
 
-    private func inventory() throws -> [TerminalNavigationMachine] {
+    private func inventory(_ values: [String: TerminalKeyboardNavigationBinding]) throws -> [TerminalNavigationMachine] {
         try machines.map { machine in
-            let panes = try bindings[machine.id].map { [try TerminalNavigationPane(id: $0.paneID, title: "Direct SSH")] }
+            let panes = try values[machine.id].map { [try TerminalNavigationPane(id: $0.paneID, title: "Direct SSH")] }
             return try TerminalNavigationMachine(id: machine.id, name: machine.name, panes: panes ?? [])
         }
     }
@@ -108,6 +123,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// within its bounded handoff, so retry briefly rather than drop the change.
     private func whileBusy(_ body: () async throws -> Void) async throws {
         for attempt in 0..<100 {
+            try Task.checkCancellation()
             do { return try await body() }
             catch TerminalNavigationError.busy where attempt < 99 { try await Task.sleep(for: .milliseconds(50)) }
         }
@@ -117,31 +133,44 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
-        guard !closed else { throw TerminalNavigationError.unavailable }
+        guard !closed, machines.contains(where: { $0.id == machineID }),
+              source.identity.machineID == machineID else { throw TerminalNavigationError.unavailable }
         let binding = TerminalKeyboardNavigationBinding(source: source, encoder: encoder)
-        var next = bindings; next[machineID] = binding
         // Bindings are installed before the inventory offers the new pane.
-        try await whileBusy { try self.owner.replaceBindings(Array(next.values)) }
-        bindings = next
-        try navigation.replaceInventory(inventory())
+        // Recompute after each busy wait, so another machine's concurrent
+        // attachment/detachment is never overwritten by an old dictionary.
         try await whileBusy {
+            guard !self.closed else { throw TerminalNavigationError.unavailable }
+            var next = self.bindings; next[machineID] = binding
+            let inventory = try self.inventory(next)
+            try self.owner.replaceBindings(Array(next.values))
+            self.bindings = next
+            try self.navigation.replaceInventory(inventory)
+        }
+        try await whileBusy {
+            guard !self.closed, self.bindings[machineID]?.source == source else { throw TerminalNavigationError.stale }
             guard let plan = try self.navigation.navigation.plan(paneID: binding.paneID)
                     ?? self.navigation.navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
             try await self.navigation.perform(plan)
         }
-        guard owner.currentSelection?.paneID == binding.paneID, let keyboard = owner.keyboard else {
+        guard !closed, owner.currentSelection?.paneID == binding.paneID, let keyboard = owner.keyboard else {
             throw TerminalNavigationError.stale
         }
         return keyboard
     }
 
-    func detach(machineID: String, source: TerminalSource) async {
-        guard bindings[machineID]?.source == source else { return }
-        var next = bindings; next[machineID] = nil
+    func detach(machineID: String, source: TerminalSource) async throws {
         // Removing the visible source seals its input before the list changes.
-        do { try await whileBusy { try self.owner.replaceBindings(Array(next.values)) } } catch { report(error) }
-        bindings = next
-        do { try navigation.replaceInventory(inventory()) } catch { report(error) }
+        // Preserve the old map on refused binding admission. A retry also
+        // reconciles inventory if an earlier inventory update failed afterward.
+        try await whileBusy {
+            var next = self.bindings
+            if next[machineID]?.source == source { next[machineID] = nil }
+            let inventory = try self.inventory(next)
+            try self.owner.replaceBindings(Array(next.values))
+            self.bindings = next
+            try self.navigation.replaceInventory(inventory)
+        }
         await owner.joinSealed()
     }
 
@@ -176,7 +205,11 @@ struct WorkspaceTerminalScreen: View {
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(machine?.background) ? .dark : .light, for: .navigationBar)
         .task { scene.connect(initialMachineID) }
-        .onDisappear { Task { await scene.close() } }
+        .onDisappear {
+            let retiring = scene
+            retiring.requestClose()
+            Task { await retiring.close() }
+        }
         .onChange(of: scenePhase) { _, phase in scene.setForeground(phase == .active) }
     }
 
@@ -190,13 +223,13 @@ struct WorkspaceTerminalScreen: View {
             case .needsReview:
                 notice(symbol: "questionmark.circle", title: "Earlier session on this machine",
                        message: "A previous session here ended before everything typed in it had a known outcome.",
-                       uncertain: true, enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+                       uncertain: true, enabled: session.settled, cleanup: session) { scene.connect(machine.id, acknowledging: true) }
             case let .ended(message):
                 notice(symbol: "checkmark.circle", title: "Session ended", message: message, uncertain: true,
-                       enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+                       enabled: session.settled, cleanup: session) { scene.connect(machine.id, acknowledging: true) }
             case let .failed(message):
                 notice(symbol: "exclamationmark.triangle", title: "Session unavailable", message: message, uncertain: true,
-                       enabled: session.settled) { scene.connect(machine.id, acknowledging: true) }
+                       enabled: session.settled, cleanup: session) { scene.connect(machine.id, acknowledging: true) }
             }
         } else if machine.target != nil {
             notice(symbol: "terminal", title: "Not connected", message: "Swipe the rail to return to a connected machine.",
@@ -210,7 +243,8 @@ struct WorkspaceTerminalScreen: View {
     /// Every way out of a session states that its last input may or may not
     /// have run; the only action is an informed, explicit new session.
     private func notice(symbol: String, title: String, message: String, uncertain: Bool, enabled: Bool,
-                        action: String? = "Start New Session", perform: @escaping () -> Void) -> some View {
+                        action: String? = "Start New Session", cleanup: TerminalSessionController? = nil,
+                        perform: @escaping () -> Void) -> some View {
         VStack(spacing: 12) {
             Image(systemName: symbol).font(.largeTitle)
             Text(title).font(.headline)
@@ -218,6 +252,15 @@ struct WorkspaceTerminalScreen: View {
             if uncertain {
                 Text("Commands typed just before it ended may or may not have run. Nothing is sent again automatically; check the machine before repeating one.")
                     .multilineTextAlignment(.center).font(.caption)
+            }
+            if cleanup?.interruptedInput == true {
+                Text("Some input was interrupted. Nothing will be replayed automatically.")
+                    .multilineTextAlignment(.center).font(.caption)
+            }
+            if let cleanup, let failure = cleanup.cleanupFailure {
+                Text("Local cleanup is incomplete: \(failure)").font(.caption).multilineTextAlignment(.center)
+                Button("Retry Cleanup") { Task { await cleanup.retryCleanup() } }
+                    .buttonStyle(.bordered)
             }
             if let action {
                 Button(action, systemImage: action == "Connect" ? "terminal" : "arrow.clockwise", action: perform)
