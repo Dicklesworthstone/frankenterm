@@ -56,6 +56,19 @@ struct LocalCredentialRevocationReview: Identifiable {
     fileprivate let epoch: UUID
 }
 
+/// Existing verified-page saves remain available alongside the current partial
+/// decoder cache. Each action keeps the original store's exact review witness.
+enum SavedOpticalScan: Identifiable, Sendable {
+    case partial(OpticalDecoderRecoveryReview), verified(OpticalScanRecoveryReview)
+    var id: UUID { switch self { case .partial(let value): value.id; case .verified(let value): value.id } }
+    var identity: OpticalFrame.Identity {
+        switch self { case .partial(let value): value.identity; case .verified(let value): value.identity }
+    }
+    var verifiedPages: Int { switch self { case .partial(let value): value.verifiedPages; case .verified(let value): value.verifiedPages } }
+    var verifiedBytes: Int { switch self { case .partial(let value): value.verifiedBytes; case .verified(let value): value.verifiedBytes } }
+    var independentParts: Int { switch self { case .partial(let value): value.independentParts; case .verified: 0 } }
+}
+
 @MainActor
 @Observable
 final class MobileWorkspaceModel {
@@ -65,6 +78,8 @@ final class MobileWorkspaceModel {
     var locallyRevokedFingerprints: Set<String> = []
     var unconfirmedCredentialRevocations: Set<String> = []
     var credentialMessage: String?
+    var credentialImport: WorkspaceKeyImportController?
+    @ObservationIgnored private var credentialImportOperation: UUID?
     var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
     var showRestore = false { didSet { updateIdleTimer() } }
@@ -72,19 +87,32 @@ final class MobileWorkspaceModel {
     var active = false { didSet { updateIdleTimer() } }
     /// Not in the background (see setScenePhase): live connections may run.
     @ObservationIgnored private var connectionsForeground = false
-    var busy = false
+    private var operationBusy = false
+    /// Import settlement retains its own reservation across scene transitions
+    /// and any older callback that releases the shared operation flag.
+    var busy: Bool {
+        get { operationBusy || credentialImportOperation != nil }
+        set { operationBusy = newValue }
+    }
     var requestingCameraAccess = false
     var offlineModeBlocked = false
-    var savedScan: OpticalScanRecoveryReview?
+    var savedScans: [SavedOpticalScan] = []
     var scanProgressMessage: String?
-    private var scanSavePermit: OpticalScanSavePermit?
-    var isSavingScanProgress: Bool { scanSavePermit != nil }
-    @ObservationIgnored private var scanRecovery: OpticalScanRecovery<AppleCryptography>?
+    private var scanSaveSession: OpticalDecoderSaveSession?
+    private var scanSaveFailure: (data: Data, prior: OpticalDecoderSaveSession, generation: UUID)?
+    var isSavingScanProgress: Bool { scanSaveSession != nil && scanSaveFailure == nil }
+    var canRetryScanSave: Bool { scanSaveFailure != nil }
+    @ObservationIgnored private var scanRecovery: OpticalDecoderRecovery<AppleCryptography>?
+    @ObservationIgnored private var verifiedScanRecovery: OpticalScanRecovery<AppleCryptography>?
     @ObservationIgnored private var scanSaveEpoch = UUID()
+    @ObservationIgnored private var scanSaveRevision = UUID()
     @ObservationIgnored private var scanRefreshEpoch = UUID()
     @ObservationIgnored private var scanSaveGeneration: UUID?
     @ObservationIgnored private var scanSaveIdentity: OpticalFrame.Identity?
-    @ObservationIgnored private var scanSavedPages = 0
+    @ObservationIgnored private var scanCadence: OpticalDecoderSaveCadence?
+    @ObservationIgnored private var scanLastSaved = ContinuousClock.now
+    @ObservationIgnored private var scanWrite: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var scanSaveTimer: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var store: WorkspaceStore?
     /// Live direct-SSH services (TerminalSessionScreen.swift), created with the store.
     @ObservationIgnored private(set) var connections: MobileConnections?
@@ -154,7 +182,10 @@ final class MobileWorkspaceModel {
                 return
             }
             let status = AVCaptureDevice.authorizationStatus(for: .video)
-            if status == .authorized { self.cameraRequested = true; return }
+            if status == .authorized {
+                if self.observations == nil, let restore = self.restore { self.startObservations(restore: restore) }
+                self.cameraRequested = true; return
+            }
             guard status == .notDetermined else {
                 self.message = "Camera access is denied or restricted. Allow it in Settings or use a local encrypted file."
                 return
@@ -164,7 +195,10 @@ final class MobileWorkspaceModel {
             // The permission sheet can deactivate the scene. Do not restart a
             // camera in an inactive scene or after the restore sheet was closed.
             if granted, self.active, self.epoch == ticket, !self.offlineModeBlocked,
-               self.state?.isSuspended == false { self.cameraRequested = true }
+               self.state?.isSuspended == false {
+                if self.observations == nil, let restore = self.restore { self.startObservations(restore: restore) }
+                self.cameraRequested = true
+            }
             else if granted { self.message = "Camera access is ready. Tap Open Camera or Resume Camera when you return." }
             else { self.message = "Camera access was not granted. The local encrypted-file import is still available." }
         }
@@ -184,8 +218,10 @@ final class MobileWorkspaceModel {
                 // A dedicated protected namespace, separate from workspace and
                 // import journals. Opening it does not opt a scan into saving.
                 do {
-                    scanRecovery = try OpticalScanRecovery(directory: support.appendingPathComponent("FrankenTermScanRecovery", isDirectory: true),
-                                                           using: AppleCryptography())
+                    verifiedScanRecovery = try OpticalScanRecovery(directory: support.appendingPathComponent("FrankenTermScanRecovery", isDirectory: true),
+                                                                   using: AppleCryptography())
+                    scanRecovery = try OpticalDecoderRecovery(directory: support.appendingPathComponent("FrankenTermDecoderRecovery", isDirectory: true),
+                                                              using: AppleCryptography())
                 } catch {
                     scanProgressMessage = "Saving scan progress is unavailable. You can still scan and restore normally. \(error.localizedDescription)"
                 }
@@ -285,7 +321,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
-        guard credentialRevocation == nil else { throw WorkspaceSSHConnectionError.busy }
+        guard credentialRevocation == nil, credentialImportOperation == nil else { throw WorkspaceSSHConnectionError.busy }
         if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
            document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             throw SSHAuthenticationError.denied
@@ -307,6 +343,7 @@ final class MobileWorkspaceModel {
     private func setActive(_ value: Bool) {
         active = value
         if !value {
+            credentialImport?.cancel()
             scannedCode = nil; stopSavingScanProgress()
             cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
             locallyRevokedFingerprints = []
@@ -326,6 +363,7 @@ final class MobileWorkspaceModel {
         }
     }
     func setRestoreVisible(_ value: Bool) {
+        if value { credentialImport?.cancel() }
         showRestore = value
         // A just-dismissed request may already be retired. Re-present only the
         // status returned by the serialized lifecycle transition.
@@ -458,61 +496,101 @@ final class MobileWorkspaceModel {
         }
     }
 
-    /// Save permission belongs to this active restore generation. The encrypted
-    /// cache remains available after pausing; discarding it is a separate choice.
+    private func cancelScanSaveTimer() {
+        scanSaveTimer?.task.cancel(); scanSaveTimer = nil
+    }
+
+    /// Retire local admission synchronously, then join the retained writer and
+    /// revoke its storage epoch. A delayed write cannot recreate retired rows.
     func stopSavingScanProgress() {
-        scanSaveEpoch = UUID(); scanSavePermit = nil
-        scanSaveGeneration = nil; scanSaveIdentity = nil; scanSavedPages = 0
+        cancelScanSaveTimer()
+        let ended = scanSaveSession ?? scanSaveFailure?.prior, prior = scanWrite
+        scanSaveEpoch = UUID(); scanSaveSession = nil; scanSaveFailure = nil
+        scanSaveGeneration = nil; scanSaveIdentity = nil; scanCadence = nil
+        guard let ended, let scanRecovery else { return }
+        let id = UUID()
+        let job = Task { [weak self] in
+            await prior?.task.value
+            do { try await scanRecovery.stopSaving(ended) }
+            catch OpticalDecoderRecoveryError.staleWriter { } // already retired
+            catch {
+                self?.scanProgressMessage = "Saving has stopped in this app, but retiring the saved writer could not be confirmed. Review saved progress before saving again. \(error.localizedDescription)"
+            }
+            guard let self, self.scanWrite?.id == id else { return }
+            self.scanWrite = nil
+            if self.active { await self.refreshSavedScan(epoch: self.epoch) }
+        }
+        scanWrite = (id, job)
+    }
+
+    func continueWithoutSaving() {
+        stopSavingScanProgress()
+        scanProgressMessage = "Scanning can continue. Previously saved progress is still available."
+        advanceAutomatically()
     }
 
     private func reconcileScanSaving() {
-        guard scanSavePermit != nil else { return }
+        guard scanSaveSession != nil else { return }
         guard let state, !state.isSuspended, state.source == .optical,
               state.identity == scanSaveIdentity, state.phase != .complete else {
             stopSavingScanProgress(); return
         }
         if scanSaveGeneration != state.generation {
-            // Repairing a page retires callbacks but keeps the same selected
-            // envelope. Its explicit save consent still covers verified pages.
-            scanSaveEpoch = UUID(); scanSaveGeneration = state.generation
+            cancelScanSaveTimer()
+            // A failed snapshot belongs to its old decoder generation. It may
+            // not become a retry after a page repair or a source transition.
+            if scanSaveFailure != nil { stopSavingScanProgress() }
+            else { scanSaveGeneration = state.generation }
         }
+    }
+
+    private func publishSavedScan(_ reviewed: OpticalDecoderRecoveryReview) {
+        scanRefreshEpoch = UUID()
+        savedScans.removeAll { if case .partial = $0 { true } else { false } }
+        savedScans.insert(.partial(reviewed), at: 0)
     }
 
     private func refreshSavedScan(epoch ticket: UUID) async {
-        guard let scanRecovery else { return }
         let refresh = UUID(); scanRefreshEpoch = refresh
-        do {
-            let reviewed = try await scanRecovery.review()
-            guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
-            savedScan = reviewed
-        } catch is CancellationError { }
-        catch {
-            guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
-            savedScan = nil
-            scanProgressMessage = "Saved scan progress could not be read. \(error.localizedDescription)"
+        var found: [SavedOpticalScan] = [], failures: [String] = []
+        if let scanRecovery {
+            do { if let value = try await scanRecovery.review() { found.append(.partial(value)) } }
+            catch is CancellationError { return }
+            catch { failures.append(error.localizedDescription) }
         }
+        if let verifiedScanRecovery {
+            do { if let value = try await verifiedScanRecovery.review() { found.append(.verified(value)) } }
+            catch is CancellationError { return }
+            catch { failures.append(error.localizedDescription) }
+        }
+        guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
+        savedScans = found
+        if !failures.isEmpty { scanProgressMessage = "Some saved progress could not be read. " + failures.joined(separator: " ") }
     }
 
-    /// One explicit operation at a time; lifecycle changes retire its UI result.
-    /// A write can finish after interruption, so the next foreground reads the
-    /// cache itself instead of guessing whether anything was saved.
-    private func scanOperation(_ operation: @escaping @MainActor
-        (OfflineRestore<AppleCryptography>, OpticalScanRecovery<AppleCryptography>, UUID) async throws -> Void) {
+    /// User actions join the existing writer. Initial consent failures can have
+    /// published, so read the actual store and require a new exact review.
+    private func scanOperation(advanceWhenFinished: Bool = true, _ operation: @escaping @MainActor
+        (OfflineRestore<AppleCryptography>, OpticalDecoderRecovery<AppleCryptography>, UUID) async throws -> Void) {
         guard active, showRestore, !busy, !offlineModeBlocked,
               let restore, let scanRecovery else { return }
-        busy = true; scanProgressMessage = nil
+        busy = true; scanProgressMessage = nil; cancelScanSaveTimer()
         let ticket = epoch, pendingLifecycle = lifecycle
         Task { [weak self] in
             await pendingLifecycle?.value
             guard let self else { return }
-            defer { self.busy = false; self.advanceAutomatically() }
+            await self.scanWrite?.task.value
+            defer {
+                self.busy = false
+                if advanceWhenFinished { self.advanceAutomatically() }
+            }
             guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked else { return }
             do { try await operation(restore, scanRecovery, ticket) }
             catch is CancellationError { }
             catch {
                 guard self.active, self.epoch == ticket else { return }
                 self.stopSavingScanProgress()
-                self.scanProgressMessage = "Scan progress was not confirmed. \(error.localizedDescription)"
+                self.scanProgressMessage = "Saving was not confirmed. Review the saved progress before trying again. \(error.localizedDescription)"
                 let latest = await restore.status()
                 guard self.active, self.epoch == ticket else { return }
                 self.state = latest
@@ -521,79 +599,269 @@ final class MobileWorkspaceModel {
         }
     }
 
-    func saveScanProgress(generation: UUID, identity: OpticalFrame.Identity) {
+    private func adoptScanWriter(_ session: OpticalDecoderSaveSession, generation: UUID) {
+        scanSaveEpoch = UUID(); scanSaveRevision = UUID(); scanSaveSession = session; scanSaveFailure = nil
+        scanSaveGeneration = generation; scanSaveIdentity = session.review.identity
+        scanCadence = .init(receivedParts: session.review.receivedParts, verifiedPages: session.review.verifiedPages)
+        scanLastSaved = .now; publishSavedScan(session.review)
+    }
+
+    func saveScanProgress(generation: UUID, identity: OpticalFrame.Identity,
+                          replacing reviewed: OpticalDecoderRecoveryReview?) {
         scanOperation { [weak self] restore, recovery, ticket in
-            guard let self, self.state?.generation == generation,
-                  self.state?.identity == identity else { throw FTError.stale }
-            guard let checkpoint = try await restore.scanCheckpoint(generation: generation) else {
-                throw FTError.malformed("scan.no_verified_pages")
-            }
-            guard self.active, self.epoch == ticket, checkpoint.identity == identity else { throw CancellationError() }
+            guard let self, self.state?.generation == generation, self.state?.identity == identity else { throw FTError.stale }
+            let checkpoint = try await restore.exportDecoderCheckpoint(generation: generation)
+            guard self.active, self.epoch == ticket else { throw CancellationError() }
             let writer = self.scanSaveEpoch
-            let permit = try await recovery.beginSaving(checkpoint, confirmedByUser: true)
-            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else { return }
-            self.scanSaveEpoch = UUID(); self.scanSavePermit = permit
-            self.scanSaveGeneration = generation; self.scanSaveIdentity = checkpoint.identity
-            self.scanSavedPages = checkpoint.verifiedPages
-            // Already queued observations can complete a page during the first
-            // write. Catch up before automatic decryption releases the envelope.
+            let session: OpticalDecoderSaveSession
+            if let reviewed {
+                guard reviewed.identity == identity else { throw FTError.stale }
+                session = try await recovery.continueSaving(reviewed, confirmedByUser: true)
+            } else { session = try await recovery.beginSaving(checkpoint, confirmedByUser: true) }
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else {
+                try? await recovery.stopSaving(session); return
+            }
+            self.adoptScanWriter(session, generation: generation)
             let latest = await restore.status()
             guard self.active, self.epoch == ticket else { return }
             self.state = latest
-            await self.saveCompletedScanPages(latest, restore: restore, epoch: ticket)
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
         }
     }
 
-    /// The exact saved review must still exist. Adoption never restores a code,
-    /// request key, camera permission, or an earlier import approval.
-    func resumeSavedScan(_ reviewed: OpticalScanRecoveryReview) {
+    func resumeSavedScan(_ reviewed: SavedOpticalScan) {
         scanOperation { [weak self] restore, recovery, ticket in
             guard let self else { return }
-            self.scannedCode = nil; self.stopSavingScanProgress()
-            self.cameraRequested = false
+            self.scannedCode = nil; self.stopSavingScanProgress(); self.cameraRequested = false
+            await self.scanWrite?.task.value
             let current = await restore.status()
             let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
             guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
-            let checkpoint = try await recovery.load(reviewed)
-            guard self.active, self.epoch == ticket else { throw CancellationError() }
-            let resumed = try await restore.resumeScan(checkpoint, generation: ready.generation)
-            guard self.active, self.epoch == ticket else { return }
-            self.state = resumed; self.lastObservation = nil
-            // The Resume action explicitly includes keeping subsequent pages.
+            let resumed: OfflineRestoreStatus, session: OpticalDecoderSaveSession
             let writer = self.scanSaveEpoch
-            let permit = try await recovery.beginSaving(checkpoint, confirmedByUser: true)
-            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else { return }
-            self.scanSaveEpoch = UUID(); self.scanSavePermit = permit
-            self.scanSaveGeneration = resumed.generation; self.scanSaveIdentity = checkpoint.identity
-            self.scanSavedPages = checkpoint.verifiedPages
+            switch reviewed {
+            case .partial(let saved):
+                let checkpoint = try await recovery.load(saved)
+                guard self.active, self.epoch == ticket else { throw CancellationError() }
+                resumed = try await restore.acceptDecoderCheckpoint(checkpoint, generation: ready.generation)
+                guard self.active, self.epoch == ticket else { return }
+                session = try await recovery.continueSaving(saved, confirmedByUser: true)
+            case .verified(let saved):
+                guard let legacy = self.verifiedScanRecovery else { throw FTError.storage }
+                guard try await recovery.review() == nil else { throw OpticalDecoderRecoveryError.savedProgressExists }
+                let checkpoint = try await legacy.load(saved)
+                guard self.active, self.epoch == ticket else { throw CancellationError() }
+                resumed = try await restore.resumeScan(checkpoint, generation: ready.generation)
+                let decoder = try await restore.exportDecoderCheckpoint(generation: resumed.generation)
+                guard self.active, self.epoch == ticket else { return }
+                session = try await recovery.beginSaving(decoder, confirmedByUser: true)
+            }
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else {
+                try? await recovery.stopSaving(session); return
+            }
+            self.state = resumed; self.lastObservation = nil
+            self.adoptScanWriter(session, generation: resumed.generation)
         }
     }
 
-    func discardSavedScan(_ reviewed: OpticalScanRecoveryReview) {
-        stopSavingScanProgress()
-        scanOperation { _, recovery, _ in try await recovery.discard(reviewed) }
+    func discardSavedScan(_ reviewed: SavedOpticalScan) {
+        scanOperation { [weak self] _, recovery, _ in
+            guard let self else { return }
+            // Discard itself rotates the epoch using the exact reviewed bytes;
+            // rotating it with stopSaving first would invalidate this review.
+            switch reviewed {
+            case .partial(let saved): try await recovery.discard(saved, confirmedByUser: true)
+            case .verified(let saved):
+                guard let legacy = self.verifiedScanRecovery else { throw FTError.storage }
+                try await legacy.discard(saved)
+            }
+            self.stopSavingScanProgress()
+        }
     }
 
-    /// Called by the single observation consumer, only after another complete
-    /// page. Awaiting this bounded write adds no camera-frame tasks or queues.
-    private func saveCompletedScanPages(_ status: OfflineRestoreStatus,
-                                       restore: OfflineRestore<AppleCryptography>, epoch ticket: UUID) async {
-        guard active, epoch == ticket, let scanRecovery, let permit = scanSavePermit,
-              scanSaveGeneration == status.generation, status.verifiedPages > scanSavedPages else { return }
+    /// Drain the bounded camera stream before the final snapshot. No suspend or
+    /// source mutation can overtake this explicitly requested save.
+    func saveAndPauseScan() {
+        scanOperation(advanceWhenFinished: false) { [weak self] restore, _, ticket in
+            guard let self else { return }
+            self.cameraRequested = false; self.scannedCode = nil
+            let consumer = self.observationTask
+            self.observations?.finish(); self.observations = nil; self.observationTask = nil
+            await consumer?.value
+            guard self.active, self.epoch == ticket else { return }
+            let current = await restore.status()
+            let priorRevision = self.scanSaveRevision
+            await self.saveScanSnapshot(current, restore: restore, epoch: ticket, force: true)
+            guard self.active, self.epoch == ticket, self.scanSaveFailure == nil,
+                  self.scanSaveSession != nil, self.scanSaveRevision != priorRevision else { return }
+            // Announce only a confirmed write. A later retirement/read failure
+            // can replace this message and must not be hidden by success text.
+            self.scanProgressMessage = "Scan progress saved. Resume the camera when you are ready."
+            self.stopSavingScanProgress()
+            await self.scanWrite?.task.value
+        }
+    }
+
+    func retryScanSave() {
+        scanOperation { [weak self] restore, _, ticket in
+            guard let self, let failed = self.scanSaveFailure,
+                  self.scanSaveGeneration == failed.generation,
+                  self.state?.generation == failed.generation else { throw FTError.stale }
+            await self.writeScanSnapshot(failed.data, after: failed.prior, generation: failed.generation, epoch: ticket)
+            guard self.active, self.epoch == ticket, self.scanSaveFailure == nil else { return }
+            let latest = await restore.status()
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+        }
+    }
+
+    /// One timer coalesces useful frame progress, including a trailing partial
+    /// burst. Complete envelopes and deliberate repairs bypass the interval.
+    private func saveScanSnapshot(_ status: OfflineRestoreStatus, restore: OfflineRestore<AppleCryptography>,
+                                  epoch ticket: UUID, force: Bool = false) async {
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, (!busy || force),
+              scanSaveFailure == nil, scanSaveSession != nil else { return }
+        let writer = scanSaveEpoch
+        var current = status
+        // A repair or completion must follow any earlier snapshot, even when
+        // that owner is still exporting its bytes rather than writing them.
+        while let pending = scanWrite {
+            guard force || current.phase == .locked || current.phase == .review else { return }
+            cancelScanSaveTimer()
+            await pending.task.value
+            guard !Task.isCancelled, active, showRestore, epoch == ticket,
+                  scanSaveEpoch == writer, scanSaveFailure == nil else { return }
+            current = await restore.status()
+        }
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              (!busy || force), scanSaveFailure == nil, let prior = scanSaveSession, let cadence = scanCadence,
+              scanSaveGeneration == current.generation, scanSaveIdentity == current.identity,
+              [.collecting, .locked, .review].contains(current.phase) else { return }
+        guard let ordinaryDelay = cadence.delay(receivedParts: current.receivedParts, verifiedPages: current.verifiedPages,
+                                                elapsed: scanLastSaved.duration(to: .now), force: force) else { return }
+        // Repeated queued observations of an already-saved locked envelope do
+        // not write again. A newly completed envelope does not wait two seconds.
+        let delay = current.phase == .collecting ? ordinaryDelay : .zero
+        if delay > .zero {
+            scheduleScanSaveTimer(after: delay, restore: restore, epoch: ticket,
+                                  writer: writer, generation: current.generation)
+            return
+        }
+        cancelScanSaveTimer()
+        let id = UUID(), predecessor = scanSaveRevision
+        let generation = current.generation, identity = current.identity
+        let job = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.scanWrite?.id == id { self.scanWrite = nil } }
+            do {
+                let checkpoint = try await restore.exportDecoderCheckpoint(generation: generation)
+                guard !Task.isCancelled, self.active, self.showRestore, self.epoch == ticket,
+                      self.scanWrite?.id == id, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation, self.scanSaveIdentity == identity,
+                      self.scanSaveRevision == predecessor, self.scanSaveFailure == nil else { return }
+                await self.writeScanSnapshot(checkpoint, after: prior, generation: generation, epoch: ticket, ownedBy: id)
+            } catch FTError.stale {
+                // A manual repair may rotate the receiver while this export
+                // waits. Its fresh forced snapshot owns the new generation.
+            } catch is CancellationError { }
+            catch {
+                guard !Task.isCancelled, self.active, self.epoch == ticket, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation, self.scanSaveIdentity == identity,
+                      self.scanSaveRevision == predecessor else { return }
+                self.stopSavingScanProgress()
+                self.scanProgressMessage = "Saving paused before a checkpoint could be made. \(error.localizedDescription)"
+            }
+        }
+        // Reserve before the first actor await: another observation or timer
+        // cannot export against this same predecessor while it is in flight.
+        scanWrite = (id, job)
+        await job.value
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              scanSaveRevision != predecessor, scanSaveFailure == nil, scanWrite == nil else { return }
+        let latest = await restore.status()
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              scanSaveGeneration == latest.generation, scanSaveIdentity == latest.identity,
+              scanSaveFailure == nil, scanWrite == nil, let latestCadence = scanCadence,
+              [.collecting, .locked, .review].contains(latest.phase),
+              let trailingDelay = latestCadence.delay(receivedParts: latest.receivedParts,
+                  verifiedPages: latest.verifiedPages, elapsed: scanLastSaved.duration(to: .now)) else { return }
+        if latest.phase == .collecting {
+            // Frames can arrive during file I/O. Retain their final partial
+            // burst even if no further camera callback arrives to start a timer.
+            scheduleScanSaveTimer(after: trailingDelay, restore: restore, epoch: ticket,
+                                  writer: writer, generation: latest.generation)
+        } else {
+            // Completion must reach storage before this caller advances to
+            // decryption/import. The changed-count guard above bounds this path.
+            await saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+        }
+    }
+
+    private func scheduleScanSaveTimer(after delay: Duration, restore: OfflineRestore<AppleCryptography>,
+                                       epoch ticket: UUID, writer: UUID, generation: UUID) {
+        guard scanSaveTimer == nil, active, showRestore, epoch == ticket,
+              scanSaveEpoch == writer, scanSaveGeneration == generation, scanSaveFailure == nil else { return }
+        let id = UUID()
+        let job = Task { [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard let self else { return }
+            // A manual action may be finishing when the deadline arrives.
+            // Keep one cancellable timer instead of losing its trailing save.
+            while self.busy {
+                guard self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                      self.epoch == ticket, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation else { return }
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+            }
+            guard !Task.isCancelled, self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                  self.epoch == ticket, self.scanSaveEpoch == writer,
+                  self.scanSaveGeneration == generation, self.scanSaveFailure == nil else { return }
+            let latest = await restore.status()
+            guard !Task.isCancelled, self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                  self.epoch == ticket, self.scanSaveEpoch == writer,
+                  self.scanSaveGeneration == generation else { return }
+            self.scanSaveTimer = nil
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket)
+        }
+        scanSaveTimer = (id, job)
+    }
+
+    /// Retain the exact failed payload and predecessor. New frames never replace
+    /// an uncertain write; Retry must reaffirm that same successor first.
+    private func writeScanSnapshot(_ checkpoint: Data, after prior: OpticalDecoderSaveSession,
+                                   generation: UUID, epoch ticket: UUID, ownedBy owner: UUID? = nil) async {
+        guard !Task.isCancelled, active, showRestore, epoch == ticket,
+              scanSaveGeneration == generation, scanSaveIdentity == prior.review.identity,
+              let recovery = scanRecovery else { return }
+        if owner == nil {
+            guard scanWrite == nil else { return }
+            let id = UUID()
+            let job = Task { [weak self] in
+                guard let self else { return }
+                defer { if self.scanWrite?.id == id { self.scanWrite = nil } }
+                await self.writeScanSnapshot(checkpoint, after: prior, generation: generation, epoch: ticket, ownedBy: id)
+            }
+            scanWrite = (id, job)
+            await job.value
+            return
+        }
+        guard scanWrite?.id == owner else { return }
         let writer = scanSaveEpoch
         do {
-            guard let checkpoint = try await restore.scanCheckpoint(generation: status.generation) else { return }
+            let saved = try await recovery.save(checkpoint, after: prior)
             guard active, epoch == ticket, scanSaveEpoch == writer else { return }
-            let reviewed = try await scanRecovery.save(checkpoint, permit: permit)
+            scanSaveRevision = UUID(); scanSaveSession = saved; scanSaveFailure = nil
+            scanCadence?.record(receivedParts: saved.review.receivedParts, verifiedPages: saved.review.verifiedPages)
+            scanLastSaved = .now; publishSavedScan(saved.review)
+        } catch {
             guard active, epoch == ticket, scanSaveEpoch == writer else { return }
-            scanRefreshEpoch = UUID()
-            savedScan = reviewed; scanSavedPages = checkpoint.verifiedPages
-        } catch is CancellationError { }
-        catch {
-            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
-            stopSavingScanProgress()
-            scanProgressMessage = "Saving scan progress paused. Scanning can continue; choose Save Scan Progress to retry. \(error.localizedDescription)"
-            await refreshSavedScan(epoch: ticket)
+            guard scanSaveGeneration == generation else {
+                stopSavingScanProgress()
+                scanProgressMessage = "Saving could not be confirmed before this scan changed. Review saved progress before saving again."
+                return
+            }
+            scanSaveFailure = (checkpoint, prior, generation)
+            cancelScanSaveTimer()
+            scanProgressMessage = "Saving could not be confirmed. Retry Saving to preserve this exact checkpoint, or continue without saving. \(error.localizedDescription)"
         }
     }
     private func scheduleWorkspaceRefresh(using store: WorkspaceStore, epoch ticket: UUID) {
@@ -631,6 +899,10 @@ final class MobileWorkspaceModel {
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
         locallyRevokedFingerprints = revoked
+        if let importing = credentialImport, !importing.isCommitting, !importing.isFinished,
+           !credentialImportIsCurrent(importing) {
+            importing.cancel(message: "The workspace or key changed. Select its current key reference again.")
+        }
         // A first import, or new machines in a replaced one: machines that
         // look alike get distinct themes before anything shows them.
         for saved in workspaces {
@@ -640,8 +912,104 @@ final class MobileWorkspaceModel {
         }
     }
 
+    func beginCredentialImport(workspaceID: UUID, credentialID: String) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let reference = document.credentials.first(where: { $0.id == credentialID }),
+              !locallyRevokedFingerprints.contains(reference.fingerprint),
+              !unconfirmedCredentialRevocations.contains(reference.fingerprint) else { return }
+        credentialReviewID = nil; credentialMessage = nil
+        credentialImport = WorkspaceKeyImportController(model: self, store: store,
+            workspaceID: saved.id, revision: saved.revision, credential: reference, epoch: epoch)
+    }
+
+    /// Every Files/passphrase callback belongs to this exact sheet, foreground
+    /// epoch and accepted identity. Finished receipts can show their own result
+    /// after the transaction has changed the saved revision.
+    fileprivate func credentialImportIsCurrent(_ importing: WorkspaceKeyImportController,
+                                               allowChangedRevision: Bool = false) -> Bool {
+        guard credentialImport === importing, active, !showRestore, epoch == importing.epoch,
+              !locallyRevokedFingerprints.contains(importing.credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(importing.credential.fingerprint),
+              let saved = workspaces.first(where: { $0.id == importing.workspaceID }),
+              let document = try? saved.document(), document.credentials.contains(where: {
+            $0.id == importing.credential.id && $0.algorithm == importing.credential.algorithm
+                && $0.fingerprint == importing.credential.fingerprint
+              }) else { return false }
+        return allowChangedRevision || saved.revision == importing.revision
+    }
+
+    /// Final confirmation discloses this workspace's session shutdown. Seal the
+    /// exact scene before awaiting cleanup; no replacement can open meanwhile.
+    fileprivate func prepareCredentialImport(_ importing: WorkspaceKeyImportController) async throws {
+        guard credentialImportIsCurrent(importing), !busy, credentialImportOperation == nil else {
+            throw WorkspaceStoreError.staleReview
+        }
+        credentialImportOperation = importing.id; busy = true; credentialReviewID = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let owner = liveScenes[importing.workspaceID]
+        owner?.requestClose()
+        if let owner {
+            await owner.close()
+            if liveScenes[importing.workspaceID] === owner { liveScenes[importing.workspaceID] = nil }
+        }
+        await connections?.manager.invalidate(workspaceID: importing.workspaceID)
+        try Task.checkCancellation()
+        guard credentialImportIsCurrent(importing), credentialImportOperation == importing.id else {
+            throw WorkspaceStoreError.staleReview
+        }
+    }
+
+    /// Runs in a retained, uncancelled settlement task. Even a cancelled caller
+    /// must reconcile a write which may already have published. Inactive scenes
+    /// keep readiness cleared until the normal foreground refresh can run.
+    fileprivate func finishCredentialImport(_ importing: WorkspaceKeyImportController,
+        result: Result<WorkspaceCredentialImportReceipt, Error>) async -> String {
+        guard credentialImportOperation == importing.id else {
+            return "The key import stopped before it could begin."
+        }
+        defer { credentialImportOperation = nil; busy = false }
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        availableCredentials.removeValue(forKey: importing.workspaceID)
+        localPolicies.removeValue(forKey: importing.workspaceID)
+        var refreshed = false
+        if active, let store {
+            do {
+                try await refreshWorkspaces(using: store, epoch: epoch)
+                refreshed = active && localPolicies[importing.workspaceID] != nil
+            } catch { }
+        }
+        let text: String
+        switch result {
+        case .success(let receipt):
+            if !refreshed {
+                text = "The key was imported. Reopen SSH Keys when the app is active to refresh connection readiness."
+            } else if receipt.cleanupPending {
+                text = "The key was imported. Protected-storage cleanup was retried while refreshing its device status. Connect when you are ready."
+            } else {
+                text = "The matching key is available on this phone. Connect when you are ready."
+            }
+        case .failure(let error):
+            if refreshed {
+                let present = availableCredentials[importing.workspaceID]?.contains(importing.credential.id) == true
+                let outcome = present ? "The key is currently present on this phone." : "The key is not currently available on this phone."
+                text = (error is CancellationError ? "Key import stopped. " : "The import reported a problem. "
+                    + WorkspaceKeyImportController.describe(error) + " ") + outcome
+            } else {
+                text = "The key import outcome could not be refreshed. Reopen SSH Keys when the app is active to check its actual device status before trying again."
+            }
+        }
+        credentialMessage = text
+        return text
+    }
+
+    fileprivate func releaseCredentialImport(_ importing: WorkspaceKeyImportController) {
+        if credentialImport === importing { credentialImport = nil }
+    }
+
     func reviewCredentialRevocation(workspaceID: UUID, credentialID: String) -> LocalCredentialRevocationReview? {
-        guard active, !busy, !showRestore, store != nil, connections != nil,
+        guard active, !busy, !showRestore, credentialImportOperation == nil, store != nil, connections != nil,
               let saved = workspaces.first(where: { $0.id == workspaceID }),
               let document = try? saved.document(),
               let key = document.credentials.first(where: { $0.id == credentialID }),
@@ -662,7 +1030,8 @@ final class MobileWorkspaceModel {
     /// The fingerprint is device-wide, including aliases in other workspaces.
     /// Once admitted, this task owns cleanup through suspension or sheet closure.
     func revokeCredentialLocally(_ reviewed: LocalCredentialRevocationReview) {
-        guard active, !busy, !showRestore, credentialRevocation == nil, let store, let connections else { return }
+        guard active, !busy, !showRestore, credentialImportOperation == nil,
+              credentialRevocation == nil, let store, let connections else { return }
         guard credentialReviewID == reviewed.id, epoch == reviewed.epoch,
               let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
               let document = try? saved.document(), document.credentials.contains(where: {
@@ -756,10 +1125,12 @@ final class MobileWorkspaceModel {
             for await observation in channel.stream {
                 guard !Task.isCancelled, let self else { break }
                 guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
+                let before = await restore.status()
+                guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
                 do {
                     let next = try await restore.observe(observation.text, generation: observation.generation)
                     guard self.active, self.epoch == observation.epoch else { continue }
-                    await self.saveCompletedScanPages(next, restore: restore, epoch: observation.epoch)
+                    await self.saveScanSnapshot(next, restore: restore, epoch: observation.epoch)
                     guard self.active, self.epoch == observation.epoch else { continue }
                     let latest = await restore.status()
                     guard self.active, self.epoch == observation.epoch else { continue }
@@ -770,7 +1141,17 @@ final class MobileWorkspaceModel {
                 } catch FTError.stale { continue }
                 catch is CancellationError { break }
                 catch {
-                    let latest = await restore.status()
+                    var latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    // Only receiver resets need an immediate write. Malformed
+                    // framing/checksums leave it unchanged and use the normal
+                    // cadence. Join even a manual writer so a reset cannot be
+                    // lost if later equations restore the same progress count.
+                    let repaired = before.generation == latest.generation
+                        && (latest.receivedParts < before.receivedParts || latest.verifiedPages < before.verifiedPages)
+                    await self.saveScanSnapshot(latest, restore: restore, epoch: observation.epoch, force: repaired)
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    latest = await restore.status()
                     guard self.active, self.epoch == observation.epoch else { continue }
                     if self.state?.generation != latest.generation { self.lastObservation = nil }
                     self.state = latest
@@ -792,7 +1173,7 @@ final class MobileWorkspaceModel {
     /// collect, and the code its animation carries unlocks it. Nothing to tap
     /// or type between pointing the camera and reviewing what arrives.
     private func advanceAutomatically() {
-        guard !busy, active, showRestore, let state, !state.isSuspended else { return }
+        guard !busy, !canRetryScanSave, active, showRestore, let state, !state.isSuspended else { return }
         switch state.phase {
         case .candidate:
             guard let digest = state.identity?.envelopeDigest,
@@ -876,14 +1257,14 @@ final class MobileWorkspaceModel {
     /// At most eight bounded strings wait on one consumer. No task-per-frame fanout.
     func observed(_ text: String) {
         if text.hasPrefix("FTCODE1:") {
-            guard active, showRestore, let frame = TransferCodeFrame.parse(text) else { return }
+            guard active, showRestore, cameraRequested, let frame = TransferCodeFrame.parse(text) else { return }
             if scannedCode?.digestPrefix != frame.digestPrefix || scannedCode?.code != frame.code {
                 scannedCode = frame
                 advanceAutomatically()
             }
             return
         }
-        guard active, showRestore, !busy, let state, !state.isSuspended,
+        guard active, showRestore, cameraRequested, !busy, let state, !state.isSuspended,
               [.idle, .candidate, .collecting].contains(state.phase), text.hasPrefix("FTQR1/"),
               text.utf8.count <= FTLimit.qrText, text != lastObservation else { return }
         let now = ContinuousClock.now
@@ -893,23 +1274,34 @@ final class MobileWorkspaceModel {
     }
     func run(_ action: @escaping @Sendable (OfflineRestore<AppleCryptography>, OfflineRestoreStatus) async throws -> OfflineRestoreStatus) {
         guard !busy, active, let restore else { return }
-        busy = true; message = nil
+        guard !canRetryScanSave else {
+            scanProgressMessage = "Retry Saving or choose Continue Without Saving before changing this scan."
+            return
+        }
+        busy = true; message = nil; cancelScanSaveTimer()
         let ticket = epoch, pendingLifecycle = lifecycle
         Task { [weak self] in
             await pendingLifecycle?.value
             guard let self else { return }
+            await self.scanWrite?.task.value
             defer {
                 self.busy = false
                 self.openPendingFileIfReady()
                 self.advanceAutomatically()
             }
             guard self.active, self.epoch == ticket, !self.offlineModeBlocked else { return }
+            guard !self.canRetryScanSave else {
+                self.scanProgressMessage = "Retry Saving or choose Continue Without Saving before changing this scan."
+                return
+            }
             do {
                 let current = await restore.status()
                 let result = try await action(restore, current)
                 guard self.active, self.epoch == ticket else { return }
                 if current.generation != result.generation { self.lastObservation = nil }
                 self.state = result
+                await self.saveScanSnapshot(result, restore: restore, epoch: ticket, force: true)
+                guard self.active, self.epoch == ticket else { return }
                 if result.phase == .complete { self.announce(result.arrival) }
                 if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
             } catch {
@@ -1041,7 +1433,7 @@ struct MobileWorkspaceRoot: View {
                             Button { model.requestRecipient() } label: {
                                 Label("Encrypt Only for This Phone", systemImage: "lock.iphone")
                             }.disabled(model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
-                            if model.savedScan != nil {
+                            if !model.savedScans.isEmpty {
                                 Button { model.setRestoreVisible(true) } label: {
                                     Label("Saved Scan", systemImage: "qrcode")
                                 }.disabled(model.busy)
@@ -1088,7 +1480,7 @@ struct MobileWorkspaceRoot: View {
                     .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
             }.buttonStyle(.borderedProminent).controlSize(.large)
                 .disabled(model.state == nil || model.requestingCameraAccess)
-            if model.savedScan != nil {
+            if !model.savedScans.isEmpty {
                 Button("Resume a Saved Scan") { model.setRestoreVisible(true) }
                     .disabled(model.state == nil || model.busy)
             }
@@ -1127,8 +1519,8 @@ struct OfflineRestoreSheet: View {
     @State private var repairPage = 0
     @State private var chooseFile = false
     private enum RestoreDecision {
-        case save(generation: UUID, identity: OpticalFrame.Identity)
-        case discard(OpticalScanRecoveryReview)
+        case save(generation: UUID, identity: OpticalFrame.Identity, replacing: OpticalDecoderRecoveryReview?)
+        case discard(SavedOpticalScan)
         case disconnect(RestoreSessionDisconnectReview)
         var title: String {
             switch self {
@@ -1240,7 +1632,7 @@ struct OfflineRestoreSheet: View {
                             }
                             }
                             scanProgressContent(state)
-                            if let saved = model.savedScan { savedScanContent(saved, state: state) }
+                            ForEach(model.savedScans) { saved in savedScanContent(saved, state: state) }
                             if [.candidate, .collecting, .locked, .documentReady, .review].contains(state.phase)
                                 || (state.phase == .idle && state.recipientRequest != nil) {
                                 Button("Start Over", role: .destructive) {
@@ -1262,8 +1654,8 @@ struct OfflineRestoreSheet: View {
                             isPresented: Binding(get: { restoreDecision != nil }, set: { if !$0 { restoreDecision = nil } }),
                             titleVisibility: .visible, presenting: restoreDecision) { decision in
             switch decision {
-            case .save(let generation, let identity):
-                Button("Save Encrypted Pages") { model.saveScanProgress(generation: generation, identity: identity) }
+            case .save(let generation, let identity, let reviewed):
+                Button("Save Encrypted Progress") { model.saveScanProgress(generation: generation, identity: identity, replacing: reviewed) }
                     .disabled(model.busy || !model.active)
             case .discard(let saved):
                 Button("Discard Saved Scan", role: .destructive) { model.discardSavedScan(saved) }
@@ -1275,10 +1667,12 @@ struct OfflineRestoreSheet: View {
             Button(decision.cancelTitle, role: .cancel) { restoreDecision = nil }
         } message: { decision in
             switch decision {
-            case .save:
-                Text("Keep this transfer's verified encrypted pages on this phone and save more as they arrive. The cache is protected on this device and excluded from backups. Transfer codes and phone request keys are never saved. Saving pauses when you leave restore or the app becomes inactive.")
+            case .save(_, _, let reviewed):
+                Text("Keep this transfer's encrypted pages and unfinished reconstruction progress on this phone. Progress is saved about every two seconds while scanning, and when you choose Save and Pause Scan. Transfer codes and phone request keys are never saved. The cache is device-protected and excluded from backups."
+                     + (reviewed == nil ? "" : " This updates the reviewed saved scan to your current progress, including any page repairs.")
+                     + " Saving stops when you leave restore or the app becomes inactive; a sudden interruption can lose progress since the last save.")
             case .discard(let saved):
-                Text("Discard \(saved.verifiedPages) saved pages for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further pages will stop.")
+                Text("Discard the saved pages and unfinished progress for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further progress will stop.")
             case .disconnect(let reviewed):
                 Text(verbatim: "Disconnect sessions in these workspaces:\n\n"
                     + reviewed.workspaceNames.joined(separator: "\n")
@@ -1313,34 +1707,50 @@ struct OfflineRestoreSheet: View {
         if state.source == .optical, [.collecting, .locked, .review].contains(state.phase),
            !state.isSuspended, !state.requiresRecipientResume, let identity = state.identity {
             VStack(alignment: .leading, spacing: 10) {
-                if model.isSavingScanProgress {
-                    Label("Keeping verified pages", systemImage: "externaldrive.badge.checkmark").font(.headline)
-                    Text("New complete pages are saved as you scan. You can resume the saved scan after restarting the app.")
+                if model.canRetryScanSave {
+                    Label("Saving needs your attention", systemImage: "externaldrive.badge.exclamationmark").font(.headline)
+                    Button("Retry Saving") { model.retryScanSave() }
+                    Button("Continue Without Saving") { model.continueWithoutSaving() }
+                } else if model.isSavingScanProgress {
+                    Label("Keeping scan progress", systemImage: "externaldrive.badge.checkmark").font(.headline)
+                    Text("Encrypted progress is saved about every two seconds, even before a page finishes. Save and pause before leaving to keep the latest progress.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    Button("Pause Saving") { model.stopSavingScanProgress() }
-                } else if state.verifiedPages > 0 {
-                    Button {
-                        restoreDecision = .save(generation: state.generation, identity: identity)
-                    } label: { Label("Save Scan Progress", systemImage: "square.and.arrow.down") }
-                    Text("Keep encrypted pages so an interrupted scan can continue later.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Save and Pause Scan") { model.saveAndPauseScan() }
+                    Button("Continue Without Saving") { model.continueWithoutSaving() }
                 } else {
-                    Text("After the first complete page is verified, you can save progress and continue this scan later.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                    let existing = model.savedScans.compactMap { saved -> OpticalDecoderRecoveryReview? in
+                        if case .partial(let value) = saved { return value }
+                        return nil
+                    }.first
+                    if existing == nil || existing?.identity == identity {
+                        Button {
+                            restoreDecision = .save(generation: state.generation, identity: identity, replacing: existing)
+                        } label: { Label(existing == nil ? "Save Scan Progress" : "Continue Saving This Scan", systemImage: "square.and.arrow.down") }
+                        Text("Keep encrypted progress so an interrupted scan can continue later, even if no page has finished.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        Text("Another transfer has saved progress. Review or discard that saved scan before saving this one.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                 }
             }
         }
     }
 
-    private func savedScanContent(_ saved: OpticalScanRecoveryReview, state: OfflineRestoreStatus) -> some View {
+    private func savedScanContent(_ saved: SavedOpticalScan, state: OfflineRestoreStatus) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Saved Scan", systemImage: "qrcode").font(.headline)
-            Text("\(saved.verifiedPages) of \(saved.identity.pageCount) pages · \(ByteCountFormatter.string(fromByteCount: Int64(saved.verifiedBytes), countStyle: .file))")
+            if case .verified = saved { Label("Saved Pages", systemImage: "qrcode").font(.headline) }
+            else { Label("Saved Scan", systemImage: "qrcode").font(.headline) }
+            Text("\(saved.verifiedPages) of \(saved.identity.pageCount) pages verified · \(ByteCountFormatter.string(fromByteCount: Int64(saved.verifiedBytes), countStyle: .file))")
                 .monospacedDigit()
+            if saved.independentParts > 0 {
+                Text("\(saved.independentParts) recovered pieces of unfinished pages also saved")
+                    .font(.callout).monospacedDigit()
+            }
             Text(verbatim: "Transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))")
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             if [.idle, .complete].contains(state.phase), !state.requiresRecipientResume {
-                Text("Resume these encrypted pages and keep saving new pages as you scan. The camera opens only when you tap Scan or Resume Camera. A complete saved scan still needs to be unlocked.")
+                Text("Resume this encrypted progress and keep saving as you scan. The camera opens only when you tap Scan or Resume Camera. A complete saved scan still needs to be unlocked.")
                     .font(.footnote).foregroundStyle(.secondary)
                 Button("Resume Saved Scan") {
                     code = ""; allowRemoval = false; allowRollback = false
@@ -1755,6 +2165,390 @@ private struct OpticalCamera: UIViewControllerRepresentable {
     }
 }
 
+typealias WorkspaceKeyPassphraseRequest = OpenSSHSourceKeyUnlocker<AppleCryptography>.Request
+
+/// One bounded file/unlock owner. Private material never enters the observable
+/// app model; file I/O and the synchronous bounded KDF stay off MainActor.
+private actor WorkspaceKeyImportWorker {
+    enum Selection: Sendable { case ready, passphrase(WorkspaceKeyPassphraseRequest) }
+    private let store: WorkspaceStore
+    private let review: WorkspaceCredentialImportReview
+    private var unlocker = OpenSSHSourceKeyUnlocker(using: AppleCryptography())
+    private var selected: UUID?
+    private var key: PrivateKeyRecord?
+    private var retired = false
+
+    init(store: WorkspaceStore, review: WorkspaceCredentialImportReview) {
+        self.store = store; self.review = review
+    }
+
+    func resetSelection(_ id: UUID) throws {
+        try Task.checkCancellation()
+        guard !retired else { throw FTError.stale }
+        try unlocker.cancel(); key = nil; selected = id
+    }
+
+    func selectFile(_ url: URL, selection: UUID) throws -> Selection {
+        try requireSelection(selection)
+        var bytes = try SelectedLocalFile.read(url, limit: FTLimit.key)
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        try requireSelection(selection)
+        do {
+            let result = try unlocker.select(pem: bytes, reference: review.credential)
+            try requireSelection(selection)
+            switch result {
+            case .ready(let key): self.key = key; return .ready
+            case .passphraseRequired(let request): return .passphrase(request)
+            }
+        } catch {
+            try? unlocker.cancel(); key = nil
+            throw error
+        }
+    }
+
+    func unlock(selection: UUID, requestID: UUID, passphrase: Data) throws {
+        try requireSelection(selection)
+        var secret = passphrase
+        defer { secret.resetBytes(in: 0..<secret.count) }
+        let unlocked = try unlocker.unlock(requestID: requestID, passphrase: secret)
+        try requireSelection(selection)
+        key = unlocked
+    }
+
+    func pendingRequest(selection: UUID) -> WorkspaceKeyPassphraseRequest? {
+        guard !retired, selected == selection else { return nil }
+        return unlocker.request
+    }
+
+    func commit(selection: UUID) async throws -> WorkspaceCredentialImportReceipt {
+        try requireSelection(selection)
+        guard let key else { throw FTError.stale }
+        // Final confirmation consumes this selected private value once. A
+        // failed or cancelled write is reconciled by the model, never replayed.
+        self.key = nil; selected = nil; retired = true
+        try unlocker.cancel()
+        return try await store.importCredential(key, review: review, confirmedByUser: true)
+    }
+
+    func retire() {
+        retired = true; key = nil; selected = nil
+        try? unlocker.cancel()
+    }
+
+    private func requireSelection(_ id: UUID) throws {
+        try Task.checkCancellation()
+        guard !retired, selected == id else { throw FTError.stale }
+    }
+}
+
+@MainActor
+@Observable
+final class WorkspaceKeyImportController: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID, epoch: UUID
+    let credential: WorkspaceDocument.Credential
+    private(set) var review: WorkspaceCredentialImportReview?
+    private(set) var passphraseRequest: WorkspaceKeyPassphraseRequest?
+    private(set) var fileRequest: UUID?
+    private(set) var isReady = false
+    private(set) var isWorking = false
+    private(set) var isCommitting = false
+    private(set) var isFinished = false
+    private(set) var isRetired = false
+    private(set) var message: String?
+    @ObservationIgnored private weak var model: MobileWorkspaceModel?
+    @ObservationIgnored private let store: WorkspaceStore
+    @ObservationIgnored private var worker: WorkspaceKeyImportWorker?
+    @ObservationIgnored private var selection: UUID?
+    @ObservationIgnored private var work: Task<Void, Never>?
+    @ObservationIgnored private var retirement: Task<Void, Never>?
+
+    init(model: MobileWorkspaceModel, store: WorkspaceStore, workspaceID: UUID,
+         revision: UUID, credential: WorkspaceDocument.Credential, epoch: UUID) {
+        self.model = model; self.store = store; self.workspaceID = workspaceID
+        self.revision = revision; self.credential = credential; self.epoch = epoch
+    }
+
+    var canChooseFile: Bool {
+        review != nil && !isWorking && !isFinished && !isRetired && fileRequest == nil
+    }
+    var canImport: Bool { isReady && !isWorking && !isFinished && !isRetired }
+
+    func prepare() {
+        guard review == nil, work == nil, !isRetired else { return }
+        start { [self] in
+            do {
+                let reviewed = try await store.reviewCredentialImport(workspaceID: workspaceID,
+                    expectedRevision: revision, credentialID: credential.id)
+                try requireCurrent()
+                review = reviewed; worker = WorkspaceKeyImportWorker(store: store, review: reviewed)
+            } catch { report(error) }
+        }
+    }
+
+    func chooseFile() {
+        guard canChooseFile, let worker else { return }
+        let chosen = UUID()
+        selection = chosen; isReady = false; passphraseRequest = nil; message = nil
+        start { [self] in
+            do {
+                try requireCurrent()
+                try await worker.resetSelection(chosen)
+                try requireCurrent()
+                guard selection == chosen else { throw FTError.stale }
+                fileRequest = chosen
+            } catch { report(error) }
+        }
+    }
+
+    func selectedFile(requestID: UUID, result: Result<[URL], Error>) {
+        guard fileRequest == requestID, selection == requestID, !isRetired, let worker else { return }
+        fileRequest = nil
+        do {
+            try requireCurrent()
+            let urls = try result.get()
+            guard urls.count == 1, let url = urls.first, url.isFileURL else {
+                throw FTError.malformed("file.local_url_required")
+            }
+            start { [self] in
+                do {
+                    try requireCurrent()
+                    let value = try await worker.selectFile(url, selection: requestID)
+                    try requireCurrent()
+                    guard selection == requestID else { throw FTError.stale }
+                    switch value {
+                    case .ready: isReady = true
+                    case .passphrase(let request): passphraseRequest = request
+                    }
+                } catch { report(error) }
+            }
+        } catch {
+            let failure = error as NSError
+            if failure.domain != NSCocoaErrorDomain || failure.code != NSUserCancelledError { report(error) }
+        }
+    }
+
+    func cancelledFile(requestID: UUID) {
+        guard fileRequest == requestID, selection == requestID, !isRetired else { return }
+        // resetSelection already discarded the previous key before this picker
+        // appeared; cancelling it needs no file read or unlock attempt.
+        fileRequest = nil; selection = nil
+    }
+
+    func unlock(_ passphrase: Data) {
+        guard !isWorking, !isRetired, let request = passphraseRequest,
+              let selection, let worker, (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.count) else { return }
+        message = nil
+        start { [self] in
+            do {
+                try requireCurrent()
+                try await worker.unlock(selection: selection, requestID: request.id, passphrase: passphrase)
+                try requireCurrent()
+                guard self.selection == selection, passphraseRequest?.id == request.id else { throw FTError.stale }
+                passphraseRequest = nil; isReady = true
+            } catch {
+                let remaining = await worker.pendingRequest(selection: selection)
+                guard !isRetired else { return }
+                if model?.credentialImportIsCurrent(self) == true, self.selection == selection,
+                   passphraseRequest?.id == request.id {
+                    passphraseRequest = remaining
+                    report(error)
+                } else { cancel() }
+            }
+        }
+    }
+
+    func importMatchingKey() {
+        guard canImport, let worker, let selection, let model else { return }
+        isReady = false; isCommitting = true; message = nil
+        start { [self] in
+            let result: Result<WorkspaceCredentialImportReceipt, Error>
+            do {
+                try requireCurrent()
+                try await model.prepareCredentialImport(self)
+                try requireCurrent()
+                result = .success(try await worker.commit(selection: selection))
+            } catch { result = .failure(error) }
+            // An unstructured task does not inherit caller cancellation. Keep
+            // it retained and joined so a published key always gets read back.
+            let settlement = Task { await model.finishCredentialImport(self, result: result) }
+            let outcome = await settlement.value
+            await worker.retire()
+            isCommitting = false; isFinished = true
+            if !isRetired, model.credentialImportIsCurrent(self, allowChangedRevision: true) {
+                message = outcome
+            } else { cancel() }
+        }
+    }
+
+    /// Retain the owner until its current work and secret retirement settle.
+    /// A newer sheet cannot start another KDF while this one is still draining.
+    func cancel(message: String? = nil) {
+        guard !isRetired else { return }
+        isRetired = true; isReady = false; passphraseRequest = nil; fileRequest = nil
+        if let message { model?.credentialMessage = message }
+        let pending = work, worker = worker
+        pending?.cancel()
+        retirement = Task { [self] in
+            await pending?.value
+            await worker?.retire()
+            model?.releaseCredentialImport(self)
+            retirement = nil
+        }
+    }
+
+    private func start(_ operation: @escaping @MainActor () async -> Void) {
+        guard work == nil, !isRetired else { return }
+        isWorking = true
+        work = Task { [self] in
+            defer { work = nil; isWorking = false }
+            await operation()
+        }
+    }
+
+    private func requireCurrent() throws {
+        try Task.checkCancellation()
+        guard !isRetired, model?.credentialImportIsCurrent(self) == true else { throw FTError.stale }
+    }
+
+    private func report(_ error: Error) {
+        guard !isRetired else { return }
+        guard model?.credentialImportIsCurrent(self) == true, !(error is CancellationError) else {
+            cancel(); return
+        }
+        message = Self.describe(error)
+    }
+
+    static func describe(_ error: Error) -> String {
+        if error is FTError || error is OpenSSHSourceKeyError || error is WorkspaceStoreError
+            || error is SSHAuthenticationError { return error.localizedDescription }
+        return "The selected key file or protected storage could not be read. Choose a local OpenSSH private-key file and try again."
+    }
+}
+
+/// A distinct view identity captures the picker ticket. A late result from a
+/// dismissed Files controller cannot borrow a subsequent selection's ticket.
+@MainActor
+private struct WorkspaceKeyFilePicker: View {
+    let requestID: UUID
+    let selected: @MainActor (UUID, Result<[URL], Error>) -> Void
+    let cancelled: @MainActor (UUID) -> Void
+    @State private var presented = false
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .fileImporter(isPresented: $presented, allowedContentTypes: [.data], allowsMultipleSelection: false) { [requestID, selected] result in
+                Task { @MainActor in selected(requestID, result) }
+            } onCancellation: { [requestID, cancelled] in
+                Task { @MainActor in cancelled(requestID) }
+            }
+            .task { presented = true }
+    }
+}
+
+@MainActor
+private struct WorkspaceKeyImportSheet: View {
+    @Bindable var controller: WorkspaceKeyImportController
+    @State private var passphrase = ""
+    @State private var passphraseLimit = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if controller.isRetired {
+                    ContentUnavailableView("Import Closed", systemImage: "lock.shield")
+                } else {
+                    Form {
+                        Section("Saved Identity") {
+                            if let name = controller.review?.workspaceName { Text(verbatim: name).font(.headline) }
+                            Text(verbatim: controller.credential.id)
+                            Text(verbatim: controller.credential.algorithm).font(.caption).foregroundStyle(.secondary)
+                            Text(verbatim: controller.credential.fingerprint)
+                                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            if let aliases = controller.review?.credentialIDs, aliases.count > 1 {
+                                Text("This identity also supplies \(aliases.count - 1) matching key references in this workspace.")
+                                    .font(.caption)
+                            }
+                        }
+                        if let message = controller.message {
+                            Section { Text(verbatim: message) }
+                        }
+                        if controller.isWorking {
+                            Section {
+                                ProgressView(controller.isCommitting ? "Saving key and refreshing device status…" : "Reading the selected identity…")
+                            }
+                        }
+                        if let request = controller.passphraseRequest, !controller.isFinished {
+                            Section {
+                                SecureField("Key File Passphrase", text: $passphrase)
+                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                    .textContentType(.password).submitLabel(.done)
+                                    .onSubmit(unlock)
+                                if passphraseLimit {
+                                    Text("The passphrase is limited to \(OpenSSHSourceKey.maximumPassphraseBytes) UTF-8 bytes.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Button("Unlock Selected Key", action: unlock)
+                                    .disabled(passphrase.isEmpty || controller.isWorking)
+                                Text("\(request.attemptsRemaining) attempts remaining. The passphrase is used only to unlock this selected file on the phone.")
+                                    .font(.caption)
+                            } header: { Text("Encrypted OpenSSH Key") }
+                        }
+                        if controller.isReady {
+                            Section {
+                                Label("Private key matches the saved fingerprint", systemImage: "checkmark.shield")
+                                Text("Import this key into protected storage on this phone. Existing sessions in this workspace will disconnect so its connection settings can refresh; their remote shells or programs may end. You choose when to connect again.")
+                                    .font(.callout)
+                                Button("Import Matching Key") { passphrase = ""; controller.importMatchingKey() }
+                                    .disabled(!controller.canImport)
+                                    .accessibilityIdentifier("keys.import.confirm")
+                            }
+                        }
+                        if !controller.isFinished {
+                            Section {
+                                Button(controller.isReady || controller.passphraseRequest != nil ? "Choose Another Key File" : "Choose Key File") {
+                                    passphrase = ""; passphraseLimit = false; controller.chooseFile()
+                                }.disabled(!controller.canChooseFile)
+                                    .accessibilityIdentifier("keys.import.choose")
+                            } footer: {
+                                Text("Choose a local OpenSSH private-key file for this exact fingerprint. Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including files protected with bcrypt and AES-CTR.")
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Import SSH Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(controller.isFinished ? "Done" : "Cancel") { passphrase = ""; controller.cancel() }
+                }
+            }
+        }
+        .privacySensitive()
+        .interactiveDismissDisabled(controller.isCommitting)
+        .background {
+            if let request = controller.fileRequest {
+                WorkspaceKeyFilePicker(requestID: request, selected: controller.selectedFile,
+                                       cancelled: controller.cancelledFile).id(request)
+            }
+        }
+        .task { controller.prepare() }
+        .onChange(of: controller.passphraseRequest?.id) { _, _ in passphrase = ""; passphraseLimit = false }
+        .onChange(of: passphrase) { old, value in
+            if value.utf8.count > OpenSSHSourceKey.maximumPassphraseBytes {
+                passphrase = old; passphraseLimit = true
+            }
+        }
+        .onDisappear { passphrase = ""; controller.cancel() }
+    }
+
+    private func unlock() {
+        guard !passphrase.isEmpty, passphrase.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else { return }
+        let bytes = Data(passphrase.utf8)
+        passphrase = ""; passphraseLimit = false
+        controller.unlock(bytes)
+    }
+}
+
 @MainActor
 private struct WorkspaceKeysSheet: View {
     let workspaceID: UUID
@@ -1767,6 +2561,7 @@ private struct WorkspaceKeysSheet: View {
     }
 
     var body: some View {
+        let importing = model.credentialImport.flatMap { $0.isRetired ? nil : $0 }
         NavigationStack {
             Group {
                 if !model.active {
@@ -1801,6 +2596,11 @@ private struct WorkspaceKeysSheet: View {
                                     }
                                     let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
                                     Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
+                                    Button("Import Matching Key…", systemImage: "square.and.arrow.down") {
+                                        reviewed = nil
+                                        model.beginCredentialImport(workspaceID: workspaceID, credentialID: key.id)
+                                    }.disabled(revoked || pending || model.credentialImport != nil)
+                                        .accessibilityIdentifier("keys.import.\(key.id)")
                                     Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
                                         reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
                                     }.disabled(revoked && !pending)
@@ -1825,6 +2625,9 @@ private struct WorkspaceKeysSheet: View {
             }
         }
         .interactiveDismissDisabled(model.busy)
+        .sheet(item: Binding(get: { importing }, set: { if $0 == nil { importing?.cancel() } })) { controller in
+            WorkspaceKeyImportSheet(controller: controller)
+        }
         .confirmationDialog("Revoke Key on This Phone?",
                             isPresented: Binding(get: { reviewed != nil }, set: { if !$0 { reviewed = nil } }),
                             titleVisibility: .visible, presenting: reviewed) { review in
