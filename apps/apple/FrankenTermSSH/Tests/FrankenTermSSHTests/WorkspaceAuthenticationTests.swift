@@ -76,10 +76,11 @@ final class SSHWorkspaceTestVault: WorkspaceCredentialVault, WorkspaceSSHSigning
 
 struct SSHWorkspaceTestFixture: Sendable {
     let store: WorkspaceStore, broker: SSHAuthenticationBroker, vault: SSHWorkspaceTestVault
-    let installed: InstalledWorkspace, archive: AirGapArchive, publicBlob: Data, host: WorkspaceDocument.HostKey
+    let installed: InstalledWorkspace, archive: AirGapArchive, publicBlob: Data, hostBlob: Data, host: WorkspaceDocument.HostKey
     let endpoint: NativeSSHEndpoint
 
     @MainActor static func make(hostname: String = "localhost", port: UInt16 = 22, hostBlob: Data? = nil,
+                     routeMode: String = "direct_ssh",
                      seed: Data = Data(0..<32), persistence: any WorkspacePersistence = SSHWorkspaceTestPersistence(),
                      mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Self {
         let crypto = SSHWorkspaceTestCryptography()
@@ -99,11 +100,14 @@ struct SSHWorkspaceTestFixture: Sendable {
         let theme: [String: Any] = ["id": "theme", "name": "Test", "foreground": "#FFFFFF", "background": "#10223C", "accent": "#3B82F6",
             "ansi": Array(repeating: "#123456", count: 16), "cursor_foreground": "#000000", "cursor_background": "#FFFFFF",
             "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF", "selection_background": "#345D91"]
+        var route: [String: Any] = ["id": "route", "mode": routeMode, "host": hostname, "port": Int(port), "user": "operator",
+            "credential_refs": ["key"], "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": []]
+        if routeMode == "frankenterm_mux" { route["attach_policy"] = "existing_only" }
+        else { route["session_creation"] = "on_select" }
         var workspace: [String: Any] = [
             "id": "work", "name": "Synthetic", "groups": [["id": "group", "name": "Test", "machine_order": ["machine"], "auto_connect": true]],
             "machines": [["id": "machine", "name": "Test", "theme_ref": "theme", "route_refs": ["route"], "preferred_route_ref": "route", "auto_connect": true]],
-            "routes": [["id": "route", "mode": "direct_ssh", "session_creation": "on_select", "host": hostname, "port": Int(port), "user": "operator",
-                "credential_refs": ["key"], "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": []]],
+            "routes": [route],
             "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
                 "requirement": "matching_private_key", "private_material": "not_included"]],
             "host_trust": [["id": "trust", "host": hostname, "port": Int(port), "revoked_keys": [],
@@ -120,13 +124,16 @@ struct SSHWorkspaceTestFixture: Sendable {
         let broker = SSHAuthenticationBroker(store: store, signer: vault, support: WorkspaceNativeSSHAuthentication.routeSupport)
         await broker.resume()
         return .init(store: store, broker: broker, vault: vault, installed: installed, archive: archive, publicBlob: blob,
+            hostBlob: peerIdentity.blob,
             host: try WorkspaceDocument.HostKey(algorithm: peerIdentity.algorithm, fingerprint: peerIdentity.fingerprint),
             endpoint: try NativeSSHEndpoint(host: hostname, port: port))
     }
 
-    func peer(transport: UUID, endpoint: NativeSSHEndpoint? = nil, hostKey: Data? = nil, cipher: String = "aes256-ctr") -> NativeSSHPeer {
-        .init(transportID: transport, endpoint: endpoint ?? self.endpoint, hostKey: hostKey ?? publicBlob,
-            keyExchange: "curve25519-sha256", hostSignature: "ssh-ed25519", outboundCipher: cipher, inboundCipher: cipher,
+    func peer(transport: UUID, endpoint: NativeSSHEndpoint? = nil, hostKey: Data? = nil, cipher: String = "aes256-ctr",
+              signature: String? = nil) -> NativeSSHPeer {
+        .init(transportID: transport, endpoint: endpoint ?? self.endpoint, hostKey: hostKey ?? hostBlob,
+            keyExchange: "curve25519-sha256", hostSignature: signature ?? (host.algorithm == "ssh-rsa" ? "rsa-sha2-512" : host.algorithm),
+            outboundCipher: cipher, inboundCipher: cipher,
             outboundMAC: "hmac-sha2-256-etm@openssh.com", inboundMAC: "hmac-sha2-256-etm@openssh.com",
             outboundCompression: "none", inboundCompression: "none")
     }
@@ -169,8 +176,8 @@ final class WorkspaceAuthenticationTests: XCTestCase {
     private func refuse(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
         do { try await body(); XCTFail("Authority should have been refused", file: file, line: line) } catch {}
     }
-    private func signed(_ fixture: SSHWorkspaceTestFixture, transport: UUID) async throws -> (WorkspaceNativeSSHAuthentication, NativeSSHPeer, NativeSSHIdentity) {
-        let authority = fixture.authority(transport: transport), peer = fixture.peer(transport: transport)
+    private func signed(_ fixture: SSHWorkspaceTestFixture, transport: UUID, hostSignature: String? = nil) async throws -> (WorkspaceNativeSSHAuthentication, NativeSSHPeer, NativeSSHIdentity) {
+        let authority = fixture.authority(transport: transport), peer = fixture.peer(transport: transport, signature: hostSignature)
         let identity = try await authority.identity(for: peer)
         let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 7, count: 32), user: "operator", publicBlob: identity.publicKey)
         let challenge = try NativeSSHChallenge(bytes: typed.signedData, transportID: transport, identity: identity)
@@ -195,6 +202,71 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 7, count: 32), user: identity.user, publicBlob: identity.publicKey)
         let replay = try NativeSSHChallenge(bytes: typed.signedData, transportID: transport, identity: identity)
         await refuse { _ = try await authority.signature(for: replay, peer: peer) }
+    }
+
+    func testExplicitMuxRouteAuthenticatesWithoutChangingItsAttachmentPolicy() async throws {
+        let f = try await SSHWorkspaceTestFixture.make(routeMode: "frankenterm_mux"), transport = UUID()
+        let (authority, peer, identity) = try await signed(f, transport: transport)
+        let authorization = try await f.broker.authorization(workspaceID: f.installed.id,
+            expectedRevision: f.installed.revision, routeID: "route", credentialID: "key", presentedHostKey: f.host)
+        XCTAssertEqual(authorization.routeMode, "frankenterm_mux")
+        XCTAssertEqual(identity.publicKey, f.publicBlob)
+        let saved = try await f.store.load().first?.document()
+        let route = try XCTUnwrap(saved?.routes.first)
+        XCTAssertEqual(route.mode, "frankenterm_mux")
+        XCTAssertEqual(route.attachPolicy, "existing_only")
+        XCTAssertNil(route.sessionCreation)
+        XCTAssertTrue(f.installed.connectLater)
+        XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
+        // Enabling the route's existing transport must not bypass the ordinary
+        // revocation/revalidation boundary after a successful signature.
+        try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host)
+        await refuse { try await authority.validate(peer: peer, identity: identity) }
+        await refuse { try await authority.validateCurrent() }
+    }
+
+    /// A bounded structural host fixture; the real SSH lane supplies independently
+    /// generated RSA private keys and verifies their exchange signatures.
+    private func rsaHostBlob() -> Data {
+        var blob = Data([0, 0, 0, 7]) + Data("ssh-rsa".utf8)
+        blob += Data([0, 0, 0, 3, 1, 0, 1])
+        blob += Data([0, 0, 1, 1, 0]) + Data(repeating: 0xA5, count: 256)
+        return blob
+    }
+
+    func testRSAHostSignaturesKeepHostIdentitySeparateFromTheUserCredential() async throws {
+        XCTAssertTrue(WorkspaceNativeSSHAuthentication.routeSupport.hostKeyAlgorithms.contains("ssh-rsa"))
+        XCTAssertFalse(WorkspaceNativeSSHAuthentication.routeSupport.credentialAlgorithms.contains("ssh-rsa"))
+        for signature in ["rsa-sha2-256", "rsa-sha2-512"] {
+            let f = try await SSHWorkspaceTestFixture.make(hostBlob: rsaHostBlob()), transport = UUID()
+            let (_, peer, identity) = try await signed(f, transport: transport, hostSignature: signature)
+            let authorization = try await f.broker.authorization(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, routeID: "route", credentialID: "key", presentedHostKey: f.host)
+            XCTAssertEqual(peer.hostSignature, signature)
+            XCTAssertEqual(authorization.presentedHostKey.algorithm, "ssh-rsa")
+            XCTAssertEqual(authorization.presentedHostKey.fingerprint, f.host.fingerprint)
+            XCTAssertEqual(authorization.algorithm, "ssh-ed25519")
+            XCTAssertEqual(identity.publicKey, f.publicBlob)
+            XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
+        }
+    }
+
+    func testRSAHostSHA1WrongSignaturePinMismatchAndRevocationFailBeforeKeyRead() async throws {
+        for signature in ["ssh-rsa", "ssh-ed25519", "rsa-sha2-512-cert-v01@openssh.com"] {
+            let f = try await SSHWorkspaceTestFixture.make(hostBlob: rsaHostBlob()), transport = UUID()
+            let authority = f.authority(transport: transport), peer = f.peer(transport: transport, signature: signature)
+            await refuse { _ = try await authority.identity(for: peer) }
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+        }
+        for revoked in [false, true] {
+            let f = try await SSHWorkspaceTestFixture.make(hostBlob: rsaHostBlob()), transport = UUID()
+            var host = f.hostBlob
+            if revoked { try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host) }
+            else { host[host.count - 1] ^= 2 }
+            let authority = f.authority(transport: transport), peer = f.peer(transport: transport, hostKey: host)
+            await refuse { _ = try await authority.identity(for: peer) }
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+        }
     }
 
     func testMuxRouteSignsInLikeADirectOne() async throws {
@@ -289,7 +361,32 @@ final class WorkspaceAuthenticationTests: XCTestCase {
               let mode = environment["FT_WORKSPACE_SSH_TEST_MODE"] else {
             throw XCTSkip("Run Tests/Interop/test_workspace.py with the built XCTest bundle and native driver.")
         }
-        let f = try await SSHWorkspaceTestFixture.make(port: port, hostBlob: mode == "wrong-host" ? nil : host)
+        let f = try await SSHWorkspaceTestFixture.make(port: port,
+            hostBlob: ["wrong-host", "rsa-wrong-host"].contains(mode) ? nil : host,
+            routeMode: mode.hasPrefix("mux-") ? "frankenterm_mux" : "direct_ssh")
+        let expectedHostSignature = environment["FT_WORKSPACE_SSH_TEST_HOST_SIGNATURE"]
+        if mode.hasPrefix("rsa-") {
+            XCTAssertNotNil(expectedHostSignature)
+            XCTAssertEqual(try SSHPublicIdentity(blob: host).algorithm, "ssh-rsa")
+        }
+        if mode == "rsa-probe" {
+            let route = try XCTUnwrap(f.archive.workspace.routes.first), activity = WorkspaceNetworkActivity()
+            let result = await WorkspaceRouteProbe.run(route: route, document: f.archive.workspace,
+                timeout: .seconds(5), networkActivity: activity)
+            XCTAssertNil(result.failure)
+            XCTAssertEqual(result.hostKey, .trustedPin)
+            let peer = try XCTUnwrap(result.peer)
+            XCTAssertEqual(peer.hostKey, host)
+            XCTAssertEqual(peer.hostSignature, try XCTUnwrap(expectedHostSignature))
+            XCTAssertEqual(try SSHPublicIdentity(blob: peer.hostKey).fingerprint, f.host.fingerprint)
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+            XCTAssertEqual(activity.accounting().connections, 0)
+            return
+        }
+        if mode == "mux-owner-auth" || mode == "mux-revoked" {
+            try await exerciseLiveMuxAuthentication(f, revoked: mode == "mux-revoked")
+            return
+        }
         if mode.hasPrefix("owner-") {
             try await exerciseLiveOwner(f, mode: mode)
             return
@@ -297,18 +394,39 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         let session = try await NativeSSHConnector.connect(to: f.endpoint, timeout: .seconds(5))
         do {
             let authority = f.authority(transport: session.transportID)
-            if mode == "revoked" { try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host) }
-            if mode == "wrong-host" || mode == "revoked" {
-                await refuse { _ = try await session.authenticate(using: authority, timeout: .seconds(5)) }
+            if mode == "revoked" || mode == "rsa-revoked" {
+                try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host)
+            }
+            if ["wrong-host", "revoked", "rsa-wrong-host", "rsa-revoked", "rsa-sha1-only"].contains(mode) {
+                do {
+                    _ = try await session.authenticate(using: authority, timeout: .seconds(5))
+                    XCTFail("An untrusted or SHA-1-only host must not authenticate")
+                } catch {
+                    if mode == "rsa-sha1-only" {
+                        let failure = try XCTUnwrap(error as? NativeSSHError)
+                        XCTAssertFalse(failure.isCredentialRefused)
+                        XCTAssertFalse(failure.isUnreachable)
+                    }
+                }
                 XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
             } else {
-                _ = try await session.authenticate(using: authority, timeout: .seconds(5))
+                let peer = try await session.authenticate(using: authority, timeout: .seconds(5))
+                if mode == "rsa-success" {
+                    XCTAssertEqual(peer.hostKey, host)
+                    XCTAssertEqual(peer.hostSignature, try XCTUnwrap(expectedHostSignature))
+                    XCTAssertEqual(f.host.algorithm, "ssh-rsa")
+                    let authorization = try await f.broker.authorization(workspaceID: f.installed.id,
+                        expectedRevision: f.installed.revision, routeID: "route", credentialID: "key", presentedHostKey: f.host)
+                    XCTAssertEqual(authorization.presentedHostKey.algorithm, "ssh-rsa")
+                    XCTAssertEqual(authorization.presentedHostKey.fingerprint, f.host.fingerprint)
+                    XCTAssertEqual(authorization.algorithm, "ssh-ed25519")
+                }
                 XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
                 if mode == "revoke-before-shell" {
                     try await f.store.revokeLocally(fingerprint: f.archive.workspace.credentials[0].fingerprint)
                     await refuse { try await session.openShell(geometry: .init(columns: 80, rows: 24), timeout: .seconds(5)) }
                 } else {
-                    XCTAssertEqual(mode, "success")
+                    XCTAssertTrue(mode == "success" || mode == "rsa-success")
                     try await session.openShell(geometry: .init(columns: 80, rows: 24), timeout: .seconds(5))
                     let bytes = Data("Imported key → real SSH.\rEND-SESSION\r".utf8)
                     let admission = try await session.admit(bytes)
@@ -328,6 +446,44 @@ final class WorkspaceAuthenticationTests: XCTestCase {
             let statistics = try await session.accounting()
             XCTAssertEqual(statistics.allocatedBytes, 0)
         } catch { await session.close(); throw error }
+    }
+
+    private func exerciseLiveMuxAuthentication(_ f: SSHWorkspaceTestFixture, revoked: Bool) async throws {
+        let activity = WorkspaceNetworkActivity()
+        func connect() async throws -> WorkspaceNativeSSHConnection {
+            try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, machineID: "machine", routeID: "route", credentialID: "key",
+                confirmedByUser: true, store: f.store, broker: f.broker, networkActivity: activity,
+                connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5),
+                // This test qualifies the real authentication path for a mux
+                // route. It never opens a channel or invokes a mux codec.
+                muxClientFactory: { throw TerminalMuxError.unavailable })
+        }
+        if revoked {
+            try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host)
+            await refuse { _ = try await connect() }
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+            XCTAssertEqual(activity.accounting().connections, 0)
+            return
+        }
+        let owner = try await connect()
+        do {
+            XCTAssertNotNil(owner.muxControl)
+            XCTAssertEqual(owner.peer.hostKey, f.hostBlob)
+            XCTAssertEqual(owner.scope.workspaceID, f.installed.id)
+            XCTAssertEqual(owner.scope.workspaceRevision, f.installed.revision)
+            XCTAssertEqual(owner.scope.routeID, "route")
+            XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
+            let authorization = try await f.broker.authorization(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, routeID: "route", credentialID: "key", presentedHostKey: f.host)
+            XCTAssertEqual(authorization.routeMode, "frankenterm_mux")
+            let route = try XCTUnwrap(f.archive.workspace.routes.first)
+            XCTAssertEqual(route.mode, "frankenterm_mux")
+            XCTAssertEqual(route.attachPolicy, "existing_only")
+            XCTAssertNil(route.sessionCreation)
+            await owner.close()
+            XCTAssertEqual(activity.accounting().connections, 0)
+        } catch { await owner.close(); throw error }
     }
 
     private func exerciseLiveOwner(_ f: SSHWorkspaceTestFixture, mode: String) async throws {

@@ -183,7 +183,7 @@ public enum WorkspaceRouteProbe {
         withExtendedLifetime(lease) {}
         guard let peer = await witness.peer else { return .init(network: network, hostKey: nil, peer: nil, failure: failure) }
         do {
-            let identity = try SSHPublicIdentity(blob: peer.hostKey)
+            let identity = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
             let decision = try document.verifyHostKey(forRouteID: route.id,
                 presented: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint),
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),

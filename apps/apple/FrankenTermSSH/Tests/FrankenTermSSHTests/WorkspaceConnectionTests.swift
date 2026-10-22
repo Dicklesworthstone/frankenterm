@@ -135,7 +135,7 @@ final class WorkspaceConnectionTests: XCTestCase {
         await broker.resume()
         let crossing = SSHWorkspaceTestFixture(store: store, broker: broker, vault: fixture.vault,
             installed: installed, archive: fixture.archive, publicBlob: fixture.publicBlob,
-            host: fixture.host, endpoint: fixture.endpoint)
+            hostBlob: fixture.hostBlob, host: fixture.host, endpoint: fixture.endpoint)
         persistence.beforeNextCatalogRead {
             // Pause the store's synchronous read only after connect captured its
             // foreground witness. Resume the real broker in a different epoch

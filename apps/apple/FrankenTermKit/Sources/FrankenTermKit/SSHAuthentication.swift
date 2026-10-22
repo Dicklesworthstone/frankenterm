@@ -31,7 +31,10 @@ public struct SSHPublicIdentity: Sendable, Equatable {
     public let blob: Data, algorithm: String, fingerprint: String
 
     public init(blob: Data) throws {
-        guard (1...512).contains(blob.count) else { throw SSHAuthenticationError.invalidChallenge }
+        // An 8192-bit RSA modulus needs 1024 magnitude bytes and one mpint
+        // sign byte. The exponent is at most 64 bits; all three SSH strings
+        // together fit in 1053 bytes. User-authentication keeps its own cap.
+        guard (1...1053).contains(blob.count) else { throw SSHAuthenticationError.invalidChallenge }
         var reader = ByteCursor(blob)
         guard let algorithm = String(data: try reader.sshString(cap: 64), encoding: .ascii) else {
             throw SSHAuthenticationError.invalidChallenge
@@ -49,10 +52,44 @@ public struct SSHPublicIdentity: Sendable, Equatable {
             case .nistp384: _ = try P384.Signing.PublicKey(x963Representation: point)
             case .nistp521: _ = try P521.Signing.PublicKey(x963Representation: point)
             }
+        } else if algorithm == "ssh-rsa" {
+            let exponent = try Self.positiveMPInt(&reader, maximumBytes: 8)
+            let modulus = try Self.positiveMPInt(&reader, maximumBytes: 1024)
+            guard let first = modulus.first, let last = modulus.last,
+                  last & 1 == 1, exponent.last.map({ $0 & 1 == 1 }) == true,
+                  exponent.count > 1 || exponent.first.map({ $0 >= 3 }) == true else {
+                throw SSHAuthenticationError.invalidChallenge
+            }
+            let bits = (modulus.count - 1) * 8 + (8 - first.leadingZeroBitCount)
+            guard (2048...8192).contains(bits) else { throw SSHAuthenticationError.unsupportedAlgorithm }
         } else { throw SSHAuthenticationError.unsupportedAlgorithm }
         guard reader.remaining == 0 else { throw SSHAuthenticationError.invalidChallenge }
         self.blob = blob; self.algorithm = algorithm
         fingerprint = "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    }
+
+    /// RFC 8332 keeps the public key blob and fingerprint in `ssh-rsa` format
+    /// while negotiating a distinct SHA-2 host signature. This is a format
+    /// compatibility check, not signature verification or host trust. The
+    /// transport must verify the actual exchange before supplying this name.
+    public func permitsHostSignature(_ signatureAlgorithm: String) -> Bool {
+        if algorithm == "ssh-rsa" {
+            return signatureAlgorithm == "rsa-sha2-256" || signatureAlgorithm == "rsa-sha2-512"
+        }
+        return signatureAlgorithm == algorithm
+    }
+
+    private static func positiveMPInt(_ reader: inout ByteCursor, maximumBytes: Int) throws -> Data {
+        let encoded = try reader.sshString(cap: maximumBytes + 1)
+        guard let first = encoded.first, first & 0x80 == 0 else { throw SSHAuthenticationError.invalidChallenge }
+        if first == 0 {
+            guard encoded.count > 1, encoded[encoded.startIndex + 1] & 0x80 != 0 else {
+                throw SSHAuthenticationError.invalidChallenge
+            }
+            return Data(encoded.dropFirst())
+        }
+        guard encoded.count <= maximumBytes else { throw SSHAuthenticationError.invalidChallenge }
+        return encoded
     }
 }
 
@@ -72,6 +109,12 @@ public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvert
               !user.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               !publicBlob.isEmpty, publicBlob.count <= 512 else { throw SSHAuthenticationError.invalidChallenge }
         let identity = try SSHPublicIdentity(blob: publicBlob)
+        // Public RSA host support does not enable RSA credential offers or
+        // signing. Their negotiated algorithm/container path is separate.
+        guard identity.algorithm == "ssh-ed25519"
+            || SSHECDSACurve.allCases.contains(where: { $0.algorithm == identity.algorithm }) else {
+            throw SSHAuthenticationError.unsupportedAlgorithm
+        }
         self.sessionIdentifier = sessionIdentifier; self.user = user
         self.publicBlob = publicBlob; self.algorithm = identity.algorithm
         fingerprint = identity.fingerprint

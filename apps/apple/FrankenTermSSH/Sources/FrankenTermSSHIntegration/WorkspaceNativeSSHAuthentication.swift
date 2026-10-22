@@ -9,13 +9,14 @@ import FrankenTermSSH
 /// its offline/network scope before invoking NativeSSHConnector.
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     /// This is the implemented adapter profile, not Apple-device qualification.
-    /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA host
-    /// keys, certificates, password/MFA and jumps are not enabled. A mux route
-    /// signs in exactly like a direct one; only the channel it opens differs.
+    /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
+    /// require SHA-2 signatures; RSA credentials, certificates, password/MFA
+    /// and jump transports are not enabled. A mux route authenticates like a
+    /// direct one; only the channel it opens differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
-        hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"])
+        hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"])
 
     private final class Retirement: @unchecked Sendable {
         private let lock = NSLock()
@@ -187,20 +188,27 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     }
 
     private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
+        guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.denied }
+        let host = try Self.hostIdentity(for: peer)
+        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+    }
+
+    /// Authentication and read-only route diagnosis apply the same negotiated
+    /// exchange profile. The native driver has already verified its signature.
+    static func hostIdentity(for peer: NativeSSHPeer) throws -> SSHPublicIdentity {
         let exchanges: Set<String> = ["curve25519-sha256", "curve25519-sha256@libssh.org",
             "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521"]
         let ciphers: Set<String> = ["aes256-ctr", "aes128-ctr"]
         let macs: Set<String> = ["hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"]
-        guard peer.transportID == transportID, peer.endpoint == endpoint,
-              exchanges.contains(peer.keyExchange), ciphers.contains(peer.outboundCipher), ciphers.contains(peer.inboundCipher),
+        guard exchanges.contains(peer.keyExchange), ciphers.contains(peer.outboundCipher), ciphers.contains(peer.inboundCipher),
               macs.contains(peer.outboundMAC), macs.contains(peer.inboundMAC),
               peer.outboundCompression == "none", peer.inboundCompression == "none" else {
             throw SSHAuthenticationError.denied
         }
         let host = try SSHPublicIdentity(blob: peer.hostKey)
-        guard peer.hostSignature == host.algorithm, Self.routeSupport.hostKeyAlgorithms.contains(host.algorithm) else {
+        guard host.permitsHostSignature(peer.hostSignature), Self.routeSupport.hostKeyAlgorithms.contains(host.algorithm) else {
             throw SSHAuthenticationError.denied
         }
-        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+        return host
     }
 }

@@ -118,12 +118,15 @@ def signature(key, data):
 
 class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
-                 auth_mode="normal", connections=1):
+                 auth_mode="normal", connections=1, host_key=None, host_signature=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
+        if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
+            raise ValueError("test host signature must be an exact supported fixture value")
         self.public = public_blob(key)
-        self.host_key = ec.generate_private_key(ec.SECP256R1())
+        self.host_key = host_key or ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
+        self.host_signature = host_signature
         self.reject = reject
         self.completion = completion
         self.auth_mode = auth_mode
@@ -182,6 +185,13 @@ class LoopbackServer:
             disabled = C.c_bool(False)
             if SERVER.ssh_bind_options_set(server, 19, C.byref(disabled)) != 0:
                 raise RuntimeError("test config isolation failed")
+            # SSH_BIND_OPTIONS_HOSTKEY_ALGORITHMS is 18 in libssh's public
+            # server.h. Offer exactly one signature algorithm; an RSA public
+            # blob remains ssh-rsa even when the exchange uses RSA/SHA-2.
+            if self.host_signature is not None:
+                algorithm = C.c_char_p(self.host_signature.encode("ascii"))
+                if SERVER.ssh_bind_options_set(server, 18, algorithm) != 0:
+                    raise RuntimeError("test host signature selection failed")
             if SERVER.ssh_bind_accept_fd(server, session, sock.detach()) != 0:
                 raise RuntimeError("test accept failed")
             if SERVER.ssh_handle_key_exchange(session) != 0:
