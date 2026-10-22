@@ -136,6 +136,7 @@ private struct TerminalReadOnlyOutput: UIViewRepresentable {
 struct MuxSearchScreen: View {
     let session: TerminalSessionController
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var text = ""
     @State private var scope = Scope.pane
     @State private var caseSensitive = false
@@ -179,14 +180,23 @@ struct MuxSearchScreen: View {
                 MuxSearchContextScreen(session: session, hit: hit, pane: pane(hit.pane)) { dismiss() }
             }
         }
-        .onDisappear { session.muxControl?.clearSearch(); typing?.cancel() }
+        .onAppear { session.beginMuxSearch() }
+        .onDisappear { session.endMuxSearch(); typing?.cancel() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { typing?.cancel(); session.endMuxSearch(); opened = nil; dismiss() }
+        }
+        .onChange(of: session.phase) { _, phase in
+            if phase != .live { typing?.cancel(); session.endMuxSearch(); opened = nil; dismiss() }
+        }
     }
 
     private var hint: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Searches the full scrollback on \(session.target.machineName), not just what this phone has drawn.",
+            Label("Searches scrollback on \(session.target.machineName), not just what this phone has drawn.",
                   systemImage: "magnifyingglass")
             Text("Pick This Pane or All Panes above the results.").foregroundStyle(.secondary)
+            Text("Results have device limits and deadlines. Interrupted or limited searches are marked incomplete.")
+                .foregroundStyle(.secondary)
         }
         .font(.callout).listRowSeparator(.hidden).padding(.vertical, 8)
     }
@@ -194,6 +204,7 @@ struct MuxSearchScreen: View {
     /// Runs the search `delay` after the last change to it; a new one replaces it.
     private func run(after delay: Duration) {
         typing?.cancel()
+        guard scenePhase == .active, session.phase == .live else { return }
         let query = text.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty, let control = session.muxControl, let state else {
             session.muxControl?.clearSearch(); return
@@ -206,11 +217,11 @@ struct MuxSearchScreen: View {
             let all = state.panes.map(\.paneId)
             if let shown = state.shown { panes = [shown] + all.filter { $0 != shown } } else { panes = all }
         }
-        guard !panes.isEmpty else { return }
         let request = TerminalMuxControl.SearchQuery(text: query, caseSensitive: caseSensitive, regex: regex)
         typing = Task {
             if delay > .zero { try? await Task.sleep(for: delay) }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, scenePhase == .active, session.phase == .live,
+                  session.muxControl === control else { return }
             control.search(request, panes: panes)
         }
     }
@@ -224,6 +235,14 @@ struct MuxSearchScreen: View {
             HStack(spacing: 8) {
                 if !search.pending.isEmpty { ProgressView().controlSize(.small) }
                 Text(summary(search, total: total)).font(.caption).foregroundStyle(.secondary)
+                if !search.pending.isEmpty {
+                    Spacer()
+                    Button("Stop Search") { typing?.cancel(); session.muxControl?.cancelSearch(search.id) }
+                        .accessibilityIdentifier("terminal.mux.search.stop")
+                }
+            }
+            if let issue = search.issue {
+                Text(verbatim: issue).font(.callout).foregroundStyle(.orange)
             }
         }
         ForEach(answered.filter { !$0.1.matches.isEmpty || $0.1.error != nil || search.panes.count == 1 }, id: \.0) { id, result in
@@ -234,7 +253,7 @@ struct MuxSearchScreen: View {
                     Text("No matches in the last \(result.searchedRows.formatted()) rows.").font(.callout).foregroundStyle(.secondary)
                 }
                 ForEach(result.matches) { match in
-                    Button { opened = MuxSearchHit(pane: id, match: match, query: search.query) } label: {
+                    Button { opened = MuxSearchHit(searchID: search.id, pane: id, match: match, query: search.query) } label: {
                         MuxSearchMatchRow(match: match, query: search.query)
                     }
                 }
@@ -249,16 +268,20 @@ struct MuxSearchScreen: View {
         if !search.pending.isEmpty {
             return "Searching \(panes)… \(total) match\(total == 1 ? "" : "es") so far"
         }
-        return total == 0 ? "No matches in \(panes)." : "\(total) match\(total == 1 ? "" : "es") in \(panes), newest first"
+        if search.issue != nil || search.results.values.contains(where: { $0.error != nil }) {
+            return "\(total) matches received. This search is incomplete."
+        }
+        return total == 0 ? "No matches in the searched rows of \(panes)." : "\(total) match\(total == 1 ? "" : "es") received from \(panes), newest first"
     }
 }
 
 /// One match opened from the results.
 struct MuxSearchHit: Hashable, Identifiable {
+    let searchID: UUID
     let pane: Int
     let match: TerminalMuxSearchMatch
     let query: TerminalMuxControl.SearchQuery
-    var id: String { "\(pane):\(match.id)" }
+    var id: String { "\(searchID):\(pane):\(match.id)" }
     static func == (a: Self, b: Self) -> Bool { a.id == b.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
@@ -303,6 +326,15 @@ enum MuxSearchHighlight {
     /// `line` with cells `start..<end` marked (to the line's end without
     /// `end`), and the long lead-in before a far-right match shortened.
     static func marked(_ line: String, from start: Int, to end: Int?) -> AttributedString {
+        // The wire supplies cell coordinates but only plain text, not a cell
+        // map. Swift Character indices are not terminal columns for wide or
+        // combining glyphs. Highlight the matching row rather than inventing a
+        // substring location in that case; exact spans require canonical cells.
+        guard line.utf8.allSatisfy({ (32...126).contains($0) }) else {
+            var text = AttributedString(line)
+            text.backgroundColor = .yellow.opacity(0.15)
+            return text
+        }
         let characters = Array(line)
         let lower = min(max(start, 0), characters.count)
         let upper = min(max(end ?? characters.count, lower), characters.count)
@@ -330,11 +362,21 @@ private struct MuxSearchContextScreen: View {
         session.muxState?.context.flatMap { $0.pane == hit.pane && $0.row == hit.match.row ? $0 : nil }
     }
 
+    private var hitIsCurrent: Bool {
+        guard session.phase == .live, let state = session.muxControl?.current,
+              state.search?.id == hit.searchID, state.panes.contains(where: { $0.paneId == hit.pane }) else { return false }
+        return state.search?.results[hit.pane]?.matches.contains(hit.match) == true
+    }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if let lines = context?.lines {
+                    if !hitIsCurrent {
+                        Text("This result is no longer current. Return to the search and try again.").padding()
+                    } else if let error = context?.error {
+                        Text(verbatim: error).padding().foregroundStyle(.orange)
+                    } else if let lines = context?.lines {
                         if lines.isEmpty { Text("These rows are no longer on the machine.").padding() }
                         ForEach(lines) { line in
                             row(line).id(line.row)
@@ -353,14 +395,15 @@ private struct MuxSearchContextScreen: View {
         .toolbar {
             ToolbarItemGroup(placement: .bottomBar) {
                 Button(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc") { copy() }
-                    .disabled(context?.lines?.isEmpty ?? true)
+                    .disabled(!hitIsCurrent || (context?.lines?.isEmpty ?? true))
                 Spacer()
                 Button("Show Pane", systemImage: "rectangle.portrait.and.arrow.right") {
-                    session.showPane(hit.pane); close()
-                }.buttonStyle(.borderedProminent)
+                    guard hitIsCurrent else { return }
+                    session.endMuxSearch(resumingView: false); session.showPane(hit.pane); close()
+                }.buttonStyle(.borderedProminent).disabled(!hitIsCurrent)
             }
         }
-        .onAppear { session.muxControl?.readContext(pane: hit.pane, row: hit.match.row) }
+        .onAppear { session.muxControl?.readContext(pane: hit.pane, row: hit.match.row, searchID: hit.searchID) }
         .onDisappear { session.muxControl?.clearContext() }
     }
 
@@ -384,7 +427,7 @@ private struct MuxSearchContextScreen: View {
     /// The rows as plain text; like other copies, it stays on this device and
     /// expires after two minutes.
     private func copy() {
-        guard let lines = context?.lines, !lines.isEmpty else { return }
+        guard hitIsCurrent, let lines = context?.lines, !lines.isEmpty else { return }
         UIPasteboard.general.setItems([["public.utf8-plain-text": lines.map(\.text).joined(separator: "\n")]],
             options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
         copied = true

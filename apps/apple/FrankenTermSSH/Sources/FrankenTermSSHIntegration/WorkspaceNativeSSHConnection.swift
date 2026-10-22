@@ -390,6 +390,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var shutdown: Task<Void, Never>?
     private let liveness: WorkspaceSSHLiveness
     private var probing = true, lastReceived: UInt64 = 0, silentIntervals = 0
+    private var nextLivenessProbe: ContinuousClock.Instant?
     private var mux: MuxAttachment?
 
     /// Bytes for the phone's terminal, applied after their resize.
@@ -404,6 +405,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private final class MuxAttachment {
         let client: any TerminalMuxClient
         let control: TerminalMuxControl
+        let queries: TerminalMuxQueryDriver
         /// The phone terminal's size as the screen last asked for it.
         var geometry: TerminalSessionGeometry
         /// The model's size once every queued segment is applied, and as
@@ -416,11 +418,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var showing = false
         var segments: [Segment] = []
         var outgoing = Data()
-        /// The client's search and row-read ids, to the screen's requests.
-        var searches: [UInt64: (id: UUID, pane: Int)] = [:]
-        var contexts: [UInt64: UUID] = [:]
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry) {
             self.client = client; self.control = control; self.geometry = geometry
+            queries = TerminalMuxQueryDriver(client: client, control: control)
             queued = geometry; applied = geometry
         }
     }
@@ -475,7 +475,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             state.shown = first.paneId
             try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
-            control.setWaker { [weak self] in Task { await self?.wakeService() } }
+            let signal = inputSignal
+            control.setWaker { signal.notify() }
             try reconcileMux()
             try await flushMux(driver: driver)
         } catch { await close(); throw error }
@@ -486,7 +487,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private func pumpMux(timeout: Duration, driver: NativeSSHDriver) async throws -> NativeSSHServiceEvent {
         guard let state = mux else { throw NativeSSHError.closed }
         try await flushMux(driver: driver)
-        let event = try await session.service(timeout: timeout, driver: driver)
+        let event = try await session.service(timeout: state.queries.waitTimeout(maximum: timeout), driver: driver)
         if !event.output.isEmpty { try state.client.receive(event.output) }
         if event.endOfOutput {
             try state.client.channelClosed()
@@ -557,13 +558,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.remove(pane: pane)
                 if state.shown == pane { state.shown = nil; state.showing = false }
             case .searchResults(let pane, let results):
-                if let request = state.searches.removeValue(forKey: results.search) {
-                    state.control.deliver(search: request.id, pane: pane, results: results)
-                }
-            case .context(_, let context):
-                if let id = state.contexts.removeValue(forKey: context.request) {
-                    state.control.deliver(context: id, lines: context.lines)
-                }
+                state.queries.receive(pane: pane, results: results)
+            case .context(let pane, let context):
+                state.queries.receive(pane: pane, context: context)
             case .failed(let reason):
                 throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.failed(reason)
             }
@@ -591,28 +588,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         // A vanished selection stays vanished. Neither old queued input nor a
         // newly created responder may silently inherit an unrelated pane.
-        // Searches run on the server, each pane's scrollback where it lives.
-        if let search = state.control.takeSearch() {
-            state.searches.removeAll()
-            for pane in search.panes {
-                do {
-                    let id = try state.client.search(pane: pane, text: search.query.text,
-                        caseSensitive: search.query.caseSensitive, regex: search.query.regex)
-                    state.searches[id] = (search.id, pane)
-                } catch {
-                    state.control.deliver(search: search.id, pane: pane, results: TerminalMuxSearchResults(
-                        search: 0, matches: [], searchedRows: 0, error: "The search could not be sent."))
-                }
-            }
-        }
-        if let context = state.control.takeContext() {
-            state.contexts.removeAll()
-            if let id = try? state.client.context(pane: context.pane, firstRow: max(context.first, 0), count: context.count) {
-                state.contexts[id] = context.id
-            } else {
-                state.control.deliver(context: context.id, lines: [])
-            }
-        }
+        // One bounded scheduler owns all accepted remote lookup IDs, including
+        // superseded and timed-out work. Terminal input keeps its separate lane.
+        state.queries.step()
         guard let pane = state.shown else { return }
         let visible = state.control.current.visible
         if visible, !state.showing {
@@ -649,7 +627,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private func serviceMux(driver: NativeSSHDriver) async throws -> TerminalSessionUpdate {
         try reconcileMux()
         if let update = nextMuxUpdate() { return update }
-        let event = try await pumpMux(timeout: liveness.interval, driver: driver)
+        let event = try await pumpMux(timeout: serviceTimeout(), driver: driver)
         try await validateForeground()
         try await checkLiveness(event, driver: driver)
         try reconcileMux()
@@ -692,7 +670,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try await validateForeground()
             guard let driver else { throw NativeSSHError.closed }
             if mux != nil { return try await serviceMux(driver: driver) }
-            let event = try await session.service(timeout: liveness.interval, driver: driver)
+            let event = try await session.service(timeout: serviceTimeout(), driver: driver)
             try await validateForeground()
             try await checkLiveness(event, driver: driver)
             let geometry = try event.resized.map {
@@ -714,12 +692,28 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// without one sends a probe that a live server must answer; silence
     /// through `missedReplies` further intervals means it is not answering.
     /// A deferred probe counts too: outbound has stayed blocked a whole interval.
-    private func checkLiveness(_ event: NativeSSHServiceEvent, driver: NativeSSHDriver) async throws {
+    private func serviceTimeout(now: ContinuousClock.Instant = .now) -> Duration {
+        guard probing, let nextLivenessProbe else { return liveness.interval }
+        return max(.nanoseconds(1), min(liveness.interval, now.duration(to: nextLivenessProbe)))
+    }
+
+    private func checkLiveness(_ event: NativeSSHServiceEvent, driver: NativeSSHDriver,
+                               now: ContinuousClock.Instant = .now) async throws {
         guard probing else { return }
         if event.accounting.receivedBytes != lastReceived {
             lastReceived = event.accounting.receivedBytes; silentIntervals = 0
+            nextLivenessProbe = now + liveness.interval
+            return
         }
-        guard event.waitExpired else { return }
+        // Query deadlines and local input wakes can shorten a service wait.
+        // Count elapsed peer-silence intervals, NOT waitExpired notifications;
+        // neither many short waits nor constant local wakes change the policy.
+        guard let deadline = nextLivenessProbe else {
+            nextLivenessProbe = now + liveness.interval
+            return
+        }
+        guard now >= deadline else { return }
+        nextLivenessProbe = now + liveness.interval
         silentIntervals += 1
         guard silentIntervals <= liveness.missedReplies else { throw TerminalTransportError.peerUnresponsive }
         if try await session.keepalive(driver: driver) == .unavailable { probing = false }
@@ -767,6 +761,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // actual restore/teardown job, not a prematurely completed closed flag.
         muxControl?.inputRouting.retire()
         muxControl?.setWaker(nil)
+        mux?.queries.retire()
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
         let task = Task<Void, Never> {
@@ -794,6 +789,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     deinit {
         muxControl?.inputRouting.retire()
+        muxControl?.endQueries()
         inputSignal.finish()
         let session = self.session, lease = networkLease
         Task {

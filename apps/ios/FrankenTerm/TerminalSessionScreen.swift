@@ -243,6 +243,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var appliedFontRevision: UInt64 = 1
     @ObservationIgnored private var fontRevisionChange: Task<Void, Never>?
     @ObservationIgnored private var historyReturn: Task<Void, Never>?
+    @ObservationIgnored private var muxSearchPresented = false
     @ObservationIgnored private var retainedCaptureAttempted = false
     @ObservationIgnored private var retainEndedOutput = true
     @ObservationIgnored private var viewAttachment: Task<Void, Never>?
@@ -286,7 +287,18 @@ final class TerminalSessionController {
     }
 
     var clipboardIsPresenting: Bool {
-        clipboard?.isPresenting == true || historyInspection != nil || historyReturning
+        clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
+    }
+    func beginMuxSearch() {
+        guard !stopped, phase == .live, presentationVisible else { return }
+        muxSearchPresented = true
+        viewAttachment?.cancel()
+        terminal?.input.retire()
+    }
+    func endMuxSearch(resumingView: Bool = true) {
+        muxSearchPresented = false
+        connection?.muxControl?.clearSearch()
+        if resumingView { showView() }
     }
     func inspectOutput() {
         guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
@@ -470,6 +482,7 @@ final class TerminalSessionController {
             interactionProblem = nil
             historyInspection?.retire()
             historyReturn?.cancel(); historyReturnBookmark = nil
+            connection?.muxControl?.clearSearch()
         }
         // Frames need a view. A session that connected in the background turns
         // visible when its view attaches (attachView calls this again), so
@@ -647,7 +660,7 @@ final class TerminalSessionController {
     /// Puts a live session on screen: the scene's keyboard, the Metal view and
     /// what follows the view. Idempotent; teardown joins it.
     func showView() {
-        guard !stopped, phase == .live, presentationVisible,
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
               focus?.shows(machineID: target.machineID) == true,
               terminal == nil, viewAttachment == nil,
               paneHandoff == nil, requestedMuxPane == nil,
@@ -666,7 +679,7 @@ final class TerminalSessionController {
         let expectedMux = connection?.muxControl?.inputRouting.current.destination
         func checkLive() throws {
             try Task.checkCancellation()
-            guard !stopped, phase == .live, presentationVisible,
+            guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
                   focus?.shows(machineID: target.machineID) == true,
                   requestedMuxPane == nil,
                   connection?.muxControl?.inputRouting.current.destination == expectedMux,
@@ -711,7 +724,7 @@ final class TerminalSessionController {
             setPresentationVisible(presentationVisible)
             view.requestKeyboard(presentationVisible)
         } catch {
-            let superseded = Task.isCancelled || stopped || !presentationVisible
+            let superseded = Task.isCancelled || stopped || !presentationVisible || clipboardIsPresenting
                 || focus?.shows(machineID: target.machineID) != true
                 || connection?.muxControl?.inputRouting.current.destination != expectedMux
             if superseded || error is CancellationError {
@@ -912,6 +925,7 @@ final class TerminalSessionController {
 
     private func sealLocalOwnership() {
         presentationVisible = false
+        muxSearchPresented = false
         clipboard?.retire()
         historyInspection?.retire()
         historyReturn?.cancel(); historyReturnBookmark = nil
@@ -1086,4 +1100,3 @@ final class TerminalSessionController {
         }
     }
 }
-
