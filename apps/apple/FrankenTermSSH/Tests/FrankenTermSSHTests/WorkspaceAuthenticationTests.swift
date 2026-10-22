@@ -197,6 +197,19 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         await refuse { _ = try await authority.signature(for: replay, peer: peer) }
     }
 
+    func testMuxRouteSignsInLikeADirectOne() async throws {
+        let f = try await SSHWorkspaceTestFixture.make { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["mode"] = "frankenterm_mux"
+            routes[0]["session_creation"] = nil
+            routes[0]["attach_policy"] = "existing_only"
+            workspace["routes"] = routes
+        }
+        let (_, _, identity) = try await signed(f, transport: UUID())
+        XCTAssertEqual(identity.publicKey, f.publicBlob)
+        XCTAssertEqual(f.vault.counts.signatures, 1)
+    }
+
     func testWrongHostEndpointTransportAndMethodsFailBeforeKeyRead() async throws {
         let f = try await SSHWorkspaceTestFixture.make()
         var other = f.publicBlob; other[other.count - 1] ^= 1

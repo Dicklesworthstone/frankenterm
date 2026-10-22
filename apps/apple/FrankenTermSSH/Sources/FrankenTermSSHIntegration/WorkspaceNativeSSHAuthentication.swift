@@ -10,7 +10,8 @@ import FrankenTermSSH
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA host
-    /// keys, certificates, password/MFA, jumps and mux attachment are not enabled.
+    /// keys, certificates, password/MFA and jumps are not enabled. A mux route
+    /// signs in exactly like a direct one; only the channel it opens differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
@@ -179,7 +180,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
         guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
               authorization.routeID == routeID, authorization.credentialID == credentialID,
               authorization.host == endpoint.host, authorization.port == endpoint.port,
-              authorization.routeMode == "direct_ssh", authorization.jumpRouteIDs.isEmpty,
+              Self.routeSupport.routeModes.contains(authorization.routeMode), authorization.jumpRouteIDs.isEmpty,
               Self.routeSupport.credentialAlgorithms.contains(authorization.algorithm) else {
             throw SSHAuthenticationError.denied
         }
