@@ -37,7 +37,7 @@ public actor WorkspaceNativeSSHConnection {
                  mux: (command: String, factory: @Sendable () throws -> any TerminalMuxClient)?) {
         self.transport = transport; self.peer = peer; identity = transport.identity
         self.scope = scope; workspaceRevision = scope.workspaceRevision
-        self.mux = mux; muxControl = mux == nil ? nil : TerminalMuxControl()
+        self.mux = mux; muxControl = transport.muxControl
     }
     public var isClosed: Bool { closed }
 
@@ -112,7 +112,8 @@ public actor WorkspaceNativeSSHConnection {
                 machineID: machineID, routeID: routeID, transportID: session.transportID,
                 channelID: session.channelID)
             let transport = WorkspaceNativeSSHTransport(session: session, identity: identity, broker: broker,
-                foreground: foreground, networkLease: lease, authority: authority, liveness: liveness)
+                foreground: foreground, networkLease: lease, authority: authority, liveness: liveness,
+                muxControl: muxCommand == nil ? nil : TerminalMuxControl())
             let mux = muxCommand.flatMap { command in muxClientFactory.map { (command: command, factory: $0) } }
             return WorkspaceNativeSSHConnection(transport: transport, peer: peer, scope: scope, mux: mux)
         } catch {
@@ -371,6 +372,14 @@ public actor WorkspaceNativeSSHConnection {
 private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     nonisolated let identity: TerminalConnectionIdentity
     nonisolated let inputSignal = TerminalSessionSignal()
+    nonisolated let muxControl: TerminalMuxControl?
+    nonisolated var acceptsModelReplies: Bool { muxControl == nil }
+
+    nonisolated func captureInputWriter() throws -> any TerminalInputWriter {
+        guard let muxControl else { return self }
+        return WorkspaceMuxInputWriter(transport: self, routing: muxControl.inputRouting,
+                                       destination: try muxControl.inputRouting.capture())
+    }
     private let session: NativeSSHSession
     private let broker: SSHAuthenticationBroker
     private let foreground: SSHForegroundLease
@@ -384,7 +393,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var mux: MuxAttachment?
 
     /// Bytes for the phone's terminal, applied after their resize.
-    private struct Segment { var resize: TerminalSessionGeometry?; var bytes: Data }
+    private struct Segment {
+        var resize: TerminalSessionGeometry?
+        var bytes: Data
+        var destination: TerminalMuxInputRouting.Destination? = nil
+    }
 
     /// One attachment to the machine's mux over this SSH command channel.
     /// Only the transport actor touches it.
@@ -414,16 +427,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     init(session: NativeSSHSession, identity: TerminalConnectionIdentity, broker: SSHAuthenticationBroker,
          foreground: SSHForegroundLease, networkLease: WorkspaceNetworkLease,
-         authority: WorkspaceNativeSSHAuthentication, liveness: WorkspaceSSHLiveness) {
+         authority: WorkspaceNativeSSHAuthentication, liveness: WorkspaceSSHLiveness,
+         muxControl: TerminalMuxControl?) {
         self.session = session; self.identity = identity; self.broker = broker
         self.foreground = foreground; self.networkLease = networkLease; self.authority = authority
-        self.liveness = liveness
+        self.liveness = liveness; self.muxControl = muxControl
     }
 
     func openShell(geometry: NativeSSHGeometry) async throws {
         do {
             try await validateForeground()
-            guard driver == nil else { throw NativeSSHError.busy }
+            guard driver == nil, muxControl == nil else { throw NativeSSHError.busy }
             try await session.openShell(geometry: geometry)
             try await validateForeground()
             driver = try await session.claimTerminalDriver(transportID: identity.transportID, channelID: identity.channelID)
@@ -438,7 +452,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                  control: TerminalMuxControl) async throws {
         do {
             try await validateForeground()
-            guard driver == nil else { throw NativeSSHError.busy }
+            guard driver == nil, control === muxControl else { throw NativeSSHError.busy }
             try await session.openCommand(command)
             try await validateForeground()
             let driver = try await session.claimTerminalDriver(transportID: identity.transportID,
@@ -459,6 +473,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 throw TerminalMuxError.noPanes
             }
             state.shown = first.paneId
+            try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
             control.setWaker { [weak self] in Task { await self?.wakeService() } }
             try reconcileMux()
@@ -504,6 +519,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             case .ready:
                 state.ready = true
             case .panes(let panes):
+                try state.control.inputRouting.replaceInventory(panes.map(\.paneId))
                 state.panes = panes; state.listed = true
                 if let shown = state.shown, !panes.contains(where: { $0.paneId == shown }) {
                     state.shown = nil; state.showing = false
@@ -525,7 +541,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     pixelWidth: min(cellWidth * UInt32(columns), 65535), pixelHeight: min(cellHeight * UInt32(rows), 65535))
                 let resize = size == state.queued ? nil : size
                 state.queued = size
-                state.segments.append(Segment(resize: resize, bytes: bytes))
+                state.segments.append(Segment(resize: resize, bytes: bytes,
+                    destination: try state.control.inputRouting.capture()))
             case .paneTitle(let pane, let title):
                 if let index = state.panes.firstIndex(where: { $0.paneId == pane }) {
                     let old = state.panes[index]
@@ -535,6 +552,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 }
                 state.control.retitle(pane: pane, title: title)
             case .paneGone(let pane):
+                state.control.inputRouting.remove(pane: pane)
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
                 if state.shown == pane { state.shown = nil; state.showing = false }
@@ -564,14 +582,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try state.client.hide(pane: old); try state.client.restoreSize(pane: old)
             }
             state.shown = requested; state.showing = false
-            // The old pane's undrawn bytes are moot: the new one draws from scratch.
-            state.segments.removeAll(); state.queued = state.applied
+            try state.control.inputRouting.select(pane: requested)
+            // Finish already-decoded output events before the replacement.
+            // Dropping a chunk's suffix could strand the canonical parser in
+            // UTF-8 or an escape sequence. Old visit markers cannot enable the
+            // new pane, and its retired view no longer accepts these frames.
             state.control.publish(shown: requested)
         }
-        if state.shown == nil, let next = state.panes.first(where: \.isActive) ?? state.panes.first {
-            state.shown = next.paneId; state.showing = false
-            state.control.publish(shown: next.paneId)
-        }
+        // A vanished selection stays vanished. Neither old queued input nor a
+        // newly created responder may silently inherit an unrelated pane.
         // Searches run on the server, each pane's scrollback where it lives.
         if let search = state.control.takeSearch() {
             state.searches.removeAll()
@@ -618,7 +637,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             segment.resize = nil
             state.segments.insert(segment, at: 0)
         }
-        return TerminalSessionUpdate(output: chunk, resized: resize)
+        return TerminalSessionUpdate(output: chunk, resized: resize,
+            muxDestination: segment.bytes.isEmpty ? segment.destination : nil)
+    }
+
+    func didApplyOutput(_ update: TerminalSessionUpdate) async {
+        guard !closed, let destination = update.muxDestination else { return }
+        muxControl?.inputRouting.didApplyOutput(destination)
     }
 
     private func serviceMux(driver: NativeSSHDriver) async throws -> TerminalSessionUpdate {
@@ -637,18 +662,28 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try await validateForeground()
             guard let driver else { throw NativeSSHError.closed }
             guard !bytes.isEmpty, bytes.count <= 65536 else { throw TerminalInputError.invalidWriteSize }
-            if let state = mux {
-                // Input goes to the pane on screen, through the mux server,
-                // exactly as the desktop app sends it.
-                guard let pane = state.shown, state.outgoing.count < 256 * 1024 else { return .wouldBlock }
-                try state.client.write(pane: pane, bytes: bytes)
-                try await flushMux(driver: driver)
-                return .accepted(bytes.count)
-            }
+            // Mux input requires the focus-captured writer below. Looking up
+            // state.shown here would retarget queued keys/paste after a swipe.
+            guard muxControl == nil else { throw TerminalInputError.invalidIdentity }
             switch try await session.admit(Data(bytes.prefix(NativeSSHSession.maximumWriteBytes)), driver: driver) {
             case .accepted(let count): return .accepted(count)
             case .wouldBlock: return .wouldBlock
             }
+        } catch { await close(); throw error }
+    }
+
+    func writeMux(_ bytes: Data, destination: TerminalMuxInputRouting.Destination) async throws -> TerminalTransportWrite {
+        do {
+            try await validateForeground()
+            guard let driver, let state = mux else { throw NativeSSHError.closed }
+            guard !bytes.isEmpty, bytes.count <= 65536 else { throw TerminalInputError.invalidWriteSize }
+            // Recheck after authorization's awaits. No actor suspension occurs
+            // between verifying the registration and encoding its numeric target.
+            try state.control.inputRouting.validateDelivery(destination)
+            guard state.outgoing.count < 256 * 1024 else { return .wouldBlock }
+            try state.client.write(pane: destination.paneID, bytes: bytes)
+            try await flushMux(driver: driver)
+            return .accepted(bytes.count)
         } catch { await close(); throw error }
     }
 
@@ -728,20 +763,18 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// callers await the same teardown, and no subsequent call can reopen it.
     func close() async {
         if let shutdown { await shutdown.value; return }
-        if !closed, let state = mux, let driver {
-            // Give the shown pane its own size back on the way out; best
-            // effort, since the connection may already be gone.
-            state.control.setWaker(nil)
-            if let pane = state.shown, state.showing {
-                try? state.client.restoreSize(pane: pane)
-                try? await flushMux(driver: driver)
-                _ = try? await session.service(timeout: .milliseconds(300), driver: driver)
-            }
-        }
-        if let shutdown { await shutdown.value; return }
+        // Fence input before the first await. Concurrent closes share the same
+        // actual restore/teardown job, not a prematurely completed closed flag.
+        muxControl?.inputRouting.retire()
+        muxControl?.setWaker(nil)
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
         let task = Task<Void, Never> {
+            if let state = self.mux, let driver = self.driver, let pane = state.shown, state.showing {
+                try? state.client.restoreSize(pane: pane)
+                try? await self.flushMux(driver: driver)
+                _ = try? await session.service(timeout: .milliseconds(300), driver: driver)
+            }
             await session.close()
             withExtendedLifetime(lease) {}
         }
@@ -760,11 +793,25 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     }
 
     deinit {
+        muxControl?.inputRouting.retire()
         inputSignal.finish()
         let session = self.session, lease = networkLease
         Task {
             await session.close()
             withExtendedLifetime(lease) {}
         }
+    }
+}
+
+/// The coordinator owns this small immutable value with its queued bytes. A
+/// selected-pane change invalidates new admission, not the original destination
+/// of already admitted writes or their bounded key/paste cleanup.
+private struct WorkspaceMuxInputWriter: TerminalInputWriter {
+    let transport: WorkspaceNativeSSHTransport
+    let routing: TerminalMuxInputRouting
+    let destination: TerminalMuxInputRouting.Destination
+    func validateInputAdmission() throws { try routing.validateAdmission(destination) }
+    func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite {
+        try await transport.writeMux(bytes, destination: destination)
     }
 }

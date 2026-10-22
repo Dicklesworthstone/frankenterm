@@ -122,6 +122,9 @@ public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
 /// transport acts on its next service turn. Thread-safe; callbacks are
 /// invoked outside the lock.
 public final class TerminalMuxControl: @unchecked Sendable {
+    /// Separate from titles/search state: exact input destinations are invalidated
+    /// only by selection, registration loss and connection retirement.
+    public let inputRouting = TerminalMuxInputRouting()
     public struct SearchQuery: Equatable, Sendable {
         public let text: String
         public let caseSensitive: Bool, regex: Bool

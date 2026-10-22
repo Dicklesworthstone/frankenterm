@@ -248,6 +248,9 @@ final class TerminalSessionController {
     @ObservationIgnored private var viewAttachment: Task<Void, Never>?
     @ObservationIgnored private var authenticatedSelection: TerminalRouteAttemptPlan.Selection?
     @ObservationIgnored private var reconnectSelection: TerminalRouteAttemptPlan.Selection?
+    @ObservationIgnored private var paneHandoff: Task<Void, Never>?
+    @ObservationIgnored private var requestedMuxPane: Int?
+    @ObservationIgnored private var displayedMuxDestination: TerminalMuxInputRouting.Destination?
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
          reconnectingFrom previous: TerminalSessionController? = nil) {
@@ -357,13 +360,97 @@ final class TerminalSessionController {
         }
     }
 
-    /// Keep consuming this source's bytes/replies while it is offscreen, but
-    /// stop allocating snapshots and preparing GPU frames. The scene owns this
-    /// policy; changing presentation never changes the keyboard destination.
-    /// Puts another of the machine's mux panes on screen.
+    /// Settle the old responder's composition and releases locally before asking
+    /// for another pane. Admitted bytes keep their old writer; this does not wait
+    /// for network delivery. The new pane gets a fresh view and focus only after
+    /// its output has reached the canonical model.
     func showPane(_ paneID: Int) {
-        guard !stopped, phase == .live else { return }
-        connection?.muxControl?.request(pane: paneID)
+        guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil,
+              !clipboardIsPresenting, let control = connection?.muxControl,
+              control.current.panes.contains(where: { $0.paneId == paneID }),
+              paneID != control.current.shown || requestedMuxPane != nil else { return }
+        requestedMuxPane = paneID
+        paneHandoff = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.paneHandoff = nil
+                // Selecting the already-shown pane can cancel an unprocessed
+                // request and produce no new transport notification.
+                self.muxInputChanged(control.inputRouting.current, control: control)
+            }
+            do {
+                if let keyboard = self.keyboard, keyboard.acceptsInput {
+                    let vacant = try await keyboard.handoff(to: nil)
+                    // Ownership of the handoff result is ours even if hiding or
+                    // cancellation raced its return. No invisible stream leaks.
+                    _ = try await self.connections.coordinator.suspend(vacant)
+                } else {
+                    self.keyboard?.suspend()
+                    await self.keyboard?.waitUntilSuspended()
+                }
+                try Task.checkCancellation()
+                guard !self.stopped, self.phase == .live, self.connection?.muxControl === control,
+                      control.current.panes.contains(where: { $0.paneId == paneID }) else {
+                    throw TerminalInputError.stale
+                }
+                // Retire, rather than merely pause, the old drawable/caret.
+                // Its in-flight GPU completions cannot target the new view.
+                self.presenter?.acceptsFrames = false
+                self.terminal?.retire(); self.terminal = nil
+                self.presenter?.view = nil
+                self.displayedMuxDestination = nil; self.lastViewportRevision = 0
+                let clipboard = self.clipboard
+                clipboard?.retire(); self.clipboard = nil; self.presenter?.clipboard = nil
+                await clipboard?.waitUntilSettled()
+                if let presentation = self.presentation, !presentation.isRetired {
+                    try presentation.request(false, source: presentation.source)
+                    await presentation.waitUntilSettled()
+                }
+                if let history = self.history {
+                    try history.request(top: nil, source: history.source)
+                    await history.waitUntilSettled()
+                }
+                self.historyReturnBookmark = nil
+                try Task.checkCancellation()
+                guard !self.stopped, self.phase == .live, self.connection?.muxControl === control,
+                      control.current.panes.contains(where: { $0.paneId == paneID }) else {
+                    throw TerminalInputError.stale
+                }
+                control.request(pane: paneID)
+            } catch {
+                self.requestedMuxPane = nil
+                if !self.stopped, !(error is CancellationError) {
+                    self.interactionProblem = "The pane switch was not completed: \(Self.describe(error))"
+                }
+                // A failed pre-barrier admission preserves the old responder.
+                // A failure after retirement may rebuild only the still-current
+                // ready pane, never the rejected destination.
+            }
+        }
+    }
+
+    /// This callback is independent of pane-title/search changes and rejects
+    /// reordered cross-executor notifications. Readiness is model-consumption
+    /// evidence; NativeTerminalView still requires its new rendered caret.
+    private func muxInputChanged(_ state: TerminalMuxInputRouting.State, control: TerminalMuxControl) {
+        guard !stopped, connection?.muxControl === control,
+              state.revision == control.inputRouting.current.revision else { return }
+        if !state.ready || displayedMuxDestination != state.destination {
+            terminal?.input.retire()
+            presenter?.acceptsFrames = false
+            terminal?.renderer.setSceneActive(false)
+        }
+        guard state.ready, !state.retired, let selected = state.destination else {
+            if state.destination == nil, phase == .live {
+                requestedMuxPane = nil
+                interactionProblem = "The selected pane is no longer available. Choose another pane; pending input was not redirected."
+            }
+            return
+        }
+        if let requestedMuxPane, requestedMuxPane != selected.paneID { return }
+        requestedMuxPane = nil
+        guard paneHandoff == nil, focus?.shows(machineID: target.machineID) == true else { return }
+        showView()
     }
 
     /// The machine's mux, which searches its panes' scrollback on the server;
@@ -377,6 +464,9 @@ final class TerminalSessionController {
         // others give their panes back to the desktop's layout.
         connection?.muxControl?.setVisible(visible)
         if !visible {
+            // A delayed view/focus build must not navigate back to a machine
+            // the user has already left. Its owner remains retained to join.
+            viewAttachment?.cancel(); paneHandoff?.cancel()
             interactionProblem = nil
             historyInspection?.retire()
             historyReturn?.cancel(); historyReturnBookmark = nil
@@ -384,7 +474,10 @@ final class TerminalSessionController {
         // Frames need a view. A session that connected in the background turns
         // visible when its view attaches (attachView calls this again), so
         // that transition draws its first frame instead of one nobody saw.
-        let shown = visible && terminal != nil
+        let muxReady = connection?.muxControl.map {
+            $0.inputRouting.current.ready && $0.inputRouting.current.destination == displayedMuxDestination
+        } ?? true
+        let shown = visible && terminal != nil && requestedMuxPane == nil && muxReady
         clipboard?.setActive(shown)
         presenter?.acceptsFrames = shown
         terminal?.renderer.setSceneActive(shown)
@@ -404,7 +497,9 @@ final class TerminalSessionController {
         // An activation may have started before a read-only sheet opened and
         // completed its handoff afterwards. Seal that newly published responder
         // before it can acquire hardware input behind the inspection surface.
-        guard !clipboardIsPresenting else {
+        guard !clipboardIsPresenting, paneHandoff == nil, requestedMuxPane == nil,
+              connection?.muxControl.map({ $0.inputRouting.current.ready
+                  && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
             keyboard.suspend()
             focus?.inputRetired(machineID: target.machineID)
             return
@@ -463,8 +558,18 @@ final class TerminalSessionController {
             let connection = attempt
             self.pump = pump
             if let control = connection.muxControl {
-                control.observe { [weak self] state in
-                    Task { @MainActor [weak self] in self?.muxState = state }
+                control.observe { [weak self, weak control] _ in
+                    guard let control else { return }
+                    Task { @MainActor [weak self] in
+                        guard let self, !self.stopped, self.connection?.muxControl === control else { return }
+                        // Notifications run outside the control's lock and may
+                        // reorder; publish its current snapshot, not stale UI.
+                        self.muxState = control.current
+                    }
+                }
+                control.inputRouting.observe { [weak self, weak control] state in
+                    guard let control else { return }
+                    Task { @MainActor [weak self] in self?.muxInputChanged(state, control: control) }
                 }
                 control.setVisible(presentationVisible)
             }
@@ -542,28 +647,48 @@ final class TerminalSessionController {
     /// Puts a live session on screen: the scene's keyboard, the Metal view and
     /// what follows the view. Idempotent; teardown joins it.
     func showView() {
-        guard !stopped, phase == .live, terminal == nil, viewAttachment == nil else { return }
+        guard !stopped, phase == .live, presentationVisible,
+              focus?.shows(machineID: target.machineID) == true,
+              terminal == nil, viewAttachment == nil,
+              paneHandoff == nil, requestedMuxPane == nil,
+              connection?.muxControl?.inputRouting.current.ready != false else { return }
         viewAttachment = Task { [weak self] in
             await self?.attachView()
             self?.viewAttachment = nil
+            // A -> B -> A may return before A's cancelled build joins. Retry
+            // only after that exact owner ends, and only if A is current again.
+            self?.showView()
         }
     }
 
     private func attachView() async {
         guard let pump, let runtime, let presenter else { return }
+        let expectedMux = connection?.muxControl?.inputRouting.current.destination
         func checkLive() throws {
             try Task.checkCancellation()
-            guard !stopped, phase == .live else { throw CancellationError() }
+            guard !stopped, phase == .live, presentationVisible,
+                  focus?.shows(machineID: target.machineID) == true,
+                  requestedMuxPane == nil,
+                  connection?.muxControl?.inputRouting.current.destination == expectedMux,
+                  connection?.muxControl?.inputRouting.current.ready != false else { throw CancellationError() }
         }
         do {
+            try checkLive()
             guard let focus else { throw TerminalKeyboardError.unavailable }
             attached = true
             let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
             self.keyboard = keyboard
             try checkLive()
-            let view = try await NativeTerminalView(session: keyboard, configuration: Self.renderConfiguration)
+            // Recreated pane views continue the canonical font revision rather
+            // than resetting it to one after a prior pinch/text-size change.
+            await fontRevisionChange?.value
+            try checkLive()
+            var configuration = Self.renderConfiguration
+            configuration.fontRevision = appliedFontRevision
+            let view = try await NativeTerminalView(session: keyboard, configuration: configuration)
             terminal = view
             try checkLive()
+            displayedMuxDestination = expectedMux
             presenter.view = view
             let clipboard = try NativeTerminalClipboardController(terminal: view,
                 destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)")
@@ -585,8 +710,15 @@ final class TerminalSessionController {
             }
             setPresentationVisible(presentationVisible)
             view.requestKeyboard(presentationVisible)
-        } catch is CancellationError {
-        } catch { fail(Self.describe(error)) }
+        } catch {
+            let superseded = Task.isCancelled || stopped || !presentationVisible
+                || focus?.shows(machineID: target.machineID) != true
+                || connection?.muxControl?.inputRouting.current.destination != expectedMux
+            if superseded || error is CancellationError {
+                terminal?.retire(); terminal = nil; presenter.view = nil
+                keyboard?.suspend(); focus?.inputRetired(machineID: target.machineID)
+            } else { fail(Self.describe(error)) }
+        }
     }
 
     /// Earlier sessions on this machine are acknowledged as the new one
@@ -784,6 +916,9 @@ final class TerminalSessionController {
         historyInspection?.retire()
         historyReturn?.cancel(); historyReturnBookmark = nil
         paletteChange?.cancel()
+        fontRevisionChange?.cancel(); paneHandoff?.cancel()
+        requestedMuxPane = nil
+        connection?.muxControl?.inputRouting.removeObserver()
         interactionProblem = nil
         presenter?.acceptsFrames = false
         presentation?.retire()
@@ -857,6 +992,7 @@ final class TerminalSessionController {
         if let startup { await startup.value }
         startup = nil
         if let viewAttachment { await viewAttachment.value }
+        if let paneHandoff { await paneHandoff.value; self.paneHandoff = nil }
         sealLocalOwnership()
         var failure: Error?
         if let connection {
@@ -882,6 +1018,7 @@ final class TerminalSessionController {
         if let inspection = historyInspection { await inspection.waitUntilSettled(); historyInspection = nil }
         if let historyReturn { await historyReturn.value; self.historyReturn = nil; historyReturning = false }
         if let paletteChange { await paletteChange.value; self.paletteChange = nil }
+        if let fontRevisionChange { await fontRevisionChange.value; self.fontRevisionChange = nil }
         if attached, let source = pump?.source {
             do {
                 // A live scene removes the exact binding and joins its sealed
