@@ -1,0 +1,39 @@
+[package]
+name = "frankenterm-mobile-attach"
+description = "Attach an SSH terminal (the FrankenTerm iPhone app) to one pane of this machine's FrankenTerm mux server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "mux", "ssh", "mobile"]
+categories = ["command-line-utilities"]
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "frankenterm-mobile-attach"
+path = "src/main.rs"
+
+[dependencies]
+codec.workspace = true
+config.workspace = true
+# Only the vendored mux client (DirectMuxClient) and its asupersync runtime.
+frankenterm-core = { workspace = true, features = ["vendored"] }
+frankenterm-term.workspace = true
+mux.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+termwiz.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["termios"] }
+signal-hook.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
