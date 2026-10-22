@@ -547,14 +547,25 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // someone else made larger is asked back to the phone's size.
                 guard (1...512).contains(rows), (1...512).contains(columns),
                       (rows * 2 + 256) * columns <= 65536 else {
+                    // The mirror counts this output as drawn; draw the pane
+                    // again from scratch once it is back at the phone's size.
                     try state.client.resize(pane: pane, rows: Int(state.geometry.rows),
                                             columns: Int(state.geometry.columns))
+                    try state.client.show(pane: pane)
                     continue
                 }
-                let cellWidth = state.geometry.pixelWidth / max(state.geometry.columns, 1)
-                let cellHeight = state.geometry.pixelHeight / max(state.geometry.rows, 1)
-                let size = try TerminalSessionGeometry(columns: UInt32(columns), rows: UInt32(rows),
-                    pixelWidth: min(cellWidth * UInt32(columns), 65535), pixelHeight: min(cellHeight * UInt32(rows), 65535))
+                // The cells the screen asked for come back with exactly the
+                // pixels it asked for: the resize driver completes only on an
+                // exact match, which whole-pixel cell arithmetic rarely gives.
+                let size: TerminalSessionGeometry
+                if UInt32(rows) == state.geometry.rows, UInt32(columns) == state.geometry.columns {
+                    size = state.geometry
+                } else {
+                    let cellWidth = state.geometry.pixelWidth / max(state.geometry.columns, 1)
+                    let cellHeight = state.geometry.pixelHeight / max(state.geometry.rows, 1)
+                    size = try TerminalSessionGeometry(columns: UInt32(columns), rows: UInt32(rows),
+                        pixelWidth: min(cellWidth * UInt32(columns), 65535), pixelHeight: min(cellHeight * UInt32(rows), 65535))
+                }
                 try state.output.append(bytes, geometry: size,
                     destination: state.control.inputRouting.capture())
                 return false

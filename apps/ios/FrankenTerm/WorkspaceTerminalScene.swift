@@ -189,7 +189,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// every pane of every machine in order.
     func stepPane(forward: Bool) {
         guard !closed else { return }
-        if let session = selectedSession, let mux = session.muxState, let shown = mux.shown,
+        if let session = selectedSession, session.phase == .live, let mux = session.muxState, let shown = mux.shown,
            let index = mux.panes.firstIndex(where: { $0.paneId == shown }) {
             let next = index + (forward ? 1 : -1)
             if mux.panes.indices.contains(next) { session.showPane(mux.panes[next].paneId); return }
@@ -531,7 +531,7 @@ struct WorkspaceTerminalScreen: View {
         let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
         VStack(spacing: 0) {
             MachineStrip(scene: scene)
-            if let session = scene.selectedSession, let mux = session.muxState, !mux.panes.isEmpty {
+            if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
                 PaneStrip(session: session, state: mux,
                           accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"))
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -943,10 +943,12 @@ private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
         ])
         do {
             // A machine attached to its mux steps through its panes instead
-            // (paneSwipe below); the others keep Kit's two-finger navigation.
+            // (paneSwipe below); the others, and one whose session ended,
+            // keep Kit's two-finger navigation.
             let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
                 permitsCanvasNavigation: { [weak scene] in
-                    scene?.selectedSession?.clipboardIsPresenting != true && scene?.selectedSession?.muxState == nil
+                    guard let session = scene?.selectedSession else { return true }
+                    return !session.clipboardIsPresenting && (session.muxState == nil || session.phase != .live)
                 })
             controls.onFailure = { [weak scene] error in scene?.report(error) }
             self.controls = controls
@@ -979,7 +981,15 @@ private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer is UISwipeGestureRecognizer else { return super.gestureRecognizerShouldBegin(gestureRecognizer) }
-        return scene?.selectedSession?.muxState != nil && scene?.selectedSession?.clipboardIsPresenting != true
+        guard let session = scene?.selectedSession else { return false }
+        return session.phase == .live && session.muxState != nil && !session.clipboardIsPresenting
+    }
+
+    /// Two fingers sliding sideways rarely keep their spacing exactly: the
+    /// terminal's pinch, which ignores small changes, must not block the swipe.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        gestureRecognizer is UISwipeGestureRecognizer && other is UIPinchGestureRecognizer
     }
 
     /// Switching machines cross-fades between their terminals.
