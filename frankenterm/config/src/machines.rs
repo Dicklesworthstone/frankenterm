@@ -1404,6 +1404,22 @@ impl Machine {
         self.routes.iter().find(|route| route.id() == id)
     }
 
+    /// What a mux route runs on the machine to reach its mux server: the
+    /// route's `relay`, or `nc -N -U <socket>`. The desktop and the phone
+    /// both run exactly this over SSH.
+    pub fn mux_remote_command(&self, route_id: &str) -> Option<String> {
+        match self.route(route_id)? {
+            MachineRoute::FrankenTermMux {
+                relay: Some(relay), ..
+            } => Some(relay.clone()),
+            MachineRoute::FrankenTermMux {
+                socket: Some(socket),
+                ..
+            } => Some(format!("nc -N -U {}", socket)),
+            _ => None,
+        }
+    }
+
     /// The local command that splices stdio to this machine's mux: one `ssh`
     /// per `via` route, tried in order. A single route is a plain argv; more
     /// than one runs under `sh -c` joined with `||`, so each next address is
@@ -1413,17 +1429,11 @@ impl Machine {
         route_id: &str,
         context: &InventoryContext,
     ) -> Option<Vec<String>> {
-        let (via, socket, relay) = match self.route(route_id)? {
-            MachineRoute::FrankenTermMux {
-                via, socket, relay, ..
-            } => (via, socket, relay),
-            _ => return None,
+        let via = match self.route(route_id)? {
+            MachineRoute::FrankenTermMux { via, .. } => via,
+            MachineRoute::Ssh { .. } => return None,
         };
-        let remote = match (relay, socket) {
-            (Some(relay), _) => relay.clone(),
-            (None, Some(socket)) => format!("nc -N -U {}", socket),
-            (None, None) => return None,
-        };
+        let remote = self.mux_remote_command(route_id)?;
         let invocations: Vec<Vec<String>> = via
             .iter()
             .filter_map(|id| match self.route(id) {
@@ -1748,6 +1758,17 @@ relay = "/Users/jemanuel/.local/bin/ft-mux-proxy"
         expected.push("/Users/jemanuel/.local/bin/ft-mux-proxy");
         assert_eq!(mmax.mux_proxy_command("mux", &context()).unwrap(), expected);
         assert_eq!(trj.mux_proxy_command("lan", &context()), None);
+
+        // The remote half alone, which the phone runs over its own SSH.
+        assert_eq!(
+            trj.mux_remote_command("mux").as_deref(),
+            Some("nc -N -U /run/user/1000/frankenterm/sock")
+        );
+        assert_eq!(
+            mmax.mux_remote_command("mux").as_deref(),
+            Some("/Users/jemanuel/.local/bin/ft-mux-proxy")
+        );
+        assert_eq!(trj.mux_remote_command("lan"), None);
     }
 
     #[test]

@@ -27,6 +27,8 @@ use std::path::{Component, Path, PathBuf};
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 64;
 const MAX_SOURCE_LINES: usize = 16_384;
+/// The phone's SSH driver runs remote commands up to this size.
+const MAX_REMOTE_COMMAND_BYTES: usize = 1024;
 const UNRESOLVED_POLICY: &str = "ssh_config.unresolved_policy";
 
 /// Stable across exports, so a new export replaces the phone's earlier one.
@@ -1138,14 +1140,10 @@ pub fn export(
         .filter(|m| wanted.contains(m.id.as_str()))
     {
         let mut route_ids = Vec::new();
-        let mut mux = 0;
+        let mut exported_ssh = BTreeMap::new();
         for route in &machine.routes {
-            let route_name = match route {
-                MachineRoute::Ssh { id, .. } => id,
-                MachineRoute::FrankenTermMux { .. } => {
-                    mux += 1;
-                    continue;
-                }
+            let MachineRoute::Ssh { id: route_name, .. } = route else {
+                continue;
             };
             let (endpoint, keys) =
                 match resolved_routes.remove(&(machine.id.clone(), route_name.clone())) {
@@ -1252,17 +1250,68 @@ pub fn export(
             if let Some(alias) = &endpoint.host_key_alias {
                 record["host_key_alias"] = json!(alias);
             }
+            exported_ssh.insert(route_name.clone(), record.clone());
             routes.push(record);
             route_ids.push(id);
         }
-        if mux > 0 {
-            notes.push(ExportNote {
-                machine: machine.id.clone(),
-                route: None,
-                message: "mux routes stay on the desktop until the phone can attach to mux panes"
-                    .into(),
-            });
+        // A mux route becomes one phone route per exported SSH route in its
+        // `via` order: the same sign-in, then the command the desktop runs
+        // on the machine to reach its mux, so the phone attaches to the same
+        // panes instead of starting a shell. They come first: the phone
+        // prefers a machine's existing panes.
+        let mut mux_ids = Vec::new();
+        for route in &machine.routes {
+            let MachineRoute::FrankenTermMux { id: mux_name, via, .. } = route else {
+                continue;
+            };
+            let Some(command) = machine.mux_remote_command(mux_name) else {
+                continue;
+            };
+            if command.is_empty()
+                || command.len() > MAX_REMOTE_COMMAND_BYTES
+                || !command.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+            {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: Some(mux_name.clone()),
+                    message: format!(
+                        "the phone runs only printable ASCII commands of at most {} bytes; this mux route stays on the desktop",
+                        MAX_REMOTE_COMMAND_BYTES
+                    ),
+                });
+                continue;
+            }
+            let before = mux_ids.len();
+            for via_name in via {
+                let Some(ssh) = exported_ssh.get(via_name) else {
+                    continue;
+                };
+                let id = if via.len() == 1 {
+                    format!("r.{}.{}", machine.id, mux_name)
+                } else {
+                    format!("r.{}.{}.{}", machine.id, mux_name, via_name)
+                };
+                let mut record = ssh.clone();
+                record["id"] = json!(id);
+                record["mode"] = json!("frankenterm_mux");
+                record["attach_policy"] = json!("existing_only");
+                record["remote_command"] = json!(command);
+                if let Some(fields) = record.as_object_mut() {
+                    fields.remove("session_creation");
+                }
+                routes.push(record);
+                mux_ids.push(id);
+            }
+            if mux_ids.len() == before {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: Some(mux_name.clone()),
+                    message: "none of this mux route's SSH routes reached the phone, so it stays on the desktop".into(),
+                });
+            }
         }
+        mux_ids.append(&mut route_ids);
+        let route_ids = mux_ids;
         if route_ids.is_empty() {
             notes.push(ExportNote {
                 machine: machine.id.clone(),
@@ -1607,17 +1656,35 @@ ssh = "jumped"
         assert_eq!(workspace["preferences"]["initial_machine_ref"], "m.trj");
 
         let routes = workspace["routes"].as_array().unwrap();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert_eq!(routes[0]["id"], "r.trj.tailscale");
         assert_eq!(routes[0]["host"], "100.91.120.17");
+        assert_eq!(routes[0]["mode"], "direct_ssh");
+        // The mux route signs in like its `via` route, then runs the same
+        // relay command the desktop runs, attaching to the existing panes.
+        let mux = &routes[1];
+        assert_eq!(mux["id"], "r.trj.mux");
+        assert_eq!(mux["mode"], "frankenterm_mux");
+        assert_eq!(mux["attach_policy"], "existing_only");
         assert_eq!(
-            routes[1]["host"], "css.example",
+            mux["remote_command"],
+            "nc -N -U /run/user/1000/frankenterm/sock"
+        );
+        assert!(mux.get("session_creation").is_none());
+        for field in ["host", "port", "user", "credential_refs", "host_trust_ref"] {
+            assert_eq!(mux[field], routes[0][field], "{}", field);
+        }
+        let trj = &workspace["machines"][0];
+        assert_eq!(trj["route_refs"], json!(["r.trj.mux", "r.trj.tailscale"]));
+        assert_eq!(trj["preferred_route_ref"], "r.trj.mux");
+        assert_eq!(
+            routes[2]["host"], "css.example",
             "the alias resolves through ~/.ssh/config"
         );
-        assert_eq!(routes[1]["user"], "ubuntu");
+        assert_eq!(routes[2]["user"], "ubuntu");
         // Both routes use the same key: one credential record.
         assert_eq!(workspace["credentials"].as_array().unwrap().len(), 1);
-        assert_eq!(routes[0]["credential_refs"], routes[1]["credential_refs"]);
+        assert_eq!(routes[0]["credential_refs"], routes[2]["credential_refs"]);
         let trust = workspace["host_trust"].as_array().unwrap();
         assert_eq!(trust.len(), 2);
         assert!(
@@ -1632,9 +1699,16 @@ ssh = "jumped"
 
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
         assert!(
+            !messages
+                .iter()
+                .any(|m| m.starts_with("trj") && m.contains("stays on the desktop")),
+            "{:?}",
+            messages
+        );
+        assert!(
             messages
                 .iter()
-                .any(|m| m.starts_with("trj: mux routes stay on the desktop")),
+                .any(|m| m.starts_with("dark (mux): none of this mux route's SSH routes")),
             "{:?}",
             messages
         );
