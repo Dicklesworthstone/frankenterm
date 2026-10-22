@@ -9,6 +9,14 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         public let paneID: Int
         fileprivate let owner: UUID, registration: UUID, visit: UUID
     }
+    /// A frozen navigation candidate, not input authority. Both the source visit
+    /// and the target registration must still exist when the handoff completes.
+    /// The inventory witness prevents a drag from acquiring a new neighbour.
+    public struct NavigationPlan: Equatable, Sendable {
+        public let paneID: Int
+        fileprivate let owner: UUID, inventory: UUID, registration: UUID
+        fileprivate let source: Destination?
+    }
     public enum PointerAction: Equatable, Sendable {
         case click(column: Int, row: Int)
         case wheel(steps: Int, column: Int, row: Int)
@@ -33,6 +41,8 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     private let lock = NSLock()
     private let owner = UUID()
     private var registrations: [Int: UUID] = [:]
+    private var paneOrder: [Int] = []
+    private var inventory = UUID()
     private var destination: Destination?
     private var ready = false, retired = false
     private var revision: UInt64 = 0
@@ -151,6 +161,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
             var next: [Int: UUID] = [:]
             for pane in panes { next[pane] = registrations[pane] ?? UUID() }
             registrations = next
+            if paneOrder != panes { paneOrder = panes; inventory = UUID() }
             guard let selected = destination, next[selected.paneID] != selected.registration else { return nil }
             destination = nil; ready = false; pointers.removeAll()
             return advance()
@@ -159,12 +170,49 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     }
     public func remove(pane: Int) {
         let notification = lock.withLock { () -> ((@Sendable (State) -> Void)?, State)? in
-            registrations[pane] = nil
+            if registrations.removeValue(forKey: pane) != nil {
+                paneOrder.removeAll { $0 == pane }; inventory = UUID()
+            }
             guard !retired, destination?.paneID == pane else { return nil }
             destination = nil; ready = false; pointers.removeAll()
             return advance()
         }
         if let (handler, state) = notification { handler?(state) }
+    }
+
+    /// Circular movement is confined to this machine. An empty, one-pane, or
+    /// missing-selection ring has no neighbour, never an implicit machine move.
+    public func navigation(forward: Bool) throws -> NavigationPlan? {
+        try lock.withLock {
+            guard !retired else { throw TerminalInputError.unavailable }
+            guard paneOrder.count > 1, let source = destination,
+                  let index = paneOrder.firstIndex(of: source.paneID) else { return nil }
+            let next = (index + (forward ? 1 : paneOrder.count - 1)) % paneOrder.count
+            return try navigationLocked(pane: paneOrder[next])
+        }
+    }
+
+    /// Capture a picker or gesture's exact target before any async keyboard work.
+    /// Titles, mouse-mode changes and output readiness do not invalidate it.
+    public func navigation(pane: Int) throws -> NavigationPlan {
+        try lock.withLock { try navigationLocked(pane: pane) }
+    }
+    private func navigationLocked(pane: Int) throws -> NavigationPlan {
+        guard !retired, let registration = registrations[pane] else { throw TerminalInputError.unavailable }
+        return NavigationPlan(paneID: pane, owner: owner, inventory: inventory,
+                              registration: registration, source: destination)
+    }
+
+    /// Check again after keyboard settlement and when the sole transport takes
+    /// the request. A -> B -> A, reordering, removal/reuse and a new connection
+    /// cannot reinterpret an earlier drag. This grants no input readiness.
+    public func validateNavigation(_ plan: NavigationPlan) throws {
+        try lock.withLock {
+            guard !retired, plan.owner == owner, plan.inventory == inventory,
+                  plan.source == destination, registrations[plan.paneID] == plan.registration else {
+                throw TerminalInputError.stale
+            }
+        }
     }
 
     /// Select is not an input acknowledgement. A new visit starts closed until
@@ -225,7 +273,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     public func retire() {
         let notification = lock.withLock { () -> ((@Sendable (State) -> Void)?, State)? in
             guard !retired else { return nil }
-            retired = true; ready = false; destination = nil; registrations.removeAll()
+            retired = true; ready = false; destination = nil; registrations.removeAll(); paneOrder.removeAll()
             pointers.removeAll(); pointerWaker = nil
             let notification = advance()
             observer = nil
@@ -235,7 +283,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     }
     private func advance() -> ((@Sendable (State) -> Void)?, State) {
         if revision == UInt64.max {
-            retired = true; ready = false; destination = nil; registrations.removeAll()
+            retired = true; ready = false; destination = nil; registrations.removeAll(); paneOrder.removeAll()
             pointers.removeAll(); pointerWaker = nil
         } else { revision += 1 }
         return (observer, snapshot())
