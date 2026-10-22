@@ -2239,6 +2239,11 @@ private struct ImportHostPolicyReview: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
                         Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes").font(.caption)
+                        if route.mode == "frankenterm_mux" {
+                            // What this route runs on the machine each time it connects.
+                            Text(verbatim: "Runs on connect: \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
                         if let state = routeReadiness.first(where: { $0.routeID == route.id }) {
                             ForEach(Array(state.issues.enumerated()), id: \.offset) { _, issue in
                                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
@@ -2939,6 +2944,11 @@ private struct MachineWorkspaceView: View {
                 Text("Reached through \(route.jumpRoutes.count) jump hosts, which this phone cannot use yet.").font(.caption).opacity(0.75)
             } else if route.mode == "frankenterm_mux" {
                 Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
+                // The exact command this route runs on the machine to reach its mux.
+                Text(verbatim: route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)
+                    .font(.system(.caption2, design: .monospaced)).opacity(0.6)
+                    .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                    .accessibilityLabel("Runs \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
             }
             ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
                     id: \.offset) { _, issue in
