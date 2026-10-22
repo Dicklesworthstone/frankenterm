@@ -129,73 +129,28 @@ impl Registry {
         Ok(count)
     }
 
-    /// Moves the next event's payload into the slot for `event_copy`.
+    /// Moves the next event's payload into the slot for `event_copy`. The
+    /// event has already left the session: one that cannot be represented is
+    /// reported as FAILED rather than lost, and the slot never keeps the
+    /// previous event's payload.
     fn next_event(&mut self, handle: u64) -> Result<(u32, u64, u32, u32, u32), Error> {
         let slot = self.slot(handle)?;
         let event = slot.session.as_mut().ok_or(Error::Stale)?.next_event();
-        let (kind, pane, rows, cols, payload) = match event {
-            None => (EVENT_NONE, 0, 0, 0, Vec::new()),
-            Some(Event::Ready { server_version }) => {
-                (EVENT_READY, 0, 0, 0, server_version.into_bytes())
-            }
-            Some(Event::Panes(panes)) => (
-                EVENT_PANES,
-                0,
-                0,
-                0,
-                serde_json::to_vec(&panes).map_err(|_| Error::Invalid)?,
-            ),
-            Some(Event::Output {
-                pane_id,
-                rows,
-                cols,
-                bytes,
-            }) => (
-                EVENT_OUTPUT,
-                pane_id as u64,
-                count(rows)?,
-                count(cols)?,
-                bytes,
-            ),
-            Some(Event::PaneTitle { pane_id, title }) => {
-                (EVENT_PANE_TITLE, pane_id as u64, 0, 0, title.into_bytes())
-            }
-            Some(Event::PaneGone { pane_id }) => {
-                (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new())
-            }
-            Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
-            Some(Event::SearchResults {
-                search,
-                pane_id,
-                matches,
-                searched_rows,
-                error,
-            }) => (
-                EVENT_SEARCH_RESULTS,
-                pane_id as u64,
-                0,
-                0,
-                serde_json::to_vec(&serde_json::json!({
-                    "search": search,
-                    "matches": matches,
-                    "searched_rows": searched_rows,
-                    "error": error,
-                }))
-                .map_err(|_| Error::Invalid)?,
-            ),
-            Some(Event::Context {
-                request,
-                pane_id,
-                lines,
-            }) => (
-                EVENT_CONTEXT,
-                pane_id as u64,
-                0,
-                0,
-                serde_json::to_vec(&serde_json::json!({ "request": request, "lines": lines }))
-                    .map_err(|_| Error::Invalid)?,
-            ),
-        };
+        let (kind, pane, rows, cols, payload) = event_parts(event)
+            .and_then(|parts| {
+                u32::try_from(parts.4.len())
+                    .map(|_| parts)
+                    .map_err(|_| Error::Capacity)
+            })
+            .unwrap_or_else(|_| {
+                (
+                    EVENT_FAILED,
+                    0,
+                    0,
+                    0,
+                    b"an event from the mux server could not be delivered".to_vec(),
+                )
+            });
         let length = u32::try_from(payload.len()).map_err(|_| Error::Capacity)?;
         slot.event = payload;
         Ok((kind, pane, rows, cols, length))
@@ -215,6 +170,71 @@ impl Registry {
         output[..count].copy_from_slice(&slot.event[offset..offset + count]);
         Ok(count)
     }
+}
+
+/// An event as (kind, pane, rows, cols, payload).
+fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Error> {
+    Ok(match event {
+        None => (EVENT_NONE, 0, 0, 0, Vec::new()),
+        Some(Event::Ready { server_version }) => {
+            (EVENT_READY, 0, 0, 0, server_version.into_bytes())
+        }
+        Some(Event::Panes(panes)) => (
+            EVENT_PANES,
+            0,
+            0,
+            0,
+            serde_json::to_vec(&panes).map_err(|_| Error::Invalid)?,
+        ),
+        Some(Event::Output {
+            pane_id,
+            rows,
+            cols,
+            bytes,
+        }) => (
+            EVENT_OUTPUT,
+            pane_id as u64,
+            count(rows)?,
+            count(cols)?,
+            bytes,
+        ),
+        Some(Event::PaneTitle { pane_id, title }) => {
+            (EVENT_PANE_TITLE, pane_id as u64, 0, 0, title.into_bytes())
+        }
+        Some(Event::PaneGone { pane_id }) => (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new()),
+        Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
+        Some(Event::SearchResults {
+            search,
+            pane_id,
+            matches,
+            searched_rows,
+            error,
+        }) => (
+            EVENT_SEARCH_RESULTS,
+            pane_id as u64,
+            0,
+            0,
+            serde_json::to_vec(&serde_json::json!({
+                "search": search,
+                "matches": matches,
+                "searched_rows": searched_rows,
+                "error": error,
+            }))
+            .map_err(|_| Error::Invalid)?,
+        ),
+        Some(Event::Context {
+            request,
+            pane_id,
+            lines,
+        }) => (
+            EVENT_CONTEXT,
+            pane_id as u64,
+            0,
+            0,
+            serde_json::to_vec(&serde_json::json!({ "request": request, "lines": lines }))
+                .map_err(|_| Error::Invalid)?,
+        ),
+    })
 }
 
 fn count(value: usize) -> Result<u32, Error> {
