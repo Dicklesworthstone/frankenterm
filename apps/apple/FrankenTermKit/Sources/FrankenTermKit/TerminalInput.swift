@@ -36,8 +36,29 @@ public enum TerminalTransportWrite: Equatable, Sendable {
     case accepted(Int), wouldBlock, failed
 }
 
-public protocol TerminalByteTransport: AnyObject, Sendable {
+/// A destination captured by a keyboard focus, not a mutable "selected pane"
+/// lookup. Every operation retains this writer through partial writes and paste
+/// cancellation. Admission may expire while delivery to its original live pane
+/// remains valid. A writer must never fall back to another pane or connection.
+public protocol TerminalInputWriter: Sendable {
+    /// Synchronous, bounded, and side-effect-free. Reject stale UI admission;
+    /// cleanup for previously admitted keys deliberately bypasses this check.
+    func validateInputAdmission() throws
+    func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite
+}
+
+public extension TerminalInputWriter {
+    func validateInputAdmission() throws {}
+}
+
+public protocol TerminalByteTransport: AnyObject, TerminalInputWriter {
     var identity: TerminalConnectionIdentity { get }
+    /// Called before publishing a focus. Direct SSH returns its immutable
+    /// channel; a multiplexed transport must capture an exact pane incarnation.
+    func captureInputWriter() throws -> any TerminalInputWriter
+    /// A phone-owned terminal answers queries. A mux mirror must not answer
+    /// again: its authoritative server already owns that side effect.
+    var acceptsModelReplies: Bool { get }
     /// A bounded, synchronous notification, not a write or a Task per event.
     /// A session driver uses it to interrupt its idle socket wait. Implementations
     /// must coalesce notifications and must not reenter the coordinator.
@@ -52,6 +73,8 @@ public protocol TerminalByteTransport: AnyObject, Sendable {
 
 public extension TerminalByteTransport {
     func inputAvailable() {}
+    func captureInputWriter() throws -> any TerminalInputWriter { self }
+    var acceptsModelReplies: Bool { true }
 }
 
 public struct TerminalInputLimits: Sendable {
@@ -193,14 +216,16 @@ public actor TerminalInputCoordinator {
     }
     private final class Operation {
         let receipt: TerminalInputReceipt, kind: TerminalInputKind, originalBytes: Int
+        let writer: any TerminalInputWriter
         let pastePayload: Range<Int>?
         let bracketed: Bool
         var bytes: Data, cursor = 0, acceptedOriginal = 0, acceptedCleanup = 0
         var inputCharge: Int, cleanupCharge: Int
         var cancelRequested = false, cleaning = false
-        init(_ receipt: TerminalInputReceipt, _ kind: TerminalInputKind, _ bytes: Data,
+        init(_ receipt: TerminalInputReceipt, _ kind: TerminalInputKind, _ bytes: Data, writer: any TerminalInputWriter,
              pastePayload: Range<Int>?, bracketed: Bool, inputCharge: Int, cleanupCharge: Int) {
             self.receipt = receipt; self.kind = kind; self.bytes = bytes; originalBytes = bytes.count
+            self.writer = writer
             self.pastePayload = pastePayload; self.bracketed = bracketed
             self.inputCharge = inputCharge; self.cleanupCharge = cleanupCharge
         }
@@ -208,6 +233,7 @@ public actor TerminalInputCoordinator {
     private struct Stream {
         var focus: TerminalFocus
         var composition: TerminalComposition?
+        var writer: (any TerminalInputWriter)?
     }
 
     public init(limits: TerminalInputLimits = TerminalInputLimits()) throws {
@@ -228,10 +254,16 @@ public actor TerminalInputCoordinator {
         else { throw TerminalInputError.stale }
         return value
     }
-    private func focusedConnection(_ focus: TerminalFocus) throws -> Connection {
-        _ = try stream(focus)
+    private func focusedConnection(_ focus: TerminalFocus, admitting: Bool = true) throws -> Connection {
+        let state = try stream(focus)
         guard let source = focus.source else { throw TerminalInputError.unavailable }
+        guard let writer = state.writer else { throw TerminalInputError.unavailable }
+        if admitting { try writer.validateInputAdmission() }
         return try connection(source)
+    }
+    private func writer(_ focus: TerminalFocus) throws -> any TerminalInputWriter {
+        guard let writer = try stream(focus).writer else { throw TerminalInputError.unavailable }
+        return writer
     }
 
     /// Call only after the selected route's real SSH authentication and PTY
@@ -258,15 +290,15 @@ public actor TerminalInputCoordinator {
         let state = try stream(from)
         guard state.composition == nil else { throw TerminalInputError.compositionPending }
         guard from.generation < UInt64.max else { throw TerminalInputError.sequenceExhausted }
-        if let source { _ = try connection(source) }
+        let nextWriter = try source.map { try connection($0).transport.captureInputWriter() }
         guard cleanup.count <= limits.maximumCleanupBytes else { throw TerminalInputError.capacity }
         if !cleanup.isEmpty {
             guard let old = from.source else { throw TerminalInputError.unavailable }
-            _ = try enqueue(connection(old), kind: .cleanup, bytes: cleanup)
+            _ = try enqueue(connection(old), kind: .cleanup, bytes: cleanup, writer: writer(from))
         }
         let focus = TerminalFocus(owner: owner, stream: from.stream, sceneID: from.sceneID,
                                   generation: from.generation + 1, source: source)
-        streams[from.stream] = Stream(focus: focus); return focus
+        streams[from.stream] = Stream(focus: focus, writer: nextWriter); return focus
     }
     /// OS suspension cannot wait for composition or a stalled writer. Retires
     /// this responder permanently. Any draft is owned by the native input view.
@@ -275,7 +307,7 @@ public actor TerminalInputCoordinator {
         _ = try stream(focus)
         var queued = cleanup.isEmpty
         if !cleanup.isEmpty, cleanup.count <= limits.maximumCleanupBytes, let source = focus.source {
-            do { _ = try enqueue(connection(source), kind: .cleanup, bytes: cleanup); queued = true }
+            do { _ = try enqueue(connection(source), kind: .cleanup, bytes: cleanup, writer: writer(focus)); queued = true }
             catch { queued = false }
         }
         streams[focus.stream] = nil
@@ -301,22 +333,23 @@ public actor TerminalInputCoordinator {
         var value = try stream(composition.focus)
         guard value.composition == composition else { throw TerminalInputError.stale }
         let connection = try focusedConnection(composition.focus)
-        let receipt = encodedBytes.isEmpty ? nil : try enqueue(connection, kind: .encodedInput, bytes: encodedBytes)
+        let receipt = encodedBytes.isEmpty ? nil : try enqueue(connection, kind: .encodedInput, bytes: encodedBytes,
+                                                               writer: writer(composition.focus))
         value.composition = nil; streams[composition.focus.stream] = value
         return receipt
     }
     public func submit(_ focus: TerminalFocus, encodedBytes: Data) throws -> TerminalInputReceipt {
         guard try stream(focus).composition == nil else { throw TerminalInputError.compositionPending }
-        return try enqueue(focusedConnection(focus), kind: .encodedInput, bytes: encodedBytes)
+        return try enqueue(focusedConnection(focus), kind: .encodedInput, bytes: encodedBytes, writer: writer(focus))
     }
     /// Source-owned key/button release uses the reserved cleanup lane. It does
     /// not finish/cancel a composition or advance focus, and never targets a new
     /// responder merely because the original source is still connected.
     public func cleanup(_ focus: TerminalFocus, encodedBytes: Data) throws -> TerminalInputReceipt? {
-        let connection = try focusedConnection(focus)
+        let connection = try focusedConnection(focus, admitting: false)
         guard encodedBytes.count <= limits.maximumCleanupBytes else { throw TerminalInputError.capacity }
         guard !encodedBytes.isEmpty else { return nil }
-        return try enqueue(connection, kind: .cleanup, bytes: encodedBytes)
+        return try enqueue(connection, kind: .cleanup, bytes: encodedBytes, writer: writer(focus))
     }
     /// Text has already passed the shared core's newline/mode policy. This last
     /// admission boundary refuses ESC/C1 and non-text controls instead of silently
@@ -335,14 +368,18 @@ public actor TerminalInputCoordinator {
         try checkCapacity(connection, kind: .paste, byteCount: encodedCount)
         let payload = Data(text.utf8), start = bracketed ? Self.pasteStart.count : 0
         let bytes = (bracketed ? Self.pasteStart : Data()) + payload + (bracketed ? Self.pasteEnd : Data())
-        return try enqueue(connection, kind: .paste, bytes: bytes,
+        return try enqueue(connection, kind: .paste, bytes: bytes, writer: writer(focus),
                            pastePayload: start..<(start + payload.count), bracketed: bracketed)
     }
     /// Direct-SSH answerbacks remain active while their viewport is hidden.
     /// This must never be connected to a mux mirror or replayed snapshot.
     public func reply(_ source: TerminalSource, encodedBytes: Data) throws -> TerminalReplyResult {
         let connection = try connection(source)
-        do { return .queued(try enqueue(connection, kind: .reply, bytes: encodedBytes)) }
+        guard connection.transport.acceptsModelReplies else {
+            if droppedReplies < UInt64.max { droppedReplies += 1 }
+            return .droppedWhole
+        }
+        do { return .queued(try enqueue(connection, kind: .reply, bytes: encodedBytes, writer: connection.transport)) }
         catch TerminalInputError.capacity {
             if droppedReplies < UInt64.max { droppedReplies += 1 }
             return .droppedWhole
@@ -367,13 +404,13 @@ public actor TerminalInputCoordinator {
                   totals.retainedRecords < limits.totalRecords else { throw TerminalInputError.capacity }
         }
     }
-    private func enqueue(_ connection: Connection, kind: TerminalInputKind, bytes: Data,
+    private func enqueue(_ connection: Connection, kind: TerminalInputKind, bytes: Data, writer: any TerminalInputWriter,
                          pastePayload: Range<Int>? = nil, bracketed: Bool = false) throws -> TerminalInputReceipt {
         try checkCapacity(connection, kind: kind, byteCount: bytes.count)
         let inputCharge = kind == .cleanup ? 0 : bytes.count
         let cleanupCharge = kind == .cleanup ? bytes.count : (kind == .paste ? Self.pasteCleanupReservation : 0)
         let receipt = TerminalInputReceipt(owner: owner, serial: try nextSerial(), source: connection.source)
-        connection.queue.append(Operation(receipt, kind, Data(bytes), pastePayload: pastePayload,
+        connection.queue.append(Operation(receipt, kind, Data(bytes), writer: writer, pastePayload: pastePayload,
                                           bracketed: bracketed, inputCharge: inputCharge, cleanupCharge: cleanupCharge))
         connection.transport.inputAvailable()
         return receipt
@@ -443,7 +480,7 @@ public actor TerminalInputCoordinator {
         var bytes = operation.bytes.subdata(in: operation.cursor..<(operation.cursor + count))
         connection.inFlight = operation.receipt.serial; connection.inFlightBytes = count
         let result: TerminalTransportWrite
-        do { result = try await connection.transport.writeSome(bytes) }
+        do { result = try await operation.writer.writeSome(bytes) }
         catch { result = .failed }
         bytes = Data()
         connection.inFlight = nil; connection.inFlightBytes = 0
