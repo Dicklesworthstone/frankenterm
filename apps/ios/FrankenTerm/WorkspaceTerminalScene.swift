@@ -54,8 +54,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Set by enteredBackground until the next activation.
     @ObservationIgnored private var inBackground = false
     @ObservationIgnored private var closing: Task<Void, Never>?
-    /// Automatic reconnects since each machine was last live.
-    @ObservationIgnored private var reconnects: [String: Int] = [:]
+    /// A short-lived successful shell does not replenish its retry budget.
+    @ObservationIgnored private var reconnectPolicies: [String: TerminalReconnectPolicy] = [:]
+    private struct ReconnectJob {
+        let id: UUID, sessionID: UUID
+        var ready = false, cancelled = false
+        let task: Task<Void, Never>
+    }
+    /// One retained timer per machine. Cancelled timers stay owned until their
+    /// callback joins; a ready timer stays queued behind normal attempt limits.
+    @ObservationIgnored private var reconnectJobs: [String: ReconnectJob] = [:]
     /// False keeps every machine down until connect() (the hosted tests
     /// drive connections one at a time); the app connects them all.
     @ObservationIgnored private let autoConnect: Bool
@@ -85,7 +93,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         case .idle, .connecting: return .connecting
         case .live: return .live
         case .couldNotConnect: return .attention
-        case .ended, .failed: return session.dropped && (reconnects[machineID] ?? 0) < 3 ? .connecting : .attention
+        case .ended, .failed:
+            return session.dropped && reconnectPolicies[machineID, default: .init()].nextDelay != nil
+                ? .connecting : .attention
         }
     }
 
@@ -118,7 +128,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func setForeground(_ active: Bool) {
         guard !closed else { return }
         foreground = active
-        if active { inBackground = false }
+        if active {
+            if inBackground {
+                for (id, session) in sessions where session.phase == .live {
+                    reconnectPolicies[id, default: .init()].recordLive()
+                }
+            }
+            inBackground = false
+        }
         if active && onScreen { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
         guard active else { return }
@@ -140,6 +157,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func enteredBackground() {
         guard !closed else { return }
         inBackground = true
+        // iOS may stop executing immediately after its grace period. Time we
+        // cannot observe a session must not count as a stable live interval.
+        for id in Array(reconnectPolicies.keys) { reconnectPolicies[id]?.recordEnd() }
+        cancelReconnects()
     }
 
     private func needsTailscale(_ machineID: String) -> Bool {
@@ -167,8 +188,19 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// sessions' records are acknowledged as it starts.
     func connect(_ machineID: String) {
         guard !closed, !inBackground,
-              var target = machines.first(where: { $0.id == machineID })?.target else { return }
+              machines.first(where: { $0.id == machineID })?.target != nil,
+              sessions[machineID]?.settled != false else { return }
+        cancelReconnect(machineID)
+        reconnectPolicies[machineID, default: .init()].resetForUserRequest()
         disconnected.remove(machineID)
+        startConnection(machineID)
+    }
+
+    /// Automatic callers have already reserved their retry budget. Keeping this
+    /// separate from Connect prevents a retry from resetting its own limit.
+    private func startConnection(_ machineID: String) {
+        guard !closed, !inBackground,
+              var target = machines.first(where: { $0.id == machineID })?.target else { return }
         if let theme = themes[machineID] { target = target.wearing(theme) }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
@@ -176,7 +208,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let controller = TerminalSessionController(target: target, connections: connections, focus: self)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
-            if controller.phase == .live { self.reconnects[machineID] = 0 }
+            switch controller.phase {
+            case .live:
+                if !self.inBackground { self.reconnectPolicies[machineID, default: .init()].recordLive() }
+            case .ended, .failed, .couldNotConnect:
+                self.reconnectPolicies[machineID, default: .init()].recordEnd()
+            case .idle, .connecting: break
+            }
             self.reconcile()
         }
         sessions[machineID] = controller
@@ -188,8 +226,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func disconnect(_ machineID: String) {
         guard !closed else { return }
         disconnected.insert(machineID)
-        reconnects[machineID] = nil
-        if let session = sessions[machineID] { Task { await session.stop() } }
+        cancelReconnect(machineID)
+        reconnectPolicies[machineID] = nil
+        if let session = sessions[machineID] {
+            session.requestStop()
+            Task { await session.stop() }
+        }
     }
 
     func disconnectAll() {
@@ -198,7 +240,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// Keeps every machine connected: starts waiting machines, the selected
     /// one at once and two others at a time, and reconnects a dropped session
-    /// (up to three times in a row) unless the user disconnected it. Nothing
+    /// with bounded backoff unless the user disconnected it. Three automatic
+    /// retries are available per outage/short-lived session streak. Nothing
     /// starts in the background, where Face ID cannot be shown.
     private func reconcile() {
         guard !closed, !inBackground, autoConnect else { return }
@@ -208,12 +251,58 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for id in order {
             guard machines.first(where: { $0.id == id })?.target != nil, !disconnected.contains(id) else { continue }
             if let session = sessions[id] {
-                guard session.settled, session.dropped, (reconnects[id] ?? 0) < 3 else { continue }
+                guard session.settled, session.dropped,
+                      let delay = reconnectPolicies[id, default: .init()].nextDelay else { continue }
+                if let job = reconnectJobs[id] {
+                    guard job.sessionID == session.id, job.ready, !job.cancelled else { continue }
+                } else {
+                    scheduleReconnect(id, sessionID: session.id, delay: delay)
+                    continue
+                }
             }
             guard slots > 0 || id == selectedMachineID else { continue }
-            if sessions[id] != nil { reconnects[id, default: 0] += 1 }
-            connect(id); slots -= 1
+            if sessions[id] != nil {
+                guard reconnectPolicies[id, default: .init()].beginRetry() else { continue }
+                reconnectJobs[id] = nil
+            }
+            startConnection(id); slots -= 1
         }
+    }
+
+    private func scheduleReconnect(_ machineID: String, sessionID: UUID, delay: Duration) {
+        guard reconnectJobs[machineID] == nil else { return }
+        let id = UUID()
+        let task = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+                self?.reconnectWaitFinished(machineID, id: id, sessionID: sessionID, elapsed: true)
+            } catch {
+                self?.reconnectWaitFinished(machineID, id: id, sessionID: sessionID, elapsed: false)
+            }
+        }
+        reconnectJobs[machineID] = .init(id: id, sessionID: sessionID, task: task)
+    }
+
+    private func reconnectWaitFinished(_ machineID: String, id: UUID, sessionID: UUID, elapsed: Bool) {
+        guard var job = reconnectJobs[machineID], job.id == id else { return }
+        if elapsed, !job.cancelled, !closed, !inBackground,
+           !disconnected.contains(machineID), sessions[machineID]?.id == sessionID {
+            job.ready = true
+            reconnectJobs[machineID] = job
+        } else { reconnectJobs[machineID] = nil }
+        reconcile()
+    }
+
+    private func cancelReconnect(_ machineID: String) {
+        guard var job = reconnectJobs[machineID] else { return }
+        if job.ready { reconnectJobs[machineID] = nil; return }
+        job.cancelled = true
+        reconnectJobs[machineID] = job
+        job.task.cancel()
+    }
+
+    private func cancelReconnects() {
+        for id in Array(reconnectJobs.keys) { cancelReconnect(id) }
     }
 
     /// Re-establishes the keyboard after its input generation ended (dismissed
@@ -241,6 +330,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func requestClose() {
         guard !closed else { return }
         closed = true
+        cancelReconnects()
         navigation.suspend()
         for controller in sessions.values {
             controller.discardRetainedOutput()
@@ -254,7 +344,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         requestClose()
         if let closing { await closing.value; return }
         let controllers = Array(sessions.values), navigation = self.navigation
+        let reconnects = reconnectJobs.values.map(\.task)
         let job = Task {
+            for reconnect in reconnects { await reconnect.value }
             for controller in controllers { await controller.stop() }
             await navigation.joinSuspension()
         }
