@@ -33,6 +33,21 @@ struct FrankenTermMobileApp: App {
     }
 }
 
+/// Confirmation names the exact retained owners it may close. A workspace
+/// reopened or replaced while the dialog is visible requires a fresh review.
+@MainActor
+struct RestoreSessionDisconnectReview {
+    let id = UUID()
+    let workspaceNames: [String]
+    fileprivate let epoch: UUID
+    fileprivate let owners: [WorkspaceTerminalScene]
+
+    fileprivate init(epoch: UUID, owners: [WorkspaceTerminalScene]) {
+        self.epoch = epoch; self.owners = owners
+        workspaceNames = owners.map(\.workspaceName)
+    }
+}
+
 @MainActor
 @Observable
 final class MobileWorkspaceModel {
@@ -65,6 +80,8 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var connectionLifecycle: Task<Void, Never>?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
+    @ObservationIgnored private var disconnectReviewID: UUID?
+    @ObservationIgnored private var restoreDisconnection: (id: UUID, task: Task<Void, Never>)?
     private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
@@ -304,6 +321,60 @@ final class MobileWorkspaceModel {
         message = nil
         updateLifecycle()
     }
+
+    private var disconnectableScenes: [WorkspaceTerminalScene] {
+        liveScenes.values.filter { scene in
+            !scene.closed || scene.sessions.values.contains { !$0.settled }
+        }.sorted {
+            let order = $0.workspaceName.localizedStandardCompare($1.workspaceName)
+            return order == .orderedSame ? $0.workspaceID.uuidString < $1.workspaceID.uuidString
+                : order == .orderedAscending
+        }
+    }
+
+    var canReviewSessionsForRestore: Bool {
+        active && showRestore && offlineModeBlocked && !busy && !disconnectableScenes.isEmpty
+    }
+
+    func reviewSessionsForRestore() -> RestoreSessionDisconnectReview? {
+        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return nil }
+        let owners = disconnectableScenes
+        guard !owners.isEmpty else { return nil }
+        let reviewed = RestoreSessionDisconnectReview(epoch: epoch, owners: owners)
+        disconnectReviewID = reviewed.id
+        return reviewed
+    }
+
+    /// Validate the complete review before sealing any owner. New, unreviewed
+    /// scenes keep their sessions and can still prevent offline admission.
+    func disconnectSessionsAndRestore(_ reviewed: RestoreSessionDisconnectReview) {
+        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return }
+        guard disconnectReviewID == reviewed.id, reviewed.epoch == epoch, !reviewed.owners.isEmpty,
+              reviewed.owners.allSatisfy({ liveScenes[$0.workspaceID] === $0 }) else {
+            message = "The workspace sessions changed. Review them again before disconnecting; this confirmation did not close any sessions."
+            return
+        }
+        disconnectReviewID = nil
+        busy = true; message = nil; cameraRequested = false
+        // No actor hop may intervene between validating the owners and sealing
+        // input/reconnect admission for every one of them.
+        for owner in reviewed.owners { owner.requestClose() }
+        let notice = announcement
+        announcement = nil; notice?.cancel()
+        let job = Task { [weak self] in
+            // The model retains this task even after leaving restore. Closing
+            // joins each owner's timers, startup, input and transport cleanup;
+            // MobileConnections keeps any failed settlements for a later retry.
+            for owner in reviewed.owners { await owner.close() }
+            await notice?.value
+            guard let self, self.restoreDisconnection?.id == reviewed.id else { return }
+            self.restoreDisconnection = nil; self.busy = false
+            guard self.active, self.showRestore, self.epoch == reviewed.epoch else { return }
+            self.updateLifecycle()
+        }
+        restoreDisconnection = (reviewed.id, job)
+    }
+
     func requestRecipient() {
         guard active, !busy else { return }
         scannedCode = nil; stopSavingScanProgress()
@@ -331,6 +402,7 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
+        disconnectReviewID = nil
         workspaceRefresh?.cancel()
         observations?.finish(); observations = nil
         observationTask?.cancel(); observationTask = nil; lastObservation = nil
@@ -646,10 +718,25 @@ final class MobileWorkspaceModel {
     /// ends its arrival notice, resets, and takes exclusion back before
     /// anything is scanned or read.
     private func restartFinished(_ restore: OfflineRestore<AppleCryptography>) async throws -> OfflineRestoreStatus {
+        let ticket = epoch
         scannedCode = nil; stopSavingScanProgress()
-        announcement?.cancel(); await announcement?.value; announcement = nil
+        let notice = announcement
+        announcement = nil; notice?.cancel(); await notice?.value
+        guard active, showRestore, epoch == ticket else { throw CancellationError() }
         _ = try await restore.reset()
-        try await restore.enterOfflineMode()
+        guard active, showRestore, epoch == ticket else { throw CancellationError() }
+        do { try await restore.enterOfflineMode() }
+        catch {
+            // A completed import released exclusion, so starting the next one
+            // may meet sessions opened since then. Offer the same explicit
+            // disconnect choice as initial entry, rather than a stale receipt.
+            let paused = await restore.suspend()
+            if active, showRestore, epoch == ticket {
+                cameraRequested = false; offlineModeBlocked = true
+                state = paused; report(error)
+            }
+            throw error
+        }
         return await restore.status()
     }
     /// Tells the Mac that sent this transfer that it arrived, so it can say so
@@ -926,17 +1013,25 @@ struct OfflineRestoreSheet: View {
     @State private var securityChangesConfirmed = false
     @State private var repairPage = 0
     @State private var chooseFile = false
-    private enum ScanDecision {
+    private enum RestoreDecision {
         case save(generation: UUID, identity: OpticalFrame.Identity)
         case discard(OpticalScanRecoveryReview)
+        case disconnect(RestoreSessionDisconnectReview)
         var title: String {
             switch self {
             case .save: "Save Scan Progress?"
             case .discard: "Discard Saved Scan?"
+            case .disconnect: "Disconnect Sessions and Restore?"
+            }
+        }
+        var cancelTitle: String {
+            switch self {
+            case .disconnect: "Keep Sessions"
+            case .save, .discard: "Cancel"
             }
         }
     }
-    @State private var scanDecision: ScanDecision?
+    @State private var restoreDecision: RestoreDecision?
     var body: some View {
         NavigationStack {
             Group {
@@ -947,9 +1042,17 @@ struct OfflineRestoreSheet: View {
                     } description: {
                         Text(model.message ?? "Close active connections before restoring. Cancel to keep your connections open.")
                     } actions: {
+                        if model.busy { ProgressView("Preparing offline restore…") }
+                        if model.canReviewSessionsForRestore {
+                            Button("Disconnect Sessions and Restore", role: .destructive) {
+                                if let reviewed = model.reviewSessionsForRestore() {
+                                    restoreDecision = .disconnect(reviewed)
+                                }
+                            }
+                        }
                         Button("Retry Offline Restore") { model.retryOfflineMode() }.buttonStyle(.borderedProminent)
                         Button("Cancel Restore") { model.setRestoreVisible(false) }
-                    }
+                    }.disabled(model.busy)
                 }
                 else if let state = model.state {
                     ScrollView {
@@ -1042,9 +1145,9 @@ struct OfflineRestoreSheet: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
-        .confirmationDialog(scanDecision?.title ?? "Saved Scan",
-                            isPresented: Binding(get: { scanDecision != nil }, set: { if !$0 { scanDecision = nil } }),
-                            titleVisibility: .visible, presenting: scanDecision) { decision in
+        .confirmationDialog(restoreDecision?.title ?? "Restore",
+                            isPresented: Binding(get: { restoreDecision != nil }, set: { if !$0 { restoreDecision = nil } }),
+                            titleVisibility: .visible, presenting: restoreDecision) { decision in
             switch decision {
             case .save(let generation, let identity):
                 Button("Save Encrypted Pages") { model.saveScanProgress(generation: generation, identity: identity) }
@@ -1052,14 +1155,21 @@ struct OfflineRestoreSheet: View {
             case .discard(let saved):
                 Button("Discard Saved Scan", role: .destructive) { model.discardSavedScan(saved) }
                     .disabled(model.busy || !model.active)
+            case .disconnect(let reviewed):
+                Button("Disconnect Sessions and Restore", role: .destructive) { model.disconnectSessionsAndRestore(reviewed) }
+                    .disabled(model.busy || !model.active)
             }
-            Button("Cancel", role: .cancel) { scanDecision = nil }
+            Button(decision.cancelTitle, role: .cancel) { restoreDecision = nil }
         } message: { decision in
             switch decision {
             case .save:
                 Text("Keep this transfer's verified encrypted pages on this phone and save more as they arrive. The cache is protected on this device and excluded from backups. Transfer codes and phone request keys are never saved. Saving pauses when you leave restore or the app becomes inactive.")
             case .discard(let saved):
                 Text("Discard \(saved.verifiedPages) saved pages for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further pages will stop.")
+            case .disconnect(let reviewed):
+                Text(verbatim: "Disconnect sessions in these workspaces:\n\n"
+                    + reviewed.workspaceNames.joined(separator: "\n")
+                    + "\n\nDirect SSH disconnection can terminate remote shells and programs. Input already sent may have executed. This also stops a pending transfer arrival notice. Other network activity may still prevent offline restore.")
             }
         }
         .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
@@ -1072,7 +1182,7 @@ struct OfflineRestoreSheet: View {
             if !active {
                 code = ""; allowRemoval = false; allowRollback = false
                 associateWithExistingWorkspace = false; securityChangesConfirmed = false
-                scanDecision = nil
+                restoreDecision = nil
             }
         }
         .onChange(of: model.state?.review?.token) { _, _ in
@@ -1082,7 +1192,7 @@ struct OfflineRestoreSheet: View {
         .onDisappear {
             code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
             associateWithExistingWorkspace = false; securityChangesConfirmed = false
-            scanDecision = nil
+            restoreDecision = nil
         }
     }
 
@@ -1097,7 +1207,7 @@ struct OfflineRestoreSheet: View {
                     Button("Pause Saving") { model.stopSavingScanProgress() }
                 } else if state.verifiedPages > 0 {
                     Button {
-                        scanDecision = .save(generation: state.generation, identity: identity)
+                        restoreDecision = .save(generation: state.generation, identity: identity)
                     } label: { Label("Save Scan Progress", systemImage: "square.and.arrow.down") }
                     Text("Keep encrypted pages so an interrupted scan can continue later.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -1130,7 +1240,7 @@ struct OfflineRestoreSheet: View {
             }
             Text("Codes and phone request keys are not saved. If an Only This Phone request key was lost when the app closed, create a new request and export again from your Mac.")
                 .font(.footnote).foregroundStyle(.secondary)
-            Button("Discard Saved Scan", role: .destructive) { scanDecision = .discard(saved) }
+            Button("Discard Saved Scan", role: .destructive) { restoreDecision = .discard(saved) }
         }.padding().frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
     }
