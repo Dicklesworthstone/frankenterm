@@ -4528,6 +4528,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-mobile-mux"
+version = "0.15.21"
+dependencies = [
+ "codec",
+ "frankenterm-term",
+ "leb128",
+ "mux",
+ "serde",
+ "termwiz 0.24.0",
+ "thiserror 2.0.21",
+ "varbincode",
+ "zstd 0.14.3",
+]
+
+[[package]]
 name = "frankenterm-mux-server"
 version = "0.15.21"
 dependencies = [
@@ -4795,6 +4810,7 @@ dependencies = [
  "frankenterm-cell",
  "frankenterm-dynamic",
  "frankenterm-escape-parser",
+ "frankenterm-mobile-mux",
  "frankenterm-sigpipe",
  "frankenterm-surface",
  "frankenterm-term",

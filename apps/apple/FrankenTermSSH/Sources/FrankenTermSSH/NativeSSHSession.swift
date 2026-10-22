@@ -283,6 +283,26 @@ public actor NativeSSHSession {
 
     /// Explicit remote side effect. Does not occur as part of authenticate/import.
     public func openShell(geometry: NativeSSHGeometry, timeout: Duration = .seconds(15)) async throws {
+        try await openChannel(timeout: timeout) {
+            ftssh_begin_shell(native.pointer, geometry.columns, geometry.rows, geometry.pixelWidth, geometry.pixelHeight)
+        }
+    }
+
+    /// Runs one remote command instead of a shell: no PTY, so the channel
+    /// carries its bytes unchanged (a mux socket relay such as
+    /// `nc -N -U <socket>`), and its stderr is discarded. Printable ASCII only.
+    public func openCommand(_ command: String, timeout: Duration = .seconds(15)) async throws {
+        let bytes = Array(command.utf8)
+        guard !bytes.isEmpty, bytes.count <= Int(FTSSH_COMMAND_CAPACITY),
+              bytes.allSatisfy({ (32...126).contains($0) }) else { throw NativeSSHError.invalidInput }
+        try await openChannel(timeout: timeout) {
+            bytes.withUnsafeBufferPointer { buffer in
+                buffer.withMemoryRebound(to: CChar.self) { ftssh_begin_command(native.pointer, $0.baseAddress, bytes.count) }
+            }
+        }
+    }
+
+    private func openChannel(timeout: Duration, begin: () -> Int32) async throws {
         let deadline = try deadline(timeout)
         guard phase == .authenticated, operation == nil, let authority = authentication,
               let peer, let identity else { throw phase == .closed ? NativeSSHError.closed : .busy }
@@ -294,7 +314,7 @@ public actor NativeSSHSession {
             try await withTaskCancellationHandler {
                 try await authority.validate(peer: peer, identity: identity)
                 try current(token, deadline)
-                try requireOK(ftssh_begin_shell(native.pointer, geometry.columns, geometry.rows, geometry.pixelWidth, geometry.pixelHeight))
+                try requireOK(begin())
                 while true {
                     try current(token, deadline)
                     let result = ftssh_shell_step(native.pointer)

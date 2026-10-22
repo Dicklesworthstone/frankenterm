@@ -1,0 +1,507 @@
+//! Audited native C boundary for the phone's mux client
+//! (`frankenterm-mobile-mux`): the protocol a FrankenTerm mux server speaks,
+//! as a byte-in/byte-out state machine. The app owns the SSH channel and the
+//! terminals; this boundary owns only protocol state.
+//!
+//! Same contract as `native_ffi`: callers provide valid, aligned,
+//! nonoverlapping initialized byte buffers and writable scalar outputs;
+//! pointers are checked, borrowed only inside their call and never stored.
+//! Rust-owned state is reachable only through generation-checked handles.
+//! A mutex serializes operations; no callback, await or I/O runs under it.
+//! A panic poisons only the affected session. See
+//! include/frankenterm_terminal.h for the public contract.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use crate::native::NativeTerminalError as Error;
+use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
+use frankenterm_mobile_mux::{Event, Session};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use std::convert::TryFrom;
+use std::panic::AssertUnwindSafe;
+use std::sync::{LazyLock, Mutex};
+
+const SLOTS: usize = 16;
+const MAX_GENERATION: u64 = u64::MAX >> 4;
+/// Channel bytes one receive call may deliver.
+pub const MAX_RECEIVE_BYTES: usize = 1 << 20;
+/// Input bytes one write or paste may carry.
+pub const MAX_WRITE_BYTES: usize = 1 << 16;
+/// The most bytes one outgoing or event copy may return.
+pub const MAX_COPY_BYTES: usize = 1 << 24;
+
+const EVENT_NONE: u32 = 0;
+const EVENT_READY: u32 = 1;
+const EVENT_PANES: u32 = 2;
+const EVENT_OUTPUT: u32 = 3;
+const EVENT_PANE_TITLE: u32 = 4;
+const EVENT_PANE_GONE: u32 = 5;
+const EVENT_FAILED: u32 = 6;
+
+#[derive(Default)]
+struct Slot {
+    generation: u64,
+    session: Option<Session>,
+    poisoned: bool,
+    outgoing: Vec<u8>,
+    event: Vec<u8>,
+}
+
+struct Registry {
+    slots: [Slot; SLOTS],
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Slot::default()),
+        }
+    }
+
+    fn index(&self, handle: u64) -> Result<usize, Error> {
+        let index = (handle & 15) as usize;
+        let generation = handle >> 4;
+        let slot = &self.slots[index];
+        if generation == 0 || generation != slot.generation || slot.session.is_none() {
+            return Err(Error::Stale);
+        }
+        Ok(index)
+    }
+
+    fn slot(&mut self, handle: u64) -> Result<&mut Slot, Error> {
+        let index = self.index(handle)?;
+        let slot = &mut self.slots[index];
+        if slot.poisoned {
+            return Err(Error::Closed);
+        }
+        Ok(slot)
+    }
+
+    fn session(&mut self, handle: u64) -> Result<&mut Session, Error> {
+        self.slot(handle)?.session.as_mut().ok_or(Error::Stale)
+    }
+
+    fn create(&mut self) -> Result<u64, Error> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.session.is_none() && slot.generation < MAX_GENERATION)
+            .ok_or(Error::Capacity)?;
+        let slot = &mut self.slots[index];
+        slot.generation += 1;
+        slot.session = Some(Session::new());
+        slot.poisoned = false;
+        slot.outgoing.clear();
+        slot.event.clear();
+        Ok((slot.generation << 4) | index as u64)
+    }
+
+    fn release(&mut self, handle: u64) -> Result<(), Error> {
+        let index = self.index(handle)?;
+        let slot = &mut self.slots[index];
+        slot.session = None;
+        slot.poisoned = false;
+        slot.outgoing = Vec::new();
+        slot.event = Vec::new();
+        Ok(())
+    }
+
+    fn poison(&mut self, handle: u64) {
+        if let Ok(index) = self.index(handle) {
+            self.slots[index].poisoned = true;
+        }
+    }
+
+    /// Copies the next bytes to send; copied bytes count as taken.
+    fn outgoing(&mut self, handle: u64, output: &mut [u8]) -> Result<usize, Error> {
+        let slot = self.slot(handle)?;
+        if let Some(session) = slot.session.as_mut() {
+            slot.outgoing.extend_from_slice(&session.take_outgoing());
+        }
+        let count = output.len().min(slot.outgoing.len());
+        output[..count].copy_from_slice(&slot.outgoing[..count]);
+        slot.outgoing.drain(..count);
+        Ok(count)
+    }
+
+    /// Moves the next event's payload into the slot for `event_copy`.
+    fn next_event(&mut self, handle: u64) -> Result<(u32, u64, u32, u32, u32), Error> {
+        let slot = self.slot(handle)?;
+        let event = slot.session.as_mut().ok_or(Error::Stale)?.next_event();
+        let (kind, pane, rows, cols, payload) = match event {
+            None => (EVENT_NONE, 0, 0, 0, Vec::new()),
+            Some(Event::Ready { server_version }) => {
+                (EVENT_READY, 0, 0, 0, server_version.into_bytes())
+            }
+            Some(Event::Panes(panes)) => (
+                EVENT_PANES,
+                0,
+                0,
+                0,
+                serde_json::to_vec(&panes).map_err(|_| Error::Invalid)?,
+            ),
+            Some(Event::Output {
+                pane_id,
+                rows,
+                cols,
+                bytes,
+            }) => (
+                EVENT_OUTPUT,
+                pane_id as u64,
+                count(rows)?,
+                count(cols)?,
+                bytes,
+            ),
+            Some(Event::PaneTitle { pane_id, title }) => {
+                (EVENT_PANE_TITLE, pane_id as u64, 0, 0, title.into_bytes())
+            }
+            Some(Event::PaneGone { pane_id }) => {
+                (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new())
+            }
+            Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
+        };
+        let length = u32::try_from(payload.len()).map_err(|_| Error::Capacity)?;
+        slot.event = payload;
+        Ok((kind, pane, rows, cols, length))
+    }
+
+    fn event_copy(
+        &mut self,
+        handle: u64,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        let slot = self.slot(handle)?;
+        if offset > slot.event.len() {
+            return Err(Error::Invalid);
+        }
+        let count = output.len().min(slot.event.len() - offset);
+        output[..count].copy_from_slice(&slot.event[offset..offset + count]);
+        Ok(count)
+    }
+}
+
+fn count(value: usize) -> Result<u32, Error> {
+    u32::try_from(value).map_err(|_| Error::Invalid)
+}
+
+fn pane(value: u64) -> Result<usize, Error> {
+    usize::try_from(value).map_err(|_| Error::Invalid)
+}
+
+static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::new()));
+
+fn boundary(owner: Option<u64>, operation: impl FnOnce(&mut Registry) -> Result<(), Error>) -> u32 {
+    frankenterm_sigpipe::install_recoverable_boundary_hook_once();
+    let mut registry = REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match catch_recoverable(
+        RecoverablePanicSite::NativeTerminalBridge,
+        AssertUnwindSafe(|| operation(&mut registry)),
+    ) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => error as u32,
+        Err(_) => {
+            if let Some(owner) = owner {
+                registry.poison(owner);
+            }
+            Error::Panic as u32
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_create(session: *mut u64) -> u32 {
+    boundary(None, |registry| {
+        unsafe {
+            output_scalar(session, 0)?;
+        }
+        let handle = registry.create()?;
+        unsafe {
+            output_scalar(session, handle)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_release(session: u64) -> u32 {
+    boundary(None, |registry| registry.release(session))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_receive(session: u64, bytes: *const u8, length: u32) -> u32 {
+    boundary(Some(session), |registry| {
+        let bytes = unsafe { input_bytes(bytes, length, MAX_RECEIVE_BYTES)? };
+        registry.session(session)?.receive(bytes);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_closed(session: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        registry.session(session)?.closed();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_outgoing(
+    session: u64,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(written, 0)?;
+        }
+        let output = unsafe { output_bytes(output, capacity, MAX_COPY_BYTES)? };
+        let count = registry.outgoing(session, output)?;
+        unsafe {
+            output_scalar(written, count as u32)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_next_event(
+    session: u64,
+    kind: *mut u32,
+    pane_id: *mut u64,
+    rows: *mut u32,
+    cols: *mut u32,
+    length: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(kind, EVENT_NONE)?;
+            output_scalar(pane_id, 0)?;
+            output_scalar(rows, 0)?;
+            output_scalar(cols, 0)?;
+            output_scalar(length, 0)?;
+        }
+        let (event, pane, event_rows, event_cols, event_length) = registry.next_event(session)?;
+        unsafe {
+            output_scalar(kind, event)?;
+            output_scalar(pane_id, pane)?;
+            output_scalar(rows, event_rows)?;
+            output_scalar(cols, event_cols)?;
+            output_scalar(length, event_length)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_event_copy(
+    session: u64,
+    offset: u32,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(written, 0)?;
+        }
+        let output = unsafe { output_bytes(output, capacity, MAX_COPY_BYTES)? };
+        let count = registry.event_copy(session, offset as usize, output)?;
+        unsafe {
+            output_scalar(written, count as u32)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_refresh_panes(session: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        registry.session(session)?.refresh_panes();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_show(session: u64, pane_id: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        registry.session(session)?.show(pane_id);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_hide(session: u64, pane_id: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        registry.session(session)?.hide(pane_id);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_write(
+    session: u64,
+    pane_id: u64,
+    bytes: *const u8,
+    length: u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        let bytes = unsafe { input_bytes(bytes, length, MAX_WRITE_BYTES)? };
+        registry.session(session)?.write(pane_id, bytes);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_paste(
+    session: u64,
+    pane_id: u64,
+    text: *const u8,
+    length: u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        let text = utf8(unsafe { input_bytes(text, length, MAX_WRITE_BYTES)? })?;
+        registry.session(session)?.paste(pane_id, text);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_resize(session: u64, pane_id: u64, rows: u32, cols: u32) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        if rows == 0 || cols == 0 || rows > 512 || cols > 512 {
+            return Err(Error::Invalid);
+        }
+        registry
+            .session(session)?
+            .resize(pane_id, rows as usize, cols as usize);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_restore_size(session: u64, pane_id: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        registry.session(session)?.restore_size(pane_id);
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take_outgoing(session: u64) -> Vec<u8> {
+        let mut output = vec![0u8; 4096];
+        let mut written = 0u32;
+        // SAFETY: live local buffers with their exact lengths.
+        let status = unsafe {
+            ft_mux_v1_outgoing(
+                session,
+                output.as_mut_ptr(),
+                output.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, 0);
+        output.truncate(written as usize);
+        output
+    }
+
+    #[test]
+    fn a_session_handshakes_and_reports_a_refused_protocol_through_the_c_abi() {
+        let mut session = 0u64;
+        // SAFETY: a live local scalar.
+        assert_eq!(unsafe { ft_mux_v1_create(&mut session) }, 0);
+        assert_ne!(session, 0);
+        // The first request is GetCodecVersion, serial 1.
+        assert_eq!(take_outgoing(session), [2, 1, 26]);
+        assert!(take_outgoing(session).is_empty());
+
+        // A v70 server's reply: codec_vers 70, version "x".
+        let reply = [5u8, 1, 27, 70, 1, b'x'];
+        // SAFETY: a live local buffer with its exact length.
+        assert_eq!(
+            unsafe { ft_mux_v1_receive(session, reply.as_ptr(), reply.len() as u32) },
+            0
+        );
+        let (mut kind, mut pane, mut rows, mut cols, mut length) = (9u32, 9u64, 9u32, 9u32, 0u32);
+        // SAFETY: live local scalars.
+        let status = unsafe {
+            ft_mux_v1_next_event(
+                session,
+                &mut kind,
+                &mut pane,
+                &mut rows,
+                &mut cols,
+                &mut length,
+            )
+        };
+        assert_eq!((status, kind, pane, rows, cols), (0, EVENT_FAILED, 0, 0, 0));
+        let mut reason = vec![0u8; length as usize];
+        let mut written = 0u32;
+        // SAFETY: a live local buffer with its exact length.
+        let status =
+            unsafe { ft_mux_v1_event_copy(session, 0, reason.as_mut_ptr(), length, &mut written) };
+        assert_eq!((status, written), (0, length));
+        let reason = String::from_utf8(reason).unwrap();
+        assert!(reason.contains("70"), "{}", reason);
+
+        // SAFETY: live local scalars.
+        let status = unsafe {
+            ft_mux_v1_next_event(
+                session,
+                &mut kind,
+                &mut pane,
+                &mut rows,
+                &mut cols,
+                &mut length,
+            )
+        };
+        assert_eq!((status, kind, length), (0, EVENT_NONE, 0));
+
+        assert_eq!(ft_mux_v1_resize(session, 1, 0, 80), Error::Invalid as u32);
+        assert_eq!(ft_mux_v1_release(session), 0);
+        assert_eq!(ft_mux_v1_release(session), Error::Stale as u32);
+        // SAFETY: a null pointer with length zero is the empty input.
+        assert_eq!(
+            unsafe { ft_mux_v1_receive(session, std::ptr::null(), 0) },
+            Error::Stale as u32
+        );
+    }
+
+    #[test]
+    fn invalid_pointers_and_text_are_refused() {
+        let mut session = 0u64;
+        // SAFETY: a live local scalar.
+        assert_eq!(unsafe { ft_mux_v1_create(&mut session) }, 0);
+        // SAFETY: deliberately null with a nonzero length; refused before use.
+        assert_eq!(
+            unsafe { ft_mux_v1_receive(session, std::ptr::null(), 4) },
+            Error::Invalid as u32
+        );
+        let invalid = [0xffu8, 0xfe];
+        // SAFETY: a live local buffer with its exact length.
+        assert_eq!(
+            unsafe { ft_mux_v1_paste(session, 1, invalid.as_ptr(), invalid.len() as u32) },
+            Error::Invalid as u32
+        );
+        let mut written = 7u32;
+        // SAFETY: deliberately null output; refused before use.
+        assert_eq!(
+            unsafe { ft_mux_v1_outgoing(session, std::ptr::null_mut(), 8, &mut written) },
+            Error::Invalid as u32
+        );
+        assert_eq!(written, 0);
+        assert_eq!(ft_mux_v1_release(session), 0);
+    }
+}

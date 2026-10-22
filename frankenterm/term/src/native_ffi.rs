@@ -303,7 +303,7 @@ fn boundary(owner: Option<u64>, operation: impl FnOnce(&mut Registry) -> Result<
     }
 }
 
-fn check_pointer<T>(pointer: *const T) -> Result<(), Error> {
+pub(crate) fn check_pointer<T>(pointer: *const T) -> Result<(), Error> {
     if pointer.is_null() || !pointer.is_aligned() {
         Err(Error::Invalid)
     } else {
@@ -314,7 +314,7 @@ fn check_pointer<T>(pointer: *const T) -> Result<(), Error> {
 /// SAFETY: pointer is valid writable storage for T, unique with respect to
 /// every input/output range in this call. Initializing scalar outputs does not
 /// require the caller's prior value to have been initialized.
-unsafe fn output_scalar<T>(pointer: *mut T, value: T) -> Result<(), Error> {
+pub(crate) unsafe fn output_scalar<T>(pointer: *mut T, value: T) -> Result<(), Error> {
     check_pointer(pointer)?;
     unsafe {
         pointer.write(value);
@@ -324,7 +324,7 @@ unsafe fn output_scalar<T>(pointer: *mut T, value: T) -> Result<(), Error> {
 
 /// SAFETY: the caller guarantees this initialized, immutable byte range is
 /// valid for this call. Only its length/null preconditions can be checked here.
-unsafe fn input_bytes<'a>(
+pub(crate) unsafe fn input_bytes<'a>(
     pointer: *const u8,
     length: u32,
     maximum: usize,
@@ -342,7 +342,7 @@ unsafe fn input_bytes<'a>(
 
 /// SAFETY: the caller guarantees this initialized byte range is exclusively
 /// writable for this call and does not overlap inputs or scalar outputs.
-unsafe fn output_bytes<'a>(
+pub(crate) unsafe fn output_bytes<'a>(
     pointer: *mut u8,
     capacity: u32,
     maximum: usize,
@@ -358,7 +358,7 @@ unsafe fn output_bytes<'a>(
     Ok(unsafe { std::slice::from_raw_parts_mut(pointer, capacity) })
 }
 
-fn utf8(bytes: &[u8]) -> Result<&str, Error> {
+pub(crate) fn utf8(bytes: &[u8]) -> Result<&str, Error> {
     std::str::from_utf8(bytes).map_err(|_| Error::Invalid)
 }
 

@@ -1,0 +1,264 @@
+//! The mux protocol exactly as codec v46 (FrankenTerm v0.13) frames it, the
+//! dialect the fleet's mux servers speak: the requests the phone sends and
+//! the prefixes of the replies it reads. Varbincode is positional, so field
+//! order and types match `codec` and `mux` byte for byte; the tests compare
+//! them with the desktop codec's own Legacy46 encoding and decoding.
+//!
+//! A reply struct may stop before the reply's last field: decoding reads a
+//! prefix and ignores the rest (hyperlink spans, image references, input
+//! serials and sequence numbers, which the phone does not use).
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ops::Range;
+use termwiz::surface::{CursorShape, CursorVisibility, Line};
+
+/// The only dialect this client speaks.
+pub const CODEC_VERSION: usize = 46;
+
+/// PDU identifiers (codec's `pdu!` table).
+pub mod ident {
+    pub const ERROR_RESPONSE: u64 = 0;
+    pub const LIST_PANES: u64 = 3;
+    pub const LIST_PANES_RESPONSE: u64 = 4;
+    pub const WRITE_TO_PANE: u64 = 9;
+    pub const UNIT_RESPONSE: u64 = 10;
+    pub const SEND_PASTE: u64 = 13;
+    pub const RESIZE: u64 = 14;
+    pub const GET_LINES: u64 = 22;
+    pub const GET_LINES_RESPONSE: u64 = 23;
+    pub const GET_PANE_RENDER_CHANGES: u64 = 24;
+    pub const GET_PANE_RENDER_CHANGES_RESPONSE: u64 = 25;
+    pub const GET_CODEC_VERSION: u64 = 26;
+    pub const GET_CODEC_VERSION_RESPONSE: u64 = 27;
+    pub const LIVENESS_RESPONSE: u64 = 30;
+    pub const PANE_REMOVED: u64 = 37;
+}
+
+pub type StableRowIndex = isize;
+
+#[derive(Serialize)]
+pub struct GetCodecVersion {}
+
+/// Prefix of PDU 27.
+#[derive(Deserialize, Debug)]
+pub struct CodecVersion {
+    pub codec_vers: usize,
+    pub version_string: String,
+}
+
+#[derive(Serialize)]
+pub struct ListPanes {}
+
+#[derive(Serialize)]
+pub struct GetPaneRenderChanges {
+    pub pane_id: usize,
+}
+
+#[derive(Serialize)]
+pub struct GetLines {
+    pub pane_id: usize,
+    pub lines: Vec<Range<StableRowIndex>>,
+}
+
+#[derive(Serialize)]
+pub struct WriteToPane {
+    pub pane_id: usize,
+    pub data: Vec<u8>,
+}
+
+/// The v46 PDU 13 schema (no input serial).
+#[derive(Serialize)]
+pub struct SendPaste<'a> {
+    pub pane_id: usize,
+    pub data: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct Resize {
+    pub containing_tab_id: usize,
+    pub pane_id: usize,
+    pub size: TerminalSize,
+}
+
+/// `frankenterm_term::TerminalSize`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub rows: usize,
+    pub cols: usize,
+    pub pixel_width: usize,
+    pub pixel_height: usize,
+    pub dpi: u32,
+}
+
+/// `mux::renderable::StableCursorPosition`.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub x: usize,
+    pub y: StableRowIndex,
+    pub shape: CursorShape,
+    pub visibility: CursorVisibility,
+}
+
+/// `mux::renderable::RenderableDimensions`.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dimensions {
+    pub cols: usize,
+    pub viewport_rows: usize,
+    pub scrollback_rows: usize,
+    pub physical_top: StableRowIndex,
+    pub scrollback_top: StableRowIndex,
+    pub dpi: u32,
+    pub pixel_width: usize,
+    pub pixel_height: usize,
+    pub reverse_video: bool,
+}
+
+/// `mux::renderable::PaneTieredScrollbackStatus`: read only to stay aligned.
+#[allow(dead_code, clippy::struct_excessive_bools)]
+#[derive(Deserialize, Debug)]
+pub struct TieredScrollbackStatus {
+    tiering_enabled: bool,
+    configured_scrollback_rows: usize,
+    configured_hot_lines: usize,
+    configured_warm_max_bytes: usize,
+    visible_rows: usize,
+    in_memory_scrollback_rows: usize,
+    warm_resident_lines: usize,
+    warm_resident_bytes: usize,
+    warm_spill_lines_total: u64,
+    warm_spill_bytes_total: u64,
+    cold_spill_lines_total: u64,
+    cold_spill_bytes_total: u64,
+    cold_sink_retained_lines: usize,
+    cold_sink_retained_bytes: usize,
+    cold_worker_peak_backlog_depth: usize,
+    cold_worker_completion_throughput_lines_per_sec: u64,
+    cold_worker_completed_lines_total: u64,
+    cold_worker_completed_batches_total: u64,
+    cold_worker_cancellation_count: u64,
+}
+
+/// The `lines` field that opens codec's `SerializedLines`.
+#[derive(Deserialize, Debug, Default)]
+pub struct LineEntries {
+    pub lines: Vec<(StableRowIndex, Line)>,
+}
+
+/// PDU 25 up to its lines, which still decodes when the lines do not.
+#[derive(Deserialize, Debug)]
+pub struct RenderHead {
+    pub pane_id: usize,
+    pub mouse_grabbed: bool,
+    pub alt_screen_active: bool,
+    pub cursor_position: CursorPosition,
+    pub dimensions: Dimensions,
+    pub tiered_scrollback_status: Option<TieredScrollbackStatus>,
+    pub dirty_lines: Vec<Range<StableRowIndex>>,
+    pub title: String,
+    pub working_dir: Option<String>,
+}
+
+/// Prefix of PDU 25, a reply to GetPaneRenderChanges or a pushed update.
+/// Varbincode writes a struct as its fields alone, so the nested head is
+/// byte for byte the flat v46 layout.
+#[derive(Deserialize, Debug)]
+pub struct RenderChanges {
+    pub head: RenderHead,
+    pub bonus_lines: LineEntries,
+}
+
+/// Prefix of PDU 23.
+#[derive(Deserialize, Debug)]
+pub struct LinesResponse {
+    pub pane_id: usize,
+    pub lines: LineEntries,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct LivenessResponse {
+    pub pane_id: usize,
+    pub is_alive: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PaneRemoved {
+    pub pane_id: usize,
+}
+
+/// The exact v46 PDU 4 schema.
+#[derive(Deserialize, Debug)]
+pub struct PaneList {
+    pub tabs: Vec<PaneNode>,
+    pub tab_titles: Vec<String>,
+    pub window_titles: HashMap<usize, String>,
+}
+
+/// v46 `mux::tab::PaneNode`: a split's geometry follows both children.
+#[derive(Deserialize, Debug)]
+pub enum PaneNode {
+    Empty,
+    Split {
+        left: Box<PaneNode>,
+        right: Box<PaneNode>,
+        node: SplitDirectionAndSize,
+    },
+    Leaf(PaneEntry),
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct SplitDirectionAndSize {
+    pub direction: SplitDirection,
+    pub first: TerminalSize,
+    pub second: TerminalSize,
+}
+
+/// The exact v46 `mux::tab::PaneEntry` field order.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct PaneEntry {
+    pub window_id: usize,
+    pub tab_id: usize,
+    pub pane_id: usize,
+    pub title: String,
+    pub size: TerminalSize,
+    pub working_dir: Option<String>,
+    pub alt_screen_active: bool,
+    pub is_active_pane: bool,
+    pub is_zoomed_pane: bool,
+    pub workspace: String,
+    pub cursor_pos: CursorPosition,
+    pub physical_top: StableRowIndex,
+    pub top_row: usize,
+    pub left_col: usize,
+    pub tty_name: Option<String>,
+}
+
+impl PaneNode {
+    /// Every pane in this tab, left to right / top to bottom.
+    pub fn leaves<'a>(&'a self, out: &mut Vec<&'a PaneEntry>) {
+        match self {
+            Self::Empty => {}
+            Self::Split { left, right, .. } => {
+                left.leaves(out);
+                right.leaves(out);
+            }
+            Self::Leaf(entry) => out.push(entry),
+        }
+    }
+}
+
+pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+    // Serializing these plain structs into memory cannot fail.
+    varbincode::serialize(value).unwrap_or_default()
+}
+
+pub fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, crate::Error> {
+    varbincode::deserialize(body).map_err(|_| crate::Error::Schema)
+}

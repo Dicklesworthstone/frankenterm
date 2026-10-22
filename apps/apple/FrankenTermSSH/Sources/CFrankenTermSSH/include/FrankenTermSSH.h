@@ -22,7 +22,7 @@ enum {
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
     FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010
 };
-enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_WRITE_CAPACITY = 16384 };
+enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -72,6 +72,11 @@ int ftssh_supply_signature(ftssh_session *session, const uint8_t *blob, size_t l
 
 int ftssh_begin_shell(ftssh_session *session, uint32_t columns, uint32_t rows,
                       uint32_t pixel_width, uint32_t pixel_height);
+/* Instead of a shell: one remote command (printable ASCII, at most
+ * FTSSH_COMMAND_CAPACITY bytes) with no PTY, so the channel carries its bytes
+ * unchanged. Its stderr is discarded. ftssh_shell_step completes the start;
+ * read, write, completion and close then work as for a shell; resize does not. */
+int ftssh_begin_command(ftssh_session *session, const char *command, size_t length);
 int ftssh_shell_step(ftssh_session *session);
 /* Admission copies the whole bounded unit or accepts nothing. Success means
  * accepted into this adapter's single 16 KiB slot, NOT remote delivery. */

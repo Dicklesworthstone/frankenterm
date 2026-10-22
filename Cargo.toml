@@ -5,6 +5,7 @@ members = [
     "crates/frankenterm-build-identity",
     "crates/frankenterm-machines",
     "crates/frankenterm-mobile-attach",
+    "crates/frankenterm-mobile-mux",
     "crates/frankenterm-core",
     "crates/frankenterm-browser-ui",
     "crates/frankenterm-redactor",

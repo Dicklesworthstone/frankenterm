@@ -157,6 +157,65 @@ uint32_t ft_terminal_v1_frame_copy(uint64_t frame, uint32_t offset, uint8_t *out
                                   uint32_t capacity, uint32_t *written);
 uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 
+/* Mux client: the protocol of a FrankenTerm mux server (codec v46, the
+ * fleet's v0.13 servers) as a byte-in/byte-out state machine. The caller
+ * owns the channel (an SSH command running `nc -N -U <socket>`), the
+ * terminals the output is drawn on, and all scheduling; nothing here does
+ * I/O or keeps a pointer. Status values are the FT_TERMINAL_* codes.
+ *
+ * After create, send what ft_mux_v1_outgoing returns, pass everything the
+ * channel delivers to ft_mux_v1_receive, and drain ft_mux_v1_next_event
+ * after each call until it reports FT_MUX_EVENT_NONE. An event's payload
+ * (length bytes) stays readable through ft_mux_v1_event_copy until the
+ * next ft_mux_v1_next_event call.
+ *
+ *   READY      payload: the server's version string; the pane list follows
+ *   PANES      payload: JSON array of {pane_id, tab_id, window_id, tab_title,
+ *              title, workspace, working_dir, size{rows, cols, pixel_width,
+ *              pixel_height, dpi}, is_active, is_zoomed, top_row, left_col}
+ *   OUTPUT     pane_id, rows, cols; payload: bytes for that pane's terminal,
+ *              which must be rows x cols before they are fed
+ *   PANE_TITLE pane_id; payload: the title
+ *   PANE_GONE  pane_id
+ *   FAILED     payload: why; the session is over, close the channel
+ */
+#define FT_MUX_EVENT_NONE 0u
+#define FT_MUX_EVENT_READY 1u
+#define FT_MUX_EVENT_PANES 2u
+#define FT_MUX_EVENT_OUTPUT 3u
+#define FT_MUX_EVENT_PANE_TITLE 4u
+#define FT_MUX_EVENT_PANE_GONE 5u
+#define FT_MUX_EVENT_FAILED 6u
+#define FT_MUX_MAX_RECEIVE_BYTES 1048576u
+#define FT_MUX_MAX_WRITE_BYTES 65536u
+#define FT_MUX_MAX_COPY_BYTES 16777216u
+
+uint32_t ft_mux_v1_create(uint64_t *session);
+uint32_t ft_mux_v1_release(uint64_t session);
+uint32_t ft_mux_v1_receive(uint64_t session, const uint8_t *bytes, uint32_t length);
+/* The channel closed; a FAILED event follows. */
+uint32_t ft_mux_v1_closed(uint64_t session);
+/* Copies up to capacity of the bytes to send next; copied bytes are taken. */
+uint32_t ft_mux_v1_outgoing(uint64_t session, uint8_t *output, uint32_t capacity, uint32_t *written);
+uint32_t ft_mux_v1_next_event(uint64_t session, uint32_t *kind, uint64_t *pane_id,
+                              uint32_t *rows, uint32_t *cols, uint32_t *length);
+uint32_t ft_mux_v1_event_copy(uint64_t session, uint32_t offset, uint8_t *output,
+                              uint32_t capacity, uint32_t *written);
+/* Asks for the pane list again; a PANES event answers. */
+uint32_t ft_mux_v1_refresh_panes(uint64_t session);
+/* Draws the pane from scratch (clearing its terminal), then every change. */
+uint32_t ft_mux_v1_show(uint64_t session, uint64_t pane_id);
+/* Stops drawing the pane. */
+uint32_t ft_mux_v1_hide(uint64_t session, uint64_t pane_id);
+/* Input bytes for the pane's program, exactly as it reads them. */
+uint32_t ft_mux_v1_write(uint64_t session, uint64_t pane_id, const uint8_t *bytes, uint32_t length);
+/* UTF-8 text the server pastes, bracketed when the program asked for it. */
+uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length);
+/* Resizes the remote pane (1..512 each), remembering its size before the
+ * first resize; restore_size puts that size back. */
+uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
+uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
+
 #ifdef __cplusplus
 }
 #endif

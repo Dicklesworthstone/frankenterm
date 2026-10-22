@@ -36,6 +36,9 @@ struct ftssh_session {
     size_t public_length, challenge_length, signature_length;
     int signature_consumed, resize_pending;
     uint32_t geometry[4], resize_geometry[4];
+    /* A command channel (no PTY) carries binary data, so stderr is dropped. */
+    char command[FTSSH_COMMAND_CAPACITY + 1];
+    size_t command_length;
     uint8_t write_buffer[FTSSH_WRITE_CAPACITY];
     size_t write_length, write_offset;
     uint64_t accepted, written, received;
@@ -318,15 +321,23 @@ int ftssh_begin_shell(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint
     s->geometry[0] = c; s->geometry[1] = r; s->geometry[2] = w; s->geometry[3] = h;
     s->phase = OPENING; return FTSSH_OK;
 }
+int ftssh_begin_command(ftssh_session *s, const char *command, size_t length) {
+    int rc = check(s, AUTHENTICATED); if(rc) return rc;
+    if(!command || !length || length > FTSSH_COMMAND_CAPACITY) return FTSSH_INVALID;
+    for(size_t i = 0; i < length; i++) if((unsigned char)command[i] < 32 || (unsigned char)command[i] > 126) return FTSSH_INVALID;
+    memcpy(s->command, command, length); s->command[length] = 0; s->command_length = length;
+    s->phase = OPENING; return FTSSH_OK;
+}
 int ftssh_shell_step(ftssh_session *s) {
     if(!s) return FTSSH_INVALID;
     int rc;
     if(s->phase == OPENING) {
         s->channel = libssh2_channel_open_ex(s->ssh, "session", 7, 128 * 1024, 16384, NULL, 0);
         if(!s->channel) return libssh2_session_last_errno(s->ssh) == LIBSSH2_ERROR_EAGAIN ? FTSSH_AGAIN : fail(s, FTSSH_CHANNEL);
-        rc = libssh2_channel_handle_extended_data2(s->channel, LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE);
+        rc = libssh2_channel_handle_extended_data2(s->channel, s->command_length ?
+            LIBSSH2_CHANNEL_EXTENDED_DATA_IGNORE : LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE);
         if(rc) return fail(s, FTSSH_CHANNEL);
-        s->phase = PTY;
+        s->phase = s->command_length ? SHELL : PTY;
     }
     if(s->phase == PTY) {
         rc = result(s, libssh2_channel_request_pty_ex(s->channel, "xterm-256color", 14, NULL, 0,
@@ -335,7 +346,9 @@ int ftssh_shell_step(ftssh_session *s) {
         s->phase = SHELL;
     }
     if(s->phase == SHELL) {
-        rc = result(s, libssh2_channel_process_startup(s->channel, "shell", 5, NULL, 0), FTSSH_CHANNEL);
+        rc = result(s, s->command_length ?
+            libssh2_channel_process_startup(s->channel, "exec", 4, s->command, (unsigned int)s->command_length) :
+            libssh2_channel_process_startup(s->channel, "shell", 5, NULL, 0), FTSSH_CHANNEL);
         if(rc) return rc;
         /* ftssh_keepalive probes ask for a reply; libssh2 treats 1 as 2 s. */
         libssh2_keepalive_config(s->ssh, 1, 1);
@@ -421,6 +434,7 @@ int ftssh_completion_step(ftssh_session *s, ftssh_completion *out) {
 }
 int ftssh_resize(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint32_t h) {
     int rc = check(s, LIVE); if(rc) return rc;
+    if(s->command_length) return FTSSH_STATE;
     if(!valid_geometry(c, r, w, h)) return FTSSH_INVALID;
     uint32_t requested[4] = {c, r, w, h};
     if(s->write_length) return FTSSH_AGAIN;

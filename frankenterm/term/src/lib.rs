@@ -77,6 +77,10 @@ pub mod native;
 #[cfg(feature = "native-ffi")]
 mod native_ffi;
 
+/// The phone's mux client behind the same audited boundary.
+#[cfg(feature = "native-ffi")]
+mod native_mux_ffi;
+
 pub mod terminal;
 pub use crate::terminal::*;
 
