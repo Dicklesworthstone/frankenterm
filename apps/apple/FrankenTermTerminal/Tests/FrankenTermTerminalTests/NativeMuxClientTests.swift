@@ -58,6 +58,16 @@ final class NativeMuxClientTests: XCTestCase {
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [3, 3, 24, 7])
         try client.write(pane: 7, bytes: Data("ls\r".utf8))
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [7, 4, 9, 7, 3] + Array("ls\r".utf8))
+
+        // Sizing the pane to the phone says what to give back, and giving it
+        // back says it is done.
+        try client.resize(pane: 7, rows: 40, columns: 54)
+        let desktop = TerminalMuxSize(rows: 24, cols: 80, pixelWidth: 640, pixelHeight: 384, dpi: 96)
+        XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: desktop, rows: 40, columns: 54)])
+        try client.restoreSize(pane: 7)
+        XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: nil, rows: 0, columns: 0)])
+        // The listed pane is 24 x 80, not a phone size left behind.
+        XCTAssertFalse(try client.adoptPhoneSize(pane: 7, desktop: desktop, rows: 40, columns: 54))
     }
 
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {
