@@ -271,8 +271,6 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private var requested: Int?
     private var pendingSearch: Search?
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
-    private var pendingScroll: (steps: Int, column: Int, row: Int)?
-    private var pendingClicks: [(column: Int, row: Int)] = []
     private var waker: (@Sendable () -> Void)?
     private var observer: (@Sendable (State) -> Void)?
     private var queriesEnded = false
@@ -299,56 +297,39 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func request(pane: Int) {
         let wake = lock.withLock { () -> (@Sendable () -> Void)? in
             guard state.panes.contains(where: { $0.paneId == pane }) else { return nil }
+            inputRouting.discardPointers()
             requested = pane; return waker
         }
         wake?()
     }
 
-    /// The most wheel notches waiting to be sent, either way.
-    public static let maximumScrollSteps = 64
-
-    /// Scrolls the program on screen like a mouse wheel over a cell of its
-    /// screen (negative steps toward older output). Notches not yet sent add
-    /// up; the transport sends them on its next turn.
-    public func scroll(steps: Int, column: Int, row: Int) {
-        guard steps != 0 else { return }
-        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
-            let total = (pendingScroll?.steps ?? 0) + max(-Self.maximumScrollSteps, min(Self.maximumScrollSteps, steps))
-            let bounded = max(-Self.maximumScrollSteps, min(Self.maximumScrollSteps, total))
-            pendingScroll = bounded == 0 ? nil : (bounded, max(column, 0), max(row, 0))
-            return waker
+    /// The view supplies its immutable displayed visit. Neither a delayed
+    /// gesture nor a blocked native writer may resolve a new target later.
+    public func scroll(steps: Int, column: Int, row: Int,
+                       destination: TerminalMuxInputRouting.Destination) throws {
+        let admission = try lock.withLock {
+            guard !queriesEnded, state.visible, requested == nil,
+                  state.shown == destination.paneID else { throw TerminalInputError.stale }
+            return try inputRouting.admitPointer(.wheel(steps: steps, column: column, row: row), destination: destination)
         }
-        wake?()
+        admission.wake?()
     }
 
-    /// The wheel notches waiting to be sent, taken.
-    public func takeScroll() -> (steps: Int, column: Int, row: Int)? {
-        lock.withLock { defer { pendingScroll = nil }; return pendingScroll }
-    }
-
-    /// Clicks at most this many taps ahead of the transport; more are dropped.
-    public static let maximumPendingClicks = 8
-
-    /// Clicks a cell of the shown pane's screen, for a program that asked for
-    /// the mouse; the transport sends it on its next turn.
-    public func click(column: Int, row: Int) {
-        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
-            guard pendingClicks.count < Self.maximumPendingClicks else { return nil }
-            pendingClicks.append((max(column, 0), max(row, 0)))
-            return waker
+    public func click(column: Int, row: Int,
+                      destination: TerminalMuxInputRouting.Destination) throws {
+        let admission = try lock.withLock {
+            guard !queriesEnded, state.visible, state.mouseGrabbed, requested == nil,
+                  state.shown == destination.paneID else { throw TerminalInputError.stale }
+            return try inputRouting.admitPointer(.click(column: column, row: row), destination: destination)
         }
-        wake?()
-    }
-
-    /// The clicks waiting to be sent, in order, taken.
-    public func takeClicks() -> [(column: Int, row: Int)] {
-        lock.withLock { defer { pendingClicks.removeAll() }; return pendingClicks }
+        admission.wake?()
     }
 
     /// Whether the shown pane's program has the mouse (transport side).
     public func setMouseGrabbed(_ grabbed: Bool) {
         update { state in
             guard state.mouseGrabbed != grabbed else { return false }
+            inputRouting.discardPointers()
             state.mouseGrabbed = grabbed
             return true
         }
@@ -359,6 +340,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func setVisible(_ visible: Bool) {
         let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
             guard state.visible != visible else { return (nil, nil, state) }
+            if !visible { inputRouting.discardPointers() }
             state.visible = visible; state.revision = UUID(); return (waker, observer, state)
         }
         notify?(snapshot)
@@ -565,6 +547,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func endQueries() {
         let (notify, snapshot) = lock.withLock {
             queriesEnded = true
+            inputRouting.discardPointers()
             pendingSearch = nil; pendingContext = nil
             if state.search?.pending.isEmpty == false {
                 state.search?.pending.removeAll(); state.search?.issue = "The connection closed before this search finished."
@@ -578,7 +561,10 @@ public final class TerminalMuxControl: @unchecked Sendable {
         notify?(snapshot)
     }
 
-    public func setWaker(_ waker: (@Sendable () -> Void)?) { lock.withLock { self.waker = waker } }
+    public func setWaker(_ waker: (@Sendable () -> Void)?) {
+        lock.withLock { self.waker = waker }
+        inputRouting.setPointerWaker(waker)
+    }
 
     public func takeRequest() -> Int? {
         lock.withLock { defer { requested = nil }; return requested }

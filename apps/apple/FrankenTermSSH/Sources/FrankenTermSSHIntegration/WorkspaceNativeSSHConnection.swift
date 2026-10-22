@@ -551,6 +551,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.ready = true
             case .panes(let panes):
                 try state.control.inputRouting.replaceInventory(panes.map(\.paneId))
+                let present = Set(panes.map(\.paneId))
+                state.grabs = state.grabs.filter { present.contains($0.key) }
                 state.panes = panes; state.listed = true
                 if let shown = state.shown, !panes.contains(where: { $0.paneId == shown }) {
                     state.shown = nil; state.showing = false
@@ -581,6 +583,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     size = try TerminalSessionGeometry(columns: UInt32(columns), rows: UInt32(rows),
                         pixelWidth: min(cellWidth * UInt32(columns), 65535), pixelHeight: min(cellHeight * UInt32(rows), 65535))
                 }
+                if size.rows != state.output.queuedGeometry.rows || size.columns != state.output.queuedGeometry.columns {
+                    state.control.inputRouting.discardPointers()
+                }
                 try state.output.append(bytes, geometry: size,
                     destination: state.control.inputRouting.capture())
                 return false
@@ -594,6 +599,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.retitle(pane: pane, title: title)
             case .paneGone(let pane):
                 state.control.inputRouting.remove(pane: pane)
+                state.grabs[pane] = nil
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
                 if state.shown == pane { state.shown = nil; state.showing = false }
@@ -604,7 +610,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             case .phoneSize(let pane, let desktop, let rows, let columns):
                 state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
             case .mouseGrab(let pane, let grabbed):
-                state.grabs[pane] = grabbed
+                guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
+                state.grabs[pane] = grabbed ? true : nil
                 state.control.setMouseGrabbed(state.shown.flatMap { state.grabs[$0] } ?? false)
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
@@ -643,7 +650,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard let pane = state.shown else {
             // No pane on screen: nothing has the mouse, and taps meant for a
             // pane that left are not replayed on the next one.
-            _ = state.control.takeClicks()
+            state.control.inputRouting.discardPointers()
             state.control.setMouseGrabbed(false)
             return
         }
@@ -656,15 +663,45 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try state.client.hide(pane: pane); try state.client.restoreSize(pane: pane)
             state.showing = false
         }
-        // A drag over a full-screen program turns its wheel, as on the desktop.
-        if let scroll = state.control.takeScroll(), state.showing {
-            try state.client.wheel(pane: pane, steps: scroll.steps, column: scroll.column, row: scroll.row)
-        }
-        // A tap on a program that has the mouse clicks it.
-        for click in state.control.takeClicks() where state.showing && state.grabs[pane] == true {
-            try state.client.click(pane: pane, column: click.column, row: click.row)
-        }
         state.control.setMouseGrabbed(state.grabs[pane] ?? false)
+    }
+
+    /// One gesture per service turn, only after earlier protocol egress drains.
+    /// No await separates taking a gesture, checking its exact pane visit and
+    /// encoding it. Superseded/hidden gestures never move to the shown pane.
+    private func dispatchMuxPointer(driver: NativeSSHDriver) async throws {
+        guard let state = mux, state.control.inputRouting.hasPendingPointers else { return }
+        guard state.showing, state.control.current.visible else {
+            state.control.inputRouting.discardPointers(); return
+        }
+        guard try await flushMux(driver: driver) else { return }
+        try await validateForeground()
+        guard mux === state, state.showing, state.control.current.visible else {
+            state.control.inputRouting.discardPointers(); return
+        }
+        // Authorization awaited another actor. A resize/write may have queued
+        // bytes meanwhile; recheck without suspending before appending an RPC.
+        guard !state.flushing, state.outgoing.isEmpty else { return }
+        state.outgoing = try state.client.outgoing(limit: NativeSSHSession.maximumWriteBytes)
+        guard state.outgoing.count <= NativeSSHSession.maximumWriteBytes else { throw TerminalInputError.capacity }
+        guard state.outgoing.isEmpty else { inputSignal.notify(); return }
+        guard let event = state.control.inputRouting.takePointer() else { return }
+        defer { if state.control.inputRouting.hasPendingPointers { inputSignal.notify() } }
+        guard event.destination.paneID == state.shown else { return }
+        try state.control.inputRouting.validateAdmission(event.destination)
+        let size = state.output.queuedGeometry
+        switch event.action {
+        case .click(let column, let row):
+            guard state.grabs[event.destination.paneID] == true,
+                  column < Int(size.columns), row < Int(size.rows) else { return }
+            try state.client.click(pane: event.destination.paneID, column: column, row: row)
+        case .wheel(let steps, let column, let row):
+            guard column < Int(size.columns), row < Int(size.rows) else { return }
+            try state.client.wheel(pane: event.destination.paneID, steps: steps, column: column, row: row)
+        }
+        // A failure may follow encoding; close owns the uncertain operation.
+        // It is never returned to the queue or replayed after reconnect.
+        try await flushMux(driver: driver)
     }
 
     /// The next bytes for the phone's terminal, at most one receive's worth.
@@ -679,6 +716,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     private func serviceMux(driver: NativeSSHDriver) async throws -> TerminalSessionUpdate {
         try reconcileMux()
+        try await dispatchMuxPointer(driver: driver)
         try await flushMux(driver: driver)
         guard !closed else { throw NativeSSHError.closed }
         if let update = nextMuxUpdate() { return update }
@@ -797,6 +835,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // this request through the ordered update path.
                 let size = try TerminalSessionGeometry(columns: geometry.columns, rows: geometry.rows,
                     pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight)
+                if size != state.geometry { state.control.inputRouting.discardPointers() }
                 state.geometry = size
                 if (size.rows, size.columns) == (state.output.queuedGeometry.rows, state.output.queuedGeometry.columns) {
                     // Same cells, new pixels: nothing for the server to redraw.

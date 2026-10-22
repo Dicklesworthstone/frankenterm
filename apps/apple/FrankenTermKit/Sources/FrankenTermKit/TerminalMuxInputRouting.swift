@@ -72,6 +72,17 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     /// clicks and reversals keep their order. A full queue rejects new input.
     @discardableResult
     public func enqueuePointer(_ action: PointerAction, destination selected: Destination) throws -> Bool {
+        let admission = try admitPointer(action, destination: selected)
+        admission.wake?()
+        return admission.accepted
+    }
+
+    /// The control owner holds its visibility/mouse-mode lock through this
+    /// admission. Return the wake rather than invoking it under either lock:
+    /// hide or mode changes cannot slip between the guard and queue mutation,
+    /// and a reentrant notification cannot deadlock the control owner.
+    func admitPointer(_ action: PointerAction, destination selected: Destination)
+        throws -> (accepted: Bool, wake: (@Sendable () -> Void)?) {
         let column: Int, row: Int
         switch action {
         case .click(let x, let y): column = x; row = y
@@ -79,7 +90,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
             guard (-Self.maximumWheelSteps...Self.maximumWheelSteps).contains(steps) else {
                 throw TerminalInputError.invalidLimits
             }
-            if steps == 0 { return false }
+            if steps == 0 { return (false, nil) }
             column = x; row = y
         }
         guard (0..<512).contains(column), (0..<512).contains(row) else { throw TerminalInputError.invalidLimits }
@@ -99,8 +110,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
             }
             return pointerWaker
         }
-        wake?()
-        return true
+        return (true, wake)
     }
 
     /// The sole transport takes one operation only AFTER prior protocol egress

@@ -291,6 +291,7 @@ final class TerminalSessionController {
     }
     func beginMuxSearch() {
         guard !stopped, phase == .live, presentationVisible else { return }
+        connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = true
         viewAttachment?.cancel()
         terminal?.input.retire()
@@ -302,10 +303,12 @@ final class TerminalSessionController {
     }
     func inspectOutput() {
         guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
+        connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestCopy()
     }
     func paste() {
         guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
+        connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
     }
     func dismissInteractionProblem() { interactionProblem = nil }
@@ -315,6 +318,7 @@ final class TerminalSessionController {
     func inspectHistory() -> TerminalHistoryInspection? {
         guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
               let runtime, let source = pump?.source else { return nil }
+        connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil
         terminal?.input.retire()
         let history = history
@@ -716,22 +720,25 @@ final class TerminalSessionController {
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
             view.onFontRevision = { [weak self] revision in self?.applyFontRevision(revision) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
-            if let control = connection?.muxControl {
-                // A drag over a full-screen program turns its wheel.
-                view.onRemoteScroll = { [weak self, weak control] steps, column, row in
-                    guard let self, !self.stopped, self.phase == .live, !self.clipboardIsPresenting else { return }
-                    control?.scroll(steps: steps, column: column, row: row)
+            if let control = connection?.muxControl, let expectedMux {
+                // The immutable view/visit pair survives a delayed callback;
+                // it must never be replaced with the newly selected pane.
+                view.onRemoteScroll = { [weak self, weak control, weak view] steps, column, row in
+                    guard let self, let control, let view else { return }
+                    self.submitPointer(.wheel(steps: steps, column: column, row: row),
+                        destination: expectedMux, control: control, view: view)
                 }
-                // A tap on a program that has the mouse clicks it.
                 view.remoteMouseGrabbed = control.current.mouseGrabbed
-                view.onRemoteClick = { [weak self, weak control] column, row in
-                    guard let self, !self.stopped, self.phase == .live, !self.clipboardIsPresenting else { return }
-                    control?.click(column: column, row: row)
+                view.onRemoteClick = { [weak self, weak control, weak view] column, row in
+                    guard let self, let control, let view else { return }
+                    self.submitPointer(.click(column: column, row: row),
+                        destination: expectedMux, control: control, view: view)
                 }
             }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
                 guard let self else { return }
+                self.connection?.muxControl?.inputRouting.discardPointers()
                 self.clipboard?.inputRetired()
                 self.focus?.inputRetired(machineID: self.target.machineID)
             }
@@ -745,6 +752,26 @@ final class TerminalSessionController {
                 terminal?.retire(); terminal = nil; presenter.view = nil
                 keyboard?.suspend(); focus?.inputRetired(machineID: target.machineID)
             } else { fail(Self.describe(error)) }
+        }
+    }
+
+    private func submitPointer(_ action: TerminalMuxInputRouting.PointerAction,
+                               destination: TerminalMuxInputRouting.Destination,
+                               control: TerminalMuxControl, view: NativeTerminalView) {
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+              paneHandoff == nil, terminal === view, connection?.muxControl === control,
+              displayedMuxDestination == destination else { return }
+        do {
+            switch action {
+            case .click(let column, let row):
+                try control.click(column: column, row: row, destination: destination)
+            case .wheel(let steps, let column, let row):
+                try control.scroll(steps: steps, column: column, row: row, destination: destination)
+            }
+        } catch TerminalInputError.stale {
+            // A retired or not-yet-presentable visit is not a broken session.
+        } catch {
+            interactionProblem = "The gesture was not accepted: \(Self.describe(error)). It will not be replayed."
         }
     }
 
@@ -939,6 +966,7 @@ final class TerminalSessionController {
 
     private func sealLocalOwnership() {
         presentationVisible = false
+        connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = false
         clipboard?.retire()
         historyInspection?.retire()
