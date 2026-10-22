@@ -39,7 +39,7 @@ final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
     var localPolicies: [UUID: WorkspaceLocalState] = [:]
-    var state: OfflineRestoreStatus? { didSet { updateIdleTimer() } }
+    var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
     var showRestore = false { didSet { updateIdleTimer() } }
     var cameraRequested = false { didSet { updateIdleTimer() } }
@@ -49,6 +49,16 @@ final class MobileWorkspaceModel {
     var busy = false
     var requestingCameraAccess = false
     var offlineModeBlocked = false
+    var savedScan: OpticalScanRecoveryReview?
+    var scanProgressMessage: String?
+    private var scanSavePermit: OpticalScanSavePermit?
+    var isSavingScanProgress: Bool { scanSavePermit != nil }
+    @ObservationIgnored private var scanRecovery: OpticalScanRecovery<AppleCryptography>?
+    @ObservationIgnored private var scanSaveEpoch = UUID()
+    @ObservationIgnored private var scanRefreshEpoch = UUID()
+    @ObservationIgnored private var scanSaveGeneration: UUID?
+    @ObservationIgnored private var scanSaveIdentity: OpticalFrame.Identity?
+    @ObservationIgnored private var scanSavedPages = 0
     @ObservationIgnored private var store: WorkspaceStore?
     /// Live direct-SSH services (TerminalSessionScreen.swift), created with the store.
     @ObservationIgnored private(set) var connections: MobileConnections?
@@ -140,6 +150,14 @@ final class MobileWorkspaceModel {
             }.value
             store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
             if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                // A dedicated protected namespace, separate from workspace and
+                // import journals. Opening it does not opt a scan into saving.
+                do {
+                    scanRecovery = try OpticalScanRecovery(directory: support.appendingPathComponent("FrankenTermScanRecovery", isDirectory: true),
+                                                           using: AppleCryptography())
+                } catch {
+                    scanProgressMessage = "Saving scan progress is unavailable. You can still scan and restore normally. \(error.localizedDescription)"
+                }
                 connections = try MobileConnections(store: created,
                     journalDirectory: support.appendingPathComponent("FrankenTermSessions", isDirectory: true))
                 updateConnectionLifecycle()
@@ -253,6 +271,7 @@ final class MobileWorkspaceModel {
     private func setActive(_ value: Bool) {
         active = value
         if !value {
+            scannedCode = nil; stopSavingScanProgress()
             cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
             // A system permission sheet can interrupt a read. Do not turn its
             // foreground callback into another automatic prompt/read attempt.
@@ -274,7 +293,10 @@ final class MobileWorkspaceModel {
         // A just-dismissed request may already be retired. Re-present only the
         // status returned by the serialized lifecycle transition.
         state = nil
-        if !value { cameraRequested = false; pendingImport = nil; offlineModeBlocked = false }
+        if !value {
+            cameraRequested = false; pendingImport = nil; offlineModeBlocked = false
+            scannedCode = nil; stopSavingScanProgress()
+        }
         updateLifecycle(discardRecipientRequest: !value)
     }
     func retryOfflineMode() {
@@ -284,6 +306,7 @@ final class MobileWorkspaceModel {
     }
     func requestRecipient() {
         guard active, !busy else { return }
+        scannedCode = nil; stopSavingScanProgress()
         pendingImport = nil; cameraRequested = false; setRestoreVisible(true)
         run { [self] restore, state in
             let current = state.phase == .complete ? try await self.restartFinished(restore) : state
@@ -297,6 +320,7 @@ final class MobileWorkspaceModel {
     }
     func resetRestore() {
         guard active, !busy else { return }
+        scannedCode = nil; stopSavingScanProgress()
         pendingImport = nil; cameraRequested = false
         run { restore, _ in try await restore.reset() }
     }
@@ -336,6 +360,146 @@ final class MobileWorkspaceModel {
             }
             guard self.epoch == ticket else { return }
             self.openPendingFileIfReady()
+            if self.active { await self.refreshSavedScan(epoch: ticket) }
+        }
+    }
+
+    /// Save permission belongs to this active restore generation. The encrypted
+    /// cache remains available after pausing; discarding it is a separate choice.
+    func stopSavingScanProgress() {
+        scanSaveEpoch = UUID(); scanSavePermit = nil
+        scanSaveGeneration = nil; scanSaveIdentity = nil; scanSavedPages = 0
+    }
+
+    private func reconcileScanSaving() {
+        guard scanSavePermit != nil else { return }
+        guard let state, !state.isSuspended, state.source == .optical,
+              state.identity == scanSaveIdentity, state.phase != .complete else {
+            stopSavingScanProgress(); return
+        }
+        if scanSaveGeneration != state.generation {
+            // Repairing a page retires callbacks but keeps the same selected
+            // envelope. Its explicit save consent still covers verified pages.
+            scanSaveEpoch = UUID(); scanSaveGeneration = state.generation
+        }
+    }
+
+    private func refreshSavedScan(epoch ticket: UUID) async {
+        guard let scanRecovery else { return }
+        let refresh = UUID(); scanRefreshEpoch = refresh
+        do {
+            let reviewed = try await scanRecovery.review()
+            guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
+            savedScan = reviewed
+        } catch is CancellationError { }
+        catch {
+            guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
+            savedScan = nil
+            scanProgressMessage = "Saved scan progress could not be read. \(error.localizedDescription)"
+        }
+    }
+
+    /// One explicit operation at a time; lifecycle changes retire its UI result.
+    /// A write can finish after interruption, so the next foreground reads the
+    /// cache itself instead of guessing whether anything was saved.
+    private func scanOperation(_ operation: @escaping @MainActor
+        (OfflineRestore<AppleCryptography>, OpticalScanRecovery<AppleCryptography>, UUID) async throws -> Void) {
+        guard active, showRestore, !busy, !offlineModeBlocked,
+              let restore, let scanRecovery else { return }
+        busy = true; scanProgressMessage = nil
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            await pendingLifecycle?.value
+            guard let self else { return }
+            defer { self.busy = false; self.advanceAutomatically() }
+            guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked else { return }
+            do { try await operation(restore, scanRecovery, ticket) }
+            catch is CancellationError { }
+            catch {
+                guard self.active, self.epoch == ticket else { return }
+                self.stopSavingScanProgress()
+                self.scanProgressMessage = "Scan progress was not confirmed. \(error.localizedDescription)"
+                let latest = await restore.status()
+                guard self.active, self.epoch == ticket else { return }
+                self.state = latest
+            }
+            if self.active, self.epoch == ticket { await self.refreshSavedScan(epoch: ticket) }
+        }
+    }
+
+    func saveScanProgress(generation: UUID, identity: OpticalFrame.Identity) {
+        scanOperation { [weak self] restore, recovery, ticket in
+            guard let self, self.state?.generation == generation,
+                  self.state?.identity == identity else { throw FTError.stale }
+            guard let checkpoint = try await restore.scanCheckpoint(generation: generation) else {
+                throw FTError.malformed("scan.no_verified_pages")
+            }
+            guard self.active, self.epoch == ticket, checkpoint.identity == identity else { throw CancellationError() }
+            let writer = self.scanSaveEpoch
+            let permit = try await recovery.beginSaving(checkpoint, confirmedByUser: true)
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else { return }
+            self.scanSaveEpoch = UUID(); self.scanSavePermit = permit
+            self.scanSaveGeneration = generation; self.scanSaveIdentity = checkpoint.identity
+            self.scanSavedPages = checkpoint.verifiedPages
+            // Already queued observations can complete a page during the first
+            // write. Catch up before automatic decryption releases the envelope.
+            let latest = await restore.status()
+            guard self.active, self.epoch == ticket else { return }
+            self.state = latest
+            await self.saveCompletedScanPages(latest, restore: restore, epoch: ticket)
+        }
+    }
+
+    /// The exact saved review must still exist. Adoption never restores a code,
+    /// request key, camera permission, or an earlier import approval.
+    func resumeSavedScan(_ reviewed: OpticalScanRecoveryReview) {
+        scanOperation { [weak self] restore, recovery, ticket in
+            guard let self else { return }
+            self.scannedCode = nil; self.stopSavingScanProgress()
+            self.cameraRequested = false
+            let current = await restore.status()
+            let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
+            guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
+            let checkpoint = try await recovery.load(reviewed)
+            guard self.active, self.epoch == ticket else { throw CancellationError() }
+            let resumed = try await restore.resumeScan(checkpoint, generation: ready.generation)
+            guard self.active, self.epoch == ticket else { return }
+            self.state = resumed; self.lastObservation = nil
+            // The Resume action explicitly includes keeping subsequent pages.
+            let writer = self.scanSaveEpoch
+            let permit = try await recovery.beginSaving(checkpoint, confirmedByUser: true)
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else { return }
+            self.scanSaveEpoch = UUID(); self.scanSavePermit = permit
+            self.scanSaveGeneration = resumed.generation; self.scanSaveIdentity = checkpoint.identity
+            self.scanSavedPages = checkpoint.verifiedPages
+        }
+    }
+
+    func discardSavedScan(_ reviewed: OpticalScanRecoveryReview) {
+        stopSavingScanProgress()
+        scanOperation { _, recovery, _ in try await recovery.discard(reviewed) }
+    }
+
+    /// Called by the single observation consumer, only after another complete
+    /// page. Awaiting this bounded write adds no camera-frame tasks or queues.
+    private func saveCompletedScanPages(_ status: OfflineRestoreStatus,
+                                       restore: OfflineRestore<AppleCryptography>, epoch ticket: UUID) async {
+        guard active, epoch == ticket, let scanRecovery, let permit = scanSavePermit,
+              scanSaveGeneration == status.generation, status.verifiedPages > scanSavedPages else { return }
+        let writer = scanSaveEpoch
+        do {
+            guard let checkpoint = try await restore.scanCheckpoint(generation: status.generation) else { return }
+            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
+            let reviewed = try await scanRecovery.save(checkpoint, permit: permit)
+            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
+            scanRefreshEpoch = UUID()
+            savedScan = reviewed; scanSavedPages = checkpoint.verifiedPages
+        } catch is CancellationError { }
+        catch {
+            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
+            stopSavingScanProgress()
+            scanProgressMessage = "Saving scan progress paused. Scanning can continue; choose Save Scan Progress to retry. \(error.localizedDescription)"
+            await refreshSavedScan(epoch: ticket)
         }
     }
     private func scheduleWorkspaceRefresh(using store: WorkspaceStore, epoch ticket: UUID) {
@@ -410,8 +574,13 @@ final class MobileWorkspaceModel {
                 do {
                     let next = try await restore.observe(observation.text, generation: observation.generation)
                     guard self.active, self.epoch == observation.epoch else { continue }
-                    self.state = next
-                    if !self.keepsCamera(next) { self.cameraRequested = false }
+                    await self.saveCompletedScanPages(next, restore: restore, epoch: observation.epoch)
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    let latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    if latest.generation != next.generation { self.lastObservation = nil }
+                    self.state = latest
+                    if !self.keepsCamera(latest) { self.cameraRequested = false }
                     self.advanceAutomatically()
                 } catch FTError.stale { continue }
                 catch is CancellationError { break }
@@ -429,8 +598,10 @@ final class MobileWorkspaceModel {
     /// The unlock code the Mac's animation carries (`FTCODE1:<digest>:<code>`),
     /// bound to the transfer whose envelope digest starts with that prefix.
     @ObservationIgnored private var scannedCode: (digestPrefix: String, code: String)?
-    /// Each automatic step runs once per transfer or review.
-    @ObservationIgnored private var automaticSteps = Set<String>()
+    /// Bounded witnesses for this receive generation and this exact review.
+    /// Resetting or resuming the same envelope must not suppress its selection.
+    @ObservationIgnored private var automaticSelection: (generation: UUID, digest: Data)?
+    @ObservationIgnored private var automaticReview: UUID?
 
     /// The transfer moves on by itself: the transfer in view is the one to
     /// collect, and the code its animation carries unlocks it. Nothing to tap
@@ -439,7 +610,9 @@ final class MobileWorkspaceModel {
         guard !busy, active, showRestore, let state, !state.isSuspended else { return }
         switch state.phase {
         case .candidate:
-            guard let digest = state.identity?.envelopeDigest, automaticSteps.insert("select:\(digest.ftHex)").inserted else { return }
+            guard let digest = state.identity?.envelopeDigest,
+                  automaticSelection?.generation != state.generation || automaticSelection?.digest != digest else { return }
+            automaticSelection = (state.generation, digest)
             run { restore, state in try await restore.selectCandidate(generation: state.generation, digest: digest) }
         case .review:
             // A restore that asks nothing saves itself; replacing a saved
@@ -448,7 +621,8 @@ final class MobileWorkspaceModel {
             guard let review = state.review, state.source != .workspaceDocument,
                   !(review.requiresSourceAssociation || review.requiresSecurityApproval
                     || review.removesMachines || review.isRollback),
-                  automaticSteps.insert("commit:\(review.token)").inserted else { return }
+                  automaticReview != review.token else { return }
+            automaticReview = review.token
             let token = review.token
             run { restore, state in
                 try await restore.commit(reviewToken: token, generation: state.generation, sourceAndContentsConfirmed: true,
@@ -472,6 +646,7 @@ final class MobileWorkspaceModel {
     /// ends its arrival notice, resets, and takes exclusion back before
     /// anything is scanned or read.
     private func restartFinished(_ restore: OfflineRestore<AppleCryptography>) async throws -> OfflineRestoreStatus {
+        scannedCode = nil; stopSavingScanProgress()
         announcement?.cancel(); await announcement?.value; announcement = nil
         _ = try await restore.reset()
         try await restore.enterOfflineMode()
@@ -548,6 +723,7 @@ final class MobileWorkspaceModel {
     func importFile(_ url: URL) {
         guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
         guard !busy else { message = "Finish the current import before opening another workspace."; return }
+        scannedCode = nil; stopSavingScanProgress()
         pendingImport = PendingFileImport(url: url)
         guard active, restore != nil else {
             if !bootstrapStarted { Task { await bootstrap() } }
@@ -640,7 +816,7 @@ final class MobileWorkspaceModel {
             // Say what failed: a generic message hid the Keychain status a
             // person (or a bug report) needs.
             let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            message = "The restore did not finish, and nothing was saved. \(detail)"
+            message = "The restore did not finish. \(detail)"
         }
     }
 }
@@ -665,6 +841,11 @@ struct MobileWorkspaceRoot: View {
                             Button { model.requestRecipient() } label: {
                                 Label("Encrypt Only for This Phone", systemImage: "lock.iphone")
                             }.disabled(model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
+                            if model.savedScan != nil {
+                                Button { model.setRestoreVisible(true) } label: {
+                                    Label("Saved Scan", systemImage: "qrcode")
+                                }.disabled(model.busy)
+                            }
                         } label: { Image(systemName: "plus") }
                             .disabled(model.state == nil)
                             .accessibilityLabel("Add machines")
@@ -707,6 +888,10 @@ struct MobileWorkspaceRoot: View {
                     .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
             }.buttonStyle(.borderedProminent).controlSize(.large)
                 .disabled(model.state == nil || model.requestingCameraAccess)
+            if model.savedScan != nil {
+                Button("Resume a Saved Scan") { model.setRestoreVisible(true) }
+                    .disabled(model.state == nil || model.busy)
+            }
         }.padding(24).padding(.bottom, 12)
     }
 
@@ -741,6 +926,17 @@ struct OfflineRestoreSheet: View {
     @State private var securityChangesConfirmed = false
     @State private var repairPage = 0
     @State private var chooseFile = false
+    private enum ScanDecision {
+        case save(generation: UUID, identity: OpticalFrame.Identity)
+        case discard(OpticalScanRecoveryReview)
+        var title: String {
+            switch self {
+            case .save: "Save Scan Progress?"
+            case .discard: "Discard Saved Scan?"
+            }
+        }
+    }
+    @State private var scanDecision: ScanDecision?
     var body: some View {
         NavigationStack {
             Group {
@@ -763,6 +959,12 @@ struct OfflineRestoreSheet: View {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Label { Text(verbatim: message) } icon: { Image(systemName: "exclamationmark.circle") }
                                     Button("Dismiss Message") { model.message = nil }
+                                }.font(.callout).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                            if let message = model.scanProgressMessage {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label { Text(verbatim: message) } icon: { Image(systemName: "externaldrive.badge.exclamationmark") }
+                                    Button("Dismiss Scan Message") { model.scanProgressMessage = nil }
                                 }.font(.callout).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
                             }
                             if state.requiresRecipientResume {
@@ -821,7 +1023,9 @@ struct OfflineRestoreSheet: View {
                                 }.buttonStyle(.borderedProminent)
                             }
                             }
-                            if [.locked, .documentReady, .review].contains(state.phase)
+                            scanProgressContent(state)
+                            if let saved = model.savedScan { savedScanContent(saved, state: state) }
+                            if [.candidate, .collecting, .locked, .documentReady, .review].contains(state.phase)
                                 || (state.phase == .idle && state.recipientRequest != nil) {
                                 Button("Start Over", role: .destructive) {
                                     code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
@@ -838,6 +1042,26 @@ struct OfflineRestoreSheet: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy) } }
         }
         .interactiveDismissDisabled(model.busy)
+        .confirmationDialog(scanDecision?.title ?? "Saved Scan",
+                            isPresented: Binding(get: { scanDecision != nil }, set: { if !$0 { scanDecision = nil } }),
+                            titleVisibility: .visible, presenting: scanDecision) { decision in
+            switch decision {
+            case .save(let generation, let identity):
+                Button("Save Encrypted Pages") { model.saveScanProgress(generation: generation, identity: identity) }
+                    .disabled(model.busy || !model.active)
+            case .discard(let saved):
+                Button("Discard Saved Scan", role: .destructive) { model.discardSavedScan(saved) }
+                    .disabled(model.busy || !model.active)
+            }
+            Button("Cancel", role: .cancel) { scanDecision = nil }
+        } message: { decision in
+            switch decision {
+            case .save:
+                Text("Keep this transfer's verified encrypted pages on this phone and save more as they arrive. The cache is protected on this device and excluded from backups. Transfer codes and phone request keys are never saved. Saving pauses when you leave restore or the app becomes inactive.")
+            case .discard(let saved):
+                Text("Discard \(saved.verifiedPages) saved pages for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further pages will stop.")
+            }
+        }
         .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls): if let url = urls.first { model.importFile(url) }
@@ -848,6 +1072,7 @@ struct OfflineRestoreSheet: View {
             if !active {
                 code = ""; allowRemoval = false; allowRollback = false
                 associateWithExistingWorkspace = false; securityChangesConfirmed = false
+                scanDecision = nil
             }
         }
         .onChange(of: model.state?.review?.token) { _, _ in
@@ -857,7 +1082,57 @@ struct OfflineRestoreSheet: View {
         .onDisappear {
             code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
             associateWithExistingWorkspace = false; securityChangesConfirmed = false
+            scanDecision = nil
         }
+    }
+
+    @ViewBuilder private func scanProgressContent(_ state: OfflineRestoreStatus) -> some View {
+        if state.source == .optical, [.collecting, .locked, .review].contains(state.phase),
+           !state.isSuspended, !state.requiresRecipientResume, let identity = state.identity {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.isSavingScanProgress {
+                    Label("Keeping verified pages", systemImage: "externaldrive.badge.checkmark").font(.headline)
+                    Text("New complete pages are saved as you scan. You can resume the saved scan after restarting the app.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Pause Saving") { model.stopSavingScanProgress() }
+                } else if state.verifiedPages > 0 {
+                    Button {
+                        scanDecision = .save(generation: state.generation, identity: identity)
+                    } label: { Label("Save Scan Progress", systemImage: "square.and.arrow.down") }
+                    Text("Keep encrypted pages so an interrupted scan can continue later.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    Text("After the first complete page is verified, you can save progress and continue this scan later.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func savedScanContent(_ saved: OpticalScanRecoveryReview, state: OfflineRestoreStatus) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Saved Scan", systemImage: "qrcode").font(.headline)
+            Text("\(saved.verifiedPages) of \(saved.identity.pageCount) pages · \(ByteCountFormatter.string(fromByteCount: Int64(saved.verifiedBytes), countStyle: .file))")
+                .monospacedDigit()
+            Text(verbatim: "Transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))")
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            if [.idle, .complete].contains(state.phase), !state.requiresRecipientResume {
+                Text("Resume these encrypted pages and keep saving new pages as you scan. The camera opens only when you tap Scan or Resume Camera. A complete saved scan still needs to be unlocked.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Resume Saved Scan") {
+                    code = ""; allowRemoval = false; allowRollback = false
+                    associateWithExistingWorkspace = false; securityChangesConfirmed = false
+                    model.resumeSavedScan(saved)
+                }.buttonStyle(.borderedProminent)
+            } else if state.identity != saved.identity {
+                Text("Start over with the current restore before resuming this saved scan.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Text("Codes and phone request keys are not saved. If an Only This Phone request key was lost when the app closed, create a new request and export again from your Mac.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button("Discard Saved Scan", role: .destructive) { scanDecision = .discard(saved) }
+        }.padding().frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
     }
 
     /// The payoff: what arrived, in its colors, and one way out.
@@ -1446,8 +1721,8 @@ private struct MachineWorkspaceView: View {
         var seen = Set<String>(), routes: [TerminalSessionRoute] = []
         for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
-                  route.jumpRoutes.isEmpty, local.routes.first(where: { $0.routeID == id })?.issues.isEmpty == true,
-                  let credential = route.credentialIDs.first(where: local.credentialIDs.contains) else { continue }
+                  route.jumpRoutes.isEmpty, let readiness = local.routes.first(where: { $0.routeID == id }),
+                  readiness.issues.isEmpty, let credential = readiness.usableCredentialIDs.first else { continue }
             routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port))
         }
         guard !routes.isEmpty else { return scene(nil) }
