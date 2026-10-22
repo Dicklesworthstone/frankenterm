@@ -80,8 +80,9 @@ struct SSHWorkspaceTestFixture: Sendable {
     let endpoint: NativeSSHEndpoint
 
     @MainActor static func make(hostname: String = "localhost", port: UInt16 = 22, hostBlob: Data? = nil,
+                     seed: Data = Data(0..<32), persistence: any WorkspacePersistence = SSHWorkspaceTestPersistence(),
                      mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Self {
-        let crypto = SSHWorkspaceTestCryptography(), seed = Data(0..<32)
+        let crypto = SSHWorkspaceTestCryptography()
         let key = try crypto.ed25519PublicKey(seed: seed)
         func field(_ bytes: Data) -> Data {
             var length = UInt32(bytes.count).bigEndian
@@ -113,7 +114,7 @@ struct SSHWorkspaceTestFixture: Sendable {
             "source": ["exporter_id": "test"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: manifest),
             keys: [PrivateKeyRecord(credentialID: "key", container: container, publicBlob: blob)], using: crypto)
-        let vault = SSHWorkspaceTestVault(), store = WorkspaceStore(persistence: SSHWorkspaceTestPersistence(), vault: vault)
+        let vault = SSHWorkspaceTestVault(), store = WorkspaceStore(persistence: persistence, vault: vault)
         let installed = try await store.install(archive, envelopeDigest: Data(repeating: 1, count: 32),
             expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let broker = SSHAuthenticationBroker(store: store, signer: vault, support: WorkspaceNativeSSHAuthentication.routeSupport)

@@ -48,12 +48,23 @@ struct RestoreSessionDisconnectReview {
     }
 }
 
+struct LocalCredentialRevocationReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let credentialID: String, algorithm: String, fingerprint: String
+    let workspaceNames: [String]
+    fileprivate let epoch: UUID
+}
+
 @MainActor
 @Observable
 final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
     var localPolicies: [UUID: WorkspaceLocalState] = [:]
+    var locallyRevokedFingerprints: Set<String> = []
+    var unconfirmedCredentialRevocations: Set<String> = []
+    var credentialMessage: String?
     var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
     var showRestore = false { didSet { updateIdleTimer() } }
@@ -82,10 +93,13 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var bootstrapStarted = false
     @ObservationIgnored private var disconnectReviewID: UUID?
     @ObservationIgnored private var restoreDisconnection: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var credentialReviewID: UUID?
+    @ObservationIgnored private var credentialRevocation: (id: UUID, task: Task<Void, Never>)?
     private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var workspaceRefresh: Task<Void, Never>?
+    @ObservationIgnored private var workspaceRefreshEpoch = UUID()
     @ObservationIgnored private var observationTask: Task<Void, Never>?
     @ObservationIgnored private var observations: AsyncStream<CameraObservation>.Continuation?
     @ObservationIgnored private var lastObservation: String?
@@ -271,6 +285,11 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
+        guard credentialRevocation == nil else { throw WorkspaceSSHConnectionError.busy }
+        if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
+           document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
+            throw SSHAuthenticationError.denied
+        }
         if let scene = liveScenes[workspaceID], scene.revision == revision, !scene.closed { return scene }
         if let stale = liveScenes.removeValue(forKey: workspaceID) { retire(stale) }
         let scene = try make()
@@ -290,6 +309,7 @@ final class MobileWorkspaceModel {
         if !value {
             scannedCode = nil; stopSavingScanProgress()
             cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
+            locallyRevokedFingerprints = []
             // A system permission sheet can interrupt a read. Do not turn its
             // foreground callback into another automatic prompt/read attempt.
             if busy { pendingImport?.needsExplicitRetry = true }
@@ -403,6 +423,8 @@ final class MobileWorkspaceModel {
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
         disconnectReviewID = nil
+        credentialReviewID = nil
+        workspaceRefreshEpoch = UUID()
         workspaceRefresh?.cancel()
         observations?.finish(); observations = nil
         observationTask?.cancel(); observationTask = nil; lastObservation = nil
@@ -591,14 +613,24 @@ final class MobileWorkspaceModel {
         }
     }
     private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
-        let snapshot = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
-        guard active, epoch == ticket else { return }
+        guard !Task.isCancelled, active, epoch == ticket else { return }
+        let request = UUID(); workspaceRefreshEpoch = request
+        let snapshot: [WorkspaceLocalState], revoked: Set<String>
+        do {
+            snapshot = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
+            revoked = try await store.locallyRevokedCredentialFingerprints()
+        } catch {
+            guard !Task.isCancelled, active, epoch == ticket, workspaceRefreshEpoch == request else { return }
+            throw error
+        }
+        guard !Task.isCancelled, active, epoch == ticket, workspaceRefreshEpoch == request else { return }
         workspaces = snapshot.map(\.workspace)
         for (id, scene) in liveScenes where !workspaces.contains(where: { $0.id == id && $0.revision == scene.revision }) {
             liveScenes[id] = nil; retire(scene)
         }
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
+        locallyRevokedFingerprints = revoked
         // A first import, or new machines in a replaced one: machines that
         // look alike get distinct themes before anything shows them.
         for saved in workspaces {
@@ -606,6 +638,87 @@ final class MobileWorkspaceModel {
                 setThemeChoices(themes.distinguishingMachines(), for: saved.id)
             }
         }
+    }
+
+    func reviewCredentialRevocation(workspaceID: UUID, credentialID: String) -> LocalCredentialRevocationReview? {
+        guard active, !busy, !showRestore, store != nil, connections != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let key = document.credentials.first(where: { $0.id == credentialID }),
+              !locallyRevokedFingerprints.contains(key.fingerprint)
+                || unconfirmedCredentialRevocations.contains(key.fingerprint) else { return nil }
+        let names = workspaces.compactMap { saved -> String? in
+            guard let document = try? saved.document(),
+                  document.credentials.contains(where: { $0.fingerprint == key.fingerprint }) else { return nil }
+            return document.name
+        }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        let reviewed = LocalCredentialRevocationReview(workspaceID: workspaceID, revision: saved.revision,
+            credentialID: key.id, algorithm: key.algorithm, fingerprint: key.fingerprint,
+            workspaceNames: names, epoch: epoch)
+        credentialReviewID = reviewed.id
+        return reviewed
+    }
+
+    /// The fingerprint is device-wide, including aliases in other workspaces.
+    /// Once admitted, this task owns cleanup through suspension or sheet closure.
+    func revokeCredentialLocally(_ reviewed: LocalCredentialRevocationReview) {
+        guard active, !busy, !showRestore, credentialRevocation == nil, let store, let connections else { return }
+        guard credentialReviewID == reviewed.id, epoch == reviewed.epoch,
+              let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
+              let document = try? saved.document(), document.credentials.contains(where: {
+                  $0.id == reviewed.credentialID && $0.fingerprint == reviewed.fingerprint && $0.algorithm == reviewed.algorithm
+              }) else {
+            credentialMessage = "This key or workspace changed. Review the key again before revoking it."
+            return
+        }
+        credentialReviewID = nil; credentialMessage = nil
+        busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let job = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.credentialRevocation?.id == reviewed.id {
+                    self.credentialRevocation = nil; self.busy = false
+                }
+            }
+            do {
+                // The manager persists denial before retiring grants and native
+                // transports, and retains failed settlement owners for retry.
+                let receipt = try await connections.manager.revokeCredentialLocally(
+                    fingerprint: reviewed.fingerprint, confirmedByUser: true)
+                // Retire any read that overlapped the write. Reflect confirmed
+                // denial immediately, even if the following readback fails.
+                self.workspaceRefreshEpoch = UUID(); self.workspaceRefresh?.cancel()
+                for id in receipt.affectedWorkspaceIDs {
+                    self.availableCredentials.removeValue(forKey: id)
+                    self.localPolicies.removeValue(forKey: id)
+                }
+                if receipt.durableDenialConfirmed {
+                    self.locallyRevokedFingerprints.insert(receipt.fingerprint)
+                    self.unconfirmedCredentialRevocations.remove(receipt.fingerprint)
+                }
+                else { self.unconfirmedCredentialRevocations.insert(receipt.fingerprint) }
+                let owners = self.liveScenes.values.filter { receipt.affectedWorkspaceIDs.contains($0.workspaceID) }
+                for owner in owners { owner.requestClose() }
+                for owner in owners { await owner.close() }
+                let retained = await connections.manager.connections()
+                let cleanupPending = owners.contains { $0.sessions.values.contains { !$0.settled } }
+                    || retained.contains { receipt.retainedConnectionIDs.contains($0.id) }
+                if receipt.durableDenialConfirmed {
+                    self.credentialMessage = cleanupPending
+                        ? "This key is revoked on this phone. Affected sessions are stopped; local cleanup remains pending and will be retried when the app becomes active."
+                        : "This key is revoked on this phone, and affected workspace sessions have been disconnected. Future imports cannot restore its permission."
+                } else {
+                    self.credentialMessage = "This key is blocked while the app runs, but saving the revocation could not be confirmed. Choose Retry Saving Revocation before closing the app. Affected workspace sessions have been stopped."
+                }
+                if self.active {
+                    do { try await self.refreshWorkspaces(using: store, epoch: self.epoch) }
+                    catch { self.credentialMessage = (self.credentialMessage ?? "") + " Device status could not be refreshed: \(error.localizedDescription)" }
+                }
+            } catch {
+                self.credentialMessage = "Revocation could not be started. \(error.localizedDescription)"
+            }
+        }
+        credentialRevocation = (reviewed.id, job)
     }
 
     /// Every theme a machine can wear, bundled from `ft mobile themes`.
@@ -1643,6 +1756,93 @@ private struct OpticalCamera: UIViewControllerRepresentable {
 }
 
 @MainActor
+private struct WorkspaceKeysSheet: View {
+    let workspaceID: UUID
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var reviewed: LocalCredentialRevocationReview?
+
+    private var document: WorkspaceDocument? {
+        try? model.workspaces.first(where: { $0.id == workspaceID })?.document()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !model.active {
+                    ContentUnavailableView("Locked", systemImage: "lock.shield",
+                        description: Text("Return to FrankenTerm to manage keys."))
+                } else if let document {
+                    List {
+                        if let message = model.credentialMessage {
+                            Section {
+                                Text(verbatim: message)
+                                Button("Dismiss Message") { model.credentialMessage = nil }
+                            }
+                        }
+                        Section {
+                            ForEach(document.credentials) { key in
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text(verbatim: key.id).font(.headline)
+                                    Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
+                                    Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled)
+                                    let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+                                    let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+                                    if pending {
+                                        Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
+                                            .font(.callout)
+                                    } else if revoked {
+                                        Label("Revoked on this phone", systemImage: "key.slash").font(.callout)
+                                    } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
+                                        Label("Key present on this phone", systemImage: "key.fill").font(.callout)
+                                    } else {
+                                        Label("Key unavailable on this phone", systemImage: "key").font(.callout)
+                                    }
+                                    let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
+                                    Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
+                                    Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                                        reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
+                                    }.disabled(revoked && !pending)
+                                }.padding(.vertical, 6)
+                            }
+                        } header: {
+                            Text(verbatim: document.name)
+                        } footer: {
+                            Text("Revocation blocks this fingerprint in every workspace on this phone, including later imports. It does not erase stored key material or revoke access on your Mac or SSH servers.")
+                        }
+                    }.disabled(model.busy)
+                } else {
+                    ContentUnavailableView("Workspace Unavailable", systemImage: "key",
+                        description: Text("Open a saved workspace to manage its key references."))
+                }
+            }
+            .navigationTitle("SSH Keys").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }.disabled(model.busy)
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.busy)
+        .confirmationDialog("Revoke Key on This Phone?",
+                            isPresented: Binding(get: { reviewed != nil }, set: { if !$0 { reviewed = nil } }),
+                            titleVisibility: .visible, presenting: reviewed) { review in
+            Button("Revoke and Disconnect", role: .destructive) { model.revokeCredentialLocally(review) }
+                .disabled(model.busy || !model.active)
+            Button("Keep Key", role: .cancel) { reviewed = nil }
+        } message: { review in
+            Text(verbatim: review.algorithm + "\n" + review.fingerprint
+                + "\n\nBlock every reference to this key on this phone. All sessions in affected workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
+                + review.workspaceNames.joined(separator: "\n")
+                + "\n\nFuture imports cannot restore permission. Your Mac and SSH servers are unchanged.")
+        }
+        .onChange(of: model.active) { _, active in if !active { reviewed = nil } }
+        .onDisappear { reviewed = nil }
+    }
+}
+
+@MainActor
 private struct MachineWorkspaceView: View {
     let initialDocument: WorkspaceDocument
     let workspaceID: UUID
@@ -1650,6 +1850,7 @@ private struct MachineWorkspaceView: View {
     @State private var selection = ""
     @State private var groupID = ""
     @State private var themeMachineID: String?
+    @State private var showKeys = false
     /// Read so a return from Tailscale re-evaluates what Connect needs.
     @Environment(\.scenePhase) private var scenePhase
     private var document: WorkspaceDocument {
@@ -1714,6 +1915,7 @@ private struct MachineWorkspaceView: View {
                     .tag(machine.id)
             }
         }.tabViewStyle(.page(indexDisplayMode: .always))
+            .sheet(isPresented: $showKeys) { WorkspaceKeysSheet(workspaceID: workspaceID, model: model) }
             .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
                 if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
                    let themes = model.machineThemes(workspaceID, document: document) {
@@ -1729,6 +1931,9 @@ private struct MachineWorkspaceView: View {
                 if !machines.contains(where: { $0.id == selection }) { selection = machines.first?.id ?? document.initialMachineID }
             }
             .toolbar {
+                if !document.credentials.isEmpty {
+                    Button("Keys", systemImage: "key") { showKeys = true }.disabled(model.busy)
+                }
                 Menu("Groups", systemImage: "rectangle.3.group") {
                     ForEach(document.groups) { group in
                         Button {
@@ -1748,7 +1953,10 @@ private struct MachineWorkspaceView: View {
     @ViewBuilder private func connectSection(_ machine: WorkspaceDocument.Machine, theme: WorkspaceDocument.Theme?) -> some View {
         let _ = scenePhase
         let accent = Color(ftHex: theme?.accent ?? "#3B82F6")
-        if let connections = model.connections, let local = model.localPolicies[workspaceID],
+        if document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
+            Label("Finish saving the key revocation in Keys before connecting.", systemImage: "exclamationmark.shield")
+                .font(.callout)
+        } else if let connections = model.connections, let local = model.localPolicies[workspaceID],
            let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
             VStack(alignment: .leading, spacing: 10) {
                 NavigationLink {
@@ -1758,7 +1966,7 @@ private struct MachineWorkspaceView: View {
                     let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
                     Label(live ? "Open Terminal" : "Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
-                }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+                }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent).disabled(model.busy)
                 // Tailscale only: say so before the first attempt waits out a timeout.
                 if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.host) == .tailnet }),
                    WorkspaceRouteNetwork.deviceTailnetAddress() == nil {

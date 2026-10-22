@@ -58,7 +58,8 @@ public enum WorkspaceRouteNetwork: Sendable, Equatable {
             let text = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer -> String? in
                 var bytes = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                 var value = pointer.pointee.sin_addr
-                return inet_ntop(AF_INET, &value, &bytes, socklen_t(bytes.count)) == nil ? nil : String(cString: bytes)
+                guard inet_ntop(AF_INET, &value, &bytes, socklen_t(bytes.count)) != nil else { return nil }
+                return String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             }
             if let text, WorkspaceRouteNetwork(host: text) == .tailnet { return text }
         }

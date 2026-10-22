@@ -325,7 +325,7 @@ private func durableJournal(directory: URL, identifier: String) throws -> Termin
 
 private func exerciseManagedConnection(store: WorkspaceStore, installed: InstalledWorkspace,
     broker: SSHAuthenticationBroker, directory: URL,
-    host: Data, failFinalPublication: Bool = false) async throws -> Int {
+    host: Data, failFinalPublication: Bool = false, revokeFingerprint: String? = nil) async throws -> Int {
     let identifier = "workspace-probe-" + UUID().uuidString
     let fault = try failFinalPublication ? FailedJournalPublication(directory: directory) : nil
     let journal: TerminalSessionJournal
@@ -407,7 +407,13 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
                   delivered.first?.inputEvidence.contains(.acceptedPrefix) == true else { throw WorkspaceProbeError.invalid }
             // Native close cannot make the epoch reviewable while the scene
             // still owns a responder. The manager retains its admission slot.
-            try await mustFail { try await manager.close(connectionID: connection.id) }
+            if let revokeFingerprint {
+                let foreground = try await broker.foregroundLease()
+                let revoked = try await manager.revokeCredentialLocally(fingerprint: revokeFingerprint, confirmedByUser: true)
+                guard revoked.durableDenialConfirmed, revoked.affectedWorkspaceIDs == [installed.id],
+                      revoked.retainedConnectionIDs == [connection.id] else { throw WorkspaceProbeError.invalid }
+                try await broker.validateForeground(foreground)
+            } else { try await mustFail { try await manager.close(connectionID: connection.id) } }
             guard WorkspaceNetworkActivity.shared.accounting().connections == 0,
                   await manager.connections().count == 1,
                   try await journal.records().first?.canResolve == false else { throw WorkspaceProbeError.invalid }
@@ -420,7 +426,12 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
             try await coordinator.retire(pump.source)
             if let fault {
                 fault.failNextWrite()
-                try await mustFail { try await manager.close(connectionID: connection.id) }
+                if let revokeFingerprint {
+                    let retry = try await manager.revokeCredentialLocally(fingerprint: revokeFingerprint, confirmedByUser: true)
+                    guard retry.durableDenialConfirmed, retry.retainedConnectionIDs == [connection.id] else {
+                        throw WorkspaceProbeError.invalid
+                    }
+                } else { try await mustFail { try await manager.close(connectionID: connection.id) } }
                 guard await coordinator.accounting().connections == 0,
                       WorkspaceNetworkActivity.shared.accounting().connections == 0,
                       await manager.connections().count == 1,
@@ -439,7 +450,13 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
                 _ = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
                     machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true)
                 throw WorkspaceProbeError.unexpected
-            } catch TerminalSessionJournalError.reviewRequired {}
+            } catch {
+                if revokeFingerprint != nil {
+                    guard error as? SSHAuthenticationError == .denied else { throw error }
+                } else {
+                    guard error as? TerminalSessionJournalError == .reviewRequired else { throw error }
+                }
+            }
             guard NativeSSHConnector.accounting().resolvingHosts == 0,
                   NativeSSHConnector.accounting().connectingSockets == 0 else { throw WorkspaceProbeError.invalid }
             try await journal.resolve(records[0])
@@ -459,6 +476,76 @@ private func exerciseManagedConnection(store: WorkspaceStore, installed: Install
         }
     } catch {
         try? await manager.close(connectionID: connection.id)
+        throw error
+    }
+}
+
+/// Replacement removes the old key's last current-manifest reference. The
+/// manager must still find it in a pending or live owner's original revision.
+private func replaceRevocationIdentity(store: WorkspaceStore, installed: InstalledWorkspace,
+                                      document: WorkspaceDocument) async throws {
+    guard var object = try JSONSerialization.jsonObject(with: document.raw) as? [String: Any],
+          var workspace = object["workspace"] as? [String: Any],
+          var credentials = workspace["credentials"] as? [[String: Any]], credentials.count == 1 else {
+        throw WorkspaceProbeError.invalid
+    }
+    credentials[0]["public_fingerprint"] = "SHA256:" + Data(repeating: 213, count: 32).base64EncodedString().dropLast()
+    workspace["credentials"] = credentials; object["workspace"] = workspace; object["bundle_id"] = "replacement-key"
+    let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+    let crypto = ProbeCryptography(), replacement = try AirGapArchive(workspace: document, keys: [], using: crypto)
+    _ = try await store.install(replacement, envelopeDigest: crypto.sha256(try replacement.encoded()),
+        expectedRevision: installed.revision, sourceAndContentsConfirmed: true,
+        securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+}
+
+private func exerciseManagedRevocation(store: WorkspaceStore, installed: InstalledWorkspace,
+    broker: SSHAuthenticationBroker, signer: ProbeSigner, document: WorkspaceDocument,
+    fingerprint: String, duringAuthentication: Bool, reimport: Bool) async throws {
+    let journal = try TerminalSessionJournal(persistence: ProbePersistence())
+    let manager = try WorkspaceSSHConnectionManager(store: store, broker: broker,
+        journal: journal, coordinator: TerminalInputCoordinator())
+    await manager.resume()
+    let foreground = try await broker.foregroundLease()
+    let connecting = Task {
+        try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
+            machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true,
+            connectionTimeout: .seconds(5), authenticationTimeout: .seconds(6))
+    }
+    do {
+        let connection: WorkspaceSSHConnection?
+        if duringAuthentication { await signer.waitUntilStarted(); connection = nil }
+        else { connection = try await connecting.value }
+        if reimport { try await replaceRevocationIdentity(store: store, installed: installed, document: document) }
+        let revoked = Task { try await manager.revokeCredentialLocally(fingerprint: fingerprint, confirmedByUser: true) }
+        if duringAuthentication {
+            await signer.waitUntilCancelled()
+            // The persistence boundary precedes signer cancellation. The
+            // protected callback remains held while the receipt's caller exits.
+            guard try await store.locallyRevokedCredentialFingerprints().contains(fingerprint),
+                  await broker.isBusy, await manager.pendingCount == 1 else { throw WorkspaceProbeError.invalid }
+            revoked.cancel()
+            try await broker.validateForeground(foreground)
+            signer.finish()
+            try await mustFail { _ = try await connecting.value }
+        }
+        let receipt = try await revoked.value
+        guard receipt.durableDenialConfirmed, receipt.affectedWorkspaceIDs == [installed.id],
+              receipt.retainedConnectionIDs.isEmpty, await manager.connections().isEmpty,
+              await manager.pendingCount == 0, await manager.permitsConnections,
+              await !broker.isBusy, WorkspaceNetworkActivity.shared.accounting().connections == 0 else {
+            throw WorkspaceProbeError.invalid
+        }
+        try await broker.validateForeground(foreground)
+        if let connection {
+            guard await connection.isClosed else { throw WorkspaceProbeError.invalid }
+            try await mustFail { _ = try await connection.openTerminal(geometry: .init(columns: 80, rows: 24)) }
+        }
+        guard try await journal.records().isEmpty else { throw WorkspaceProbeError.invalid }
+        await manager.suspend()
+    } catch {
+        signer.finish(); connecting.cancel()
+        _ = try? await connecting.value
+        await manager.suspend()
         throw error
     }
 }
@@ -585,7 +672,8 @@ private enum WorkspaceProbe {
               let request = try JSONSerialization.jsonObject(with: input) as? [String: String],
               let pemText = request["pem"] else { throw WorkspaceProbeError.invalid }
         let mode = CommandLine.arguments[3]
-        let delayed: Set<String> = ["revokeKeyDuring", "revokeHostDuring", "reimportDuring", "cancelDuring", "suspendDuring"]
+        let delayed: Set<String> = ["revokeKeyDuring", "revokeHostDuring", "reimportDuring", "cancelDuring", "suspendDuring",
+            "managedRevokeDuring", "managedRevokeDuringReimport"]
         let positive: Set<String> = ["io", "foreignCancel"]
         let crypto = ProbeCryptography(), key = try PrivateKeyRecord.fromPEM(Data(pemText.utf8), credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
@@ -601,12 +689,23 @@ private enum WorkspaceProbe {
         let signer = ProbeSigner(vault: vault, held: delayed.contains(mode))
         let broker = SSHAuthenticationBroker(store: store, signer: signer, support: support)
         await broker.resume()
-        if mode == "managed" || mode == "managedClose" || mode == "managedFinalWriteFailure" || mode == "managedBindingClose" {
+        if ["managedRevokeDuring", "managedRevokeDuringReimport", "managedRevokeAfterReimport"].contains(mode) {
+            try await exerciseManagedRevocation(store: store, installed: installed, broker: broker, signer: signer,
+                document: document, fingerprint: identity.fingerprint, duringAuthentication: delayed.contains(mode),
+                reimport: mode != "managedRevokeDuring")
+            FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: ["mode": mode, "bytes": 0,
+                "signs": signer.calls, "cancellations": signer.cancellations, "closed": true,
+                "algorithm": identity.algorithm, "fingerprint": identity.fingerprint], options: [.sortedKeys]) + Data([10]))
+            return
+        }
+        if mode == "managed" || mode == "managedClose" || mode == "managedFinalWriteFailure" || mode == "managedBindingClose"
+            || mode == "managedRevokeFinalWriteFailure" {
             guard let path = request["journalDirectory"] else { throw WorkspaceProbeError.invalid }
             let directory = URL(fileURLWithPath: path, isDirectory: true), bytes: Int
-            if mode == "managed" || mode == "managedFinalWriteFailure" {
+            if mode == "managed" || mode == "managedFinalWriteFailure" || mode == "managedRevokeFinalWriteFailure" {
                 bytes = try await exerciseManagedConnection(store: store, installed: installed, broker: broker,
-                    directory: directory, host: hostBlob, failFinalPublication: mode == "managedFinalWriteFailure")
+                    directory: directory, host: hostBlob, failFinalPublication: mode != "managed",
+                    revokeFingerprint: mode == "managedRevokeFinalWriteFailure" ? identity.fingerprint : nil)
             } else if mode == "managedClose" {
                 try await exerciseCloseDuringCreation(store: store, installed: installed, broker: broker,
                     directory: directory)

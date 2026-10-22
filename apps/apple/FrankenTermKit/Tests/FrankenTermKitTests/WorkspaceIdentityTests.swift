@@ -104,6 +104,29 @@ final class WorkspaceIdentityTests: XCTestCase {
         } catch { XCTAssertEqual(error as? WorkspaceStoreError, .revokedIdentity) }
     }
 
+    func testLocalRevocationInventorySurvivesReopeningWithoutReadingPrivateKeys() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let empty = try await store.locallyRevokedCredentialFingerprints()
+        XCTAssertTrue(empty.isEmpty)
+        XCTAssertNil(disk.bytes(.catalog)); XCTAssertNil(disk.bytes(.journal))
+        let archive = try candidate(), fingerprint = archive.workspace.credentials[0].fingerprint
+        let saved = try await store.install(archive, envelopeDigest: digest, transferID: transfer,
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        try await store.revokeLocally(fingerprint: fingerprint)
+        let before = disk.bytes(.catalog), creates = vault.creates
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let revoked = try await reopened.locallyRevokedCredentialFingerprints()
+        let available = try await reopened.availableCredentialIDs(workspaceID: saved.workspace.id)
+        XCTAssertEqual(revoked, [fingerprint]); XCTAssertTrue(available.isEmpty)
+        XCTAssertEqual(disk.bytes(.catalog), before)
+        XCTAssertNil(disk.bytes(.journal)); XCTAssertEqual(vault.creates, creates)
+        do {
+            _ = try await reopened.previewImport(archive, envelopeDigest: digest, transferID: transfer, support: support)
+            XCTFail("reopening allowed a revoked private identity to be reimported")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .revokedIdentity) }
+    }
+
     func testRequiredPortabilityBlocksOnlyItsRoutesInPreviewSnapshotAndHostVerification() async throws {
         let disk = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: disk, vault: vault)

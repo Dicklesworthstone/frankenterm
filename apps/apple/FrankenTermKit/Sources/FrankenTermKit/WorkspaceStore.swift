@@ -580,6 +580,17 @@ public actor WorkspaceStore {
         }
     }
 
+    /// Device-wide denial survives relaunch and future imports. This reports
+    /// actual protected-store state, including after an ambiguous write error;
+    /// it does not certify that an earlier write reached durable storage.
+    public func locallyRevokedCredentialFingerprints() throws -> Set<String> {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            return catalog.revokedFingerprints
+        }
+    }
+
     public func availableCredentialIDs(workspaceID: UUID) throws -> Set<String> {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()

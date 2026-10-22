@@ -14,6 +14,19 @@ public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedEr
     }
 }
 
+/// Local denial applies to every installed or subsequently imported alias of
+/// this fingerprint. It does not remove a key from a remote authorized_keys.
+/// A storage error may occur after publication: false means unconfirmed
+/// durability, never that the denial was rolled back. Retry to reaffirm it.
+public struct WorkspaceCredentialRevocationReceipt: Sendable {
+    public let fingerprint: String
+    public let affectedWorkspaceIDs: Set<UUID>
+    public let durableDenialConfirmed: Bool
+    /// Native I/O is closed, but these exact owners still need input/journal
+    /// settlement. Their admission slots remain retained for an explicit retry.
+    public let retainedConnectionIDs: Set<UUID>
+}
+
 /// How a live connection notices that its server stopped answering: a dropped
 /// or changed network, a sleeping or hung host. After each `interval` with no
 /// bytes from the server the connection sends one keepalive that asks for a
@@ -46,7 +59,9 @@ public actor WorkspaceSSHConnectionManager {
     private struct Machine: Hashable, Sendable { let workspaceID: UUID; let machineID: String }
     private struct Pending {
         let id: UUID
+        let machine: Machine
         let task: Task<WorkspaceSSHConnection, Error>
+        var credentialFingerprints: Set<String> = []
     }
     private let store: WorkspaceStore, broker: SSHAuthenticationBroker
     private let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator
@@ -59,6 +74,8 @@ public actor WorkspaceSSHConnectionManager {
     private var live: [Machine: WorkspaceSSHConnection] = [:]
     private var settlements: [UUID: Task<Void, Error>] = [:]
     private var retiringWorkspaces: [UUID: Int] = [:]
+    private var deniedCredentials: Set<String> = []
+    private var revocations: [String: Task<WorkspaceCredentialRevocationReceipt, Error>] = [:]
 
     public init(store: WorkspaceStore, broker: SSHAuthenticationBroker,
                 journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator,
@@ -127,6 +144,71 @@ public actor WorkspaceSSHConnectionManager {
         await settle(attempts: attempts, connections: connections)
     }
 
+    /// Confirm the exact fingerprint and disclose workspace-wide disconnection
+    /// before calling. Persist global denial before cancelling managed prompts
+    /// and closing all connections in workspaces that reference the identity.
+    /// Retained owner metadata includes earlier revisions, so reimport cannot
+    /// hide a connection using a key removed from the current manifest.
+    ///
+    /// Once admitted, the bounded operation outlives its caller's cancellation.
+    /// Even an ambiguous write keeps the fingerprint denied in this manager;
+    /// unrelated workspaces and the broker's foreground lease remain active.
+    public func revokeCredentialLocally(fingerprint: String, confirmedByUser: Bool) async throws
+        -> WorkspaceCredentialRevocationReceipt {
+        guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+        try Task.checkCancellation()
+        guard fingerprint.utf8.count == 50 else { throw FTError.malformed("identity.fingerprint") }
+        if let operation = revocations[fingerprint] { return try await operation.value }
+        guard revocations.count < 3 else { throw WorkspaceSSHConnectionError.capacity }
+        let operation = Task { try await performCredentialRevocation(fingerprint) }
+        revocations[fingerprint] = operation
+        defer { revocations.removeValue(forKey: fingerprint) }
+        return try await operation.value
+    }
+
+    private func performCredentialRevocation(_ fingerprint: String) async throws
+        -> WorkspaceCredentialRevocationReceipt {
+        var affected: Set<UUID> = []
+        for workspace in try await store.load() {
+            if try workspace.document().credentials.contains(where: { $0.fingerprint == fingerprint }) {
+                affected.insert(workspace.id)
+            }
+        }
+        affected.formUnion(pending.values.filter { $0.credentialFingerprints.contains(fingerprint) }
+            .map { $0.machine.workspaceID })
+        affected.formUnion(live.values.filter { $0.credentialFingerprints.contains(fingerprint) }
+            .map { $0.scope.workspaceID })
+        // Every admitted value came from a validated workspace, a retained
+        // owner, or a previously admitted denial. Arbitrary strings cannot
+        // consume the bounded process-local denial inventory.
+        guard !affected.isEmpty || deniedCredentials.contains(fingerprint) else {
+            throw SSHAuthenticationError.denied
+        }
+        guard deniedCredentials.count < 4096 || deniedCredentials.contains(fingerprint) else {
+            throw FTError.limit("store.revocations")
+        }
+        deniedCredentials.insert(fingerprint)
+        for id in affected { retiringWorkspaces[id, default: 0] += 1 }
+        defer {
+            for id in affected {
+                if retiringWorkspaces[id] == 1 { retiringWorkspaces.removeValue(forKey: id) }
+                else { retiringWorkspaces[id, default: 1] -= 1 }
+            }
+        }
+        let persisted: Bool
+        do { try await store.revokeLocally(fingerprint: fingerprint); persisted = true }
+        catch { persisted = false }
+
+        let attempts = pending.filter { affected.contains($0.key.workspaceID) }.map(\.value)
+        let connections = live.filter { affected.contains($0.key.workspaceID) }.map { ($0.key, $0.value) }
+        for attempt in attempts { attempt.task.cancel() }
+        for (_, connection) in connections { await connection.sealAdmission() }
+        await settle(attempts: attempts, connections: connections)
+        return .init(fingerprint: fingerprint, affectedWorkspaceIDs: affected,
+            durableDenialConfirmed: persisted,
+            retainedConnectionIDs: Set(live.values.filter { affected.contains($0.scope.workspaceID) }.map(\.id)))
+    }
+
     public func connections() -> [WorkspaceSSHConnection] {
         live.values.sorted {
             if $0.scope.workspaceID != $1.scope.workspaceID {
@@ -159,6 +241,8 @@ public actor WorkspaceSSHConnectionManager {
         let store = self.store, broker = self.broker, journal = self.journal
         let coordinator = self.coordinator, networkActivity = self.networkActivity, liveness = self.liveness
         let task = Task<WorkspaceSSHConnection, Error> {
+            let fingerprints = try await credentialSnapshot(machine: machine, attemptID: attemptID,
+                generation: generation, expectedRevision: expectedRevision, credentialID: credentialID)
             let native = try await WorkspaceNativeSSHConnection.connect(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, machineID: machineID, routeID: routeID,
                 credentialID: credentialID, confirmedByUser: confirmedByUser,
@@ -167,31 +251,53 @@ public actor WorkspaceSSHConnectionManager {
                 liveness: liveness)
             do {
                 try Task.checkCancellation()
-                return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator)
+                return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator,
+                    credentialFingerprints: fingerprints)
             } catch {
                 await native.close()
                 throw error
             }
         }
-        pending[machine] = .init(id: attemptID, task: task)
+        pending[machine] = .init(id: attemptID, machine: machine, task: task)
         defer { if pending[machine]?.id == attemptID { pending.removeValue(forKey: machine) } }
         let connection = try await withTaskCancellationHandler {
             try await task.value
         } onCancel: { task.cancel() }
         do {
             try Task.checkCancellation()
-            guard foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,
+            guard !task.isCancelled, foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,
                   pending[machine]?.id == attemptID else { throw WorkspaceSSHConnectionError.stale }
             try await connection.validateForPublication()
             try Task.checkCancellation()
-            guard foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,
+            guard !task.isCancelled, foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,
                   pending[machine]?.id == attemptID else { throw WorkspaceSSHConnectionError.stale }
             live[machine] = connection
             return connection
         } catch {
-            try? await connection.close()
+            try? await settleConnection(machine, connection).value
             throw error
         }
+    }
+
+    /// Register immutable credential metadata before the native factory can
+    /// resolve a hostname or request a signer. Recheck after the store actor
+    /// hop: a revocation admitted while this read was pending wins the race.
+    private func credentialSnapshot(machine: Machine, attemptID: UUID, generation: UUID,
+                                    expectedRevision: UUID, credentialID: String) async throws -> Set<String> {
+        try Task.checkCancellation()
+        let workspaces = try await store.load()
+        try Task.checkCancellation()
+        guard let workspace = workspaces.first(where: { $0.id == machine.workspaceID }),
+              workspace.revision == expectedRevision else { throw SSHAuthenticationError.stale }
+        let document = try workspace.document()
+        guard let credential = document.credentials.first(where: { $0.id == credentialID }),
+              !deniedCredentials.contains(credential.fingerprint) else { throw SSHAuthenticationError.denied }
+        let fingerprints = Set(document.credentials.map(\.fingerprint))
+        guard foreground, lifecycle == generation, pending[machine]?.id == attemptID,
+              retiringWorkspaces[machine.workspaceID] == nil,
+              fingerprints.isDisjoint(with: revocations.keys) else { throw WorkspaceSSHConnectionError.stale }
+        pending[machine]?.credentialFingerprints = fingerprints
+        return fingerprints
     }
 
     /// Remove only the exact owner after its durable settlement succeeds. A
@@ -213,7 +319,9 @@ public actor WorkspaceSSHConnectionManager {
         let id = attempt.id, operation = attempt.task
         let job = Task<Void, Error> {
             defer { settlements.removeValue(forKey: id) }
-            if let connection = try? await operation.value { try await connection.close() }
+            if let connection = try? await operation.value {
+                try await settleConnection(attempt.machine, connection).value
+            }
         }
         settlements[id] = job
         return job
@@ -222,6 +330,9 @@ public actor WorkspaceSSHConnectionManager {
     private func settleConnection(_ machine: Machine, _ connection: WorkspaceSSHConnection) -> Task<Void, Error> {
         let id = connection.id
         if let existing = settlements[id] { return existing }
+        // A completed attempt can lose publication to revocation or suspension.
+        // It still needs a retained cleanup owner if journal settlement fails.
+        if live[machine] == nil { live[machine] = connection }
         let job = Task<Void, Error> {
             defer { settlements.removeValue(forKey: id) }
             try await connection.close()
@@ -240,12 +351,14 @@ public final class WorkspaceSSHConnection: Sendable {
     public let identity: TerminalConnectionIdentity
     public let peer: NativeSSHPeer
     public let scope: TerminalSessionScope
+    fileprivate let credentialFingerprints: Set<String>
     private let native: WorkspaceNativeSSHConnection
     private let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator
 
     fileprivate init(native: WorkspaceNativeSSHConnection, journal: TerminalSessionJournal,
-                     coordinator: TerminalInputCoordinator) {
+                     coordinator: TerminalInputCoordinator, credentialFingerprints: Set<String>) {
         self.native = native; self.journal = journal; self.coordinator = coordinator
+        self.credentialFingerprints = credentialFingerprints
         identity = native.identity; peer = native.peer; scope = native.scope
     }
     public var isClosed: Bool { get async { await native.isClosed } }

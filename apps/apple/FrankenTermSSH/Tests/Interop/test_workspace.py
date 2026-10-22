@@ -97,7 +97,7 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
         host = fixture.public_blob(ec.generate_private_key(ec.SECP256R1())) if mode == "wrongPin" else server.host_blob
         pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
         request = {"pem": pem.decode()}
-        if mode in ["managed", "managedClose", "managedFinalWriteFailure", "managedBindingClose"]:
+        if mode in ["managed", "managedClose", "managedFinalWriteFailure", "managedBindingClose", "managedRevokeFinalWriteFailure"]:
             # Keep the tiny public journal artifact for failed-run diagnosis.
             directory = Path(tempfile.mkdtemp(prefix="frankenterm-workspace-ssh-journal-"))
             request["journalDirectory"] = str(directory)
@@ -116,13 +116,13 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
             self.assertTrue(server.done.wait(2), "SSH server retained a closed connection")
             offered = [event[1] for event in server.events if event[0] == "authentication"]
             side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
-            if mode in ["io", "foreignCancel", "managed", "managedFinalWriteFailure"]:
+            if mode in ["io", "foreignCancel", "managed", "managedFinalWriteFailure", "managedRevokeFinalWriteFailure"]:
                 self.assertEqual(offered, [0, 1], "libssh must validate the production signature")
                 self.assertEqual(side_effects, ["channel", "pty", "shell"])
                 self.assertEqual(server.received, "protected workspace → actual SSH 🦀\r\nEND-SESSION\r".encode())
                 self.assertEqual(result["bytes"], len(server.received))
                 self.assertEqual(result["signs"], 1)
-                if mode in ["managed", "managedFinalWriteFailure"]:
+                if mode in ["managed", "managedFinalWriteFailure", "managedRevokeFinalWriteFailure"]:
                     self.assertEqual(server.events.creation_observations, 3)
                     self.assertIn(("resize", 132, 42), server.events)
                     self.assertNotIn(("resize", 160, 50), server.events)
@@ -140,7 +140,7 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
                 records = json.loads((directory / "catalog.json").read_bytes())["records"]
                 self.assertEqual([record["state"] for record in records], ["interrupted"])
                 self.assertEqual(records[0]["input_evidence"], 0)
-            elif mode in ["beforeShellRevocation", "managedClose"]:
+            elif mode in ["beforeShellRevocation", "managedClose", "managedRevokeAfterReimport"]:
                 self.assertEqual(offered, [0, 1])
                 self.assertEqual(side_effects, [], "a revoked or retired connection must not create a channel or PTY")
                 self.assertEqual(result["signs"], 1)
@@ -148,17 +148,18 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
                     self.assertEqual(server.events.creation_observations, 0)
                     records = json.loads((directory / "catalog.json").read_bytes())["records"]
                     self.assertEqual([record["state"] for record in records], ["interrupted"])
-            elif mode in ["revokeKeyDuring", "revokeHostDuring", "reimportDuring", "cancelDuring", "suspendDuring"]:
+            elif mode in ["revokeKeyDuring", "revokeHostDuring", "reimportDuring", "cancelDuring", "suspendDuring",
+                          "managedRevokeDuring", "managedRevokeDuringReimport"]:
                 self.assertEqual(offered, [0], "a stale or cancelled signature must never reach SSH")
                 self.assertEqual(side_effects, [])
                 self.assertEqual(result["signs"], 1)
-                if mode in ["cancelDuring", "suspendDuring"]:
+                if mode in ["cancelDuring", "suspendDuring", "managedRevokeDuring", "managedRevokeDuringReimport"]:
                     self.assertGreater(result["cancellations"], 0)
             else:
                 self.assertEqual(offered, [], "untrusted or stale identity must not even be offered")
                 self.assertEqual(side_effects, [])
                 self.assertEqual(result["signs"], 0)
-            if mode not in ["io", "foreignCancel", "managed", "managedFinalWriteFailure"]:
+            if mode not in ["io", "foreignCancel", "managed", "managedFinalWriteFailure", "managedRevokeFinalWriteFailure"]:
                 self.assertEqual(result["bytes"], 0)
                 self.assertEqual(server.received, b"")
         finally:
@@ -202,6 +203,17 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
 
     def test_closed_source_retries_failed_journal_publication_without_retaining_input_or_replaying(self):
         self.run_probe("managedFinalWriteFailure")
+
+    def test_managed_revocation_persists_before_cancelling_protected_worker_and_survives_caller_cancellation(self):
+        for mode in ["managedRevokeDuring", "managedRevokeDuringReimport"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode)
+
+    def test_managed_revocation_finds_live_identity_removed_by_reimport(self):
+        self.run_probe("managedRevokeAfterReimport")
+
+    def test_managed_revocation_retains_closed_owner_through_input_and_failed_journal_settlement(self):
+        self.run_probe("managedRevokeFinalWriteFailure")
 
     def test_suspension_joins_parked_creation_without_reviving_old_grants_or_overriding_resume(self):
         self.run_probe("managedClose")
