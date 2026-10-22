@@ -89,6 +89,29 @@ public struct WorkspaceImportReceipt: Sendable {
     public let cleanupPending: Bool
 }
 
+/// A local review of one already accepted public identity. This is neither an
+/// archive import nor permission to connect. Only the issuing store can consume
+/// it, and the exact saved revision and current revocation policy are rechecked.
+public struct WorkspaceCredentialImportReview: Identifiable, Sendable {
+    public let id: UUID
+    public let workspaceID: UUID
+    public let expectedRevision: UUID
+    public let workspaceName: String
+    /// Pass this exact reference to OpenSSHSourceKeyUnlocker when selecting a
+    /// deliberate local file. Unlocking does not itself approve installation.
+    public let credential: WorkspaceDocument.Credential
+    /// Aliases of the same algorithm and fingerprint in this workspace. All
+    /// receive the same protected item; no unrelated identity is repaired.
+    public let credentialIDs: [String]
+    fileprivate let owner: UUID
+}
+
+public struct WorkspaceCredentialImportReceipt: Sendable {
+    public let workspace: InstalledWorkspace
+    public let credentialIDs: [String]
+    public let cleanupPending: Bool
+}
+
 public struct WorkspaceReimportReview: Sendable {
     public let expectedRevision: UUID?
     public let removesMachines: Bool
@@ -259,6 +282,7 @@ public actor WorkspaceStore {
     private let persistence: any WorkspacePersistence
     private let vault: any WorkspaceCredentialVault
     private let sshAuthorizationOwner = UUID()
+    private let credentialImportOwner = UUID()
     private static let catalogLimit = 16 * 1024 * 1024
     private static let journalLimit = 128 * 1024
     static let importHistoryLimit = 4096
@@ -563,6 +587,135 @@ public actor WorkspaceStore {
             do { try recover(catalog: &catalog) } catch { cleanupPending = true }
             return receipt(installed, requested: document.credentials.map(\.id),
                            available: Set(bindings.map(\.credentialID)), cleanupPending: cleanupPending)
+        }
+    }
+
+    /// Select an existing public reference before opening a file or prompting
+    /// for its passphrase. No file contents or private material enter the review.
+    public func reviewCredentialImport(workspaceID: UUID, expectedRevision: UUID,
+                                       credentialID: String) throws -> WorkspaceCredentialImportReview {
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  saved.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
+            let document = try saved.document()
+            guard let credential = document.credentials.first(where: { $0.id == credentialID }) else {
+                throw WorkspaceStoreError.staleReview
+            }
+            guard !catalog.revokedFingerprints.contains(credential.fingerprint) else {
+                throw WorkspaceStoreError.revokedIdentity
+            }
+            let identity = CredentialIdentity(credential)
+            return .init(id: UUID(), workspaceID: saved.id, expectedRevision: saved.revision,
+                workspaceName: document.name, credential: credential,
+                credentialIDs: document.credentials.filter { CredentialIdentity($0) == identity }.map(\.id),
+                owner: credentialImportOwner)
+        }
+    }
+
+    /// Install a deliberately selected, unlocked OpenSSH key for this exact
+    /// saved public reference. The caller's final consent follows selection and
+    /// unlocking, and must be retired on cancellation or loss of foreground.
+    ///
+    /// This transaction changes only the selected identity's local bindings and
+    /// local revision. It preserves the accepted manifest, import history, trust,
+    /// portability findings and connection preferences, and starts no network
+    /// activity. A thrown storage write may have published: reload the store to
+    /// reconcile it before reporting whether the key was installed.
+    public func importCredential(_ key: PrivateKeyRecord, review: WorkspaceCredentialImportReview,
+                                 confirmedByUser: Bool) throws -> WorkspaceCredentialImportReceipt {
+        guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
+        guard review.owner == credentialImportOwner else { throw WorkspaceStoreError.staleReview }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let index = catalog.workspaces.firstIndex(where: { $0.id == review.workspaceID }),
+                  catalog.workspaces[index].revision == review.expectedRevision else {
+                throw WorkspaceStoreError.staleReview
+            }
+            let saved = catalog.workspaces[index], document = try saved.document()
+            guard let credential = document.credentials.first(where: { $0.id == review.credential.id }),
+                  credential.algorithm == review.credential.algorithm,
+                  credential.fingerprint == review.credential.fingerprint,
+                  key.credentialID == credential.id else { throw WorkspaceStoreError.staleReview }
+            guard !catalog.revokedFingerprints.contains(credential.fingerprint) else {
+                throw WorkspaceStoreError.revokedIdentity
+            }
+            guard key.certificates.isEmpty else { throw FTError.unsupported("store.key_certificate") }
+            let identity = CredentialIdentity(credential)
+            let aliases = document.credentials.filter { CredentialIdentity($0) == identity }.map(\.id)
+            guard aliases == review.credentialIDs else { throw WorkspaceStoreError.staleReview }
+            // Never trust a caller-supplied public blob or a custom crypto
+            // provider's unlock result as proof of the actual private identity.
+            let proven = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: key.container)
+            guard proven.blob == key.publicBlob, proven.algorithm == credential.algorithm,
+                  proven.fingerprint == credential.fingerprint else { throw SSHAuthenticationError.identityMismatch }
+            try Task.checkCancellation()
+            let reusable = try reusableCredentialAccounts(for: document, preferredWorkspace: saved,
+                                                          catalog: catalog)[identity]
+            if let reusable {
+                if let existing = try vault.publicIdentity(account: reusable) {
+                    guard existing == proven else { throw SSHAuthenticationError.identityMismatch }
+                } else if try vault.enrichPublicIdentity(account: reusable, identity: proven) {
+                    guard try vault.publicIdentity(account: reusable) == proven else { throw FTError.storage }
+                }
+                try Task.checkCancellation()
+                if aliases.allSatisfy({ id in saved.bindings.contains {
+                    $0.credentialID == id && $0.fingerprint == credential.fingerprint && $0.account == reusable
+                } }) {
+                    return .init(workspace: saved, credentialIDs: aliases, cleanupPending: false)
+                }
+            }
+
+            let transaction = UUID(), revision = UUID()
+            let account = reusable ?? "ft-import:\(transaction.uuidString):0"
+            let selectedIDs = Set(aliases)
+            let previous = Dictionary(uniqueKeysWithValues: saved.bindings.map { ($0.credentialID, $0) })
+            let bindings: [InstalledWorkspace.Binding] = document.credentials.compactMap { reference in
+                if selectedIDs.contains(reference.id) {
+                    return .init(credentialID: reference.id, fingerprint: reference.fingerprint, account: account)
+                }
+                return previous[reference.id]
+            }
+            let repaired = InstalledWorkspace(id: saved.id, revision: revision, manifest: saved.manifest,
+                envelopeDigest: saved.envelopeDigest, bindings: bindings,
+                inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater)
+            catalog.workspaces[index] = repaired
+            let next = try encode(catalog, limit: Self.catalogLimit)
+            let retained = Set(bindings.map(\.account))
+            let journal = Journal(transaction: transaction, targetRevision: revision,
+                newAccounts: reusable == nil ? [account] : [],
+                retiredAccounts: Set(saved.bindings.map(\.account)).subtracting(retained).sorted())
+            try Task.checkCancellation()
+            // Journal ownership precedes the first protected-item insertion.
+            // Recovery also preserves retired accounts used by other workspaces.
+            try persistence.write(encode(journal, limit: Self.journalLimit), to: .journal)
+            do {
+                try Task.checkCancellation()
+                if reusable == nil {
+                    try vault.create(account: account, privateContainer: key.container, fingerprint: credential.fingerprint)
+                }
+                guard try vault.fingerprint(account: account) == credential.fingerprint else { throw FTError.storage }
+                if let stored = try vault.publicIdentity(account: account), stored != proven {
+                    throw SSHAuthenticationError.identityMismatch
+                }
+                try Task.checkCancellation()
+                try persistence.write(next, to: .catalog)
+            } catch {
+                // Publication may have happened before the write failed. The
+                // existing durable recovery path decides which account survives.
+                do {
+                    var actual = try readCatalog()
+                    try recover(catalog: &actual)
+                } catch { throw WorkspaceStoreError.recoveryRequired }
+                throw error
+            }
+            var cleanupPending = false
+            do { try recover(catalog: &catalog) } catch { cleanupPending = true }
+            return .init(workspace: repaired, credentialIDs: aliases, cleanupPending: cleanupPending)
         }
     }
 
