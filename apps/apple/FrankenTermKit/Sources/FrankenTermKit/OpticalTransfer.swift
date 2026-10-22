@@ -179,6 +179,68 @@ struct URPageDecoder: Sendable {
         count = part.count; messageLength = part.messageLength; checksum = part.checksum; fragmentLength = part.payload.count
         rows = Array(repeating: nil, count: part.count)
     }
+    /// Only independent ciphertext equations survive a checkpoint. There is no
+    /// growing history of camera observations or duplicate sequence numbers.
+    func checkpoint() throws -> Data {
+        guard rank > 0, rank < count, rows.compactMap({ $0 }).count == rank else {
+            throw FTError.malformed("scan.partial_rank")
+        }
+        var result = CBORWriter.array(4) + CBORWriter.uint(UInt64(count))
+            + CBORWriter.uint(UInt64(messageLength)) + CBORWriter.uint(UInt64(checksum))
+            + CBORWriter.array(rank)
+        for (pivot, entry) in rows.enumerated() {
+            guard let row = entry else { continue }
+            var mask = Data()
+            for word in row.bits { mask.appendBE(word, bytes: 8) }
+            result += CBORWriter.array(3) + CBORWriter.uint(UInt64(pivot))
+                + CBORWriter.bytes(mask) + CBORWriter.bytes(row.payload)
+        }
+        return result
+    }
+
+    /// Checkpoint bytes are untrusted even when their checksum matches. Require
+    /// the wire's exact geometry and a canonical upper-echelon matrix before
+    /// restoring private decoder state. Page/envelope hashes still gate use.
+    init(checkpoint reader: inout CBORReader, expectedMessageLength: Int) throws {
+        try reader.tuple(4)
+        let count = try reader.head(major: 0), length = try reader.head(major: 0)
+        let checksum = try reader.head(major: 0)
+        guard (257...(FTLimit.page + 3)).contains(expectedMessageLength),
+              length == UInt64(expectedMessageLength), count == (length + 255) / 256,
+              (2...129).contains(count), checksum <= UInt32.max else {
+            throw FTError.malformed("scan.partial_geometry")
+        }
+        let rank = try reader.array(cap: Int(count) - 1)
+        guard rank > 0 else { throw FTError.malformed("scan.partial_rank") }
+        self.count = Int(count); messageLength = expectedMessageLength
+        self.checksum = UInt32(checksum)
+        fragmentLength = (expectedMessageLength + self.count - 1) / self.count
+        rows = Array(repeating: nil, count: self.count)
+        let words = (self.count + 63) / 64
+        var previous = -1
+        for _ in 0..<rank {
+            try reader.tuple(3)
+            let rawPivot = try reader.head(major: 0)
+            guard rawPivot < count else { throw FTError.malformed("scan.pivot") }
+            let pivot = Int(rawPivot)
+            guard pivot > previous else { throw FTError.malformed("scan.pivot_order") }
+            let mask = try reader.bytes(cap: words * 8)
+            guard mask.count == words * 8 else { throw FTError.malformed("scan.mask_length") }
+            var bits: [UInt64] = [], cursor = ByteCursor(mask)
+            for _ in 0..<words { bits.append(try cursor.uint(8)) }
+            let word = pivot / 64, flag = UInt64(1) << (pivot % 64)
+            guard bits[..<word].allSatisfy({ $0 == 0 }),
+                  bits[word] & flag != 0, bits[word] & (flag - 1) == 0,
+                  self.count % 64 == 0 || bits[words - 1] >> (self.count % 64) == 0 else {
+                throw FTError.malformed("scan.mask_echelon")
+            }
+            let payload = try reader.bytes(cap: fragmentLength)
+            guard payload.count == fragmentLength else { throw FTError.malformed("scan.fragment_length") }
+            rows[pivot] = Row(bits: bits, payload: payload)
+            previous = pivot
+        }
+        self.rank = rank
+    }
     mutating func receive<C: AirGapCryptography>(_ part: URPart, using crypto: C) throws -> Data? {
         guard part.count == count, part.messageLength == messageLength, part.checksum == checksum,
               part.payload.count == fragmentLength else { throw FTError.malformed("ur.changed_geometry") }
@@ -334,6 +396,9 @@ public struct OpticalSender: Sendable {
 /// Caller explicitly selects one identity before construction. No receive call
 /// can switch sources. Value ownership permits an actor to serialize mutations.
 public struct OpticalReceiver: Sendable {
+    /// This is a ciphertext checkpoint limit, not a workspace/QR payload limit.
+    public static let decoderCheckpointByteLimit = 6 * 1024 * 1024
+    private static let decoderCheckpointDomain = Data("FrankenTerm/FTDC/v1/checksum\0".utf8)
     public let identity: OpticalFrame.Identity
     private var decoders: [Int: URPageDecoder] = [:]
     private var expectedDigests: [Int: Data] = [:]
@@ -370,6 +435,80 @@ public struct OpticalReceiver: Sendable {
         return try OpticalScanCheckpoint(identity: identity, pages: verified, pageDigests: digests, using: crypto)
     }
 
+    /// An explicit local save may retain these bytes. It contains only encrypted
+    /// page material, independent recovery equations and public source metadata:
+    /// NEVER a transfer code, FTCODE1 frame, recipient secret, key or plaintext.
+    /// The checksum detects corruption; it does not authenticate an exporter.
+    /// Unlike FTSC's verified-page-only checkpoint, this opt-in FTDC format
+    /// retains UNVERIFIED equations. They are not exposed as verified pages and
+    /// must still pass normal page and envelope checks before decryption.
+    public func decoderCheckpoint<C: AirGapCryptography>(using crypto: C) throws -> Data {
+        let pages = (0..<identity.pageCount).filter { verified[$0] != nil || decoders[$0] != nil }
+        var data = Data("FTDC".utf8) + CBORWriter.array(5) + CBORWriter.uint(1)
+            + CBORWriter.bytes(identity.transferID) + CBORWriter.bytes(identity.envelopeDigest)
+            + CBORWriter.uint(UInt64(identity.envelopeLength)) + CBORWriter.array(pages.count)
+        for index in pages {
+            guard let digest = expectedDigests[index], digest.count == 32 else {
+                throw FTError.malformed("scan.page_digest")
+            }
+            data += CBORWriter.array(4) + CBORWriter.uint(UInt64(index)) + CBORWriter.bytes(digest)
+            if let page = verified[index] { data += CBORWriter.uint(0) + CBORWriter.bytes(page) }
+            else if let decoder = decoders[index] { data += CBORWriter.uint(1) + (try decoder.checkpoint()) }
+        }
+        guard data.count <= Self.decoderCheckpointByteLimit - 32 else { throw FTError.limit("scan.bytes") }
+        let checksum = crypto.sha256(Self.decoderCheckpointDomain + data)
+        guard checksum.count == 32 else { throw FTError.malformed("scan.digest") }
+        return data + checksum
+    }
+
+    /// Resume only after an explicit file selection. Restoring a checkpoint
+    /// grants no decrypt/import/network authority. All camera observations must
+    /// still match this exact transfer and every completed page is reverified.
+    public init<C: AirGapCryptography>(decoderCheckpoint data: Data, using crypto: C) throws {
+        guard data.count <= Self.decoderCheckpointByteLimit else { throw FTError.limit("scan.bytes") }
+        guard data.count >= 92, data.starts(with: Data("FTDC".utf8)) else {
+            throw FTError.malformed("scan.header")
+        }
+        let body = Data(data.dropLast(32))
+        guard crypto.sha256(Self.decoderCheckpointDomain + body) == Data(data.suffix(32)) else { throw FTError.checksum }
+        var reader = CBORReader(Data(body.dropFirst(4)))
+        try reader.tuple(5)
+        guard try reader.head(major: 0) == 1 else { throw FTError.unsupported("scan.version") }
+        let transfer = try reader.bytes(cap: 16), digest = try reader.bytes(cap: 32)
+        let length = try reader.head(major: 0)
+        guard transfer.count == 16, digest.count == 32, (4170...UInt64(FTLimit.envelope)).contains(length) else {
+            throw FTError.malformed("scan.identity")
+        }
+        identity = .init(transferID: transfer, envelopeDigest: digest, envelopeLength: Int(length))
+        let pageCount = try reader.array(cap: identity.pageCount)
+        var previous = -1
+        for _ in 0..<pageCount {
+            try reader.tuple(4)
+            let rawIndex = try reader.head(major: 0)
+            guard rawIndex < identity.pageCount else { throw FTError.malformed("scan.page_index") }
+            let index = Int(rawIndex)
+            guard index > previous else { throw FTError.malformed("scan.page_order") }
+            let pageDigest = try reader.bytes(cap: 32)
+            guard pageDigest.count == 32 else { throw FTError.malformed("scan.page_digest") }
+            let kind = try reader.head(major: 0)
+            let expectedLength = min(FTLimit.page, identity.envelopeLength - index * FTLimit.page)
+            switch kind {
+            case 0:
+                let page = try reader.bytes(cap: expectedLength)
+                guard page.count == expectedLength, crypto.sha256(page) == pageDigest else { throw FTError.checksum }
+                verified[index] = page
+            case 1:
+                let messageLength = expectedLength + CBORWriter.head(2, UInt64(expectedLength)).count
+                decoders[index] = try URPageDecoder(checkpoint: &reader, expectedMessageLength: messageLength)
+            default: throw FTError.malformed("scan.page_kind")
+            }
+            expectedDigests[index] = pageDigest; previous = index
+        }
+        try reader.finish()
+        // A malicious file cannot promote individually matching pages into an
+        // unrelated FTAG envelope, even when it recomputes the outer checksum.
+        if isComplete { _ = try envelope(using: crypto) }
+    }
     public mutating func resetIncompletePage(_ page: Int) {
         guard verified[page] == nil else { return }
         decoders[page] = nil; expectedDigests[page] = nil
