@@ -2288,12 +2288,12 @@ impl SnapshotPublicationStore {
                 "the newer root fails verification",
             ));
         }
-        if let Err(error) = verifier.verify_root(older, self) {
-            if !verifier.superseded_by_newer(&error) {
-                return Ok(ObjectReclamation::skipped(
-                    "the older root fails verification",
-                ));
-            }
+        if let Err(error) = verifier.verify_root(older, self)
+            && !verifier.superseded_by_newer(&error)
+        {
+            return Ok(ObjectReclamation::skipped(
+                "the older root fails verification",
+            ));
         }
         self.reclaim_unreachable_locked(
             &publication_lock,
@@ -2384,8 +2384,13 @@ impl SnapshotPublicationStore {
         }
 
         // Each root's capture precedes every object its publication wrote.
-        let cutoff = std::time::UNIX_EPOCH
-            + std::time::Duration::from_millis(roots[0].created_at_ms.min(roots[1].created_at_ms));
+        let Some(cutoff) = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(
+            roots[0].created_at_ms.min(roots[1].created_at_ms),
+        )) else {
+            return Ok(ObjectReclamation::skipped(
+                "a retained root's capture time is out of range",
+            ));
+        };
         let path = self.root_path.join(OBJECTS_DIR_NAME);
         let mut unreachable = Vec::new();
         for (index, entry) in self
