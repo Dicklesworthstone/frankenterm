@@ -315,14 +315,37 @@ private struct MuxSearchMatchRow: View {
     let match: TerminalMuxSearchMatch
     let query: TerminalMuxControl.SearchQuery
     var body: some View {
-        Text(MuxSearchHighlight.marked(match.text.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? "",
-                                       from: match.startColumn, to: match.endRow == match.row ? match.endColumn : nil))
+        Text(MuxSearchHighlight.marked(match))
             .font(.system(.footnote, design: .monospaced)).lineLimit(2)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 enum MuxSearchHighlight {
+    /// The match's first row with the match marked: exactly where its
+    /// offsets say, else by cells (ASCII rows only).
+    static func marked(_ match: TerminalMuxSearchMatch) -> AttributedString {
+        if let range = match.matchedRange { return marked(match.text, range: range) }
+        return marked(match.text.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? "",
+                      from: match.startColumn, to: match.endRow == match.row ? match.endColumn : nil)
+    }
+
+    /// The row of `text` where `range` starts, with `range` marked (to the
+    /// row's end, for a match running onto the next rows).
+    static func marked(_ text: String, range: Range<String.Index>) -> AttributedString {
+        let rowEnd = text[range.lowerBound...].firstIndex(of: "\n") ?? text.endIndex
+        let rowStart = text[..<range.lowerBound].lastIndex(of: "\n").map { text.index(after: $0) } ?? text.startIndex
+        let upper = min(range.upperBound, rowEnd)
+        let before = text[rowStart..<range.lowerBound]
+        var marked = AttributedString(before.count > 24 ? "…" + String(before.suffix(20)) : String(before))
+        var hit = AttributedString(String(text[range.lowerBound..<upper]))
+        hit.backgroundColor = .yellow.opacity(0.45)
+        hit.font = .system(.footnote, design: .monospaced).bold()
+        marked += hit
+        marked += AttributedString(String(text[upper..<rowEnd]))
+        return marked
+    }
+
     /// `line` with cells `start..<end` marked (to the line's end without
     /// `end`), and the long lead-in before a far-right match shortened.
     static func marked(_ line: String, from start: Int, to end: Int?) -> AttributedString {
@@ -410,7 +433,11 @@ private struct MuxSearchContextScreen: View {
     @ViewBuilder private func row(_ line: TerminalMuxContextLine) -> some View {
         let matched = line.row == hit.match.row
         Group {
-            if matched {
+            if matched, let range = hit.match.matchedRange,
+               hit.match.text.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) == line.text {
+                // The match's text began with this very row: its offsets apply.
+                Text(MuxSearchHighlight.marked(hit.match.text, range: range))
+            } else if matched {
                 Text(MuxSearchHighlight.marked(line.text, from: hit.match.startColumn,
                                                to: hit.match.endRow == hit.match.row ? hit.match.endColumn : nil))
             } else {

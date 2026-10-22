@@ -36,7 +36,26 @@ public struct TerminalMuxPane: Decodable, Equatable, Sendable, Identifiable {
 public struct TerminalMuxSearchMatch: Decodable, Equatable, Sendable, Identifiable {
     public let row: Int64, startColumn: Int, endRow: Int64, endColumn: Int
     public let text: String
+    /// Where the match is in `text`, as UTF-8 offsets the client computed
+    /// from the rows' cells (so wide characters before it do not shift it).
+    public let textStart: Int?, textEnd: Int?
     public var id: String { "\(row):\(startColumn):\(endRow):\(endColumn)" }
+
+    public init(row: Int64, startColumn: Int, endRow: Int64, endColumn: Int, text: String,
+                textStart: Int? = nil, textEnd: Int? = nil) {
+        self.row = row; self.startColumn = startColumn; self.endRow = endRow; self.endColumn = endColumn
+        self.text = text; self.textStart = textStart; self.textEnd = textEnd
+    }
+
+    /// The matched part of `text`, when its offsets are present and fall on
+    /// character boundaries.
+    public var matchedRange: Range<String.Index>? {
+        let utf8 = text.utf8
+        guard let textStart, let textEnd, 0 <= textStart, textStart <= textEnd, textEnd <= utf8.count,
+              let lower = utf8.index(utf8.startIndex, offsetBy: textStart).samePosition(in: text),
+              let upper = utf8.index(utf8.startIndex, offsetBy: textEnd).samePosition(in: text) else { return nil }
+        return lower..<upper
+    }
 }
 
 /// A pane's answer to a search: its newest matches, newest first.
