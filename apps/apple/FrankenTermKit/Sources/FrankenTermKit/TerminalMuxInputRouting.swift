@@ -9,6 +9,19 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         public let paneID: Int
         fileprivate let owner: UUID, registration: UUID, visit: UUID
     }
+    public enum PointerAction: Equatable, Sendable {
+        case click(column: Int, row: Int)
+        case wheel(steps: Int, column: Int, row: Int)
+    }
+    /// A gesture belongs to the exact displayed visit, not a mutable pane ID.
+    /// Unlike admitted text, unsent gestures are cancelled when that visit ends.
+    public struct PointerInput: Equatable, Sendable {
+        public let destination: Destination
+        public let action: PointerAction
+    }
+    public static let maximumPendingPointers = 8
+    public static let maximumWheelSteps = 64
+    public static let wheelStepsPerTurn = 8
     public struct State: Equatable, Sendable {
         public let revision: UInt64
         public let destination: Destination?
@@ -24,6 +37,8 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     private var ready = false, retired = false
     private var revision: UInt64 = 0
     private var observer: (@Sendable (State) -> Void)?
+    private var pointers: [PointerInput] = []
+    private var pointerWaker: (@Sendable () -> Void)?
     private static let maximumPanes = 4096
 
     public init() {}
@@ -39,6 +54,83 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     }
     public func removeObserver() { lock.withLock { observer = nil } }
 
+    /// Install the existing coalescing transport signal, not a task-per-gesture.
+    public func setPointerWaker(_ handler: (@Sendable () -> Void)?) {
+        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard !retired else { return nil }
+            pointerWaker = handler
+            return pointers.isEmpty ? nil : handler
+        }
+        wake?()
+    }
+    public var hasPendingPointers: Bool { lock.withLock { !pointers.isEmpty } }
+    public var pendingPointerCount: Int { lock.withLock { pointers.count } }
+
+    /// Called synchronously by a source-matching native view. No route is looked
+    /// up here on behalf of an old callback: it must supply its captured visit.
+    /// Only adjacent, same-cell, same-direction wheel operations coalesce;
+    /// clicks and reversals keep their order. A full queue rejects new input.
+    @discardableResult
+    public func enqueuePointer(_ action: PointerAction, destination selected: Destination) throws -> Bool {
+        let column: Int, row: Int
+        switch action {
+        case .click(let x, let y): column = x; row = y
+        case .wheel(let steps, let x, let y):
+            guard (-Self.maximumWheelSteps...Self.maximumWheelSteps).contains(steps) else {
+                throw TerminalInputError.invalidLimits
+            }
+            if steps == 0 { return false }
+            column = x; row = y
+        }
+        guard (0..<512).contains(column), (0..<512).contains(row) else { throw TerminalInputError.invalidLimits }
+        let wake = try lock.withLock { () -> (@Sendable () -> Void)? in
+            guard !retired, ready, destination == selected,
+                  registrations[selected.paneID] == selected.registration else { throw TerminalInputError.stale }
+            if case .wheel(let steps, let x, let y) = action,
+               let last = pointers.last, last.destination == selected,
+               case .wheel(let previous, let oldX, let oldY) = last.action,
+               oldX == x, oldY == y, (previous > 0) == (steps > 0),
+               (-Self.maximumWheelSteps...Self.maximumWheelSteps).contains(previous + steps) {
+                pointers[pointers.count - 1] = PointerInput(destination: selected,
+                    action: .wheel(steps: previous + steps, column: x, row: y))
+            } else {
+                guard pointers.count < Self.maximumPendingPointers else { throw TerminalInputError.capacity }
+                pointers.append(PointerInput(destination: selected, action: action))
+            }
+            return pointerWaker
+        }
+        wake?()
+        return true
+    }
+
+    /// The sole transport takes one operation only AFTER prior protocol egress
+    /// drains. No await may intervene between taking it and encoding that exact
+    /// target. A throwing/ambiguous encode is never retried automatically.
+    /// Wheel batches are split without moving a later click ahead of their tail.
+    public func takePointer() -> PointerInput? {
+        lock.withLock {
+            guard !retired, ready, let first = pointers.first,
+                  first.destination == destination,
+                  registrations[first.destination.paneID] == first.destination.registration else {
+                pointers.removeAll(); return nil
+            }
+            if case .wheel(let steps, let column, let row) = first.action,
+               steps > Self.wheelStepsPerTurn || steps < -Self.wheelStepsPerTurn {
+                let taken = steps > 0 ? Self.wheelStepsPerTurn : -Self.wheelStepsPerTurn
+                pointers[0] = PointerInput(destination: first.destination,
+                    action: .wheel(steps: steps - taken, column: column, row: row))
+                return PointerInput(destination: first.destination,
+                    action: .wheel(steps: taken, column: column, row: row))
+            }
+            pointers.removeFirst()
+            return first
+        }
+    }
+
+    /// Hiding, opening an inspection or changing geometry cancels only unsent
+    /// gestures. It cannot retract bytes already accepted by the native writer.
+    public func discardPointers() { lock.withLock { pointers.removeAll() } }
+
     /// Validate the whole bounded inventory before replacing registrations.
     /// The transport calls this before publishing the same inventory to the UI.
     public func replaceInventory(_ panes: [Int]) throws {
@@ -50,7 +142,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
             for pane in panes { next[pane] = registrations[pane] ?? UUID() }
             registrations = next
             guard let selected = destination, next[selected.paneID] != selected.registration else { return nil }
-            destination = nil; ready = false
+            destination = nil; ready = false; pointers.removeAll()
             return advance()
         }
         if let (handler, state) = notification { handler?(state) }
@@ -59,7 +151,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         let notification = lock.withLock { () -> ((@Sendable (State) -> Void)?, State)? in
             registrations[pane] = nil
             guard !retired, destination?.paneID == pane else { return nil }
-            destination = nil; ready = false
+            destination = nil; ready = false; pointers.removeAll()
             return advance()
         }
         if let (handler, state) = notification { handler?(state) }
@@ -75,7 +167,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
                 return (destination, nil)
             }
             let selected = Destination(paneID: pane, owner: owner, registration: registration, visit: UUID())
-            destination = selected; ready = false
+            destination = selected; ready = false; pointers.removeAll()
             let notification = advance()
             guard !retired else { throw TerminalInputError.sequenceExhausted }
             return (selected, notification)
@@ -124,6 +216,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         let notification = lock.withLock { () -> ((@Sendable (State) -> Void)?, State)? in
             guard !retired else { return nil }
             retired = true; ready = false; destination = nil; registrations.removeAll()
+            pointers.removeAll(); pointerWaker = nil
             let notification = advance()
             observer = nil
             return notification
@@ -133,6 +226,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     private func advance() -> ((@Sendable (State) -> Void)?, State) {
         if revision == UInt64.max {
             retired = true; ready = false; destination = nil; registrations.removeAll()
+            pointers.removeAll(); pointerWaker = nil
         } else { revision += 1 }
         return (observer, snapshot())
     }
