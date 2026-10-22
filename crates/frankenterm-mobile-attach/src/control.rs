@@ -8,11 +8,15 @@
 //! [`LONE_ESC_RELEASE_AFTER`], an `ESC P`-prefixed partial match (Alt+Shift+P)
 //! for [`PREFIX_RELEASE_AFTER`].  Malformed messages are dropped, never
 //! forwarded as keystrokes, once their full prefix has been seen.
+//! Bracketed paste is forwarded byte for byte, including any private-looking
+//! messages in its contents. Only its exact end marker resumes control parsing.
 
 use std::time::Duration;
 
 /// The exact byte prefix of every control message.
 pub const CONTROL_PREFIX: &[u8] = b"\x1bPft-mobile;";
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 /// The longest payload (`verb;arg`) accepted; longer messages are dropped.
 pub const MAX_CONTROL_PAYLOAD: usize = 256;
 /// How long a lone trailing ESC is held waiting for a following byte.
@@ -44,8 +48,11 @@ enum State {
     /// Passing bytes through.
     #[default]
     Ground,
-    /// Holding a proper, non-empty prefix of [`CONTROL_PREFIX`].
+    /// Holding a proper, non-empty prefix of a control or paste-start marker.
     Prefix(Vec<u8>),
+    /// Paste bytes are already forwarded, including any matched end prefix.
+    /// No payload is retained here and idle cannot end the paste.
+    Paste { end_matched: usize },
     /// Inside a message payload.
     Payload {
         payload: Vec<u8>,
@@ -96,7 +103,7 @@ impl ControlScanner {
     /// Whether bytes are held back waiting for more input.
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        !matches!(self.state, State::Ground)
+        matches!(self.state, State::Prefix(_) | State::Payload { .. })
     }
 
     /// How long after the last input [`Self::on_idle`] will settle the held
@@ -104,7 +111,7 @@ impl ControlScanner {
     #[must_use]
     pub fn release_after(&self) -> Option<Duration> {
         match &self.state {
-            State::Ground => None,
+            State::Ground | State::Paste { .. } => None,
             State::Prefix(held) if held.len() == 1 => Some(LONE_ESC_RELEASE_AFTER),
             State::Prefix(_) => Some(PREFIX_RELEASE_AFTER),
             State::Payload { .. } => Some(PAYLOAD_ABANDON_AFTER),
@@ -132,7 +139,7 @@ impl ControlScanner {
         match std::mem::take(&mut self.state) {
             State::Prefix(held) => vec![ScanItem::Data(held)],
             // An unterminated payload is dropped, never typed.
-            State::Ground | State::Payload { .. } => Vec::new(),
+            State::Ground | State::Paste { .. } | State::Payload { .. } => Vec::new(),
         }
     }
 
@@ -146,14 +153,21 @@ impl ControlScanner {
                 }
             }
             State::Prefix(held) => {
-                if byte == CONTROL_PREFIX[held.len()] {
+                if (CONTROL_PREFIX.starts_with(held)
+                    && CONTROL_PREFIX.get(held.len()) == Some(&byte))
+                    || (PASTE_START.starts_with(held)
+                        && PASTE_START.get(held.len()) == Some(&byte))
+                {
                     held.push(byte);
-                    if held.len() == CONTROL_PREFIX.len() {
+                    if held.as_slice() == CONTROL_PREFIX {
                         self.state = State::Payload {
                             payload: Vec::new(),
                             escape: false,
                             overflow: false,
                         };
+                    } else if held.as_slice() == PASTE_START {
+                        out.data.extend_from_slice(held);
+                        self.state = State::Paste { end_matched: 0 };
                     }
                     return;
                 }
@@ -165,6 +179,19 @@ impl ControlScanner {
                 };
                 out.data.extend_from_slice(&held);
                 self.step(byte, out);
+            }
+            State::Paste { end_matched } => {
+                out.data.push(byte);
+                if byte == PASTE_END[*end_matched] {
+                    *end_matched += 1;
+                    if *end_matched == PASTE_END.len() {
+                        self.state = State::Ground;
+                    }
+                } else {
+                    // ESC occurs only at the marker's start, so it is the
+                    // only possible overlapping prefix after a mismatch.
+                    *end_matched = usize::from(byte == PASTE_END[0]);
+                }
             }
             State::Payload {
                 payload,
@@ -232,6 +259,7 @@ fn parse_payload(payload: &[u8]) -> Option<ControlMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use termwiz::input::{InputEvent, InputParser};
 
     fn data(bytes: &[u8]) -> ScanItem {
         ScanItem::Data(bytes.to_vec())
@@ -254,6 +282,46 @@ mod tests {
             }
         }
         out
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ParsedItem {
+        Input(InputEvent),
+        Control(ControlMessage),
+    }
+
+    /// Use the same scanner-then-parser ordering as Session::on_input.
+    fn parse_chunks(chunks: &[&[u8]]) -> Vec<ParsedItem> {
+        let mut scanner = ControlScanner::new();
+        let mut parser = InputParser::new();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            for item in scanner.feed(chunk) {
+                match item {
+                    ScanItem::Data(bytes) => out.extend(
+                        parser
+                            .parse_as_vec(&bytes, true)
+                            .into_iter()
+                            .map(ParsedItem::Input),
+                    ),
+                    ScanItem::Control(message) => out.push(ParsedItem::Control(message)),
+                }
+            }
+        }
+        out.extend(
+            parser
+                .parse_as_vec(&[], false)
+                .into_iter()
+                .map(ParsedItem::Input),
+        );
+        out
+    }
+
+    fn parsed_control(verb: &str, arg: &str) -> ParsedItem {
+        ParsedItem::Control(ControlMessage {
+            verb: verb.to_string(),
+            arg: arg.to_string(),
+        })
     }
 
     #[test]
@@ -383,5 +451,100 @@ mod tests {
             scanner.feed(b"\x1bPft-mobile;future-verb;a;b\x1b\\"),
             vec![control("future-verb", "a;b")]
         );
+    }
+
+    #[test]
+    fn paste_contents_are_forwarded_byte_for_byte_without_extracting_controls() {
+        let mut input = PASTE_START.to_vec();
+        input.extend_from_slice(b"\x1bPft-mobile;attach;99\x1b\\\x1bPft-mobile;panes\x1b\\");
+        input.extend_from_slice(b"\x1bPft-mobile;");
+        input.extend(std::iter::repeat_n(b'a', MAX_CONTROL_PAYLOAD + 50));
+        input.extend_from_slice(b"\x1b\\\x00\xff\x7f\r\n");
+        input.extend_from_slice(PASTE_END);
+        let mut scanner = ControlScanner::new();
+        assert_eq!(scanner.feed(&input), vec![data(&input)]);
+        assert!(!scanner.is_pending());
+        assert_eq!(scanner.release_after(), None);
+    }
+
+    #[test]
+    fn pasted_commands_cannot_redirect_input_at_any_read_boundary() {
+        let payload = "before\x1bPft-mobile;attach;99\x1b\\\x1bPft-mobile;panes\x1b\\é after";
+        let mut input = b"\x1bPft-mobile;attach;7\x1b\\".to_vec();
+        input.extend_from_slice(PASTE_START);
+        input.extend_from_slice(payload.as_bytes());
+        input.extend_from_slice(PASTE_END);
+        input.extend_from_slice(b"\x1bPft-mobile;attach;9\x1b\\");
+        input.extend_from_slice(b"\x1b[200~second\x1b[201~");
+        let expected = vec![
+            parsed_control("attach", "7"),
+            ParsedItem::Input(InputEvent::Paste(payload.to_string())),
+            parsed_control("attach", "9"),
+            ParsedItem::Input(InputEvent::Paste("second".to_string())),
+        ];
+        assert_eq!(parse_chunks(&[&input]), expected);
+        for split in 1..input.len() {
+            assert_eq!(
+                parse_chunks(&[&input[..split], &input[split..]]),
+                expected,
+                "split at byte {split}"
+            );
+        }
+        assert_eq!(parse_chunks(&input.chunks(1).collect::<Vec<_>>()), expected);
+    }
+
+    #[test]
+    fn idle_during_paste_or_its_end_marker_cannot_reenable_controls() {
+        let payload = b"\x1bPft-mobile;attach;99\x1b\\";
+        for split in 0..PASTE_END.len() {
+            let mut scanner = ControlScanner::new();
+            let mut parser = InputParser::new();
+            let mut head = PASTE_START.to_vec();
+            head.extend_from_slice(payload);
+            head.extend_from_slice(&PASTE_END[..split]);
+            assert_eq!(scanner.feed(&head), vec![data(&head)]);
+            assert_eq!(parser.parse_as_vec(&head, true), Vec::new());
+            assert!(!scanner.is_pending(), "paste bytes have already been forwarded");
+            assert_eq!(scanner.release_after(), None);
+            assert!(scanner.on_idle(Duration::from_secs(60)).is_empty());
+            assert!(parser.parse_as_vec(&[], false).is_empty());
+
+            let after_idle = b"\x1bPft-mobile;attach;88\x1b\\";
+            let mut continued = after_idle.to_vec();
+            continued.extend_from_slice(PASTE_END);
+            let mut tail = continued.clone();
+            tail.extend_from_slice(b"\x1bPft-mobile;attach;9\x1b\\");
+            let items = scanner.feed(&tail);
+            assert_eq!(
+                items,
+                vec![data(&continued), control("attach", "9")],
+                "end marker split at byte {split}"
+            );
+            let ScanItem::Data(bytes) = &items[0] else {
+                panic!("the paste must settle before the following control");
+            };
+            let mut expected = payload.to_vec();
+            expected.extend_from_slice(&PASTE_END[..split]);
+            expected.extend_from_slice(after_idle);
+            assert_eq!(
+                parser.parse_as_vec(bytes, true),
+                vec![InputEvent::Paste(String::from_utf8(expected).unwrap())]
+            );
+        }
+    }
+
+    #[test]
+    fn nested_starts_and_false_end_prefixes_stay_inside_the_same_paste() {
+        let payload = "nested\x1b[200~\x1b[201x\x1b[20\x1bPft-mobile;attach;99\x1b\\\x1b";
+        let mut input = PASTE_START.to_vec();
+        input.extend_from_slice(payload.as_bytes());
+        input.extend_from_slice(PASTE_END);
+        input.extend_from_slice(b"\x1bPft-mobile;panes\x1b\\");
+        let expected = vec![
+            ParsedItem::Input(InputEvent::Paste(payload.to_string())),
+            parsed_control("panes", ""),
+        ];
+        assert_eq!(parse_chunks(&[&input]), expected);
+        assert_eq!(parse_chunks(&input.chunks(1).collect::<Vec<_>>()), expected);
     }
 }

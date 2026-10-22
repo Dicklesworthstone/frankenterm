@@ -50,8 +50,6 @@ const RESIZE_SETTLE: Duration = Duration::from_secs(1);
 const FIRST_RENDER_BUDGET: Duration = Duration::from_secs(5);
 /// Attach attempts while panes keep disappearing under us.
 const MAX_ATTACH_ATTEMPTS: usize = 8;
-/// Delay before retrying a re-attach that failed transiently.
-const REATTACH_RETRY: Duration = Duration::from_millis(100);
 
 /// The phone's terminal size, from the PTY's `TIOCGWINSZ`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,6 +138,19 @@ pub fn run_session(
     let mux = Mux::connect(&config.socket_path)?;
     let mut session = Session::new(mux, config, out);
     let result = session.run(events);
+    let abandon_attachment = match &result {
+        Err(SessionError::PaneNotFound(id)) => session.attached.is_some_and(|attached| {
+            attached.pane == *id || !session.panes.iter().any(|pane| pane.id == attached.pane)
+        }),
+        Err(SessionError::NoPanes) => true,
+        Err(SessionError::Mux(error)) => pane_is_gone(error) || connection_is_lost(error),
+        _ => false,
+    };
+    if abandon_attachment {
+        // After source loss even cleanup must not address a possible
+        // same-number successor or reconnect merely to restore geometry.
+        session.attached = None;
+    }
     session.finish();
     session.mux.close();
     result
@@ -171,7 +182,6 @@ struct Mux {
     /// Declared first: the client is dropped before the runtime it uses.
     client: DirectMuxClient,
     runtime: Runtime,
-    socket_path: PathBuf,
 }
 
 fn connect_client(runtime: &Runtime, socket_path: &Path) -> Result<DirectMuxClient, SessionError> {
@@ -190,11 +200,7 @@ impl Mux {
             .build()
             .map_err(SessionError::Runtime)?;
         match connect_client(&runtime, socket_path) {
-            Ok(client) => Ok(Self {
-                client,
-                runtime,
-                socket_path: socket_path.to_path_buf(),
-            }),
+            Ok(client) => Ok(Self { client, runtime }),
             Err(error) => {
                 retire_runtime(runtime);
                 Err(error)
@@ -202,15 +208,8 @@ impl Mux {
         }
     }
 
-    fn reconnect(&mut self) -> Result<(), SessionError> {
-        self.client = connect_client(&self.runtime, &self.socket_path)?;
-        Ok(())
-    }
-
     fn close(self) {
-        let Self {
-            client, runtime, ..
-        } = self;
+        let Self { client, runtime } = self;
         drop(client);
         retire_runtime(runtime);
     }
@@ -386,9 +385,6 @@ struct Session<'w> {
     panes: Vec<PaneSummary>,
     announced: Option<Vec<u8>>,
     attached: Option<Attachment>,
-    /// A pane that vanished; attach elsewhere at `reattach_at`.
-    reattach_from: Option<u64>,
-    reattach_at: Instant,
     view: View,
     cursor: Option<CursorState>,
     cursor_shape: Option<CursorShape>,
@@ -501,8 +497,6 @@ impl<'w> Session<'w> {
             panes: Vec::new(),
             announced: None,
             attached: None,
-            reattach_from: None,
-            reattach_at: now,
             view: View::default(),
             cursor: None,
             cursor_shape: None,
@@ -548,10 +542,10 @@ impl<'w> Session<'w> {
             let mut resize = None;
             for event in batch {
                 match event {
-                    Event::Input(bytes) => {
-                        let result = self.on_input(&bytes);
-                        self.recover(result)?;
-                    }
+                    // The scanner may already have consumed later input in
+                    // this read. A dispatch failure ends the session; keeping
+                    // only part of that batch would lose its framing/owner.
+                    Event::Input(bytes) => self.on_input(&bytes)?,
                     Event::Resize(size) => resize = Some(size),
                     Event::InputClosed => return Ok(SessionEnd::InputClosed),
                     Event::Terminate => return Ok(SessionEnd::Terminated),
@@ -559,64 +553,38 @@ impl<'w> Session<'w> {
             }
             if let Some(size) = resize {
                 let result = self.on_resize(size);
-                self.recover(result)?;
+                Self::recover(result)?;
             }
-            let result = self.settle_idle_input();
-            self.recover(result)?;
-
-            if let Some(gone) = self.reattach_from.take() {
-                let result = self.attach_somewhere(None, Some(gone), false);
-                if matches!(result, Err(SessionError::Mux(_))) {
-                    // Transient (or a reconnect is needed): try again shortly.
-                    self.reattach_from = Some(gone);
-                    self.reattach_at = Instant::now() + REATTACH_RETRY;
-                }
-                self.recover(result)?;
-            }
+            self.settle_idle_input()?;
             if Instant::now() >= self.next_topology {
-                let result = self.refresh_topology();
-                self.recover(result)?;
+                let result = self.refresh_topology(false);
+                Self::recover(result)?;
                 self.next_topology = Instant::now() + self.topology_interval;
             }
             if Instant::now() >= self.next_render {
                 let result = self.poll_render();
-                self.recover(result)?;
+                Self::recover(result)?;
                 self.next_render = Instant::now() + self.render_interval();
             }
         }
     }
 
-    /// Handle a recoverable mux failure: a vanished pane schedules a
-    /// re-attach, a broken connection is replaced, anything else is retried
-    /// by the next poll.  Other errors end the session.
-    fn recover(&mut self, result: Result<(), SessionError>) -> Result<(), SessionError> {
+    /// Read/resize failures may retry on the next poll. Loss of the selected
+    /// pane or its connection ends this invocation: numeric IDs cannot prove
+    /// that a replacement is the source the user selected. Input never retries.
+    fn recover(result: Result<(), SessionError>) -> Result<(), SessionError> {
         match result {
-            Err(SessionError::Mux(error)) => {
-                if pane_is_gone(&error) {
-                    if let Some(attached) = self.attached {
-                        self.schedule_reattach(attached.pane);
-                    }
-                } else if connection_is_lost(&error) {
-                    self.mux.reconnect()?;
-                    self.view.valid = false;
-                    self.announced = None;
-                }
+            Err(SessionError::Mux(error))
+                if !pane_is_gone(&error) && !connection_is_lost(&error) =>
+            {
                 Ok(())
             }
             other => other,
         }
     }
 
-    fn schedule_reattach(&mut self, gone: u64) {
-        self.reattach_from = Some(gone);
-        self.reattach_at = Instant::now();
-    }
-
     fn next_deadline(&self) -> Instant {
         let mut deadline = self.next_render.min(self.next_topology);
-        if self.reattach_from.is_some() {
-            deadline = deadline.min(self.reattach_at);
-        }
         if self.parser_pending {
             deadline = deadline.min(self.last_input + LONE_ESC_RELEASE_AFTER);
         }
@@ -649,7 +617,19 @@ impl<'w> Session<'w> {
         for item in self.scanner.feed(bytes) {
             match item {
                 ScanItem::Data(data) => self.parse_input(&data, true)?,
-                ScanItem::Control(message) => self.on_control(&message)?,
+                ScanItem::Control(message) => {
+                    // An ESC or other ambiguous key preceding this control
+                    // belongs to the CURRENT pane. Failure must stop the
+                    // switch, never carry an uncertain effect to its target.
+                    self.parse_input(&[], false)?;
+                    // InputParser can retain incomplete UTF-8 even after a
+                    // flush. Retire that fragment at the control boundary.
+                    // Keep the scanner: it has already framed later items in
+                    // this same read, possibly including a new paste.
+                    self.parser = InputParser::new();
+                    self.parser_pending = false;
+                    self.on_control(&message)?;
+                }
             }
         }
         Ok(())
@@ -696,18 +676,9 @@ impl<'w> Session<'w> {
                 let Ok(pane) = message.arg.trim().parse::<u64>() else {
                     return self.announce(true);
                 };
-                self.panes = self.mux.list_panes()?;
-                if self.panes.iter().any(|summary| summary.id == pane) {
-                    self.attach_somewhere(Some(pane), None, false)
-                } else {
-                    // Tell the app the current truth instead.
-                    self.announce(true)
-                }
+                self.attach_somewhere(Some(pane), None, true)
             }
-            "panes" => {
-                self.panes = self.mux.list_panes()?;
-                self.announce(true)
-            }
+            "panes" => self.refresh_topology(true),
             // Newer apps may send verbs this helper does not know.
             _ => Ok(()),
         }
@@ -747,30 +718,27 @@ impl<'w> Session<'w> {
         Ok(())
     }
 
-    fn refresh_topology(&mut self) -> Result<(), SessionError> {
+    fn refresh_topology(&mut self, force: bool) -> Result<(), SessionError> {
         self.panes = self.mux.list_panes()?;
         if let Some(attached) = self.attached.as_mut() {
             match self.panes.iter().find(|pane| pane.id == attached.pane) {
                 Some(pane) => attached.tab = pane.tab,
-                None => {
-                    let gone = attached.pane;
-                    self.schedule_reattach(gone);
-                    return Ok(());
-                }
+                None => return Err(SessionError::PaneNotFound(attached.pane)),
             }
         }
-        self.announce(false)
+        self.announce(force)
     }
 
     /// Give the attached pane back its original size, if it still exists.
-    fn release_attachment(&mut self) {
+    fn release_attachment(&mut self) -> Result<(), SessionError> {
         if let Some(attached) = self.attached.take() {
-            if self.panes.iter().any(|pane| pane.id == attached.pane) {
-                let _ = self
-                    .mux
-                    .resize(attached.tab, attached.pane, attached.original);
+            if !self.panes.iter().any(|pane| pane.id == attached.pane) {
+                return Err(SessionError::PaneNotFound(attached.pane));
             }
+            self.mux
+                .resize(attached.tab, attached.pane, attached.original)?;
         }
+        Ok(())
     }
 
     /// Attach to `preferred`, else to the pane the desktop most recently
@@ -800,8 +768,11 @@ impl<'w> Session<'w> {
             match self.attach_to(target) {
                 Ok(Attach::Attached) => return Ok(()),
                 Ok(Attach::PaneGone) => {}
-                Err(SessionError::Mux(error)) if pane_is_gone(&error) => {}
+                Err(SessionError::Mux(error)) if !strict && pane_is_gone(&error) => {}
                 Err(error) => return Err(error),
+            }
+            if strict {
+                return Err(SessionError::PaneNotFound(target));
             }
             gone = Some(target);
             preferred = None;
@@ -811,7 +782,7 @@ impl<'w> Session<'w> {
 
     fn attach_to(&mut self, pane: u64) -> Result<Attach, SessionError> {
         if self.attached.map(|attached| attached.pane) != Some(pane) {
-            self.release_attachment();
+            self.release_attachment()?;
         }
         let Some(summary) = self.panes.iter().find(|summary| summary.id == pane) else {
             return Ok(Attach::PaneGone);
@@ -1145,7 +1116,7 @@ impl<'w> Session<'w> {
     /// Detach: restore the pane's size and the phone terminal's modes.
     /// Best effort: the connection or the phone may already be gone.
     fn finish(&mut self) {
-        self.release_attachment();
+        let _ = self.release_attachment();
         let mut reset = Vec::new();
         reset.extend_from_slice(b"\x1b[?2026l");
         if self.view.alt {
