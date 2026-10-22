@@ -12,8 +12,8 @@
 use codec::{
     GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, LivenessResponse, MuxWireDecodedPayload, MuxWireDialect,
-    PaneRemoved, Pdu, Resize, SearchScrollbackRequest, SearchScrollbackResponse, UnitResponse,
-    WriteToPane,
+    PaneRemoved, Pdu, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SendKeyDown,
+    TabAddedToWindow, UnitResponse, WriteToPane,
 };
 use frankenterm_mobile_mux::{Event, Session};
 use frankenterm_term::color::ColorPalette;
@@ -158,7 +158,10 @@ pub struct Server {
     pub title: String,
     pub written: Vec<u8>,
     pub pastes: Vec<String>,
+    pub keys: Vec<termwiz::input::KeyEvent>,
     pub resizes: Vec<TerminalSize>,
+    /// Search replies expand past the phone's frame limit.
+    pub oversize_search: bool,
     pub requests: Vec<&'static str>,
     /// GetLines requests still to answer with an ErrorResponse.
     pub refuse_lines: usize,
@@ -185,7 +188,9 @@ impl Server {
             title: "agent".to_owned(),
             written: Vec::new(),
             pastes: Vec::new(),
+            keys: Vec::new(),
             resizes: Vec::new(),
+            oversize_search: false,
             requests: Vec::new(),
             refuse_lines: 0,
             search_ranges: Vec::new(),
@@ -286,6 +291,12 @@ impl Server {
                 self.push();
                 self.reply(10, serial, &UnitResponse {});
             }
+            MuxWireDecodedPayload::Pdu(Pdu::SendKeyDown(SendKeyDown { event, .. })) => {
+                self.requests.push("SendKeyDown");
+                self.keys.push(event);
+                self.push();
+                self.reply(10, serial, &UnitResponse {});
+            }
             MuxWireDecodedPayload::Pdu(Pdu::Resize(Resize { size, .. })) => {
                 self.requests.push("Resize");
                 self.resizes.push(size);
@@ -303,6 +314,14 @@ impl Server {
             })) => {
                 self.requests.push("SearchScrollback");
                 self.search_ranges.push(range.clone());
+                if self.oversize_search {
+                    // A reply that expands past 16 MiB (a pattern matching
+                    // nearly every cell), compressed as the server sends it.
+                    let body = vec![0u8; 16 * 1024 * 1024 + 1];
+                    let frame = server_frame(32, serial, &body, true);
+                    self.to_phone.extend_from_slice(&frame);
+                    return;
+                }
                 // The v0.13 LocalPane::search, for plain text: rows in range
                 // oldest first, stopping at the limit. A regex here is matched
                 // as its literal text, and "(" is the invalid one.
@@ -430,6 +449,15 @@ impl Server {
         let pane_id = self.pane_id;
         self.reply(37, 0, &PaneRemoved { pane_id });
     }
+
+    /// The notice every client gets when the desktop opens a tab.
+    pub fn notify_tab_added(&mut self) {
+        let notice = TabAddedToWindow {
+            tab_id: self.tab_id + 1,
+            window_id: 0,
+        };
+        self.reply(55, 0, &notice);
+    }
 }
 
 /// The server, a session, and the phone terminal the session draws on.
@@ -441,6 +469,13 @@ pub struct Harness {
     /// Phone-bound bytes are delivered in pieces of this size.
     pub chunk: usize,
     pub outputs: usize,
+    /// The server's replies wait (in order) until this is cleared: they are
+    /// on their way while the phone does something else.
+    pub hold: bool,
+    /// The phone's requests wait likewise, so the server keeps pushing
+    /// while they are on their way.
+    pub hold_requests: bool,
+    held_requests: Vec<u8>,
 }
 
 impl Harness {
@@ -452,17 +487,30 @@ impl Harness {
             events: Vec::new(),
             chunk: usize::MAX,
             outputs: 0,
+            hold: false,
+            hold_requests: false,
+            held_requests: Vec::new(),
         }
     }
 
     pub fn pump(&mut self) {
         loop {
-            let outgoing = self.session.take_outgoing();
+            self.held_requests
+                .extend_from_slice(&self.session.take_outgoing());
+            let outgoing = if self.hold_requests {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.held_requests)
+            };
             let mut progressed = !outgoing.is_empty();
             if progressed {
                 self.server.receive(&outgoing);
             }
-            let incoming = std::mem::take(&mut self.server.to_phone);
+            let incoming = if self.hold {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.server.to_phone)
+            };
             if !incoming.is_empty() {
                 progressed = true;
                 for piece in incoming.chunks(self.chunk.max(1)) {

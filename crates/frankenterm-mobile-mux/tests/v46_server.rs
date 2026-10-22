@@ -370,6 +370,10 @@ fn a_search_reports_the_newest_matches_first_with_their_text() {
         ]
     );
     assert_eq!((matches[0].start_column, matches[0].end_column), (10, 16));
+    assert_eq!(
+        &matches[0].text[matches[0].text_start..matches[0].text_end],
+        "NEEDLE"
+    );
 
     // Case matters when asked to.
     let exact = frankenterm_mobile_mux::SearchQuery {
@@ -406,7 +410,7 @@ fn a_search_walks_back_block_by_block_into_older_history() {
     let (matches, searched, _) = search_results(&harness, search);
     assert_eq!(matches.len(), 1, "{matches:?}");
     assert_eq!(matches[0].text, "early marker");
-    assert!(searched > frankenterm_mobile_mux::search::BLOCK_ROWS as usize);
+    assert!(searched > 4000, "searched {searched}");
     let ranges = &harness.server.search_ranges;
     assert!(ranges.len() >= 2, "{ranges:?}");
     assert!(
@@ -462,4 +466,250 @@ fn a_title_change_is_reported() {
         title: "cargo test".to_owned()
     }));
     assert_eq!(harness.phone.get_title(), "cargo test");
+}
+
+fn query(text: &str) -> frankenterm_mobile_mux::SearchQuery {
+    frankenterm_mobile_mux::SearchQuery {
+        text: text.into(),
+        case_sensitive: true,
+        regex: false,
+    }
+}
+
+fn requests(harness: &Harness, name: &str) -> usize {
+    harness
+        .server
+        .requests
+        .iter()
+        .filter(|request| **request == name)
+        .count()
+}
+
+#[test]
+fn a_row_finished_and_scrolled_off_while_a_fetch_is_out_is_fetched_again() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    // A scroll needs rows fetched; the fetch is on its way while the
+    // server keeps pushing.
+    harness.hold_requests = true;
+    harness.quiet_output(&numbered(0, 6));
+    harness.push();
+    // The cursor's row arrives half written, then is finished and scrolled
+    // off between two pushes.
+    harness.output(b"first draft");
+    harness.quiet_output(b"\r\x1b[2Kfinal text\r\n");
+    harness.quiet_output(&numbered(6, 12));
+    harness.push();
+    harness.hold_requests = false;
+    harness.pump();
+    assert_mirrored(&mut harness);
+    let phone = all_text(&mut harness.phone);
+    assert!(phone.contains(&"final text".to_owned()), "{phone:?}");
+    assert!(!phone.contains(&"first draft".to_owned()), "{phone:?}");
+    assert_eq!(phone, all_text(&mut harness.server.term));
+}
+
+#[test]
+fn rows_fetched_before_a_hide_are_not_drawn_after_it() {
+    let mut harness = Harness::new(4, 20);
+    harness.quiet_output(&numbered(0, 8));
+    harness.attach();
+    let pane = harness.server.pane_id;
+    // A redraw fetches its rows; the reply arrives after the phone looked
+    // away, and the screen changes before it looks back.
+    harness.session.hide(pane);
+    harness.session.show(pane);
+    harness.hold = true;
+    harness.pump();
+    harness.session.hide(pane);
+    harness.hold = false;
+    harness.pump();
+    harness.output(b"\x1b[H\x1b[2Kchanged top\x1b[4;1H");
+    harness.session.show(pane);
+    harness.pump();
+    assert_mirrored(&mut harness);
+}
+
+#[test]
+fn the_first_paint_leaves_whatever_screen_the_phone_was_on() {
+    let mut harness = Harness::new(4, 20);
+    harness.quiet_output(&numbered(0, 8));
+    // The phone's terminal last showed another pane's full-screen program.
+    harness
+        .phone
+        .advance_bytes(b"\x1b[?1049h\x1b[2Jvim was here");
+    harness.attach();
+    assert!(!harness.phone.is_alt_screen_active());
+    assert!(
+        harness.phone.bracketed_paste_enabled(),
+        "pastes arrive bracketed, to go to the server whole"
+    );
+    assert_mirrored(&mut harness);
+    assert_eq!(
+        all_text(&mut harness.phone),
+        all_text(&mut harness.server.term)
+    );
+}
+
+#[test]
+fn a_v0_13_0_server_on_protocol_47_is_spoken_to() {
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 47;
+    harness.quiet_output(b"hello");
+    harness.attach();
+    assert_mirrored(&mut harness);
+}
+
+#[test]
+fn keys_go_as_key_presses_and_bracketed_pastes_as_pastes_in_order() {
+    use termwiz::input::{KeyCode, Modifiers};
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness
+        .session
+        .write(pane, b"ls\x1b[A\x1b[1;5C\x1b[200~one\rtwo\x1b[201~\r");
+    harness.pump();
+    let keys: Vec<_> = harness
+        .server
+        .keys
+        .iter()
+        .map(|key| (key.key, key.modifiers))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (KeyCode::UpArrow, Modifiers::NONE),
+            (KeyCode::RightArrow, Modifiers::CTRL)
+        ]
+    );
+    assert_eq!(harness.server.pastes, ["one\rtwo"]);
+    assert_eq!(harness.server.written, b"ls\r");
+    let order: Vec<_> = harness
+        .server
+        .requests
+        .iter()
+        .copied()
+        .filter(|request| ["WriteToPane", "SendKeyDown", "SendPaste"].contains(request))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "WriteToPane",
+            "SendKeyDown",
+            "SendKeyDown",
+            "SendPaste",
+            "WriteToPane"
+        ]
+    );
+}
+
+#[test]
+fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    for (rows, cols) in [(10, 32), (12, 30)] {
+        harness.session.resize(pane, rows, cols);
+        harness.pump();
+        // A list taken now shows the phone's size.
+        harness.session.refresh_panes();
+        harness.pump();
+        harness.session.restore_size(pane);
+        harness.pump();
+        let restored = harness.server.resizes.last().copied().expect("a restore");
+        assert_eq!((restored.rows, restored.cols), (6, 20));
+    }
+    // The desktop resizes the pane itself; a list after the restore says so.
+    harness.server.term.resize(support::size(7, 22));
+    harness.session.refresh_panes();
+    harness.pump();
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    harness.session.restore_size(pane);
+    harness.pump();
+    let restored = harness.server.resizes.last().copied().expect("a restore");
+    assert_eq!((restored.rows, restored.cols), (7, 22));
+    let count = harness.server.resizes.len();
+    harness.session.restore_size(pane);
+    harness.pump();
+    assert_eq!(harness.server.resizes.len(), count, "restored once");
+}
+
+#[test]
+fn a_search_reaches_output_written_since_the_pane_was_listed() {
+    let mut harness = Harness::new(4, 30);
+    harness.pump();
+    assert!(harness.session.is_ready());
+    let mut output = Vec::new();
+    for n in 0..3000 {
+        let line = if n == 2990 {
+            "late marker\r\n".to_owned()
+        } else {
+            format!("row {n}\r\n")
+        };
+        output.extend_from_slice(line.as_bytes());
+    }
+    harness.quiet_output(&output);
+    let pane = harness.server.pane_id;
+    let search = harness
+        .session
+        .search(pane, &query("late marker"))
+        .expect("a search");
+    harness.pump();
+    let (matches, _, error) = search_results(&harness, search);
+    assert_eq!(error, None);
+    assert_eq!(matches.len(), 1, "{matches:?}");
+
+    let search = harness
+        .session
+        .search(99, &query("late marker"))
+        .expect("a search");
+    harness.pump();
+    let (matches, _, error) = search_results(&harness, search);
+    assert!(matches.is_empty());
+    assert_eq!(error.as_deref(), Some("The pane has closed."));
+}
+
+#[test]
+fn a_new_desktop_tab_refreshes_the_pane_list() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    let lists = requests(&harness, "ListPanes");
+    let panes = harness
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::Panes(_)))
+        .count();
+    harness.server.notify_tab_added();
+    harness.server.notify_tab_added();
+    harness.pump();
+    assert!(requests(&harness, "ListPanes") > lists);
+    assert!(
+        harness
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Panes(_)))
+            .count()
+            > panes
+    );
+}
+
+#[test]
+fn a_search_reply_too_large_fails_only_the_search() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    harness.server.oversize_search = true;
+    let pane = harness.server.pane_id;
+    let search = harness.session.search(pane, &query("e")).expect("a search");
+    harness.pump();
+    let (matches, _, error) = search_results(&harness, search);
+    assert!(matches.is_empty());
+    assert!(
+        error.as_deref().is_some_and(|error| error.contains("Too many matches")),
+        "{error:?}"
+    );
+    assert!(harness.session.is_ready());
+    harness.output(b"still here");
+    assert_mirrored(&mut harness);
 }

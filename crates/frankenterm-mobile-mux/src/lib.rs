@@ -8,6 +8,7 @@
 //! local terminal renders exactly like a shell's output.
 
 pub mod frame;
+pub mod input;
 pub mod mirror;
 pub mod render;
 pub mod search;
