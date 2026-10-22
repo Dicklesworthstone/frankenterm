@@ -158,7 +158,8 @@ uint32_t ft_terminal_v1_frame_copy(uint64_t frame, uint32_t offset, uint8_t *out
 uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 
 /* Mux client: the protocol of a FrankenTerm mux server (codec v46 and v47,
- * the fleet's v0.13 servers) as a byte-in/byte-out state machine. The caller
+ * the fleet's v0.13 servers, and the current window 61..70, a FrankenTerm
+ * GUI's own mux) as a byte-in/byte-out state machine. The caller
  * owns the channel (an SSH command running `nc -N -U <socket>`), the
  * terminals the output is drawn on, and all scheduling; nothing here does
  * I/O or keeps a pointer. Status values are the FT_TERMINAL_* codes.

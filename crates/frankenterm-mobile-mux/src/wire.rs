@@ -1,8 +1,9 @@
 //! The mux protocol exactly as codec v46 (FrankenTerm v0.13) frames it, the
-//! dialect the fleet's mux servers speak: the requests the phone sends and
-//! the prefixes of the replies it reads. Varbincode is positional, so field
-//! order and types match `codec` and `mux` byte for byte; the tests compare
-//! them with the desktop codec's own Legacy46 encoding and decoding.
+//! dialect the fleet's mux servers speak, and as the current codec window
+//! does where it differs: the requests the phone sends and the prefixes of
+//! the replies it reads. Varbincode is positional, so field order and types
+//! match `codec` and `mux` byte for byte; the tests compare them with the
+//! desktop codec's own encoding and decoding in both dialects.
 //!
 //! A reply struct may stop before the reply's last field: decoding reads a
 //! prefix and ignores the rest (hyperlink spans, image references, input

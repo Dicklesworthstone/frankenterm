@@ -1,6 +1,6 @@
 [package]
 name = "frankenterm-mobile-mux"
-description = "The iPhone's FrankenTerm mux client: the desktop's mux protocol (codec v46) as a sans-IO state machine"
+description = "The iPhone's FrankenTerm mux client: the desktop's mux protocol (codec v46/v47 and the current window) as a sans-IO state machine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
