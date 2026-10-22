@@ -8,7 +8,7 @@ final class WorkspaceHostTrustTests: XCTestCase {
     private let hostFingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     private let otherFingerprint = "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"
     private let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh", "frankenterm_mux"],
-        authenticationMethods: [.publicKey], credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
+        authenticationMethods: [.publicKey], credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 1)
 
     private func archive(_ bundleID: String, host: String = "host.example.invalid", port: Int = 22,
                          trustID: String = "trust", mutate: (inout [String: Any]) -> Void = { _ in }) throws -> AirGapArchive {

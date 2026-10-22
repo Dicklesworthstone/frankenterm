@@ -883,7 +883,7 @@ public actor WorkspaceStore {
     /// lease, then revalidates it before exposing its result to the transport.
     public func authorizeSSHAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, credentialID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport) throws -> WorkspaceSSHAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHAuthorization {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
@@ -891,17 +891,34 @@ public actor WorkspaceStore {
                   saved.revision == expectedRevision else { throw SSHAuthenticationError.stale }
             let document = try saved.document()
             guard let route = document.routes.first(where: { $0.id == routeID }),
-                  route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
+                  transitForRouteID != nil || route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
                   route.authenticationMethods.contains(.publicKey), route.credentialIDs.contains(credentialID),
                   let credential = document.credentials.first(where: { $0.id == credentialID }),
                   let binding = saved.bindings.first(where: { $0.credentialID == credentialID }),
                   binding.fingerprint == credential.fingerprint,
                   !catalog.revokedFingerprints.contains(credential.fingerprint) else { throw SSHAuthenticationError.denied }
+            let available = try availableCredentials(saved, catalog: catalog)
             let states = try readiness(document: document, workspaceID: workspaceID,
-                available: availableCredentials(saved, catalog: catalog), findings: saved.findings,
+                available: available, findings: saved.findings,
                 catalog: catalog, support: support)
-            guard let selected = states.first(where: { $0.routeID == routeID }), selected.isLocallyReady,
-                  selected.usableCredentialIDs.contains(credentialID) else { throw SSHAuthenticationError.denied }
+            let selected: WorkspaceDocument.RouteReadiness
+            if let destinationID = transitForRouteID {
+                guard support.maximumJumpHops >= 1, route.jumpRoutes.isEmpty,
+                      let destination = document.routes.first(where: { $0.id == destinationID }),
+                      destination.jumpRoutes == [routeID],
+                      states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
+                    throw SSHAuthenticationError.denied
+                }
+                selected = try document.readiness(forRouteID: routeID, availableCredentialIDs: available,
+                    reviewedTrustIDs: Set(document.hostTrust.map(\.id)), revokedCredentialFingerprints: catalog.revokedFingerprints,
+                    support: support, revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
+                    requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog),
+                    transitForRouteID: destinationID)
+            } else {
+                guard let state = states.first(where: { $0.routeID == routeID }) else { throw SSHAuthenticationError.denied }
+                selected = state
+            }
+            guard selected.isLocallyReady, selected.usableCredentialIDs.contains(credentialID) else { throw SSHAuthenticationError.denied }
             let decision = try document.verifyHostKey(forRouteID: routeID, presented: presentedHostKey,
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
                 revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
@@ -912,6 +929,7 @@ public actor WorkspaceStore {
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
                 credentialID: credentialID, host: route.host, port: route.port, user: route.user,
                 routeMode: route.mode, jumpRouteIDs: route.jumpRoutes,
+                transitForRouteID: transitForRouteID,
                 algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey)
         }
     }
@@ -924,7 +942,8 @@ public actor WorkspaceStore {
         guard authorization.storeOwner == sshAuthorizationOwner else { throw SSHAuthenticationError.stale }
         let current = try authorizeSSHAuthentication(workspaceID: authorization.workspaceID,
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
-            credentialID: authorization.credentialID, presentedHostKey: authorization.presentedHostKey, support: support)
+            credentialID: authorization.credentialID, presentedHostKey: authorization.presentedHostKey, support: support,
+            transitForRouteID: authorization.transitForRouteID)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 

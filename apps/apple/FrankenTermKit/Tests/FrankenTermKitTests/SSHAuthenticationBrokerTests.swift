@@ -116,6 +116,97 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         XCTFail("Authentication requests did not reach the expected bounded queue", file: file, line: line)
     }
 
+    private var jumpSupport: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 1)
+    }
+    private func transitFixture(mode: String = "direct_ssh", mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Fixture {
+        try await fixture { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            var hop = routes[0]
+            hop["id"] = "hop"; hop["host"] = "jump.example.invalid"; hop["mode"] = mode
+            hop["host_trust_ref"] = "hop-trust"; hop["session_creation"] = nil
+            routes[0]["jump_routes"] = ["hop"]
+            routes.append(hop); workspace["routes"] = routes
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            var trust = trusts[0]; trust["id"] = "hop-trust"; trust["host"] = "jump.example.invalid"
+            trusts.append(trust); workspace["host_trust"] = trusts
+            mutate(&workspace)
+        }
+    }
+
+    func testTransitAuthorizationRetainsExactDestinationWithoutLeafSessionPolicy() async throws {
+        // A mux preference is inert for a transit hop, even when this profile
+        // only enables direct destination shells. Neither case needs a PTY.
+        for mode in ["direct_ssh", "frankenterm_mux"] {
+            let f = try await transitFixture(mode: mode)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                 support: jumpSupport)
+            await broker.resume()
+            await expectFailure {
+                _ = try await broker.authorization(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "hop", credentialID: "key", presentedHostKey: f.pin)
+            }
+            let selected = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "hop", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(), transitForRouteID: "route")
+            XCTAssertEqual(selected.authorization.transitForRouteID, "route")
+            XCTAssertEqual(selected.authorization.host, "jump.example.invalid")
+            let request = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "hop", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                sessionIdentifier: Data(repeating: 0x91, count: 32), publicBlob: f.key.publicBlob, transitForRouteID: "route")
+            let signed = try await broker.confirm(requestID: request.id)
+            XCTAssertEqual(signed.authorization, selected.authorization)
+            XCTAssertFalse(signed.signatureBlob.isEmpty)
+            try await broker.validate(selected)
+        }
+    }
+
+    func testTransitAuthorizationRejectsUnrelatedScopesAndRequiredPolicyBeforeSigner() async throws {
+        for variant in 0..<5 {
+            let f = try await transitFixture { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                if variant == 1 { routes[0]["jump_routes"] = [] as [String] }
+                if variant == 2 { routes[1]["required_capabilities"] = ["unimplemented.hop.policy"] }
+                if variant == 3 { routes[0]["required_capabilities"] = ["unimplemented.destination.policy"] }
+                workspace["routes"] = routes
+            }
+            let signer = DelayedSSHSigner(f.key.container, delayIdentity: true)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: variant == 4 ? support : jumpSupport)
+            await broker.resume()
+            await expectFailure {
+                _ = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "hop", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                    transitForRouteID: variant == 0 ? "hop" : "route")
+            }
+            XCTAssertEqual(signer.calls, 0)
+        }
+    }
+
+    func testTransitSignatureCannotOutliveHopRevocationOrDestinationRevision() async throws {
+        for replace in [false, true] {
+            let f = try await transitFixture(), signer = DelayedSSHSigner(f.key.container)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: jumpSupport)
+            await broker.resume()
+            let request = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "hop", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                sessionIdentifier: Data(repeating: 0x42, count: 32), publicBlob: f.key.publicBlob, transitForRouteID: "route")
+            let signing = Task { try await broker.confirm(requestID: request.id) }
+            await signer.waitUntilStarted()
+            defer { signer.finish() }
+            if replace {
+                let replacement = try AirGapArchive(workspace: f.archive.workspace.reissuingBundle(id: "replacement-hop"),
+                                                   keys: [f.key], using: crypto)
+                _ = try await f.store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
+                    transferID: Data(repeating: 9, count: 16), expectedRevision: f.installed.revision,
+                    sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+            } else {
+                try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "hop-trust", key: f.pin)
+            }
+            signer.finish()
+            await expectFailure { _ = try await signing.value }
+        }
+    }
+
     func testConcurrentIdentityLookupsUseOneProtectedWorkerInFIFOOrder() async throws {
         let f = try await fixture(), signer = DelayedSSHSigner(try sampleKey(using: crypto).0.container, delayIdentity: true)
         let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)

@@ -47,6 +47,8 @@ for name, result, args in [
     ("ssh_message_auth_pubkey", P, [P]), ("ssh_message_auth_publickey_state", I, [P]),
     ("ssh_message_auth_reply_pk_ok_simple", I, [P]), ("ssh_message_auth_reply_success", I, [P, I]),
     ("ssh_message_channel_request_open_reply_accept", P, [P]),
+    ("ssh_message_channel_request_open_destination", C.c_char_p, [P]),
+    ("ssh_message_channel_request_open_destination_port", I, [P]),
     ("ssh_message_channel_request_reply_success", I, [P]),
     ("ssh_message_channel_request_pty_term", C.c_char_p, [P]),
     ("ssh_message_channel_request_pty_width", I, [P]), ("ssh_message_channel_request_pty_height", I, [P]),
@@ -74,6 +76,8 @@ for name, result, args in [
     ("ftssh_approve_host_key", I, [P, P, Z]),
     ("ftssh_begin_authentication", I, [P, P, Z, P, Z]), ("ftssh_authentication_step", I, [P]),
     ("ftssh_copy_challenge", I, [P, P, Z, C.POINTER(Z)]), ("ftssh_supply_signature", I, [P, P, Z]),
+    ("ftssh_begin_forward", I, [P, P, Z, C.c_uint16]), ("ftssh_forward_step", I, [P]),
+    ("ftssh_forward_adopt", I, [C.POINTER(P), Z, C.POINTER(P)]),
     ("ftssh_begin_shell", I, [P, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32]), ("ftssh_shell_step", I, [P]),
     ("ftssh_admit_write", I, [P, P, Z]), ("ftssh_flush_write", I, [P]),
     ("ftssh_read", I, [P, P, Z, C.POINTER(Z)]),
@@ -118,7 +122,8 @@ def signature(key, data):
 
 class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
-                 auth_mode="normal", connections=1, host_key=None, host_signature=None):
+                 auth_mode="normal", connections=1, host_key=None, host_signature=None,
+                 forward_to=None, forward_host="target.internal.invalid"):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
@@ -127,6 +132,9 @@ class LoopbackServer:
         self.host_key = host_key or ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.host_signature = host_signature
+        if forward_to is not None and forward_to[0] not in ("127.0.0.1", "::1"):
+            raise ValueError("test relay destination must be loopback")
+        self.forward_to, self.forward_host = forward_to, forward_host
         self.reject = reject
         self.completion = completion
         self.auth_mode = auth_mode
@@ -243,6 +251,15 @@ class LoopbackServer:
                                 SERVER.ssh_message_auth_reply_success(message, 0)
                         else:
                             SERVER.ssh_message_reply_default(message)
+                    elif kind == 2 and subtype == 2 and self.forward_to is not None:
+                        destination = SERVER.ssh_message_channel_request_open_destination(message)
+                        port = SERVER.ssh_message_channel_request_open_destination_port(message)
+                        self.events.append(("forward", destination, port))
+                        if destination != self.forward_host.encode("ascii") or port != self.forward_to[1]:
+                            SERVER.ssh_message_reply_default(message)
+                            return
+                        channel = SERVER.ssh_message_channel_request_open_reply_accept(message)
+                        break
                     elif kind == 2 and subtype == 1:
                         channel = SERVER.ssh_message_channel_request_open_reply_accept(message)
                         self.events.append(("channel",))
@@ -259,6 +276,9 @@ class LoopbackServer:
                 finally:
                     SERVER.ssh_message_free(message)
             if not channel:
+                return
+            if self.forward_to is not None:
+                self.forward(session, channel)
                 return
             SERVER.ssh_channel_write(channel, b"ready\r\n", 7)
             SERVER.ssh_channel_write_stderr(channel, b"stderr\r\n", 8)
@@ -343,6 +363,58 @@ class LoopbackServer:
                 if self.control is control:
                     self.control = None
 
+    def forward(self, session, channel):
+        """Independent server direct-tcpip relay, with two bounded 32 KiB slots."""
+        target = socket.create_connection(self.forward_to, timeout=2)
+        target.setblocking(False)
+        SERVER.ssh_set_blocking(session, 0)
+        to_target, to_channel = b"", b""
+        buffer = C.create_string_buffer(8192)
+        ended = False
+        try:
+            while not self.stop.is_set():
+                message = SERVER.ssh_message_get(session)
+                if message:
+                    SERVER.ssh_message_reply_default(message)
+                    SERVER.ssh_message_free(message)
+                if len(to_target) < 32768:
+                    n = SERVER.ssh_channel_read_nonblocking(channel, buffer, min(len(buffer), 32768 - len(to_target)), 0)
+                    if n > 0:
+                        to_target += buffer.raw[:n]
+                    elif n == -1:
+                        return
+                if to_target:
+                    try:
+                        n = target.send(to_target)
+                        to_target = to_target[n:]
+                    except BlockingIOError:
+                        pass
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                if not ended and len(to_channel) < 32768:
+                    try:
+                        part = target.recv(min(8192, 32768 - len(to_channel)))
+                        if part:
+                            to_channel += part
+                        else:
+                            ended = True
+                    except BlockingIOError:
+                        pass
+                    except ConnectionResetError:
+                        return
+                if to_channel:
+                    n = SERVER.ssh_channel_write(channel, to_channel, min(8192, len(to_channel)))
+                    if n > 0:
+                        to_channel = to_channel[n:]
+                    elif n == -1:
+                        return
+                if ended and not to_channel:
+                    SERVER.ssh_channel_send_eof(channel)
+                    return
+                self.stop.wait(0.001)
+        finally:
+            target.close()
+
     def close(self):
         self.stop.set()
         self.release_completion.set()
@@ -405,6 +477,8 @@ class NativeSSHTests(unittest.TestCase):
 
     def wait(self, handle):
         fd, direction = DRIVER.ftssh_descriptor(handle), DRIVER.ftssh_directions(handle)
+        if direction & 4:
+            return
         select.select([fd] if direction & 1 or not direction else [], [fd] if direction & 2 else [], [], 0.01)
 
     def data(self, handle, function, cap=65536):
@@ -435,6 +509,80 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
         return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
+
+    def test_one_hop_owns_independent_exchange_and_transit_never_opens_a_shell(self):
+        destination_key = ed25519.Ed25519PrivateKey.generate()
+        hop_key = ec.generate_private_key(ec.SECP256R1())
+        destination = LoopbackServer(destination_key)
+        hop = LoopbackServer(hop_key, forward_to=destination.address)
+        self.servers.extend([hop, destination])
+        sock = socket.create_connection(hop.address, timeout=3)
+        sock.settimeout(None)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        handle = P()
+        self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
+        sock.detach(); self.handles.append(handle)
+        self.assertEqual(self.authenticate(handle, hop, hop_key), 0)
+        host = b"target.internal.invalid"
+        self.assertEqual(DRIVER.ftssh_begin_forward(handle, host, len(host), destination.address[1]), 0)
+        self.advance(handle, DRIVER.ftssh_forward_step)
+        child = P()
+        owned = handle.value
+        self.assertEqual(DRIVER.ftssh_forward_adopt(C.byref(handle), 1, C.byref(child)), -1000)
+        self.assertEqual(handle.value, owned)
+        self.assertFalse(child.value)
+        self.assertEqual(DRIVER.ftssh_forward_adopt(C.byref(handle), 2 * 1024 * 1024, C.byref(child)), 0)
+        self.assertFalse(handle.value)
+        self.handles.append(child)
+        self.assertEqual(self.authenticate(child, destination, destination_key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_forward(child, host, len(host), destination.address[1]), -1010)
+        self.assertEqual(DRIVER.ftssh_begin_shell(child, 80, 24, 0, 0), 0)
+        self.advance(child, DRIVER.ftssh_shell_step)
+        self.advance(child, lambda h: DRIVER.ftssh_resize(h, 132, 42, 1000, 700))
+        # Cross the outer receive window several times in both directions.
+        # The inner write may need a parent WINDOW_ADJUST read, and every
+        # retried packet must retain its original immutable contents.
+        payload = (("Nested SSH → independent keys.\r\n" * 100).encode()
+                   + bytes(range(256)) * 2048 + b"END-SESSION\r")
+        admitted, received, eof = 0, bytearray(), False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if admitted < len(payload):
+                chunk = payload[admitted:admitted+16384]
+                rc = DRIVER.ftssh_admit_write(child, chunk, len(chunk))
+                self.assertIn(rc, (0, 1))
+                if rc == 0:
+                    admitted += len(chunk)
+                    self.assertEqual(DRIVER.ftssh_admit_write(child, b"NOT-ADMITTED", 12), 1)
+            self.assertIn(DRIVER.ftssh_flush_write(child), (0, 1))
+            out, count = C.create_string_buffer(8192), Z()
+            rc = DRIVER.ftssh_read(child, out, len(out), C.byref(count))
+            self.assertIn(rc, (0, 1, 3))
+            received += out.raw[:count.value]
+            stats = Stats()
+            self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
+            self.assertLessEqual(stats.pending, 16384)
+            self.assertLessEqual(stats.peak, 4 * 1024 * 1024)
+            if rc == 3:
+                eof = True
+                break
+            self.wait(child)
+        self.assertTrue(eof)
+        self.assertEqual(admitted, len(payload))
+        self.assertEqual(stats.accepted, len(payload))
+        self.assertEqual(stats.written, len(payload))
+        self.assertEqual(received, b"ready\r\nstderr\r\n" + payload)
+        self.assertEqual(destination.received, payload)
+        self.assertIn(("resize", 132, 42), destination.events)
+        self.assertEqual([e[0] for e in hop.events if e[0] in ["channel", "pty", "shell"]], [])
+        self.assertEqual([e[1] for e in hop.events if e[0] == "authentication"], [0, 1])
+        self.assertEqual([e[1] for e in destination.events if e[0] == "authentication"], [0, 1])
+        self.assertNotEqual(hop.host_blob, destination.host_blob)
+        self.assertEqual(DRIVER.ftssh_close(child), 0)
+        stats = Stats()
+        self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
+        self.assertEqual(stats.allocated, 0)
+        self.assertLessEqual(stats.peak, 4 * 1024 * 1024)
 
     def test_real_authentication_pty_unicode_data_and_resize_for_four_key_families(self):
         keys = [ed25519.Ed25519PrivateKey.generate()] + [ec.generate_private_key(c) for c in [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()]]

@@ -72,7 +72,7 @@ public actor WorkspaceNativeSSHConnection {
         guard let machine = document.machines.first(where: { $0.id == machineID }),
               machine.routeIDs.contains(routeID),
               let route = document.routes.first(where: { $0.id == routeID }),
-              route.jumpRoutes.isEmpty,
+              route.jumpRoutes.count <= 1,
               (route.mode == "direct_ssh" && (route.sessionCreation == "on_select" || route.sessionCreation == "manual"))
                 || (route.mode == "frankenterm_mux" && (route.attachPolicy ?? "existing_only") == "existing_only"),
               let ready = entry.routes.first(where: { $0.routeID == routeID }),
@@ -92,13 +92,24 @@ public actor WorkspaceNativeSSHConnection {
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         try await broker.validateForeground(foreground)
         try Task.checkCancellation()
-        let session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
+        let session: NativeSSHSession
+        if let hopID = route.jumpRoutes.first {
+            guard let hop = document.routes.first(where: { $0.id == hopID }), hop.jumpRoutes.isEmpty,
+                  let hopReadiness = entry.routes.first(where: { $0.routeID == hopID }),
+                  !hopReadiness.usableCredentialIDs.isEmpty else { throw SSHAuthenticationError.denied }
+            session = try await connectThroughHop(hop, credentialIDs: hopReadiness.usableCredentialIDs,
+                destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
+                revision: expectedRevision, store: store, broker: broker, foreground: foreground,
+                lease: lease, connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout)
+        } else {
+            session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
+        }
         do {
             try await broker.validateForeground(foreground)
             try Task.checkCancellation()
             let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: workspaceID,
                 revision: expectedRevision, routeID: routeID, credentialID: credentialID,
-                transportID: session.transportID, endpoint: endpoint)
+                transportID: session.transportID, endpoint: endpoint, allowedJumpRouteIDs: route.jumpRoutes)
             let peer = try await session.authenticate(using: authority, timeout: authenticationTimeout)
             try await broker.validateForeground(foreground)
             try Task.checkCancellation()
@@ -121,6 +132,63 @@ public actor WorkspaceNativeSSHConnection {
             // Keep exclusion until cancellation/readiness teardown has joined.
             withExtendedLifetime(lease) {}
             throw error
+        }
+    }
+
+    /// Each hop-key attempt has its own TCP connection, peer verification and
+    /// signer witness. Only an explicit unsigned refusal advances this list.
+    /// A hop failure never masquerades as a refusal of the destination's key.
+    private static func connectThroughHop(_ hop: WorkspaceDocument.Route, credentialIDs: [String],
+        destination: NativeSSHEndpoint, destinationRouteID: String, workspaceID: UUID, revision: UUID,
+        store: WorkspaceStore, broker: SSHAuthenticationBroker, foreground: SSHForegroundLease,
+        lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration)
+        async throws -> NativeSSHSession {
+        do {
+            var plan = try TerminalRouteAttemptPlan(routes: [.init(routeID: hop.id, credentialIDs: credentialIDs)])
+            let endpoint = try NativeSSHEndpoint(host: hop.host, port: hop.port)
+            while let attempt = plan.current {
+                try Task.checkCancellation()
+                try await broker.validateForeground(foreground)
+                // A completed refusal cannot carry the next key across local
+                // revocation/reimport or resume. Recheck before opening a socket.
+                let current = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+                guard let entry = current.first(where: { $0.workspace.id == workspaceID }),
+                      entry.workspace.revision == revision,
+                      entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
+                      entry.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs
+                        .contains(attempt.selection.credentialID) == true else { throw SSHAuthenticationError.stale }
+                try await broker.validateForeground(foreground)
+                try Task.checkCancellation()
+                let outer = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout,
+                                                                networkLifetime: lease)
+                do {
+                    let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: workspaceID,
+                        revision: revision, routeID: hop.id, credentialID: attempt.selection.credentialID,
+                        transportID: outer.transportID, endpoint: endpoint, transitForRouteID: destinationRouteID)
+                    _ = try await outer.authenticate(using: authority, timeout: authenticationTimeout)
+                    try await broker.validateForeground(foreground)
+                    try Task.checkCancellation()
+                    _ = try plan.connected(attempt)
+                    let child = try await outer.forward(to: destination, timeout: connectionTimeout)
+                    do {
+                        try await broker.validateForeground(foreground)
+                        try await child.validateForwardingPath()
+                        try Task.checkCancellation()
+                        return child
+                    } catch { await child.close(); throw error }
+                } catch {
+                    await outer.close()
+                    try Task.checkCancellation()
+                    try await broker.validateForeground(foreground)
+                    if (error as? NativeSSHError)?.isCredentialRefused == true,
+                       try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
+                    throw error
+                }
+            }
+            throw NativeSSHError.jumpConnectionFailed
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw NativeSSHError.jumpConnectionFailed
         }
     }
 
@@ -893,6 +961,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard !closed else { throw NativeSSHError.closed }
         try await broker.validateForeground(foreground)
         try await authority.validateCurrent()
+        try await session.validateForwardingPath()
         guard !closed else { throw NativeSSHError.closed }
         try Task.checkCancellation()
     }

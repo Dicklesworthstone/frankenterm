@@ -905,12 +905,23 @@ struct WorkspaceTerminalScreen: View {
         .padding()
     }
 
-    /// "over Tailscale · 100.91.120.17", naming how the route travels.
+    /// Phone connectivity describes the first hop. A private destination behind
+    /// a public jump host does not require this phone to share its local network.
     static func via(_ route: TerminalSessionRoute) -> String {
-        switch WorkspaceRouteNetwork(host: route.host) {
-        case .tailnet: "over Tailscale · \(route.host)"
-        case .localNetwork: "on the local network · \(route.host)"
-        case .internet: route.host
+        func endpoint(_ host: String, _ port: UInt16) -> String {
+            let address = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+            return "\(address):\(port)"
+        }
+        let path: String
+        if let jump = route.jumpHost {
+            path = "\(endpoint(route.host, route.port)) via \(endpoint(jump, route.networkPort))"
+        } else {
+            path = route.port == 22 ? route.host : endpoint(route.host, route.port)
+        }
+        switch WorkspaceRouteNetwork(host: route.networkHost) {
+        case .tailnet: return "over Tailscale · \(path)"
+        case .localNetwork: return "on the local network · \(path)"
+        case .internet: return path
         }
     }
 

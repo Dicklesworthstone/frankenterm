@@ -223,6 +223,9 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     public let workspaceID: UUID, workspaceRevision: UUID
     public let routeID: String, credentialID: String, host: String, port: UInt16, user: String
     public let routeMode: String, jumpRouteIDs: [String]
+    /// A store-validated exact single-hop dependency, never a generic transit
+    /// bypass. Nil means this route is being authenticated as a destination.
+    public let transitForRouteID: String?
     public let algorithm: String, fingerprint: String, presentedHostKey: WorkspaceDocument.HostKey
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
@@ -430,13 +433,14 @@ public actor SSHAuthenticationBroker {
     /// Read current authority without touching a private key, so a concrete
     /// transport can refuse unimplemented route modes before requesting unlock.
     public func authorization(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
-                              presentedHostKey: WorkspaceDocument.HostKey) async throws -> WorkspaceSSHAuthorization {
+                              presentedHostKey: WorkspaceDocument.HostKey,
+                              transitForRouteID: String? = nil) async throws -> WorkspaceSSHAuthorization {
         guard foreground else { throw SSHAuthenticationError.unavailable }
         try Task.checkCancellation()
         let generation = foregroundGeneration
         let result = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, support: support)
+            presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID)
         guard foreground, foregroundGeneration == generation else { throw SSHAuthenticationError.unavailable }
         try Task.checkCancellation()
         return result
@@ -445,14 +449,15 @@ public actor SSHAuthenticationBroker {
     /// Verify the real host and current route before reading or offering the
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
-                               presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID) async throws -> WorkspaceSSHIdentity {
+                               presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
+                               transitForRouteID: String? = nil) async throws -> WorkspaceSSHIdentity {
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
         let id = try await acquireWorker(transportID: transportID)
         defer { releaseWorker(id) }
         try checkCurrent(id)
         let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, support: support)
+            presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID)
         try checkCurrent(id)
         pending?.authorization = authorization
         let signer = self.signer
@@ -490,7 +495,8 @@ public actor SSHAuthenticationBroker {
 
     public func prepare(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                         presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
-                        sessionIdentifier: Data, publicBlob: Data) async throws -> SSHAuthenticationRequest {
+                        sessionIdentifier: Data, publicBlob: Data,
+                        transitForRouteID: String? = nil) async throws -> SSHAuthenticationRequest {
         // Bound input before retaining it across the first suspension point.
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
         guard [32, 48, 64].contains(sessionIdentifier.count), (1...512).contains(publicBlob.count) else {
@@ -501,7 +507,7 @@ public actor SSHAuthenticationBroker {
             try checkCurrent(id)
             let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-                presentedHostKey: presentedHostKey, support: support)
+                presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID)
             try checkCurrent(id)
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: sessionIdentifier,
                                                                user: authorization.user, publicBlob: publicBlob)

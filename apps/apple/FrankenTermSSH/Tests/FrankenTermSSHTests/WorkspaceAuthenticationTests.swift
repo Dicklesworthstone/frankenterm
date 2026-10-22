@@ -74,6 +74,36 @@ final class SSHWorkspaceTestVault: WorkspaceCredentialVault, WorkspaceSSHSigning
     func cancel(requestID: UUID) {}
 }
 
+/// Pauses the actual destination signing operation after the outer hop has
+/// authenticated. It never substitutes a signature or transport decision.
+private actor SSHJumpPausedSigner: WorkspaceSSHSigning {
+    let base: SSHWorkspaceTestVault
+    private var pending: (UUID, CheckedContinuation<Void, Error>)?
+    var isPaused: Bool { pending != nil }
+    init(_ base: SSHWorkspaceTestVault) { self.base = base }
+    func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
+        try await base.publicIdentity(requestID: requestID, authorization: authorization)
+    }
+    func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization, challenge: SSHUserAuthenticationChallenge) async throws -> Data {
+        try Task.checkCancellation()
+        if authorization.transitForRouteID == nil {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                pending = (requestID, continuation)
+            }
+            try Task.checkCancellation()
+        }
+        return try await base.sign(requestID: requestID, authorization: authorization, challenge: challenge)
+    }
+    nonisolated func cancel(requestID: UUID) { Task { await cancelPending(requestID) } }
+    private func cancelPending(_ id: UUID) {
+        guard let retained = pending, retained.0 == id else { return }
+        pending = nil; retained.1.resume(throwing: CancellationError())
+    }
+    func release() {
+        let retained = pending; pending = nil; retained?.1.resume()
+    }
+}
+
 struct SSHWorkspaceTestFixture: Sendable {
     let store: WorkspaceStore, broker: SSHAuthenticationBroker, vault: SSHWorkspaceTestVault
     let installed: InstalledWorkspace, archive: AirGapArchive, publicBlob: Data, hostBlob: Data, host: WorkspaceDocument.HostKey
@@ -81,6 +111,7 @@ struct SSHWorkspaceTestFixture: Sendable {
 
     @MainActor static func make(hostname: String = "localhost", port: UInt16 = 22, hostBlob: Data? = nil,
                      routeMode: String = "direct_ssh",
+                     additionalKeys: [PrivateKeyRecord] = [],
                      seed: Data = Data(0..<32), persistence: any WorkspacePersistence = SSHWorkspaceTestPersistence(),
                      mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Self {
         let crypto = SSHWorkspaceTestCryptography()
@@ -117,7 +148,7 @@ struct SSHWorkspaceTestFixture: Sendable {
         let manifest = try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": "bundle",
             "source": ["exporter_id": "test"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: manifest),
-            keys: [PrivateKeyRecord(credentialID: "key", container: container, publicBlob: blob)], using: crypto)
+            keys: [PrivateKeyRecord(credentialID: "key", container: container, publicBlob: blob)] + additionalKeys, using: crypto)
         let vault = SSHWorkspaceTestVault(), store = WorkspaceStore(persistence: persistence, vault: vault)
         let installed = try await store.install(archive, envelopeDigest: Data(repeating: 1, count: 32),
             expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
@@ -361,6 +392,10 @@ final class WorkspaceAuthenticationTests: XCTestCase {
               let mode = environment["FT_WORKSPACE_SSH_TEST_MODE"] else {
             throw XCTSkip("Run Tests/Interop/test_workspace.py with the built XCTest bundle and native driver.")
         }
+        if mode.hasPrefix("jump-") {
+            try await exerciseLiveJump(mode: mode, destinationPort: port, destinationHost: host, environment: environment)
+            return
+        }
         let f = try await SSHWorkspaceTestFixture.make(port: port,
             hostBlob: ["wrong-host", "rsa-wrong-host"].contains(mode) ? nil : host,
             routeMode: mode.hasPrefix("mux-") ? "frankenterm_mux" : "direct_ssh")
@@ -448,6 +483,120 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         } catch { await session.close(); throw error }
     }
 
+    private func exerciseLiveJump(mode: String, destinationPort: UInt16, destinationHost: Data,
+                                  environment: [String: String]) async throws {
+        let hopPort = try XCTUnwrap(environment["FT_WORKSPACE_SSH_JUMP_PORT"].flatMap(UInt16.init))
+        let hopHost = try XCTUnwrap(environment["FT_WORKSPACE_SSH_JUMP_HOSTKEY"].flatMap { Data(base64Encoded: $0) })
+        let independent = try await SSHWorkspaceTestFixture.make(seed: Data(32..<64))
+        let record = try XCTUnwrap(independent.archive.keys.first)
+        let hopKey = PrivateKeyRecord(credentialID: "hop-key", container: record.container, publicBlob: record.publicBlob)
+        let hopIdentity = try SSHPublicIdentity(blob: hopKey.publicBlob)
+        let hopPin = try SSHPublicIdentity(blob: mode == "jump-wrong-hop" ? hopKey.publicBlob : hopHost)
+        let f = try await SSHWorkspaceTestFixture.make(hostname: "target.internal.invalid", port: destinationPort,
+            hostBlob: mode == "jump-wrong-destination" ? nil : destinationHost, additionalKeys: [hopKey]) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            var hop = routes[0]
+            hop["id"] = "hop"; hop["mode"] = "frankenterm_mux"
+            hop["host"] = "127.0.0.1"; hop["port"] = Int(hopPort); hop["host_trust_ref"] = "hop-trust"
+            hop["session_creation"] = nil
+            hop["credential_refs"] = ["jump-revoke-hop-after-auth", "jump-revoke-during-signature"].contains(mode)
+                ? ["hop-key", "key"] : ["hop-key"]
+            if ["jump-hop-key-fallback", "jump-hop-refused"].contains(mode) { hop["credential_refs"] = ["key", "hop-key"] }
+            routes[0]["jump_routes"] = ["hop"]
+            routes.append(hop); workspace["routes"] = routes
+            var credentials = workspace["credentials"] as! [[String: Any]]
+            credentials.append(["id": "hop-key", "algorithm": hopIdentity.algorithm,
+                "public_fingerprint": hopIdentity.fingerprint, "requirement": "matching_private_key", "private_material": "not_included"])
+            workspace["credentials"] = credentials
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts.append(["id": "hop-trust", "host": "127.0.0.1", "port": Int(hopPort), "revoked_keys": [],
+                "pins": [["algorithm": hopPin.algorithm, "fingerprint": hopPin.fingerprint]]])
+            workspace["host_trust"] = trusts
+        }
+        XCTAssertNotEqual(f.publicBlob, hopKey.publicBlob)
+        XCTAssertNotEqual(destinationHost, hopHost)
+        let activity = WorkspaceNetworkActivity()
+        if mode == "jump-probe" {
+            let route = try XCTUnwrap(f.archive.workspace.routes.first(where: { $0.id == "route" }))
+            let result = await WorkspaceRouteProbe.run(route: route, document: f.archive.workspace, networkActivity: activity)
+            XCTAssertEqual(result.failure as? NativeSSHError, .jumpAuthenticationRequired)
+            XCTAssertNil(result.peer)
+            XCTAssertEqual(activity.accounting().connections, 0)
+            XCTAssertEqual(f.vault.counts.reads, 0)
+            return
+        }
+        if ["jump-success", "jump-auth-only", "jump-hop-key-fallback"].contains(mode) {
+            try await exerciseLiveOwner(f, mode: mode == "jump-success" ? "owner-success" : "owner-connect-only",
+                                        expectedAuthentications: 2, expectedIdentityReads: mode == "jump-hop-key-fallback" ? 3 : 2)
+            return
+        }
+        if mode == "jump-revoked" { try await f.store.revokeLocally(fingerprint: hopIdentity.fingerprint) }
+        func connect(using authority: SSHAuthenticationBroker? = nil) async throws -> WorkspaceNativeSSHConnection {
+            try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true, store: f.store,
+                broker: authority ?? f.broker, networkActivity: activity, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5))
+        }
+        if mode == "jump-cancel-signature" || mode == "jump-revoke-during-signature" {
+            let signer = SSHJumpPausedSigner(f.vault)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            await broker.resume()
+            let task = Task { try await connect(using: broker) }
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !(await signer.isPaused), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            let paused = await signer.isPaused
+            XCTAssertTrue(paused)
+            if mode == "jump-cancel-signature" || !paused { task.cancel() }
+            else {
+                try await f.store.revokeLocally(fingerprint: hopIdentity.fingerprint)
+                let states = try await f.store.routeReadiness(workspaceID: f.installed.id,
+                    support: WorkspaceNativeSSHAuthentication.routeSupport)
+                XCTAssertTrue(try XCTUnwrap(states.first(where: { $0.routeID == "route" })).isLocallyReady)
+                await signer.release()
+            }
+            do {
+                let owner = try await task.value
+                await owner.close()
+                XCTFail("A retired nested signature published a connection")
+            } catch {
+                if mode == "jump-cancel-signature" { XCTAssertTrue(error is CancellationError) }
+            }
+            XCTAssertEqual(f.vault.counts.reads, 2)
+            XCTAssertEqual(f.vault.counts.signatures, mode == "jump-cancel-signature" ? 1 : 2)
+        } else if mode == "jump-revoke-hop-after-auth" {
+            let owner = try await connect()
+            do {
+                try await f.store.revokeLocally(fingerprint: hopIdentity.fingerprint)
+                let states = try await f.store.routeReadiness(workspaceID: f.installed.id,
+                    support: WorkspaceNativeSSHAuthentication.routeSupport)
+                // Another key keeps the graph ready, but must not silently
+                // replace the selected live hop's revoked authorization.
+                XCTAssertTrue(try XCTUnwrap(states.first(where: { $0.routeID == "route" })).isLocallyReady)
+                let sink = SSHWorkspaceTerminalProbe(identity: owner.identity), coordinator = try TerminalInputCoordinator()
+                await refuse {
+                    _ = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
+                        try await sink.prepare($0, fail: false)
+                    }
+                }
+                let summary = await sink.summary()
+                XCTAssertNil(summary.0)
+                await owner.close()
+            } catch { await owner.close(); throw error }
+        } else {
+            XCTAssertTrue(["jump-wrong-hop", "jump-wrong-destination", "jump-revoked", "jump-hop-refused"].contains(mode))
+            do {
+                let owner = try await connect()
+                await owner.close()
+                XCTFail("A rejected jump path authenticated")
+            } catch {
+                XCTAssertFalse((error as? NativeSSHError)?.isCredentialRefused == true)
+            }
+            let expected = mode == "jump-wrong-destination" ? 1 : 0
+            XCTAssertEqual(f.vault.counts.reads, mode == "jump-hop-refused" ? 2 : expected)
+            XCTAssertEqual(f.vault.counts.signatures, expected)
+        }
+        XCTAssertEqual(activity.accounting().connections, 0)
+    }
+
     private func exerciseLiveMuxAuthentication(_ f: SSHWorkspaceTestFixture, revoked: Bool) async throws {
         let activity = WorkspaceNetworkActivity()
         func connect() async throws -> WorkspaceNativeSSHConnection {
@@ -486,7 +635,8 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         } catch { await owner.close(); throw error }
     }
 
-    private func exerciseLiveOwner(_ f: SSHWorkspaceTestFixture, mode: String) async throws {
+    private func exerciseLiveOwner(_ f: SSHWorkspaceTestFixture, mode: String, expectedAuthentications: Int = 1,
+                                   expectedIdentityReads: Int? = nil) async throws {
         let activity = WorkspaceNetworkActivity()
         let owner = try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id,
             expectedRevision: f.installed.revision, machineID: "machine", routeID: "route", credentialID: "key",
@@ -498,7 +648,13 @@ final class WorkspaceAuthenticationTests: XCTestCase {
                 XCTAssertEqual($0 as? WorkspaceNetworkError, .connectionsActive)
             }
             XCTAssertEqual(owner.workspaceRevision, f.installed.revision)
-            XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
+            XCTAssertEqual(f.vault.counts.reads, expectedIdentityReads ?? expectedAuthentications)
+            XCTAssertEqual(f.vault.counts.signatures, expectedAuthentications)
+            if mode == "owner-connect-only" {
+                await owner.close()
+                XCTAssertEqual(activity.accounting().connections, 0)
+                return
+            }
             let coordinator = try TerminalInputCoordinator(), sink = SSHWorkspaceTerminalProbe(identity: owner.identity)
             if mode == "owner-marker-failure" {
                 await refuse {

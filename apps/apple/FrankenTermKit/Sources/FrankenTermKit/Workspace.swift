@@ -377,17 +377,22 @@ public struct WorkspaceDocument: Sendable {
     public struct RouteSupport: Sendable {
         public let routeModes: Set<String>, authenticationMethods: Set<AuthenticationMethod>
         public let credentialAlgorithms: Set<String>, hostKeyAlgorithms: Set<String>, capabilities: Set<String>
+        /// A working direct transport does not imply nested SSH support. The
+        /// profile must explicitly qualify the complete expanded jump chain.
+        public let maximumJumpHops: Int
         public init(routeModes: Set<String>, authenticationMethods: Set<AuthenticationMethod>,
-                    credentialAlgorithms: Set<String>, hostKeyAlgorithms: Set<String>, capabilities: Set<String> = []) {
+                    credentialAlgorithms: Set<String>, hostKeyAlgorithms: Set<String>, capabilities: Set<String> = [],
+                    maximumJumpHops: Int = 0) {
             self.routeModes = routeModes; self.authenticationMethods = authenticationMethods
             self.credentialAlgorithms = credentialAlgorithms; self.hostKeyAlgorithms = hostKeyAlgorithms; self.capabilities = capabilities
+            self.maximumJumpHops = max(0, min(maximumJumpHops, 3))
         }
         public static let offlineOnly = RouteSupport(routeModes: [], authenticationMethods: [], credentialAlgorithms: [], hostKeyAlgorithms: [])
     }
     public enum RouteReadinessIssue: Equatable, Sendable {
         case transportUnavailable, unsupportedRequirement, authenticationUnavailable
         case credentialUnavailable, credentialAlgorithmUnavailable, hostTrustMissing, hostTrustNeedsReview, hostIdentityRevoked
-        case hostAlgorithmUnavailable, locallyRejectedTrust, sessionPolicyMissing, blockedJumpRoute(String)
+        case hostAlgorithmUnavailable, locallyRejectedTrust, sessionPolicyMissing, jumpTransportUnavailable, blockedJumpRoute(String)
         public var message: String {
             switch self {
             case .transportUnavailable: "The terminal transport for this route is not integrated in this build."
@@ -401,6 +406,7 @@ public struct WorkspaceDocument: Sendable {
             case .hostAlgorithmUnavailable: "No accepted host-key algorithm is supported by this build."
             case .locallyRejectedTrust: "A local host-trust rejection blocks this route."
             case .sessionPolicyMissing: "This route needs an explicit session-creation or existing-mux attachment policy."
+            case .jumpTransportUnavailable: "This route's jump-host chain is not supported by this build."
             case .blockedJumpRoute: "A required jump route is not locally ready."
             }
         }
@@ -653,7 +659,8 @@ public struct WorkspaceDocument: Sendable {
                           locallyRevokedHostKeys: [String: Set<HostKey>] = [:],
                           support: RouteSupport = .offlineOnly,
                           revokedHostKeysByTrustScope: [String: Set<HostKey>] = [:],
-                          requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:]) throws -> RouteReadiness {
+                          requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
+                          transitForRouteID: String? = nil) throws -> RouteReadiness {
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
         let credentialMap = Dictionary(uniqueKeysWithValues: credentials.map { ($0.id, $0) })
@@ -665,12 +672,20 @@ public struct WorkspaceDocument: Sendable {
             requirements[trust.canonicalTrustScope, default: []].formUnion(trust.requiredPolicyRequirements)
             if locallyRejectedTrustIDs.contains(trust.id) { rejectedScopes.insert(trust.canonicalTrustScope) }
         }
+        func expandedHopCount(_ route: Route) -> Int {
+            // Parsing already rejects missing references, cycles, and graphs
+            // exceeding three hops. Count nested and ordered hops alike.
+            route.jumpRoutes.reduce(0) { count, id in
+                count + 1 + (routeMap[id].map(expandedHopCount) ?? 0)
+            }
+        }
         func evaluate(_ routeID: String, transit: Bool) throws -> RouteReadiness {
             guard let route = routeMap[routeID], let trust = trustMap[route.trustID] else { throw FTError.stale }
             var issues: [RouteReadinessIssue] = []
             func add(_ issue: RouteReadinessIssue) { if !issues.contains(issue) { issues.append(issue) } }
             // Transit supplies only SSH, never the hop's shell or mux preference.
             if !support.routeModes.contains(transit ? "direct_ssh" : route.mode) { add(.transportUnavailable) }
+            if !transit, expandedHopCount(route) > support.maximumJumpHops { add(.jumpTransportUnavailable) }
             let required = Set(route.requiredCapabilities).union(requirements[trust.canonicalTrustScope] ?? [])
             if !Self.supports(required, using: support.capabilities) || !route.requiredExtensions.isEmpty { add(.unsupportedRequirement) }
             if !transit, (route.mode == "direct_ssh" && route.sessionCreation == nil)
@@ -702,6 +717,16 @@ public struct WorkspaceDocument: Sendable {
             }
             for hop in route.jumpRoutes where !(try evaluate(hop, transit: true)).isLocallyReady { add(.blockedJumpRoute(hop)) }
             return .init(routeID: routeID, usableCredentialIDs: methods.contains(.publicKey) ? usable : [], issues: issues)
+        }
+        if let destinationID = transitForRouteID {
+            // This is a scoped configuration query, not a free-standing claim
+            // that any route may be treated as a transit host. Authentication
+            // also requires the destination's complete durable readiness.
+            guard support.maximumJumpHops >= 1, let destination = routeMap[destinationID],
+                  destination.jumpRoutes == [id], let hop = routeMap[id], hop.jumpRoutes.isEmpty else {
+                throw FTError.stale
+            }
+            return try evaluate(id, transit: true)
         }
         return try evaluate(id, transit: false)
     }

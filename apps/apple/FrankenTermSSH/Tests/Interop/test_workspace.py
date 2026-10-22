@@ -41,7 +41,7 @@ def xctest_command():
 class WorkspaceInteropTests(unittest.TestCase):
     def test_imported_workspace_through_real_transport(self):
         for mode in ["success", "wrong-host", "revoked", "revoke-before-shell",
-                     "owner-success", "owner-revoked", "owner-marker-failure", "owner-close-before-run"]:
+                     "owner-success", "owner-revoked", "owner-marker-failure", "owner-close-before-run", "owner-connect-only"]:
             with self.subTest(mode=mode):
                 key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
                 server = fixture.LoopbackServer(key)
@@ -125,6 +125,55 @@ class WorkspaceInteropTests(unittest.TestCase):
 
     def test_revoked_explicit_mux_route_is_denied_before_networking(self):
         self.run_host_mode("mux-revoked")
+
+    def test_one_hop_workspace_uses_independent_keys_and_only_destination_pty(self):
+        for mode in ["jump-success", "jump-auth-only", "jump-wrong-hop", "jump-wrong-destination",
+                     "jump-revoked", "jump-revoke-hop-after-auth", "jump-probe", "jump-cancel-signature",
+                     "jump-revoke-during-signature", "jump-hop-key-fallback", "jump-hop-refused"]:
+            with self.subTest(mode=mode):
+                destination_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+                hop_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+                destination = fixture.LoopbackServer(destination_key)
+                repeated_hop = mode in ["jump-hop-key-fallback", "jump-hop-refused"]
+                hop = fixture.LoopbackServer(hop_key, forward_to=destination.address,
+                    connections=2 if repeated_hop else 1, reject=mode == "jump-hop-refused")
+                try:
+                    environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(destination.address[1]),
+                        FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(destination.host_blob).decode(),
+                        FT_WORKSPACE_SSH_JUMP_PORT=str(hop.address[1]),
+                        FT_WORKSPACE_SSH_JUMP_HOSTKEY=base64.b64encode(hop.host_blob).decode(),
+                        FT_WORKSPACE_SSH_TEST_MODE=mode)
+                    result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=20)
+                    output = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 0, output[-18000:])
+                    self.assertIn("Executed 1 test", output)
+                    self.assertNotIn("skipped", output.lower())
+                    no_hop = mode in ["jump-revoked", "jump-probe"]
+                    no_target = no_hop or mode in ["jump-wrong-hop", "jump-hop-refused"]
+                    self.assertEqual(hop.accepted_connections, 0 if no_hop else (2 if repeated_hop else 1))
+                    self.assertEqual(destination.accepted_connections, 0 if no_target else 1)
+                    hop_offers = [e for e in hop.events if e[0] == "authentication"]
+                    target_offers = [e for e in destination.events if e[0] == "authentication"]
+                    expected_hop = [0, 0, 1] if mode == "jump-hop-key-fallback" else (
+                        [0, 0] if mode == "jump-hop-refused" else ([] if no_target else [0, 1]))
+                    self.assertEqual([e[1] for e in hop_offers], expected_hop)
+                    expected_target = [] if no_target or mode == "jump-wrong-destination" else (
+                        [0] if mode in ["jump-cancel-signature", "jump-revoke-during-signature"] else [0, 1])
+                    self.assertEqual([e[1] for e in target_offers], expected_target)
+                    if repeated_hop:
+                        self.assertEqual(hop_offers[0][3], fixture.public_blob(destination_key))
+                        self.assertTrue(all(e[3] == fixture.public_blob(hop_key) for e in hop_offers[1:]))
+                    else:
+                        self.assertTrue(all(e[3] == fixture.public_blob(hop_key) for e in hop_offers))
+                    self.assertTrue(all(e[3] == fixture.public_blob(destination_key) for e in target_offers))
+                    self.assertEqual([e for e in hop.events if e[0] in ["channel", "pty", "shell"]], [])
+                    target_shell = any(e[0] == "shell" for e in destination.events)
+                    self.assertEqual(target_shell, mode == "jump-success")
+                    self.assertEqual(destination.received,
+                        "Imported key → owned terminal.\rEND-SESSION\r".encode() if mode == "jump-success" else b"")
+                finally:
+                    hop.close()
+                    destination.close()
 
 
 class ObservedServerEvents(list):

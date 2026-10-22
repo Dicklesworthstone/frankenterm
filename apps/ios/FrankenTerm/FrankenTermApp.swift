@@ -2910,7 +2910,7 @@ private struct MachineWorkspaceView: View {
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
                 }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent).disabled(model.busy)
                 // Tailscale only: say so before the first attempt waits out a timeout.
-                if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.host) == .tailnet }),
+                if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.networkHost) == .tailnet }),
                    WorkspaceRouteNetwork.deviceTailnetAddress() == nil {
                     HStack {
                         Label("Needs Tailscale on this \(UIDevice.current.model)", systemImage: "network.badge.shield.half.filled")
@@ -2932,7 +2932,8 @@ private struct MachineWorkspaceView: View {
 
     /// A saved route: where it goes and anything this phone still needs for it.
     @ViewBuilder private func routeRow(_ route: WorkspaceDocument.Route, preferred: Bool) -> some View {
-        let network = WorkspaceRouteNetwork(host: route.host)
+        let hop = route.jumpRoutes.first.flatMap { id in document.routes.first(where: { $0.id == id }) }
+        let network = WorkspaceRouteNetwork(host: hop?.host ?? route.host)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Image(systemName: network == .tailnet ? "network.badge.shield.half.filled" : network == .localNetwork ? "wifi" : "globe")
@@ -2940,9 +2941,13 @@ private struct MachineWorkspaceView: View {
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 if preferred { Text("Preferred").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.white.opacity(0.15), in: Capsule()) }
             }
-            if !route.jumpRoutes.isEmpty {
-                Text("Reached through \(route.jumpRoutes.count) jump hosts, which this phone cannot use yet.").font(.caption).opacity(0.75)
-            } else if route.mode == "frankenterm_mux" {
+            if let hop, route.jumpRoutes.count == 1, hop.jumpRoutes.isEmpty {
+                Text(verbatim: "Through \(hop.user)@\(hop.host):\(hop.port)")
+                    .font(.system(.caption, design: .monospaced)).opacity(0.75).textSelection(.enabled)
+            } else if !route.jumpRoutes.isEmpty {
+                Text("This jump-host chain needs more than the one hop supported by this build.").font(.caption).opacity(0.75)
+            }
+            if route.mode == "frankenterm_mux" {
                 Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
                 // The exact command this route runs on the machine to reach its mux.
                 Text(verbatim: route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)
@@ -2982,7 +2987,7 @@ private struct MachineWorkspaceView: View {
         let theme = theme(for: machine)
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
-                  unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
+                  unavailable: "None of this machine's SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
                   theme: theme, autoConnect: machine.autoConnect)
         }
         // Every ready route, the preferred one first: mux routes attach to the
@@ -2991,12 +2996,15 @@ private struct MachineWorkspaceView: View {
         for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }),
                   route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
-                  route.jumpRoutes.isEmpty, let readiness = local.routes.first(where: { $0.routeID == id }),
+                  route.jumpRoutes.count <= 1, let readiness = local.routes.first(where: { $0.routeID == id }),
                   readiness.issues.isEmpty, !readiness.usableCredentialIDs.isEmpty else { continue }
+            let hop = route.jumpRoutes.first.flatMap { hopID in document.routes.first(where: { $0.id == hopID }) }
+            guard route.jumpRoutes.isEmpty || hop?.jumpRoutes.isEmpty == true else { continue }
             routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
                                 mux: route.mode == "frankenterm_mux",
                                 sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
-                                    : (route.sessionCreation == "manual" ? .manual : .onSelect)))
+                                    : (route.sessionCreation == "manual" ? .manual : .onSelect),
+                                jumpHost: hop?.host, jumpPort: hop?.port))
         }
         guard !routes.isEmpty else { return scene(nil) }
         return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,

@@ -51,6 +51,42 @@ private final class SceneMemorySigner: WorkspaceSSHSigning, @unchecked Sendable 
 
 @MainActor
 final class TerminalSessionControllerTests: XCTestCase {
+    func testRouteOrderUsesFirstHopReachabilityRatherThanDestination() {
+        let routes: [TerminalSessionRoute] = [
+            .init(id: "private-via-tailnet", credentialIDs: ["key"], host: "10.40.0.7", port: 22,
+                  jumpHost: "100.91.120.17", jumpPort: 2200),
+            .init(id: "tailnet-via-public", credentialIDs: ["key"], host: "100.92.33.44", port: 22,
+                  jumpHost: "gateway.example"),
+            .init(id: "direct-public", credentialIDs: ["key"], host: "public.example", port: 2222),
+            .init(id: "direct-tailnet", credentialIDs: ["key"], host: "100.81.2.3", port: 22)
+        ]
+        let target = TerminalSessionTarget(workspaceID: UUID(), revision: UUID(), machineID: "build",
+                                           machineName: "Build", routes: routes)
+        var queried: [String] = []
+        let withoutTailnet = target.attemptOrder { host in
+            queried.append(host)
+            return WorkspaceRouteNetwork(host: host) != .tailnet
+        }
+        XCTAssertEqual(queried, ["100.91.120.17", "gateway.example", "public.example", "100.81.2.3"],
+                       "Only the endpoint reached by the phone determines route priority")
+        XCTAssertEqual(withoutTailnet.map(\.id), ["tailnet-via-public", "direct-public", "private-via-tailnet", "direct-tailnet"])
+        XCTAssertEqual(target.attemptOrder { _ in true }.map(\.id), routes.map(\.id),
+                       "Equally reachable routes retain the configured preference")
+        XCTAssertEqual(routes.map(\.networkPort), [2200, 22, 2222, 22])
+    }
+
+    func testConnectionCaptionNamesBothEndpointsAndClassifiesTheFirstHop() {
+        let publicHop = TerminalSessionRoute(id: "public", credentialIDs: ["key"], host: "100.92.33.44", port: 2222,
+                                            jumpHost: "gateway.example")
+        XCTAssertEqual(WorkspaceTerminalScreen.via(publicHop), "100.92.33.44:2222 via gateway.example:22")
+        let tailnetHop = TerminalSessionRoute(id: "tailnet", credentialIDs: ["key"], host: "fd00::20", port: 2222,
+                                             jumpHost: "fd7a:115c:a1e0::1", jumpPort: 2200)
+        XCTAssertEqual(WorkspaceTerminalScreen.via(tailnetHop),
+                       "over Tailscale · [fd00::20]:2222 via [fd7a:115c:a1e0::1]:2200")
+        let direct = TerminalSessionRoute(id: "local", credentialIDs: ["key"], host: "192.168.1.8", port: 22)
+        XCTAssertEqual(WorkspaceTerminalScreen.via(direct), "on the local network · 192.168.1.8")
+    }
+
     private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
                           creation: TerminalSessionCreation = .onSelect) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",

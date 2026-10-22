@@ -59,6 +59,13 @@ struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
     var mux = false
     var sessionCreation: TerminalSessionCreation = .onSelect
+    var jumpHost: String? = nil
+    var jumpPort: UInt16? = nil
+
+    /// Only the first SSH endpoint must be reachable from this device. The
+    /// destination's private address is resolved and reached by its jump host.
+    var networkHost: String { jumpHost ?? host }
+    var networkPort: UInt16 { jumpHost == nil ? port : (jumpPort ?? 22) }
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -84,11 +91,11 @@ struct TerminalSessionTarget: Hashable, Sendable {
               routes: routes, theme: theme)
     }
 
-    /// The order to try the routes in: those this device can reach now first
+    /// The order to try the routes in: first hops this device can reach now first
     /// (see WorkspaceRouteNetwork.isLikelyReachable), each group in the
     /// machine's own order.
-    func attemptOrder() -> [TerminalSessionRoute] {
-        let reachable = routes.map { WorkspaceRouteNetwork.isLikelyReachable($0.host) }
+    func attemptOrder(isLikelyReachable: (String) -> Bool = WorkspaceRouteNetwork.isLikelyReachable) -> [TerminalSessionRoute] {
+        let reachable = routes.map { isLikelyReachable($0.networkHost) }
         return routes.indices.filter { reachable[$0] }.map { routes[$0] }
             + routes.indices.filter { !reachable[$0] }.map { routes[$0] }
     }
@@ -916,8 +923,9 @@ final class TerminalSessionController {
                         message: "The machine refused all available configured keys for this route. Add the intended key's public half to ~/.ssh/authorized_keys on the machine.", remedy: .none))
                 }
                 if let failure = error as? NativeSSHError, failure.isUnreachable {
-                    let help = WorkspaceConnectionHelp(failure: failure, machine: target.machineName, host: candidate.host,
-                        port: candidate.port, onTailnet: onTailnet, device: device)
+                    let machine = candidate.jumpHost == nil ? target.machineName : "The jump host for \(target.machineName)"
+                    let help = WorkspaceConnectionHelp(failure: failure, machine: machine, host: candidate.networkHost,
+                        port: candidate.networkPort, onTailnet: onTailnet, device: device)
                         ?? .init(title: "Couldn't connect to \(target.machineName)", message: Self.describe(error), remedy: .none)
                     if plan.hasCredentialRefusal {
                         _ = try plan.failed(.unreachable, attempt: attempt)

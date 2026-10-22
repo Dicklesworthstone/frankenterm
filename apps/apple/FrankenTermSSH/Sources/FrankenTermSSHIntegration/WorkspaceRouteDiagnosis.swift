@@ -170,6 +170,9 @@ public enum WorkspaceRouteProbe {
                            timeout: Duration = .seconds(8),
                            networkActivity: WorkspaceNetworkActivity = .shared) async -> Result {
         let network = WorkspaceRouteNetwork(host: route.host)
+        guard route.jumpRoutes.isEmpty else {
+            return .init(network: network, hostKey: nil, peer: nil, failure: NativeSSHError.jumpAuthenticationRequired)
+        }
         let session: NativeSSHSession, lease: WorkspaceNetworkLease
         do {
             lease = try networkActivity.beginConnection()

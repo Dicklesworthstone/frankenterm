@@ -197,7 +197,7 @@ final class WorkspaceConnectionTests: XCTestCase {
         }
     }
 
-    func testUnsupportedModeJumpAndMissingSessionOrAuthenticationPoliciesNeverDial() async throws {
+    func testUnsupportedModeMultipleJumpsAndMissingSessionOrAuthenticationPoliciesNeverDial() async throws {
         for variant in 0..<4 {
             let fixture = try await SSHWorkspaceTestFixture.make { workspace in
                 var routes = workspace["routes"] as! [[String: Any]]
@@ -210,7 +210,11 @@ final class WorkspaceConnectionTests: XCTestCase {
                     var jump = routes[0]
                     jump["id"] = "jump-route"; jump["session_creation"] = nil
                     routes[0]["jump_routes"] = ["jump-route"]
+                    var outerJump = jump
+                    outerJump["id"] = "outer-jump-route"
+                    jump["jump_routes"] = ["outer-jump-route"]
                     routes.append(jump)
+                    routes.append(outerJump)
                 case 2: routes[0]["session_creation"] = nil
                 default: routes[0]["authentication_methods"] = ["password"]
                 }

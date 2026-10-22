@@ -9,6 +9,7 @@ import Glibc
 
 public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
     case invalidInput, busy, closed, timedOut, authenticationTimedOut, invalidChallenge
+    case jumpConnectionFailed, jumpAuthenticationRequired
     case native(Int32)
     case resolution(Int32), connection(Int32)
 
@@ -43,6 +44,8 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
         case .timedOut: "The machine didn't answer in time."
         case .authenticationTimedOut: "The SSH connection did not finish authentication in time."
         case .invalidChallenge: "The machine asked for authentication this app can't answer."
+        case .jumpConnectionFailed: "The jump host could not establish the approved connection. Check its route, key and host trust."
+        case .jumpAuthenticationRequired: "Checking this route requires signing in to its jump host. Connect to check the complete route."
         case let .resolution(code): "The machine's name couldn't be looked up (\(String(cString: gai_strerror(code))))."
         case let .connection(code): "The machine couldn't be reached (\(String(cString: strerror(code))))."
         case let .native(code):
@@ -200,6 +203,12 @@ public actor NativeSSHSession {
     private var waiter: SocketReadiness?
     private var shutdown: Task<Void, Never>?
     private var authentication: (any NativeSSHAuthentication)?
+    private struct ForwardingWitness: Sendable {
+        let authority: any NativeSSHAuthentication
+        let peer: NativeSSHPeer
+        let identity: NativeSSHIdentity
+    }
+    private var forwardingWitnesses: [ForwardingWitness] = []
     private var peer: NativeSSHPeer?
     private var identity: NativeSSHIdentity?
     private var requestedResize: NativeSSHGeometry?
@@ -225,6 +234,72 @@ public actor NativeSSHSession {
         native = NativeHandle(handle); self.transportID = transportID; self.endpoint = endpoint
     }
 
+    private init(native: NativeHandle, endpoint: NativeSSHEndpoint, witnesses: [ForwardingWitness]) {
+        self.native = native; self.endpoint = endpoint; transportID = UUID()
+        forwardingWitnesses = witnesses
+    }
+
+    /// Creates an independently authenticated SSH transport inside this exact
+    /// approved hop. Success consumes this outer owner; only the returned actor
+    /// can drive either library session. There is no transit PTY, exec, socket
+    /// listener or shared forwarding transport. A second hop is unsupported.
+    public func forward(to endpoint: NativeSSHEndpoint, timeout: Duration = .seconds(15),
+                        maximumNativeBytes: Int = 2 * 1024 * 1024) async throws -> NativeSSHSession {
+        let deadline = try deadline(timeout)
+        guard phase == .authenticated, operation == nil, forwardingWitnesses.isEmpty,
+              let authority = authentication, let peer, let identity else {
+            throw phase == .closed ? NativeSSHError.closed : .busy
+        }
+        guard (65536...4 * 1024 * 1024).contains(maximumNativeBytes) else { throw NativeSSHError.invalidInput }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token; phase = .opening
+        let timer = expiry(deadline, operation: token)
+        defer { timer.cancel(); if operation == token { operation = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                try await authority.validate(peer: peer, identity: identity)
+                try current(token, deadline)
+                try requireOK(endpoint.host.withCString {
+                    ftssh_begin_forward(native.pointer, $0, endpoint.host.utf8.count, endpoint.port)
+                })
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_forward_step(native.pointer)
+                    if result == FTSSH_OK { break }
+                    try requireAgain(result)
+                    try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                }
+                try await authority.validate(peer: peer, identity: identity)
+                try current(token, deadline)
+                let transferred = try native.forwarded(maximumNativeBytes: maximumNativeBytes)
+                // No suspension point after native ownership moves. Closing
+                // this consumed actor must never cancel the child's hop grant.
+                let child = NativeSSHSession(native: transferred, endpoint: endpoint,
+                    witnesses: [.init(authority: authority, peer: peer, identity: identity)])
+                authentication = nil; self.peer = nil; self.identity = nil
+                phase = .closed; operation = nil
+                return child
+            } onCancel: { [weak self] in Task { await self?.close() } }
+        } catch {
+            await close()
+            if Task.isCancelled { throw CancellationError() }
+            throw error
+        }
+    }
+
+    /// The live workspace owner repeats this along with destination policy.
+    /// Reimport, host/credential revocation and foreground loss at the hop
+    /// invalidate the dependent connection even after both logins succeeded.
+    public func validateForwardingPath() async throws {
+        try Task.checkCancellation()
+        guard phase != .closed else { throw NativeSSHError.closed }
+        for witness in forwardingWitnesses {
+            try await witness.authority.validate(peer: witness.peer, identity: witness.identity)
+            try Task.checkCancellation()
+            guard phase != .closed else { throw NativeSSHError.closed }
+        }
+    }
+
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
         let deadline = try deadline(timeout)
         guard phase == .fresh, operation == nil else { throw phase == .closed ? NativeSSHError.closed : .busy }
@@ -235,6 +310,7 @@ public actor NativeSSHSession {
         defer { timer.cancel(); if operation == token { operation = nil } }
         do {
             return try await withTaskCancellationHandler {
+                try await validateForwardingPath()
                 while true {
                     try current(token, deadline)
                     let result = ftssh_handshake(native.pointer)
@@ -243,7 +319,10 @@ public actor NativeSSHSession {
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
                 let found = try copyPeer()
+                try await validateForwardingPath()
+                try current(token, deadline)
                 let selected = try await authority.identity(for: found)
+                try await validateForwardingPath()
                 try current(token, deadline)
                 try requireOK(found.hostKey.withUnsafeBytes {
                     ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
@@ -261,9 +340,12 @@ public actor NativeSSHSession {
                         guard !signed else { throw NativeSSHError.invalidChallenge }
                         let bytes = try copyBytes(capacity: 1024, ftssh_copy_challenge)
                         let challenge = try NativeSSHChallenge(bytes: bytes, transportID: transportID, identity: selected)
+                        try await validateForwardingPath()
+                        try current(token, deadline)
                         let signature = try await authority.signature(for: challenge, peer: found)
                         try current(token, deadline)
                         try await authority.validate(peer: found, identity: selected)
+                        try await validateForwardingPath()
                         try current(token, deadline)
                         guard (1...512).contains(signature.count) else { throw NativeSSHError.invalidChallenge }
                         try requireOK(signature.withUnsafeBytes {
@@ -276,6 +358,7 @@ public actor NativeSSHSession {
                     }
                 }
                 try await authority.validate(peer: found, identity: selected)
+                try await validateForwardingPath()
                 try current(token, deadline)
                 peer = found; identity = selected; phase = .authenticated
                 return found
@@ -325,6 +408,7 @@ public actor NativeSSHSession {
         do {
             try await withTaskCancellationHandler {
                 try await authority.validate(peer: peer, identity: identity)
+                try await validateForwardingPath()
                 try current(token, deadline)
                 try requireOK(begin())
                 while true {
@@ -335,6 +419,7 @@ public actor NativeSSHSession {
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
                 try await authority.validate(peer: peer, identity: identity)
+                try await validateForwardingPath()
                 try current(token, deadline)
                 phase = .live
             } onCancel: { [weak self] in Task { await self?.close() } }
@@ -568,6 +653,8 @@ public actor NativeSSHSession {
         if let shutdown { await shutdown.value; return }
         phase = .closed; operation = nil
         authentication?.cancel(transportID: transportID)
+        for witness in forwardingWitnesses { witness.authority.cancel(transportID: witness.peer.transportID) }
+        forwardingWitnesses.removeAll()
         authentication = nil; peer = nil; identity = nil; requestedResize = nil; serviceWakePending = false
         native.close()
         let old = waiter; waiter = nil
@@ -602,6 +689,12 @@ public actor NativeSSHSession {
         guard phase != .closed, operation == token else { throw NativeSSHError.closed }
     }
     private func ready(directions: Int32, deadline: ContinuousClock.Instant) async throws {
+        if directions & Int32(FTSSH_RETRY) != 0 {
+            try Task.checkCancellation()
+            guard ContinuousClock.now < deadline else { throw NativeSSHError.timedOut }
+            await Task.yield()
+            return
+        }
         let next = try SocketReadiness(descriptor: ftssh_descriptor(native.pointer), directions: directions, deadline: deadline)
         waiter = next
         defer { if waiter === next { waiter = nil } }
@@ -634,6 +727,15 @@ private final class NativeHandle: @unchecked Sendable {
     private(set) var pointer: OpaquePointer?
     private var finalAccounting: ftssh_stats?
     init(_ pointer: OpaquePointer) { self.pointer = pointer }
+    func forwarded(maximumNativeBytes: Int) throws -> NativeHandle {
+        var child: OpaquePointer?
+        let result = ftssh_forward_adopt(&pointer, maximumNativeBytes, &child)
+        guard result == FTSSH_OK, let child else { throw NativeSSHError.native(result) }
+        // This wrapper owns no native resources after transfer. The child's
+        // aggregate accounting includes the retained outer library allocations.
+        finalAccounting = ftssh_stats()
+        return NativeHandle(child)
+    }
     func accounting() throws -> ftssh_stats {
         if let finalAccounting { return finalAccounting }
         var stats = ftssh_stats()

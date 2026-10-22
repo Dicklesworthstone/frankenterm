@@ -23,7 +23,8 @@ enum {
     FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010,
     FTSSH_AUTH_FAILED = -1011
 };
-enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024 };
+enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
+       FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -81,6 +82,18 @@ int ftssh_copy_challenge(ftssh_session *session, uint8_t *output, size_t capacit
  */
 int ftssh_supply_signature(ftssh_session *session, const uint8_t *blob, size_t length);
 
+/* One explicitly approved transit channel, with no session, PTY or command.
+ * After forward_step succeeds, forward_adopt atomically transfers the complete
+ * outer handle into a fresh inner SSH handle and sets *outer to NULL. Failure
+ * leaves the outer handle owned by the caller. The inner handle's callbacks
+ * consume ONLY the direct-tcpip channel; the root descriptor supplies readiness,
+ * never destination plaintext. Its one serial owner drives and closes both
+ * library sessions. No transport sharing or second jump is supported.
+ */
+int ftssh_begin_forward(ftssh_session *session, const char *host, size_t host_length, uint16_t port);
+int ftssh_forward_step(ftssh_session *session);
+int ftssh_forward_adopt(ftssh_session **outer, size_t max_allocated, ftssh_session **inner);
+
 int ftssh_begin_shell(ftssh_session *session, uint32_t columns, uint32_t rows,
                       uint32_t pixel_width, uint32_t pixel_height);
 /* Instead of a shell: one remote command (printable ASCII, at most
@@ -117,6 +130,8 @@ int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,
  * the platform cannot report queued socket bytes. Never leaves a half-sent
  * packet that would block later writes: if one remains, the session fails. */
 int ftssh_keepalive(ftssh_session *session);
+/* RETRY requests a cooperative yield, then another bounded turn without
+ * waiting for new socket bytes (the outer receive quantum was exhausted). */
 int ftssh_directions(ftssh_session *session);
 int ftssh_descriptor(ftssh_session *session);
 int ftssh_get_stats(ftssh_session *session, ftssh_stats *result);

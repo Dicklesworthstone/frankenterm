@@ -10,13 +10,14 @@ import FrankenTermSSH
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
-    /// require SHA-2 signatures; RSA credentials, certificates, password/MFA
-    /// and jump transports are not enabled. A mux route authenticates like a
-    /// direct one; only the channel it opens differs.
+    /// require SHA-2 signatures; RSA credentials, certificates and password/MFA
+    /// are not enabled. Exactly one public-key jump is supported. A mux route
+    /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
-        hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"])
+        hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
+        maximumJumpHops: 1)
 
     private final class Retirement: @unchecked Sendable {
         private let lock = NSLock()
@@ -52,16 +53,19 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     private nonisolated let transportID: UUID
     private let workspaceID: UUID, revision: UUID
     private let routeID: String, credentialID: String, endpoint: NativeSSHEndpoint
+    private let transitForRouteID: String?, allowedJumpRouteIDs: [String]
     private var phase = Phase.fresh
     private var selected: WorkspaceSSHIdentity?
     private var selectedPeer: NativeSSHPeer?
     private var selectedIdentity: NativeSSHIdentity?
 
     public init(broker: SSHAuthenticationBroker, workspaceID: UUID, revision: UUID,
-                routeID: String, credentialID: String, transportID: UUID, endpoint: NativeSSHEndpoint) {
+                routeID: String, credentialID: String, transportID: UUID, endpoint: NativeSSHEndpoint,
+                transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = []) {
         self.broker = broker; self.workspaceID = workspaceID; self.revision = revision
         self.routeID = routeID; self.credentialID = credentialID
         self.transportID = transportID; self.endpoint = endpoint
+        self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
     }
 
     public func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity {
@@ -86,11 +90,12 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
             let foreground = try await broker.foregroundLease()
             try checkCurrent()
             let authorization = try await broker.authorization(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, credentialID: credentialID, presentedHostKey: host)
+                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transitForRouteID: transitForRouteID)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(authorization)
             let value = try await broker.publicIdentity(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transportID: transportID)
+                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transportID: transportID,
+                transitForRouteID: transitForRouteID)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(value.authorization)
             guard value.authorization == authorization else { throw SSHAuthenticationError.stale }
@@ -130,7 +135,8 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
             }
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
-                transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.identity.blob)
+                transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.identity.blob,
+                transitForRouteID: transitForRouteID)
             try checkCurrent()
             guard request.authorization == selected.authorization else { throw SSHAuthenticationError.stale }
             let result = try await broker.confirm(requestID: request.id)
@@ -181,7 +187,9 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
         guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
               authorization.routeID == routeID, authorization.credentialID == credentialID,
               authorization.host == endpoint.host, authorization.port == endpoint.port,
-              Self.routeSupport.routeModes.contains(authorization.routeMode), authorization.jumpRouteIDs.isEmpty,
+              authorization.transitForRouteID == transitForRouteID,
+              transitForRouteID != nil || Self.routeSupport.routeModes.contains(authorization.routeMode),
+              authorization.jumpRouteIDs == allowedJumpRouteIDs, allowedJumpRouteIDs.count <= 1,
               Self.routeSupport.credentialAlgorithms.contains(authorization.algorithm) else {
             throw SSHAuthenticationError.denied
         }

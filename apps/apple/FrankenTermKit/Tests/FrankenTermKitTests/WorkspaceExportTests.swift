@@ -191,7 +191,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
     private let crypto = TestCryptography()
     private var support: WorkspaceDocument.RouteSupport {
         .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
-              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 2)
     }
 
     private func fixture(fingerprint: String = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",

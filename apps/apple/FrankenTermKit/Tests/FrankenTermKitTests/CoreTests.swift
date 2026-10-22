@@ -469,7 +469,7 @@ final class CoreTests: XCTestCase {
     }
     private var qualifiedTestTransport: WorkspaceDocument.RouteSupport {
         .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
-              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"])
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 3)
     }
 
     func testLatestNativePlanFixtureParsesWithoutRewritingItsPolicy() throws {
@@ -578,6 +578,53 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try document.readiness(forRouteID: "jump", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues, [.sessionPolicyMissing])
         XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).isLocallyReady)
         XCTAssertTrue(try document.readiness(forRouteID: "route", availableCredentialIDs: [], reviewedTrustIDs: ["trust"], support: qualifiedTestTransport).issues.contains(.blockedJumpRoute("jump")))
+    }
+
+    func testJumpReadinessRequiresExplicitQualificationOfTheEntireExpandedChain() throws {
+        func profile(_ hops: Int = 0) -> WorkspaceDocument.RouteSupport {
+            .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+                  credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: hops)
+        }
+        func document(nested: Bool, ordered: Bool = false) throws -> WorkspaceDocument {
+            try WorkspaceDocument(data: changedWorkspace { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                var first = routes[0], second = routes[0]
+                first["id"] = "first"; second["id"] = "second"
+                first.removeValue(forKey: "session_creation")
+                second.removeValue(forKey: "session_creation")
+                routes[0]["jump_routes"] = ordered ? ["first", "second"] : ["first"]
+                if nested { first["jump_routes"] = ["second"] }
+                routes.append(contentsOf: [first, second]); workspace["routes"] = routes
+            })
+        }
+        let oneHop = try document(nested: false)
+        func readiness(_ document: WorkspaceDocument, _ support: WorkspaceDocument.RouteSupport) throws -> WorkspaceDocument.RouteReadiness {
+            try document.readiness(forRouteID: "route", availableCredentialIDs: ["key"], reviewedTrustIDs: ["trust"], support: support)
+        }
+        XCTAssertEqual(try readiness(oneHop, profile()).issues, [.jumpTransportUnavailable])
+        XCTAssertTrue(try readiness(oneHop, profile(1)).isLocallyReady)
+        XCTAssertEqual(try readiness(document(nested: true), profile(1)).issues, [.jumpTransportUnavailable])
+        XCTAssertEqual(try readiness(document(nested: false, ordered: true), profile(1)).issues, [.jumpTransportUnavailable])
+        XCTAssertTrue(try readiness(document(nested: true), profile(2)).isLocallyReady)
+        XCTAssertTrue(try readiness(document(nested: false, ordered: true), profile(2)).isLocallyReady)
+        // Transit eligibility ignores the hop's absent session policy only
+        // under its exact configured single-hop destination relationship.
+        XCTAssertEqual(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(1)).issues, [.sessionPolicyMissing])
+        XCTAssertTrue(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route").isLocallyReady)
+        XCTAssertThrowsError(try oneHop.readiness(forRouteID: "second", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route"))
+        XCTAssertThrowsError(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(), transitForRouteID: "route"))
+        XCTAssertThrowsError(try document(nested: true).readiness(forRouteID: "first", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(2), transitForRouteID: "route"))
+        XCTAssertTrue(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: [],
+            reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route").issues.contains(.credentialUnavailable))
+        // A direct route needs no jump qualification, even when other routes
+        // in the same imported document are unavailable.
+        let direct = try WorkspaceDocument(data: sampleManifest())
+        XCTAssertTrue(try readiness(direct, profile()).isLocallyReady)
     }
 
     func testUnknownExtensionsCannotSmuggleSecretsOrActivateRequirements() throws {
