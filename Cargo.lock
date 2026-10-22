@@ -4510,6 +4510,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-mobile-attach"
+version = "0.15.21"
+dependencies = [
+ "codec",
+ "config",
+ "frankenterm-core",
+ "frankenterm-term",
+ "mux",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "signal-hook 0.4.5",
+ "tempfile",
+ "termwiz 0.24.0",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "frankenterm-mux-server"
 version = "0.15.21"
 dependencies = [

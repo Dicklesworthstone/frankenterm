@@ -231,7 +231,7 @@ impl Mux {
             return Vec::new();
         };
         let mut clients = list.clients;
-        clients.sort_by(|a, b| b.last_input.cmp(&a.last_input));
+        clients.sort_by_key(|client| std::cmp::Reverse(client.last_input));
         clients
             .into_iter()
             .filter_map(|client| client.focused_pane_id.map(|id| id as u64))
@@ -253,9 +253,10 @@ impl Mux {
         let mut start = rows.start;
         while start < rows.end {
             let end = start.saturating_add(LINES_PER_REQUEST).min(rows.end);
+            let request = std::iter::once(start..end).collect();
             let reply = self
                 .runtime
-                .block_on(Box::pin(self.client.get_lines(pane, vec![start..end])))?;
+                .block_on(Box::pin(self.client.get_lines(pane, request)))?;
             // A reply whose internal references do not validate is treated
             // as missing rows rather than trusted.
             if let Ok((lines, _images)) = reply.lines.extract_data_checked() {
