@@ -80,6 +80,8 @@ ft events --limit 20
 - `serial <port>`: open serial device session
 - `ls-fonts`: inspect font resolution and font inventory
 - `show-keys`: print effective key assignments
+- `cli`: send one request to a running GUI or mux server (`list`, `spawn`,
+  `move-pane-to-new-tab`), without opening a window
 
 Useful examples:
 
@@ -106,7 +108,23 @@ frankenterm-gui ssh deploy@10.0.0.5
 # Inspect key assignments
 frankenterm-gui show-keys
 frankenterm-gui show-keys --lua
+
+# From inside a pane: open a tab in this window, list panes, move a pane
+frankenterm-gui cli spawn --cwd ~/src -- htop
+frankenterm-gui cli list --format json
+frankenterm-gui cli move-pane-to-new-tab --pane-id 12 --new-window
 ```
+
+`frankenterm-gui cli` takes the same arguments as the matching `wezterm cli`
+subcommands and prints the same output (`spawn` prints the new pane id;
+`list --format json` adds an `is_floating` field). It connects to
+`$FRANKENTERM_UNIX_SOCKET` or `$WEZTERM_UNIX_SOCKET`, which FrankenTerm sets
+in every pane, else to a running GUI (`--class` picks one started with
+`--class`), else to the first configured unix domain; `--prefer-mux` skips
+the GUI. It never starts a server. The pane it acts on or from is `--pane-id`, else
+`$WEZTERM_PANE`, else the focused pane of the most recently active client; a
+pane id that does not exist is an error. Without `--workspace`, a new window
+gets the workspace of that pane.
 
 Default session-manager entry point:
 

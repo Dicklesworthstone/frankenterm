@@ -309,6 +309,12 @@ enum SubCommand {
 
     #[command(name = "show-keys", about = "Show key assignments")]
     ShowKeys(ShowKeysCommand),
+
+    #[command(
+        name = "cli",
+        about = "Send one request (list, spawn, move-pane-to-new-tab) to a running mux"
+    )]
+    Cli(frankenterm_gui::cli::CliCommand),
 }
 
 async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -3226,14 +3232,10 @@ impl Publish {
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
-            match frankenterm_client::client::Client::new_unix_domain(
-                None,
-                &dom,
-                false,
-                &mut ui,
-                true,
-                std::sync::Weak::new(),
-            ) {
+            // Request-only: the running GUI announces the very tab this
+            // spawns to every connection, and a client that rejected that
+            // notification could lose the spawn's reply.
+            match frankenterm_client::client::Client::new_request_only_unix_domain(&dom, &mut ui) {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
@@ -5930,6 +5932,17 @@ fn run() -> anyhow::Result<()> {
         SubCommand::ShowKeys(cmd) => {
             check_cli_config_health()?;
             run_show_keys(config, &cmd)
+        }
+        SubCommand::Cli(cmd) => {
+            // Report failures on stderr with a nonzero status: scripts run
+            // this, so it must not raise the GUI's startup-failure toast.
+            if let Err(err) =
+                check_cli_config_health().and_then(|()| frankenterm_gui::cli::run(cmd))
+            {
+                eprintln!("frankenterm-gui cli: {err:#}");
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }
