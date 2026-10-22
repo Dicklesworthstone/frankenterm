@@ -1,5 +1,103 @@
 import Foundation
 
+/// One immutable encrypted export, with separate ownership of its optional
+/// generated code. Live frames and saved media read ciphertext only. A code
+/// reveal retires the exact playback lease before returning private text.
+public struct OpticalExportSession: Sendable, CustomDebugStringConvertible {
+    public enum State: Equatable, Sendable { case paused, playing, revealingCode }
+    public struct Playback: Equatable, Sendable {
+        private let witness = UUID()
+        fileprivate init() {}
+    }
+    public struct Frame: Sendable {
+        public let text: String
+        public let emittedSymbolCount: Int
+        public let symbolsPerSecond: Int
+    }
+
+    public let id = UUID()
+    public let envelope: Data
+    public let mode: FTAGMode
+    public var identity: OpticalFrame.Identity { sender.identity }
+    public var hasTransferCode: Bool { code != nil }
+    public private(set) var state = State.paused
+    public private(set) var emittedSymbolCount = 0
+    public private(set) var symbolsPerSecond = 5
+    public private(set) var repairPage: Int?
+    public var debugDescription: String { "OpticalExportSession([encrypted], [code redacted])" }
+
+    private let code: TransferCode?
+    private var sender: OpticalSender
+    private var playback: Playback?
+
+    /// A newly sealed code-protected transfer retains its generated code only
+    /// in memory. `FTAG.Export` is minted by the actual envelope sealer.
+    public init<C: AirGapCryptography>(export: FTAG.Export, using crypto: C) throws {
+        try self.init(envelope: export.envelope, code: export.code, using: crypto)
+        guard mode == .code else { throw FTError.malformed("export.code_mode") }
+    }
+
+    /// Reopen an already-encrypted file, or present a newly sealed recipient
+    /// transfer. Parsing its framing does not authenticate its source or recover
+    /// its code; those checks still belong to the phone's ordinary restore.
+    public init<C: AirGapCryptography>(envelope: Data, using crypto: C) throws {
+        try self.init(envelope: envelope, code: nil, using: crypto)
+    }
+
+    private init<C: AirGapCryptography>(envelope: Data, code: TransferCode?, using crypto: C) throws {
+        try Task.checkCancellation()
+        mode = try FTAGHeader(envelope: envelope).mode
+        sender = try OpticalSender(envelope: envelope, using: crypto)
+        self.envelope = envelope
+        self.code = code
+    }
+
+    /// Starting, changing speed or selecting a repair page changes presentation
+    /// only. Previous callbacks cannot emit or pause a newer playback lease.
+    public mutating func beginPlayback(symbolsPerSecond rate: Int = 5, repairPage page: Int? = nil) throws -> Playback {
+        try Task.checkCancellation()
+        try configure(rate: rate, page: page)
+        let lease = Playback()
+        playback = lease; state = .playing
+        return lease
+    }
+
+    public mutating func updatePlayback(_ lease: Playback, symbolsPerSecond rate: Int, repairPage page: Int?) throws {
+        try Task.checkCancellation()
+        guard state == .playing, playback == lease else { throw FTError.stale }
+        try configure(rate: rate, page: page)
+    }
+
+    private mutating func configure(rate: Int, page: Int?) throws {
+        guard [3, 5, 10].contains(rate) else { throw FTError.malformed("export.symbol_rate") }
+        if let page, !(0..<identity.pageCount).contains(page) { throw FTError.malformed("qr.page") }
+        symbolsPerSecond = rate; repairPage = page
+    }
+
+    public mutating func pause(_ lease: Playback) {
+        guard playback == lease else { return }
+        playback = nil; state = .paused
+    }
+
+    /// The caller covers its QR surface before requesting this text, hides it
+    /// on deactivation, and never includes it in a recording or saved file.
+    public mutating func revealTransferCode<C: AirGapCryptography>(using crypto: C) throws -> String {
+        try Task.checkCancellation()
+        guard let code else { throw FTError.unsupported("export.transfer_code_unavailable") }
+        playback = nil; state = .revealingCode
+        return code.reveal(using: crypto)
+    }
+
+    public mutating func next<C: AirGapCryptography>(_ lease: Playback, using crypto: C) throws -> Frame {
+        try Task.checkCancellation()
+        guard state == .playing, playback == lease else { throw FTError.stale }
+        guard emittedSymbolCount < Int.max else { throw FTError.limit("qr.sequence") }
+        let text = try sender.next(repairPage: repairPage, using: crypto)
+        emittedSymbolCount += 1
+        return .init(text: text, emittedSymbolCount: emittedSymbolCount, symbolsPerSecond: symbolsPerSecond)
+    }
+}
+
 /// Finite recordings contain every source symbol plus the planned repair set.
 /// Replaying this schedule cannot create new fountain information.
 public struct OpticalAnimationPlan: Sendable {

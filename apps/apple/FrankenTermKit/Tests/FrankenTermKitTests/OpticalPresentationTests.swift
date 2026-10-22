@@ -4,6 +4,153 @@ import XCTest
 
 final class OpticalPresentationTests: XCTestCase {
     let crypto = TestCryptography()
+    func testExportPlaybackReconstructsAndUnlocksOnlyWithTheSeparatelyRevealedCode() throws {
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        var session = try OpticalExportSession(export: sealed, using: crypto)
+        XCTAssertTrue(session.hasTransferCode)
+        XCTAssertEqual(session.state, .paused)
+        let code = try session.revealTransferCode(using: crypto)
+        XCTAssertEqual(code, sealed.code.reveal(using: crypto))
+        XCTAssertEqual(session.state, .revealingCode)
+        let playback = try session.beginPlayback()
+        var receiver: OpticalReceiver?
+        for _ in 0..<session.identity.sourcePartCount {
+            let output = try session.next(playback, using: crypto)
+            XCTAssertEqual(output.symbolsPerSecond, 5)
+            XCTAssertNil(TransferCodeFrame.parse(output.text))
+            XCTAssertFalse(output.text.contains(code))
+            let frame = try OpticalFrame(text: output.text)
+            if receiver == nil { receiver = OpticalReceiver(selecting: frame) }
+            try receiver?.receive(frame, using: crypto)
+        }
+        let recovered = try XCTUnwrap(receiver?.envelope(using: crypto))
+        XCTAssertEqual(recovered, sealed.envelope)
+        XCTAssertEqual(try FTAG.open(recovered, code: TransferCode(entered: code, using: crypto), using: crypto).workspace.raw,
+                       archive.workspace.raw)
+        XCTAssertThrowsError(try FTAG.open(recovered, code: TransferCode(secret: Data(repeating: 0xFE, count: 16)), using: crypto))
+        XCTAssertEqual(session.envelope, sealed.envelope)
+        XCTAssertFalse(String(reflecting: session).contains(code))
+        // Exercise the actual recording verifier with the session's saved
+        // ciphertext after code reveal and live playback have both occurred.
+        var video = try OpticalVideoVerifier(source: OpticalVideoSource(envelope: session.envelope),
+            symbolsPerSecond: 10, using: crypto)
+        for (index, text) in video.expectedTexts.enumerated() {
+            XCTAssertNil(TransferCodeFrame.parse(text))
+            XCTAssertFalse(text.contains(code))
+            for hold in 0..<video.plan.framesPerSymbol {
+                try video.receive(decodedText: text, presentationFrame: index * video.plan.framesPerSymbol + hold,
+                    durationFrames: 1, using: crypto)
+            }
+        }
+        try video.finish(using: crypto)
+    }
+
+    func testCodeRevealRetiresPlaybackAndOldCleanupCannotPauseAReplacement() throws {
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        var session = try OpticalExportSession(export: sealed, using: crypto)
+        let first = try session.beginPlayback()
+        let firstFrame = try session.next(first, using: crypto)
+        _ = try session.revealTransferCode(using: crypto)
+        XCTAssertThrowsError(try session.next(first, using: crypto)) { XCTAssertEqual($0 as? FTError, .stale) }
+        session.pause(first)
+        XCTAssertEqual(session.state, .revealingCode)
+        let next = try session.beginPlayback(symbolsPerSecond: 3)
+        session.pause(first)
+        XCTAssertEqual(session.state, .playing)
+        let secondFrame = try session.next(next, using: crypto)
+        XCTAssertNotEqual(firstFrame.text, secondFrame.text)
+        XCTAssertEqual(secondFrame.emittedSymbolCount, 2)
+        XCTAssertEqual(secondFrame.symbolsPerSecond, 3)
+        session.pause(next)
+        XCTAssertThrowsError(try session.next(next, using: crypto))
+        XCTAssertEqual(session.state, .paused)
+        XCTAssertEqual(session.envelope, sealed.envelope)
+    }
+
+    func testReopenedEncryptedFileSupportsFreshTargetedRepairWithoutARecoveredCode() throws {
+        var random = URRandom(seed: Data("reopened encrypted backup".utf8), using: crypto)
+        let bytes = Data(try (0..<40000).map { _ in UInt8(try random.index(count: 256)) })
+        let envelope = try FTAG.sealArchiveBytes(bytes, code: TransferCode(secret: Data(repeating: 8, count: 16)),
+            transferID: Data(repeating: 7, count: 16), salt: Data(repeating: 6, count: 16),
+            nonce: Data(repeating: 5, count: 12), compress: false, using: crypto)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ft-reopen-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        let file = root.appendingPathComponent("saved.ftairgap")
+        try envelope.write(to: file, options: .withoutOverwriting)
+        var session = try OpticalExportSession(envelope: SelectedLocalFile.read(file, limit: FTLimit.envelope), using: crypto)
+        XCTAssertFalse(session.hasTransferCode)
+        XCTAssertThrowsError(try session.revealTransferCode(using: crypto))
+        XCTAssertEqual(session.identity.pageCount, 2)
+        let source = try OpticalSender(envelope: envelope, using: crypto)
+        var receiver: OpticalReceiver?
+        for page in [1, 0] {
+            let playback = try session.beginPlayback(symbolsPerSecond: page == 1 ? 10 : 3, repairPage: page)
+            for _ in 0..<(try source.sourcePartCount(page: page)) {
+                let output = try session.next(playback, using: crypto)
+                let frame = try OpticalFrame(text: output.text)
+                XCTAssertEqual(frame.pageIndex, page)
+                XCTAssertEqual(frame.identity, source.identity)
+                if receiver == nil { receiver = OpticalReceiver(selecting: frame) }
+                try receiver?.receive(frame, using: crypto)
+            }
+            session.pause(playback)
+        }
+        XCTAssertEqual(try receiver?.envelope(using: crypto), envelope)
+        let repair = try session.beginPlayback(repairPage: 1)
+        let frame = try OpticalFrame(text: session.next(repair, using: crypto).text)
+        XCTAssertEqual(frame.pageIndex, 1)
+        let parts = frame.ur.split(separator: "/")
+        XCTAssertEqual(parts.count, 3)
+        let part = try URPart(cbor: Bytewords.decode(parts[2]))
+        XCTAssertGreaterThan(part.sequence, UInt32(try source.sourcePartCount(page: 1)))
+        XCTAssertEqual(session.envelope, envelope)
+        XCTAssertEqual(try Data(contentsOf: file), envelope)
+    }
+
+    func testPlaybackSettingsAndForeignLeasesCannotChangeTheSelectedExport() throws {
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        var session = try OpticalExportSession(export: sealed, using: crypto)
+        var other = try OpticalExportSession(envelope: sealed.envelope, using: crypto)
+        let current = try session.beginPlayback(symbolsPerSecond: 10)
+        let foreign = try other.beginPlayback()
+        XCTAssertThrowsError(try session.next(foreign, using: crypto))
+        session.pause(foreign)
+        for rate in [0, 1, 4, 6, 30] { XCTAssertThrowsError(try session.beginPlayback(symbolsPerSecond: rate)) }
+        for page in [-1, session.identity.pageCount] { XCTAssertThrowsError(try session.beginPlayback(repairPage: page)) }
+        XCTAssertEqual(try session.next(current, using: crypto).symbolsPerSecond, 10)
+        XCTAssertEqual(session.emittedSymbolCount, 1)
+        XCTAssertThrowsError(try session.updatePlayback(foreign, symbolsPerSecond: 3, repairPage: 0))
+        XCTAssertThrowsError(try session.updatePlayback(current, symbolsPerSecond: 3, repairPage: -1))
+        XCTAssertEqual(try session.next(current, using: crypto).symbolsPerSecond, 10)
+        try session.updatePlayback(current, symbolsPerSecond: 3, repairPage: 0)
+        let repaired = try session.next(current, using: crypto)
+        XCTAssertEqual(repaired.symbolsPerSecond, 3)
+        XCTAssertEqual(try OpticalFrame(text: repaired.text).pageIndex, 0)
+        XCTAssertEqual(session.envelope, sealed.envelope)
+        XCTAssertNotEqual(session.id, other.id)
+    }
+
+    func testRecipientPresentationCannotRevealOrInventAGeneratedCode() throws {
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let recipient = try RecipientSession(using: crypto)
+        let envelope = try FTAG.seal(archive, recipient: recipient.request, using: crypto)
+        var session = try OpticalExportSession(envelope: envelope, using: crypto)
+        XCTAssertEqual(session.mode, .recipient)
+        XCTAssertFalse(session.hasTransferCode)
+        XCTAssertThrowsError(try session.revealTransferCode(using: crypto))
+        let playback = try session.beginPlayback()
+        let frame = try OpticalFrame(text: session.next(playback, using: crypto).text)
+        XCTAssertEqual(frame.identity.envelopeDigest, crypto.sha256(envelope))
+        XCTAssertEqual(try FTAG.open(session.envelope, recipient: recipient, using: crypto).workspace.raw, archive.workspace.raw)
+        XCTAssertThrowsError(try OpticalExportSession(export: .init(envelope: envelope,
+            code: TransferCode(secret: Data(repeating: 1, count: 16))), using: crypto))
+        XCTAssertThrowsError(try OpticalExportSession(envelope: envelope + Data([0]), using: crypto))
+        XCTAssertThrowsError(try OpticalExportSession(envelope: Data("not an envelope".utf8), using: crypto))
+    }
+
     func testFiniteScheduleContainsEverySystematicPartAndReconstructs() throws {
         var random = URRandom(seed: Data("finite recording test".utf8), using: crypto)
         let data = Data(try (0..<40000).map { _ in UInt8(try random.index(count: 256)) })
