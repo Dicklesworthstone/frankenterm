@@ -1998,8 +1998,8 @@ private struct MachineWorkspaceView: View {
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 if preferred { Text("Preferred").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.white.opacity(0.15), in: Capsule()) }
             }
-            if route.mode != "direct_ssh" {
-                Text("Persistent mux route: opens from the desktop app for now.").font(.caption).opacity(0.75)
+            if route.mode == "frankenterm_mux" {
+                Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
             } else if !route.jumpRoutes.isEmpty {
                 Text("Reached through \(route.jumpRoutes.count) jump hosts, which this phone cannot use yet.").font(.caption).opacity(0.75)
             }
@@ -2035,13 +2035,16 @@ private struct MachineWorkspaceView: View {
                   unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
                   theme: theme)
         }
-        // Every ready direct-SSH route, the preferred one first.
+        // Every ready route, the preferred one first: mux routes attach to the
+        // machine's existing panes, direct-SSH routes to its mux if one answers.
         var seen = Set<String>(), routes: [TerminalSessionRoute] = []
         for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
-            guard let route = document.routes.first(where: { $0.id == id }), route.mode == "direct_ssh",
+            guard let route = document.routes.first(where: { $0.id == id }),
+                  route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
                   route.jumpRoutes.isEmpty, let readiness = local.routes.first(where: { $0.routeID == id }),
                   readiness.issues.isEmpty, let credential = readiness.usableCredentialIDs.first else { continue }
-            routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port))
+            routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port,
+                                mux: route.mode == "frankenterm_mux"))
         }
         guard !routes.isEmpty else { return scene(nil) }
         return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,

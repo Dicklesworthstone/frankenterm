@@ -184,6 +184,21 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
     }
 
+    /// Steps through the selected machine's mux panes, and past either end
+    /// on to the next or previous machine, so one swipe direction walks
+    /// every pane of every machine in order.
+    func stepPane(forward: Bool) {
+        guard !closed else { return }
+        if let session = selectedSession, let mux = session.muxState, let shown = mux.shown,
+           let index = mux.panes.firstIndex(where: { $0.paneId == shown }) {
+            let next = index + (forward ? 1 : -1)
+            if mux.panes.indices.contains(next) { session.showPane(mux.panes[next].paneId); return }
+        }
+        let ids = machines.map(\.id)
+        guard ids.count > 1, let current = selectedMachineID, let index = ids.firstIndex(of: current) else { return }
+        select(ids[(index + (forward ? 1 : ids.count - 1)) % ids.count])
+    }
+
     /// Opens a session for a machine, replacing one that ended. Earlier
     /// sessions' records are acknowledged as it starts.
     func connect(_ machineID: String) {
@@ -505,6 +520,11 @@ struct WorkspaceTerminalScreen: View {
         let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
         VStack(spacing: 0) {
             MachineStrip(scene: scene)
+            if let session = scene.selectedSession, let mux = session.muxState, !mux.panes.isEmpty {
+                PaneStrip(session: session, state: mux,
+                          accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"))
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             ZStack {
                 WorkspaceCanvasHost(scene: scene, terminal: machine.flatMap { scene.sessions[$0.id]?.terminal })
                 if let machine { card(for: machine).transition(.opacity.combined(with: .scale(scale: 0.97))) }
@@ -784,6 +804,68 @@ private struct MachineStrip: View {
     }
 }
 
+/// The selected machine's FrankenTerm panes, the ones the desktop app shows,
+/// each named by its project directory and its program's title. Tap one to
+/// put it on screen; a two-finger swipe on the terminal steps through them.
+private struct PaneStrip: View {
+    let session: TerminalSessionController
+    let state: TerminalMuxControl.State
+    let accent: Color
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.split.2x1").font(.caption).foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    ForEach(state.panes) { pane in chip(pane).id(pane.paneId) }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            }
+            .onChange(of: state.shown, initial: true) { _, shown in
+                guard let shown else { return }
+                withAnimation(.snappy) { proxy.scrollTo(shown, anchor: .center) }
+            }
+        }
+        .background(.ultraThinMaterial.opacity(0.85))
+        .sensoryFeedback(.selection, trigger: state.shown)
+    }
+
+    private func chip(_ pane: TerminalMuxPane) -> some View {
+        let shown = pane.paneId == state.shown
+        let names = Self.names(pane)
+        return Button { withAnimation(.snappy) { session.showPane(pane.paneId) } } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(verbatim: names.place).font(.caption.weight(shown ? .semibold : .medium))
+                if let detail = names.detail {
+                    Text(verbatim: detail).font(.caption2).opacity(0.7)
+                }
+            }
+            .lineLimit(1).frame(maxWidth: 170, alignment: .leading)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .foregroundStyle(shown ? Color.primary : Color.primary.opacity(0.7))
+            .background {
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(shown ? accent.opacity(0.22) : Color.primary.opacity(0.06))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(shown ? accent : .clear, lineWidth: 1.2))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(names.detail.map { "\(names.place), \($0)" } ?? names.place)
+        .accessibilityAddTraits(shown ? .isSelected : [])
+    }
+
+    /// The pane's project directory first (agents' panes are told apart by
+    /// project), then its program's title when that says something more.
+    static func names(_ pane: TerminalMuxPane) -> (place: String, detail: String?) {
+        let title = pane.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let directory = pane.workingDir.flatMap { URL(string: $0)?.lastPathComponent }.flatMap { $0.isEmpty || $0 == "/" ? nil : $0 }
+        guard let directory else { return (title.isEmpty ? "Pane \(pane.paneId)" : title, nil) }
+        return (directory, title.isEmpty || title == directory ? nil : title)
+    }
+}
+
 /// A machine's state in one glyph: a lit dot in its accent when live, a
 /// breathing ring while connecting, an alert when it needs a look.
 private struct StatusDot: View {
@@ -824,7 +906,7 @@ private struct WorkspaceCanvasHost: UIViewRepresentable {
     func updateUIView(_ view: WorkspaceCanvasView, context: Context) { view.show(terminal) }
 }
 
-private final class WorkspaceCanvasView: UIView {
+private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
     private let canvas = UIView()
     private var controls: NativeTerminalNavigationControls?
     private weak var scene: WorkspaceTerminalScene?
@@ -839,11 +921,22 @@ private final class WorkspaceCanvasView: UIView {
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor), canvas.trailingAnchor.constraint(equalTo: trailingAnchor)
         ])
         do {
+            // A machine attached to its mux steps through its panes instead
+            // (paneSwipe below); the others keep Kit's two-finger navigation.
             let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
-                permitsCanvasNavigation: { [weak scene] in scene?.selectedSession?.clipboardIsPresenting != true })
+                permitsCanvasNavigation: { [weak scene] in
+                    scene?.selectedSession?.clipboardIsPresenting != true && scene?.selectedSession?.muxState == nil
+                })
             controls.onFailure = { [weak scene] error in scene?.report(error) }
             self.controls = controls
         } catch { scene.report(error) }
+        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(paneSwipe(_:)))
+            swipe.direction = direction
+            swipe.numberOfTouchesRequired = 2
+            swipe.delegate = self
+            canvas.addGestureRecognizer(swipe)
+        }
         // A tap brings the keyboard back after its input generation ended.
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
         tap.cancelsTouchesInView = false
@@ -854,6 +947,16 @@ private final class WorkspaceCanvasView: UIView {
 
     @objc private func tapped() {
         Task { [weak scene] in await scene?.activateKeyboard() }
+    }
+
+    /// Swiping left shows the next pane, right the previous one.
+    @objc private func paneSwipe(_ swipe: UISwipeGestureRecognizer) {
+        scene?.stepPane(forward: swipe.direction == .left)
+    }
+
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer is UISwipeGestureRecognizer else { return super.gestureRecognizerShouldBegin(gestureRecognizer) }
+        return scene?.selectedSession?.muxState != nil && scene?.selectedSession?.clipboardIsPresenting != true
     }
 
     /// Switching machines cross-fades between their terminals.

@@ -1261,7 +1261,10 @@ pub fn export(
         // prefers a machine's existing panes.
         let mut mux_ids = Vec::new();
         for route in &machine.routes {
-            let MachineRoute::FrankenTermMux { id: mux_name, via, .. } = route else {
+            let MachineRoute::FrankenTermMux {
+                id: mux_name, via, ..
+            } = route
+            else {
                 continue;
             };
             let Some(command) = machine.mux_remote_command(mux_name) else {

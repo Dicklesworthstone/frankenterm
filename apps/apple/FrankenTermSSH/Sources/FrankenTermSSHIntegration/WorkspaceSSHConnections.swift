@@ -67,6 +67,9 @@ public actor WorkspaceSSHConnectionManager {
     private let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator
     private let networkActivity: WorkspaceNetworkActivity
     private let liveness: WorkspaceSSHLiveness
+    /// Makes the protocol client for a connection that attaches to a
+    /// machine's mux panes; without one every connection starts a shell.
+    private let muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)?
     private var foreground = false, requestedForeground = false, mustSuspend = false
     private var lifecycle = UUID()
     private var transition: Task<Void, Never>?
@@ -79,9 +82,11 @@ public actor WorkspaceSSHConnectionManager {
 
     public init(store: WorkspaceStore, broker: SSHAuthenticationBroker,
                 journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator,
-                networkActivity: WorkspaceNetworkActivity = .shared, liveness: WorkspaceSSHLiveness = .standard) {
+                networkActivity: WorkspaceNetworkActivity = .shared, liveness: WorkspaceSSHLiveness = .standard,
+                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil) {
         self.store = store; self.broker = broker; self.journal = journal
         self.coordinator = coordinator; self.networkActivity = networkActivity; self.liveness = liveness
+        self.muxClientFactory = muxClientFactory
     }
 
     public func resume() async {
@@ -223,7 +228,8 @@ public actor WorkspaceSSHConnectionManager {
     public func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
                         routeID: String, credentialID: String, confirmedByUser: Bool,
                         connectionTimeout: Duration = .seconds(15),
-                        authenticationTimeout: Duration = .seconds(60)) async throws -> WorkspaceSSHConnection {
+                        authenticationTimeout: Duration = .seconds(60),
+                        attachMux: Bool = true) async throws -> WorkspaceSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         guard foreground else { throw WorkspaceSSHConnectionError.offline }
         guard retiringWorkspaces[workspaceID] == nil else { throw WorkspaceSSHConnectionError.stale }
@@ -240,6 +246,7 @@ public actor WorkspaceSSHConnectionManager {
         let generation = lifecycle, attemptID = UUID()
         let store = self.store, broker = self.broker, journal = self.journal
         let coordinator = self.coordinator, networkActivity = self.networkActivity, liveness = self.liveness
+        let muxClientFactory = self.muxClientFactory
         let task = Task<WorkspaceSSHConnection, Error> {
             let fingerprints = try await credentialSnapshot(machine: machine, attemptID: attemptID,
                 generation: generation, expectedRevision: expectedRevision, credentialID: credentialID)
@@ -248,7 +255,7 @@ public actor WorkspaceSSHConnectionManager {
                 credentialID: credentialID, confirmedByUser: confirmedByUser,
                 store: store, broker: broker, journal: journal, networkActivity: networkActivity,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
-                liveness: liveness)
+                liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux)
             do {
                 try Task.checkCancellation()
                 return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator,
@@ -351,6 +358,8 @@ public final class WorkspaceSSHConnection: Sendable {
     public let identity: TerminalConnectionIdentity
     public let peer: NativeSSHPeer
     public let scope: TerminalSessionScope
+    /// The machine's mux panes when this connection attaches to them.
+    public var muxControl: TerminalMuxControl? { native.muxControl }
     fileprivate let credentialFingerprints: Set<String>
     private let native: WorkspaceNativeSSHConnection
     private let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator

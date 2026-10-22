@@ -1,0 +1,124 @@
+import Foundation
+import FrankenTermKit
+import CFrankenTermTerminal
+
+/// The Rust mux client (frankenterm-mobile-mux) behind ft_mux_v1_*: the
+/// protocol of the machine's FrankenTerm mux server, the same one the
+/// desktop app attaches to.
+///
+/// Sendability audit: lock serializes every C call and the handle. C keeps no
+/// borrowed buffer and never calls Swift. Returned Data owns its bytes.
+public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: UInt64
+
+    public init() throws {
+        var created: UInt64 = 0
+        try Self.check(ft_mux_v1_create(&created))
+        guard created != 0 else { throw TerminalModelError.invalid }
+        handle = created
+    }
+
+    deinit { if handle != 0 { _ = ft_mux_v1_release(handle) } }
+
+    private static func check(_ status: UInt32) throws {
+        switch status {
+        case UInt32(FT_TERMINAL_OK): return
+        case UInt32(FT_TERMINAL_INVALID): throw TerminalModelError.invalid
+        case UInt32(FT_TERMINAL_STALE): throw TerminalModelError.stale
+        case UInt32(FT_TERMINAL_CLOSED): throw TerminalModelError.closed
+        case UInt32(FT_TERMINAL_CAPACITY): throw TerminalModelError.capacity
+        case UInt32(FT_TERMINAL_PANIC): throw TerminalModelError.poisoned
+        default: throw TerminalModelError.invalid
+        }
+    }
+
+    private func call(_ operation: (UInt64) -> UInt32) throws {
+        try lock.withLock { try Self.check(operation(handle)) }
+    }
+
+    public func receive(_ bytes: Data) throws {
+        var offset = 0
+        while offset < bytes.count {
+            let count = min(bytes.count - offset, Int(FT_MUX_MAX_RECEIVE_BYTES))
+            try bytes[bytes.startIndex + offset ..< bytes.startIndex + offset + count].withUnsafeBytes { buffer in
+                try call { ft_mux_v1_receive($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(count)) }
+            }
+            offset += count
+        }
+    }
+
+    public func channelClosed() throws { try call { ft_mux_v1_closed($0) } }
+
+    public func outgoing(limit: Int) throws -> Data {
+        guard limit > 0 else { return Data() }
+        let capacity = min(limit, Int(FT_MUX_MAX_COPY_BYTES))
+        var bytes = Data(count: capacity), written: UInt32 = 0
+        try bytes.withUnsafeMutableBytes { buffer in
+            try call { ft_mux_v1_outgoing($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(capacity), &written) }
+        }
+        bytes.count = Int(written)
+        return bytes
+    }
+
+    public func nextEvent() throws -> TerminalMuxEvent? {
+        try lock.withLock {
+            var kind: UInt32 = 0, pane: UInt64 = 0, rows: UInt32 = 0, cols: UInt32 = 0, length: UInt32 = 0
+            try Self.check(ft_mux_v1_next_event(handle, &kind, &pane, &rows, &cols, &length))
+            var payload = Data(count: Int(length))
+            if length > 0 {
+                var written: UInt32 = 0
+                try payload.withUnsafeMutableBytes { buffer in
+                    try Self.check(ft_mux_v1_event_copy(handle, 0, buffer.bindMemory(to: UInt8.self).baseAddress,
+                                                        length, &written))
+                }
+                guard written == length else { throw TerminalModelError.invalid }
+            }
+            let paneID = Int(clamping: pane)
+            switch kind {
+            case UInt32(FT_MUX_EVENT_NONE): return nil
+            case UInt32(FT_MUX_EVENT_READY):
+                return .ready(serverVersion: String(decoding: payload, as: UTF8.self))
+            case UInt32(FT_MUX_EVENT_PANES):
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                return .panes(try decoder.decode([TerminalMuxPane].self, from: payload))
+            case UInt32(FT_MUX_EVENT_OUTPUT):
+                return .output(paneID: paneID, rows: Int(rows), columns: Int(cols), bytes: payload)
+            case UInt32(FT_MUX_EVENT_PANE_TITLE):
+                return .paneTitle(paneID: paneID, title: String(decoding: payload, as: UTF8.self))
+            case UInt32(FT_MUX_EVENT_PANE_GONE): return .paneGone(paneID: paneID)
+            case UInt32(FT_MUX_EVENT_FAILED): return .failed(String(decoding: payload, as: UTF8.self))
+            default: throw TerminalModelError.invalid
+            }
+        }
+    }
+
+    public func refreshPanes() throws { try call { ft_mux_v1_refresh_panes($0) } }
+    public func show(pane: Int) throws { try call { ft_mux_v1_show($0, UInt64(pane)) } }
+    public func hide(pane: Int) throws { try call { ft_mux_v1_hide($0, UInt64(pane)) } }
+
+    public func write(pane: Int, bytes: Data) throws {
+        guard !bytes.isEmpty else { return }
+        guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
+        try bytes.withUnsafeBytes { buffer in
+            try call { ft_mux_v1_write($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+        }
+    }
+
+    public func paste(pane: Int, text: String) throws {
+        let bytes = Data(text.utf8)
+        guard !bytes.isEmpty else { return }
+        guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
+        try bytes.withUnsafeBytes { buffer in
+            try call { ft_mux_v1_paste($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+        }
+    }
+
+    public func resize(pane: Int, rows: Int, columns: Int) throws {
+        guard (1...512).contains(rows), (1...512).contains(columns) else { throw TerminalModelError.invalid }
+        try call { ft_mux_v1_resize($0, UInt64(pane), UInt32(rows), UInt32(columns)) }
+    }
+
+    public func restoreSize(pane: Int) throws { try call { ft_mux_v1_restore_size($0, UInt64(pane)) } }
+}

@@ -12,7 +12,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA host
     /// keys, certificates, password/MFA, jumps and mux attachment are not enabled.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
-        routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+        routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
         hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"])
 

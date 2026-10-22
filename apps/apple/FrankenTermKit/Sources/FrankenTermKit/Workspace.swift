@@ -262,6 +262,9 @@ public struct WorkspaceDocument: Sendable {
         public let authenticationMethods: [AuthenticationMethod]
         public let jumpRoutes: [String]
         public let sessionCreation: String?, attachPolicy: String?, hostKeyAlias: String?
+        /// A frankenterm_mux route's command on the machine that reaches its
+        /// mux (`nc -N -U <socket>` or a relay), exactly what the desktop runs.
+        public let remoteCommand: String?
         public let requiredCapabilities: [String], requiredExtensions: [String]
     }
     public struct Credential: Identifiable, Sendable {
@@ -543,7 +546,8 @@ public struct WorkspaceDocument: Sendable {
         }
         routes = try records("routes", cap: 256).map {
             try $0.allowing(["id", "mode", "host", "port", "user", "credential_refs", "authentication_methods", "host_trust_ref",
-                             "jump_routes", "session_creation", "attach_policy", "host_key_alias", "required_capabilities"])
+                             "jump_routes", "session_creation", "attach_policy", "remote_command", "host_key_alias",
+                             "required_capabilities"])
             let mode = try $0.text("mode")
             // Via Mac has a different authentication schema; never reinterpret it as SSH.
             guard ["direct_ssh", "frankenterm_mux"].contains(mode) else { throw FTError.unsupported("route.mode") }
@@ -555,11 +559,16 @@ public struct WorkspaceDocument: Sendable {
             }
             guard !methods.isEmpty else { throw FTError.malformed("route.authentication_policy") }
             let creation = try $0["session_creation"]?.string(), attach = try $0["attach_policy"]?.string()
+            let command = try $0["remote_command"]?.string()
             if mode == "direct_ssh" {
-                guard attach == nil, creation.map({ ["on_select", "manual"].contains($0) }) ?? true else { throw FTError.unsupported("route.session_creation") }
+                guard attach == nil, command == nil,
+                      creation.map({ ["on_select", "manual"].contains($0) }) ?? true else { throw FTError.unsupported("route.session_creation") }
             } else {
                 guard creation == nil, attach == nil || attach == "existing_only" else { throw FTError.unsupported("route.attach_policy") }
             }
+            // The phone's SSH driver runs only printable ASCII commands.
+            if let command, command.isEmpty || command.utf8.count > 1024
+                || !command.utf8.allSatisfy({ (32...126).contains($0) }) { throw FTError.malformed("route.remote_command") }
             let originalHost = try $0.text("host")
             let user = try Self.displayText($0.text("user"), cap: 256)
             guard !user.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) }) else { throw FTError.malformed("route.user") }
@@ -568,6 +577,7 @@ public struct WorkspaceDocument: Sendable {
                          trustID: try Self.identifier($0.text("host_trust_ref")), authenticationMethods: methods, jumpRoutes: jumps,
                          sessionCreation: creation, attachPolicy: attach,
                          hostKeyAlias: try $0["host_key_alias"].map { try Self.host($0.string()) },
+                         remoteCommand: command,
                          requiredCapabilities: try Self.capabilities($0), requiredExtensions: try Self.requiredExtensions($0))
         }
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })

@@ -31,8 +31,11 @@ final class MobileConnections {
                                              support: WorkspaceNativeSSHAuthentication.routeSupport)
         coordinator = try TerminalInputCoordinator()
         journal = try TerminalSessionJournal(directory: journalDirectory, identifier: journalIdentifier)
+        // Machines with a FrankenTerm mux are attached to like the desktop app
+        // does: the same panes, through the Rust mux client.
         manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal,
-                                                coordinator: coordinator, liveness: liveness)
+                                                coordinator: coordinator, liveness: liveness,
+                                                muxClientFactory: { try NativeMuxClient() })
     }
 
     /// Admits connections and retries any cleanup that failed earlier. Sessions
@@ -49,10 +52,12 @@ final class MobileConnections {
     fileprivate func releaseCleanup(_ id: UUID) { pendingCleanup[id] = nil }
 }
 
-/// One ready direct-SSH route to a machine, with the key it uses: the first of
-/// the route's ordered references available on this device.
+/// One ready route to a machine, with the key it uses: the first of the
+/// route's ordered references available on this device. A mux route attaches
+/// to the machine's existing FrankenTerm panes instead of starting a shell.
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialID: String, host: String, port: UInt16
+    var mux = false
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -194,6 +199,11 @@ final class TerminalSessionController {
     private(set) var historyReturning = false
     private(set) var retainedOutput: TerminalRetainedOutput?
     private(set) var retainedOutputFailure: String?
+    /// The machine's mux panes and the one on screen, when this session is
+    /// attached to its FrankenTerm mux rather than a shell of its own.
+    private(set) var muxState: TerminalMuxControl.State?
+    /// No mux answered on this machine, so this session is a new shell.
+    private(set) var shellOnly = false
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -331,9 +341,18 @@ final class TerminalSessionController {
     /// Keep consuming this source's bytes/replies while it is offscreen, but
     /// stop allocating snapshots and preparing GPU frames. The scene owns this
     /// policy; changing presentation never changes the keyboard destination.
+    /// Puts another of the machine's mux panes on screen.
+    func showPane(_ paneID: Int) {
+        guard !stopped, phase == .live else { return }
+        connection?.muxControl?.request(pane: paneID)
+    }
+
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
+        // Only the machine on screen sizes its mux pane to the phone; the
+        // others give their panes back to the desktop's layout.
+        connection?.muxControl?.setVisible(visible)
         if !visible {
             interactionProblem = nil
             historyInspection?.retire()
@@ -396,12 +415,33 @@ final class TerminalSessionController {
     private func performStart() async {
         do {
             try checkStarting()
-            let connection = try await connectAcknowledgingEarlierSessions()
-            self.connection = connection
+            var attempt = try await connectAcknowledgingEarlierSessions()
+            self.connection = attempt
             try checkStarting()
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
-            let pump = try await connection.openTerminal(geometry: geometry)
+            let pump: TerminalSessionPump
+            do { pump = try await attempt.openTerminal(geometry: geometry) }
+            catch TerminalMuxError.unavailable {
+                // Nothing answered at the machine's mux socket: it gets a shell
+                // of its own instead, as before there was a mux to attach to.
+                Self.log.info("no mux on \(self.target.machineID, privacy: .public); opening a shell")
+                try? await connections.manager.close(connectionID: attempt.id)
+                self.connection = nil
+                shellOnly = true
+                try checkStarting()
+                attempt = try await connectAcknowledgingEarlierSessions()
+                self.connection = attempt
+                try checkStarting()
+                pump = try await attempt.openTerminal(geometry: geometry)
+            }
+            let connection = attempt
             self.pump = pump
+            if let control = connection.muxControl {
+                control.observe { [weak self] state in
+                    Task { @MainActor [weak self] in self?.muxState = state }
+                }
+                control.setVisible(presentationVisible)
+            }
             try checkStarting()
             let presenter = TerminalFramePresenter(source: pump.source, connection: connection)
             presenter.onUnavailable = { [weak self] reason in
@@ -549,13 +589,13 @@ final class TerminalSessionController {
         let onTailnet = WorkspaceRouteNetwork.deviceTailnetAddress() != nil
         let device = "this \(UIDevice.current.model)"
         var unreachable: [WorkspaceConnectionHelp] = []
-        for candidate in target.attemptOrder() {
+        for candidate in target.attemptOrder() where !(shellOnly && candidate.mux) {
             try checkStarting()
             route = candidate
             do {
                 return try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
-                    credentialID: candidate.credentialID, confirmedByUser: true)
+                    credentialID: candidate.credentialID, confirmedByUser: true, attachMux: !shellOnly)
             } catch is CancellationError {
                 throw CancellationError()
             } catch TerminalSessionJournalError.reviewRequired {

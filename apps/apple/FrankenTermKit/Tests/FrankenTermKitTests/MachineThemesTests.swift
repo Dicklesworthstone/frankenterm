@@ -33,6 +33,43 @@ final class MachineThemesTests: XCTestCase {
         try XCTUnwrap(document.machines.first { $0.id == id })
     }
 
+    /// A machine with a FrankenTerm mux offers it first: the phone attaches to
+    /// the desktop's panes by running the command the desktop runs there.
+    func testTheExportOffersEachMachinesMuxFirstWithTheDesktopsCommand() throws {
+        let document = try export()
+        let trj = try machine(document, "m.trj")
+        XCTAssertEqual(trj.preferredRouteID, "r.trj.mux")
+        XCTAssertEqual(trj.routeIDs, ["r.trj.mux", "r.trj.tailscale"])
+        let mux = try XCTUnwrap(document.routes.first { $0.id == "r.trj.mux" })
+        let ssh = try XCTUnwrap(document.routes.first { $0.id == "r.trj.tailscale" })
+        XCTAssertEqual(mux.mode, "frankenterm_mux")
+        XCTAssertEqual(mux.attachPolicy, "existing_only")
+        XCTAssertEqual(mux.remoteCommand, "nc -N -U /run/user/1000/frankenterm/sock")
+        XCTAssertNil(ssh.remoteCommand)
+        XCTAssertEqual(mux.host, ssh.host); XCTAssertEqual(mux.user, ssh.user); XCTAssertEqual(mux.trustID, ssh.trustID)
+    }
+
+    /// The phone's SSH driver runs only printable ASCII, and only mux routes
+    /// carry a command at all.
+    func testARemoteCommandTheDriverCannotRunIsRefused() throws {
+        func document(routeID: String, command: String) throws -> WorkspaceDocument {
+            let data = try Data(contentsOf: Self.repository.appendingPathComponent("fixtures/ios-airgap/machines-export.ftworkspace"))
+            var root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
+            var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+            let index = try XCTUnwrap(routes.firstIndex { $0["id"] as? String == routeID })
+            routes[index]["remote_command"] = command
+            workspace["routes"] = routes; root["workspace"] = workspace
+            return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root))
+        }
+        XCTAssertEqual(try document(routeID: "r.trj.mux", command: "ft-mux-proxy --pane-socket").routes
+            .first { $0.id == "r.trj.mux" }?.remoteCommand, "ft-mux-proxy --pane-socket")
+        XCTAssertThrowsError(try document(routeID: "r.trj.mux", command: "nc -N -U /s\nrm -rf ~"))
+        XCTAssertThrowsError(try document(routeID: "r.trj.mux", command: ""))
+        XCTAssertThrowsError(try document(routeID: "r.trj.mux", command: String(repeating: "x", count: 1025)))
+        XCTAssertThrowsError(try document(routeID: "r.trj.tailscale", command: "nc -N -U /s"))
+    }
+
     func testTheBundledCatalogOffersTheDistinctThemesFirstThenEveryScheme() throws {
         let catalog = try catalog()
         XCTAssertEqual(catalog.distinctCount, 12)
