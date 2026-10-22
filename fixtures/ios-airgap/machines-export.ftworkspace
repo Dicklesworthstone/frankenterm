@@ -72,8 +72,9 @@
         "auto_connect": false,
         "id": "m.trj",
         "name": "Threadripper",
-        "preferred_route_ref": "r.trj.tailscale",
+        "preferred_route_ref": "r.trj.mux",
         "route_refs": [
+          "r.trj.mux",
           "r.trj.tailscale"
         ],
         "tags": [],
@@ -94,8 +95,9 @@
         "auto_connect": false,
         "id": "m.dark",
         "name": "dark",
-        "preferred_route_ref": "r.dark.ssh",
+        "preferred_route_ref": "r.dark.mux",
         "route_refs": [
+          "r.dark.mux",
           "r.dark.ssh"
         ],
         "tags": [],
@@ -126,6 +128,23 @@
         "user": "ubuntu"
       },
       {
+        "attach_policy": "existing_only",
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [
+          "c.07899bb8cd6ceb021207a823"
+        ],
+        "host": "100.91.120.17",
+        "host_trust_ref": "h.727e8dda692b557fa6e50fe5",
+        "id": "r.trj.mux",
+        "jump_routes": [],
+        "mode": "frankenterm_mux",
+        "port": 22,
+        "remote_command": "nc -N -U /run/user/1000/frankenterm/sock",
+        "user": "ubuntu"
+      },
+      {
         "authentication_methods": [
           "publickey"
         ],
@@ -153,6 +172,21 @@
         "mode": "direct_ssh",
         "port": 22,
         "session_creation": "on_select",
+        "user": "unknown-user"
+      },
+      {
+        "attach_policy": "existing_only",
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [],
+        "host": "jumped",
+        "host_trust_ref": "h.d48b13425a68110a55a35d82",
+        "id": "r.dark.mux",
+        "jump_routes": [],
+        "mode": "frankenterm_mux",
+        "port": 22,
+        "remote_command": "nc -N -U /s",
         "user": "unknown-user"
       }
     ],
