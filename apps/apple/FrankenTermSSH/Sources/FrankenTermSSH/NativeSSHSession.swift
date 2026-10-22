@@ -8,13 +8,21 @@ import Glibc
 #endif
 
 public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
-    case invalidInput, busy, closed, timedOut, invalidChallenge
+    case invalidInput, busy, closed, timedOut, authenticationTimedOut, invalidChallenge
     case native(Int32)
     case resolution(Int32), connection(Int32)
 
     /// The socket itself failed: reset, closed by the peer, or unreadable.
     public var isConnectionFailure: Bool {
         if case let .native(code) = self { return code == FTSSH_IO }
+        return false
+    }
+
+    /// The approved server explicitly refused an unsigned public-key offer.
+    /// No signing callback ran. Only this evidence permits another configured
+    /// credential to be considered; signed/partial/unknown failures never do.
+    public var isCredentialRefused: Bool {
+        if case let .native(code) = self { return code == FTSSH_AUTH_REJECTED }
         return false
     }
 
@@ -33,6 +41,7 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
         case .busy: "Another operation is already using this connection."
         case .closed: "The connection is closed."
         case .timedOut: "The machine didn't answer in time."
+        case .authenticationTimedOut: "The SSH connection did not finish authentication in time."
         case .invalidChallenge: "The machine asked for authentication this app can't answer."
         case let .resolution(code): "The machine's name couldn't be looked up (\(String(cString: gai_strerror(code))))."
         case let .connection(code): "The machine couldn't be reached (\(String(cString: strerror(code))))."
@@ -42,6 +51,7 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
             case FTSSH_NEGOTIATION: "The machine's SSH server offers no encryption this app accepts."
             case FTSSH_HOST_REJECTED: "The machine's host key changed during the connection."
             case FTSSH_AUTH_REJECTED: "The machine didn't accept this key. Add the key's public half to ~/.ssh/authorized_keys on the machine."
+            case FTSSH_AUTH_FAILED: "SSH key authentication could not be completed. The server may require an additional authentication method."
             case FTSSH_CLOSED: "The machine closed the connection."
             case FTSSH_UNSUPPORTED: "The machine requires an SSH feature this app doesn't support."
             default: "The SSH connection failed (code \(code))."
@@ -276,7 +286,9 @@ public actor NativeSSHSession {
         } catch {
             await close()
             if Task.isCancelled { throw CancellationError() }
-            if ContinuousClock.now >= deadline { throw NativeSSHError.timedOut }
+            if ContinuousClock.now >= deadline || error as? NativeSSHError == .timedOut {
+                throw NativeSSHError.authenticationTimedOut
+            }
             throw error
         }
     }

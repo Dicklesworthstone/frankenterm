@@ -228,7 +228,9 @@ private final class ProbeSigner: WorkspaceSSHSigning, @unchecked Sendable {
     }
 }
 
-private func manifest(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16) throws -> WorkspaceDocument {
+private func manifest(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16,
+                      secondIdentity: SSHPublicIdentity? = nil) throws -> WorkspaceDocument {
+    let identities = [("key", identity)] + (secondIdentity.map { [("key-2", $0)] } ?? [])
     let theme: [String: Any] = ["id": "theme", "name": "Loopback", "foreground": "#FFFFFF", "background": "#10223C",
         "accent": "#3B82F6", "ansi": Array(repeating: "#123456", count: 16), "cursor_foreground": "#000000",
         "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF", "selection_background": "#345D91"]
@@ -237,10 +239,12 @@ private func manifest(identity: SSHPublicIdentity, host: SSHPublicIdentity, port
         "machines": [["id": "machine", "name": "Loopback", "theme_ref": "theme", "route_refs": ["route"],
                        "preferred_route_ref": "route", "auto_connect": true]],
         "routes": [["id": "route", "mode": "direct_ssh", "session_creation": "on_select", "host": "LOCALHOST.",
-                    "port": Int(port), "user": "operator", "credential_refs": ["key"], "authentication_methods": ["publickey"],
+                    "port": Int(port), "user": "operator", "credential_refs": identities.map { $0.0 }, "authentication_methods": ["publickey"],
                     "host_trust_ref": "trust", "jump_routes": []]],
-        "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
-                         "requirement": "matching_private_key", "private_material": "not_included"]],
+        "credentials": identities.map { id, identity in
+            ["id": id, "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
+             "requirement": "matching_private_key", "private_material": "not_included"]
+        },
         "host_trust": [["id": "trust", "host": "LOCALHOST.", "port": Int(port), "revoked_keys": [],
                         "pins": [["algorithm": host.algorithm, "fingerprint": host.fingerprint]]]],
         "themes": [theme], "preferences": ["initial_machine_ref": "machine", "initial_group_ref": "group", "connect_on_open": true]
@@ -321,6 +325,161 @@ private func durableJournal(directory: URL, identifier: String) throws -> Termin
     #else
     try TerminalSessionJournal(directory: directory, identifier: identifier)
     #endif
+}
+
+/// Suspend only between fully settled connection attempts. The parent exercises
+/// actual caller cancellation or changes durable authority before releasing it.
+private actor OrderedCredentialBoundary {
+    private var reached = false, released = false
+    private var observer: CheckedContinuation<Void, Never>?
+    private var continuation: CheckedContinuation<Void, Never>?
+    func pause() async {
+        reached = true; observer?.resume(); observer = nil
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func wait() async {
+        guard !reached else { return }
+        await withCheckedContinuation { observer = $0 }
+    }
+    func release() { released = true; continuation?.resume(); continuation = nil }
+}
+
+/// Use the same production attempt plan as the native controller. Every choice
+/// still passes through the actual store, manager, signer and native transport.
+private func exerciseOrderedCredentials(store: WorkspaceStore, installed: InstalledWorkspace,
+    document: WorkspaceDocument, broker: SSHAuthenticationBroker, signer: ProbeSigner,
+    directory: URL, host: Data, mode: String) async throws -> Int {
+    let journal = try durableJournal(directory: directory, identifier: "ordered-probe-" + UUID().uuidString)
+    let coordinator = try TerminalInputCoordinator()
+    let manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal, coordinator: coordinator)
+    await manager.resume()
+    let ready = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+    guard let entry = ready.first(where: { $0.workspace.id == installed.id }),
+          let route = entry.routes.first(where: { $0.routeID == "route" }), route.isLocallyReady,
+          route.usableCredentialIDs == ["key", "key-2"] else { throw WorkspaceProbeError.invalid }
+    let boundary = OrderedCredentialBoundary()
+    let operation = Task<WorkspaceSSHConnection, Error> {
+        var plan = try TerminalRouteAttemptPlan(routes: [.init(routeID: "route", credentialIDs: route.usableCredentialIDs)])
+        defer { plan.cancel() }
+        var offered = 0
+        while let attempt = plan.current {
+            try Task.checkCancellation()
+            offered += 1
+            let connection: WorkspaceSSHConnection
+            do {
+                connection = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
+                    machineID: "machine", routeID: attempt.selection.routeID, credentialID: attempt.selection.credentialID,
+                    confirmedByUser: true, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(6), attachMux: false)
+            } catch {
+                try Task.checkCancellation()
+                guard let failure = error as? NativeSSHError, failure.isCredentialRefused else {
+                    _ = try plan.failed(.terminal, attempt: attempt)
+                    throw error
+                }
+                guard offered == 1, attempt.selection.credentialID == "key", signer.calls == 0,
+                      await !broker.isBusy, await manager.pendingCount == 0,
+                      await manager.connections().isEmpty,
+                      WorkspaceNetworkActivity.shared.accounting().connections == 0,
+                      NativeSSHConnector.accounting().resolvingHosts == 0,
+                      NativeSSHConnector.accounting().connectingSockets == 0,
+                      try await journal.records().isEmpty else { throw WorkspaceProbeError.invalid }
+                guard try plan.failed(.credentialRefused, attempt: attempt)?.selection.credentialID == "key-2" else {
+                    throw WorkspaceProbeError.invalid
+                }
+                if mode != "orderedSuccess" { await boundary.pause() }
+                continue
+            }
+            do {
+                try Task.checkCancellation()
+                guard offered == 2, try plan.connected(attempt).credentialID == "key-2",
+                      connection.peer.hostKey == host, signer.calls == 1,
+                      try await journal.records().isEmpty else { throw WorkspaceProbeError.invalid }
+                return connection
+            } catch { try? await manager.close(connectionID: connection.id); throw error }
+        }
+        throw WorkspaceProbeError.unexpected
+    }
+    if mode != "orderedSuccess" {
+        await boundary.wait()
+        switch mode {
+        case "orderedCancel":
+            // Like a synchronously sealed native scene, cancel before awaiting
+            // manager invalidation; a bare invalidate permits a NEW user action.
+            operation.cancel()
+            await manager.invalidate(workspaceID: installed.id)
+        case "orderedRevokeNext":
+            guard let next = document.credentials.first(where: { $0.id == "key-2" }) else { throw WorkspaceProbeError.invalid }
+            let result = try await manager.revokeCredentialLocally(fingerprint: next.fingerprint, confirmedByUser: true)
+            guard result.durableDenialConfirmed, result.affectedWorkspaceIDs == [installed.id],
+                  result.retainedConnectionIDs.isEmpty else { throw WorkspaceProbeError.invalid }
+        case "orderedStaleRevision":
+            let crypto = ProbeCryptography()
+            let replacement = try AirGapArchive(workspace: document.reissuingBundle(id: "ordered-reimport"), keys: [], using: crypto)
+            let imported = try await store.install(replacement, envelopeDigest: crypto.sha256(try replacement.encoded()),
+                expectedRevision: installed.revision, sourceAndContentsConfirmed: true,
+                securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
+            guard imported.revision != installed.revision else { throw WorkspaceProbeError.invalid }
+            await manager.invalidate(workspaceID: installed.id)
+        case "orderedSuspend": await manager.suspend()
+        default: throw WorkspaceProbeError.invalid
+        }
+        await boundary.release()
+        do { _ = try await operation.value; throw WorkspaceProbeError.unexpected }
+        catch {
+            switch mode {
+            case "orderedCancel": guard error is CancellationError else { throw error }
+            case "orderedRevokeNext": guard error as? SSHAuthenticationError == .denied else { throw error }
+            case "orderedStaleRevision": guard error as? SSHAuthenticationError == .stale else { throw error }
+            case "orderedSuspend": guard error as? WorkspaceSSHConnectionError == .offline else { throw error }
+            default: throw error
+            }
+        }
+        guard signer.calls == 0, await !broker.isBusy, await manager.pendingCount == 0,
+              await manager.connections().isEmpty, try await journal.records().isEmpty,
+              WorkspaceNetworkActivity.shared.accounting().connections == 0,
+              NativeSSHConnector.accounting().resolvingHosts == 0,
+              NativeSSHConnector.accounting().connectingSockets == 0 else { throw WorkspaceProbeError.invalid }
+        await manager.suspend()
+        return 0
+    }
+    let connection = try await operation.value
+    let pump = try await connection.openTerminal(geometry: .init(columns: 80, rows: 24))
+    let consumer = ManagedConsumer(source: pump.source, connection: connection)
+    let run = Task { try await pump.run(consumer: consumer) }
+    let watchdog = Task {
+        do { try await Task.sleep(for: .seconds(7)); pump.requestStop() } catch {}
+    }
+    defer { watchdog.cancel() }
+    do {
+        try await consumer.waitForGreeting()
+        let stream = try await coordinator.makeStream(sceneID: UUID())
+        let focus = try await coordinator.changeFocus(stream, to: pump.source)
+        let payload = Data("protected workspace → actual SSH 🦀\r\nEND-SESSION\r".utf8)
+        let receipt = try await coordinator.submit(focus, encodedBytes: payload)
+        guard try await run.value == .completed(.init(remoteExit: nil, channelClosed: true)) else { throw WorkspaceProbeError.invalid }
+        try await consumer.verify(receipt: receipt, payload: payload)
+        try await mustFail { try await manager.close(connectionID: connection.id) }
+        try await coordinator.suspend(focus)
+        try await pump.reconcileStoppedOutcomes { outcomes, source in try await connection.recordInput(outcomes, source: source) }
+        try await connection.prepareInputSettlement(source: pump.source)
+        try await coordinator.retire(pump.source)
+        try await manager.close(connectionID: connection.id)
+        let records = try await journal.records(), closed = await coordinator.accounting()
+        guard records.count == 1, records[0].scope == connection.scope, records[0].state == .interrupted,
+              records[0].canResolve, records[0].inputEvidence.contains(.transportAccepted),
+              closed.connections == 0, closed.streams == 0, closed.retainedBytes == 0,
+              closed.inFlightBytes == 0, await manager.pendingCount == 0,
+              await manager.connections().isEmpty,
+              WorkspaceNetworkActivity.shared.accounting().connections == 0 else { throw WorkspaceProbeError.invalid }
+        try await journal.resolve(records[0])
+        await manager.suspend()
+        return payload.count
+    } catch {
+        pump.requestStop(); try? await manager.close(connectionID: connection.id)
+        _ = try? await run.value
+        throw error
+    }
 }
 
 private func exerciseManagedConnection(store: WorkspaceStore, installed: InstalledWorkspace,
@@ -677,18 +836,28 @@ private enum WorkspaceProbe {
         let positive: Set<String> = ["io", "foreignCancel"]
         let crypto = ProbeCryptography(), key = try PrivateKeyRecord.fromPEM(Data(pemText.utf8), credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
-        let document = try manifest(identity: identity, host: host, port: port)
-        let archive = try AirGapArchive(workspace: document, keys: [key], using: crypto)
+        let second = try request["secondPEM"].map { try PrivateKeyRecord.fromPEM(Data($0.utf8), credentialID: "key-2", using: crypto) }
+        let document = try manifest(identity: identity, host: host, port: port,
+            secondIdentity: second.map { try SSHPublicIdentity(blob: $0.publicBlob) })
+        let archive = try AirGapArchive(workspace: document, keys: [key] + (second.map { [$0] } ?? []), using: crypto)
         let vault = ProbeVault(), persistence = ProbePersistence()
         let store = WorkspaceStore(persistence: persistence, vault: vault)
         let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
             transferID: Data(repeating: 1, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         guard installed.connectLater, document.routes.first?.host == "localhost" else { throw WorkspaceProbeError.invalid }
         let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
-            credentialAlgorithms: [identity.algorithm], hostKeyAlgorithms: [host.algorithm])
+            credentialAlgorithms: Set(document.credentials.map(\.algorithm)), hostKeyAlgorithms: [host.algorithm])
         let signer = ProbeSigner(vault: vault, held: delayed.contains(mode))
         let broker = SSHAuthenticationBroker(store: store, signer: signer, support: support)
         await broker.resume()
+        if mode.hasPrefix("ordered") {
+            guard second != nil, let path = request["journalDirectory"] else { throw WorkspaceProbeError.invalid }
+            let bytes = try await exerciseOrderedCredentials(store: store, installed: installed, document: document,
+                broker: broker, signer: signer, directory: URL(fileURLWithPath: path, isDirectory: true), host: hostBlob, mode: mode)
+            FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: ["mode": mode, "bytes": bytes,
+                "signs": signer.calls, "closed": true], options: [.sortedKeys]) + Data([10]))
+            return
+        }
         if ["managedRevokeDuring", "managedRevokeDuringReimport", "managedRevokeAfterReimport"].contains(mode) {
             try await exerciseManagedRevocation(store: store, installed: installed, broker: broker, signer: signer,
                 document: document, fingerprint: identity.fingerprint, duringAuthentication: delayed.contains(mode),

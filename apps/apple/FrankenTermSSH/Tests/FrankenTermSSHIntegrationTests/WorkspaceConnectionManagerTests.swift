@@ -4,16 +4,67 @@ import FrankenTermKit
 import FrankenTermSSH
 import FrankenTermSSHIntegration
 
+/// Park the manager's real store read, then finish with a retryable-looking
+/// error even if the task was cancelled. A completed task does not replace its
+/// original error when cancellation arrives; the manager must fence that result.
+private final class ConnectionManagerFailureGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var started = false, released = false, cancelled = false
+    private var startObserver: CheckedContinuation<Void, Never>?
+    private var cancellationObserver: CheckedContinuation<Bool, Never>?
+
+    func pauseAndFail() throws {
+        condition.lock()
+        guard !started else { condition.unlock(); return }
+        started = true
+        let observer = startObserver; startObserver = nil
+        condition.unlock(); observer?.resume(); condition.lock()
+        let deadline = Date().addingTimeInterval(3)
+        while !released {
+            if Task.isCancelled, !cancelled {
+                cancelled = true
+                let observer = cancellationObserver; cancellationObserver = nil
+                condition.unlock(); observer?.resume(returning: true); condition.lock()
+            }
+            if Date() >= deadline { released = true; break }
+            _ = condition.wait(until: min(Date().addingTimeInterval(0.01), deadline))
+        }
+        let cancellation = cancellationObserver; cancellationObserver = nil
+        let observed = cancelled
+        condition.unlock(); cancellation?.resume(returning: observed)
+        throw NativeSSHError.native(-1006)
+    }
+    func waitUntilStarted() async {
+        await withCheckedContinuation { observer in
+            condition.lock()
+            if started { condition.unlock(); observer.resume() }
+            else { startObserver = observer; condition.unlock() }
+        }
+    }
+    func waitUntilCancelled() async -> Bool {
+        await withCheckedContinuation { observer in
+            condition.lock()
+            if cancelled || released {
+                let value = cancelled; condition.unlock(); observer.resume(returning: value)
+            } else { cancellationObserver = observer; condition.unlock() }
+        }
+    }
+    func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
 private final class ConnectionManagerPersistence: WorkspacePersistence, @unchecked Sendable {
     private let lock = NSRecursiveLock()
+    private let failure: ConnectionManagerFailureGate?
     private var slots: [String: Data] = [:]
     private var leases = 0
+    init(failure: ConnectionManagerFailureGate? = nil) { self.failure = failure }
     var accesses: Int { lock.withLock { leases } }
     func withExclusiveAccess<T>(_ body: () throws -> T) throws -> T {
         try lock.withLock { leases += 1; return try body() }
     }
     func read(_ slot: WorkspaceStorageSlot, limit: Int) throws -> Data? {
-        try lock.withLock {
+        if slot == .catalog { try failure?.pauseAndFail() }
+        return try lock.withLock {
             guard let value = slots[slot.rawValue] else { return nil }
             guard value.count <= limit else { throw FTError.storage }
             return value
@@ -47,8 +98,8 @@ final class WorkspaceConnectionManagerTests: XCTestCase, @unchecked Sendable {
         let journal: TerminalSessionJournal
         let networkActivity: WorkspaceNetworkActivity
     }
-    private func fixture() throws -> Fixture {
-        let storePersistence = ConnectionManagerPersistence(), sessionPersistence = ConnectionManagerPersistence()
+    private func fixture(failure: ConnectionManagerFailureGate? = nil) throws -> Fixture {
+        let storePersistence = ConnectionManagerPersistence(failure: failure), sessionPersistence = ConnectionManagerPersistence()
         let vault = ConnectionManagerVault(), store = WorkspaceStore(persistence: storePersistence, vault: vault)
         let support = WorkspaceNativeSSHAuthentication.routeSupport
         let broker = SSHAuthenticationBroker(store: store, signer: vault, support: support)
@@ -110,6 +161,50 @@ final class WorkspaceConnectionManagerTests: XCTestCase, @unchecked Sendable {
         } catch { XCTAssertEqual(error as? WorkspaceNetworkError, .confirmationRequired) }
         XCTAssertEqual(fixture.storePersistence.accesses, 0)
         XCTAssertEqual(fixture.sessionPersistence.accesses, 0)
+        XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+    }
+
+    func testRetiredAttemptCannotPublishItsOriginalFallbackEligibleError() async throws {
+        for action in ["cancel", "invalidate", "suspend"] {
+            let failure = ConnectionManagerFailureGate(), fixture = try fixture(failure: failure)
+            await fixture.manager.resume()
+            let workspaceID = UUID()
+            let attempt = Task {
+                try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: UUID(),
+                    machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true)
+            }
+            await failure.waitUntilStarted()
+            let retirement: Task<Void, Never>?
+            switch action {
+            case "invalidate": retirement = Task { await fixture.manager.invalidate(workspaceID: workspaceID) }
+            case "suspend": retirement = Task { await fixture.manager.suspend() }
+            default: attempt.cancel(); retirement = nil
+            }
+            let cancelled = await failure.waitUntilCancelled()
+            failure.release()
+            XCTAssertTrue(cancelled, action)
+            do { _ = try await attempt.value; XCTFail("Retired attempt succeeded: \(action)") }
+            catch { XCTAssertTrue(error is CancellationError, "\(action): \(error)") }
+            await retirement?.value
+            let pending = await fixture.manager.pendingCount, connections = await fixture.manager.connections()
+            XCTAssertEqual(pending, 0); XCTAssertTrue(connections.isEmpty)
+            XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+            XCTAssertEqual(fixture.sessionPersistence.accesses, 0, "No shell marker before authentication")
+        }
+    }
+
+    func testCurrentAttemptPreservesItsActualFailureAfterCleanup() async throws {
+        let failure = ConnectionManagerFailureGate(), fixture = try fixture(failure: failure)
+        await fixture.manager.resume()
+        let attempt = Task {
+            try await fixture.manager.connect(workspaceID: UUID(), expectedRevision: UUID(),
+                machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true)
+        }
+        await failure.waitUntilStarted(); failure.release()
+        do { _ = try await attempt.value; XCTFail("Faulted attempt succeeded") }
+        catch { XCTAssertEqual(error as? NativeSSHError, .native(-1006)) }
+        let pending = await fixture.manager.pendingCount, connections = await fixture.manager.connections()
+        XCTAssertEqual(pending, 0); XCTAssertTrue(connections.isEmpty)
         XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
     }
 }

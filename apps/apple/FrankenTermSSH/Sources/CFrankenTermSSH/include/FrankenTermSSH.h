@@ -20,7 +20,8 @@ enum {
     FTSSH_INVALID = -1000, FTSSH_STATE = -1001, FTSSH_LIMIT = -1002,
     FTSSH_IO = -1003, FTSSH_NEGOTIATION = -1004, FTSSH_HOST_REJECTED = -1005,
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
-    FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010
+    FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010,
+    FTSSH_AUTH_FAILED = -1011
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024 };
 
@@ -58,6 +59,16 @@ int ftssh_approve_host_key(ftssh_session *session, const uint8_t *key, size_t le
  * automatic fallback, or private-key material enters this adapter. */
 int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t user_length,
                              const uint8_t *public_blob, size_t blob_length);
+/* Discovers supported methods after host approval, then offers only this key.
+ * FTSSH_AUTH_REJECTED means the server explicitly refused the unsigned public
+ * key offer before entering the signing callback. Only that result permits an
+ * owner to consider another explicitly configured identity on a new connection.
+ * FTSSH_AUTH_FAILED is terminal: libssh2 cannot distinguish signed rejection
+ * from partial authentication or some protocol failures. It NEVER permits key
+ * fallback. No publickey method, or success without the selected key's signature,
+ * is FTSSH_UNSUPPORTED. Every authentication failure terminates this handle;
+ * no shell is opened.
+ */
 int ftssh_authentication_step(ftssh_session *session);
 /* Challenge is the exact bounded RFC 4252 preimage produced by libssh2. Its
  * service, method, user, public key and algorithm were checked before retention.

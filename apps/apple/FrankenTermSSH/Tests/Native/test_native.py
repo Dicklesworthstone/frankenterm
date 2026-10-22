@@ -117,12 +117,18 @@ def signature(key, data):
 
 
 class LoopbackServer:
-    def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown"):
+    def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
+                 auth_mode="normal", connections=1):
+        if not isinstance(connections, int) or not 1 <= connections <= 8:
+            raise ValueError("test connection count must be bounded")
         self.public = public_blob(key)
         self.host_key = ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.reject = reject
         self.completion = completion
+        self.auth_mode = auth_mode
+        self.connections = connections
+        self.accepted_connections = 0
         self.output_eof = threading.Event()
         self.control_flood_ready = threading.Event()
         self.release_completion = threading.Event()
@@ -132,17 +138,39 @@ class LoopbackServer:
         self.listener = socket.socket(family, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1" if family == socket.AF_INET else "::1", 0))
         self.listener.listen(1)
-        self.listener.settimeout(5)
+        self.listener.settimeout(0.1)
         self.address = self.listener.getsockname()
         self.control = None
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def run(self):
-        session, server, key, channel = None, None, P(), None
         try:
-            sock, _ = self.listener.accept()
-            self.control = sock.dup()
+            for _ in range(self.connections):
+                if self.stop.is_set() or self.errors:
+                    break
+                self.run_connection()
+        finally:
+            self.done.set()
+
+    def run_connection(self):
+        session, server, key, channel = None, None, P(), None
+        control = None
+        try:
+            accept_deadline = time.monotonic() + 5
+            while not self.stop.is_set():
+                try:
+                    sock, _ = self.listener.accept()
+                    break
+                except socket.timeout:
+                    if time.monotonic() >= accept_deadline:
+                        raise TimeoutError("test connection accept exceeded deadline")
+            else:
+                return
+            self.accepted_connections += 1
+            self.events.append(("connection", self.accepted_connections))
+            control = sock.dup()
+            self.control = control
             pem = self.host_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
             if SERVER.ssh_pki_import_privkey_base64(pem, None, None, None, C.byref(key)) != 0:
                 raise RuntimeError("test host-key import failed")
@@ -158,7 +186,7 @@ class LoopbackServer:
                 raise RuntimeError("test accept failed")
             if SERVER.ssh_handle_key_exchange(session) != 0:
                 return  # client rejection/cancellation is an exercised path
-            SERVER.ssh_set_auth_methods(session, 4)
+            SERVER.ssh_set_auth_methods(session, 2 if self.auth_mode == "publickeyDisabled" else 4)
             while not self.stop.is_set():
                 message = SERVER.ssh_message_get(session)
                 if not message:
@@ -167,6 +195,12 @@ class LoopbackServer:
                     kind, subtype = SERVER.ssh_message_type(message), SERVER.ssh_message_subtype(message)
                     if kind == 4:
                         SERVER.ssh_message_service_reply_success(message)
+                    elif kind == 1 and subtype == 1:
+                        self.events.append(("authentication-methods", SERVER.ssh_message_auth_user(message)))
+                        if self.auth_mode == "noneSucceeds":
+                            SERVER.ssh_message_auth_reply_success(message, 0)
+                        else:
+                            SERVER.ssh_message_reply_default(message)
                     elif kind == 1 and subtype == 4:
                         pubkey = SERVER.ssh_message_auth_pubkey(message)
                         encoded = P()
@@ -179,12 +213,24 @@ class LoopbackServer:
                         state = SERVER.ssh_message_auth_publickey_state(message)
                         user = SERVER.ssh_message_auth_user(message)
                         self.events.append(("authentication", state, user, offered))
+                        if self.auth_mode == "disconnectOffer" or (self.auth_mode == "disconnectSignature" and state == 1):
+                            control.shutdown(socket.SHUT_RDWR)
+                            return
                         if self.reject or offered != self.public or user != b"operator":
                             SERVER.ssh_message_reply_default(message)
                         elif state == 0:
-                            SERVER.ssh_message_auth_reply_pk_ok_simple(message)
+                            if self.auth_mode == "unsignedSuccess":
+                                SERVER.ssh_message_auth_reply_success(message, 0)
+                            else:
+                                SERVER.ssh_message_auth_reply_pk_ok_simple(message)
                         elif state == 1:
-                            SERVER.ssh_message_auth_reply_success(message, 0)
+                            if self.auth_mode == "rejectSignature":
+                                SERVER.ssh_message_reply_default(message)
+                            elif self.auth_mode == "partial":
+                                SERVER.ssh_set_auth_methods(session, 2)
+                                SERVER.ssh_message_auth_reply_success(message, 1)
+                            else:
+                                SERVER.ssh_message_auth_reply_success(message, 0)
                         else:
                             SERVER.ssh_message_reply_default(message)
                     elif kind == 2 and subtype == 1:
@@ -279,17 +325,24 @@ class LoopbackServer:
                 SERVER.ssh_bind_free(server)
             if key:
                 SERVER.ssh_key_free(key)
-            self.done.set()
+            # Preserve the fixture's final TCP lifetime until close(), so the
+            # client can drain SSH channel-close evidence before socket EOF.
+            # Earlier attempts retire completely before the next accept.
+            if control and self.accepted_connections < self.connections:
+                control.close()
+                if self.control is control:
+                    self.control = None
 
     def close(self):
         self.stop.set()
         self.release_completion.set()
-        if self.control:
+        control = self.control
+        if control:
             try:
-                self.control.shutdown(socket.SHUT_RDWR)
+                control.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self.control.close()
+            control.close()
         self.listener.close()
         self.thread.join(3)
         if self.thread.is_alive():
@@ -315,9 +368,9 @@ class NativeSSHTests(unittest.TestCase):
         for server in self.servers:
             server.close()
 
-    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown"):
+    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal"):
         key = key or ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        server = LoopbackServer(key, reject, family, completion)
+        server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode)
         self.servers.append(server)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -349,15 +402,15 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(function(handle, buffer, cap, C.byref(count)), 0)
         return buffer.raw[:count.value]
 
-    def authenticate(self, handle, server, key):
+    def authenticate(self, handle, server, key, terminal=(0,)):
         self.advance(handle, DRIVER.ftssh_handshake)
         actual = self.data(handle, DRIVER.ftssh_copy_host_key)
         self.assertEqual(actual, server.host_blob)
         self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
         blob = public_blob(key)
         self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
-        outcome = self.advance(handle, DRIVER.ftssh_authentication_step, (2, -1006))
-        if outcome == -1006:
+        outcome = self.advance(handle, DRIVER.ftssh_authentication_step, (2, -1006) + terminal)
+        if outcome != 2:
             return outcome
         challenge = self.data(handle, DRIVER.ftssh_copy_challenge, 1024)
         sid, rest = take_string(challenge)
@@ -371,8 +424,7 @@ class NativeSSHTests(unittest.TestCase):
         signed = signature(key, challenge)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
-        self.advance(handle, DRIVER.ftssh_authentication_step)
-        return 0
+        return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
 
     def test_real_authentication_pty_unicode_data_and_resize_for_four_key_families(self):
         keys = [ed25519.Ed25519PrivateKey.generate()] + [ec.generate_private_key(c) for c in [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()]]
@@ -530,7 +582,50 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_close(handle), 0)
         self.assertTrue(server.done.wait(2))
         self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0])
+        self.assertEqual([e[1] for e in server.events if e[0] == "authentication-methods"], [b"operator"])
         self.assertFalse(any(e[0] == "shell" for e in server.events))
+
+    def test_disabled_publickey_and_none_success_cannot_offer_a_key_or_open_a_channel(self):
+        for mode in ["publickeyDisabled", "noneSucceeds"]:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(auth_mode=mode)
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(-1010,)), -1010)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication-methods"], [b"operator"])
+                self.assertFalse(any(e[0] in ("authentication", "channel", "pty", "shell") for e in server.events))
+
+    def test_unsigned_publickey_success_is_not_key_authentication(self):
+        handle, server, key = self.start(auth_mode="unsignedSuccess")
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(-1010,)), -1010)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0])
+        self.assertFalse(any(e[0] in ("channel", "pty", "shell") for e in server.events))
+
+    def test_signed_rejection_and_partial_authentication_are_terminal_not_refusal(self):
+        for mode in ["rejectSignature", "partial"]:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(auth_mode=mode)
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(-1011,)), -1011)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1011)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+                self.assertFalse(any(e[0] in ("channel", "pty", "shell") for e in server.events))
+
+    def test_lost_socket_before_or_after_signature_is_never_key_refusal(self):
+        for mode, states in [("disconnectOffer", [0]), ("disconnectSignature", [0, 1])]:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(auth_mode=mode)
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(-1003,)), -1003)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1003)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], states)
+                self.assertFalse(any(e[0] in ("channel", "pty", "shell") for e in server.events))
 
     def test_ipv6_socket_and_idempotent_close(self):
         handle, server, key = self.start(family=socket.AF_INET6)

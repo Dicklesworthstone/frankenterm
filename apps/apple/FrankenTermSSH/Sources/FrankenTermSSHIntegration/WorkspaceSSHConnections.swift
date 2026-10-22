@@ -267,9 +267,21 @@ public actor WorkspaceSSHConnectionManager {
         }
         pending[machine] = .init(id: attemptID, machine: machine, task: task)
         defer { if pending[machine]?.id == attemptID { pending.removeValue(forKey: machine) } }
-        let connection = try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: { task.cancel() }
+        let connection: WorkspaceSSHConnection
+        do {
+            connection = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: { task.cancel() }
+        } catch {
+            // A completed task retains its original error even when revocation
+            // or invalidation cancels it before this continuation runs. Never
+            // let that obsolete key refusal authorize the caller's next key.
+            try Task.checkCancellation()
+            guard !task.isCancelled else { throw CancellationError() }
+            guard foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,
+                  pending[machine]?.id == attemptID else { throw WorkspaceSSHConnectionError.stale }
+            throw error
+        }
         do {
             try Task.checkCancellation()
             guard !task.isCancelled, foreground, lifecycle == generation, retiringWorkspaces[workspaceID] == nil,

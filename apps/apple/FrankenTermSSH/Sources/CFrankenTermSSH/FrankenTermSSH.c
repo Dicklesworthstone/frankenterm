@@ -35,6 +35,7 @@ struct ftssh_session {
     uint8_t public_blob[512], challenge[1024], signature[256];
     size_t public_length, challenge_length, signature_length;
     int signature_consumed, resize_pending;
+    int auth_methods_checked, sign_callback_entered, sign_error, socket_failed;
     uint32_t geometry[4], resize_geometry[4];
     /* A command channel (no PTY) carries binary data, so stderr is dropped. */
     char command[FTSSH_COMMAND_CAPACITY + 1];
@@ -96,6 +97,7 @@ static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length,
     flags |= MSG_NOSIGNAL;
 #endif
     ssize_t result = send(fd, data, length, flags);
+    if((result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) || (!result && length)) s->socket_failed = 1;
     return result < 0 ? -errno : result;
 }
 static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, int flags, void **abstract) {
@@ -106,11 +108,18 @@ static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, in
         if(length > s->receive_budget) length = s->receive_budget;
     }
     ssize_t result = recv(fd, data, length, flags);
+    if((result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) || (!result && length)) s->socket_failed = 1;
     if(result > 0) {
         if(s->limited_receive) s->receive_budget -= (size_t)result;
         if((uint64_t)result <= UINT64_MAX - s->received) s->received += (uint64_t)result;
     }
     return result < 0 ? -errno : result;
+}
+static void socket_disconnected(LIBSSH2_SESSION *ssh, int reason, const char *message, int message_length,
+                                const char *language, int language_length, void **abstract) {
+    (void)ssh; (void)reason; (void)message; (void)message_length; (void)language; (void)language_length;
+    ftssh_session *s = *abstract;
+    s->socket_failed = 1;
 }
 static int fail(ftssh_session *s, int code) {
     s->phase = FAILED; s->terminal_error = code; return code;
@@ -173,6 +182,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     libssh2_session_set_blocking(s->ssh, 0);
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_SEND, (libssh2_cb_generic *)socket_send);
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_RECV, (libssh2_cb_generic *)socket_receive);
+    libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_DISCONNECT, (libssh2_cb_generic *)socket_disconnected);
     const struct { int method; const char *allowed; } policies[] = {
         {LIBSSH2_METHOD_KEX, "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"},
         {LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"},
@@ -250,42 +260,107 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
     memcpy(s->public_blob, blob, length); s->public_length = length;
     s->phase = AUTH; return FTSSH_OK;
 }
+static int reject_challenge(ftssh_session *s) {
+    s->sign_error = FTSSH_CHALLENGE;
+    return LIBSSH2_ERROR_INVAL;
+}
 static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t *signature_length,
                          const unsigned char *data, size_t length, void **abstract) {
     (void)ssh;
     ftssh_session *s = *abstract;
+    s->sign_callback_entered = 1;
     *signature = NULL; *signature_length = 0;
     const uint8_t *cursor = data, *sid; size_t left = length, sid_length;
     if(length > sizeof(s->challenge) || !field(&cursor, &left, &sid, &sid_length) ||
-       !(sid_length == 32 || sid_length == 48 || sid_length == 64) || !left || *cursor++ != 50) return -1;
+       !(sid_length == 32 || sid_length == 48 || sid_length == 64) || !left || *cursor++ != 50) return reject_challenge(s);
     left--;
     if(!expected_field(&cursor, &left, s->user, strlen(s->user)) ||
        !expected_field(&cursor, &left, "ssh-connection", 14) ||
-       !expected_field(&cursor, &left, "publickey", 9) || !left || *cursor++ != 1) return -1;
+       !expected_field(&cursor, &left, "publickey", 9) || !left || *cursor++ != 1) return reject_challenge(s);
     left--;
     if(!expected_field(&cursor, &left, s->algorithm, strlen(s->algorithm)) ||
-       !expected_field(&cursor, &left, s->public_blob, s->public_length) || left) return -1;
-    if(s->challenge_length && (s->challenge_length != length || !equal(s->challenge, data, length))) return -1;
+       !expected_field(&cursor, &left, s->public_blob, s->public_length) || left) return reject_challenge(s);
+    if(s->challenge_length && (s->challenge_length != length || !equal(s->challenge, data, length))) return reject_challenge(s);
     if(!s->challenge_length) { memcpy(s->challenge, data, length); s->challenge_length = length; }
-    if(s->signature_consumed) return -1;
+    if(s->signature_consumed) return reject_challenge(s);
     if(!s->signature_length) return LIBSSH2_ERROR_EAGAIN;
     void *context = s;
     unsigned char *owned = allocate(s->signature_length, &context);
-    if(!owned) return LIBSSH2_ERROR_ALLOC;
+    if(!owned) { s->sign_error = FTSSH_LIMIT; return LIBSSH2_ERROR_ALLOC; }
     memcpy(owned, s->signature, s->signature_length);
     *signature = owned; *signature_length = s->signature_length;
     s->signature_consumed = 1;
     memset(s->signature, 0, sizeof(s->signature));
     return 0;
 }
+
+/* The public library API returns a terminated name-list. Bound the complete
+ * list and validate every token before accepting an exact publickey token. */
+static int publickey_method(const char *methods) {
+    if(!methods) return FTSSH_AUTH_FAILED;
+    size_t length = strnlen(methods, 1025), start = 0;
+    if(length > 1024) return FTSSH_LIMIT;
+    if(!length) return FTSSH_UNSUPPORTED;
+    int found = 0;
+    for(size_t i = 0; i <= length; i++) {
+        if(i == length || methods[i] == ',') {
+            if(i == start) return FTSSH_AUTH_FAILED;
+            if(i - start == 9 && memcmp(methods + start, "publickey", 9) == 0) found = 1;
+            start = i + 1;
+        } else if((unsigned char)methods[i] < 33 || (unsigned char)methods[i] > 126) {
+            return FTSSH_AUTH_FAILED;
+        }
+    }
+    return found ? FTSSH_OK : FTSSH_UNSUPPORTED;
+}
+
+static int authentication_result(ftssh_session *s, int rc, int authenticated, int offered) {
+    /* libssh2 overwrites receive and callback errors with PUBLICKEY_UNVERIFIED.
+     * Preserve evidence from our own callbacks instead of guessing from it. */
+    if(s->socket_failed) return fail(s, FTSSH_IO);
+    if(s->sign_error) return fail(s, s->sign_error);
+    if(authenticated && (!offered || !s->sign_callback_entered || !s->signature_consumed))
+        return fail(s, FTSSH_UNSUPPORTED);
+    if(rc == LIBSSH2_ERROR_EAGAIN)
+        return s->challenge_length && !s->signature_length ? FTSSH_SIGNATURE_NEEDED : FTSSH_AGAIN;
+    if(!rc && authenticated) {
+        s->phase = AUTHENTICATED; return FTSSH_OK;
+    }
+    /* In libssh2 1.11.1 userauth.c, AUTHENTICATION_FAILED is the explicit
+     * USERAUTH_FAILURE response to the unsigned offer. PUBLICKEY_UNVERIFIED
+     * also covers signed failure/partial success, and is never retry evidence. */
+    if(offered && s->auth_methods_checked && rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED &&
+       !s->sign_callback_entered && !s->challenge_length && !s->signature_consumed)
+        return fail(s, FTSSH_AUTH_REJECTED);
+    switch(rc) {
+    case LIBSSH2_ERROR_ALLOC: return fail(s, FTSSH_LIMIT);
+    case LIBSSH2_ERROR_SOCKET_NONE: case LIBSSH2_ERROR_SOCKET_SEND:
+    case LIBSSH2_ERROR_SOCKET_DISCONNECT: case LIBSSH2_ERROR_SOCKET_RECV:
+    case LIBSSH2_ERROR_BAD_SOCKET: return fail(s, FTSSH_IO);
+    case LIBSSH2_ERROR_METHOD_NONE: case LIBSSH2_ERROR_METHOD_NOT_SUPPORTED:
+    case LIBSSH2_ERROR_ALGO_UNSUPPORTED: return fail(s, FTSSH_UNSUPPORTED);
+    default: return fail(s, FTSSH_AUTH_FAILED);
+    }
+}
 int ftssh_authentication_step(ftssh_session *s) {
     int rc = check(s, AUTH); if(rc) return rc;
+    if(!s->auth_methods_checked) {
+        s->receive_budget = 32768; s->limited_receive = 1;
+        const char *methods = libssh2_userauth_list(s->ssh, s->user, (unsigned int)strlen(s->user));
+        s->limited_receive = 0;
+        int authenticated = libssh2_userauth_authenticated(s->ssh);
+        if(!methods || authenticated || s->socket_failed)
+            return authentication_result(s, libssh2_session_last_errno(s->ssh), authenticated, 0);
+        rc = publickey_method(methods);
+        if(rc) return fail(s, rc);
+        s->auth_methods_checked = 1;
+    }
     if(s->challenge_length && !s->signature_length) return FTSSH_SIGNATURE_NEEDED;
     void *context = s;
+    s->receive_budget = 32768; s->limited_receive = 1;
     rc = libssh2_userauth_publickey(s->ssh, s->user, s->public_blob, s->public_length, sign_callback, &context);
-    if(rc == LIBSSH2_ERROR_EAGAIN) return s->challenge_length && !s->signature_length ? FTSSH_SIGNATURE_NEEDED : FTSSH_AGAIN;
-    if(rc != 0 || !libssh2_userauth_authenticated(s->ssh)) return fail(s, FTSSH_AUTH_REJECTED);
-    s->phase = AUTHENTICATED; return FTSSH_OK;
+    s->limited_receive = 0;
+    return authentication_result(s, rc, libssh2_userauth_authenticated(s->ssh), 1);
 }
 int ftssh_copy_challenge(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length) {
     int rc = check(s, AUTH); if(rc) return rc;

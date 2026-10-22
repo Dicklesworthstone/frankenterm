@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import CFrankenTermSSH
 @testable import FrankenTermSSH
 #if canImport(Darwin)
 import Darwin
@@ -57,7 +58,11 @@ final class SessionTests: XCTestCase, @unchecked Sendable {
         do {
             _ = try await session.authenticate(using: authority, timeout: .milliseconds(40))
             XCTFail("Silent peer authenticated")
-        } catch { XCTAssertEqual(error as? NativeSSHError, .timedOut) }
+        } catch {
+            XCTAssertEqual(error as? NativeSSHError, .authenticationTimedOut)
+            XCTAssertFalse((error as? NativeSSHError)?.isUnreachable ?? true)
+            XCTAssertFalse((error as? NativeSSHError)?.isCredentialRefused ?? true)
+        }
         let stats = try await session.accounting()
         XCTAssertEqual(stats.allocatedBytes, 0)
         XCTAssertGreaterThanOrEqual(authority.cancellations, 1)
@@ -157,6 +162,24 @@ final class SessionTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data()))
         XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: 513)))
+    }
+
+    func testCredentialRefusalDoesNotConflateAuthenticationAndConnectionFailures() {
+        XCTAssertTrue(NativeSSHError.native(Int32(FTSSH_AUTH_REJECTED)).isCredentialRefused)
+        let failures: [NativeSSHError] = [
+            .authenticationTimedOut, .timedOut, .closed, .busy, .invalidChallenge,
+            .connection(ECONNRESET), .resolution(EAI_NONAME),
+            .native(Int32(FTSSH_IO)), .native(Int32(FTSSH_NEGOTIATION)),
+            .native(Int32(FTSSH_HOST_REJECTED)), .native(Int32(FTSSH_AUTH_FAILED)),
+            .native(Int32(FTSSH_UNSUPPORTED)), .native(Int32(FTSSH_CHALLENGE)),
+            .native(Int32(FTSSH_LIMIT))
+        ]
+        for failure in failures { XCTAssertFalse(failure.isCredentialRefused, "\(failure)") }
+        for failure: NativeSSHError in [.authenticationTimedOut, .native(Int32(FTSSH_AUTH_REJECTED)),
+            .native(Int32(FTSSH_AUTH_FAILED)), .native(Int32(FTSSH_UNSUPPORTED))] {
+            XCTAssertFalse(failure.isUnreachable, "\(failure)")
+        }
+        XCTAssertTrue(NativeSSHError.timedOut.isUnreachable)
     }
 
     func testTypedChallengeRequiresEveryExactFieldAndNoTrailingData() throws {
