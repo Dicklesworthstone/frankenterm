@@ -2935,10 +2935,10 @@ private struct MachineWorkspaceView: View {
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 if preferred { Text("Preferred").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.white.opacity(0.15), in: Capsule()) }
             }
-            if route.mode == "frankenterm_mux" {
-                Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
-            } else if !route.jumpRoutes.isEmpty {
+            if !route.jumpRoutes.isEmpty {
                 Text("Reached through \(route.jumpRoutes.count) jump hosts, which this phone cannot use yet.").font(.caption).opacity(0.75)
+            } else if route.mode == "frankenterm_mux" {
+                Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
             }
             ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
                     id: \.offset) { _, issue in
