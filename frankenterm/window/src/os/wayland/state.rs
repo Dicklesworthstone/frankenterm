@@ -36,6 +36,7 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwi
 
 use crate::x11::KeyboardWithFallback;
 
+use super::fractional_scale::FractionalScaleGlobals;
 use super::inputhandler::{TextInputData, TextInputState};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::{OutputManagerData, OutputManagerState, SurfaceUserData, WaylandWindowInner};
@@ -82,6 +83,9 @@ pub(super) struct WaylandState {
     pub(super) shm: Shm,
     pub(super) mem_pool: RefCell<SlotPool>,
     pub(super) kde_blur_manager: Option<OrgKdeKwinBlurManager>,
+    /// `wp_fractional_scale_manager_v1` plus `wp_viewporter`, when the
+    /// compositor offers both and `enable_wayland_fractional_scale` is set.
+    pub(super) fractional_scale: Option<FractionalScaleGlobals>,
     pub(super) seat_bindings: SeatBindings<ObjectId>,
 }
 
@@ -95,6 +99,19 @@ impl WaylandState {
             SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)?;
 
         let blur_manager: Option<OrgKdeKwinBlurManager> = globals.bind(qh, 1..=1, GlobalData).ok();
+        let fractional_scale = if config::configuration().enable_wayland_fractional_scale {
+            FractionalScaleGlobals::bind(globals, qh)
+        } else {
+            None
+        };
+        log::debug!(
+            "Wayland fractional scaling is {}",
+            if fractional_scale.is_some() {
+                "available"
+            } else {
+                "unavailable or disabled"
+            }
+        );
         let wayland_state = WaylandState {
             registry: RegistryState::new(globals),
             output: OutputState::new(globals, qh),
@@ -129,6 +146,7 @@ impl WaylandState {
             shm,
             mem_pool: RefCell::new(mem_pool),
             kde_blur_manager: blur_manager,
+            fractional_scale,
             seat_bindings: SeatBindings::default(),
         };
         Ok(wayland_state)

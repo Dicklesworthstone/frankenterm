@@ -927,6 +927,16 @@ pub struct Config {
     #[dynamic(default)]
     pub enable_zwlr_output_manager: bool,
 
+    /// When the Wayland compositor offers `wp_fractional_scale_v1` and
+    /// `wp_viewporter`, render each window at the output's fractional scale
+    /// (for example 1.25) instead of rounding up to the next integer scale
+    /// and letting the compositor shrink the result. Set this to false to
+    /// keep the integer buffer-scale path. Read when the Wayland connection
+    /// starts. Only builds with Wayland support use it.
+    /// The default is true.
+    #[dynamic(default = "default_true")]
+    pub enable_wayland_fractional_scale: bool,
+
     /// Whether to prefer EGL over other GL implementations.
     /// EGL on Windows has jankier resize behavior than WGL (which
     /// is used if EGL is unavailable), but EGL survives graphics
@@ -3571,6 +3581,27 @@ mod tests {
         assert_eq!(cfg.initial_rows, defaults.initial_rows);
         assert_eq!(cfg.initial_cols, defaults.initial_cols);
         assert_eq!(cfg.scrollback_lines, defaults.scrollback_lines);
+    }
+
+    /// Build a `Config` from `key = value` pairs the way the TOML and Lua
+    /// loaders do, through `FromDynamic`.
+    fn config_from_pairs(pairs: Vec<(&str, Value)>) -> Result<Config, frankenterm_dynamic::Error> {
+        let mut object = frankenterm_dynamic::Object::default();
+        for (key, value) in pairs {
+            object.insert(Value::String(key.to_string()), value);
+        }
+        Config::from_dynamic(&Value::Object(object), FromDynamicOptions::default())
+    }
+
+    #[test]
+    fn wayland_fractional_scale_is_on_by_default_and_can_be_turned_off() {
+        assert!(Config::default_config().enable_wayland_fractional_scale);
+        let config = config_from_pairs(vec![(
+            "enable_wayland_fractional_scale",
+            Value::Bool(false),
+        )])
+        .expect("a boolean is a valid enable_wayland_fractional_scale");
+        assert!(!config.enable_wayland_fractional_scale);
     }
 
     #[test]
