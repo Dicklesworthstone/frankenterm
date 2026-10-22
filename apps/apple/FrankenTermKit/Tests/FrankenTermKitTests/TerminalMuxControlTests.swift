@@ -429,3 +429,182 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(control.current.failure, "The server reported an oversized error message.")
     }
 }
+
+final class TerminalMuxNavigationRequestTests: XCTestCase {
+    private func pane(_ id: Int) -> TerminalMuxPane {
+        .init(paneId: id, tabId: 4, windowId: 2, tabTitle: "work", title: "pane-\(id)", workspace: "default",
+              workingDir: nil, size: .init(rows: 24, cols: 80), isActive: id == 10, isZoomed: false)
+    }
+    private func fixture() throws -> TerminalMuxControl {
+        let control = TerminalMuxControl()
+        try control.inputRouting.replaceInventory([10, 20, 30])
+        let selected = try control.inputRouting.select(pane: 10)
+        control.inputRouting.didApplyOutput(selected)
+        control.publish(panes: [10, 20, 30].map(pane), shown: 10)
+        control.setVisible(true)
+        return control
+    }
+
+    func testQueuedRequestKeepsExactCandidateAndDoesNotSelectItEarly() throws {
+        let control = try fixture()
+        let plan = try XCTUnwrap(control.inputRouting.navigation(forward: true))
+        try control.request(plan)
+        XCTAssertEqual(control.current.shown, 10)
+        XCTAssertEqual(control.inputRouting.current.destination?.paneID, 10)
+        XCTAssertTrue(control.inputRouting.current.ready)
+        XCTAssertEqual(control.takeRequest(), 20)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertNil(control.current.rejectedNavigation)
+    }
+
+    func testReorderAfterQueueRejectsInsteadOfAcquiringANewNeighbour() throws {
+        let control = try fixture()
+        let plan = try XCTUnwrap(control.inputRouting.navigation(forward: true))
+        try control.request(plan)
+        try control.inputRouting.replaceInventory([10, 30, 20])
+        control.publish(panes: [10, 30, 20].map(pane), shown: 10)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+        XCTAssertEqual(control.current.shown, 10)
+        try control.inputRouting.replaceInventory([10, 20, 30])
+        XCTAssertThrowsError(try control.request(plan))
+        XCTAssertNil(control.takeRequest())
+    }
+
+    func testRemovalRejectsExactWaitingRequestAndReuseDoesNotRestoreIt() throws {
+        let control = try fixture()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        control.inputRouting.remove(pane: 20); control.remove(pane: 20)
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+        XCTAssertNil(control.takeRequest())
+        try control.inputRouting.replaceInventory([10, 20, 30])
+        control.publish(panes: [10, 20, 30].map(pane), shown: 10)
+        XCTAssertThrowsError(try control.request(plan))
+        XCTAssertNil(control.takeRequest())
+        let fresh = try control.inputRouting.navigation(pane: 20)
+        try control.request(fresh)
+        XCTAssertNil(control.current.rejectedNavigation)
+        XCTAssertEqual(control.takeRequest(), 20)
+    }
+
+    func testSourceRoundTripBeforeTransportConsumeExpiresPlan() throws {
+        let control = try fixture()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        try control.inputRouting.select(pane: 30)
+        try control.inputRouting.select(pane: 10)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+    }
+
+    func testInvalidAndForeignRequestsCannotOverwriteAnAlreadyQueuedCandidate() throws {
+        let control = try fixture(), other = try fixture()
+        let intended = try control.inputRouting.navigation(pane: 20)
+        try control.request(intended)
+        let foreign = try other.inputRouting.navigation(pane: 30)
+        XCTAssertThrowsError(try control.request(foreign))
+        control.request(pane: -1)
+        XCTAssertEqual(control.takeRequest(), 20)
+        XCTAssertNil(control.current.rejectedNavigation)
+    }
+
+    func testHideRevokesQueuedGestureAndShowDoesNotReplayIt() throws {
+        let control = try fixture()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        control.setVisible(false)
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertThrowsError(try control.request(plan))
+        control.setVisible(true)
+        XCTAssertNil(control.takeRequest())
+        try control.request(control.inputRouting.navigation(pane: 30))
+        XCTAssertEqual(control.takeRequest(), 30)
+    }
+
+    func testConnectionEndRevokesPendingAndFutureRequests() throws {
+        let control = try fixture()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        control.endQueries()
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertThrowsError(try control.request(plan))
+        control.request(pane: 30)
+        XCTAssertNil(control.takeRequest())
+    }
+
+    func testReentrantObserverCanHideBeforeWakeWithoutDeadlockOrResurrection() throws {
+        final class Count: @unchecked Sendable {
+            let lock = NSLock()
+            var calls = 0
+        }
+        let control = try fixture(), count = Count()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        control.setWaker { count.lock.withLock { count.calls += 1 } }
+        let revision = control.current.revision
+        // The initial observation reads state only. A new queued publication
+        // reenters hiding after the control released its critical section.
+        control.observe { state in
+            if state.revision != revision, state.visible { control.setVisible(false) }
+        }
+        try control.request(plan)
+        XCTAssertFalse(control.current.visible)
+        XCTAssertEqual(control.current.rejectedNavigation, plan)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertGreaterThanOrEqual(count.lock.withLock { count.calls }, 1)
+    }
+
+    func testReentrantRejectionObserverCanQueueFreshPlanWithoutOldTakeErasingIt() throws {
+        let control = try fixture()
+        let old = try control.inputRouting.navigation(pane: 20)
+        try control.request(old)
+        try control.inputRouting.replaceInventory([10, 30, 20])
+        let fresh = try control.inputRouting.navigation(pane: 30)
+        control.observe { state in
+            if state.rejectedNavigation == old { try? control.request(fresh) }
+        }
+        XCTAssertNil(control.takeRequest())
+        XCTAssertEqual(control.takeRequest(), 30)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertNil(control.current.rejectedNavigation)
+    }
+
+    func testMetadataRefreshDoesNotCancelCapturedCandidate() throws {
+        let control = try fixture()
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        for index in 0..<100 {
+            try control.inputRouting.replaceInventory([10, 20, 30])
+            control.publish(panes: [10, 20, 30].map(pane), shown: 10)
+            control.retitle(pane: 20, title: "new-title-\(index)")
+            control.setMouseGrabbed(index % 2 == 0)
+        }
+        XCTAssertEqual(control.takeRequest(), 20)
+        XCTAssertNil(control.current.rejectedNavigation)
+    }
+
+    func testQueuedNavigationCancelsOnlyUnsentPointers() throws {
+        let control = try fixture(), source = try control.inputRouting.capture()
+        control.setMouseGrabbed(true)
+        try control.click(column: 1, row: 1, destination: source)
+        XCTAssertEqual(control.inputRouting.pendingPointerCount, 1)
+        let plan = try control.inputRouting.navigation(pane: 20)
+        try control.request(plan)
+        XCTAssertEqual(control.inputRouting.pendingPointerCount, 0)
+        XCTAssertThrowsError(try control.click(column: 1, row: 1, destination: source))
+        XCTAssertNoThrow(try control.inputRouting.validateDelivery(source))
+        XCTAssertEqual(control.takeRequest(), 20)
+    }
+
+    func testTenThousandReplacementsRetainOnlyTheLatestExactTarget() throws {
+        let control = try fixture()
+        for index in 0..<10_000 {
+            try control.request(control.inputRouting.navigation(pane: index % 2 == 0 ? 20 : 30))
+        }
+        XCTAssertEqual(control.takeRequest(), 30)
+        XCTAssertNil(control.takeRequest())
+        XCTAssertEqual(control.current.shown, 10)
+    }
+}

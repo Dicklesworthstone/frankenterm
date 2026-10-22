@@ -265,10 +265,13 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var failure: String?
         /// The shown pane's program has asked for the mouse: a tap clicks.
         public var mouseGrabbed = false
+        /// A captured request expired before the transport could apply it. The
+        /// original presenter can stop waiting without selecting a substitute.
+        public var rejectedNavigation: TerminalMuxInputRouting.NavigationPlan?
     }
     private let lock = NSLock()
     private var state = State()
-    private var requested: Int?
+    private var requested: TerminalMuxInputRouting.NavigationPlan?
     private var pendingSearch: Search?
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
     private var waker: (@Sendable () -> Void)?
@@ -293,14 +296,23 @@ public final class TerminalMuxControl: @unchecked Sendable {
         handler(snapshot)
     }
 
-    /// Asks the transport to show this pane instead.
+    /// Capture an immediate picker request. Gesture callers capture earlier and
+    /// use request(_:) after their existing source-bound keyboard handoff.
     public func request(pane: Int) {
-        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
-            guard state.panes.contains(where: { $0.paneId == pane }) else { return nil }
+        guard let plan = try? inputRouting.navigation(pane: pane) else { return }
+        try? request(plan)
+    }
+
+    public func request(_ plan: TerminalMuxInputRouting.NavigationPlan) throws {
+        let (wake, notify, snapshot) = try lock.withLock {
+            guard !queriesEnded, state.visible,
+                  state.panes.contains(where: { $0.paneId == plan.paneID }) else { throw TerminalInputError.stale }
+            try inputRouting.validateNavigation(plan)
             inputRouting.discardPointers()
-            requested = pane; return waker
+            requested = plan; state.rejectedNavigation = nil; state.revision = UUID()
+            return (waker, observer, state)
         }
-        wake?()
+        notify?(snapshot); wake?()
     }
 
     /// The view supplies its immutable displayed visit. Neither a delayed
@@ -340,7 +352,10 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func setVisible(_ visible: Bool) {
         let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
             guard state.visible != visible else { return (nil, nil, state) }
-            if !visible { inputRouting.discardPointers() }
+            if !visible {
+                inputRouting.discardPointers()
+                if let requested { state.rejectedNavigation = requested; self.requested = nil }
+            }
             state.visible = visible; state.revision = UUID(); return (waker, observer, state)
         }
         notify?(snapshot)
@@ -547,6 +562,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func endQueries() {
         let (notify, snapshot) = lock.withLock {
             queriesEnded = true
+            if let requested { state.rejectedNavigation = requested; self.requested = nil }
             inputRouting.discardPointers()
             pendingSearch = nil; pendingContext = nil
             if state.search?.pending.isEmpty == false {
@@ -567,7 +583,21 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     public func takeRequest() -> Int? {
-        lock.withLock { defer { requested = nil }; return requested }
+        let (pane, notify, snapshot) = lock.withLock { () -> (Int?, (@Sendable (State) -> Void)?, State) in
+            guard let plan = requested else { return (nil, nil, state) }
+            requested = nil
+            // The sole transport owns inventory and selection; it calls this
+            // and selects synchronously, with no actor suspension in between.
+            if !queriesEnded, state.visible,
+               state.panes.contains(where: { $0.paneId == plan.paneID }),
+               (try? inputRouting.validateNavigation(plan)) != nil {
+                return (plan.paneID, nil, state)
+            }
+            state.rejectedNavigation = plan; state.revision = UUID()
+            return (nil, observer, state)
+        }
+        notify?(snapshot)
+        return pane
     }
 
     public func publish(panes: [TerminalMuxPane]? = nil, shown: Int?) {
@@ -602,7 +632,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
             state.panes.removeAll { $0.paneId == pane }
             if state.shown == pane { state.shown = nil }
             removeQueryPane(pane)
-            if requested == pane { requested = nil }
+            if requested?.paneID == pane {
+                state.rejectedNavigation = requested; requested = nil
+            }
             state.revision = UUID()
             return (observer, state)
         }
