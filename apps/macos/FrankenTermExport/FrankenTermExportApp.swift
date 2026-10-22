@@ -225,15 +225,7 @@ private actor MacExportEngine {
     func loadSSHSelection(_ aliases: [String]) throws -> SelectionState {
         retireKeyRequest(); invalidateExport()
         guard let pending = sshSource else { throw FTError.stale }
-        var publicKeys: [String: Data] = [:]
-        for reference in try pending.source.identityFileReferences(for: aliases) {
-            try Task.checkCancellation()
-            guard let identity = Self.identityURL(reference) else { continue }
-            let url = identity.pathExtension == "pub" ? identity : identity.appendingPathExtension("pub")
-            do { publicKeys[reference] = try SelectedLocalFile.read(url, limit: FTLimit.key) }
-            catch is CancellationError { throw CancellationError() }
-            catch { /* The source reports missing public identities explicitly. */ }
-        }
+        let publicIdentityFiles = try pending.source.loadPublicIdentityFiles(for: aliases)
         // Freeze the actual user/global trust-file selection for every chosen
         // destination and jump. Never pool unrelated aliases' trust or treat an
         // unreadable revocation source as an absent file.
@@ -247,7 +239,7 @@ private actor MacExportEngine {
                 try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: $0)
             } ?? SSHWorkspaceRegistry()
             let result = try pending.source.export(aliases: aliases, workspaceName: "SSH Machines", defaultUser: NSUserName(),
-                publicKeys: publicKeys, knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
+                publicIdentityFiles: publicIdentityFiles, knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
             let selected = try WorkspaceExportSelection(workspace: result.workspace,
                 groupIDs: [result.workspace.initialGroupID], findings: result.portability)
             _ = try selected.review(decisions: [:], loadedFingerprints: [])
@@ -699,7 +691,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, matching public .pub files, and each host's user/global known-hosts files are read within fixed limits. Relative Include paths use ~/.ssh. Commands and Match conditions are never executed; private keys are chosen separately."
+        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, public identities, and each host's known-hosts files are read within fixed limits. When a .pub file is missing, the configured OpenSSH key's public header supplies its identity. Including or unlocking private keys requires a separate choice. Relative Include paths use ~/.ssh; commands and Match conditions are never executed."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in

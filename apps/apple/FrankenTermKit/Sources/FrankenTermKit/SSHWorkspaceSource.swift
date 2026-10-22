@@ -64,6 +64,34 @@ public struct SSHWorkspaceSource: Sendable {
     public static let maximumKnownHostsFiles = 64
     public static let maximumKnownHostsFilesPerSetting = 16
 
+    /// Public-only source inventory. A present but unsupported identity is an
+    /// unresolved policy input, distinct from a reference whose files are absent.
+    /// No private container bytes or passphrases can enter a validated snapshot.
+    public struct PublicIdentitySnapshot: Sendable {
+        public enum File: Equatable, Sendable {
+            case present(Data), missing, unavailable
+        }
+        public let files: [String: File]
+
+        public init(files: [String: File]) throws {
+            guard files.count <= 256 else { throw FTError.limit("ssh.identity_references") }
+            var normalized: [String: File] = [:], bytes = 0
+            for (reference, file) in files {
+                try Task.checkCancellation()
+                guard reference.utf8.count <= FTLimit.text, SSHWorkspaceSource.localReference(reference),
+                      !reference.split(separator: "/").contains("..") else { throw FTError.malformed("ssh.identity.reference") }
+                switch file {
+                case .present(let data):
+                    guard data.count <= SSHWorkspaceSource.maximumSourceBytes - bytes else { throw FTError.limit("ssh.identity.bytes") }
+                    bytes += data.count
+                    normalized[reference] = .present(try SSHWorkspaceSource.publicKey(data).blob)
+                case .missing, .unavailable: normalized[reference] = file
+                }
+            }
+            self.files = normalized
+        }
+    }
+
     /// A frozen public trust inventory. An absent file differs from a file that
     /// could not be read: only the former proves there were no records to apply.
     /// References stay on the exporter; the workspace carries keys and policy.
@@ -374,7 +402,15 @@ public struct SSHWorkspaceSource: Sendable {
                 try Task.checkCancellation()
                 path.appendPathComponent(component)
                 do { try requireLocal(path) }
-                catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return nil }
+                catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                    // Resource metadata may follow a dangling symbolic link.
+                    // Only an absent directory entry is an absent source; a
+                    // present link must never authorize a different fallback.
+                    var metadata = stat()
+                    let status = component.withCString { fstatat(current, $0, &metadata, AT_SYMLINK_NOFOLLOW) }
+                    if status < 0, errno == ENOENT { return nil }
+                    throw FTError.unsupported("ssh.include_file")
+                }
                 let needsDirectory = directory || index < components.count - 1
                 let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | (needsDirectory ? O_DIRECTORY : 0)
                 let next = component.withCString { openat(current, $0, flags) }
@@ -437,9 +473,9 @@ public struct SSHWorkspaceSource: Sendable {
     }
 
     /// Returns references from the selected concrete aliases and their complete
-    /// supported jump chains. The caller may read matching .pub files after
-    /// explicit source selection; do not enumerate the user's .ssh directory or
-    /// treat these strings as shell instructions.
+    /// supported jump chains. `loadPublicIdentityFiles` reads only these selected
+    /// references; do not enumerate the user's .ssh directory or treat these
+    /// strings as shell instructions.
     public func identityFileReferences(for selectedAliases: [String]) throws -> [String] {
         try validateSelection(selectedAliases)
         var seen = Set<String>(), result: [String] = [], budget = MatchBudget()
@@ -450,6 +486,52 @@ public struct SSHWorkspaceSource: Sendable {
         }
         guard result.count <= 256 else { throw FTError.limit("ssh.identity_references") }
         return result
+    }
+
+    /// Freeze public identities for the selected destinations and jump hosts.
+    /// Prefer the exact .pub sidecar; only its absence permits inspection of the
+    /// configured OpenSSH container's public header. An explicitly configured
+    /// .pub reference never authorizes reading a sibling private file.
+    ///
+    /// This performs no unlock, KDF, agent query or private-key approval. The
+    /// container fallback returns only its public blob; full private-derived
+    /// identity validation remains mandatory when a user later includes a key.
+    /// A malformed .pub or unsupported private container remains unavailable in
+    /// the affected route's findings; other selected identities can still export.
+    /// No unavailable source is replaced. Unsafe or unreadable files fail closed.
+    public func loadPublicIdentityFiles(for selectedAliases: [String],
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) throws -> PublicIdentitySnapshot {
+        guard homeDirectory.isFileURL else { throw FTError.malformed("ssh.identity.reference") }
+        let home = ConfigurationParser.physicalURL(homeDirectory, isDirectory: true) ?? homeDirectory.standardizedFileURL
+        var result: [String: PublicIdentitySnapshot.File] = [:], bytes = 0
+        func read(_ url: URL) throws -> Data? {
+            #if os(macOS) || os(iOS)
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            #endif
+            let data = try Self.readLocalSourceFile(url,
+                remaining: min(FTLimit.key, Self.maximumSourceBytes - bytes), site: "ssh.identity")
+            if let data { bytes += data.count }
+            return data
+        }
+        for reference in try identityFileReferences(for: selectedAliases) {
+            try Task.checkCancellation()
+            guard !reference.split(separator: "/").contains("..") else { throw FTError.unsupported("ssh.identity.reference") }
+            let identity = reference.hasPrefix("~/") ? home.appendingPathComponent(String(reference.dropFirst(2)))
+                : URL(fileURLWithPath: reference)
+            let explicitlyPublic = identity.pathExtension == "pub"
+            let sidecar = explicitlyPublic ? identity : identity.appendingPathExtension("pub")
+            if let data = try read(sidecar) {
+                if let key = try? Self.publicKey(data) { result[reference] = .present(key.blob) }
+                else { result[reference] = .unavailable }
+            } else if !explicitlyPublic, var pem = try read(identity) {
+                defer { pem.resetBytes(in: 0..<pem.count) }
+                if let source = try? OpenSSHSourceKey(pem: pem) { result[reference] = .present(source.publicBlob) }
+                else { result[reference] = .unavailable }
+            } else { result[reference] = .missing }
+        }
+        try Task.checkCancellation()
+        return try PublicIdentitySnapshot(files: result)
     }
 
     /// Effective file lists for just the selected destinations and their jump
@@ -489,7 +571,7 @@ public struct SSHWorkspaceSource: Sendable {
             defer { if access { url.stopAccessingSecurityScopedResource() } }
             #endif
             do {
-                if let data = try Self.readKnownHostsFile(url, remaining: Self.maximumSourceBytes - bytes) {
+                if let data = try Self.readLocalSourceFile(url, remaining: Self.maximumSourceBytes - bytes, site: "ssh.known_hosts") {
                     files[reference] = .present(data); bytes += data.count
                 } else { files[reference] = .missing }
             } catch is CancellationError { throw CancellationError() }
@@ -501,20 +583,20 @@ public struct SSHWorkspaceSource: Sendable {
         return try KnownHostsSnapshot(files: files)
     }
 
-    private static func readKnownHostsFile(_ url: URL, remaining: Int) throws -> Data? {
+    private static func readLocalSourceFile(_ url: URL, remaining: Int, site: String) throws -> Data? {
         guard let descriptor = try ConfigurationParser.openLocal(url, directory: false) else { return nil }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         var before = stat()
         guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
               before.st_uid == getuid() || before.st_uid == 0, before.st_mode & 0o022 == 0 else {
-            throw FTError.unsupported("ssh.known_hosts.file")
+            throw FTError.unsupported(site + ".file")
         }
-        guard before.st_size >= 0, before.st_size <= remaining else { throw FTError.limit("ssh.known_hosts.bytes") }
+        guard before.st_size >= 0, before.st_size <= remaining else { throw FTError.limit(site + ".bytes") }
         var data = Data()
         while let chunk = try handle.read(upToCount: min(65_536, remaining + 1 - data.count)), !chunk.isEmpty {
             try Task.checkCancellation()
-            guard chunk.count <= remaining - data.count else { throw FTError.limit("ssh.known_hosts.bytes") }
+            guard chunk.count <= remaining - data.count else { throw FTError.limit(site + ".bytes") }
             data += chunk
         }
         var after = stat()
@@ -532,11 +614,14 @@ public struct SSHWorkspaceSource: Sendable {
 
     /// publicKeys maps the exact IdentityFile reference to selected .pub contents
     /// (or a binary SSH public blob). No private material is accepted or emitted.
+    /// publicIdentityFiles supplies a frozen inventory with per-reference failure
+    /// states instead; unavailable sources keep only their affected routes inert.
     /// knownHostFiles applies only each route's actual effective file lists.
     /// The original knownHosts input remains a deliberately partial single
     /// source; it cannot satisfy an explicit User/GlobalKnownHostsFile policy.
     public func export<C: AirGapCryptography>(aliases selectedAliases: [String], workspaceName: String,
                                               defaultUser: String, publicKeys: [String: Data] = [:],
+                                              publicIdentityFiles: PublicIdentitySnapshot? = nil,
                                               knownHosts: Data? = nil, knownHostFiles: KnownHostsSnapshot? = nil,
                                               registry: inout SSHWorkspaceRegistry,
                                               using crypto: C) throws -> SSHWorkspaceExport {
@@ -545,6 +630,19 @@ public struct SSHWorkspaceSource: Sendable {
               Self.validUser(defaultUser) else { throw FTError.malformed("ssh.export_name_or_user") }
         try registry.validate()
         guard publicKeys.count <= 256 else { throw FTError.limit("ssh.public_keys") }
+        guard publicIdentityFiles == nil || publicKeys.isEmpty else { throw FTError.malformed("ssh.identity.ambiguous_sources") }
+        var selectedPublicKeys = publicKeys, unavailableIdentities = Set<String>()
+        if let publicIdentityFiles {
+            let expected = Set(try identityFileReferences(for: selectedAliases))
+            guard Set(publicIdentityFiles.files.keys).isSubset(of: expected) else { throw FTError.malformed("ssh.identity.unselected_source") }
+            for (reference, file) in publicIdentityFiles.files {
+                switch file {
+                case .present(let data): selectedPublicKeys[reference] = data
+                case .unavailable: unavailableIdentities.insert(reference)
+                case .missing: break
+                }
+            }
+        }
         if let knownHosts, knownHosts.count > Self.maximumSourceBytes { throw FTError.limit("ssh.known_hosts.bytes") }
         guard knownHosts == nil || knownHostFiles == nil else { throw FTError.malformed("ssh.known_hosts.ambiguous_sources") }
         var knownByFile: [String: (entries: [KnownHost], problems: [Problem])] = [:]
@@ -574,13 +672,30 @@ public struct SSHWorkspaceSource: Sendable {
             sourceBytes.appendBE(UInt64(knownHosts?.count ?? 0), bytes: 4)
             if let knownHosts { sourceBytes += knownHosts }
         }
-        for reference in publicKeys.keys.sorted() {
-            guard let bytes = publicKeys[reference], reference.utf8.count <= FTLimit.text,
-                  bytes.count <= FTLimit.key else { throw FTError.limit("ssh.public_key") }
-            sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
-            sourceBytes.appendBE(UInt64(bytes.count), bytes: 4); sourceBytes += bytes
-            guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
+        if let publicIdentityFiles {
+            sourceBytes += Data("file-scoped-public-identities/v1\0".utf8)
+            sourceBytes.appendBE(UInt64(publicIdentityFiles.files.count), bytes: 4)
+            for reference in publicIdentityFiles.files.keys.sorted() {
+                guard let file = publicIdentityFiles.files[reference] else { throw FTError.stale }
+                sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
+                switch file {
+                case .present(let data):
+                    sourceBytes.append(1); sourceBytes.appendBE(UInt64(data.count), bytes: 4); sourceBytes += data
+                case .missing: sourceBytes.append(2)
+                case .unavailable: sourceBytes.append(3)
+                }
+                guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
+            }
+        } else {
+            for reference in publicKeys.keys.sorted() {
+                guard let bytes = publicKeys[reference], reference.utf8.count <= FTLimit.text,
+                      bytes.count <= FTLimit.key else { throw FTError.limit("ssh.public_key") }
+                sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
+                sourceBytes.appendBE(UInt64(bytes.count), bytes: 4); sourceBytes += bytes
+                guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
+            }
         }
+        guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
         let revision = crypto.sha256(sourceBytes).ftHex.lowercased()
         let legacyKnown = try Self.knownHosts(knownHosts)
         var workingRegistry = registry, budget = MatchBudget()
@@ -654,7 +769,10 @@ public struct SSHWorkspaceSource: Sendable {
                 guard Self.localReference(reference) else {
                     resolved.problems.append(Problem("identityfile", "An identity reference requires unsupported token, environment, relative-path, or home-directory resolution.")); continue
                 }
-                guard let data = publicKeys[reference] else {
+                if unavailableIdentities.contains(reference) {
+                    resolved.problems.append(Problem("identityfile", "A configured identity could not be recovered from its public file or the supported OpenSSH container profile. Its identity remains unresolved; no alternative key was substituted.")); continue
+                }
+                guard let data = selectedPublicKeys[reference] else {
                     resolved.problems.append(Problem("identityfile", "A referenced public identity was not supplied. No filename-based or agent identity was substituted.", required: false)); continue
                 }
                 guard let key = try? Self.publicKey(data) else {
