@@ -533,7 +533,8 @@ struct WorkspaceTerminalScreen: View {
             MachineStrip(scene: scene)
             if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
                 PaneStrip(session: session, state: mux,
-                          accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"))
+                          accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
+                          onKeyboard: { Task { await scene.activateKeyboard() } })
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             ZStack {
@@ -832,21 +833,36 @@ private struct PaneStrip: View {
     let session: TerminalSessionController
     let state: TerminalMuxControl.State
     let accent: Color
+    /// Brings up the keyboard: needed while the pane's program has the mouse,
+    /// since a tap on the terminal is then a click.
+    let onKeyboard: () -> Void
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    Image(systemName: "square.split.2x1").font(.caption).foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                    ForEach(state.panes) { pane in chip(pane).id(pane.paneId) }
+        HStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.split.2x1").font(.caption).foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        ForEach(state.panes) { pane in chip(pane).id(pane.paneId) }
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
                 }
-                .padding(.horizontal, 12).padding(.vertical, 6)
+                .onChange(of: state.shown, initial: true) { _, shown in
+                    guard let shown else { return }
+                    withAnimation(.snappy) { proxy.scrollTo(shown, anchor: .center) }
+                }
             }
-            .onChange(of: state.shown, initial: true) { _, shown in
-                guard let shown else { return }
-                withAnimation(.snappy) { proxy.scrollTo(shown, anchor: .center) }
+            Button(action: onKeyboard) {
+                Image(systemName: state.mouseGrabbed ? "keyboard.badge.ellipsis" : "keyboard")
+                    .font(.callout)
+                    .foregroundStyle(state.mouseGrabbed ? accent : Color.primary.opacity(0.7))
+                    .frame(width: 44, height: 36)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show keyboard")
+            .accessibilityHint(state.mouseGrabbed ? "Taps on this program are clicks." : "")
         }
         .background(.ultraThinMaterial.opacity(0.85))
         .sensoryFeedback(.selection, trigger: state.shown)

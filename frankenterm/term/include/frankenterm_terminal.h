@@ -193,6 +193,8 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              dpi}, the desktop's size to give back. An empty payload (rows
  *              and cols 0): it no longer is. Keep the latest per pane across
  *              connections for ft_mux_v1_adopt_phone_size.
+ *   MOUSE_GRAB pane_id; payload: one byte, 1 when the pane's program has
+ *              asked for the mouse (a tap is then a click), 0 when not
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -204,6 +206,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_SEARCH_RESULTS 7u
 #define FT_MUX_EVENT_CONTEXT 8u
 #define FT_MUX_EVENT_PHONE_SIZE 9u
+#define FT_MUX_EVENT_MOUSE_GRAB 10u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
@@ -254,6 +257,10 @@ uint32_t ft_mux_v1_adopt_phone_size(uint64_t session, uint64_t pane_id, uint32_t
  * mouse and sends a full-screen program arrow keys, as for the desktop's
  * wheel; other programs ignore them. */
 uint32_t ft_mux_v1_wheel(uint64_t session, uint64_t pane_id, int32_t steps, uint32_t column, uint32_t row);
+/* Clicks the left button (press, release) on the pane's screen cell
+ * column,row (each at most 4096); the server reports it to a program that
+ * asked for the mouse. */
+uint32_t ft_mux_v1_click(uint64_t session, uint64_t pane_id, uint32_t column, uint32_t row);
 /* Searches the pane's scrollback on the server, newest rows first, for
  * UTF-8 text (at most 4096 bytes) with FT_MUX_SEARCH_* flags; a
  * SEARCH_RESULTS event with this id answers (with an error for a pane that

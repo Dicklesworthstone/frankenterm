@@ -673,6 +673,48 @@ fn a_wheel_turns_over_the_cell_it_is_over_in_bounded_notches() {
 }
 
 #[test]
+fn a_programs_hold_on_the_mouse_is_reported_and_a_click_reaches_it() {
+    use frankenterm_term::input::{MouseButton, MouseEventKind};
+    let grabs = |harness: &Harness| -> Vec<bool> {
+        harness
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::MouseGrab { grabbed, .. } => Some(*grabbed),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut harness = Harness::new(5, 30);
+    harness.attach();
+    assert_eq!(grabs(&harness), [false], "the first update says");
+    harness.server.mouse_grabbed = true;
+    harness.output(b"htop");
+    harness.output(b" running");
+    assert_eq!(grabs(&harness), [false, true], "only changes are reported");
+
+    let pane = harness.server.pane_id;
+    harness.session.click(pane, 12, 3);
+    harness.pump();
+    let seen: Vec<_> = harness
+        .server
+        .mouse
+        .iter()
+        .map(|event| (event.kind, event.button, event.x, event.y))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (MouseEventKind::Press, MouseButton::Left, 12, 3),
+            (MouseEventKind::Release, MouseButton::Left, 12, 3),
+        ]
+    );
+    harness.server.mouse_grabbed = false;
+    harness.output(b"\r\n");
+    assert_eq!(grabs(&harness), [false, true, false]);
+}
+
+#[test]
 fn an_unfinished_paste_is_sent_when_input_moves_to_another_pane() {
     let mut harness = Harness::new(4, 20);
     harness.attach();

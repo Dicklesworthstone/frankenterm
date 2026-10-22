@@ -578,6 +578,7 @@ final class TerminalSessionController {
                         // Notifications run outside the control's lock and may
                         // reorder; publish its current snapshot, not stale UI.
                         self.muxState = control.current
+                        self.terminal?.remoteMouseGrabbed = control.current.mouseGrabbed
                     }
                 }
                 control.inputRouting.observe { [weak self, weak control] state in
@@ -720,6 +721,12 @@ final class TerminalSessionController {
                 view.onRemoteScroll = { [weak self, weak control] steps, column, row in
                     guard let self, !self.stopped, self.phase == .live, !self.clipboardIsPresenting else { return }
                     control?.scroll(steps: steps, column: column, row: row)
+                }
+                // A tap on a program that has the mouse clicks it.
+                view.remoteMouseGrabbed = control.current.mouseGrabbed
+                view.onRemoteClick = { [weak self, weak control] column, row in
+                    guard let self, !self.stopped, self.phase == .live, !self.clipboardIsPresenting else { return }
+                    control?.click(column: column, row: row)
                 }
             }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }

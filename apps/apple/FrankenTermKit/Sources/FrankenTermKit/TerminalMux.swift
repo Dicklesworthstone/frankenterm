@@ -100,6 +100,8 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     /// The phone's size (rows x columns) is in effect for the pane, and
     /// `desktop` is the size to give back; or, without `desktop`, no longer.
     case phoneSize(paneID: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int)
+    /// The pane's program asked for the mouse (a tap is then a click), or stopped.
+    case mouseGrab(paneID: Int, grabbed: Bool)
     /// The session is over; the channel must close.
     case failed(String)
 }
@@ -183,9 +185,14 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// left at the phone's size, if it still has exactly that size, so that
     /// `restoreSize` gives it `desktop`. True when taken over.
     func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool
+    /// Clicks the left button on the pane's screen cell, for a program that
+    /// asked for the mouse.
+    func click(pane: Int, column: Int, row: Int) throws
 }
 
 extension TerminalMuxClient {
+    /// A client without a mouse ignores clicks.
+    public func click(pane: Int, column: Int, row: Int) throws {}
     /// A client without a wheel ignores it.
     public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {}
     /// A client that keeps no sizes takes over none.
@@ -256,6 +263,8 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// Why the mux server ended an attached session (a reply this app
         /// could not read, say), when it was not the connection dropping.
         public var failure: String?
+        /// The shown pane's program has asked for the mouse: a tap clicks.
+        public var mouseGrabbed = false
     }
     private let lock = NSLock()
     private var state = State()
@@ -263,6 +272,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private var pendingSearch: Search?
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
     private var pendingScroll: (steps: Int, column: Int, row: Int)?
+    private var pendingClicks: [(column: Int, row: Int)] = []
     private var waker: (@Sendable () -> Void)?
     private var observer: (@Sendable (State) -> Void)?
     private var queriesEnded = false
@@ -314,6 +324,34 @@ public final class TerminalMuxControl: @unchecked Sendable {
     /// The wheel notches waiting to be sent, taken.
     public func takeScroll() -> (steps: Int, column: Int, row: Int)? {
         lock.withLock { defer { pendingScroll = nil }; return pendingScroll }
+    }
+
+    /// Clicks at most this many taps ahead of the transport; more are dropped.
+    public static let maximumPendingClicks = 8
+
+    /// Clicks a cell of the shown pane's screen, for a program that asked for
+    /// the mouse; the transport sends it on its next turn.
+    public func click(column: Int, row: Int) {
+        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard pendingClicks.count < Self.maximumPendingClicks else { return nil }
+            pendingClicks.append((max(column, 0), max(row, 0)))
+            return waker
+        }
+        wake?()
+    }
+
+    /// The clicks waiting to be sent, in order, taken.
+    public func takeClicks() -> [(column: Int, row: Int)] {
+        lock.withLock { defer { pendingClicks.removeAll() }; return pendingClicks }
+    }
+
+    /// Whether the shown pane's program has the mouse (transport side).
+    public func setMouseGrabbed(_ grabbed: Bool) {
+        update { state in
+            guard state.mouseGrabbed != grabbed else { return false }
+            state.mouseGrabbed = grabbed
+            return true
+        }
     }
 
     /// Whether the machine is on screen. Only a visible machine's pane is

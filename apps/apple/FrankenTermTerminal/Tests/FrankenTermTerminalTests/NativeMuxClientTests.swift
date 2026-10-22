@@ -68,6 +68,15 @@ final class NativeMuxClientTests: XCTestCase {
         XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: nil, rows: 0, columns: 0)])
         // The listed pane is 24 x 80, not a phone size left behind.
         XCTAssertFalse(try client.adoptPhoneSize(pane: 7, desktop: desktop, rows: 40, columns: 54))
+
+        // A click is a press and a release: two SendMouseEvent (12) frames.
+        _ = try client.outgoing(limit: 4096)
+        try client.click(pane: 7, column: 3, row: 2)
+        let click = Array(try client.outgoing(limit: 4096))
+        XCTAssertEqual(click.count % 2, 0)
+        let half = click.count / 2
+        XCTAssertEqual(click[2], 12); XCTAssertEqual(click[half + 2], 12)
+        XCTAssertThrowsError(try client.click(pane: 7, column: 5000, row: 0))
     }
 
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {

@@ -412,6 +412,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var outgoing = Data()
         /// Panes left at the phone's size on this machine, across connections.
         let sizes: TerminalMuxPhoneSizes
+        /// Which panes' programs have asked for the mouse.
+        var grabs: [Int: Bool] = [:]
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry,
              sizes: TerminalMuxPhoneSizes) {
             self.client = client; self.control = control; self.geometry = geometry; self.sizes = sizes
@@ -601,6 +603,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.queries.receive(pane: pane, context: context)
             case .phoneSize(let pane, let desktop, let rows, let columns):
                 state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
+            case .mouseGrab(let pane, let grabbed):
+                state.grabs[pane] = grabbed
+                state.control.setMouseGrabbed(state.shown.flatMap { state.grabs[$0] } ?? false)
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
                 // be reconnected), but its reason reaches the screen.
@@ -635,7 +640,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // One bounded scheduler owns all accepted remote lookup IDs, including
         // superseded and timed-out work. Terminal input keeps its separate lane.
         state.queries.step()
-        guard let pane = state.shown else { return }
+        guard let pane = state.shown else {
+            // No pane on screen: nothing has the mouse, and taps meant for a
+            // pane that left are not replayed on the next one.
+            _ = state.control.takeClicks()
+            state.control.setMouseGrabbed(false)
+            return
+        }
         let visible = state.control.current.visible
         if visible, !state.showing {
             try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
@@ -649,6 +660,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         if let scroll = state.control.takeScroll(), state.showing {
             try state.client.wheel(pane: pane, steps: scroll.steps, column: scroll.column, row: scroll.row)
         }
+        // A tap on a program that has the mouse clicks it.
+        for click in state.control.takeClicks() where state.showing && state.grabs[pane] == true {
+            try state.client.click(pane: pane, column: click.column, row: click.row)
+        }
+        state.control.setMouseGrabbed(state.grabs[pane] ?? false)
     }
 
     /// The next bytes for the phone's terminal, at most one receive's worth.

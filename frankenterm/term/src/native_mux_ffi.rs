@@ -40,6 +40,7 @@ const EVENT_FAILED: u32 = 6;
 const EVENT_SEARCH_RESULTS: u32 = 7;
 const EVENT_CONTEXT: u32 = 8;
 const EVENT_PHONE_SIZE: u32 = 9;
+const EVENT_MOUSE_GRAB: u32 = 10;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -204,6 +205,13 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
         }
         Some(Event::PaneGone { pane_id }) => (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new()),
         Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
+        Some(Event::MouseGrab { pane_id, grabbed }) => (
+            EVENT_MOUSE_GRAB,
+            pane_id as u64,
+            0,
+            0,
+            vec![u8::from(grabbed)],
+        ),
         Some(Event::PhoneSize {
             pane_id,
             desktop,
@@ -537,6 +545,20 @@ pub extern "C" fn ft_mux_v1_wheel(
         registry
             .session(session)?
             .wheel(pane_id, steps, column as usize, row as usize);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ft_mux_v1_click(session: u64, pane_id: u64, column: u32, row: u32) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        if column > 4096 || row > 4096 {
+            return Err(Error::Invalid);
+        }
+        registry
+            .session(session)?
+            .click(pane_id, column as usize, row as usize);
         Ok(())
     })
 }

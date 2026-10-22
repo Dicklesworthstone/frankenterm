@@ -104,6 +104,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 return .searchResults(paneID: paneID, try decoder.decode(TerminalMuxSearchResults.self, from: payload))
             case UInt32(FT_MUX_EVENT_CONTEXT):
                 return .context(paneID: paneID, try JSONDecoder().decode(TerminalMuxContext.self, from: payload))
+            case UInt32(FT_MUX_EVENT_MOUSE_GRAB):
+                guard payload.count == 1, payload[payload.startIndex] <= 1 else { throw TerminalModelError.invalid }
+                return .mouseGrab(paneID: paneID, grabbed: payload[payload.startIndex] == 1)
             case UInt32(FT_MUX_EVENT_PHONE_SIZE):
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -157,6 +160,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     public func restoreSize(pane: Int) throws {
         let pane = try Self.paneID(pane)
         try call { ft_mux_v1_restore_size($0, pane) }
+    }
+
+    public func click(pane: Int, column: Int, row: Int) throws {
+        let pane = try Self.paneID(pane)
+        guard (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }
+        try call { ft_mux_v1_click($0, pane, UInt32(column), UInt32(row)) }
     }
 
     public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool {

@@ -769,6 +769,11 @@ public final class NativeTerminalView: UIView {
     /// owner turns that program's wheel `steps` notches (negative toward older
     /// output) over cell (column, row). Unset, such a drag does nothing.
     public var onRemoteScroll: (@MainActor (_ steps: Int, _ column: Int, _ row: Int) -> Void)?
+    /// The program on screen has asked for the mouse: a tap clicks the cell
+    /// under the finger through `onRemoteClick` instead of toggling the
+    /// keyboard.
+    public var remoteMouseGrabbed = false
+    public var onRemoteClick: (@MainActor (_ column: Int, _ row: Int) -> Void)?
     /// Rows of drag per wheel notch: a notch scrolls a program about three rows.
     private static let rowsPerNotch = 3
 
@@ -861,7 +866,7 @@ public final class NativeTerminalView: UIView {
         press.minimumPressDuration = 0.35; press.delegate = touchFilter
         addGestureRecognizer(press)
         // A tap clears a selection, else shows or hides the keyboard.
-        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
+        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
         tap.delegate = touchFilter
         addGestureRecognizer(tap)
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
@@ -1053,10 +1058,19 @@ public final class NativeTerminalView: UIView {
 
     // MARK: Taps, text size
 
-    @objc private func tapped() {
+    @objc private func tapped(_ tap: UITapGestureRecognizer) {
         guard !retired else { return }
         stopMomentum()
         if selection != nil { clearSelection(); return }
+        // A program that asked for the mouse takes the tap as a click; the
+        // keyboard has its own button then.
+        if remoteMouseGrabbed, let onRemoteClick, let cell = renderer.cellSize, cell.width > 0, cell.height > 0,
+           let frame = renderer.admittedFrame, frame.isLive {
+            let point = tap.location(in: self)
+            onRemoteClick(min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
+                          min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)))
+            return
+        }
         if !input.isFirstResponder { onKeyboardRequest?() }
         // With a hardware keyboard there is no on-screen keyboard to put
         // away, and resigning would only stop the typing.
@@ -1397,7 +1411,7 @@ public final class NativeTerminalView: UIView {
     public func retire() {
         guard !retired else { return }
         clearSelection(); stopMomentum()
-        onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil; onRemoteScroll = nil
+        onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil; onRemoteScroll = nil; onRemoteClick = nil
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil

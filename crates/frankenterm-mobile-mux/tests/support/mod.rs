@@ -163,6 +163,8 @@ pub struct Server {
     pub resizes: Vec<TerminalSize>,
     /// Search replies expand past the phone's frame limit.
     pub oversize_search: bool,
+    /// The pane's program has asked for the mouse.
+    pub mouse_grabbed: bool,
     pub requests: Vec<&'static str>,
     /// GetLines requests still to answer with an ErrorResponse.
     pub refuse_lines: usize,
@@ -193,6 +195,7 @@ impl Server {
             mouse: Vec::new(),
             resizes: Vec::new(),
             oversize_search: false,
+            mouse_grabbed: false,
             requests: Vec::new(),
             refuse_lines: 0,
             search_ranges: Vec::new(),
@@ -454,7 +457,7 @@ impl Server {
         }
         let reply = GetPaneRenderChangesResponse {
             pane_id: self.pane_id,
-            mouse_grabbed: false,
+            mouse_grabbed: self.mouse_grabbed,
             alt_screen_active: alt,
             cursor_position: cursor,
             dimensions: dims,

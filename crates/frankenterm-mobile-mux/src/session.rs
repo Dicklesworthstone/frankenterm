@@ -85,6 +85,12 @@ pub enum Event {
         rows: usize,
         cols: usize,
     },
+    /// The pane's program asked for the mouse, or stopped: while it has it,
+    /// a tap is a click ([`Session::click`]).
+    MouseGrab {
+        pane_id: usize,
+        grabbed: bool,
+    },
     /// The session is over; close the channel.
     Failed {
         reason: String,
@@ -159,6 +165,8 @@ pub struct Session {
     panes: Vec<PaneInfo>,
     mirrors: HashMap<usize, PaneMirror>,
     sizing: HashMap<usize, PaneSizing>,
+    /// Whether each mirrored pane's program has asked for the mouse.
+    grabs: HashMap<usize, bool>,
     events: VecDeque<Event>,
     searches: HashMap<u64, SearchJob>,
     /// Searches waiting for a pane list asked for after they began (the
@@ -357,6 +365,31 @@ impl Session {
             modifiers: termwiz::input::Modifiers::NONE,
         };
         for _ in 0..steps.unsigned_abs().min(MAX_WHEEL_STEPS) {
+            self.send(
+                ident::SEND_MOUSE_EVENT,
+                &SendMouseEvent { pane_id, event },
+                Request::Action,
+            );
+        }
+    }
+
+    /// Clicks the left button on a cell of the pane's screen: a press and a
+    /// release, which the server reports to a program that asked for the
+    /// mouse (others ignore them).
+    pub fn click(&mut self, pane_id: usize, column: usize, row: usize) {
+        if !self.is_ready() {
+            return;
+        }
+        for kind in [MouseEventKind::Press, MouseEventKind::Release] {
+            let event = MouseEvent {
+                kind,
+                x: column,
+                y: i64::try_from(row).unwrap_or(i64::MAX),
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+                button: MouseButton::Left,
+                modifiers: termwiz::input::Modifiers::NONE,
+            };
             self.send(
                 ident::SEND_MOUSE_EVENT,
                 &SendMouseEvent { pane_id, event },
@@ -721,6 +754,10 @@ impl Session {
                         Err(_) => (wire::decode::<RenderHead>(&frame.body)?, None),
                     };
                     self.update_title(pane_id, &head.title);
+                    let grabbed = head.mouse_grabbed;
+                    if self.grabs.insert(pane_id, grabbed) != Some(grabbed) {
+                        self.events.push_back(Event::MouseGrab { pane_id, grabbed });
+                    }
                     if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
                         mirror.apply_changes(head, lines)?;
                     }
@@ -882,6 +919,7 @@ impl Session {
 
     fn pane_gone(&mut self, pane_id: usize) {
         self.mirrors.remove(&pane_id);
+        self.grabs.remove(&pane_id);
         let phone_sized = self
             .sizing
             .remove(&pane_id)

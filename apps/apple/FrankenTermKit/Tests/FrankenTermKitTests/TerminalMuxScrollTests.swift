@@ -29,4 +29,24 @@ final class TerminalMuxScrollTests: XCTestCase {
         control.scroll(steps: -3, column: 0, row: 0)
         XCTAssertNil(control.takeScroll(), "notches that cancel out send nothing")
     }
+
+    func testClicksQueueInOrderBoundedAndTheMouseGrabIsPublishedOnChange() {
+        let control = TerminalMuxControl()
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var grabs: [Bool] = [] }
+        let seen = Seen()
+        control.observe { state in seen.lock.withLock { seen.grabs.append(state.mouseGrabbed) } }
+        control.setMouseGrabbed(true)
+        control.setMouseGrabbed(true)
+        control.setMouseGrabbed(false)
+        XCTAssertEqual(seen.lock.withLock { seen.grabs }, [false, true, false], "only changes are published")
+
+        control.click(column: 3, row: 4)
+        control.click(column: -1, row: 9)
+        let taken = control.takeClicks()
+        XCTAssertEqual(taken.map(\.column), [3, 0])
+        XCTAssertEqual(taken.map(\.row), [4, 9])
+        XCTAssertTrue(control.takeClicks().isEmpty, "sent once")
+        for column in 0..<(TerminalMuxControl.maximumPendingClicks + 5) { control.click(column: column, row: 0) }
+        XCTAssertEqual(control.takeClicks().count, TerminalMuxControl.maximumPendingClicks)
+    }
 }
