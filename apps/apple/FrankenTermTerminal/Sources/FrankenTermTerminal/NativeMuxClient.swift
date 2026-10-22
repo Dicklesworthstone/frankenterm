@@ -104,6 +104,11 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 return .searchResults(paneID: paneID, try decoder.decode(TerminalMuxSearchResults.self, from: payload))
             case UInt32(FT_MUX_EVENT_CONTEXT):
                 return .context(paneID: paneID, try JSONDecoder().decode(TerminalMuxContext.self, from: payload))
+            case UInt32(FT_MUX_EVENT_PHONE_SIZE):
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let desktop = payload.isEmpty ? nil : try decoder.decode(TerminalMuxSize.self, from: payload)
+                return .phoneSize(paneID: paneID, desktop: desktop, rows: Int(rows), columns: Int(cols))
             default: throw TerminalModelError.invalid
             }
         }
@@ -152,6 +157,20 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     public func restoreSize(pane: Int) throws {
         let pane = try Self.paneID(pane)
         try call { ft_mux_v1_restore_size($0, pane) }
+    }
+
+    public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool {
+        let pane = try Self.paneID(pane)
+        guard (1...4096).contains(desktop.rows), (1...4096).contains(desktop.cols),
+              (1...512).contains(rows), (1...512).contains(columns),
+              let pixelWidth = UInt32(exactly: desktop.pixelWidth), let pixelHeight = UInt32(exactly: desktop.pixelHeight),
+              let dpi = UInt32(exactly: desktop.dpi) else { throw TerminalModelError.invalid }
+        var adopted: UInt32 = 0
+        try call {
+            ft_mux_v1_adopt_phone_size($0, pane, UInt32(desktop.rows), UInt32(desktop.cols), pixelWidth, pixelHeight,
+                                       dpi, UInt32(rows), UInt32(columns), &adopted)
+        }
+        return adopted == 1
     }
 
     public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {

@@ -392,4 +392,40 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         control.readContext(pane: 1, row: 5)
         XCTAssertNotNil(control.current.context?.error); XCTAssertNil(control.takeContext())
     }
+
+    func testPhoneSizesSurviveAcrossConnectionsPerMachineAndClearWhenRestored() throws {
+        let suite = "frankenterm.tests.phoneSizes.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
+        let first = TerminalMuxPhoneSizes(workspace: "w", machine: "ts1", defaults: defaults)
+        first.set(pane: 4, desktop: desktop, rows: 40, columns: 54)
+        first.set(pane: 9, desktop: desktop, rows: 40, columns: 54)
+        first.set(pane: 9, desktop: nil, rows: 0, columns: 0)
+
+        // The next connection to the same machine sees what was left.
+        let next = TerminalMuxPhoneSizes(workspace: "w", machine: "ts1", defaults: defaults)
+        XCTAssertEqual(next.records, [4: .init(desktop: desktop, rows: 40, columns: 54)])
+        XCTAssertTrue(TerminalMuxPhoneSizes(workspace: "w", machine: "ts2", defaults: defaults).records.isEmpty)
+        next.removeAll()
+        XCTAssertTrue(first.records.isEmpty)
+
+        for pane in 0..<(TerminalMuxPhoneSizes.maximumRecords + 10) {
+            first.set(pane: pane, desktop: desktop, rows: 40, columns: 54)
+        }
+        XCTAssertEqual(first.records.count, TerminalMuxPhoneSizes.maximumRecords, "bounded")
+    }
+
+    func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {
+        let control = TerminalMuxControl()
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var failures: [String?] = [] }
+        let seen = Seen()
+        control.observe { state in seen.lock.withLock { seen.failures.append(state.failure) } }
+        XCTAssertNil(control.current.failure)
+        control.recordFailure("malformed mux frame: a pane size no terminal has")
+        XCTAssertEqual(control.current.failure, "malformed mux frame: a pane size no terminal has")
+        XCTAssertEqual(seen.lock.withLock { seen.failures.last }, "malformed mux frame: a pane size no terminal has")
+        control.recordFailure(String(repeating: "x", count: 4096))
+        XCTAssertEqual(control.current.failure, "The server reported an oversized error message.")
+    }
 }

@@ -39,6 +39,7 @@ const EVENT_PANE_GONE: u32 = 5;
 const EVENT_FAILED: u32 = 6;
 const EVENT_SEARCH_RESULTS: u32 = 7;
 const EVENT_CONTEXT: u32 = 8;
+const EVENT_PHONE_SIZE: u32 = 9;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -203,6 +204,21 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
         }
         Some(Event::PaneGone { pane_id }) => (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new()),
         Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
+        Some(Event::PhoneSize {
+            pane_id,
+            desktop,
+            rows,
+            cols,
+        }) => (
+            EVENT_PHONE_SIZE,
+            pane_id as u64,
+            count(rows)?,
+            count(cols)?,
+            match desktop {
+                Some(size) => serde_json::to_vec(&size).map_err(|_| Error::Invalid)?,
+                None => Vec::new(),
+            },
+        ),
         Some(Event::SearchResults {
             search,
             pane_id,
@@ -521,6 +537,53 @@ pub extern "C" fn ft_mux_v1_wheel(
         registry
             .session(session)?
             .wheel(pane_id, steps, column as usize, row as usize);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ft_mux_v1_adopt_phone_size(
+    session: u64,
+    pane_id: u64,
+    desktop_rows: u32,
+    desktop_cols: u32,
+    desktop_pixel_width: u32,
+    desktop_pixel_height: u32,
+    desktop_dpi: u32,
+    rows: u32,
+    cols: u32,
+    adopted: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(adopted, 0)?;
+        }
+        let pane_id = pane(pane_id)?;
+        let cells = 1..=4096u32;
+        if !cells.contains(&desktop_rows)
+            || !cells.contains(&desktop_cols)
+            || !(1..=512).contains(&rows)
+            || !(1..=512).contains(&cols)
+        {
+            return Err(Error::Invalid);
+        }
+        let desktop = frankenterm_mobile_mux::wire::TerminalSize {
+            rows: desktop_rows as usize,
+            cols: desktop_cols as usize,
+            pixel_width: desktop_pixel_width as usize,
+            pixel_height: desktop_pixel_height as usize,
+            dpi: desktop_dpi,
+        };
+        let taken = registry.session(session)?.adopt_phone_size(
+            pane_id,
+            desktop,
+            rows as usize,
+            cols as usize,
+        );
+        unsafe {
+            output_scalar(adopted, u32::from(taken))?;
+        }
         Ok(())
     })
 }

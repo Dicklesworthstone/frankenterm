@@ -977,7 +977,12 @@ final class TerminalSessionController {
                 case .disconnected, .transportFailed: dropped = true
                 default: break
                 }
-                phase = .ended(Self.describe(reason))
+                // The mux server's own reason, when it ended the session.
+                if let failure = connection?.muxControl?.current.failure {
+                    phase = .ended("The machine's FrankenTerm mux ended the session: \(failure)")
+                } else {
+                    phase = .ended(Self.describe(reason))
+                }
             case let .failure(error):
                 dropped = error is TerminalTransportError || (error as? NativeSSHError)?.isConnectionFailure == true
                 phase = .failed(Self.describe(error))

@@ -721,6 +721,72 @@ fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
     assert_eq!(harness.server.resizes.len(), count, "restored once");
 }
 
+fn phone_sizes(harness: &Harness) -> Vec<(usize, Option<(usize, usize)>, usize, usize)> {
+    harness
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::PhoneSize {
+                pane_id,
+                desktop,
+                rows,
+                cols,
+            } => Some((
+                *pane_id,
+                desktop.map(|size| (size.rows, size.cols)),
+                *rows,
+                *cols,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_size_left_by_a_dropped_connection_is_given_back_by_the_next() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    let left = phone_sizes(&harness);
+    assert_eq!(left, [(pane, Some((6, 20)), 10, 32)]);
+    let desktop = match harness.events.iter().rev().find_map(|event| match event {
+        Event::PhoneSize {
+            desktop: Some(size),
+            ..
+        } => Some(*size),
+        _ => None,
+    }) {
+        Some(size) => size,
+        None => panic!("a desktop size"),
+    };
+
+    // The connection drops without a restore; a new one attaches.
+    harness.session = frankenterm_mobile_mux::Session::new();
+    harness.events.clear();
+    harness.pump();
+    assert!(harness.session.is_ready());
+    // A size this pane no longer has is not taken over.
+    assert!(!harness.session.adopt_phone_size(pane, desktop, 11, 32));
+    assert!(!harness.session.adopt_phone_size(pane + 1, desktop, 10, 32));
+    assert!(harness.session.adopt_phone_size(pane, desktop, 10, 32));
+    harness.session.restore_size(pane);
+    harness.pump();
+    let restored = harness.server.resizes.last().copied().expect("a restore");
+    assert_eq!((restored.rows, restored.cols), (6, 20));
+    assert_eq!(
+        phone_sizes(&harness),
+        [(pane, None, 0, 0)],
+        "the record is cleared"
+    );
+
+    // Once restored, a later list shows the desktop's size: nothing to adopt.
+    harness.session.refresh_panes();
+    harness.pump();
+    assert!(!harness.session.adopt_phone_size(pane, desktop, 10, 32));
+}
+
 #[test]
 fn a_search_reaches_output_written_since_the_pane_was_listed() {
     let mut harness = Harness::new(4, 30);

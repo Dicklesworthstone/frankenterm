@@ -188,6 +188,11 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              newline-joined) and text_start..text_end the match within
  *              it, as UTF-8 byte offsets
  *   CONTEXT    pane_id; payload: JSON {request, lines: [{row, text}]}
+ *   PHONE_SIZE pane_id, rows, cols: the phone's size is in effect for the
+ *              pane; payload: JSON {rows, cols, pixel_width, pixel_height,
+ *              dpi}, the desktop's size to give back. An empty payload (rows
+ *              and cols 0): it no longer is. Keep the latest per pane across
+ *              connections for ft_mux_v1_adopt_phone_size.
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -198,6 +203,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_FAILED 6u
 #define FT_MUX_EVENT_SEARCH_RESULTS 7u
 #define FT_MUX_EVENT_CONTEXT 8u
+#define FT_MUX_EVENT_PHONE_SIZE 9u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
@@ -232,6 +238,16 @@ uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text
  * gave it; restore_size puts that size back. */
 uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
 uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
+/* After the pane list arrives: an earlier connection left the pane at the
+ * phone's size rows x cols (1..512 each) without giving back the desktop's
+ * (desktop rows and cols 1..4096), as its last PHONE_SIZE event said. If the
+ * pane is still listed at exactly that size, restore_size will give it the
+ * desktop's size; *adopted is 1. Otherwise (the desktop resized it since, or
+ * the id now names another pane) nothing changes and *adopted is 0. */
+uint32_t ft_mux_v1_adopt_phone_size(uint64_t session, uint64_t pane_id, uint32_t desktop_rows,
+                                    uint32_t desktop_cols, uint32_t desktop_pixel_width,
+                                    uint32_t desktop_pixel_height, uint32_t desktop_dpi,
+                                    uint32_t rows, uint32_t cols, uint32_t *adopted);
 /* Turns a mouse wheel steps notches (nonzero; negative toward older output,
  * at most 64 sent per call) over the pane's screen cell column,row (each at
  * most 4096). The server reports them to a program that asked for the

@@ -410,8 +410,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         /// The shown pane is sized to the phone and drawing.
         var showing = false
         var outgoing = Data()
-        init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry) {
-            self.client = client; self.control = control; self.geometry = geometry
+        /// Panes left at the phone's size on this machine, across connections.
+        let sizes: TerminalMuxPhoneSizes
+        init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry,
+             sizes: TerminalMuxPhoneSizes) {
+            self.client = client; self.control = control; self.geometry = geometry; self.sizes = sizes
             queries = TerminalMuxQueryDriver(client: client, control: control)
             output = TerminalMuxOutputBuffer(geometry: geometry)
         }
@@ -452,7 +455,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             self.driver = driver
             let state = MuxAttachment(client: client, control: control, geometry: try TerminalSessionGeometry(
                 columns: geometry.columns, rows: geometry.rows,
-                pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight))
+                pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight),
+                sizes: TerminalMuxPhoneSizes(workspace: identity.workspaceID, machine: identity.machineID))
             mux = state
             // The server's protocol check and its pane list.
             let deadline = ContinuousClock.now + .seconds(15)
@@ -471,6 +475,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             guard let first = state.panes.first(where: \.isActive) ?? state.panes.first else {
                 throw TerminalMuxError.noPanes
             }
+            // Panes an earlier connection left at the phone's size get the
+            // desktop's back; the one about to be shown is resized anyway, and
+            // keeps the desktop's size to give back when the phone looks away.
+            for (pane, record) in state.sizes.records.sorted(by: { $0.key < $1.key }) {
+                guard try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
+                                                rows: record.rows, columns: record.columns) else { continue }
+                if pane != first.paneId { try client.restoreSize(pane: pane) }
+            }
+            state.sizes.removeAll()
             state.shown = first.paneId
             try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
@@ -586,7 +599,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.queries.receive(pane: pane, results: results)
             case .context(let pane, let context):
                 state.queries.receive(pane: pane, context: context)
+            case .phoneSize(let pane, let desktop, let rows, let columns):
+                state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
             case .failed(let reason):
+                // Once attached, a failure still ends this connection (and may
+                // be reconnected), but its reason reaches the screen.
+                if state.ready { state.control.recordFailure(reason) }
                 throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.failed(reason)
             }
         }

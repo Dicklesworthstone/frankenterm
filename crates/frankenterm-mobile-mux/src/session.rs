@@ -74,6 +74,17 @@ pub enum Event {
         pane_id: usize,
         lines: Vec<ContextLine>,
     },
+    /// The phone's size (`rows` by `cols`) is now in effect for the pane and
+    /// `desktop` is the size to give back; or, with no `desktop`, it no longer
+    /// is. Kept across connections, it lets the next session give a pane its
+    /// size back when this one ended without doing so
+    /// ([`Session::adopt_phone_size`]).
+    PhoneSize {
+        pane_id: usize,
+        desktop: Option<TerminalSize>,
+        rows: usize,
+        cols: usize,
+    },
     /// The session is over; close the channel.
     Failed {
         reason: String,
@@ -518,6 +529,40 @@ impl Session {
             Request::Action
         };
         self.send_resize(tab_id, pane_id, size, request);
+        self.events.push_back(Event::PhoneSize {
+            pane_id,
+            desktop: Some(desktop),
+            rows,
+            cols,
+        });
+    }
+
+    /// Takes over a pane an earlier session left at the phone's size
+    /// (`rows` by `cols`, from its [`Event::PhoneSize`]) without giving the
+    /// desktop's back, so [`Session::restore_size`] returns `desktop`. Only a
+    /// pane still listed at exactly that size is taken over: one the desktop
+    /// resized since, or another pane under a reused id, is left alone.
+    pub fn adopt_phone_size(
+        &mut self,
+        pane_id: usize,
+        desktop: TerminalSize,
+        rows: usize,
+        cols: usize,
+    ) -> bool {
+        let still_phone_sized = self.panes.iter().any(|pane| {
+            pane.pane_id == pane_id && (pane.size.rows, pane.size.cols) == (rows, cols)
+        });
+        if !self.is_ready() || !still_phone_sized || (desktop.rows, desktop.cols) == (rows, cols) {
+            return false;
+        }
+        self.sizing.insert(
+            pane_id,
+            PaneSizing {
+                desktop,
+                phone_until: Some(u64::MAX),
+            },
+        );
+        true
     }
 
     /// Gives the pane back the size the desktop gave it, if the phone
@@ -548,6 +593,12 @@ impl Session {
         if let Some(sizing) = self.sizing.get_mut(&pane_id) {
             sizing.phone_until = Some(restored);
         }
+        self.events.push_back(Event::PhoneSize {
+            pane_id,
+            desktop: None,
+            rows: 0,
+            cols: 0,
+        });
     }
 
     fn send_resize(&mut self, tab_id: usize, pane_id: usize, size: TerminalSize, request: Request) {
@@ -831,9 +882,20 @@ impl Session {
 
     fn pane_gone(&mut self, pane_id: usize) {
         self.mirrors.remove(&pane_id);
-        self.sizing.remove(&pane_id);
+        let phone_sized = self
+            .sizing
+            .remove(&pane_id)
+            .is_some_and(|sizing| sizing.phone_until.is_some());
         self.panes.retain(|pane| pane.pane_id != pane_id);
         self.events.push_back(Event::PaneGone { pane_id });
+        if phone_sized {
+            self.events.push_back(Event::PhoneSize {
+                pane_id,
+                desktop: None,
+                rows: 0,
+                cols: 0,
+            });
+        }
     }
 
     /// Fetches the rows the pane's mirror lacks, or draws it.

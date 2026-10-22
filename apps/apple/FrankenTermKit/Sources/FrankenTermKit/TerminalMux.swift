@@ -80,6 +80,14 @@ public struct TerminalMuxContext: Decodable, Equatable, Sendable {
     public let lines: [TerminalMuxContextLine]
 }
 
+/// A pane size as the mux server keeps it, pixels and dpi included.
+public struct TerminalMuxSize: Codable, Equatable, Sendable {
+    public let rows: Int, cols: Int, pixelWidth: Int, pixelHeight: Int, dpi: Int
+    public init(rows: Int, cols: Int, pixelWidth: Int, pixelHeight: Int, dpi: Int) {
+        self.rows = rows; self.cols = cols; self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight; self.dpi = dpi
+    }
+}
+
 public enum TerminalMuxEvent: Equatable, Sendable {
     case ready(serverVersion: String)
     case panes([TerminalMuxPane])
@@ -89,8 +97,58 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case paneGone(paneID: Int)
     case searchResults(paneID: Int, TerminalMuxSearchResults)
     case context(paneID: Int, TerminalMuxContext)
+    /// The phone's size (rows x columns) is in effect for the pane, and
+    /// `desktop` is the size to give back; or, without `desktop`, no longer.
+    case phoneSize(paneID: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int)
     /// The session is over; the channel must close.
     case failed(String)
+}
+
+/// The panes a phone left at its own size on one machine, kept across
+/// connections: when a connection drops before giving a pane the desktop's
+/// size back, the next one does.
+public final class TerminalMuxPhoneSizes: @unchecked Sendable {
+    public struct Record: Codable, Equatable, Sendable {
+        public let desktop: TerminalMuxSize
+        public let rows: Int, columns: Int
+    }
+    /// More panes than any machine has; older entries beyond it are dropped.
+    public static let maximumRecords = 256
+    private let lock = NSLock()
+    private let defaults: UserDefaults
+    private let key: String
+
+    public init(workspace: String, machine: String, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        key = "frankenterm.mux.phoneSizes.\(workspace).\(machine)"
+    }
+
+    public var records: [Int: Record] { lock.withLock { load() } }
+
+    public func set(pane: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int) {
+        lock.withLock {
+            var all = load()
+            if let desktop { all[pane] = Record(desktop: desktop, rows: rows, columns: columns) }
+            else { all[pane] = nil }
+            store(all)
+        }
+    }
+
+    public func removeAll() { lock.withLock { defaults.removeObject(forKey: key) } }
+
+    private func load() -> [Int: Record] {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([String: Record].self, from: data) else { return [:] }
+        return Dictionary(decoded.compactMap { key, value in Int(key).map { ($0, value) } },
+                          uniquingKeysWith: { first, _ in first })
+    }
+
+    private func store(_ all: [Int: Record]) {
+        guard !all.isEmpty else { defaults.removeObject(forKey: key); return }
+        let kept = all.sorted { $0.key < $1.key }.suffix(Self.maximumRecords)
+        let encoded = Dictionary(kept.map { (String($0.key), $0.value) }, uniquingKeysWith: { first, _ in first })
+        if let data = try? JSONEncoder().encode(encoded) { defaults.set(data, forKey: key) }
+    }
 }
 
 /// The protocol state of one connection to a machine's mux server, the same
@@ -121,11 +179,17 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// the pane's screen cell: wheel events for a program that asked for the
     /// mouse, arrow keys for a full-screen one, nothing for others.
     func wheel(pane: Int, steps: Int, column: Int, row: Int) throws
+    /// After the pane list arrives: takes over a pane an earlier connection
+    /// left at the phone's size, if it still has exactly that size, so that
+    /// `restoreSize` gives it `desktop`. True when taken over.
+    func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool
 }
 
 extension TerminalMuxClient {
     /// A client without a wheel ignores it.
     public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {}
+    /// A client that keeps no sizes takes over none.
+    public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool { false }
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
@@ -189,6 +253,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var visible = false
         public var search: Search?
         public var context: Context?
+        /// Why the mux server ended an attached session (a reply this app
+        /// could not read, say), when it was not the connection dropping.
+        public var failure: String?
     }
     private let lock = NSLock()
     private var state = State()
@@ -365,6 +432,14 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     // MARK: transport side
+
+    /// The attached session is ending for `reason`; the screen shows it.
+    public func recordFailure(_ reason: String) {
+        update { state in
+            state.failure = Self.boundedError(reason)
+            return true
+        }
+    }
 
     /// The search to start, once.
     public func takeSearch() -> Search? { lock.withLock { defer { pendingSearch = nil }; return pendingSearch } }
