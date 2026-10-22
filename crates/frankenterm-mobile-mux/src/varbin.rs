@@ -92,7 +92,8 @@ impl<'de> Deserializer<'de> {
 macro_rules! unsigned {
     ($method:ident, $visit:ident, $ty:ty) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            let value = <$ty>::try_from(self.unsigned()?).map_err(|_| error("number out of range"))?;
+            let value =
+                <$ty>::try_from(self.unsigned()?).map_err(|_| error("number out of range"))?;
             visitor.$visit(value)
         }
     };
@@ -101,7 +102,8 @@ macro_rules! unsigned {
 macro_rules! signed {
     ($method:ident, $visit:ident, $ty:ty) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            let value = <$ty>::try_from(self.signed()?).map_err(|_| error("number out of range"))?;
+            let value =
+                <$ty>::try_from(self.signed()?).map_err(|_| error("number out of range"))?;
             visitor.$visit(value)
         }
     };
@@ -377,7 +379,7 @@ mod tests {
                     y: vec![1, 2, 3],
                 },
             ],
-            names: [(3, "three".to_owned())].into_iter().collect(),
+            names: HashMap::from([(3, "three".to_owned())]),
             range: -5..9,
         };
         let bytes = varbincode::serialize(&sample).unwrap();

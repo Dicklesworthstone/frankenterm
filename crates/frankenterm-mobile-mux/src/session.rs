@@ -152,6 +152,8 @@ pub struct Session {
     list_again: bool,
     next_lookup: u64,
     input: InputSplitter,
+    /// The pane an unfinished paste is for.
+    paste_pane: Option<usize>,
 }
 
 impl Session {
@@ -260,7 +262,16 @@ impl Session {
         if !self.is_ready() || data.is_empty() {
             return;
         }
-        for piece in self.input.split(data) {
+        // Input for another pane means the unfinished paste's writer
+        // stopped: what arrived of it goes to its pane as it is.
+        if self.paste_pane.is_some_and(|pane| pane != pane_id) {
+            if let (Some(pane), Some(text)) = (self.paste_pane.take(), self.input.take_pending()) {
+                self.paste(pane, &text);
+            }
+        }
+        let pieces = self.input.split(data);
+        self.paste_pane = self.input.in_paste().then_some(pane_id);
+        for piece in pieces {
             match piece {
                 Piece::Bytes(data) => {
                     self.send(
@@ -362,7 +373,11 @@ impl Session {
                     self.continue_search(search);
                 }
                 _ => {
-                    self.finish_search(search, &HashMap::new(), Some("The pane has closed.".into()));
+                    self.finish_search(
+                        search,
+                        &HashMap::new(),
+                        Some("The pane has closed.".into()),
+                    );
                 }
             }
         }

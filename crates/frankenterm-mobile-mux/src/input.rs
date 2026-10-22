@@ -75,6 +75,20 @@ impl InputSplitter {
         flush(&mut pieces, &mut text);
         pieces
     }
+
+    /// A paste has begun and its end has not arrived yet.
+    pub fn in_paste(&self) -> bool {
+        self.paste.is_some()
+    }
+
+    /// The part of an unfinished paste received so far, ending it: its
+    /// writer stopped, or input moved on to another pane.
+    pub fn take_pending(&mut self) -> Option<String> {
+        self.paste
+            .take()
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
 
 fn flush(pieces: &mut Vec<Piece>, text: &mut Vec<u8>) {
@@ -96,7 +110,11 @@ fn modifiers(parameter: u32) -> Option<Modifiers> {
         return None;
     }
     let mut mods = Modifiers::NONE;
-    for (bit, modifier) in [(1, Modifiers::SHIFT), (2, Modifiers::ALT), (4, Modifiers::CTRL)] {
+    for (bit, modifier) in [
+        (1, Modifiers::SHIFT),
+        (2, Modifiers::ALT),
+        (4, Modifiers::CTRL),
+    ] {
         if bits & bit != 0 {
             mods |= modifier;
         }

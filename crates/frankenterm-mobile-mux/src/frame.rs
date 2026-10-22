@@ -166,7 +166,10 @@ mod tests {
         let mut reader = FrameReader::default();
         reader.push(&frame);
         let got = reader.next_frame().expect("frame").expect("complete");
-        assert_eq!((got.serial, got.ident, got.body, got.oversized), (5, 25, body, false));
+        assert_eq!(
+            (got.serial, got.ident, got.body, got.oversized),
+            (5, 25, body, false)
+        );
     }
 
     #[test]

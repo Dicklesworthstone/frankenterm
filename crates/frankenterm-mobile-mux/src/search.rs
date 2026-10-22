@@ -226,7 +226,9 @@ impl SearchJob {
                     joined.push_str(&line.text);
                 }
                 let text_start = text_start.unwrap_or(0).min(joined.len());
-                let text_end = text_end.unwrap_or(joined.len()).clamp(text_start, joined.len());
+                let text_end = text_end
+                    .unwrap_or(joined.len())
+                    .clamp(text_start, joined.len());
                 SearchMatch {
                     row: hit.start_y,
                     start_column: hit.start_x,
@@ -257,7 +259,11 @@ mod tests {
 
     fn walk(end: StableRowIndex) -> SearchJob {
         let mut job = SearchJob::new(1, Pattern::Regex("x".into()));
-        assert_eq!(job.next_request(), None, "nothing is asked before the end is known");
+        assert_eq!(
+            job.next_request(),
+            None,
+            "nothing is asked before the end is known"
+        );
         job.start(end);
         job
     }
@@ -325,7 +331,10 @@ mod tests {
             .collect();
         let matches = SearchJob::matches(&best, &|row| rows.get(&row));
         assert_eq!(matches[0].text, "row 90");
-        assert_eq!(&matches[0].text[matches[0].text_start..matches[0].text_end], "w 9");
+        assert_eq!(
+            &matches[0].text[matches[0].text_start..matches[0].text_end],
+            "w 9"
+        );
         assert_eq!((matches[2].row, matches[2].start_column), (5, 1));
     }
 

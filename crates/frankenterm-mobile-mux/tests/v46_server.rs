@@ -605,6 +605,23 @@ fn keys_go_as_key_presses_and_bracketed_pastes_as_pastes_in_order() {
 }
 
 #[test]
+fn an_unfinished_paste_is_sent_when_input_moves_to_another_pane() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"\x1b[200~half a paste");
+    harness.pump();
+    assert!(
+        harness.server.pastes.is_empty(),
+        "a paste waits for its end"
+    );
+    harness.session.write(pane + 1, b"x");
+    harness.pump();
+    assert_eq!(harness.server.pastes, ["half a paste"]);
+    assert_eq!(harness.server.written, b"x");
+}
+
+#[test]
 fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
     let mut harness = Harness::new(6, 20);
     harness.attach();
@@ -706,7 +723,9 @@ fn a_search_reply_too_large_fails_only_the_search() {
     let (matches, _, error) = search_results(&harness, search);
     assert!(matches.is_empty());
     assert!(
-        error.as_deref().is_some_and(|error| error.contains("Too many matches")),
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("Too many matches")),
         "{error:?}"
     );
     assert!(harness.session.is_ready());

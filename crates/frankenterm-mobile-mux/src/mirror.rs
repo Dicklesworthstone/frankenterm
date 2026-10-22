@@ -180,11 +180,7 @@ impl PaneMirror {
                     // from there may have been written and scrolled off since
                     // the last update, and what is cached for it is out of
                     // date: fetch it again. Rows above the cursor were done.
-                    let unsettled = previous
-                        .cursor
-                        .y
-                        .max(previous.top())
-                        .min(target.top());
+                    let unsettled = previous.cursor.y.max(previous.top()).min(target.top());
                     self.lines
                         .retain(|row, _| *row < unsettled || viewport.contains(row));
                 }
