@@ -2272,6 +2272,13 @@ impl SnapshotPublicationStore {
         root_object_id: &[u8; 32],
         key: &[u8],
     ) -> Result<ObjectReclamation, PublicationError> {
+        // Reading first leaves a store without two roots exactly as it is:
+        // acquiring the lock would create it.
+        if self.inspect_root_candidates()?.0.len() < 2 {
+            return Ok(ObjectReclamation::skipped(
+                "both root slots must hold roots",
+            ));
+        }
         let publication_lock = self.acquire_publication_lock()?;
         let (mut candidates, diagnostics) = self.inspect_root_candidates()?;
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.generation));
@@ -6358,6 +6365,29 @@ mod tests {
         assert!(selected.current.is_some() && selected.previous.is_some());
         publish_listed_generation(&store, Some(&newest), 2, 2, &ListedObjectsVerifier)
             .expect("reclaimed store admits the next generation");
+    }
+
+    #[test]
+    fn reclaiming_a_store_without_two_roots_leaves_it_untouched() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let reclaim = || {
+            store
+                .reclaim_unreachable_objects(
+                    &ListedObjectsVerifier,
+                    RECLAIM_NAMESPACE,
+                    &RECLAIM_ROOT,
+                    RECLAIM_KEY,
+                )
+                .unwrap()
+        };
+        assert!(reclaim().skipped.is_some());
+        assert!(!temp.path().join(".publication.lock").exists());
+        publish_listed_generation(&store, None, 1, 2, &ListedObjectsVerifier).unwrap();
+        let objects = store.list_object_ids().unwrap();
+        assert!(reclaim().skipped.is_some());
+        assert_eq!(store.list_object_ids().unwrap(), objects);
     }
 
     #[test]
