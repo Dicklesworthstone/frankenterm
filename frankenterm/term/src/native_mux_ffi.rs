@@ -15,7 +15,7 @@
 
 use crate::native::NativeTerminalError as Error;
 use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
-use frankenterm_mobile_mux::{Event, Session};
+use frankenterm_mobile_mux::{Event, SearchQuery, Session};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
@@ -37,6 +37,11 @@ const EVENT_OUTPUT: u32 = 3;
 const EVENT_PANE_TITLE: u32 = 4;
 const EVENT_PANE_GONE: u32 = 5;
 const EVENT_FAILED: u32 = 6;
+const EVENT_SEARCH_RESULTS: u32 = 7;
+const EVENT_CONTEXT: u32 = 8;
+/// Search flags.
+const SEARCH_CASE_SENSITIVE: u32 = 1;
+const SEARCH_REGEX: u32 = 2;
 
 #[derive(Default)]
 struct Slot {
@@ -159,6 +164,37 @@ impl Registry {
                 (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new())
             }
             Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
+            Some(Event::SearchResults {
+                search,
+                pane_id,
+                matches,
+                searched_rows,
+                error,
+            }) => (
+                EVENT_SEARCH_RESULTS,
+                pane_id as u64,
+                0,
+                0,
+                serde_json::to_vec(&serde_json::json!({
+                    "search": search,
+                    "matches": matches,
+                    "searched_rows": searched_rows,
+                    "error": error,
+                }))
+                .map_err(|_| Error::Invalid)?,
+            ),
+            Some(Event::Context {
+                request,
+                pane_id,
+                lines,
+            }) => (
+                EVENT_CONTEXT,
+                pane_id as u64,
+                0,
+                0,
+                serde_json::to_vec(&serde_json::json!({ "request": request, "lines": lines }))
+                    .map_err(|_| Error::Invalid)?,
+            ),
         };
         let length = u32::try_from(payload.len()).map_err(|_| Error::Capacity)?;
         slot.event = payload;
@@ -388,6 +424,68 @@ pub extern "C" fn ft_mux_v1_resize(session: u64, pane_id: u64, rows: u32, cols: 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_search(
+    session: u64,
+    pane_id: u64,
+    text: *const u8,
+    length: u32,
+    flags: u32,
+    search: *mut u64,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(search, 0)?;
+        }
+        let pane_id = pane(pane_id)?;
+        if flags & !(SEARCH_CASE_SENSITIVE | SEARCH_REGEX) != 0 || length == 0 {
+            return Err(Error::Invalid);
+        }
+        let text = utf8(unsafe { input_bytes(text, length, 4096)? })?;
+        let query = SearchQuery {
+            text: text.to_owned(),
+            case_sensitive: flags & SEARCH_CASE_SENSITIVE != 0,
+            regex: flags & SEARCH_REGEX != 0,
+        };
+        let id = registry
+            .session(session)?
+            .search(pane_id, &query)
+            .ok_or(Error::Closed)?;
+        unsafe {
+            output_scalar(search, id)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_context(
+    session: u64,
+    pane_id: u64,
+    first_row: i64,
+    count: u32,
+    request: *mut u64,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(request, 0)?;
+        }
+        let pane_id = pane(pane_id)?;
+        let first = isize::try_from(first_row).map_err(|_| Error::Invalid)?;
+        let end = first
+            .checked_add(isize::try_from(count).map_err(|_| Error::Invalid)?)
+            .ok_or(Error::Invalid)?;
+        let id = registry
+            .session(session)?
+            .context(pane_id, first..end)
+            .ok_or(Error::Invalid)?;
+        unsafe {
+            output_scalar(request, id)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ft_mux_v1_restore_size(session: u64, pane_id: u64) -> u32 {
     boundary(Some(session), |registry| {
         let pane_id = pane(pane_id)?;
@@ -477,6 +575,39 @@ mod tests {
             unsafe { ft_mux_v1_receive(session, std::ptr::null(), 0) },
             Error::Stale as u32
         );
+    }
+
+    #[test]
+    fn searches_wait_for_the_handshake_and_refuse_bad_arguments() {
+        let mut session = 0u64;
+        // SAFETY: a live local scalar.
+        assert_eq!(unsafe { ft_mux_v1_create(&mut session) }, 0);
+        let text = b"needle";
+        let mut search = 9u64;
+        // SAFETY: live local buffers and scalars with their exact lengths.
+        unsafe {
+            assert_eq!(
+                ft_mux_v1_search(session, 1, text.as_ptr(), text.len() as u32, 0, &mut search),
+                Error::Closed as u32,
+                "no search before the server answered"
+            );
+            assert_eq!(search, 0);
+            assert_eq!(
+                ft_mux_v1_search(session, 1, text.as_ptr(), text.len() as u32, 4, &mut search),
+                Error::Invalid as u32
+            );
+            assert_eq!(
+                ft_mux_v1_search(session, 1, text.as_ptr(), 0, 0, &mut search),
+                Error::Invalid as u32
+            );
+            let mut request = 9u64;
+            assert_eq!(
+                ft_mux_v1_context(session, 1, 0, 2000, &mut request),
+                Error::Invalid as u32
+            );
+            assert_eq!(request, 0);
+        }
+        assert_eq!(ft_mux_v1_release(session), 0);
     }
 
     #[test]

@@ -178,6 +178,10 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *   PANE_TITLE pane_id; payload: the title
  *   PANE_GONE  pane_id
  *   FAILED     payload: why; the session is over, close the channel
+ *   SEARCH_RESULTS pane_id; payload: JSON {search, matches: [{row,
+ *              start_column, end_row, end_column, text}], searched_rows,
+ *              error}: the newest matches, newest first
+ *   CONTEXT    pane_id; payload: JSON {request, lines: [{row, text}]}
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -186,6 +190,10 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_PANE_TITLE 4u
 #define FT_MUX_EVENT_PANE_GONE 5u
 #define FT_MUX_EVENT_FAILED 6u
+#define FT_MUX_EVENT_SEARCH_RESULTS 7u
+#define FT_MUX_EVENT_CONTEXT 8u
+#define FT_MUX_SEARCH_CASE_SENSITIVE 1u
+#define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
 #define FT_MUX_MAX_WRITE_BYTES 65536u
 #define FT_MUX_MAX_COPY_BYTES 16777216u
@@ -215,6 +223,15 @@ uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text
  * first resize; restore_size puts that size back. */
 uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
 uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
+/* Searches the pane's scrollback on the server, newest rows first, for
+ * UTF-8 text (at most 4096 bytes) with FT_MUX_SEARCH_* flags; a
+ * SEARCH_RESULTS event with this id answers. CLOSED before the handshake. */
+uint32_t ft_mux_v1_search(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length,
+                          uint32_t flags, uint64_t *search);
+/* The text of the pane's rows first_row..first_row+count (count at most
+ * 1000); a CONTEXT event with this id answers. */
+uint32_t ft_mux_v1_context(uint64_t session, uint64_t pane_id, int64_t first_row, uint32_t count,
+                           uint64_t *request);
 
 #ifdef __cplusplus
 }
