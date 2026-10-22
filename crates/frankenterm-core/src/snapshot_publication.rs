@@ -20,8 +20,11 @@
 //! - **Immutable Objects (`objects/<id>.obj`)**: Content-addressed recovery objects are published
 //!   with no-clobber semantics under the publication lock. Existing identical objects are adopted idempotently;
 //!   conflicting residue fails closed with an error.
-//! - **No File Deletion**: Incomplete staging files or torn generation roots are strictly preserved on
-//!   disk for post-incident forensics.
+//! - **Reclaiming Only Unreachable Objects**: Incomplete staging files, torn generation roots and
+//!   discovery files are strictly preserved on disk for post-incident forensics. After a repair-protected
+//!   root commits, still under the publication lock, the store unlinks the objects neither retained root
+//!   can read (manifest objects, their repair closures, the roots' own repair closures) that are older
+//!   than both roots, and nothing when it cannot prove what either root needs (ft-6nfed).
 //! - **Cumulative Writer Quota**: The existing publication lock serializes logical file-byte and
 //!   retained-entry admission. An immutable private policy binds participating writers; retained
 //!   stages, orphan objects and metadata remain charged after reopen. Inactive-root replacement
@@ -446,6 +449,24 @@ pub struct ObjectPublicationReceipt {
     pub was_already_present: bool,
 }
 
+/// What one reclamation pass unlinked, or why it unlinked nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectReclamation {
+    pub removed_objects: usize,
+    pub removed_bytes: u64,
+    /// Set when the pass could not prove what both retained roots need.
+    pub skipped: Option<&'static str>,
+}
+
+impl ObjectReclamation {
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            skipped: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
 /// Only a decoded, authenticated reconstruction can resolve envelope corruption,
 /// and only a newer verified root can supersede guardian evidence. All other
 /// authority diagnostics remain blocking.
@@ -516,6 +537,20 @@ pub trait RootVerifier {
     /// prefers a newer verified root. No rejection is by default.
     fn superseded_by_newer(&self, _error: &Self::Error) -> bool {
         false
+    }
+
+    /// Every store object `candidate`'s authenticated manifest names, with
+    /// the repair descriptors of those objects; the store adds the root's
+    /// own descriptors and each descriptor's records. Only roots that bind
+    /// publication are asked, including one whose evidence a newer capture
+    /// superseded. `None`, the default, says the verifier cannot tell, and
+    /// the store then reclaims nothing.
+    fn root_objects(
+        &self,
+        _candidate: &RootSlotCandidate,
+        _store: &SnapshotPublicationStore,
+    ) -> Option<Vec<String>> {
+        None
     }
 }
 
@@ -1902,6 +1937,15 @@ impl SnapshotPublicationStore {
         {
             return Ok(false);
         }
+        let (digest, length) = Self::candidate_envelope_digest(candidate)?;
+        Ok(length == discovery.outer_envelope_len && digest == discovery.outer_envelope_sha256)
+    }
+
+    /// The SHA-256 and length of `candidate`'s whole envelope, trailer
+    /// included: the representation its root repair descriptor is named for.
+    fn candidate_envelope_digest(
+        candidate: &RootSlotCandidate,
+    ) -> Result<([u8; 32], u64), PublicationError> {
         let header = GenerationEnvelopeHeader {
             generation: candidate.generation,
             publisher_id: candidate.publisher_id.clone(),
@@ -1915,9 +1959,6 @@ impl SnapshotPublicationStore {
         let length = (candidate.manifest_bytes.len() as u64)
             .checked_add(ENVELOPE_MAGIC.len() as u64 + 4 + header_bytes.len() as u64 + 32)
             .ok_or(PublicationError::AllocationFailed)?;
-        if length != discovery.outer_envelope_len {
-            return Ok(false);
-        }
         let mut content_hash = Sha256::new();
         content_hash.update(ENVELOPE_MAGIC);
         content_hash.update((header_bytes.len() as u32).to_le_bytes());
@@ -1925,8 +1966,7 @@ impl SnapshotPublicationStore {
         content_hash.update(&candidate.manifest_bytes);
         let trailer = content_hash.clone().finalize();
         content_hash.update(trailer);
-        let digest: [u8; 32] = content_hash.finalize().into();
-        Ok(digest == discovery.outer_envelope_sha256)
+        Ok((content_hash.finalize().into(), length))
     }
 
     /// Publishes an immutable recovery object into `objects/<object_id>.obj`.
@@ -2220,6 +2260,182 @@ impl SnapshotPublicationStore {
         Ok(object_ids)
     }
 
+    /// Reclaim what a store that filled before publication reclaimed still
+    /// holds: such a store refuses the objects a new generation writes
+    /// before its root could reclaim anything (ft-6nfed). Both root slots
+    /// must hold intact roots; the newer must verify and the older verify
+    /// or be superseded by it, as publication requires.
+    pub fn reclaim_unreachable_objects<V: RootVerifier>(
+        &self,
+        verifier: &V,
+        namespace: &str,
+        root_object_id: &[u8; 32],
+        key: &[u8],
+    ) -> Result<ObjectReclamation, PublicationError> {
+        let publication_lock = self.acquire_publication_lock()?;
+        let (mut candidates, diagnostics) = self.inspect_root_candidates()?;
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.generation));
+        let [newer, older] = candidates.as_slice() else {
+            return Ok(ObjectReclamation::skipped("both root slots must hold roots"));
+        };
+        if !diagnostics.is_empty() || newer.generation == older.generation {
+            return Ok(ObjectReclamation::skipped("a root slot is unresolved"));
+        }
+        if verifier.verify_root(newer, self).is_err() {
+            return Ok(ObjectReclamation::skipped("the newer root fails verification"));
+        }
+        if let Err(error) = verifier.verify_root(older, self) {
+            if !verifier.superseded_by_newer(&error) {
+                return Ok(ObjectReclamation::skipped("the older root fails verification"));
+            }
+        }
+        self.reclaim_unreachable_locked(
+            &publication_lock,
+            verifier,
+            [newer, older],
+            namespace,
+            root_object_id,
+            key,
+        )
+    }
+
+    /// Unlink each object neither retained root can read that is older
+    /// than both. The caller holds the publication lock and has verified
+    /// both roots. What a root can read: what its manifest names (asked of
+    /// `verifier`), the repair descriptors for its envelope and manifest,
+    /// and the records every such descriptor names. Each discovery slot
+    /// must name its slot's root: a stale one could direct a later
+    /// publication to repair an older root. An object no root names but
+    /// written since the older root's capture can belong to a publication
+    /// still in flight, so it stays until a later pass. Staging files, torn
+    /// roots and discovery files are never touched.
+    fn reclaim_unreachable_locked<V: RootVerifier>(
+        &self,
+        _lock: &PublicationLock,
+        verifier: &V,
+        roots: [&RootSlotCandidate; 2],
+        namespace: &str,
+        root_object_id: &[u8; 32],
+        key: &[u8],
+    ) -> Result<ObjectReclamation, PublicationError> {
+        if roots[0].slot == roots[1].slot {
+            return Ok(ObjectReclamation::skipped("retained roots share a slot"));
+        }
+        let (discoveries, diagnostics) =
+            self.inspect_repair_discovery(namespace, root_object_id, key)?;
+        if !diagnostics.is_empty() {
+            return Ok(ObjectReclamation::skipped("a discovery slot is unreadable"));
+        }
+        let mut reachable = std::collections::HashSet::new();
+        for discovery in &discoveries {
+            let root = if roots[0].slot == discovery.slot {
+                roots[0]
+            } else {
+                roots[1]
+            };
+            if !self.root_candidate_matches_discovery(root, discovery)? {
+                return Ok(ObjectReclamation::skipped(
+                    "a discovery names a root its slot no longer holds",
+                ));
+            }
+            reachable.insert(discovery.repair.object_id.clone());
+        }
+        for root in roots {
+            let Some(objects) = verifier.root_objects(root, self) else {
+                return Ok(ObjectReclamation::skipped(
+                    "the verifier cannot name a retained root's objects",
+                ));
+            };
+            reachable.extend(objects);
+            let (envelope, _) = Self::candidate_envelope_digest(root)?;
+            reachable.insert(repair_descriptor_object_id(&envelope));
+            if let Ok(manifest) = <[u8; 32]>::try_from(
+                hex::decode(&root.manifest_sha256).unwrap_or_default(),
+            ) {
+                reachable.insert(repair_descriptor_object_id(&manifest));
+            }
+        }
+        let limits = RepairObjectLimits::default();
+        let descriptors: Vec<String> = reachable
+            .iter()
+            .filter(|object| object.starts_with("repair-descriptor-"))
+            .cloned()
+            .collect();
+        for descriptor in descriptors {
+            let bytes =
+                match self.read_object_bounded(&descriptor, limits.max_descriptor_bytes as u64) {
+                    Ok(bytes) => bytes,
+                    Err(PublicationError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            reachable.extend(RepairObjectDescriptor::authenticated_records_object_ids(
+                &bytes, key, limits,
+            )?);
+        }
+
+        // Each root's capture precedes every object its publication wrote.
+        let cutoff = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(roots[0].created_at_ms.min(roots[1].created_at_ms));
+        let path = self.root_path.join(OBJECTS_DIR_NAME);
+        let mut unreachable = Vec::new();
+        for (index, entry) in self
+            .objects_dir
+            .entries()
+            .map_err(|error| PublicationError::io(&path, error))?
+            .enumerate()
+        {
+            if index >= self.limits.max_store_entries {
+                return Err(PublicationError::ExcessiveDirectoryEntries {
+                    max_entries: self.limits.max_store_entries,
+                });
+            }
+            let name = entry
+                .map_err(|error| PublicationError::io(&path, error))?
+                .file_name();
+            let Some(object) = name.to_str().and_then(|name| name.strip_suffix(".obj")) else {
+                continue;
+            };
+            if !object.starts_with('.')
+                && validate_object_id(object).is_ok()
+                && !reachable.contains(object)
+            {
+                unreachable.push(name);
+            }
+        }
+        let mut reclaimed = ObjectReclamation::default();
+        for name in unreachable {
+            let object_path = path.join(&name);
+            let metadata = match self.objects_dir.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(PublicationError::io(&object_path, error)),
+            };
+            let modified = metadata
+                .modified()
+                .map_err(|error| PublicationError::io(&object_path, error))?
+                .into_std();
+            if !metadata.is_file() || modified >= cutoff {
+                continue;
+            }
+            match self.objects_dir.remove_file(&name) {
+                Ok(()) => {
+                    reclaimed.removed_objects += 1;
+                    reclaimed.removed_bytes = reclaimed.removed_bytes.saturating_add(metadata.len());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(PublicationError::io(&object_path, error)),
+            }
+        }
+        if reclaimed.removed_objects > 0 {
+            sync_directory(&self.objects_dir, &path)?;
+        }
+        Ok(reclaimed)
+    }
+
     // -------------------------------------------------------------------------
     // Root Candidate Inspection
     // -------------------------------------------------------------------------
@@ -2414,7 +2630,7 @@ impl SnapshotPublicationStore {
         }
 
         // 1. Acquire descriptor-bound cross-process publication lock covering inspect/CAS/verify/commit
-        let _publication_lock = self.acquire_publication_lock()?;
+        let publication_lock = self.acquire_publication_lock()?;
 
         self.admit_store_policy()?;
 
@@ -2871,6 +3087,39 @@ impl SnapshotPublicationStore {
 
         if let Some(protection) = protection {
             self.publish_committed_discovery(request, target_slot, protection)?;
+            // The slots now hold this root and the active root it succeeds.
+            // The root committed: a failed pass only leaves unreachable
+            // objects to the next publication.
+            if let Some(active) = active_candidate {
+                match self.reclaim_unreachable_locked(
+                    &publication_lock,
+                    verifier,
+                    [&actual_candidate, active],
+                    protection.namespace,
+                    &protection.root_object_id,
+                    protection.key,
+                ) {
+                    Ok(ObjectReclamation {
+                        skipped: Some(reason),
+                        ..
+                    }) => tracing::warn!(
+                        generation = request.generation,
+                        reason,
+                        "recovery store kept unreachable objects"
+                    ),
+                    Ok(reclaimed) => tracing::debug!(
+                        generation = request.generation,
+                        objects = reclaimed.removed_objects,
+                        bytes = reclaimed.removed_bytes,
+                        "recovery store reclaimed unreachable objects"
+                    ),
+                    Err(error) => tracing::warn!(
+                        generation = request.generation,
+                        %error,
+                        "recovery store reclamation failed"
+                    ),
+                }
+            }
         }
 
         Ok(GenerationPublicationReceipt {

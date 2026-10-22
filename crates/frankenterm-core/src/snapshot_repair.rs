@@ -600,6 +600,32 @@ impl RepairObjectDescriptor {
         key: &[u8],
         limits: RepairObjectLimits,
     ) -> Result<Self, RepairError> {
+        let descriptor = Self::authenticated_unvalidated(bytes, key, limits)?;
+        descriptor.validate(expected, key, limits)?;
+        Ok(descriptor)
+    }
+
+    /// The records objects an authenticated descriptor names, whatever
+    /// representation it is for. A store keeping the repair closure of a
+    /// root it retains needs these names, not the identity checks a decode
+    /// makes.
+    pub fn authenticated_records_object_ids(
+        bytes: &[u8],
+        key: &[u8],
+        limits: RepairObjectLimits,
+    ) -> Result<Vec<String>, RepairError> {
+        Ok(Self::authenticated_unvalidated(bytes, key, limits)?
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.records_object_id)
+            .collect())
+    }
+
+    fn authenticated_unvalidated(
+        bytes: &[u8],
+        key: &[u8],
+        limits: RepairObjectLimits,
+    ) -> Result<Self, RepairError> {
         if bytes.len() < 40
             || bytes.len() > limits.max_descriptor_bytes
             || !bytes.starts_with(REPAIR_DESCRIPTOR_MAGIC)
@@ -616,7 +642,6 @@ impl RepairObjectDescriptor {
         descriptor
             .authenticated_mac
             .copy_from_slice(&bytes[tag_at..]);
-        descriptor.validate(expected, key, limits)?;
         Ok(descriptor)
     }
 }
