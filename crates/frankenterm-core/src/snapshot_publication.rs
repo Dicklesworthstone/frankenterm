@@ -2276,17 +2276,23 @@ impl SnapshotPublicationStore {
         let (mut candidates, diagnostics) = self.inspect_root_candidates()?;
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.generation));
         let [newer, older] = candidates.as_slice() else {
-            return Ok(ObjectReclamation::skipped("both root slots must hold roots"));
+            return Ok(ObjectReclamation::skipped(
+                "both root slots must hold roots",
+            ));
         };
         if !diagnostics.is_empty() || newer.generation == older.generation {
             return Ok(ObjectReclamation::skipped("a root slot is unresolved"));
         }
         if verifier.verify_root(newer, self).is_err() {
-            return Ok(ObjectReclamation::skipped("the newer root fails verification"));
+            return Ok(ObjectReclamation::skipped(
+                "the newer root fails verification",
+            ));
         }
         if let Err(error) = verifier.verify_root(older, self) {
             if !verifier.superseded_by_newer(&error) {
-                return Ok(ObjectReclamation::skipped("the older root fails verification"));
+                return Ok(ObjectReclamation::skipped(
+                    "the older root fails verification",
+                ));
             }
         }
         self.reclaim_unreachable_locked(
@@ -2349,9 +2355,9 @@ impl SnapshotPublicationStore {
             reachable.extend(objects);
             let (envelope, _) = Self::candidate_envelope_digest(root)?;
             reachable.insert(repair_descriptor_object_id(&envelope));
-            if let Ok(manifest) = <[u8; 32]>::try_from(
-                hex::decode(&root.manifest_sha256).unwrap_or_default(),
-            ) {
+            if let Ok(manifest) =
+                <[u8; 32]>::try_from(hex::decode(&root.manifest_sha256).unwrap_or_default())
+            {
                 reachable.insert(repair_descriptor_object_id(&manifest));
             }
         }
@@ -2424,7 +2430,8 @@ impl SnapshotPublicationStore {
             match self.objects_dir.remove_file(&name) {
                 Ok(()) => {
                     reclaimed.removed_objects += 1;
-                    reclaimed.removed_bytes = reclaimed.removed_bytes.saturating_add(metadata.len());
+                    reclaimed.removed_bytes =
+                        reclaimed.removed_bytes.saturating_add(metadata.len());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(PublicationError::io(&object_path, error)),
@@ -6020,5 +6027,355 @@ mod tests {
         // Next acquire must succeed and bind to current inode
         let lock2 = store.acquire_publication_lock().unwrap();
         drop(lock2);
+    }
+
+    const RECLAIM_KEY: &[u8] = b"reclamation-repair-key";
+    const RECLAIM_ROOT: [u8; 32] = [91; 32];
+    const RECLAIM_NAMESPACE: &str = "reclamation";
+
+    /// `(object, sha256)` per manifest line.
+    fn listed_objects(manifest: &[u8]) -> Vec<(String, String)> {
+        std::str::from_utf8(manifest)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(object, digest)| (object.to_owned(), digest.to_owned()))
+            .collect()
+    }
+
+    /// Verifies a root whose manifest lists its objects by reading each,
+    /// and names each with its repair descriptor, as the whole-mux verifier
+    /// names a pane checkpoint.
+    struct ListedObjectsVerifier;
+    impl RootVerifier for ListedObjectsVerifier {
+        type Error = PublicationError;
+        type Verified = ();
+
+        fn verify_root(
+            &self,
+            candidate: &RootSlotCandidate,
+            store: &SnapshotPublicationStore,
+        ) -> Result<(), PublicationError> {
+            for (object, digest) in listed_objects(&candidate.manifest_bytes) {
+                if sha256_hex(&store.read_object(&object)?) != digest {
+                    return Err(PublicationError::InvalidDiscovery("listed object differs"));
+                }
+            }
+            Ok(())
+        }
+
+        fn root_objects(
+            &self,
+            candidate: &RootSlotCandidate,
+            _store: &SnapshotPublicationStore,
+        ) -> Option<Vec<String>> {
+            let mut objects = Vec::new();
+            for (object, digest) in listed_objects(&candidate.manifest_bytes) {
+                let digest: [u8; 32] = hex::decode(digest).ok()?.try_into().ok()?;
+                objects.push(repair_descriptor_object_id(&digest));
+                objects.push(object);
+            }
+            Some(objects)
+        }
+    }
+
+    /// One repair-protected generation in whole-mux order: the capture
+    /// time, `panes` objects, an orphan an abandoned attempt leaves, then
+    /// the root listing the objects. `gap_ms` before the capture outlasts
+    /// coarse file timestamps.
+    fn publish_listed_generation(
+        store: &SnapshotPublicationStore,
+        previous: Option<&GenerationRootPublishRequest>,
+        panes: usize,
+        gap_ms: u64,
+        verifier: &impl RootVerifier,
+    ) -> Result<(GenerationRootPublishRequest, GenerationPublicationReceipt), PublicationError>
+    {
+        let cx = Cx::for_testing();
+        let generation = previous.map_or(1, |previous| previous.generation + 1);
+        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+        let created_at_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let mut manifest = String::new();
+        for pane in 0..panes {
+            let object = quota_object(
+                &format!("checkpoint-{generation}-{pane}"),
+                format!("checkpoint {generation} {pane}").as_bytes(),
+            );
+            store.publish_repair_protected_object(
+                &cx,
+                &object,
+                Sha256::digest(object.object_id.as_bytes()).into(),
+                generation,
+                RECLAIM_KEY,
+            )?;
+            manifest.push_str(&format!(
+                "{} {}\n",
+                object.object_id, object.expected_sha256
+            ));
+        }
+        store.publish_object(&quota_object(
+            &format!("abandoned-{generation}"),
+            b"abandoned attempt",
+        ))?;
+        let request = GenerationRootPublishRequest {
+            generation,
+            publisher_id: "reclamation-test".into(),
+            predecessor: previous.map(|previous| PredecessorBinding {
+                expected_generation: previous.generation,
+                expected_hash: sha256_hex(&previous.manifest_bytes),
+            }),
+            manifest_bytes: manifest.into_bytes(),
+            created_at_ms,
+        };
+        let receipt = store.publish_repair_protected_generation_root(
+            &cx,
+            &request,
+            RECLAIM_NAMESPACE,
+            RECLAIM_ROOT,
+            RECLAIM_KEY,
+            verifier,
+        )?;
+        Ok((request, receipt))
+    }
+
+    /// Decode `expected` from its repair descriptor and records alone.
+    fn repaired_from_records(
+        store: &SnapshotPublicationStore,
+        expected: &ExpectedRecoveryIdentity,
+    ) -> Vec<u8> {
+        let descriptor = store.read_repair_descriptor(expected, RECLAIM_KEY).unwrap();
+        crate::snapshot_repair::decode_repair_object(
+            &Cx::for_testing(),
+            &descriptor,
+            expected,
+            RECLAIM_KEY,
+            shared_admission_controller(),
+            RepairObjectLimits::default(),
+            |chunk| {
+                store
+                    .read_repair_records(chunk)
+                    .map_err(|error| RepairError::Storage(error.to_string()))
+            },
+        )
+        .unwrap()
+        .into_parts()
+        .0
+    }
+
+    #[test]
+    fn reclamation_keeps_what_both_roots_read_and_unlinks_older_unreachable_objects() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let mut published: Vec<(GenerationRootPublishRequest, GenerationPublicationReceipt)> =
+            Vec::new();
+        for _ in 0..5 {
+            let generation = publish_listed_generation(
+                &store,
+                published.last().map(|(request, _)| request),
+                2,
+                15,
+                &ListedObjectsVerifier,
+            )
+            .unwrap();
+            published.push(generation);
+        }
+        let objects = store.list_object_ids().unwrap();
+        for generation in 1..=5_u64 {
+            for pane in 0..2 {
+                assert_eq!(
+                    objects.contains(&format!("checkpoint-{generation}-{pane}")),
+                    generation >= 4,
+                    "generation {generation} pane {pane}: {objects:?}"
+                );
+            }
+        }
+        for generation in 1..=3 {
+            assert!(!objects.contains(&format!("abandoned-{generation}")));
+        }
+        assert!(objects.contains(&"abandoned-5".to_owned()));
+        // Per retained generation: two objects with a descriptor and records
+        // each, the root's descriptor and records; at most two orphans.
+        assert!(objects.len() <= 2 * (2 * 3 + 2) + 2, "{objects:?}");
+
+        let selected = store.select_verified_roots(&ListedObjectsVerifier).unwrap();
+        assert!(selected.current.is_some() && selected.previous.is_some());
+        assert!(!selected.has_unresolved_authority());
+        for (request, _) in &published[3..] {
+            for (object, digest) in listed_objects(&request.manifest_bytes) {
+                let expected = ExpectedRecoveryIdentity::new(
+                    hex::decode(digest).unwrap().try_into().unwrap(),
+                    Sha256::digest(object.as_bytes()).into(),
+                    request.generation,
+                );
+                assert_eq!(
+                    repaired_from_records(&store, &expected),
+                    store.read_object(&object).unwrap()
+                );
+            }
+        }
+        let (discoveries, diagnostics) = store
+            .inspect_repair_discovery(RECLAIM_NAMESPACE, &RECLAIM_ROOT, RECLAIM_KEY)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            discoveries.iter().map(|d| d.generation).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        for discovery in &discoveries {
+            let expected = ExpectedRecoveryIdentity::new(
+                discovery.outer_envelope_sha256,
+                RECLAIM_ROOT,
+                discovery.generation,
+            );
+            let envelope = repaired_from_records(&store, &expected);
+            let recovered = store
+                .decode_recovered_root(discovery.slot, &envelope)
+                .unwrap();
+            assert!(
+                store
+                    .root_candidate_matches_discovery(&recovered, discovery)
+                    .unwrap()
+            );
+        }
+
+        // A torn newest root falls back to its predecessor's closure.
+        std::fs::write(&published[4].1.path, b"torn newest root").unwrap();
+        let selected = store.select_verified_roots(&ListedObjectsVerifier).unwrap();
+        assert!(selected.current.is_some() && selected.previous.is_none());
+        let (candidates, _) = store.inspect_root_candidates().unwrap();
+        assert_eq!(
+            candidates.iter().map(|c| c.generation).collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn reclamation_keeps_objects_written_since_the_older_root() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let first = publish_listed_generation(&store, None, 1, 15, &ListedObjectsVerifier)
+            .unwrap()
+            .0;
+        let second = publish_listed_generation(&store, Some(&first), 1, 15, &ListedObjectsVerifier)
+            .unwrap()
+            .0;
+        // A concurrent publisher bound to generation 2 is writing objects.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        store
+            .publish_object(&quota_object("in-flight", b"concurrent capture"))
+            .unwrap();
+        let third = publish_listed_generation(&store, Some(&second), 1, 15, &ListedObjectsVerifier)
+            .unwrap()
+            .0;
+        assert!(store.has_object("in-flight").unwrap());
+        assert!(!store.has_object("checkpoint-1-0").unwrap());
+        publish_listed_generation(&store, Some(&third), 1, 15, &ListedObjectsVerifier).unwrap();
+        assert!(!store.has_object("in-flight").unwrap());
+        assert!(store.has_object("checkpoint-3-0").unwrap());
+    }
+
+    #[test]
+    fn reclamation_needs_a_verifier_that_names_every_retained_root() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let mut previous = None;
+        for _ in 0..4 {
+            previous = Some(
+                publish_listed_generation(&store, previous.as_ref(), 1, 2, &AcceptAllVerifier)
+                    .unwrap()
+                    .0,
+            );
+        }
+        let objects = store.list_object_ids().unwrap();
+        for generation in 1..=4 {
+            assert!(objects.contains(&format!("checkpoint-{generation}-0")));
+            assert!(objects.contains(&format!("abandoned-{generation}")));
+        }
+    }
+
+    #[test]
+    fn reclaiming_a_store_filled_before_publication_reclaimed_resumes_publication() {
+        let temp = private_test_directory();
+        let limits = PublicationLimits {
+            max_store_entries: 64,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        // A verifier that cannot name objects reclaims nothing, as before.
+        let mut previous: Option<GenerationRootPublishRequest> = None;
+        let full = loop {
+            match publish_listed_generation(&store, previous.as_ref(), 2, 2, &AcceptAllVerifier) {
+                Ok((request, _)) => {
+                    assert!(request.generation < 16, "the store never filled");
+                    previous = Some(request);
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(full, PublicationError::StoreCapacity { .. }),
+            "{full}"
+        );
+        let filled = store.list_object_ids().unwrap().len();
+        let reclaimed = store
+            .reclaim_unreachable_objects(
+                &ListedObjectsVerifier,
+                RECLAIM_NAMESPACE,
+                &RECLAIM_ROOT,
+                RECLAIM_KEY,
+            )
+            .unwrap();
+        assert_eq!(reclaimed.skipped, None);
+        assert!(reclaimed.removed_objects > 0 && reclaimed.removed_bytes > 0);
+        assert_eq!(
+            store.list_object_ids().unwrap().len(),
+            filled - reclaimed.removed_objects
+        );
+        let newest = previous.unwrap();
+        assert!(!store.has_object("checkpoint-1-0").unwrap());
+        for generation in newest.generation - 1..=newest.generation {
+            assert!(
+                store
+                    .has_object(&format!("checkpoint-{generation}-1"))
+                    .unwrap()
+            );
+        }
+        let selected = store.select_verified_roots(&ListedObjectsVerifier).unwrap();
+        assert!(selected.current.is_some() && selected.previous.is_some());
+        publish_listed_generation(&store, Some(&newest), 2, 2, &ListedObjectsVerifier)
+            .expect("reclaimed store admits the next generation");
+    }
+
+    #[test]
+    fn reclamation_keeps_the_store_flat_over_500_generations() {
+        let temp = private_test_directory();
+        // Without reclamation, about twenty generations fill this store.
+        let limits = PublicationLimits {
+            max_store_entries: 128,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        let mut previous = None;
+        let mut most_objects = 0;
+        for _ in 0..500 {
+            let (request, _) =
+                publish_listed_generation(&store, previous.as_ref(), 1, 2, &ListedObjectsVerifier)
+                    .unwrap();
+            most_objects = most_objects.max(store.list_object_ids().unwrap().len());
+            previous = Some(request);
+        }
+        assert_eq!(previous.unwrap().generation, 500);
+        assert!(most_objects <= 40, "{most_objects} objects at most");
+        let selected = store.select_verified_roots(&ListedObjectsVerifier).unwrap();
+        assert!(selected.current.is_some() && selected.previous.is_some());
     }
 }

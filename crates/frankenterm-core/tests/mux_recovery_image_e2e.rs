@@ -519,6 +519,48 @@ fn test_mux_recovery_image_e2e_full_positive_journey() {
 }
 
 #[test]
+fn test_mux_recovery_e2e_publication_reclaims_what_neither_retained_root_reads() {
+    let mut fixture = Fixture::new();
+    let cx = frankenterm_core::cx::for_request();
+    let (_directory, store) = store();
+    let mut predecessor: Option<(GenerationPublicationReceipt, ValidatedWholeMuxRecovery)> = None;
+    for _ in 0..4 {
+        // Each capture follows every earlier write, past coarse file times.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fixture.captured.captured_at_epoch_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let receipt = fixture.publish(
+            &cx,
+            &store,
+            predecessor
+                .as_ref()
+                .map(|(receipt, verified)| (receipt, verified)),
+        );
+        predecessor = Some((receipt, fixture.current(&cx, &store)));
+    }
+    let objects = store.list_object_ids().unwrap();
+    for generation in 1..=4 {
+        for pane in 0..8 {
+            assert_eq!(
+                objects.contains(&format!("generation-{generation}-pane-{pane}")),
+                generation >= 3,
+                "generation {generation} pane {pane}"
+            );
+        }
+    }
+    let selected =
+        select_verified_recovery_roots_with_cx(&cx, &store, &fixture.verifier()).unwrap();
+    assert!(!selected.has_unresolved_authority());
+    assert_eq!(selected.current.unwrap().generation(), 4);
+    assert_eq!(selected.previous.unwrap().generation(), 3);
+}
+
+#[test]
 fn test_mux_recovery_e2e_preserves_nonfirst_visible_window_stack_member() {
     let mut fixture = Fixture::new();
     let window = &mut fixture.captured.windows[1];
