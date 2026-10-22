@@ -157,8 +157,8 @@ uint32_t ft_terminal_v1_frame_copy(uint64_t frame, uint32_t offset, uint8_t *out
                                   uint32_t capacity, uint32_t *written);
 uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 
-/* Mux client: the protocol of a FrankenTerm mux server (codec v46, the
- * fleet's v0.13 servers) as a byte-in/byte-out state machine. The caller
+/* Mux client: the protocol of a FrankenTerm mux server (codec v46 and v47,
+ * the fleet's v0.13 servers) as a byte-in/byte-out state machine. The caller
  * owns the channel (an SSH command running `nc -N -U <socket>`), the
  * terminals the output is drawn on, and all scheduling; nothing here does
  * I/O or keeps a pointer. Status values are the FT_TERMINAL_* codes.
@@ -172,15 +172,20 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *   READY      payload: the server's version string; the pane list follows
  *   PANES      payload: JSON array of {pane_id, tab_id, window_id, tab_title,
  *              title, workspace, working_dir, size{rows, cols, pixel_width,
- *              pixel_height, dpi}, is_active, is_zoomed, top_row, left_col}
+ *              pixel_height, dpi}, is_active, is_zoomed, top_row, left_col,
+ *              physical_top}; again whenever the desktop adds or reshapes
+ *              a tab, or a pane closes
  *   OUTPUT     pane_id, rows, cols; payload: bytes for that pane's terminal,
  *              which must be rows x cols before they are fed
  *   PANE_TITLE pane_id; payload: the title
  *   PANE_GONE  pane_id
  *   FAILED     payload: why; the session is over, close the channel
  *   SEARCH_RESULTS pane_id; payload: JSON {search, matches: [{row,
- *              start_column, end_row, end_column, text}], searched_rows,
- *              error}: the newest matches, newest first
+ *              start_column, end_row, end_column, text, text_start,
+ *              text_end}], searched_rows, error}: the newest matches,
+ *              newest first; text is the matched rows (at most four,
+ *              newline-joined) and text_start..text_end the match within
+ *              it, as UTF-8 byte offsets
  *   CONTEXT    pane_id; payload: JSON {request, lines: [{row, text}]}
  */
 #define FT_MUX_EVENT_NONE 0u
@@ -215,17 +220,21 @@ uint32_t ft_mux_v1_refresh_panes(uint64_t session);
 uint32_t ft_mux_v1_show(uint64_t session, uint64_t pane_id);
 /* Stops drawing the pane. */
 uint32_t ft_mux_v1_hide(uint64_t session, uint64_t pane_id);
-/* Input bytes for the pane's program, exactly as it reads them. */
+/* What the pane's terminal typed. Cursor, editing and function key
+ * sequences go to the server as key presses, encoded in the modes the
+ * pane's program set; a bracketed paste (OUTPUT turns bracketed paste on in
+ * the phone's terminal) goes as one paste; everything else as is. */
 uint32_t ft_mux_v1_write(uint64_t session, uint64_t pane_id, const uint8_t *bytes, uint32_t length);
 /* UTF-8 text the server pastes, bracketed when the program asked for it. */
 uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length);
-/* Resizes the remote pane (1..512 each), remembering its size before the
- * first resize; restore_size puts that size back. */
+/* Resizes the remote pane (1..512 each), remembering the size the desktop
+ * gave it; restore_size puts that size back. */
 uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
 uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
 /* Searches the pane's scrollback on the server, newest rows first, for
  * UTF-8 text (at most 4096 bytes) with FT_MUX_SEARCH_* flags; a
- * SEARCH_RESULTS event with this id answers. CLOSED before the handshake. */
+ * SEARCH_RESULTS event with this id answers (with an error for a pane that
+ * has closed). CLOSED before the handshake. */
 uint32_t ft_mux_v1_search(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length,
                           uint32_t flags, uint64_t *search);
 /* The text of the pane's rows first_row..first_row+count (count at most
