@@ -579,12 +579,16 @@ private enum NativeTerminalPreparationResult: Sendable {
     case synchronized(TerminalRenderFrame)
     case inactive(TerminalRenderFrame)
     case waitingForResources(TerminalRenderFrame)
+    /// Laid out for another font than the one configured: a text-size change
+    /// is between the renderer and the model. The screen keeps the last frame
+    /// until one for the configured font arrives.
+    case awaitingFont(TerminalRenderFrame)
     case unrenderable(TerminalRenderFrame, TerminalRenderError)
     var semantic: TerminalRenderFrame {
         switch self {
         case let .ready(value): value.semantic
         case let .synchronized(value), let .inactive(value), let .waitingForResources(value),
-             let .unrenderable(value, _): value
+             let .awaitingFont(value), let .unrenderable(value, _): value
         }
     }
 }
@@ -634,8 +638,10 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
                         completion(.success(.inactive(frame))); return
                     }
                     if frame.flags & 8 != 0 { completion(.success(.synchronized(frame))); return }
+                    if frame.fontRevision != configuration.fontRevision {
+                        completion(.success(.awaitingFont(frame))); return
+                    }
                     do {
-                        guard frame.fontRevision == configuration.fontRevision else { throw TerminalRenderError.staleFrame }
                         let owned: NativeTerminalResources
                         if let existing = resources[lease.slot] { owned = existing }
                         else {

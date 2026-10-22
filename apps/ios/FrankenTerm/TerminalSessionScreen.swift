@@ -237,6 +237,10 @@ final class TerminalSessionController {
     @ObservationIgnored private var basePalette: [UInt8]?
     @ObservationIgnored private var appliedPalette: [UInt8]?
     @ObservationIgnored private var paletteChange: Task<Void, Never>?
+    /// Font revisions: the renderer's newest, and the newest the model has.
+    @ObservationIgnored private var wantedFontRevision: UInt64 = 1
+    @ObservationIgnored private var appliedFontRevision: UInt64 = 1
+    @ObservationIgnored private var fontRevisionChange: Task<Void, Never>?
     @ObservationIgnored private var historyReturn: Task<Void, Never>?
     @ObservationIgnored private var retainedCaptureAttempted = false
     @ObservationIgnored private var retainEndedOutput = true
@@ -554,6 +558,7 @@ final class TerminalSessionController {
                 Task { await focus.activateKeyboard() }
             }
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
+            view.onFontRevision = { [weak self] revision in self?.applyFontRevision(revision) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
@@ -641,6 +646,28 @@ final class TerminalSessionController {
 
     /// Shows this terminal's text at `size` points.
     func setFontSize(_ size: Double) { terminal?.setFontPointSize(size) }
+
+    /// The renderer took a new font; the model's next frames must say so or
+    /// they are not drawn. One change at a time reaches the runtime, and the
+    /// newest revision wins (a pinch makes several).
+    private func applyFontRevision(_ revision: UInt64) {
+        wantedFontRevision = max(wantedFontRevision, revision)
+        guard fontRevisionChange == nil else { return }
+        fontRevisionChange = Task { [weak self] in
+            while let self, !self.stopped, let runtime = self.runtime, let source = self.pump?.source,
+                  self.wantedFontRevision > self.appliedFontRevision {
+                let wanted = self.wantedFontRevision
+                do {
+                    try await runtime.setFontRevision(wanted, source: source)
+                    self.appliedFontRevision = wanted
+                } catch {
+                    if !self.stopped { self.fail(Self.describe(error)) }
+                    break
+                }
+            }
+            self?.fontRevisionChange = nil
+        }
+    }
 
     /// User-facing text: an error's own description when it has one.
     static func describe(_ error: any Error) -> String {

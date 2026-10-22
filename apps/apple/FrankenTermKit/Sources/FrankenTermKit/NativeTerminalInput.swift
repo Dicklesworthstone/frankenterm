@@ -779,6 +779,11 @@ public final class NativeTerminalView: UIView {
     /// The user changed the text size (pinch or ⌘+ / ⌘- / ⌘0); the owner keeps
     /// it for this terminal's later sessions and the others.
     public var onFontSizeChange: (@MainActor (Double) -> Void)?
+    /// Each text-size change gives the renderer a new font revision; frames
+    /// laid out for an older one are not drawn. The owner must hand this
+    /// revision to the terminal model (TerminalModelRuntime.setFontRevision)
+    /// so its next frames carry it.
+    public var onFontRevision: (@MainActor (UInt64) -> Void)?
     /// Text sizes a pinch or key command can reach.
     public static let fontSizes: ClosedRange<Double> = 9...30
     /// The selected cells, by stable row; nil when nothing is selected.
@@ -1052,7 +1057,10 @@ public final class NativeTerminalView: UIView {
             clearSelection()
             configuration.fontPointSize = clamped
             configuration.fontRevision += 1
-            do { try renderer.updateConfiguration(configuration) } catch { onFailure?(error) }
+            do {
+                try renderer.updateConfiguration(configuration)
+                onFontRevision?(configuration.fontRevision)
+            } catch { onFailure?(error) }
         }
         if notify { onFontSizeChange?(clamped) }
     }
@@ -1326,7 +1334,7 @@ public final class NativeTerminalView: UIView {
     public func retire() {
         guard !retired else { return }
         clearSelection(); stopMomentum()
-        onKeyboardRequest = nil; onFontSizeChange = nil
+        onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil

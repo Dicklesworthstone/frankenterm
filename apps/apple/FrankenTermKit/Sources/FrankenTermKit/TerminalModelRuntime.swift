@@ -80,7 +80,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private let coordinator: TerminalInputCoordinator
     private let delivery: any TerminalModelDelivery
     private var operationActive = false
-    private enum OperationKind: CaseIterable { case consumer, keyboard, presentation, viewport, palette, history }
+    private enum OperationKind: CaseIterable { case consumer, keyboard, presentation, viewport, palette, font, history }
     private struct WaitingOperation {
         let kind: OperationKind
         let continuation: CheckedContinuation<Void, Error>
@@ -457,8 +457,12 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try model.setBasePalette(rgba)
         if visible { try await publishFrame() }
     }
+    /// Marks the frames that follow as laid out for the renderer's new font
+    /// (a text-size change). Like a palette change, it waits once behind
+    /// output instead of failing.
     public func setFontRevision(_ revision: UInt64, source: TerminalSource) async throws {
-        try requireSource(source); try beginOperation(); defer { finishOperation() }
+        try requireSource(source)
+        try await acquireOperation(.font); defer { finishOperation() }
         try model.setFontRevision(revision)
         if visible { try await publishFrame() }
     }
