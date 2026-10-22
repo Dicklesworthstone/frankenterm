@@ -763,7 +763,11 @@ fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
     assert_eq!(harness.server.resizes.len(), count, "restored once");
 }
 
-fn phone_sizes(harness: &Harness) -> Vec<(usize, Option<(usize, usize)>, usize, usize)> {
+/// One PhoneSize event: pane, the desktop's rows and columns (none when
+/// cleared), and the phone's rows and columns.
+type PhoneSizeSeen = (usize, Option<(usize, usize)>, usize, usize);
+
+fn phone_sizes(harness: &Harness) -> Vec<PhoneSizeSeen> {
     harness
         .events
         .iter()
