@@ -10,11 +10,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
+use termwiz::input::KeyEvent;
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 
-/// The only dialect this client speaks.
-pub const CODEC_VERSION: usize = 46;
+/// The dialects this client speaks: v46, and v0.13.0's v47, which only adds
+/// two PDUs the phone never sends.
+pub const CODEC_VERSIONS: RangeInclusive<usize> = 46..=47;
 
 /// PDU identifiers (codec's `pdu!` table).
 pub mod ident {
@@ -23,6 +25,7 @@ pub mod ident {
     pub const LIST_PANES_RESPONSE: u64 = 4;
     pub const WRITE_TO_PANE: u64 = 9;
     pub const UNIT_RESPONSE: u64 = 10;
+    pub const SEND_KEY_DOWN: u64 = 11;
     pub const SEND_PASTE: u64 = 13;
     pub const RESIZE: u64 = 14;
     pub const GET_LINES: u64 = 22;
@@ -35,6 +38,10 @@ pub mod ident {
     pub const SEARCH_SCROLLBACK: u64 = 31;
     pub const SEARCH_SCROLLBACK_RESPONSE: u64 = 32;
     pub const PANE_REMOVED: u64 = 37;
+    /// Pushed when a tab's split layout changes or a tab is added: the
+    /// pane list is out of date.
+    pub const TAB_RESIZED: u64 = 54;
+    pub const TAB_ADDED_TO_WINDOW: u64 = 55;
 }
 
 pub type StableRowIndex = isize;
@@ -74,6 +81,16 @@ pub struct WriteToPane {
 pub struct SendPaste<'a> {
     pub pane_id: usize,
     pub data: &'a str,
+}
+
+/// PDU 11: a key press the server encodes for the pane's program, in the
+/// modes that program set (application cursor keys, keypad, kitty).
+/// `input_serial` is codec's `InputSerial(u64)` newtype.
+#[derive(Serialize)]
+pub struct SendKeyDown {
+    pub pane_id: usize,
+    pub event: KeyEvent,
+    pub input_serial: u64,
 }
 
 #[derive(Serialize)]
@@ -295,6 +312,8 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     varbincode::serialize(value).unwrap_or_default()
 }
 
+/// Decodes a reply (or its prefix) from the server, never trusting its
+/// lengths beyond the bytes it actually sent.
 pub fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, crate::Error> {
-    varbincode::deserialize(body).map_err(|_| crate::Error::Schema)
+    crate::varbin::deserialize(body).map_err(|_| crate::Error::Schema)
 }

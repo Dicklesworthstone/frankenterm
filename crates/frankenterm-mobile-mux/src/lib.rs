@@ -12,6 +12,7 @@ pub mod mirror;
 pub mod render;
 pub mod search;
 pub mod session;
+mod varbin;
 pub mod wire;
 
 pub use search::{ContextLine, SearchMatch, SearchQuery};

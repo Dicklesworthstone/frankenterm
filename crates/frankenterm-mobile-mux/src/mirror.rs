@@ -15,6 +15,9 @@ use termwiz::surface::{CursorVisibility, Line};
 /// Remote history the phone's scrollback receives when a pane is first
 /// drawn, and the most rows one catch-up after a burst of output replays.
 pub const HISTORY_ROWS: usize = 1000;
+/// The largest pane, either way, a server may report; anything bigger is a
+/// broken or hostile server, whose rows the mirror would walk one by one.
+pub const MAX_PANE_CELLS_EACH_WAY: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
@@ -99,6 +102,11 @@ pub struct PaneMirror {
     /// A requested size (rows, cols) the server has not answered yet: the
     /// pane is not drawn at any other size until it does.
     resizing: Option<(usize, usize)>,
+    /// Bumped by every show and hide. Rows fetched in an earlier epoch may
+    /// predate changes pushed while the pane was hidden, which the mirror
+    /// did not track, so their reply is dropped.
+    epoch: u64,
+    fetch_epoch: u64,
 }
 
 impl PaneMirror {
@@ -127,27 +135,60 @@ impl PaneMirror {
         self.visible = true;
         self.shown = Shown::default();
         self.drawn = None;
+        self.forget_rows();
     }
 
     /// Stops drawing; later changes only update what the pane looks like.
     pub fn hide(&mut self) {
         self.visible = false;
+        self.forget_rows();
+    }
+
+    fn forget_rows(&mut self) {
+        self.epoch += 1;
         self.lines.clear();
         self.absent.clear();
         self.dirty.clear();
     }
 
     /// A pushed update. Without its lines (they did not decode) every row
-    /// of the screen is fetched again.
-    pub fn apply_changes(&mut self, head: RenderHead, lines: Option<LineEntries>) {
+    /// of the screen is fetched again. A size no terminal has is refused.
+    pub fn apply_changes(
+        &mut self,
+        head: RenderHead,
+        lines: Option<LineEntries>,
+    ) -> Result<(), crate::Error> {
+        let dims = head.dimensions;
+        let sane = 1..=MAX_PANE_CELLS_EACH_WAY;
+        if !sane.contains(&dims.viewport_rows) || !sane.contains(&dims.cols) {
+            return Err(crate::Error::Frame("a pane size no terminal has"));
+        }
         let target = Target {
-            dims: head.dimensions,
+            dims,
             cursor: head.cursor_position,
             alt: head.alt_screen_active,
             title: head.title,
         };
         if self.visible {
             let viewport = target.viewport();
+            if let Some(previous) = &self.target {
+                if previous.alt != target.alt {
+                    self.lines.clear();
+                } else if previous.top() != target.top() {
+                    // The server reports the rows that changed on the screen
+                    // only. Output lands at and below the cursor, so a row
+                    // from there may have been written and scrolled off since
+                    // the last update, and what is cached for it is out of
+                    // date: fetch it again. Rows above the cursor were done.
+                    let unsettled = previous
+                        .cursor
+                        .y
+                        .max(previous.top())
+                        .min(target.top());
+                    self.lines
+                        .retain(|row, _| *row < unsettled || viewport.contains(row));
+                }
+            }
             let dirty = match lines {
                 Some(_) => head.dirty_lines,
                 None => vec![viewport.clone()],
@@ -165,12 +206,16 @@ impl PaneMirror {
             }
         }
         self.target = Some(target);
+        Ok(())
     }
 
     /// Stores a GetLines reply; rows asked for and not returned are gone
     /// from the server and draw as blank.
     pub fn apply_lines(&mut self, entries: LineEntries, requested: &[Range<StableRowIndex>]) {
         self.fetching = false;
+        if self.fetch_epoch != self.epoch {
+            return;
+        }
         let mut returned = BTreeSet::new();
         for (row, line) in entries.lines {
             returned.insert(row);
@@ -184,6 +229,7 @@ impl PaneMirror {
 
     pub fn set_fetching(&mut self) {
         self.fetching = true;
+        self.fetch_epoch = self.epoch;
     }
 
     /// The pane was asked to become `rows` by `cols`.
@@ -321,7 +367,12 @@ impl PaneMirror {
         let top = target.top();
         let mut out = String::from("\x1b[?25l");
         if !self.shown.painted {
-            out.push_str("\x1b[0m\x1b[H\x1b[2J\x1b[3J");
+            // Whatever the terminal showed before (another pane, perhaps in
+            // its alternate screen) goes: back to the primary screen, wiped
+            // with its history. Pastes are bracketed from here on, so the
+            // session can hand each one to the server whole, which brackets
+            // it again only if the pane's program asked.
+            out.push_str("\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[?2004h");
         }
         if target.alt && self.shown.alt.is_none() {
             out.push_str("\x1b[?1049h");

@@ -3,12 +3,17 @@
 //! zstd-compressed body. Requests from the phone are never compressed.
 
 use crate::Error;
+use std::io::Read as _;
 
 const COMPRESSED: u64 = 1 << 63;
-/// A frame or decompressed body larger than this ends the session rather
-/// than being buffered: the biggest legitimate v46 reply (a full screen of
-/// lines) is far smaller.
+/// A frame larger than this ends the session rather than being buffered:
+/// the biggest legitimate v46 reply (a full screen of lines) is far
+/// smaller. A compressed body that expands past it is dropped instead, and
+/// only the request it answers fails (a search matching nearly every cell).
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Consumed bytes the reader keeps before moving the rest to the front.
+const COMPACT_AFTER: usize = 64 * 1024;
 
 /// One complete frame with its body decompressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +21,9 @@ pub struct Frame {
     pub serial: u64,
     pub ident: u64,
     pub body: Vec<u8>,
+    /// The body expanded past [`MAX_BODY_BYTES`] and was dropped (`body`
+    /// is empty).
+    pub oversized: bool,
 }
 
 /// Frames one uncompressed request.
@@ -54,16 +62,24 @@ fn read_leb(bytes: &mut &[u8]) -> Result<Option<u64>, Error> {
 #[derive(Debug, Default)]
 pub struct FrameReader {
     buffer: Vec<u8>,
+    /// Bytes at the front of `buffer` already returned as frames: a burst
+    /// of many frames is consumed without moving the rest for each one.
+    start: usize,
 }
 
 impl FrameReader {
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.start > 0 && (self.start >= COMPACT_AFTER || self.start == self.buffer.len()) {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
         self.buffer.extend_from_slice(bytes);
     }
 
     /// The next complete frame, or `None` until more bytes arrive.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, Error> {
-        let mut cursor = self.buffer.as_slice();
+        let unread = &self.buffer[self.start..];
+        let mut cursor = unread;
         let Some(tagged) = read_leb(&mut cursor)? else {
             return Ok(None);
         };
@@ -77,23 +93,38 @@ impl FrameReader {
             return Ok(None);
         }
         let mut region = &cursor[..length];
-        let consumed = self.buffer.len() - cursor.len() + length;
+        let consumed = unread.len() - cursor.len() + length;
         let serial = read_leb(&mut region)?.ok_or(Error::Frame("truncated serial"))?;
         let ident = read_leb(&mut region)?.ok_or(Error::Frame("truncated ident"))?;
-        let body = if compressed {
-            zstd::bulk::Decompressor::new()
-                .and_then(|mut decompressor| decompressor.decompress(region, MAX_BODY_BYTES))
-                .map_err(|_| Error::Frame("undecodable compressed body"))?
+        let (body, oversized) = if compressed {
+            expand(region)?
         } else {
-            region.to_vec()
+            (region.to_vec(), false)
         };
-        self.buffer.drain(..consumed);
+        self.start += consumed;
         Ok(Some(Frame {
             serial,
             ident,
             body,
+            oversized,
         }))
     }
+}
+
+/// A zstd body, grown as it decodes (its size is not known up front) and
+/// abandoned once it passes [`MAX_BODY_BYTES`].
+fn expand(packed: &[u8]) -> Result<(Vec<u8>, bool), Error> {
+    let undecodable = |_| Error::Frame("undecodable compressed body");
+    let decoder = zstd::stream::read::Decoder::with_buffer(packed).map_err(undecodable)?;
+    let mut body = Vec::new();
+    decoder
+        .take(MAX_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(undecodable)?;
+    if body.len() > MAX_BODY_BYTES {
+        return Ok((Vec::new(), true));
+    }
+    Ok((body, false))
 }
 
 #[cfg(test)]
@@ -135,7 +166,48 @@ mod tests {
         let mut reader = FrameReader::default();
         reader.push(&frame);
         let got = reader.next_frame().expect("frame").expect("complete");
-        assert_eq!((got.serial, got.ident, got.body), (5, 25, body));
+        assert_eq!((got.serial, got.ident, got.body, got.oversized), (5, 25, body, false));
+    }
+
+    #[test]
+    fn a_body_that_expands_too_far_is_dropped_but_the_stream_continues() {
+        let body = vec![0u8; MAX_BODY_BYTES + 1];
+        let packed = zstd::bulk::compress(&body, 3).expect("compress");
+        let mut ids = Vec::new();
+        write_leb(&mut ids, 7);
+        write_leb(&mut ids, 32);
+        let mut bytes = Vec::new();
+        write_leb(&mut bytes, (ids.len() + packed.len()) as u64 | COMPRESSED);
+        bytes.extend_from_slice(&ids);
+        bytes.extend_from_slice(&packed);
+        bytes.extend_from_slice(&encode(10, 8, &[]));
+        let mut reader = FrameReader::default();
+        reader.push(&bytes);
+        let got = reader.next_frame().expect("frame").expect("complete");
+        assert_eq!((got.serial, got.ident, got.oversized), (7, 32, true));
+        assert!(got.body.is_empty());
+        let next = reader.next_frame().expect("frame").expect("complete");
+        assert_eq!((next.serial, next.ident, next.oversized), (8, 10, false));
+    }
+
+    #[test]
+    fn many_frames_in_one_burst_all_arrive() {
+        let bytes: Vec<u8> = (1..=5000u64)
+            .flat_map(|serial| encode(10, serial, &[1, 2, 3]))
+            .collect();
+        let mut reader = FrameReader::default();
+        let mut serials = Vec::new();
+        // Chunks that split frames, read between pushes so the consumed
+        // front is compacted along the way.
+        for chunk in bytes.chunks(7_001) {
+            reader.push(chunk);
+            while let Some(frame) = reader.next_frame().expect("frame") {
+                serials.push(frame.serial);
+            }
+        }
+        assert_eq!(serials, (1..=5000).collect::<Vec<_>>());
+        reader.push(&encode(10, 5001, &[]));
+        assert_eq!(reader.next_frame().unwrap().unwrap().serial, 5001);
     }
 
     #[test]

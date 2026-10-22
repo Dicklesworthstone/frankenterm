@@ -427,7 +427,7 @@ impl Session {
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
                 let version: CodecVersion = wire::decode(&frame.body)?;
-                if version.codec_vers == wire::CODEC_VERSION {
+                if wire::CODEC_VERSIONS.contains(&version.codec_vers) {
                     self.ready = true;
                     self.events.push_back(Event::Ready {
                         server_version: version.version_string,
@@ -435,9 +435,10 @@ impl Session {
                     self.refresh_panes();
                 } else {
                     self.fail(format!(
-                        "the mux server speaks protocol {}, and this app speaks {}",
+                        "the mux server speaks protocol {}, and this app speaks {} to {}",
                         version.codec_vers,
-                        wire::CODEC_VERSION
+                        wire::CODEC_VERSIONS.start(),
+                        wire::CODEC_VERSIONS.end()
                     ));
                 }
             }
