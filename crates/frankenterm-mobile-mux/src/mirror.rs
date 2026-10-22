@@ -117,6 +117,11 @@ impl PaneMirror {
         self.target.as_ref().map(|target| target.title.as_str())
     }
 
+    /// One past the pane's newest row, as last reported.
+    pub fn end_row(&self) -> Option<StableRowIndex> {
+        self.target.as_ref().map(|target| target.viewport().end)
+    }
+
     /// Starts drawing again; the phone terminal is redrawn from scratch.
     pub fn show(&mut self) {
         self.visible = true;

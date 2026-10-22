@@ -310,6 +310,147 @@ fn a_removed_pane_is_reported_and_the_list_refreshed() {
     );
 }
 
+fn search_results(
+    harness: &Harness,
+    search: u64,
+) -> (
+    Vec<frankenterm_mobile_mux::SearchMatch>,
+    usize,
+    Option<String>,
+) {
+    harness
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::SearchResults {
+                search: id,
+                matches,
+                searched_rows,
+                error,
+                ..
+            } if *id == search => Some((matches.clone(), *searched_rows, error.clone())),
+            _ => None,
+        })
+        .expect("search results")
+}
+
+#[test]
+fn a_search_reports_the_newest_matches_first_with_their_text() {
+    let mut harness = Harness::new(5, 40);
+    let mut output = Vec::new();
+    for n in 0..40 {
+        let line = if n % 10 == 3 {
+            format!("build {n}: NEEDLE found\r\n")
+        } else {
+            format!("line {n}\r\n")
+        };
+        output.extend_from_slice(line.as_bytes());
+    }
+    harness.quiet_output(&output);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    let query = frankenterm_mobile_mux::SearchQuery {
+        text: "needle".into(),
+        case_sensitive: false,
+        regex: false,
+    };
+    let search = harness.session.search(pane, &query).expect("a search");
+    harness.pump();
+    let (matches, searched, error) = search_results(&harness, search);
+    assert_eq!(error, None);
+    assert!(searched >= 40);
+    let texts: Vec<_> = matches.iter().map(|hit| hit.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "build 33: NEEDLE found",
+            "build 23: NEEDLE found",
+            "build 13: NEEDLE found",
+            "build 3: NEEDLE found"
+        ]
+    );
+    assert_eq!((matches[0].start_column, matches[0].end_column), (10, 16));
+
+    // Case matters when asked to.
+    let exact = frankenterm_mobile_mux::SearchQuery {
+        case_sensitive: true,
+        ..query
+    };
+    let search = harness.session.search(pane, &exact).expect("a search");
+    harness.pump();
+    assert!(search_results(&harness, search).0.is_empty());
+}
+
+#[test]
+fn a_search_walks_back_block_by_block_into_older_history() {
+    let mut harness = Harness::new(4, 30);
+    let mut output = Vec::new();
+    for n in 0..6200 {
+        let line = if n == 1500 {
+            "early marker\r\n".to_owned()
+        } else {
+            format!("row {n}\r\n")
+        };
+        output.extend_from_slice(line.as_bytes());
+    }
+    harness.quiet_output(&output);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    let query = frankenterm_mobile_mux::SearchQuery {
+        text: "early marker".into(),
+        case_sensitive: true,
+        regex: false,
+    };
+    let search = harness.session.search(pane, &query).expect("a search");
+    harness.pump();
+    let (matches, searched, _) = search_results(&harness, search);
+    assert_eq!(matches.len(), 1, "{matches:?}");
+    assert_eq!(matches[0].text, "early marker");
+    assert!(searched > frankenterm_mobile_mux::search::BLOCK_ROWS as usize);
+    let ranges = &harness.server.search_ranges;
+    assert!(ranges.len() >= 2, "{ranges:?}");
+    assert!(
+        ranges.windows(2).all(|pair| pair[1].end == pair[0].start),
+        "newest block first: {ranges:?}"
+    );
+}
+
+#[test]
+fn a_refused_search_reports_why_and_context_reads_rows() {
+    let mut harness = Harness::new(5, 30);
+    harness.quiet_output(&numbered(0, 20));
+    harness.attach();
+    let pane = harness.server.pane_id;
+    let query = frankenterm_mobile_mux::SearchQuery {
+        text: "(".into(),
+        case_sensitive: false,
+        regex: true,
+    };
+    let search = harness.session.search(pane, &query).expect("a search");
+    harness.pump();
+    let (matches, _, error) = search_results(&harness, search);
+    assert!(matches.is_empty());
+    assert_eq!(error.as_deref(), Some("regex parse error: unclosed group"));
+
+    let request = harness
+        .session
+        .context(pane, 4..7)
+        .expect("a context request");
+    harness.pump();
+    let lines = harness.events.iter().find_map(|event| match event {
+        Event::Context {
+            request: id, lines, ..
+        } if *id == request => Some(lines.clone()),
+        _ => None,
+    });
+    let lines = lines.expect("context");
+    let rows: Vec<_> = lines
+        .iter()
+        .map(|line| (line.row, line.text.as_str()))
+        .collect();
+    assert_eq!(rows, [(4, "line 4"), (5, "line 5"), (6, "line 6")]);
+}
+
 #[test]
 fn a_title_change_is_reported() {
     let mut harness = Harness::new(4, 20);

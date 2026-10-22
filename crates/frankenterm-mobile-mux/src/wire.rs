@@ -32,6 +32,8 @@ pub mod ident {
     pub const GET_CODEC_VERSION: u64 = 26;
     pub const GET_CODEC_VERSION_RESPONSE: u64 = 27;
     pub const LIVENESS_RESPONSE: u64 = 30;
+    pub const SEARCH_SCROLLBACK: u64 = 31;
+    pub const SEARCH_SCROLLBACK_RESPONSE: u64 = 32;
     pub const PANE_REMOVED: u64 = 37;
 }
 
@@ -79,6 +81,40 @@ pub struct Resize {
     pub containing_tab_id: usize,
     pub pane_id: usize,
     pub size: TerminalSize,
+}
+
+/// `mux::pane::Pattern`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    CaseSensitiveString(String),
+    CaseInSensitiveString(String),
+    Regex(String),
+}
+
+/// PDU 31: matches in a pane's rows `range`, oldest first, at most `limit`.
+#[derive(Serialize)]
+pub struct SearchScrollback {
+    pub pane_id: usize,
+    pub pattern: Pattern,
+    pub range: Range<StableRowIndex>,
+    pub limit: Option<u32>,
+}
+
+/// `mux::pane::SearchResult`: from `start_x` of row `start_y` to `end_x` of
+/// row `end_y`, in cells.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchResult {
+    pub start_y: StableRowIndex,
+    pub start_x: usize,
+    pub end_y: StableRowIndex,
+    pub end_x: usize,
+    pub match_id: usize,
+}
+
+/// PDU 32.
+#[derive(Deserialize, Debug)]
+pub struct SearchResults {
+    pub results: Vec<SearchResult>,
 }
 
 /// `frankenterm_term::TerminalSize`.

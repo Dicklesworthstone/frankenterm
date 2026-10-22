@@ -12,13 +12,15 @@
 use codec::{
     GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, LivenessResponse, MuxWireDecodedPayload, MuxWireDialect,
-    PaneRemoved, Pdu, Resize, UnitResponse, WriteToPane,
+    PaneRemoved, Pdu, Resize, SearchScrollbackRequest, SearchScrollbackResponse, UnitResponse,
+    WriteToPane,
 };
 use frankenterm_mobile_mux::{Event, Session};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     CellAttributes, Line, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
 };
+use mux::pane::{Pattern, SearchResult};
 use mux::renderable::{
     RenderableDimensions, StableCursorPosition, terminal_get_cursor_position,
     terminal_get_dimensions, terminal_get_dirty_lines, terminal_get_lines,
@@ -160,6 +162,8 @@ pub struct Server {
     pub requests: Vec<&'static str>,
     /// GetLines requests still to answer with an ErrorResponse.
     pub refuse_lines: usize,
+    /// The row ranges searches asked for, in order.
+    pub search_ranges: Vec<std::ops::Range<StableRowIndex>>,
     /// No push follows a resize (the v0.13 handler pushes nothing itself;
     /// the program's redraw usually does).
     pub quiet_resize: bool,
@@ -184,6 +188,7 @@ impl Server {
             resizes: Vec::new(),
             requests: Vec::new(),
             refuse_lines: 0,
+            search_ranges: Vec::new(),
             quiet_resize: false,
             subscribed: false,
             pushed: None,
@@ -289,6 +294,56 @@ impl Server {
                 if !self.quiet_resize {
                     self.push();
                 }
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
+                pattern,
+                range,
+                limit,
+                ..
+            })) => {
+                self.requests.push("SearchScrollback");
+                self.search_ranges.push(range.clone());
+                // The v0.13 LocalPane::search, for plain text: rows in range
+                // oldest first, stopping at the limit. A regex here is matched
+                // as its literal text, and "(" is the invalid one.
+                let (needle, folded) = match pattern {
+                    Pattern::CaseSensitiveString(text) => (text, false),
+                    Pattern::CaseInSensitiveString(text) => (text.to_lowercase(), true),
+                    Pattern::Regex(text) if text == "(" => {
+                        self.reply(
+                            0,
+                            serial,
+                            &"Error: regex parse error: unclosed group".to_owned(),
+                        );
+                        return;
+                    }
+                    Pattern::Regex(text) => (text, false),
+                };
+                let (first, lines) = terminal_get_lines(&mut self.term, range);
+                let mut results = Vec::new();
+                'rows: for (index, line) in lines.iter().enumerate() {
+                    let text = line.as_str().to_string();
+                    let haystack = if folded {
+                        text.to_lowercase()
+                    } else {
+                        text.clone()
+                    };
+                    for (at, _) in haystack.match_indices(&needle) {
+                        if limit.is_some_and(|limit| results.len() == limit as usize) {
+                            break 'rows;
+                        }
+                        let column = haystack[..at].chars().count();
+                        let row = first + index as StableRowIndex;
+                        results.push(SearchResult {
+                            start_y: row,
+                            start_x: column,
+                            end_y: row,
+                            end_x: column + needle.chars().count(),
+                            match_id: 0,
+                        });
+                    }
+                }
+                self.reply(32, serial, &SearchScrollbackResponse { results });
             }
             other => panic!("the v0.13 server test does not expect {other:?}"),
         }

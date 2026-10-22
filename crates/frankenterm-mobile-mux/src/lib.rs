@@ -10,9 +10,11 @@
 pub mod frame;
 pub mod mirror;
 pub mod render;
+pub mod search;
 pub mod session;
 pub mod wire;
 
+pub use search::{ContextLine, SearchMatch, SearchQuery};
 pub use session::{Event, PaneInfo, Session};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

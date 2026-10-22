@@ -145,6 +145,90 @@ fn requests_match_the_desktop_v46_encoding() {
     }
 }
 
+#[test]
+fn searches_match_the_desktop_v46_encoding_and_decoding() {
+    use mux::pane::{Pattern, SearchResult};
+    let patterns = [
+        (
+            wire::Pattern::CaseSensitiveString("Needle".into()),
+            Pattern::CaseSensitiveString("Needle".into()),
+        ),
+        (
+            wire::Pattern::CaseInSensitiveString("needle".into()),
+            Pattern::CaseInSensitiveString("needle".into()),
+        ),
+        (
+            wire::Pattern::Regex(r"err(or)?\s+\d+".into()),
+            Pattern::Regex(r"err(or)?\s+\d+".into()),
+        ),
+    ];
+    for (serial, (ours, theirs)) in (40u64..).zip(patterns) {
+        let phone = phone(
+            wire::ident::SEARCH_SCROLLBACK,
+            serial,
+            &wire::SearchScrollback {
+                pane_id: 4,
+                pattern: ours,
+                range: -10..5000,
+                limit: Some(200),
+            },
+        );
+        let desktop = desktop_v46(
+            Pdu::SearchScrollbackRequest(codec::SearchScrollbackRequest {
+                pane_id: 4,
+                pattern: theirs,
+                range: -10..5000,
+                limit: Some(200),
+            }),
+            serial,
+        );
+        assert_eq!(phone, desktop, "serial {serial}");
+    }
+
+    let results = vec![
+        SearchResult {
+            start_y: -3,
+            start_x: 7,
+            end_y: -2,
+            end_x: 1,
+            match_id: 0,
+        },
+        SearchResult {
+            start_y: 4000,
+            start_x: 0,
+            end_y: 4000,
+            end_x: 12,
+            match_id: 5,
+        },
+    ];
+    let body = varbincode::serialize(&codec::SearchScrollbackResponse {
+        results: results.clone(),
+    })
+    .expect("serialize");
+    let bytes = server_frame(32, 9, &body, true);
+    let decoded = Pdu::decode_for_dialect(bytes.as_slice(), MuxWireDialect::LEGACY46)
+        .expect("desktop decodes");
+    let MuxWireDecodedPayload::Pdu(Pdu::SearchScrollbackResponse(desktop)) = decoded.payload()
+    else {
+        panic!("desktop decoded {:?}", decoded.payload());
+    };
+    assert_eq!(desktop.results, results);
+    let mut reader = frame::FrameReader::default();
+    reader.push(&bytes);
+    let frame = reader.next_frame().expect("frame").expect("complete");
+    let ours: wire::SearchResults = wire::decode(&frame.body).expect("the phone decodes it");
+    let ours: Vec<_> = ours
+        .results
+        .iter()
+        .map(|r| (r.start_y, r.start_x, r.end_y, r.end_x, r.match_id))
+        .collect();
+    let theirs: Vec<_> = results
+        .iter()
+        .map(|r| (r.start_y, r.start_x, r.end_y, r.end_x, r.match_id))
+        .collect();
+    assert_eq!(ours, theirs);
+}
+
 fn styled_terminal() -> frankenterm_term::Terminal {
     let mut term = terminal(5, 30);
     term.advance_bytes(
