@@ -2,6 +2,64 @@ import Foundation
 import XCTest
 @testable import FrankenTermKit
 
+final class OpticalDecoderSaveCadenceTests: XCTestCase {
+    func testOrdinaryDuplicateFramesNeverScheduleWrites() {
+        let cadence = OpticalDecoderSaveCadence(receivedParts: 8, verifiedPages: 1)
+        for elapsed in [Duration.zero, .milliseconds(500), .seconds(2), .seconds(86_400)] {
+            XCTAssertNil(cadence.delay(receivedParts: 8, verifiedPages: 1, elapsed: elapsed))
+        }
+    }
+
+    func testOrdinaryProgressUsesMonotonicTwoSecondDeadline() {
+        let cadence = OpticalDecoderSaveCadence(receivedParts: 8, verifiedPages: 1)
+        let samples: [(Duration, Duration)] = [
+            (.seconds(-1), .seconds(2)),
+            (.zero, .seconds(2)),
+            (.milliseconds(35), .milliseconds(1_965)),
+            (.milliseconds(1_999), .milliseconds(1)),
+            (.seconds(2), .zero),
+            (.seconds(3), .zero),
+        ]
+        for (elapsed, delay) in samples {
+            XCTAssertEqual(cadence.delay(receivedParts: 9, verifiedPages: 1, elapsed: elapsed), delay)
+        }
+    }
+
+    func testNewFramesDoNotPostponeDeadlineOrPretendToHaveSaved() {
+        var cadence = OpticalDecoderSaveCadence(receivedParts: 8, verifiedPages: 0)
+        XCTAssertEqual(cadence.delay(receivedParts: 9, verifiedPages: 0, elapsed: .milliseconds(500)),
+                       .milliseconds(1_500))
+        XCTAssertEqual(cadence.delay(receivedParts: 12, verifiedPages: 0, elapsed: .milliseconds(1_500)),
+                       .milliseconds(500))
+        XCTAssertEqual(cadence.delay(receivedParts: 16, verifiedPages: 0, elapsed: .seconds(2)), .zero)
+        XCTAssertEqual(cadence.delay(receivedParts: 16, verifiedPages: 0, elapsed: .seconds(3)), .zero)
+        cadence.record(receivedParts: 16, verifiedPages: 0)
+        XCTAssertNil(cadence.delay(receivedParts: 16, verifiedPages: 0, elapsed: .zero))
+        XCTAssertEqual(cadence.delay(receivedParts: 17, verifiedPages: 0, elapsed: .milliseconds(200)),
+                       .milliseconds(1_800))
+    }
+
+    func testVerifiedPageTransitionIsDirtyEvenWhenPartCountStaysTheSame() {
+        let cadence = OpticalDecoderSaveCadence(receivedParts: 16, verifiedPages: 0)
+        XCTAssertEqual(cadence.delay(receivedParts: 16, verifiedPages: 1, elapsed: .milliseconds(500)),
+                       .milliseconds(1_500))
+        XCTAssertEqual(cadence.delay(receivedParts: 16, verifiedPages: 1, elapsed: .zero, force: true), .zero)
+    }
+
+    func testForcedPauseCompletionAndLowerRankRepairBypassInterval() {
+        var cadence = OpticalDecoderSaveCadence(receivedParts: 8, verifiedPages: 1)
+        XCTAssertEqual(cadence.delay(receivedParts: 9, verifiedPages: 1, elapsed: .zero, force: true), .zero)
+        XCTAssertEqual(cadence.delay(receivedParts: 16, verifiedPages: 2, elapsed: .zero, force: true), .zero)
+        XCTAssertEqual(cadence.delay(receivedParts: 4, verifiedPages: 1, elapsed: .zero, force: true), .zero)
+        cadence.record(receivedParts: 4, verifiedPages: 1)
+        XCTAssertNil(cadence.delay(receivedParts: 4, verifiedPages: 1, elapsed: .zero))
+        XCTAssertEqual(cadence.delay(receivedParts: 4, verifiedPages: 1, elapsed: .zero, force: true), .zero,
+                       "a repair can change which equations survive without changing their count")
+        XCTAssertEqual(cadence.delay(receivedParts: 5, verifiedPages: 1, elapsed: .milliseconds(500)),
+                       .milliseconds(1_500))
+    }
+}
+
 private final class DecoderRecoveryDisk: WorkspacePersistence, @unchecked Sendable {
     enum Fault { case before, after }
     private let lock = NSRecursiveLock()
@@ -125,6 +183,32 @@ final class OpticalDecoderRecoveryTests: XCTestCase {
         XCTAssertEqual(disk.writes, writes)
     }
 
+    func testForcedSameRankCheckpointReplacesDifferentPartialEquations() async throws {
+        let disk = DecoderRecoveryDisk(), store = Store(persistence: disk, using: crypto)
+        let initial = try checkpoint(), first = try await store.beginSaving(initial, confirmedByUser: true)
+        var cadence = OpticalDecoderSaveCadence(receivedParts: first.review.receivedParts,
+                                               verifiedPages: first.review.verifiedPages)
+        let sender = try sender()
+        var receiver = OpticalReceiver(selecting: try OpticalFrame(text: sender.frame(page: 0, sequence: 5, using: crypto)))
+        for sequence in 5...8 {
+            try receiver.receive(OpticalFrame(text: sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)), using: crypto)
+        }
+        let repaired = try receiver.decoderCheckpoint(using: crypto)
+        XCTAssertNotEqual(repaired, initial)
+        XCTAssertEqual(receiver.receivedParts, first.review.receivedParts)
+        XCTAssertEqual(receiver.verifiedPages, first.review.verifiedPages)
+        XCTAssertNil(cadence.delay(receivedParts: receiver.receivedParts, verifiedPages: receiver.verifiedPages,
+                                   elapsed: .zero))
+        XCTAssertEqual(cadence.delay(receivedParts: receiver.receivedParts, verifiedPages: receiver.verifiedPages,
+                                     elapsed: .zero, force: true), .zero)
+        let saved = try await store.save(repaired, after: first)
+        cadence.record(receivedParts: saved.review.receivedParts, verifiedPages: saved.review.verifiedPages)
+        let restored = try await store.load(saved.review)
+        XCTAssertEqual(restored, repaired)
+        XCTAssertNil(cadence.delay(receivedParts: receiver.receivedParts, verifiedPages: receiver.verifiedPages,
+                                   elapsed: .zero))
+    }
+
     func testResumeConsentRotatesWriterAcrossActorInstances() async throws {
         let disk = DecoderRecoveryDisk(), original = Store(persistence: disk, using: crypto)
         let first = try await original.beginSaving(checkpoint(), confirmedByUser: true)
@@ -183,12 +267,19 @@ final class OpticalDecoderRecoveryTests: XCTestCase {
         for fault in [DecoderRecoveryDisk.Fault.before, .after] {
             let disk = DecoderRecoveryDisk(), store = Store(persistence: disk, using: crypto)
             let first = try await store.beginSaving(checkpoint(), confirmedByUser: true)
+            var cadence = OpticalDecoderSaveCadence(receivedParts: first.review.receivedParts,
+                                                   verifiedPages: first.review.verifiedPages)
+            XCTAssertEqual(cadence.delay(receivedParts: 8, verifiedPages: 0, elapsed: .seconds(2)), .zero)
             disk.arm(fault)
             await expectStorage { _ = try await store.save(self.checkpoint(parts: 8), after: first) }
+            XCTAssertEqual(cadence.delay(receivedParts: 8, verifiedPages: 0, elapsed: .seconds(3)), .zero,
+                           "a failed save must remain due even if its successor was published")
             let writes = disk.writes
             let retry = try await store.save(checkpoint(parts: 8), after: first)
             XCTAssertEqual(disk.writes, writes + 1, "readback alone cannot certify a failed fsync")
             XCTAssertEqual(retry.review.receivedParts, 8)
+            cadence.record(receivedParts: retry.review.receivedParts, verifiedPages: retry.review.verifiedPages)
+            XCTAssertNil(cadence.delay(receivedParts: 8, verifiedPages: 0, elapsed: .zero))
             _ = try await store.save(checkpoint(parts: 9), after: retry)
             await expect(.staleWriter) { _ = try await store.save(self.checkpoint(parts: 8), after: first) }
         }

@@ -201,17 +201,27 @@ public actor OfflineRestore<C: AirGapCryptography> {
         return status()
     }
 
-    /// Save opt-in FTDC ciphertext reconstruction state during collection,
-    /// including incomplete equations. Ordinary FTSC exports remain verified-
-    /// page-only. This does not enable automatic checkpoint persistence. The caller
+    /// Export opt-in FTDC ciphertext reconstruction state, including incomplete
+    /// equations while collecting and the final envelope while locked or under
+    /// review. Ordinary FTSC exports remain verified-page-only. This does not
+    /// enable automatic checkpoint persistence. The caller
     /// owns explicit protected-file publication; this actor never writes a
     /// transfer code, decoded archive, private key or recipient request secret.
     /// A recipient-bound scan still needs its original in-memory request key:
     /// a checkpoint cannot recover that key after this process terminates.
     public func exportDecoderCheckpoint(generation token: UUID) throws -> Data {
         try check(token)
-        guard phase == .collecting, source == .optical, let receiver else { throw FTError.stale }
-        let data = try receiver.decoderCheckpoint(using: crypto)
+        guard source == .optical else { throw FTError.stale }
+        let data: Data
+        if let receiver {
+            data = try receiver.decoderCheckpoint(using: crypto)
+        } else {
+            // Completion releases the live decoder. Reuse the bounded,
+            // verified ciphertext snapshot so the last page is saved too,
+            // without retaining a second receiver or any decrypted state.
+            guard let checkpoint = try scanCheckpoint(generation: token) else { throw FTError.stale }
+            data = try OpticalReceiver(resuming: checkpoint, using: crypto).decoderCheckpoint(using: crypto)
+        }
         try Task.checkCancellation()
         return data
     }

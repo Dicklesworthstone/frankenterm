@@ -32,6 +32,41 @@ public struct OpticalDecoderSaveSession: Sendable {
     fileprivate let epoch: UUID
 }
 
+/// Coalesces ordinary scan progress against the last confirmed durable save.
+/// The owner supplies monotonic elapsed time and retains at most one trailing
+/// timer. Querying a deadline never marks progress as persisted; call `record`
+/// only with the counts returned by a successful recovery-store operation.
+///
+/// Counts describe progress, not the exact decoder contents. Force a save after
+/// page repair even when the number of retained equations has not changed.
+public struct OpticalDecoderSaveCadence: Sendable {
+    private var receivedParts: Int
+    private var verifiedPages: Int
+    private static let interval: Duration = .seconds(2)
+
+    public init(receivedParts: Int, verifiedPages: Int) {
+        self.receivedParts = receivedParts
+        self.verifiedPages = verifiedPages
+    }
+
+    /// Explicit completion, pause or repair is due immediately when forced.
+    /// Ordinary unchanged progress needs no timer or write; changed progress is
+    /// due two seconds after the last confirmed save. New frames do not postpone
+    /// that time. Force can persist different equations with equal counts.
+    public func delay(receivedParts: Int, verifiedPages: Int, elapsed: Duration,
+                      force: Bool = false) -> Duration? {
+        if force { return .zero }
+        guard receivedParts != self.receivedParts || verifiedPages != self.verifiedPages else { return nil }
+        guard elapsed < Self.interval else { return .zero }
+        return Self.interval - max(.zero, elapsed)
+    }
+
+    public mutating func record(receivedParts: Int, verifiedPages: Int) {
+        self.receivedParts = receivedParts
+        self.verifiedPages = verifiedPages
+    }
+}
+
 /// Opt-in persistence for FTDC's incomplete reconstruction state. Use a dedicated
 /// directory, distinct from both WorkspaceStore and verified-only FTSC recovery.
 /// The existing file adapter supplies atomic publication, file/directory fsync,
