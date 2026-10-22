@@ -606,6 +606,9 @@ pub struct ShaderUniform {
     pub foreground_text_hsb: [f32; 3],
     pub milliseconds: u32,
     pub projection: [[f32; 4]; 4],
+    /// `text_gamma` / `text_contrast`: `TextCompositionUniforms::params`
+    /// from `text_composition.rs`.
+    pub text_composition: [f32; 4],
     // sampler2D atlas_nearest_sampler;
     // sampler2D atlas_linear_sampler;
 }
@@ -2038,6 +2041,59 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::mpsc;
+
+    /// `shader.wgsl` must parse and validate, and the Rust `ShaderUniform`
+    /// that fills its uniform buffer must have the WGSL struct's exact
+    /// layout: a mismatch shifts every field after it on the GPU.
+    #[test]
+    fn shader_uniform_matches_the_wgsl_uniform_layout() {
+        use super::ShaderUniform;
+        use std::mem::{offset_of, size_of};
+        use wgpu::naga;
+
+        let module = naga::front::wgsl::parse_str(WEBGPU_SHADER_SOURCE)
+            .unwrap_or_else(|err| panic!("shader.wgsl does not parse: {err}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|err| panic!("shader.wgsl does not validate: {err:?}"));
+
+        let (_, uniform) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("ShaderUniform"))
+            .expect("shader.wgsl declares struct ShaderUniform");
+        let naga::TypeInner::Struct { members, span } = &uniform.inner else {
+            panic!("ShaderUniform is not a struct: {:?}", uniform.inner);
+        };
+        let wgsl_layout: Vec<(&str, usize)> = members
+            .iter()
+            .map(|member| {
+                (
+                    member.name.as_deref().unwrap_or("<unnamed>"),
+                    member.offset as usize,
+                )
+            })
+            .collect();
+        assert_eq!(
+            wgsl_layout,
+            vec![
+                (
+                    "foreground_text_hsb",
+                    offset_of!(ShaderUniform, foreground_text_hsb)
+                ),
+                ("milliseconds", offset_of!(ShaderUniform, milliseconds)),
+                ("projection", offset_of!(ShaderUniform, projection)),
+                (
+                    "text_composition",
+                    offset_of!(ShaderUniform, text_composition)
+                ),
+            ]
+        );
+        assert_eq!(*span as usize, size_of::<ShaderUniform>());
+    }
 
     /// ft-yccm0.1.7: drawables are accounted as wgpu-hal Metal configures
     /// them: clamp(latency, 1..=3) + 1 images of width x height texels.

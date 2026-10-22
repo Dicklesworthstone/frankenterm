@@ -340,6 +340,69 @@ fail-closed until its durable negative intent commits, preventing an older
 
 `click_interval_ms` controls how much time FrankenTerm allows between successive clicks when deciding whether a gesture counts as a double-click or triple-click selection. The default is `500`, which matches common desktop defaults, but operators who need a slower cadence can raise it to `1000`-`2000` in `frankenterm.toml`.
 
+### Text rendering
+
+Six keys shape how glyphs are rasterized and blended. They can be set in
+`frankenterm.toml` or in a Lua config.
+
+FreeType hinting and subpixel text:
+
+- `freetype_load_target` (default `"Normal"`): the hinting, one of `Normal`,
+  `Light`, `Mono`, `HorizontalLcd` or `VerticalLcd`.
+- `freetype_render_target` (default: the value of `freetype_load_target`):
+  how glyphs are rendered. `HorizontalLcd` or `VerticalLcd` gives subpixel
+  (LCD) text.
+- `freetype_lcd_filter` (default `"Default"`): the filter FreeType runs over
+  subpixel glyphs to tame color fringes. `Default` uses the taps
+  `8, 77, 86, 77, 8` (in 1/256), `Light` uses `0, 85, 86, 85, 0` and is
+  crisper with slightly more fringing, and `None` does no filtering. Current
+  FreeType has no `Legacy` filter, so neither does this key. Grayscale text
+  ignores it.
+- `freetype_lcd_filter_weights` (default unset): five taps of your own that
+  replace the filter's, for example `[16, 64, 96, 64, 16]`. Taps that add up
+  to 256 leave the brightness unchanged; a center tap of 0 turns filtering
+  off.
+
+The two filter keys are read when fonts load: a config reload picks up a
+change, a per-window override does not. They only affect text rasterized by
+FreeType. On macOS the default rasterizer is CoreText, so there they need
+`font_rasterizer = "FreeType"`.
+
+Text weight, after kitty's `text_composition_strategy`:
+
+- `text_gamma` (default unset): 0.01 or more. Values above 1 make text
+  heavier, values below 1 lighter.
+- `text_contrast` (default unset): 0 to 100, a percentage by which every
+  glyph pixel's coverage is raised.
+
+With both unset, text renders exactly as before. Setting either one does
+two things. First, glyphs are blended in linear light instead of gamma
+space, which by itself makes light text on a dark background heavier and
+dark text on a light background lighter; `text_gamma = 1` alone gives just
+that. Second, each pixel's coverage `a` is reshaped:
+
+```
+w  = (1 - luminance(text) + luminance(background)) / 2
+a' = clamp(mix(a, a^(1 / text_gamma), w) * (1 + text_contrast / 100), 0, 1)
+```
+
+So `text_gamma` acts fully on black text on white and not at all on white
+text on black, which offsets the lighter dark-on-light text that linear
+blending produces. kitty's macOS default is:
+
+```toml
+text_gamma = 1.7
+text_contrast = 30
+```
+
+The OpenGL front end blends in gamma space, so its glyph shader rescales the
+coverage to give the linear-light result. A shader cannot read the pixel it
+draws over, so it assumes the active pane's default background; text over
+other colors (a selection, a colored cell, the tab bar) comes out slightly
+different from an exact linear blend. The WebGpu front end draws to an sRGB
+surface, which already blends in linear light, so there only the curve
+applies. The Metal front end does not support these two keys yet.
+
 ## Migration Guide: WezTerm -> FrankenTerm
 
 ### A. Config migration (Lua -> TOML)

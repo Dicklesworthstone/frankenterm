@@ -10,7 +10,8 @@ use crate::default_config_with_overrides_applied;
 use crate::exec_domain::ExecDomain;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
-    FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
+    FontShaperSelection, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule,
+    TextStyle,
 };
 use crate::frontend::FrontEndSelection;
 use crate::keyassignment::{
@@ -492,6 +493,19 @@ pub struct Config {
     pub freetype_render_target: Option<FreeTypeLoadTarget>,
     #[dynamic(default)]
     pub freetype_load_flags: Option<FreeTypeLoadFlags>,
+
+    /// The LCD filter FreeType applies to subpixel text (a
+    /// `freetype_render_target` of `HorizontalLcd` or `VerticalLcd`):
+    /// `Default`, `Light` or `None`. Read when fonts load.
+    #[dynamic(default)]
+    pub freetype_lcd_filter: FreeTypeLcdFilter,
+
+    /// Five LCD filter taps in 1/256 units that replace the ones of
+    /// `freetype_lcd_filter`, for example `[8, 77, 86, 77, 8]`. Taps that
+    /// add up to 256 keep the brightness; a zero center tap turns filtering
+    /// off. Read when fonts load.
+    #[dynamic(default, validate = "validate_freetype_lcd_filter_weights")]
+    pub freetype_lcd_filter_weights: Option<Vec<u8>>,
 
     /// Selects the freetype interpret version to use.
     /// Likely values are 35, 38 and 40 which have different
@@ -1056,6 +1070,21 @@ pub struct Config {
 
     #[dynamic(default)]
     pub text_min_contrast_ratio: Option<f32>,
+
+    /// Glyph coverage gamma, after kitty's `text_composition_strategy`:
+    /// 0.01 or more. Higher values make text heavier, fully for dark text
+    /// on a light background and hardly at all for light text on a dark
+    /// one. Setting this or `text_contrast` also blends text in linear
+    /// light. Applies to the OpenGL and WebGpu front ends.
+    #[dynamic(default, validate = "validate_text_gamma")]
+    pub text_gamma: Option<f32>,
+
+    /// Extra glyph coverage contrast, a percentage from 0 to 100, after
+    /// kitty's `text_composition_strategy`. Setting this or `text_gamma`
+    /// also blends text in linear light. Applies to the OpenGL and WebGpu
+    /// front ends.
+    #[dynamic(default, validate = "validate_text_contrast")]
+    pub text_contrast: Option<f32>,
 
     #[dynamic(default)]
     pub force_reverse_video_cursor: bool,
@@ -2754,6 +2783,37 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
     }
 }
 
+/// The smallest `text_gamma`; kitty uses the same floor.
+pub const MIN_TEXT_GAMMA: f32 = 0.01;
+
+fn validate_text_gamma(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(gamma) if !(gamma.is_finite() && *gamma >= MIN_TEXT_GAMMA) => Err(format!(
+            "text_gamma must be a number of at least {MIN_TEXT_GAMMA}, got {gamma}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_contrast(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(contrast) if !(0.0..=100.0).contains(contrast) => Err(format!(
+            "text_contrast must be a percentage from 0 to 100, got {contrast}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_freetype_lcd_filter_weights(value: &Option<Vec<u8>>) -> Result<(), String> {
+    match value {
+        Some(weights) if weights.len() != 5 => Err(format!(
+            "freetype_lcd_filter_weights must list exactly 5 weights, got {}",
+            weights.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn validate_unfocused_max_fps(value: &Option<u64>) -> Result<(), String> {
     match value {
         Some(fps) if !(MIN_MAX_FPS..=MAX_MAX_FPS).contains(fps) => Err(format!(
@@ -3602,6 +3662,102 @@ mod tests {
         )])
         .expect("a boolean is a valid enable_wayland_fractional_scale");
         assert!(!config.enable_wayland_fractional_scale);
+    }
+
+    fn float(value: f64) -> Value {
+        Value::F64(ordered_float::OrderedFloat(value))
+    }
+
+    fn weights(taps: &[u64]) -> Value {
+        Value::Array(
+            taps.iter()
+                .copied()
+                .map(Value::U64)
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    #[test]
+    fn text_rendering_options_default_to_the_existing_rendering() {
+        let config = Config::default_config();
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Default);
+        assert_eq!(config.freetype_lcd_filter_weights, None);
+        assert_eq!(config.text_gamma, None);
+        assert_eq!(config.text_contrast, None);
+    }
+
+    #[test]
+    fn text_rendering_options_parse() {
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("Light".to_string())),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77, 8])),
+            ("text_gamma", float(1.7)),
+            // Lua and TOML integers are accepted for the float options.
+            ("text_contrast", Value::U64(30)),
+        ])
+        .expect("valid text rendering options");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Light);
+        assert_eq!(
+            config.freetype_lcd_filter_weights,
+            Some(vec![8, 77, 86, 77, 8])
+        );
+        assert_eq!(config.text_gamma, Some(1.7));
+        assert_eq!(config.text_contrast, Some(30.0));
+
+        // The range ends are valid.
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("None".to_string())),
+            ("text_gamma", float(f64::from(MIN_TEXT_GAMMA))),
+            ("text_contrast", Value::U64(100)),
+        ])
+        .expect("range ends are valid");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::None);
+        assert_eq!(config.text_gamma, Some(MIN_TEXT_GAMMA));
+        assert_eq!(config.text_contrast, Some(100.0));
+        let config = config_from_pairs(vec![("text_contrast", Value::U64(0))])
+            .expect("a contrast of 0 is valid");
+        assert_eq!(config.text_contrast, Some(0.0));
+    }
+
+    #[test]
+    fn text_rendering_options_reject_bad_values() {
+        let cases = [
+            ("text_gamma", float(0.0)),
+            ("text_gamma", float(0.009)),
+            ("text_gamma", Value::I64(-2)),
+            ("text_gamma", float(f64::NAN)),
+            ("text_gamma", float(f64::INFINITY)),
+            // Finite as an f64, infinite as the f32 the option holds.
+            ("text_gamma", float(1.0e39)),
+            ("text_contrast", Value::I64(-1)),
+            ("text_contrast", float(100.5)),
+            ("text_contrast", float(f64::NAN)),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77])),
+            (
+                "freetype_lcd_filter_weights",
+                weights(&[8, 77, 86, 77, 8, 0]),
+            ),
+            ("freetype_lcd_filter_weights", weights(&[])),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 256, 77, 8])),
+            // FreeType no longer has its pre-2.3 Legacy filter.
+            ("freetype_lcd_filter", Value::String("Legacy".to_string())),
+        ];
+        for (key, value) in cases {
+            // This crate is edition 2018: a lone panic! literal is not a
+            // format string, so the arguments are passed explicitly.
+            let shown = format!("{} = {:?}", key, value);
+            let err = match config_from_pairs(vec![(key, value)]) {
+                Ok(_) => panic!("{} was accepted", shown),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(key),
+                "{}: error does not name the key: {}",
+                shown,
+                err
+            );
+        }
     }
 
     #[test]

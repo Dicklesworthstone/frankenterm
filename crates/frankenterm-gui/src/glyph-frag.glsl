@@ -22,6 +22,14 @@ uniform sampler2D atlas_linear_sampler;
 uniform bool subpixel_aa;
 uniform uint milliseconds;
 
+// text_gamma / text_contrast, filled in by text_composition.rs.
+// x: above 0.5 when on (otherwise glyphs blend exactly as before);
+// y: coverage exponent; z: coverage gain; w: luminance of
+// text_composition_background, the linear color text is assumed to be
+// drawn over.
+uniform vec4 text_composition;
+uniform vec3 text_composition_background;
+
 struct ColorEase {
   vec4 in_function;
   vec4 out_function;
@@ -110,6 +118,28 @@ vec4 to_srgb(vec4 linearRGB)
   return vec4(mix(higher, lower, cutoff), linearRGB.a);
 }
 
+// kitty's text_composition_strategy curve, applied to each coverage value.
+// CoverageCurve::apply in text_composition.rs is the CPU version.
+vec3 curve_coverage(vec3 coverage, float text_luminance) {
+  float weight = 0.5 * (1.0 - text_luminance + text_composition.w);
+  vec3 curved = mix(coverage, pow(coverage, vec3(text_composition.y)), weight);
+  return clamp(curved * text_composition.z, 0.0, 1.0);
+}
+
+// This framebuffer blends sRGB-encoded values. Per channel, return the
+// coverage that makes that blend over `background` land on the linear-light
+// blend at `coverage` (coverage_for_gamma_space_blend in
+// text_composition.rs). Where text and background encode to nearly the same
+// value, keep the coverage.
+vec3 coverage_for_gamma_space_blend(vec3 coverage, vec3 text, vec3 background) {
+  vec3 text_encoded = to_srgb(vec4(text, 1.0)).rgb;
+  vec3 background_encoded = to_srgb(vec4(background, 1.0)).rgb;
+  vec3 span = text_encoded - background_encoded;
+  vec3 target = to_srgb(vec4(mix(background, text, coverage), 1.0)).rgb;
+  vec3 rescaled = clamp((target - background_encoded) / span, 0.0, 1.0);
+  return mix(rescaled, coverage, lessThan(abs(span), vec3(1.0e-4)));
+}
+
 void main() {
   vec4 fg_color = mix(o_fg_color, o_fg_color_alt, o_fg_color_mix);
   if (o_has_color == 3.0) {
@@ -154,6 +184,23 @@ void main() {
   }
 
   color = apply_hsv(color, o_hsv);
+
+  if (text_composition.x > 0.5 && o_has_color == 0.0) {
+    vec3 text = clamp(color.rgb, 0.0, 1.0);
+    float text_luminance = dot(text, vec3(0.2126, 0.7152, 0.0722));
+    if (subpixel_aa) {
+      // Subpixel glyphs blend with one coverage per channel (colorMask is
+      // the second blend source), so rescale each channel against its own
+      // text and background values.
+      colorMask.rgb = coverage_for_gamma_space_blend(
+        curve_coverage(colorMask.rgb, text_luminance), text, text_composition_background);
+    } else {
+      // One coverage for all three channels: rescale against luminances.
+      color.a = coverage_for_gamma_space_blend(
+        curve_coverage(vec3(color.a), text_luminance),
+        vec3(text_luminance), vec3(text_composition.w)).x;
+    }
+  }
 
   // We MUST output SRGB and tell glium that we do that (outputs_srgb),
   // otherwise something in glium over-gamma-corrects depending on the gl setup.

@@ -247,6 +247,21 @@ pub enum FreeTypeLoadTarget {
     VerticalLcd,
 }
 
+/// The FreeType filter applied to subpixel (`HorizontalLcd` or
+/// `VerticalLcd`) glyph renders to limit color fringes. Grayscale renders
+/// do not use it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum FreeTypeLcdFilter {
+    /// FreeType's default five-tap filter, weights 8, 77, 86, 77, 8 (in
+    /// 1/256): the least color fringing, slightly soft.
+    #[default]
+    Default,
+    /// Weights 0, 85, 86, 85, 0: sharper, with a little more fringing.
+    Light,
+    /// No filtering: the sharpest result and the most color fringing.
+    None,
+}
+
 bitflags! {
     // Note that these are strongly coupled with deps/freetype/src/lib.rs,
     // but we can't directly reference that from here without making config
