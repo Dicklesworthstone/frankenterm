@@ -62,8 +62,8 @@ public struct OfflineRestoreStatus: Sendable {
     public let incompletePageIndices: [Int]
     public let review: OfflineRestoreReview?
     public let receipt: WorkspaceImportReceipt?
-    /// After a scanned or encrypted transfer commits: what tells its sender
-    /// it arrived (see TransferCompletion).
+    /// Legacy completion witness for integrations which explicitly negotiate a
+    /// return channel. The native offline restore never transmits this value.
     public let arrival: TransferArrival?
 }
 
@@ -101,8 +101,8 @@ public actor OfflineRestore<C: AirGapCryptography> {
     /// Call before presenting a scanner or reading the selected local file.
     /// Existing connections must be closed deliberately by their owners; entering
     /// restore never disconnects a shell on the user's behalf. A completed
-    /// restore has nothing left to read and gives up exclusion (so the device
-    /// may tell the sender, or connect) until a reset and this call again.
+    /// restore has nothing left to read and gives up exclusion so the user may
+    /// deliberately connect later, until a reset and this call again.
     public func enterOfflineMode() throws {
         try Task.checkCancellation()
         if offlineLease == nil, phase != .complete { offlineLease = try networkActivity.beginOfflineRestore() }
@@ -197,6 +197,36 @@ public actor OfflineRestore<C: AirGapCryptography> {
         receiver = selected; self.candidate = nil; phase = .collecting
         if selected.isComplete {
             try finishOpticalEnvelope(from: selected)
+        }
+        return status()
+    }
+
+    /// A deliberately selected local recording uses the same optical receiver
+    /// as the camera. Admit one bounded image atomically: two different sources
+    /// in its first image are ambiguous, and no decoder is allocated for either.
+    /// Later foreign sources cannot replace the selected transfer. A recording
+    /// grants collection authority only; codes, decryption and source approval
+    /// remain separate user actions, even when all ciphertext is recovered.
+    @discardableResult
+    public func observeRecordingFrame(_ texts: [String], generation token: UUID) throws -> OfflineRestoreStatus {
+        try check(token)
+        guard [.idle, .candidate, .collecting, .locked].contains(phase) else { throw WorkspaceStoreError.busy }
+        guard texts.count <= OpticalRecordingLimits.maximumCodesPerFrame else { throw FTError.limit("recording.qr_count") }
+        guard phase != .locked else { return status() }
+        let frames = texts.compactMap { text -> (String, OpticalFrame)? in
+            guard text.hasPrefix("FTQR1/"), text.utf8.count <= FTLimit.qrText,
+                  let frame = try? OpticalFrame(text: text) else { return nil }
+            return (text, frame)
+        }
+        if identity == nil, let first = frames.first?.1.identity,
+           frames.contains(where: { $0.1.identity != first }) {
+            throw FTError.malformed("recording.ambiguous_sources")
+        }
+        for (text, frame) in frames {
+            if let identity, frame.identity != identity { continue }
+            _ = try observe(text, generation: token)
+            if phase == .candidate { _ = try selectCandidate(generation: token, digest: frame.identity.envelopeDigest) }
+            if phase == .locked { break }
         }
         return status()
     }

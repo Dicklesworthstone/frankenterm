@@ -320,6 +320,82 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Structural parser fixtures, not generated private keys. Actual RSA host
+    /// signatures are exercised by the independent libssh loopback harness.
+    private func rsaPublicBlob(exponent: Data = Data([1, 0, 1]), modulus: Data) -> Data {
+        string(Data("ssh-rsa".utf8)) + string(exponent) + string(modulus)
+    }
+
+    func testRSAHostIdentityPreservesItsCanonicalFingerprintAndRequiresSHA2() throws {
+        let blob = rsaPublicBlob(modulus: Data([0]) + Data(repeating: 0xA5, count: 256))
+        let host = try SSHPublicIdentity(blob: blob)
+        XCTAssertEqual(host.blob, blob)
+        XCTAssertEqual(host.algorithm, "ssh-rsa")
+        // Independently computed from this exact SSH blob with Python hashlib.
+        XCTAssertEqual(host.fingerprint, "SHA256:ecOadYuKd3sZt88BcsfofO2iQzd1t1iQSPFiPNMWCn4")
+        XCTAssertTrue(host.permitsHostSignature("rsa-sha2-256"))
+        XCTAssertTrue(host.permitsHostSignature("rsa-sha2-512"))
+        for refused in ["ssh-rsa", "rsa-sha2-384", "ssh-ed25519", "ecdsa-sha2-nistp256",
+                        "rsa-sha2-256-cert-v01@openssh.com", "", "RSA-SHA2-512"] {
+            XCTAssertFalse(host.permitsHostSignature(refused))
+        }
+        for fixture in try fixtures() {
+            let identity = try SSHPublicIdentity(blob: fixture.key.publicBlob)
+            XCTAssertTrue(identity.permitsHostSignature(fixture.algorithm))
+            XCTAssertFalse(identity.permitsHostSignature("rsa-sha2-256"))
+            XCTAssertFalse(identity.permitsHostSignature("rsa-sha2-512"))
+        }
+    }
+
+    func testRSAHostKeyBoundsUseActualModulusBitsAndCanonicalPositiveIntegers() throws {
+        for bits in [2048, 2049, 3072, 4096, 8191, 8192] {
+            var magnitude = Data(repeating: 0xA5, count: (bits + 7) / 8)
+            magnitude[0] = UInt8(1 << ((bits - 1) % 8))
+            let encoded = magnitude[0] & 0x80 == 0 ? magnitude : Data([0]) + magnitude
+            XCTAssertEqual(try SSHPublicIdentity(blob: rsaPublicBlob(modulus: encoded)).algorithm, "ssh-rsa")
+        }
+        let modulus = Data([0]) + Data(repeating: 0xA5, count: 256)
+        // Both small and larger canonical exponents fit the bounded profile.
+        for exponent in [Data([3]), Data([1, 0, 1]), Data([0]) + Data(repeating: 0xFF, count: 8)] {
+            XCTAssertNoThrow(try SSHPublicIdentity(blob: rsaPublicBlob(exponent: exponent, modulus: modulus)))
+        }
+        for exponent in [Data(), Data([0]), Data([1]), Data([2]), Data([4]), Data([0x81]),
+                         Data([0, 3]), Data([0, 0x7F]), Data([0, 0, 0x81]), Data(repeating: 1, count: 9)] {
+            XCTAssertThrowsError(try SSHPublicIdentity(blob: rsaPublicBlob(exponent: exponent, modulus: modulus)))
+        }
+        for invalid in [Data(), Data([0]), Data(repeating: 0xA5, count: 256),
+                        Data([0, 0]) + Data(repeating: 0xA5, count: 256),
+                        Data([0x7F]) + Data(repeating: 0xA5, count: 255),
+                        Data([0]) + Data(repeating: 0xA5, count: 255),
+                        Data([0]) + Data(repeating: 0xA4, count: 256),
+                        Data([1]) + Data(repeating: 0xA5, count: 1024)] {
+            XCTAssertThrowsError(try SSHPublicIdentity(blob: rsaPublicBlob(modulus: invalid)))
+        }
+        let valid = rsaPublicBlob(modulus: modulus)
+        XCTAssertThrowsError(try SSHPublicIdentity(blob: valid + Data([0])))
+        XCTAssertThrowsError(try SSHPublicIdentity(blob: Data(valid.dropLast())))
+        for invalidName in ["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa-cert-v01@openssh.com"] {
+            XCTAssertThrowsError(try SSHPublicIdentity(blob:
+                string(Data(invalidName.utf8)) + string(Data([1, 0, 1])) + string(modulus)))
+        }
+    }
+
+    func testRSAHostSupportDoesNotEnableUserAuthenticationOrPrivateKeyImport() throws {
+        let blob = rsaPublicBlob(modulus: Data([0]) + Data(repeating: 0xA5, count: 256))
+        _ = try SSHPublicIdentity(blob: blob)
+        XCTAssertThrowsError(try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 9, count: 32),
+            user: "operator", publicBlob: blob)) { error in
+            XCTAssertEqual(error as? SSHAuthenticationError, .unsupportedAlgorithm)
+        }
+        // A structurally aligned RSA private record remains outside the import
+        // profile; accepting its host public blob cannot stage private material.
+        let container = Data("openssh-key-v1\0".utf8) + string(Data("none".utf8)) + string(Data("none".utf8))
+            + string(Data()) + Data([0, 0, 0, 1]) + string(blob) + string(Data(repeating: 0, count: 24))
+        XCTAssertThrowsError(try PrivateKeyRecord.validateContainer(container, using: TestCryptography())) { error in
+            XCTAssertEqual(error as? FTError, .unsupported("key.family"))
+        }
+    }
+
     func testCancellationNeverReturnsASignature() async throws {
         let key = try sampleKey(using: TestCryptography()).0
         let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 1, count: 32),

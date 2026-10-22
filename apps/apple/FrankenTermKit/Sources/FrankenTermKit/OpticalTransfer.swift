@@ -317,11 +317,11 @@ public struct OpticalFrame: Sendable {
     }
 }
 
-/// The unlock code as one more frame of a code-protected animation, so the
-/// phone needs nothing typed: `FTCODE1:<first 8 bytes of the envelope digest
-/// in hex>:<revealed code>`. Uppercase throughout, because the FTQR1 profile
-/// encodes only the QR alphanumeric alphabet. Anyone who films the animation
-/// gets the code with the pages; the operator chose that over typing it.
+/// A deliberately revealed unlock code, displayed only while ciphertext
+/// playback is paused and covered: `FTCODE1:<first 8 bytes of the envelope
+/// digest in hex>:<revealed code>`. It must never be interleaved with FTQR1
+/// playback or included in a saved recording. Capturing this separate code
+/// together with the ciphertext still allows decryption.
 public enum TransferCodeFrame {
     public static func digestPrefix(_ envelopeDigest: Data) -> String { Data(envelopeDigest.prefix(8)).ftHex }
 

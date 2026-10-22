@@ -52,15 +52,12 @@ struct FrankenTermExportApp: App {
 /// Private keys need a separate pick.
 private actor MacExportEngine {
     struct Prepared: Sendable {
+        let id: UUID
         let comparison: String, pages: Int, bytes: Int
         let protection: ExportProtection
         let recipientComparison: String?
-        /// The unlock code as a frame the animation interleaves
-        /// (`FTCODE1:<envelope digest prefix>:<code>`), so the phone needs
-        /// nothing typed. Anyone filming the animation can read it too.
-        let codeFrame: String?
-        /// What the phone proves once this transfer has arrived.
-        let arrival: TransferArrival
+        let hasTransferCode: Bool
+        let isReplay: Bool
     }
     struct SelectionState: Sendable {
         let source: WorkspaceDocument
@@ -89,8 +86,7 @@ private actor MacExportEngine {
     private var sshSource: (source: SSHWorkspaceSource, url: URL)?
     private var decisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     private var keys: [PrivateKeyRecord] = []
-    private var exportedEnvelope: Data?
-    private var sender: OpticalSender?
+    private var transfer: OpticalExportSession?
 
     private func fingerprint(_ key: PrivateKeyRecord) -> String {
         "SHA256:" + crypto.sha256(key.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "")
@@ -102,7 +98,7 @@ private actor MacExportEngine {
                      review: try selection.review(decisions: decisions, loadedFingerprints: loaded),
                      identityReferences: identityReferences)
     }
-    func invalidateExport() { exportedEnvelope = nil; sender = nil }
+    func invalidateExport() { transfer = nil }
     private func retireKeyRequest() {
         if let pending = pendingKeyInstallation {
             keys = pending.previousKeys; decisions = pending.previousDecisions
@@ -382,43 +378,66 @@ private actor MacExportEngine {
         // changes selected keys or prepares the same source document again.
         // Playback and file/animation saves continue reusing this one envelope.
         let archive = try selection.archive(decisions: decisions, keys: keys, bundleID: UUID().uuidString, using: crypto)
-        let envelope: Data
-        let code: TransferCode?
+        let preparedTransfer: OpticalExportSession
         let recipientComparison: String?
         switch protection {
         case .recipient:
             guard let recipient, let confirmedRequestDigest else { throw FTError.malformed("export.recipient_confirmation") }
-            envelope = try FTAG.seal(archive, recipient: recipient, confirmedRequestDigest: confirmedRequestDigest, using: crypto)
-            code = nil
+            let envelope = try FTAG.seal(archive, recipient: recipient, confirmedRequestDigest: confirmedRequestDigest, using: crypto)
+            preparedTransfer = try OpticalExportSession(envelope: envelope, using: crypto)
             recipientComparison = recipient.comparison(using: crypto)
         case .code:
             guard recipient == nil, confirmedRequestDigest == nil else { throw FTError.malformed("export.protection_selection") }
             let candidate = try FTAG.seal(archive, using: crypto)
-            envelope = candidate.envelope; code = candidate.code
+            preparedTransfer = try OpticalExportSession(export: candidate, using: crypto)
             recipientComparison = nil
         }
         try Task.checkCancellation()
-        let optical = try OpticalSender(envelope: envelope, using: crypto)
-        exportedEnvelope = envelope; sender = optical
-        let digest = optical.identity.envelopeDigest
-        return .init(comparison: FTAG.comparison(envelope, using: crypto), pages: optical.identity.pageCount,
-                     bytes: envelope.count, protection: protection, recipientComparison: recipientComparison,
-                     codeFrame: code.map { TransferCodeFrame.text(envelopeDigest: digest, code: $0.reveal(using: crypto)) },
-                     arrival: .init(envelopeDigest: digest, workspaceDigest: crypto.sha256(archive.workspace.raw)))
+        transfer = preparedTransfer
+        return metadata(preparedTransfer, recipientComparison: recipientComparison, isReplay: false)
     }
-    func next(repairPage: Int?) throws -> String {
-        guard var active = sender else { throw FTError.stale }
-        let text = try active.next(repairPage: repairPage, using: crypto)
-        sender = active
-        return text
+    func openEncryptedTransfer(_ url: URL) throws -> Prepared {
+        let bytes = try SelectedLocalFile.read(url, limit: FTLimit.envelope)
+        let preparedTransfer = try OpticalExportSession(envelope: bytes, using: crypto)
+        try Task.checkCancellation()
+        clear()
+        transfer = preparedTransfer
+        return metadata(preparedTransfer, recipientComparison: nil, isReplay: true)
     }
-    func encryptedEnvelope() throws -> Data {
-        guard let exportedEnvelope else { throw FTError.stale }
-        return exportedEnvelope
+    private func metadata(_ value: OpticalExportSession, recipientComparison: String?, isReplay: Bool) -> Prepared {
+        .init(id: value.id, comparison: FTAG.comparison(value.envelope, using: crypto), pages: value.identity.pageCount,
+              bytes: value.envelope.count, protection: value.mode == .code ? .code : .recipient,
+              recipientComparison: recipientComparison, hasTransferCode: value.hasTransferCode, isReplay: isReplay)
     }
-    func saveEncryptedFile(to url: URL) throws {
-        guard let exportedEnvelope else { throw FTError.stale }
-        try save(exportedEnvelope, to: url)
+    func beginPlayback(exportID: UUID, rate: Int, repairPage: Int?) throws -> OpticalExportSession.Playback {
+        guard var active = transfer, active.id == exportID else { throw FTError.stale }
+        let lease = try active.beginPlayback(symbolsPerSecond: rate, repairPage: repairPage)
+        transfer = active
+        return lease
+    }
+    func next(exportID: UUID, playback: OpticalExportSession.Playback, rate: Int, repairPage: Int?) throws -> OpticalExportSession.Frame {
+        guard var active = transfer, active.id == exportID else { throw FTError.stale }
+        try active.updatePlayback(playback, symbolsPerSecond: rate, repairPage: repairPage)
+        let frame = try active.next(playback, using: crypto)
+        transfer = active
+        return frame
+    }
+    func pausePlayback(exportID: UUID, playback: OpticalExportSession.Playback) {
+        guard var active = transfer, active.id == exportID else { return }
+        active.pause(playback); transfer = active
+    }
+    func revealTransferCode(exportID: UUID) throws -> (code: String, frame: String) {
+        guard var active = transfer, active.id == exportID else { throw FTError.stale }
+        let code = try active.revealTransferCode(using: crypto)
+        transfer = active
+        return (code, TransferCodeFrame.text(envelopeDigest: active.identity.envelopeDigest, code: code))
+    }
+    func encryptedEnvelope(exportID: UUID) throws -> Data {
+        guard let transfer, transfer.id == exportID else { throw FTError.stale }
+        return transfer.envelope
+    }
+    func saveEncryptedFile(exportID: UUID, to url: URL) throws {
+        try save(encryptedEnvelope(exportID: exportID), to: url)
     }
     func savePublicWorkspace(to url: URL) throws -> String {
         guard let selection else { throw FTError.stale }
@@ -457,16 +476,16 @@ private final class MacExportModel {
     var sshSearch = ""
     var sourceSheet: ExportSourceSheet?
     var keyUnlockRequest: SourceKeyUnlockRequest?
-    var prepared: MacExportEngine.Prepared? { didSet { listenForArrival() } }
-    /// The phone said this transfer arrived; the animation has stopped.
-    private(set) var arrived = false
+    var prepared: MacExportEngine.Prepared?
+    private(set) var revealedTransferCode: String?
+    private(set) var revealedCodeSymbol: QRCodeSymbol?
     var symbol: QRCodeSymbol?
     var message: String?
     var busy = false
     var playing = false
     var emitted = 0
-    var rate = 5
-    var repairPage = -1
+    private(set) var rate = 5
+    private(set) var repairPage = -1
     var approveSelectedKeys = false
     private(set) var protection = ExportProtection.code
     private(set) var recipientRequest: RecipientRequest?
@@ -491,18 +510,10 @@ private final class MacExportModel {
     @ObservationIgnored private var sshSelectionID: UUID?
     @ObservationIgnored private var loadedAtLaunch = false
     @ObservationIgnored private var playWhenPrepared = false
-    @ObservationIgnored private var arrivalListener: TransferCompletionListener?
-
-    /// Each prepared transfer listens for its own arrival, and only while it
-    /// is the one on screen (see TransferCompletion).
-    private func listenForArrival() {
-        arrivalListener?.stop(); arrivalListener = nil; arrived = false
-        guard let arrival = prepared?.arrival else { return }
-        arrivalListener = TransferCompletionListener(arrival: arrival) { [weak self] in
-            guard let self, self.prepared?.arrival == arrival else { return }
-            self.arrived = true; self.pause()
-        }
-    }
+    @ObservationIgnored private var playbackSettings = UUID()
+    @ObservationIgnored private var codeRevealEpoch = UUID()
+    @ObservationIgnored private var sessionActive = true
+    @ObservationIgnored private var screensAwake = true
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
     var recipientConfirmed: Bool {
@@ -665,6 +676,23 @@ private final class MacExportModel {
             apply(result)
         }
     }
+    func chooseEncryptedTransfer() {
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan()
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.data]
+        panel.message = "Choose a local .ftairgap file to replay or repair its encrypted QR transfer. Its original code or matching iPhone request key is still required."
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
+        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
+        perform { [self] operation in
+            let result = try await engine.openEncryptedTransfer(url)
+            try requireCurrentWork(operation)
+            guard foreground else { await engine.invalidateExport(); throw CancellationError() }
+            clearVisibleMaterial()
+            prepared = result
+            message = "Encrypted transfer opened. Playback and repair reuse these exact saved bytes. Verify its comparison value on the iPhone before restoring."
+        }
+    }
     func chooseSSHConfiguration() {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan()
@@ -819,7 +847,11 @@ private final class MacExportModel {
                 if playWhenPrepared {
                     playWhenPrepared = false
                     // After this work settles (busy clears), not inside it.
-                    Task { @MainActor [weak self] in self?.play() }
+                    let exportID = result.id, presentation = generation
+                    Task { @MainActor [weak self] in
+                        guard let self, self.prepared?.id == exportID, self.generation == presentation else { return }
+                        self.play()
+                    }
                 }
             } catch let error as FTError where mode == .recipient && error == .authentication {
                 guard !Task.isCancelled, workOperationID == operation, foreground, generation == token else {
@@ -853,39 +885,75 @@ private final class MacExportModel {
             }
         }
     }
-    /// Plays while the window is open, focused or not: the person is looking
-    /// at their phone, and often clicked another window to get there.
+    func selectRate(_ value: Int) {
+        guard !busy, [3, 5, 10].contains(value), value != rate else { return }
+        rate = value; playbackSettings = UUID()
+    }
+    func selectRepairPage(_ value: Int) {
+        guard !busy, let prepared, value == -1 || (0..<prepared.pages).contains(value), value != repairPage else { return }
+        repairPage = value; playbackSettings = UUID()
+    }
+    func revealTransferCode() {
+        guard !busy, foreground, let prepared, prepared.hasTransferCode else { return }
+        pause()
+        let token = codeRevealEpoch, exportID = prepared.id
+        perform { [self] operation in
+            let revealed = try await engine.revealTransferCode(exportID: exportID)
+            try requireCurrentWork(operation)
+            let image = try await renderer.codeSymbol(text: revealed.frame)
+            try requireCurrentWork(operation)
+            guard foreground, sessionActive, screensAwake, codeRevealEpoch == token,
+                  self.prepared?.id == exportID else { throw CancellationError() }
+            revealedTransferCode = revealed.code; revealedCodeSymbol = image
+        }
+    }
+    func hideTransferCode() {
+        codeRevealEpoch = UUID(); revealedTransferCode = nil; revealedCodeSymbol = nil
+    }
+    /// Regular playback contains only encrypted FTQR1 data. A generated code
+    /// is revealed separately while this surface is paused and covered.
     func play() {
-        guard !busy, prepared != nil, windowOpen, !arrived else { return }
+        guard !busy, !playing, let prepared, windowOpen, sessionActive, screensAwake else { return }
+        let prior = playback
         pause(); playing = true
-        let token = generation
+        let token = generation, exportID = prepared.id, engine = self.engine
         awake = ProcessInfo.processInfo.beginActivity(options: [.idleDisplaySleepDisabled], reason: "Display encrypted workspace QR transfer")
         playback = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self, self.playing, self.generation == token, self.windowOpen else { break }
+            await prior?.value
+            guard !Task.isCancelled, let self, self.playing, self.generation == token,
+                  self.windowOpen, self.prepared?.id == exportID else { return }
+            do {
+                let lease = try await engine.beginPlayback(exportID: exportID, rate: self.rate,
+                    repairPage: self.repairPage < 0 ? nil : self.repairPage)
                 do {
-                    // Every sixth symbol carries the unlock code, so a phone
-                    // that collects the pages has the code too.
-                    let image: QRCodeSymbol
-                    if let frame = self.prepared?.codeFrame, self.emitted % 6 == 5 {
-                        image = try await self.renderer.codeSymbol(text: frame)
-                    } else {
-                        let text = try await self.engine.next(repairPage: self.repairPage < 0 ? nil : self.repairPage)
-                        image = try await self.renderer.symbol(text: text)
+                    while !Task.isCancelled {
+                        guard self.playing, self.generation == token, self.windowOpen,
+                              self.prepared?.id == exportID else { break }
+                        let settings = self.playbackSettings
+                        let frame = try await engine.next(exportID: exportID, playback: lease, rate: self.rate,
+                            repairPage: self.repairPage < 0 ? nil : self.repairPage)
+                        let image = try await self.renderer.symbol(text: frame.text)
+                        guard !Task.isCancelled, self.playing, self.generation == token, self.windowOpen,
+                              self.prepared?.id == exportID else { break }
+                        guard settings == self.playbackSettings else { continue }
+                        self.symbol = image; self.emitted += 1
+                        try await Task.sleep(for: .milliseconds(1000 / frame.symbolsPerSecond))
                     }
-                    guard !Task.isCancelled, self.playing, self.generation == token, self.windowOpen else { break }
-                    self.symbol = image; self.emitted += 1
-                    try await Task.sleep(for: .milliseconds(1000 / self.rate))
-                } catch is CancellationError { break }
-                catch {
-                    guard !Task.isCancelled, self.generation == token, self.windowOpen else { break }
-                    self.pause(); self.report(error); break
+                } catch {
+                    if !Task.isCancelled, self.generation == token, self.windowOpen {
+                        self.pause(); self.report(error)
+                    }
+                }
+                await engine.pausePlayback(exportID: exportID, playback: lease)
+            } catch {
+                if !Task.isCancelled, self.generation == token, self.windowOpen {
+                    self.pause(); self.report(error)
                 }
             }
         }
     }
     func pause() {
-        generation = UUID(); playback?.cancel(); playback = nil; playing = false; symbol = nil
+        generation = UUID(); playback?.cancel(); playing = false; symbol = nil; hideTransferCode()
         if let awake { ProcessInfo.processInfo.endActivity(awake); self.awake = nil }
     }
     /// Done sending: the window goes back to the machines.
@@ -902,11 +970,21 @@ private final class MacExportModel {
             loadThisMac()
         }
     }
+    func setSessionActive(_ value: Bool) {
+        sessionActive = value
+        if !value { pause() }
+    }
+    func setScreensAwake(_ value: Bool) {
+        screensAwake = value
+        if !value { pause() }
+    }
     func setForeground(_ value: Bool) {
         foreground = value && windowOpen
         if !foreground {
-            // The animation keeps playing (see play()); the camera and key
-            // prompts belong to the focused window only.
+            // A generated code belongs to the focused window. Ciphertext may
+            // continue playing while the user looks at the phone; display sleep,
+            // session lock and window closure pause it explicitly.
+            hideTransferCode()
             cancelRecipientScan()
             if let token = sourceKeyOperation {
                 work?.cancel(); retireSourceKeyPrompt()
@@ -917,16 +995,19 @@ private final class MacExportModel {
         }
     }
     func saveEncryptedFile() {
-        guard !busy, prepared != nil else { return }
+        guard !busy, let prepared else { return }
+        let resume = playing, exportID = prepared.id
         pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Workspace.ftairgap"
-        let recipientOnly = prepared?.protection == .recipient
+        let recipientOnly = prepared.protection == .recipient
         panel.message = recipientOnly
             ? "Save encrypted bytes for the confirmed iPhone. This file will not open after the phone loses its active request key. Choose a new filename."
             : "Save encrypted bytes only. Keep the separately revealed transfer code in a different place. Choose a new filename."
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
-        perform(resumingPlayback: true) { [self] operation in
-            try await engine.saveEncryptedFile(to: url)
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else {
+            if resume { play() }; return
+        }
+        perform(resumingPlayback: resume) { [self] operation in
+            try await engine.saveEncryptedFile(exportID: exportID, to: url)
             try requireCurrentWork(operation)
             message = recipientOnly
                 ? "Encrypted workspace saved for the confirmed iPhone. Its active request key is required; this file is not an independent recovery backup."
@@ -947,17 +1028,20 @@ private final class MacExportModel {
         }
     }
     func saveAnimation() {
-        guard !busy, prepared != nil else { return }
+        guard !busy, let prepared else { return }
+        let resume = playing, exportID = prepared.id
         pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-QR.apng"
         panel.allowedContentTypes = [.png]; panel.allowsOtherFileTypes = true
-        let recipientOnly = prepared?.protection == .recipient
+        let recipientOnly = prepared.protection == .recipient
         panel.message = "Save a lossless animated PNG. Every encoded frame is checked before the final file is published. Choose a new filename."
             + (recipientOnly ? " The confirmed iPhone must retain its active request key; this is not an independent recovery backup." : " Keep its transfer code separate.")
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else {
+            if resume { play() }; return
+        }
         let speed = rate
-        perform(resumingPlayback: true) { [self] operation in
-            let bytes = try await engine.encryptedEnvelope()
+        perform(resumingPlayback: resume) { [self] operation in
+            let bytes = try await engine.encryptedEnvelope(exportID: exportID)
             try requireCurrentWork(operation)
             let count = try await renderer.saveAnimation(envelope: bytes, to: url, symbolsPerSecond: speed)
             try requireCurrentWork(operation)
@@ -966,17 +1050,20 @@ private final class MacExportModel {
         }
     }
     func saveVideo() {
-        guard !busy, prepared != nil else { return }
+        guard !busy, let prepared else { return }
+        let resume = playing, exportID = prepared.id
         pause()
         let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-QR.mp4"
         panel.allowedContentTypes = [.mpeg4Movie]
-        let recipientOnly = prepared?.protection == .recipient
+        let recipientOnly = prepared.protection == .recipient
         panel.message = "Save an encrypted QR video. Every decoded frame and the reconstructed package must pass verification before the new file is published."
             + (recipientOnly ? " The confirmed iPhone must retain its active request key; this is not an independent recovery backup." : " Keep its transfer code separate.")
-        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { play(); return }
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else {
+            if resume { play() }; return
+        }
         let speed = rate
-        perform(resumingPlayback: true) { [self] operation in
-            let bytes = try await engine.encryptedEnvelope()
+        perform(resumingPlayback: resume) { [self] operation in
+            let bytes = try await engine.encryptedEnvelope(exportID: exportID)
             try requireCurrentWork(operation)
             let source = try OpticalVideoSource(envelope: bytes)
             let receipt = try await videoRenderer.save(source: source, to: url, symbolsPerSecond: speed)
@@ -1098,6 +1185,7 @@ private struct MacExportView: View {
                                 Button("Reload This Mac's Machines") { model.loadThisMac() }
                                 Button("Import SSH Config…") { model.chooseSSHConfiguration() }
                                 Button("Open Workspace…") { model.chooseWorkspace() }
+                                Button("Open Encrypted Transfer…") { model.chooseEncryptedTransfer() }
                             }.fixedSize().disabled(model.busy)
                         }
                         if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
@@ -1123,52 +1211,134 @@ private struct MacExportView: View {
                 }.onDisappear { model.sourceSheetDismissed(sheet) }
             }
             .onAppear { model.openExport(isActive: scenePhase == .active) }
-            .onChange(of: scenePhase, initial: true) { _, phase in model.setForeground(phase == .active) }
+            .onChange(of: scenePhase, initial: true) { _, phase in
+                model.setForeground(phase == .active)
+                if phase == .background { model.pause() }
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)
+                .receive(on: RunLoop.main)) { _ in model.setSessionActive(false) }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidBecomeActiveNotification)
+                .receive(on: RunLoop.main)) { _ in model.setSessionActive(true) }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
+                .receive(on: RunLoop.main)) { _ in model.setScreensAwake(false) }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
+                .receive(on: RunLoop.main)) { _ in model.setScreensAwake(true) }
             .onDisappear { model.closeExport() }
     }
 
-    /// While sending, the window is the animation: nothing to read, choose or
-    /// type. When the phone says it has everything, the window says so.
+    /// The sender knows only what it displays. Completion stays a deliberate
+    /// user action; this offline screen never starts network discovery.
     private var sending: some View {
-        VStack(spacing: 18) {
-            if model.arrived {
-                Spacer()
-                Image(systemName: "checkmark.circle.fill").font(.system(size: 96)).foregroundStyle(.green)
-                    .symbolEffect(.bounce, value: model.arrived)
-                Text("Your iPhone has your machines").font(.largeTitle.bold())
-                Text("You can close this window.").font(.title3).foregroundStyle(.secondary)
-                Spacer()
-            } else {
-                Text("Point your iPhone's camera at this").font(.largeTitle.bold())
-                Text("In FrankenTerm on the iPhone, tap Scan My Mac.").font(.title3).foregroundStyle(.secondary)
-                ZStack {
-                    RoundedRectangle(cornerRadius: 20).fill(.white)
-                    if let symbol = model.symbol {
-                        PixelPerfectQRCode(symbol: symbol).padding(20)
-                    } else {
-                        ProgressView().controlSize(.large)
+        Group {
+            if let prepared = model.prepared {
+                VStack(spacing: 14) {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(prepared.isReplay ? "Replay encrypted transfer" : "Send to your iPhone").font(.title.bold())
+                            Text("Package prepared · \(ByteCountFormatter.string(fromByteCount: Int64(prepared.bytes), countStyle: .file)) · \(prepared.pages) pages")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Done") { model.stopSending() }.disabled(model.busy)
                     }
-                }.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if let code = model.revealedTransferCode, let image = model.revealedCodeSymbol {
+                        transferCodeCard(code, symbol: image)
+                    } else {
+                        ZStack {
+                            Rectangle().fill(.white)
+                            if let symbol = model.symbol {
+                                PixelPerfectQRCode(symbol: symbol).padding(20)
+                            } else {
+                                VStack(spacing: 12) {
+                                    Image(systemName: "pause.circle").font(.system(size: 48))
+                                    Text(model.busy ? "Preparing your transfer…" : "Playback paused").font(.title3)
+                                    Text("Resume to display encrypted QR frames.").font(.callout)
+                                }.foregroundStyle(.black)
+                            }
+                        }.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    HStack {
+                        Button(model.playing ? "Pause" : "Resume Playback") {
+                            if model.playing { model.pause() } else { model.play() }
+                        }.buttonStyle(.borderedProminent)
+                        if prepared.hasTransferCode {
+                            Button(model.revealedTransferCode == nil ? "Show Transfer Code" : "Hide Transfer Code") {
+                                if model.revealedTransferCode == nil { model.revealTransferCode() }
+                                else { model.hideTransferCode() }
+                            }
+                        }
+                        Spacer()
+                        Text("\(model.emitted) symbols displayed").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    }.disabled(model.busy)
+                    HStack(spacing: 24) {
+                        Picker("Speed", selection: Binding(get: { model.rate }, set: { model.selectRate($0) })) {
+                            Text("3 / sec").tag(3); Text("5 / sec").tag(5); Text("10 / sec").tag(10)
+                        }.pickerStyle(.segmented).frame(maxWidth: 300)
+                        Picker("Repair page", selection: Binding(get: { model.repairPage }, set: { model.selectRepairPage($0) })) {
+                            Text("All pages").tag(-1)
+                            ForEach(0..<prepared.pages, id: \.self) { page in Text("Page \(page + 1)").tag(page) }
+                        }.frame(maxWidth: 220)
+                        Spacer(minLength: 0)
+                    }.disabled(model.busy)
+                    VStack(spacing: 4) {
+                        Text("In FrankenTerm on the iPhone, choose Scan My Mac. Keep scanning until the phone has the complete transfer.")
+                        if prepared.protection == .code {
+                            Text(prepared.hasTransferCode
+                                ? "Then choose Show Transfer Code and scan or enter it on the phone. The code is never part of playback or a saved recording."
+                                : "Enter the original transfer code on the phone. An encrypted file cannot recover a lost code.")
+                        } else {
+                            Text("The iPhone must still hold the matching Only This Phone request key.")
+                        }
+                        Text(verbatim: "Compare on your iPhone: \(prepared.comparison)")
+                            .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                        Text("Waiting for you to finish on the phone").foregroundStyle(.secondary)
+                    }.font(.caption).multilineTextAlignment(.center)
+                    backupControls(prepared)
+                    if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
+                    if model.busy {
+                        HStack { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
+                    }
+                }.padding(24)
             }
-            if let message = model.message { Text(verbatim: message).font(.callout).foregroundStyle(.red) }
-            HStack {
-                Spacer()
-                Button("Done") { model.stopSending() }.controlSize(.large).keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent).tint(model.arrived ? .green : .accentColor)
-                Spacer()
-            }.overlay(alignment: .trailing) {
-                // Recordings and files carry no code, so only a transfer
-                // encrypted for one phone can be opened from them.
-                if model.prepared?.protection == .recipient, !model.arrived {
-                    Menu {
-                        Button("Save Encrypted File…") { model.saveEncryptedFile() }
-                        Button("Save as MP4 Video…") { model.saveVideo() }
-                        Button("Save as QR Animation…") { model.saveAnimation() }
-                    } label: { Image(systemName: "ellipsis.circle") }
-                        .menuStyle(.borderlessButton).fixedSize().disabled(model.busy)
-                }
+        }
+    }
+
+    private func transferCodeCard(_ code: String, symbol: QRCodeSymbol) -> some View {
+        VStack(spacing: 16) {
+            Label("Private transfer code", systemImage: "key.fill").font(.title2.bold())
+            HStack(spacing: 24) {
+                PixelPerfectQRCode(symbol: symbol).aspectRatio(1, contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .privacySensitive().accessibilityLabel("Private transfer code QR")
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(verbatim: code).font(.system(.title2, design: .monospaced)).textSelection(.enabled)
+                        .privacySensitive().accessibilityLabel("Private transfer code").accessibilityValue(code)
+                    Text("Scan this separate QR or enter the code on your iPhone. Keep a separate copy if you save a backup; closing this export releases the code held by this app.")
+                }.frame(maxWidth: 240)
             }
-        }.padding(28).animation(.smooth, value: model.arrived)
+            Text("QR playback is paused and covered. A recording of both this code and the animation can unlock the transfer.")
+                .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func backupControls(_ prepared: MacExportEngine.Prepared) -> some View {
+        DisclosureGroup("Save an encrypted backup") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(prepared.protection == .code
+                    ? "Save the transfer code separately from these files. The same encrypted package can be restored from a file or a QR recording."
+                    : "These files work only while the original iPhone request key remains available. For an independent recovery backup, prepare a new transfer using Generated Transfer Code.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Encrypted File…") { model.saveEncryptedFile() }
+                    Button("MP4 Video…") { model.saveVideo() }
+                    Button("QR Animation…") { model.saveAnimation() }
+                }.disabled(model.busy)
+                Text("Saved recordings contain every planned source symbol and a finite repair set. For fresh repair symbols later, reopen the encrypted .ftairgap file on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.top, 8)
+        }
     }
 
     private func recipientCamera(scanID: UUID) -> some View {

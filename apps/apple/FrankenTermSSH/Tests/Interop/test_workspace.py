@@ -17,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, ec
+from cryptography.hazmat.primitives.asymmetric import ed25519, ec, rsa
 
 NATIVE_LIBRARY, TEST_BUNDLE = sys.argv[1:3]
 PROBE = sys.argv[3] if len(sys.argv) > 3 else None
@@ -68,6 +68,63 @@ class WorkspaceInteropTests(unittest.TestCase):
                         self.assertEqual(server.received, b"")
                 finally:
                     server.close()
+
+    def run_host_mode(self, mode, host_key=None, host_signature=None):
+        key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        server = fixture.LoopbackServer(key, host_key=host_key, host_signature=host_signature)
+        try:
+            environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(server.address[1]),
+                               FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(server.host_blob).decode(),
+                               FT_WORKSPACE_SSH_TEST_MODE=mode)
+            if host_signature is None:
+                environment.pop("FT_WORKSPACE_SSH_TEST_HOST_SIGNATURE", None)
+            else:
+                environment["FT_WORKSPACE_SSH_TEST_HOST_SIGNATURE"] = host_signature
+            result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=20)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output[-16000:])
+            self.assertIn("Executed 1 test", output)
+            self.assertNotIn("skipped", output.lower())
+            authentication = [event for event in server.events if event[0] == "authentication"]
+            side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
+            expected_authentication = [0, 1] if mode in ["rsa-success", "mux-owner-auth"] else []
+            self.assertEqual([event[1] for event in authentication], expected_authentication)
+            self.assertEqual([event[3] for event in authentication],
+                             [fixture.public_blob(key)] * len(expected_authentication))
+            self.assertEqual(side_effects, ["channel", "pty", "shell"] if mode == "rsa-success" else [])
+            self.assertEqual(server.received,
+                             "Imported key → real SSH.\rEND-SESSION\r".encode() if mode == "rsa-success" else b"")
+            self.assertEqual(server.accepted_connections, 0 if mode == "mux-revoked" else 1)
+        finally:
+            server.close()
+
+    def test_rsa_hosts_use_each_sha2_signature_and_open_a_real_terminal(self):
+        for bits, algorithm in [(2048, "rsa-sha2-256"), (4096, "rsa-sha2-512")]:
+            with self.subTest(bits=bits, algorithm=algorithm):
+                host = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+                self.run_host_mode("rsa-success", host, algorithm)
+
+    def test_wrong_or_revoked_rsa_host_pin_prevents_every_key_offer(self):
+        host = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        for mode in ["rsa-wrong-host", "rsa-revoked"]:
+            with self.subTest(mode=mode):
+                self.run_host_mode(mode, host, "rsa-sha2-512")
+
+    def test_rsa_sha1_only_server_cannot_trigger_authentication_or_fallback(self):
+        host = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.run_host_mode("rsa-sha1-only", host, "ssh-rsa")
+
+    def test_rsa_route_diagnosis_verifies_sha2_host_without_offering_a_key(self):
+        host = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
+            with self.subTest(algorithm=algorithm):
+                self.run_host_mode("rsa-probe", host, algorithm)
+
+    def test_explicit_mux_route_authenticates_without_opening_a_terminal(self):
+        self.run_host_mode("mux-owner-auth")
+
+    def test_revoked_explicit_mux_route_is_denied_before_networking(self):
+        self.run_host_mode("mux-revoked")
 
 
 class ObservedServerEvents(list):
