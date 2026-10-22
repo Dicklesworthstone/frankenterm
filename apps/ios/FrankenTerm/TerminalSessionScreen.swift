@@ -58,6 +58,7 @@ final class MobileConnections {
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
     var mux = false
+    var sessionCreation: TerminalSessionCreation = .onSelect
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -158,6 +159,9 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
 /// Detachment must succeed before the source and its canonical model retire.
 @MainActor
 protocol TerminalSessionFocus: AnyObject {
+    /// Existing sessions may keep running while iOS permits it; starting a
+    /// remote terminal requires the owning scene's current foreground admission.
+    var permitsTerminalCreation: Bool { get }
     /// Whether this machine is the one on screen now; a session connecting in
     /// the background waits to attach its view until it is.
     func shows(machineID: String) -> Bool
@@ -177,7 +181,7 @@ protocol TerminalSessionFocus: AnyObject {
 @Observable
 final class TerminalSessionController {
     enum Phase: Equatable {
-        case idle, connecting, live
+        case idle, connecting, ready, live
         /// No route reached a signed-in connection, so no shell started and
         /// nothing was sent.
         case couldNotConnect(WorkspaceConnectionHelp)
@@ -223,6 +227,9 @@ final class TerminalSessionController {
     @ObservationIgnored private weak var focus: (any TerminalSessionFocus)?
     @ObservationIgnored private var attached = false
     @ObservationIgnored private var startup: Task<Void, Never>?
+    @ObservationIgnored private var startupID: UUID?
+    @ObservationIgnored private var terminalRequested = false
+    @ObservationIgnored private var explicitTerminalRequested = false
     @ObservationIgnored private var run: Task<TerminalSessionEnd, Error>?
     @ObservationIgnored private var runObserver: Task<Void, Never>?
     @ObservationIgnored private var cleanup: (id: UUID, task: Task<Void, Never>)?
@@ -528,16 +535,59 @@ final class TerminalSessionController {
         } catch { keyboard.suspend(); fail(Self.describe(error)) }
     }
 
-    /// The retained startup task owns partially constructed resources. Teardown
-    /// cancels and joins it; a late connection/view cannot outlive a settled UI.
-    func start() async {
+    /// Authentication and terminal creation are separate admissions. A group
+    /// can prepare an authenticated connection without creating a remote shell
+    /// or running the mux command. Selection is checked again after prompts.
+    func start(openTerminal: Bool = true) async {
+        terminalRequested = terminalRequested || openTerminal
         guard phase == .idle, !stopped else { return }
+        await startOwnedOperation()
+    }
+
+    /// A committed selection requests on-select/existing-only activation; the
+    /// explicit Open Terminal action also authorizes a manual route. Requests
+    /// arriving while authentication is suspended share its existing owner.
+    func activateTerminal(explicit: Bool = false) async {
+        guard !stopped else { return }
+        terminalRequested = true
+        explicitTerminalRequested = explicitTerminalRequested || explicit
+        if phase == .idle { await start(); return }
+        if let startup { await startup.value }
+        guard !stopped, phase == .ready, shouldOpenTerminal else { return }
+        await startOwnedOperation()
+    }
+
+    /// The app actually entered the background while remote creation was in
+    /// flight. Join the same operation through normal cleanup; a potentially
+    /// sent request keeps its journal evidence and is never silently retried.
+    /// Authentication prompts and already-live sessions have separate owners.
+    func suspendPendingTerminalCreation() {
+        guard phase == .connecting, connection != nil, terminalRequested else { return }
+        startup?.cancel()
+    }
+
+    private var shouldOpenTerminal: Bool {
+        guard focus?.permitsTerminalCreation == true, terminalRequested,
+              route.sessionCreation.permitsOpening(explicit: explicitTerminalRequested) else { return false }
+        return explicitTerminalRequested || focus?.shows(machineID: target.machineID) == true
+    }
+
+    /// Each operation retains all partially constructed resources. Teardown
+    /// cancels and joins it; a late connection/view cannot outlive a settled UI.
+    private func startOwnedOperation() async {
         phase = .connecting
+        let id = UUID()
+        startupID = id
         let job = Task { await self.performStart() }
         startup = job
         await withTaskCancellationHandler { await job.value } onCancel: { job.cancel() }
+        // A Ready activation can resume first and reserve a newer operation
+        // while this completed authentication wrapper is still suspended.
+        // Its connecting phase belongs to that new owner, not failed startup.
+        guard startupID == id else { return }
+        startup = nil; startupID = nil
         if Task.isCancelled { requestStop() }
-        if stopped || phase != .live { await teardown() }
+        if stopped || (phase != .live && phase != .ready) { await teardown() }
     }
 
     private func checkStarting() throws {
@@ -550,13 +600,22 @@ final class TerminalSessionController {
     private func performStart() async {
         do {
             try checkStarting()
-            var attempt = try await connectAcknowledgingEarlierSessions()
+            let prepared: WorkspaceSSHConnection
+            if let connection { prepared = connection }
+            else if shouldOpenTerminal { prepared = try await connectAcknowledgingEarlierSessions() }
+            else { prepared = try await connectFirstReachable() }
+            var attempt = prepared
             self.connection = attempt
             try checkStarting()
+            guard shouldOpenTerminal else { phase = .ready; return }
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
             let pump: TerminalSessionPump
             do { pump = try await attempt.openTerminal(geometry: geometry) }
             catch let failure as TerminalMuxError {
+                // An existing-only mux route never grants permission to create
+                // a shell on another route. Opportunistic mux discovery on a
+                // direct SSH route retains that route's creation policy.
+                guard !route.mux else { throw failure }
                 // No mux answered, it speaks a protocol this app does not (a
                 // newer desktop's), or it has no panes: the machine gets a
                 // shell of its own instead, as before there was a mux.
@@ -570,6 +629,7 @@ final class TerminalSessionController {
                 attempt = try await connectAcknowledgingEarlierSessions()
                 self.connection = attempt
                 try checkStarting()
+                guard shouldOpenTerminal else { phase = .ready; return }
                 pump = try await attempt.openTerminal(geometry: geometry)
             }
             let connection = attempt
@@ -987,7 +1047,7 @@ final class TerminalSessionController {
 
     /// Synchronous disappearance/close barrier, before SwiftUI schedules cleanup.
     func requestStop() {
-        if !stopped, phase == .connecting || phase == .live {
+        if !stopped, phase == .connecting || phase == .ready || phase == .live {
             phase = .ended(Self.describe(TerminalSessionEnd.cancelled))
         }
         stopped = true

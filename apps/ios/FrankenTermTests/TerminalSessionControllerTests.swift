@@ -51,7 +51,8 @@ private final class SceneMemorySigner: WorkspaceSSHSigning, @unchecked Sendable 
 
 @MainActor
 final class TerminalSessionControllerTests: XCTestCase {
-    private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String) throws -> WorkspaceDocument {
+    private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
+                          creation: TerminalSessionCreation = .onSelect) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
             "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF",
@@ -62,7 +63,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["alpha", "beta"]]],
             "machines": ["alpha", "beta"].map { ["id": $0, "name": $0.capitalized, "theme_ref": "theme", "route_refs": ["route-\($0)"],
                                                  "preferred_route_ref": "route-\($0)", "auto_connect": false] as [String: Any] },
-            "routes": ["alpha", "beta"].map { ["id": "route-\($0)", "mode": "direct_ssh", "session_creation": "on_select",
+            "routes": ["alpha", "beta"].map { ["id": "route-\($0)", "mode": "direct_ssh", "session_creation": creation.rawValue,
                                                "host": "127.0.0.1", "port": Int(port), "user": user, "credential_refs": ["key"],
                                                "authentication_methods": ["publickey"], "host_trust_ref": "trust",
                                                "jump_routes": []] as [String: Any] },
@@ -81,7 +82,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let connections: MobileConnections, scene: WorkspaceTerminalScene, outPath: String
     }
 
-    private func liveScene(liveness: WorkspaceSSHLiveness = .standard) async throws -> LiveScene {
+    private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
+                           creation: TerminalSessionCreation = .onSelect) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -92,7 +94,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let crypto = AppleCryptography()
         let key = try PrivateKeyRecord.fromPEM(pem, credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
-        let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user),
+        let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user, creation: creation),
                                         keys: [key], using: crypto)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-" + UUID().uuidString)
         let vault = SceneMemoryVault()
@@ -107,7 +109,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized,
-                routes: [.init(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port)]),
+                routes: [.init(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port,
+                               sessionCreation: creation)]),
                 unavailable: "", theme: nil)
         }
         let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision, workspaceName: "Scene",
@@ -117,16 +120,100 @@ final class TerminalSessionControllerTests: XCTestCase {
         return LiveScene(connections: connections, scene: scene, outPath: outPath)
     }
 
-    /// Connects a machine through the scene and waits for its session to settle
-    /// into a phase other than connecting.
+    /// Existing display/input tests deliberately create a terminal, including
+    /// offscreen terminals. Mere background authentication is tested separately.
     @discardableResult
     private func connect(_ scene: WorkspaceTerminalScene, _ machine: String) async throws -> TerminalSessionController {
-        scene.connect(machine)
+        scene.openTerminal(machine)
         let session = try XCTUnwrap(scene.sessions[machine])
         for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
             try await Task.sleep(for: .milliseconds(50))
         }
         return session
+    }
+
+    func testPreparedBackgroundConnectionOpensOnlyAfterCommittedSelection() async throws {
+        let live = try await liveScene(), scene = live.scene
+        scene.connect("beta")
+        let session = try XCTUnwrap(scene.sessions["beta"])
+        for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(session.phase, .ready)
+        XCTAssertNil(session.terminal)
+        let prepared = await live.connections.manager.connections()
+        XCTAssertEqual(prepared.count, 1)
+        let before = try await live.connections.journal.records()
+        XCTAssertTrue(before.isEmpty, "preparing a connection creates no terminal epoch")
+        let accounting = await live.connections.coordinator.accounting()
+        XCTAssertEqual(accounting.connections, 0, "authentication does not publish a terminal source")
+
+        scene.select("beta")
+        for _ in 0..<400 where session.phase != .live || session.terminal == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(scene.sessions["beta"] === session)
+        XCTAssertEqual(session.phase, .live)
+        let opened = await live.connections.manager.connections()
+        XCTAssertEqual(opened.count, 1)
+        if !session.shellOnly {
+            XCTAssertEqual(opened.map(\.id), prepared.map(\.id), "selection uses the authenticated owner")
+        }
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo PREPARED-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "PREPARED-42")
+        XCTAssertTrue(output.contains("PREPARED-42"))
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    func testManualConnectionNeedsExplicitTerminalActionAndCoalescesRepeatedActivation() async throws {
+        let live = try await liveScene(creation: .manual), scene = live.scene
+        scene.connect("alpha")
+        let session = try XCTUnwrap(scene.sessions["alpha"])
+        for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(session.phase, .ready)
+        await session.activateTerminal()
+        XCTAssertEqual(session.phase, .ready, "selection does not upgrade a manual route")
+        scene.setForeground(false)
+        await session.activateTerminal(explicit: true)
+        XCTAssertEqual(session.phase, .ready, "even an explicit request waits for foreground admission")
+        let before = try await live.connections.journal.records()
+        XCTAssertTrue(before.isEmpty)
+        let prepared = await live.connections.manager.connections()
+        scene.setForeground(true)
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<16 { group.addTask { await session.activateTerminal(explicit: true) } }
+            await group.waitForAll()
+        }
+        XCTAssertEqual(session.phase, .live)
+        let opened = await live.connections.manager.connections()
+        XCTAssertEqual(opened.count, 1)
+        if !session.shellOnly { XCTAssertEqual(opened.map(\.id), prepared.map(\.id)) }
+        let records = try await live.connections.journal.records()
+        XCTAssertEqual(records.count, 1, "repeated actions open one terminal epoch")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    func testClosingPreparedConnectionRetiresItWithoutCreatingATerminal() async throws {
+        let live = try await liveScene(creation: .manual), scene = live.scene
+        scene.connect("alpha")
+        let session = try XCTUnwrap(scene.sessions["alpha"])
+        for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(session.phase, .ready)
+        await scene.close()
+        await session.activateTerminal(explicit: true)
+        await assertReleased(session, connections: live.connections)
+        let records = try await live.connections.journal.records()
+        let connections = await live.connections.manager.connections()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertTrue(connections.isEmpty)
     }
 
     /// Puts a live session's view in the key window (rendering and the caret

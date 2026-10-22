@@ -11,14 +11,14 @@ struct SceneMachine: Identifiable {
     let target: TerminalSessionTarget?
     let unavailable: String
     let theme: WorkspaceDocument.Theme?
+    var autoConnect = false
 }
 
-/// Keeps a live direct-SSH session for every machine of a workspace and gives
-/// the scene's single keyboard to exactly the selected machine. Every machine
-/// connects in the background as soon as the scene opens (the selected one
-/// first, two others at a time), its shell running and its output arriving
-/// before the user ever switches to it. Sessions outlive the screen: they run
-/// until the user disconnects them, and a dropped one reconnects by itself.
+/// Keeps the workspace's authenticated connections and terminals, giving its
+/// single keyboard to exactly the selected machine. Only the active group's
+/// opted-in machines prepare in the background. Selection may open a prepared
+/// on-select route; a manual route waits for Open Terminal. A lost terminal's
+/// replacement waits for New Session, even after bounded reauthentication.
 ///
 /// Every switch, from the machine strip, a menu, a two-finger swipe or a new
 /// connection, goes through Kit's navigation coordinator: the old source's
@@ -28,7 +28,7 @@ struct SceneMachine: Identifiable {
 @Observable
 final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// What a machine is doing, for its chip and card.
-    enum Status: Equatable { case live, connecting, attention, disconnected, unavailable }
+    enum Status: Equatable { case live, ready, connecting, attention, disconnected, unavailable }
 
     let workspaceID: UUID, revision: UUID
     let workspaceName: String
@@ -39,8 +39,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
     private(set) var problem: String?
-    /// Machines the user disconnected: they stay down until Connect.
-    private(set) var disconnected: Set<String> = []
+    /// One source of truth for imported opt-ins, explicit actions and losses.
+    private var connectionIntent: TerminalConnectionIntent
+    /// Machines the user disconnected: navigation never revives them.
+    var disconnected: Set<String> { connectionIntent.disconnected }
 
     @ObservationIgnored let connections: MobileConnections
     @ObservationIgnored let owner: TerminalKeyboardNavigationOwner
@@ -51,6 +53,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored private var foreground = true
     /// The terminal screen is showing; sessions run whether or not it is.
     @ObservationIgnored private var onScreen = false
+    /// A retained scene can reopen at another machine. Its previous selection
+    /// must not create a terminal before the requested focus handoff commits.
+    @ObservationIgnored private var appearanceSelection: String?
     /// Set by enteredBackground until the next activation.
     @ObservationIgnored private var inBackground = false
     @ObservationIgnored private var closing: Task<Void, Never>?
@@ -64,14 +69,28 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// One retained timer per machine. Cancelled timers stay owned until their
     /// callback joins; a ready timer stays queued behind normal attempt limits.
     @ObservationIgnored private var reconnectJobs: [String: ReconnectJob] = [:]
-    /// False keeps every machine down until connect() (the hosted tests
-    /// drive connections one at a time); the app connects them all.
+    private struct ControllerJob {
+        let id: UUID, controllerID: UUID
+        let task: Task<Void, Never>
+    }
+    /// Startup and Ready activation share one exact-controller owner. Phase
+    /// callbacks cannot start a second activation while its wrapper settles.
+    @ObservationIgnored private var controllerJobs: [String: ControllerJob] = [:]
+    /// A user retry may replace an ended owner once its cleanup has joined;
+    /// imported warm-up intent alone never restarts an authentication failure.
+    @ObservationIgnored private var requestedConnections: Set<String> = []
+    /// False disables group warming and automatic retries; explicit actions
+    /// still use the same bounded scheduler (also useful to hosted tests).
     @ObservationIgnored private let autoConnect: Bool
 
     init(workspaceID: UUID, revision: UUID, workspaceName: String, machines: [SceneMachine],
-         initialMachineID: String, connections: MobileConnections, autoConnect: Bool = true) throws {
+         initialMachineID: String, connections: MobileConnections,
+         initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true) throws {
         self.workspaceID = workspaceID; self.revision = revision; self.autoConnect = autoConnect
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
+        connectionIntent = try TerminalConnectionIntent(
+            machines: machines.map { .init(id: $0.id, autoConnect: $0.autoConnect) },
+            selectedMachineID: initialMachineID, group: autoConnect ? initialGroup : nil)
         themes = Dictionary(uniqueKeysWithValues: machines.compactMap { machine in machine.theme.map { (machine.id, $0) } })
         owner = try TerminalKeyboardNavigationOwner(coordinator: connections.coordinator, sceneID: UUID(),
                                                     workspaceID: workspaceID.uuidString, bindings: [])
@@ -88,25 +107,46 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func status(of machineID: String) -> Status {
         guard machines.first(where: { $0.id == machineID })?.target != nil else { return .unavailable }
         if disconnected.contains(machineID) { return .disconnected }
-        guard let session = sessions[machineID] else { return autoConnect ? .connecting : .disconnected }
+        guard let session = sessions[machineID] else {
+            return connectionIntent.shouldPrepare(machineID) ? .connecting : .disconnected
+        }
         switch session.phase {
         case .idle, .connecting: return .connecting
+        case .ready: return .ready
         case .live: return .live
         case .couldNotConnect: return .attention
         case .ended, .failed:
-            return session.dropped && reconnectPolicies[machineID, default: .init()].nextDelay != nil
+            return autoConnect && session.dropped && connectionIntent.permitsReconnect(machineID)
+                && reconnectPolicies[machineID, default: .init()].nextDelay != nil
                 ? .connecting : .attention
         }
     }
 
+    func requiresNewSession(_ machineID: String) -> Bool { connectionIntent.requiresNewSession.contains(machineID) }
+
     // MARK: Screen lifecycle
 
-    /// The terminal screen appeared, opening on `machineID`: show it, and make
-    /// sure every machine is connected or on its way.
-    func appear(selecting machineID: String, active: Bool) {
+    /// Opening a group's scene scopes new warm-up work. A deliberate Connect
+    /// link approves its selected machine, without upgrading a manual route.
+    func appear(selecting machineID: String, active: Bool,
+                group: TerminalConnectionIntent.Group? = nil, connectOnOpen: Bool = false) {
         guard !closed else { return }
+        do {
+            try connectionIntent.setGroup(autoConnect ? group : nil)
+            if connectOnOpen {
+                try connectionIntent.approveConnection(machineID)
+                if let session = sessions[machineID] {
+                    switch session.phase {
+                    case .ended, .failed, .couldNotConnect: requestedConnections.insert(machineID)
+                    case .idle, .connecting, .ready, .live: break
+                    }
+                } else { requestedConnections.insert(machineID) }
+                cancelReconnect(machineID)
+                reconnectPolicies[machineID, default: .init()].resetForUserRequest()
+            }
+        } catch { report(error); return }
+        appearanceSelection = machineID == selectedMachineID ? nil : machineID
         onScreen = true
-        disconnected.remove(machineID)
         setForeground(active)
         if machineID != selectedMachineID { select(machineID) }
         else if let session = selectedSession, session.phase == .live {
@@ -121,6 +161,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func disappear() {
         guard !closed else { return }
         onScreen = false
+        appearanceSelection = nil
         navigation.suspend()
         updatePresentationVisibility()
     }
@@ -142,11 +183,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         reconcile()
         // Back from turning Tailscale on: try the machine that needed it, once
         // the app's own resume has let connections through again.
-        if let id = selectedMachineID, needsTailscale(id), WorkspaceRouteNetwork.deviceTailnetAddress() != nil {
+        if let id = selectedMachineID, let controllerID = sessions[id]?.id,
+           needsTailscale(id), WorkspaceRouteNetwork.deviceTailnetAddress() != nil {
             let manager = connections.manager
             Task { [weak self] in
                 for _ in 0..<20 where await !manager.permitsConnections { try? await Task.sleep(for: .milliseconds(100)) }
-                guard let self, !self.closed, self.foreground, self.needsTailscale(id) else { return }
+                guard let self, !self.closed, self.foreground, self.sessions[id]?.id == controllerID,
+                      self.needsTailscale(id) else { return }
                 self.connect(id)
             }
         }
@@ -161,10 +204,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         // cannot observe a session must not count as a stable live interval.
         for id in Array(reconnectPolicies.keys) { reconnectPolicies[id]?.recordEnd() }
         cancelReconnects()
+        for controller in sessions.values { controller.suspendPendingTerminalCreation() }
     }
 
     private func needsTailscale(_ machineID: String) -> Bool {
-        guard case .couldNotConnect(let help) = sessions[machineID]?.phase else { return false }
+        guard !disconnected.contains(machineID),
+              case .couldNotConnect(let help) = sessions[machineID]?.phase else { return false }
         return help.remedy == .turnOnTailscale
     }
 
@@ -199,26 +244,51 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         select(ids[(index + (forward ? 1 : ids.count - 1)) % ids.count])
     }
 
-    /// Opens a session for a machine, replacing one that ended. Earlier
-    /// sessions' records are acknowledged as it starts.
+    /// Connect approves authentication and normal on-select behavior. It does
+    /// not grant a manual route, or a lost session, permission for a new PTY.
     func connect(_ machineID: String) {
-        guard !closed, !inBackground,
-              machines.first(where: { $0.id == machineID })?.target != nil,
-              sessions[machineID]?.settled != false else { return }
+        requestConnection(machineID, terminal: false)
+    }
+
+    /// The explicitly labelled Open Terminal / New Session action approves
+    /// this exact machine even when its route is manual or its old PTY ended.
+    func openTerminal(_ machineID: String) {
+        requestConnection(machineID, terminal: true)
+    }
+
+    private func requestConnection(_ machineID: String, terminal: Bool) {
+        guard permitsTerminalCreation,
+              machines.first(where: { $0.id == machineID })?.target != nil else { return }
+        if let session = sessions[machineID], !session.settled {
+            switch session.phase {
+            case .idle, .connecting, .ready: break
+            case .live: return
+            case .ended, .failed, .couldNotConnect: return
+            }
+        }
+        do {
+            if terminal { try connectionIntent.requestTerminal(machineID) }
+            else { try connectionIntent.approveConnection(machineID) }
+        } catch { report(error); return }
         cancelReconnect(machineID)
         reconnectPolicies[machineID, default: .init()].resetForUserRequest()
-        disconnected.remove(machineID)
-        startConnection(machineID)
+        if sessions[machineID] == nil || sessions[machineID]?.settled == true {
+            requestedConnections.insert(machineID)
+        }
+        reconcile()
     }
 
     /// Automatic callers have already reserved their retry budget. Keeping this
     /// separate from Connect prevents a retry from resetting its own limit.
     private func startConnection(_ machineID: String, preservingSuccessfulCandidate: Bool = false) {
-        guard !closed, !inBackground,
+        guard permitsTerminalCreation, controllerJobs[machineID] == nil,
               var target = machines.first(where: { $0.id == machineID })?.target else { return }
         if let theme = themes[machineID] { target = target.wearing(theme) }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
+        do { try connectionIntent.connectionStarted(machineID) }
+        catch { report(error); return }
+        requestedConnections.remove(machineID)
         let previous = sessions[machineID]
         previous?.discardRetainedOutput()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
@@ -227,22 +297,62 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             guard let self, let controller, self.sessions[machineID] === controller else { return }
             switch controller.phase {
             case .live:
+                try? self.connectionIntent.terminalOpened(machineID)
                 if !self.inBackground { self.reconnectPolicies[machineID, default: .init()].recordLive() }
-            case .ended, .failed, .couldNotConnect:
+            case .ended, .failed:
+                try? self.connectionIntent.terminalEnded(machineID)
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
-            case .idle, .connecting: break
+            case .couldNotConnect:
+                self.reconnectPolicies[machineID, default: .init()].recordEnd()
+            case .idle, .connecting, .ready: break
             }
             self.reconcile()
         }
         sessions[machineID] = controller
         controller.setPresentationVisible(isVisible(machineID))
-        Task { await controller.start() }
+        runController(controller, machineID: machineID, starting: true)
+    }
+
+    /// Background preparation first reaches Ready. A deliberate terminal action
+    /// enters the controller's reviewed creation path from the start, so New
+    /// Session can acknowledge an earlier terminal's journal before sign-in.
+    /// The retained wrapper also covers the controller's task-publication gap.
+    private func runController(_ controller: TerminalSessionController, machineID: String, starting: Bool) {
+        guard controllerJobs[machineID] == nil else { return }
+        let id = UUID()
+        let task = Task { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            if starting, !Task.isCancelled, self.permitsTerminalCreation,
+               self.sessions[machineID] === controller, !self.disconnected.contains(machineID) {
+                let opening = self.connectionIntent.opening(machineID, creation: controller.route.sessionCreation)
+                if opening == .explicit { await controller.activateTerminal(explicit: true) }
+                else { await controller.start(openTerminal: false) }
+            }
+            if !Task.isCancelled, self.permitsTerminalCreation,
+               self.sessions[machineID] === controller, controller.phase == .ready {
+                let opening = self.connectionIntent.opening(machineID, creation: controller.route.sessionCreation)
+                if opening == .explicit || (opening == .onSelect && self.isVisible(machineID)) {
+                    await controller.activateTerminal(explicit: opening == .explicit)
+                }
+            }
+            self.controllerWorkFinished(machineID, id: id, controllerID: controller.id)
+        }
+        controllerJobs[machineID] = .init(id: id, controllerID: controller.id, task: task)
+    }
+
+    private func controllerWorkFinished(_ machineID: String, id: UUID, controllerID: UUID) {
+        guard let job = controllerJobs[machineID], job.id == id, job.controllerID == controllerID else { return }
+        controllerJobs[machineID] = nil
+        reconcile()
     }
 
     /// Ends a machine's session; it stays disconnected until Connect.
     func disconnect(_ machineID: String) {
         guard !closed else { return }
-        disconnected.insert(machineID)
+        do { try connectionIntent.disconnect(machineID) }
+        catch { report(error); return }
+        requestedConnections.remove(machineID)
+        controllerJobs[machineID]?.task.cancel()
         cancelReconnect(machineID)
         reconnectPolicies[machineID] = nil
         if let session = sessions[machineID] {
@@ -255,34 +365,57 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for machine in machines where machine.target != nil { disconnect(machine.id) }
     }
 
-    /// Keeps every machine connected: starts waiting machines, the selected
-    /// one at once and two others at a time, and reconnects a dropped session
-    /// with bounded backoff unless the user disconnected it. Three automatic
-    /// retries are available per outage/short-lived session streak. Nothing
-    /// starts in the background, where Face ID cannot be shown.
+    /// Three operations at most prepare approved machines, selected first.
+    /// Existing owners survive group changes; their bounded reconnect policy
+    /// prepares a replacement transport without authorizing a replacement PTY.
     private func reconcile() {
-        guard !closed, !inBackground, autoConnect else { return }
-        let ids = machines.map(\.id)
-        let order = (try? TerminalConnectionOrder.prioritize(ids, selected: selectedMachineID, including: Set(ids))) ?? ids
-        var slots = 2 - sessions.values.filter { $0.phase == .idle || $0.phase == .connecting }.count
+        guard permitsTerminalCreation else { return }
+        let ready = Set(sessions.filter { $0.value.phase == .idle || $0.value.phase == .ready }.map(\.key))
+        let readyOrder = (try? TerminalConnectionOrder.prioritize(machines.map(\.id), selected: selectedMachineID,
+                                                                 including: ready)) ?? []
+        for id in readyOrder where controllerJobs.count < 3 && controllerJobs[id] == nil {
+            guard let controller = sessions[id], !disconnected.contains(id) else { continue }
+            if controller.phase == .idle {
+                runController(controller, machineID: id, starting: true)
+                continue
+            }
+            let opening = connectionIntent.opening(id, creation: controller.route.sessionCreation)
+            if opening == .explicit || (opening == .onSelect && isVisible(id)) {
+                runController(controller, machineID: id, starting: false)
+            }
+        }
+        let available = Set(machines.filter { $0.target != nil }.map(\.id))
+        let preparedOrder = (try? connectionIntent.connectionOrder(available: available)) ?? []
+        let retries: Set<String> = autoConnect ? available.filter(connectionIntent.permitsReconnect) : []
+        let included = Set(preparedOrder).union(retries)
+        let first = Set(preparedOrder)
+        let inventory = preparedOrder + machines.map(\.id).filter { !first.contains($0) }
+        let order = (try? TerminalConnectionOrder.prioritize(inventory, selected: selectedMachineID, including: included)) ?? preparedOrder
+        var slots = max(0, 3 - controllerJobs.count)
         for id in order {
-            guard machines.first(where: { $0.id == id })?.target != nil, !disconnected.contains(id) else { continue }
+            guard !disconnected.contains(id), controllerJobs[id] == nil else { continue }
             if let session = sessions[id] {
-                guard session.settled, session.dropped,
-                      let delay = reconnectPolicies[id, default: .init()].nextDelay else { continue }
-                if let job = reconnectJobs[id] {
-                    guard job.sessionID == session.id, job.ready, !job.cancelled else { continue }
-                } else {
-                    scheduleReconnect(id, sessionID: session.id, delay: delay)
-                    continue
+                guard session.settled else { continue }
+                if !requestedConnections.contains(id) {
+                    guard autoConnect, connectionIntent.permitsReconnect(id), session.dropped,
+                          let delay = reconnectPolicies[id, default: .init()].nextDelay else { continue }
+                    if let job = reconnectJobs[id] {
+                        guard job.sessionID == session.id, job.ready, !job.cancelled else { continue }
+                    } else {
+                        scheduleReconnect(id, sessionID: session.id, delay: delay)
+                        continue
+                    }
                 }
             }
-            guard slots > 0 || id == selectedMachineID else { continue }
-            if sessions[id] != nil {
+            // The manager owns the authoritative limits. Avoid turning a large
+            // group's queued warm-up into failures when its 16 owners are full.
+            guard slots > 0, sessions.values.filter({ !$0.settled }).count < 16 else { continue }
+            let retry = sessions[id] != nil && !requestedConnections.contains(id)
+            if retry {
                 guard reconnectPolicies[id, default: .init()].beginRetry() else { continue }
                 reconnectJobs[id] = nil
             }
-            startConnection(id, preservingSuccessfulCandidate: sessions[id] != nil); slots -= 1
+            startConnection(id, preservingSuccessfulCandidate: retry); slots -= 1
         }
     }
 
@@ -348,6 +481,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !closed else { return }
         closed = true
         cancelReconnects()
+        for job in controllerJobs.values { job.task.cancel() }
         navigation.suspend()
         for controller in sessions.values {
             controller.discardRetainedOutput()
@@ -362,9 +496,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         if let closing { await closing.value; return }
         let controllers = Array(sessions.values), navigation = self.navigation
         let reconnects = reconnectJobs.values.map(\.task)
+        let operations = controllerJobs.values.map(\.task)
         let job = Task {
             for reconnect in reconnects { await reconnect.value }
             for controller in controllers { await controller.stop() }
+            for operation in operations { await operation.value }
             await navigation.joinSuspension()
         }
         closing = job
@@ -389,16 +525,21 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// that connected in the background gets its view now.
     private func navigationChanged() {
         let selection = navigation.navigation.selection
-        if selectedMachineID != selection?.machineID { selectedMachineID = selection?.machineID }
+        if selectedMachineID != selection?.machineID {
+            selectedMachineID = selection?.machineID
+            do { try connectionIntent.select(selectedMachineID) } catch { report(error) }
+        }
+        if appearanceSelection == selectedMachineID { appearanceSelection = nil }
         updatePresentationVisibility()
         if onScreen, let session = selectedSession, session.phase == .live, session.terminal == nil { session.showView() }
+        reconcile()
         guard navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
         sessions[selection.machineID]?.install(keyboard)
     }
 
     private func isVisible(_ machineID: String) -> Bool {
-        !closed && foreground && onScreen && machineID == selectedMachineID
+        permitsTerminalCreation && onScreen && appearanceSelection == nil && machineID == selectedMachineID
     }
 
     private func updatePresentationVisibility() {
@@ -417,7 +558,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: TerminalSessionFocus
 
-    func shows(machineID: String) -> Bool { !closed && onScreen && selectedMachineID == machineID }
+    var permitsTerminalCreation: Bool { !closed && foreground && !inBackground }
+
+    func shows(machineID: String) -> Bool { isVisible(machineID) }
 
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
@@ -495,13 +638,18 @@ struct SceneThemeSource {
 struct LiveWorkspaceView: View {
     let initialMachineID: String
     var themes: SceneThemeSource? = nil
+    var group: TerminalConnectionIntent.Group? = nil
+    var connectOnOpen = false
     let makeScene: @MainActor () throws -> WorkspaceTerminalScene
     @State private var scene: WorkspaceTerminalScene?
     @State private var failed = false
 
     var body: some View {
         Group {
-            if let scene { WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID, themes: themes) }
+            if let scene {
+                WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID, themes: themes,
+                                        group: group, connectOnOpen: connectOnOpen)
+            }
             else if failed { Text("These machines could not be opened together.").padding() }
             else { Color.black.ignoresSafeArea() }
         }
@@ -518,7 +666,11 @@ struct WorkspaceTerminalScreen: View {
     @State var scene: WorkspaceTerminalScene
     let initialMachineID: String
     var themes: SceneThemeSource? = nil
+    var group: TerminalConnectionIntent.Group? = nil
+    var connectOnOpen = false
     @Environment(\.scenePhase) private var scenePhase
+    /// A presentation returning to this screen is not another Connect action.
+    @State private var initialConnectionConsumed = false
     @State private var pickingTheme = false
     @State private var historyInspection: TerminalHistoryInspection?
     @State private var retainedOutput: TerminalRetainedOutput?
@@ -570,7 +722,12 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
-        .task { scene.appear(selecting: initialMachineID, active: scenePhase == .active) }
+        .task {
+            let connect = connectOnOpen && !initialConnectionConsumed
+            initialConnectionConsumed = true
+            scene.appear(selecting: initialMachineID, active: scenePhase == .active,
+                         group: group, connectOnOpen: connect)
+        }
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             scene.disappear()
@@ -615,7 +772,19 @@ struct WorkspaceTerminalScreen: View {
                 if let machine, machine.target != nil {
                     switch scene.status(of: machine.id) {
                     case .disconnected, .attention:
-                        Button("Connect \(machine.name)", systemImage: "bolt.horizontal") { scene.connect(machine.id) }
+                        if scene.requiresNewSession(machine.id), !scene.disconnected.contains(machine.id) {
+                            Button(scene.sessions[machine.id]?.route.mux == true ? "Reconnect Existing Panes" : "New Session",
+                                   systemImage: "plus.rectangle") { scene.openTerminal(machine.id) }
+                        } else {
+                            Button("Connect \(machine.name)", systemImage: "bolt.horizontal") { scene.connect(machine.id) }
+                        }
+                    case .ready:
+                        Button(scene.sessions[machine.id]?.route.mux == true ? "Open Existing Panes"
+                               : (scene.requiresNewSession(machine.id) ? "New Session" : "Open Terminal"),
+                               systemImage: "terminal") { scene.openTerminal(machine.id) }
+                        Button("Disconnect \(machine.name)", systemImage: "xmark.circle", role: .destructive) {
+                            scene.disconnect(machine.id)
+                        }
                     default:
                         Button("Disconnect \(machine.name)", systemImage: "xmark.circle", role: .destructive) {
                             scene.disconnect(machine.id)
@@ -639,10 +808,14 @@ struct WorkspaceTerminalScreen: View {
 
     @ViewBuilder private func card(for machine: SceneMachine) -> some View {
         let accent = Color(ftHex: scene.themes[machine.id]?.accent ?? "#3B82F6")
-        if let session = scene.sessions[machine.id] {
+        if scene.disconnected.contains(machine.id) {
+            disconnectedCard(machine, accent: accent)
+        } else if let session = scene.sessions[machine.id] {
             switch session.phase {
             case .idle, .connecting:
                 connecting(machine, accent: accent, detail: Self.via(session.route))
+            case .ready:
+                readyCard(machine, session: session, accent: accent)
             case .live:
                 if session.terminal == nil { ProgressView().controlSize(.large).tint(accent) }
             case let .couldNotConnect(help):
@@ -658,7 +831,7 @@ struct WorkspaceTerminalScreen: View {
                 }
             }
         } else if machine.target != nil {
-            if scene.disconnected.contains(machine.id) { disconnectedCard(machine, accent: accent) }
+            if scene.status(of: machine.id) == .disconnected { disconnectedCard(machine, accent: accent) }
             else { connecting(machine, accent: accent, detail: "Waiting to connect") }
         } else {
             sceneCard(symbol: "network.slash", title: "Not available here", message: machine.unavailable, accent: accent) { EmptyView() }
@@ -677,16 +850,33 @@ struct WorkspaceTerminalScreen: View {
 
     private func disconnectedCard(_ machine: SceneMachine, accent: Color) -> some View {
         sceneCard(symbol: "bolt.horizontal.circle", title: "\(machine.name) is disconnected",
-                  message: "It stays down until you connect it again.", accent: accent) {
+                  message: "Connect to sign in to this machine. Its route decides when to open a terminal.", accent: accent) {
             Button("Connect", systemImage: "bolt.horizontal") { scene.connect(machine.id) }
                 .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+        }
+    }
+
+    private func readyCard(_ machine: SceneMachine, session: TerminalSessionController, accent: Color) -> some View {
+        let ended = scene.requiresNewSession(machine.id)
+        let message = session.route.mux
+            ? "The connection is ready to attach to this machine's existing FrankenTerm panes."
+            : (ended
+                ? "The previous terminal has ended. Choose New Session to open a terminal; an ended shell cannot be restored."
+                : "This machine is signed in. No terminal has been opened on this connection.")
+        let action = session.route.mux ? "Open Existing Panes" : (ended ? "New Session" : "Open Terminal")
+        return sceneCard(symbol: "checkmark.shield", title: "Signed in to \(machine.name)", message: message, accent: accent) {
+            Button(action, systemImage: "terminal") { scene.openTerminal(machine.id) }
+                .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+                .accessibilityIdentifier("terminal.ready.open")
         }
     }
 
     private func endedCard(_ machine: SceneMachine, message: String, session: TerminalSessionController,
                            accent: Color) -> some View {
         sceneCard(symbol: "moon.zzz", title: "Session ended", message: message, accent: accent) {
-            Button("Reconnect", systemImage: "arrow.clockwise") { scene.connect(machine.id) }
+            Button(session.route.mux ? "Reconnect Existing Panes" : "New Session", systemImage: "arrow.clockwise") {
+                scene.openTerminal(machine.id)
+            }
                 .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
                 .disabled(!session.settled)
             if let output = session.retainedOutput {
@@ -818,6 +1008,7 @@ private struct MachineStrip: View {
     static func describe(_ status: WorkspaceTerminalScene.Status) -> String {
         switch status {
         case .live: "connected"
+        case .ready: "signed in, terminal not open"
         case .connecting: "connecting"
         case .attention: "needs attention"
         case .disconnected: "disconnected"
@@ -914,6 +1105,8 @@ private struct StatusDot: View {
             switch status {
             case .live:
                 Circle().fill(accent).frame(width: 8, height: 8).shadow(color: accent, radius: 3)
+            case .ready:
+                Image(systemName: "checkmark.circle").font(.system(size: 10)).foregroundStyle(accent)
             case .connecting:
                 Circle().stroke(accent, lineWidth: 1.5).frame(width: 8, height: 8)
                     .phaseAnimator([false, true]) { ring, out in

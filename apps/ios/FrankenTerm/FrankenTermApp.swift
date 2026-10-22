@@ -2958,19 +2958,22 @@ private struct MachineWorkspaceView: View {
     }
 
     /// The workspace's live scene, kept by the app across visits, opening on
-    /// `initial`. It holds every machine, this group's first, and keeps all
-    /// of them connected; each tries its ready direct-SSH routes, those this
-    /// phone can reach now first (TerminalSessionTarget.attemptOrder).
+    /// `initial`. Every machine remains navigable, while only this group's
+    /// opted-in peers prepare authenticated connections in the background.
     private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String) -> some View {
         let themes = SceneThemeSource(
             themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
             choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
         let ordered = machines + document.machines.filter { machine in !machines.contains { $0.id == machine.id } }
-        return LiveWorkspaceView(initialMachineID: initial, themes: themes) { [model, workspaceID, document] in
+        let selectedGroupID = groupID.isEmpty ? document.initialGroupID : groupID
+        let group = document.groups.first(where: { $0.id == selectedGroupID }).map {
+            TerminalConnectionIntent.Group(id: $0.id, machineIDs: $0.machineOrder, autoConnect: $0.autoConnect)
+        }
+        return LiveWorkspaceView(initialMachineID: initial, themes: themes, group: group, connectOnOpen: true) { [model, workspaceID, document] in
             try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision) {
                 try WorkspaceTerminalScene(workspaceID: workspaceID, revision: local.workspace.revision,
                     workspaceName: document.name, machines: ordered.map { sceneMachine($0, local: local) },
-                    initialMachineID: initial, connections: connections)
+                    initialMachineID: initial, connections: connections, initialGroup: group)
             }
         }
     }
@@ -2980,7 +2983,7 @@ private struct MachineWorkspaceView: View {
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
                   unavailable: "None of this machine's direct SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
-                  theme: theme)
+                  theme: theme, autoConnect: machine.autoConnect)
         }
         // Every ready route, the preferred one first: mux routes attach to the
         // machine's existing panes, direct-SSH routes to its mux if one answers.
@@ -2991,7 +2994,9 @@ private struct MachineWorkspaceView: View {
                   route.jumpRoutes.isEmpty, let readiness = local.routes.first(where: { $0.routeID == id }),
                   readiness.issues.isEmpty, !readiness.usableCredentialIDs.isEmpty else { continue }
             routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
-                                mux: route.mode == "frankenterm_mux"))
+                                mux: route.mode == "frankenterm_mux",
+                                sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
+                                    : (route.sessionCreation == "manual" ? .manual : .onSelect)))
         }
         guard !routes.isEmpty else { return scene(nil) }
         return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
