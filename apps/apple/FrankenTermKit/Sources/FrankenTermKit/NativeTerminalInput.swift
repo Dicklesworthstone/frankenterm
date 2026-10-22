@@ -1,4 +1,5 @@
 #if canImport(UIKit)
+import GameController
 import UIKit
 import SwiftUI
 
@@ -150,11 +151,13 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// the displayed projection. Preserve uncommitted composition, but stop
     /// new input and hide candidate geometry until a matching frame completes.
     /// Key-up cleanup remains available for keys admitted before invalidation.
+    /// Ctrl and alt the user set stay set: a new text size or a look at
+    /// history does not change what the next key should send.
     public func invalidateRenderedCaret(source: TerminalSource) throws {
         guard source == session.originalFocus.source else { throw TerminalInputError.stale }
         guard hasGeometry else { return }
         inputDelegate?.selectionWillChange(self)
-        hasGeometry = false; pendingPaste = nil; accessoryModifiers.clear()
+        hasGeometry = false; pendingPaste = nil
         updateAccessory(); setNeedsLayout(); setNeedsDisplay()
         inputDelegate?.selectionDidChange(self)
     }
@@ -801,6 +804,11 @@ public final class NativeTerminalView: UIView {
     private enum SelectionDrag { case word(TerminalTextSelection), handle(fixed: TerminalGridPoint, offset: CGPoint) }
     private var drag: SelectionDrag?
     private var dragPoint = CGPoint.zero
+    /// Where the drag began: only a finger that moved toward an edge scrolls.
+    private var dragOrigin = CGPoint.zero
+    /// The width the selection was made at; a new width rewraps its rows.
+    private var selectionColumns: Int?
+    private let touchFilter = NativeTerminalTouchFilter()
     private var autoScroll: Timer?
     private var theme: TerminalChromeTheme?
     private var themedPalette: UInt64?
@@ -809,6 +817,8 @@ public final class NativeTerminalView: UIView {
     private var momentumHistory: TerminalRenderHistory?
     private var pinchStart: Double?
     private var pinchApplied: CFTimeInterval = 0
+    /// The fingers' spacing changed enough to be a pinch, not a two-finger swipe.
+    private var pinchEngaged = false
 
     public init(session: TerminalKeyboardSession, bundle: Bundle = .main,
                 configuration: NativeTerminalRenderConfiguration = .init()) async throws {
@@ -837,12 +847,15 @@ public final class NativeTerminalView: UIView {
         pan.maximumNumberOfTouches = 1; pan.delegate = panDelegate
         pan.allowedScrollTypesMask = .all
         addGestureRecognizer(pan)
-        // Press and hold selects a word; keep dragging to select more.
+        // Press and hold selects a word; keep dragging to select more. A
+        // selection handle's touches are its own drag's.
         let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
-        press.minimumPressDuration = 0.35
+        press.minimumPressDuration = 0.35; press.delegate = touchFilter
         addGestureRecognizer(press)
         // A tap clears a selection, else shows or hides the keyboard.
-        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
+        tap.delegate = touchFilter
+        addGestureRecognizer(tap)
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
         for handle in [selectionOverlay.startHandle, selectionOverlay.endHandle] {
             handle.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handleDragged(_:))))
@@ -931,11 +944,15 @@ public final class NativeTerminalView: UIView {
     /// history range of the last admitted frame.
     public func scrollHistory(byRows rows: Int) {
         guard !retired, let frame = renderer.admittedFrame, let history = frame.history else { return }
+        let top = min(max(frame.viewportFirst + Int64(rows), history.first), history.live)
+        // At either end there is nothing further to show, and no frame to ask for.
+        guard top != frame.viewportFirst else { return }
         lastHistoryRequest = nil
-        requestHistory(top: frame.viewportFirst + Int64(rows), within: history)
+        requestHistory(top: top, within: history)
     }
     public func returnToLiveOutput() {
         guard !retired else { return }
+        stopMomentum()
         lastHistoryRequest = .some(nil)
         onHistoryViewportRequest?(nil)
     }
@@ -1015,7 +1032,10 @@ public final class NativeTerminalView: UIView {
         guard !retired else { return }
         stopMomentum()
         if selection != nil { clearSelection(); return }
-        if input.isFirstResponder { input.retire() } else { onKeyboardRequest?() }
+        if !input.isFirstResponder { onKeyboardRequest?() }
+        // With a hardware keyboard there is no on-screen keyboard to put
+        // away, and resigning would only stop the typing.
+        else if GCKeyboard.coalesced == nil { input.retire() }
     }
 
     @objc private func pinched(_ pinch: UIPinchGestureRecognizer) {
@@ -1023,9 +1043,13 @@ public final class NativeTerminalView: UIView {
         switch pinch.state {
         case .began:
             stopMomentum(); clearSelection()
-            pinchStart = fontPointSize
+            pinchStart = fontPointSize; pinchEngaged = false
         case .changed:
-            guard let start = pinchStart else { return }
+            guard let start = pinchStart, pinch.scale > 0 else { return }
+            // Fingers swiping sideways drift a little apart or together; only
+            // a clear change of spacing is a pinch.
+            guard pinchEngaged || abs(log(Double(pinch.scale))) > 0.08 else { return }
+            pinchEngaged = true
             let size = Self.clampedFontSize(start * Double(pinch.scale))
             showSizeBadge(size)
             // Each size change re-lays out the terminal (and resizes the remote
@@ -1033,10 +1057,14 @@ public final class NativeTerminalView: UIView {
             let now = CACurrentMediaTime()
             if now - pinchApplied > 0.12 { pinchApplied = now; applyFontSize(size, notify: false) }
         case .ended:
-            if let start = pinchStart { applyFontSize(start * Double(pinch.scale), notify: true) }
-            pinchStart = nil; hideSizeBadge()
+            if pinchEngaged, let start = pinchStart, pinch.scale > 0 {
+                applyFontSize(start * Double(pinch.scale), notify: true)
+            }
+            pinchStart = nil; pinchEngaged = false; hideSizeBadge()
         default:
-            pinchStart = nil; hideSizeBadge()
+            // Interrupted: keep the size shown so far, everywhere.
+            if pinchEngaged { applyFontSize(fontPointSize, notify: true) }
+            pinchStart = nil; pinchEngaged = false; hideSizeBadge()
         }
     }
 
@@ -1105,6 +1133,7 @@ public final class NativeTerminalView: UIView {
             guard let grid = gridPoint(at: point), let frame = renderer.admittedFrame,
                   let row = frame.lines.first(where: { $0.stableIndex == grid.row }) else { return }
             editMenu.dismissMenu()
+            dragOrigin = point
             let word = TerminalTextSelection.word(at: grid.column, in: row, columns: frame.columns)
             drag = .word(word)
             setSelection(word)
@@ -1127,6 +1156,7 @@ public final class NativeTerminalView: UIView {
         switch pan.state {
         case .began:
             editMenu.dismissMenu()
+            dragOrigin = point
             // Keep the finger's offset from the cell it grabbed, so the end
             // under the knob does not jump to the knob's position.
             let moving = handle.atStart ? current.start : current.end
@@ -1173,13 +1203,19 @@ public final class NativeTerminalView: UIView {
     private func autoScrollTick() {
         guard drag != nil, let cell = renderer.cellSize else { return }
         let edge = max(cell.height, 24)
-        if dragPoint.y < edge { scrollHistory(byRows: -1) }
-        else if dragPoint.y > bounds.height - edge { scrollHistory(byRows: 1) }
+        // A press that starts at an edge selects there; the finger has to
+        // move toward the edge to scroll.
+        if dragPoint.y < edge, dragPoint.y < dragOrigin.y - cell.height / 2 { scrollHistory(byRows: -1) }
+        else if dragPoint.y > bounds.height - edge, dragPoint.y > dragOrigin.y + cell.height / 2 { scrollHistory(byRows: 1) }
     }
 
     private func setSelection(_ value: TerminalTextSelection?) {
         selection = value
-        if value == nil { selectionRows.removeAll() } else { captureSelectionRows() }
+        if value == nil { selectionRows.removeAll(); selectionColumns = nil }
+        else {
+            if selectionColumns == nil { selectionColumns = renderer.admittedFrame?.columns }
+            captureSelectionRows()
+        }
         drawSelection()
     }
 
@@ -1247,6 +1283,8 @@ public final class NativeTerminalView: UIView {
             }
         }
         guard selection != nil else { return }
+        // A new width rewraps the rows: the cells no longer hold what was chosen.
+        if let columns = selectionColumns, columns != frame.columns { clearSelection(); return }
         captureSelectionRows()
         if drag != nil { extendDrag() }
         drawSelection()
@@ -1360,6 +1398,15 @@ extension NativeTerminalView: @preconcurrency UIEditMenuInteractionDelegate {
     public func editMenuInteraction(_ interaction: UIEditMenuInteraction,
                                     targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
         selectionOverlay.selectionBounds?.intersection(bounds) ?? .null
+    }
+}
+
+/// A selection handle's touches belong to its own drag: a press or tap on a
+/// handle neither starts a new selection nor clears the current one.
+@MainActor
+private final class NativeTerminalTouchFilter: NSObject, UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        !(touch.view is NativeTerminalSelectionOverlay.SelectionHandle)
     }
 }
 
