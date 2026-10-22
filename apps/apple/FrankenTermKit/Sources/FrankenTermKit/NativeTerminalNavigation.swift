@@ -8,12 +8,16 @@ import UIKit.UIGestureRecognizerSubclass
 /// The scene owns source registration, frame routing and network admission.
 @MainActor
 public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizerDelegate {
+    /// A captured, source-bound action. Capture happens at touch-down; execution
+    /// must validate the captured destination and use the existing focus barrier.
+    public typealias NavigationAction = @MainActor () async throws -> Void
     public var onFailure: (@MainActor (Error) -> Void)?
     /// Called only after a complete focus/identity publication. The scene can now
     /// install the focus owner's new keyboard and exact-source Metal surface.
     public var onSelection: (@MainActor (TerminalNavigationSelection) -> Void)?
     private let coordinator: TerminalNavigationCoordinator
     private let permitsCanvasNavigation: @MainActor () -> Bool
+    private let canvasAction: (@MainActor (TerminalNavigationAxis, TerminalNavigationDirection) -> NavigationAction?)?
     private let machine = UIButton(type: .system), pane = UIButton(type: .system)
     private let railGesture = TerminalRingGesture(target: nil, action: nil)
     private let canvasGesture = TerminalRingGesture(target: nil, action: nil)
@@ -28,9 +32,11 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
     /// terminal mouse interaction or another application-owned gesture has focus.
     /// The identity rail and explicit controls remain separate alternatives.
     public init(coordinator: TerminalNavigationCoordinator, terminalCanvas: UIView,
-                permitsCanvasNavigation: @escaping @MainActor () -> Bool) throws {
+                permitsCanvasNavigation: @escaping @MainActor () -> Bool,
+                canvasAction: (@MainActor (TerminalNavigationAxis, TerminalNavigationDirection) -> NavigationAction?)? = nil) throws {
         self.coordinator = coordinator; self.canvas = terminalCanvas
         self.permitsCanvasNavigation = permitsCanvasNavigation
+        self.canvasAction = canvasAction
         super.init(frame: .zero)
         // Reserve the only throwing resource before installing recognizers on
         // someone else's view. Failure must not leave an orphaned canvas gesture.
@@ -60,6 +66,10 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
             gesture.capture = { [weak self] in self?.capturePlans() }
             gesture.accept = { [weak self] in self?.perform($0) }
         }
+        // A mux scene has a separate pane ring behind its connection. It can
+        // supply exact remote-pane actions without a competing swipe recognizer
+        // or pretending that its panes are independent SSH connections.
+        canvasGesture.capture = { [weak self] in self?.capturePlans(canvas: true) }
         railGesture.allowed = { [weak self] in
             guard let self else { return false }
             return !self.retired && !UIAccessibility.isVoiceOverRunning && !UIAccessibility.isSwitchControlRunning
@@ -90,11 +100,13 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
         Task { @MainActor in if let observation { coordinator.removeObserver(observation) } }
     }
 
-    /// Call when removing the scene's terminal controls. This retires keyboard
-    /// focus, not remote sessions; the app's connection owner controls those.
-    public func retire() {
+    /// A scene owner retires keyboard focus, not remote sessions. A replaced
+    /// canvas detaches only its own recognizers/task; its successor can already
+    /// be using the same scene's coordinator when SwiftUI dismantles this view.
+    public func retire(suspendNavigation: Bool = true) {
         guard !retired else { return }
-        retired = true; action?.cancel(); coordinator.suspend()
+        retired = true; action?.cancel()
+        if suspendNavigation { coordinator.suspend() }
         if let observation { coordinator.removeObserver(observation) }
         observation = nil
         canvas?.removeGestureRecognizer(canvasGesture); removeGestureRecognizer(railGesture)
@@ -146,20 +158,28 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
         if changed, phase == .ready, let selection { onSelection?(selection) }
     }
 
-    private func capturePlans() -> TerminalRingGesture.Plans? {
+    private func capturePlans(canvas: Bool = false) -> TerminalRingGesture.Plans? {
         guard !retired, action == nil, coordinator.phase == .ready || coordinator.phase == .inactive else { return nil }
         let model = coordinator.navigation
-        return .init(machinePrevious: try? model.plan(axis: .machine, direction: .previous),
-                     machineNext: try? model.plan(axis: .machine, direction: .next),
-                     panePrevious: try? model.plan(axis: .pane, direction: .previous),
-                     paneNext: try? model.plan(axis: .pane, direction: .next))
+        func capture(_ axis: TerminalNavigationAxis, _ direction: TerminalNavigationDirection) -> NavigationAction? {
+            if canvas, let canvasAction { return canvasAction(axis, direction) }
+            guard let plan = try? model.plan(axis: axis, direction: direction) else { return nil }
+            let coordinator = coordinator
+            return { try await coordinator.perform(plan) }
+        }
+        return .init(machinePrevious: capture(.machine, .previous), machineNext: capture(.machine, .next),
+                     panePrevious: capture(.pane, .previous), paneNext: capture(.pane, .next))
     }
     private func perform(_ plan: TerminalNavigationPlan) {
+        let coordinator = coordinator
+        perform { try await coordinator.perform(plan) }
+    }
+    private func perform(_ navigation: @escaping NavigationAction) {
         guard !retired, action == nil else { return }
         action = Task { [weak self] in
             guard let self else { return }
             defer { self.action = nil }
-            do { try await self.coordinator.perform(plan) }
+            do { try await navigation() }
             catch { if !self.retired, !Task.isCancelled { self.onFailure?(error) } }
         }
     }
@@ -201,16 +221,16 @@ public final class NativeTerminalNavigationControls: UIView, UIGestureRecognizer
 @MainActor
 private final class TerminalRingGesture: UIGestureRecognizer {
     struct Plans {
-        let machinePrevious: TerminalNavigationPlan?, machineNext: TerminalNavigationPlan?
-        let panePrevious: TerminalNavigationPlan?, paneNext: TerminalNavigationPlan?
-        func plan(_ axis: TerminalNavigationAxis, _ direction: TerminalNavigationDirection) -> TerminalNavigationPlan? {
+        let machinePrevious: NativeTerminalNavigationControls.NavigationAction?, machineNext: NativeTerminalNavigationControls.NavigationAction?
+        let panePrevious: NativeTerminalNavigationControls.NavigationAction?, paneNext: NativeTerminalNavigationControls.NavigationAction?
+        func plan(_ axis: TerminalNavigationAxis, _ direction: TerminalNavigationDirection) -> NativeTerminalNavigationControls.NavigationAction? {
             if axis == .machine { return direction == .next ? machineNext : machinePrevious }
             return direction == .next ? paneNext : panePrevious
         }
     }
     var machineOnly = false
     var capture: (@MainActor () -> Plans?)?
-    var accept: (@MainActor (TerminalNavigationPlan) -> Void)?
+    var accept: (@MainActor (@escaping NativeTerminalNavigationControls.NavigationAction) -> Void)?
     var allowed: (@MainActor () -> Bool)?
     private var plans: Plans?, classifier: TerminalNavigationGesture?
     private var touches = Set<UITouch>()

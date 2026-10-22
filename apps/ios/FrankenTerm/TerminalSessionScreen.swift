@@ -265,6 +265,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var reconnectSelection: TerminalRouteAttemptPlan.Selection?
     @ObservationIgnored private var paneHandoff: Task<Void, Never>?
     @ObservationIgnored private var requestedMuxPane: Int?
+    @ObservationIgnored private var requestedMuxNavigation: TerminalMuxInputRouting.NavigationPlan?
     @ObservationIgnored private var displayedMuxDestination: TerminalMuxInputRouting.Destination?
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
@@ -395,11 +396,32 @@ final class TerminalSessionController {
     /// for network delivery. The new pane gets a fresh view and focus only after
     /// its output has reached the canonical model.
     func showPane(_ paneID: Int) {
+        guard let control = connection?.muxControl else { return }
+        do { _ = try startPaneHandoff(control.inputRouting.navigation(pane: paneID)) }
+        catch { if !stopped { interactionProblem = "The pane switch was not completed: \(Self.describe(error))" } }
+    }
+
+    /// A gesture's task owns and joins local keyboard cleanup. Its captured
+    /// target is checked again after every potentially suspended preparation.
+    func navigatePane(_ plan: TerminalMuxInputRouting.NavigationPlan) async throws {
+        try Task.checkCancellation()
+        guard let task = try startPaneHandoff(plan) else { return }
+        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        try Task.checkCancellation()
+    }
+
+    var paneNavigationBusy: Bool { paneHandoff != nil || viewAttachment != nil || requestedMuxPane != nil }
+
+    private func startPaneHandoff(_ plan: TerminalMuxInputRouting.NavigationPlan) throws -> Task<Void, Never>? {
+        let paneID = plan.paneID
         guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil,
-              !clipboardIsPresenting, let control = connection?.muxControl,
-              control.current.panes.contains(where: { $0.paneId == paneID }),
-              paneID != control.current.shown || requestedMuxPane != nil else { return }
+              presentationVisible, !clipboardIsPresenting,
+              focus?.shows(machineID: target.machineID) == true,
+              let control = connection?.muxControl else { throw TerminalInputError.unavailable }
+        try control.inputRouting.validateNavigation(plan)
+        guard paneID != control.current.shown || requestedMuxPane != nil else { return nil }
         requestedMuxPane = paneID
+        requestedMuxNavigation = plan
         paneHandoff = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -419,10 +441,12 @@ final class TerminalSessionController {
                     await self.keyboard?.waitUntilSuspended()
                 }
                 try Task.checkCancellation()
-                guard !self.stopped, self.phase == .live, self.connection?.muxControl === control,
+                guard !self.stopped, self.phase == .live, self.presentationVisible,
+                      self.connection?.muxControl === control,
                       control.current.panes.contains(where: { $0.paneId == paneID }) else {
                     throw TerminalInputError.stale
                 }
+                try control.inputRouting.validateNavigation(plan)
                 // Retire, rather than merely pause, the old drawable/caret.
                 // Its in-flight GPU completions cannot target the new view.
                 self.presenter?.acceptsFrames = false
@@ -442,13 +466,25 @@ final class TerminalSessionController {
                 }
                 self.historyReturnBookmark = nil
                 try Task.checkCancellation()
-                guard !self.stopped, self.phase == .live, self.connection?.muxControl === control,
+                guard !self.stopped, self.phase == .live, self.presentationVisible,
+                      self.connection?.muxControl === control,
                       control.current.panes.contains(where: { $0.paneId == paneID }) else {
                     throw TerminalInputError.stale
                 }
-                control.request(pane: paneID)
+                try control.request(plan)
             } catch {
-                self.requestedMuxPane = nil
+                self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
+                // The plan can expire after handoff succeeds but before the
+                // old view is retired. Its responder is already gone; keeping
+                // that drawable would block showView from rebuilding input.
+                if self.keyboard?.phase == .retired {
+                    self.presenter?.acceptsFrames = false
+                    self.terminal?.retire(); self.terminal = nil; self.presenter?.view = nil
+                    self.displayedMuxDestination = nil; self.lastViewportRevision = 0
+                    let clipboard = self.clipboard
+                    clipboard?.retire(); self.clipboard = nil; self.presenter?.clipboard = nil
+                    await clipboard?.waitUntilSettled()
+                }
                 if !self.stopped, !(error is CancellationError) {
                     self.interactionProblem = "The pane switch was not completed: \(Self.describe(error))"
                 }
@@ -457,6 +493,7 @@ final class TerminalSessionController {
                 // ready pane, never the rejected destination.
             }
         }
+        return paneHandoff
     }
 
     /// This callback is independent of pane-title/search changes and rejects
@@ -472,13 +509,13 @@ final class TerminalSessionController {
         }
         guard state.ready, !state.retired, let selected = state.destination else {
             if state.destination == nil, phase == .live {
-                requestedMuxPane = nil
+                requestedMuxPane = nil; requestedMuxNavigation = nil
                 interactionProblem = "The selected pane is no longer available. Choose another pane; pending input was not redirected."
             }
             return
         }
         if let requestedMuxPane, requestedMuxPane != selected.paneID { return }
-        requestedMuxPane = nil
+        requestedMuxPane = nil; requestedMuxNavigation = nil
         guard paneHandoff == nil, focus?.shows(machineID: target.machineID) == true else { return }
         showView()
     }
@@ -650,6 +687,14 @@ final class TerminalSessionController {
                         // reorder; publish its current snapshot, not stale UI.
                         self.muxState = control.current
                         self.terminal?.remoteMouseGrabbed = control.current.mouseGrabbed
+                        if let rejected = control.current.rejectedNavigation,
+                           rejected == self.requestedMuxNavigation {
+                            self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
+                            if self.presentationVisible {
+                                self.interactionProblem = "The pane list or selection changed. The swipe was cancelled; choose the pane again."
+                            }
+                            self.muxInputChanged(control.inputRouting.current, control: control)
+                        }
                     }
                 }
                 control.inputRouting.observe { [weak self, weak control] state in
@@ -1041,7 +1086,7 @@ final class TerminalSessionController {
         historyReturn?.cancel(); historyReturnBookmark = nil
         paletteChange?.cancel()
         fontRevisionChange?.cancel(); paneHandoff?.cancel()
-        requestedMuxPane = nil
+        requestedMuxPane = nil; requestedMuxNavigation = nil
         connection?.muxControl?.inputRouting.removeObserver()
         interactionProblem = nil
         presenter?.acceptsFrames = false

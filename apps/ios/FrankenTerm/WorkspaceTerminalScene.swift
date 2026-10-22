@@ -20,7 +20,7 @@ struct SceneMachine: Identifiable {
 /// on-select route; a manual route waits for Open Terminal. A lost terminal's
 /// replacement waits for New Session, even after bounded reauthentication.
 ///
-/// Every switch, from the machine strip, a menu, a two-finger swipe or a new
+/// Every switch, from the machine strip, a menu, a one-finger swipe or a new
 /// connection, goes through Kit's navigation coordinator: the old source's
 /// composition and held keys settle behind a focus barrier before the new
 /// source can accept input.
@@ -53,6 +53,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored private var foreground = true
     /// The terminal screen is showing; sessions run whether or not it is.
     @ObservationIgnored private var onScreen = false
+    /// A touch begun before a lifecycle or machine transition cannot become a
+    /// fresh navigation request merely because the same screen returns later.
+    @ObservationIgnored private var canvasGeneration = UUID()
     /// A retained scene can reopen at another machine. Its previous selection
     /// must not create a terminal before the requested focus handoff commits.
     @ObservationIgnored private var appearanceSelection: String?
@@ -131,6 +134,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func appear(selecting machineID: String, active: Bool,
                 group: TerminalConnectionIntent.Group? = nil, connectOnOpen: Bool = false) {
         guard !closed else { return }
+        canvasGeneration = UUID()
         do {
             try connectionIntent.setGroup(autoConnect ? group : nil)
             if connectOnOpen {
@@ -161,6 +165,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func disappear() {
         guard !closed else { return }
         onScreen = false
+        canvasGeneration = UUID()
         appearanceSelection = nil
         navigation.suspend()
         updatePresentationVisibility()
@@ -168,6 +173,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func setForeground(_ active: Bool) {
         guard !closed else { return }
+        if foreground != active { canvasGeneration = UUID() }
         foreground = active
         if active {
             if inBackground {
@@ -229,19 +235,54 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
     }
 
-    /// Steps through the selected machine's mux panes, and past either end
-    /// on to the next or previous machine, so one swipe direction walks
-    /// every pane of every machine in order.
+    /// Pane traversal is a separate ring. At either end it wraps within this
+    /// machine; zero or one pane never falls through to another machine.
     func stepPane(forward: Bool) {
-        guard !closed else { return }
-        if let session = selectedSession, session.phase == .live, let mux = session.muxState, let shown = mux.shown,
-           let index = mux.panes.firstIndex(where: { $0.paneId == shown }) {
-            let next = index + (forward ? 1 : -1)
-            if mux.panes.indices.contains(next) { session.showPane(mux.panes[next].paneId); return }
+        guard !closed, let session = selectedSession, session.phase == .live,
+              let control = session.muxControl else { return }
+        do {
+            if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
+        } catch { report(error) }
+    }
+
+    var permitsCanvasNavigation: Bool {
+        !closed && foreground && onScreen && appearanceSelection == nil
+            && selectedSession?.clipboardIsPresenting != true
+            && selectedSession?.paneNavigationBusy != true
+            && selectedSession?.terminal?.remoteMouseGrabbed != true
+    }
+
+    /// Called once per direction at touch-down by the native finger classifier.
+    /// Never look up a new neighbour at touch-up or after keyboard settlement.
+    func captureCanvasAction(_ axis: TerminalNavigationAxis, _ direction: TerminalNavigationDirection)
+        -> NativeTerminalNavigationControls.NavigationAction? {
+        guard permitsCanvasNavigation else { return nil }
+        let generation = canvasGeneration, sourceMachine = selectedMachineID
+        let sessionID = selectedSession?.id
+        let sourcePane = selectedSession?.muxControl?.inputRouting.current.destination
+        let stillCurrent: @MainActor () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.permitsCanvasNavigation && self.canvasGeneration == generation
+                && self.selectedMachineID == sourceMachine && self.selectedSession?.id == sessionID
+                && self.selectedSession?.muxControl?.inputRouting.current.destination == sourcePane
         }
-        let ids = machines.map(\.id)
-        guard ids.count > 1, let current = selectedMachineID, let index = ids.firstIndex(of: current) else { return }
-        select(ids[(index + (forward ? 1 : ids.count - 1)) % ids.count])
+        switch axis {
+        case .machine:
+            guard let plan = try? navigation.navigation.plan(axis: .machine, direction: direction) else { return nil }
+            return { [weak self] in
+                guard let self, stillCurrent() else { throw TerminalNavigationError.stale }
+                try await self.navigation.perform(plan)
+            }
+        case .pane:
+            guard let session = selectedSession, session.phase == .live, let control = session.muxControl,
+                  let plan = try? control.inputRouting.navigation(forward: direction == .next) else { return nil }
+            return { [weak session, weak control] in
+                guard let session, let control, stillCurrent(), session.muxControl === control else {
+                    throw TerminalNavigationError.stale
+                }
+                try await session.navigatePane(plan)
+            }
+        }
     }
 
     /// Connect approves authentication and normal on-select behavior. It does
@@ -480,6 +521,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func requestClose() {
         guard !closed else { return }
         closed = true
+        canvasGeneration = UUID()
         cancelReconnects()
         for job in controllerJobs.values { job.task.cancel() }
         navigation.suspend()
@@ -526,6 +568,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private func navigationChanged() {
         let selection = navigation.navigation.selection
         if selectedMachineID != selection?.machineID {
+            canvasGeneration = UUID()
             selectedMachineID = selection?.machineID
             do { try connectionIntent.select(selectedMachineID) } catch { report(error) }
         }
@@ -966,7 +1009,7 @@ struct WorkspaceTerminalScreen: View {
 
 /// Every machine as a chip in its own colors, with its state (live,
 /// connecting, needs attention, disconnected) at a glance and the one on screen
-/// raised. Tap a chip to switch; swipe the terminal with two fingers to step
+/// raised. Tap a chip to switch; swipe the terminal with one finger to step
 /// through them in order.
 private struct MachineStrip: View {
     let scene: WorkspaceTerminalScene
@@ -1013,6 +1056,7 @@ private struct MachineStrip: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(machine.name), \(Self.describe(status))")
+        .accessibilityHint("Changes machines. One-finger horizontal swipes on the terminal do the same when mouse interaction is inactive.")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
@@ -1092,6 +1136,7 @@ private struct PaneStrip: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(names.detail.map { "\(names.place), \($0)" } ?? names.place)
+        .accessibilityHint("Changes panes within this machine. Two-finger horizontal swipes wrap through this machine's panes.")
         .accessibilityAddTraits(shown ? .isSelected : [])
     }
 
@@ -1139,15 +1184,16 @@ private struct StatusDot: View {
 /// Hosts the selected machine's asynchronously created terminal. Other
 /// machines' views leave the window, which pauses their rendering; their
 /// sessions keep running. The navigation controls are not drawn (the machine
-/// strip replaces their rail) but keep the canvas's two-finger swipe.
+/// strip replaces their rail) but own both independent canvas gestures.
 private struct WorkspaceCanvasHost: UIViewRepresentable {
     let scene: WorkspaceTerminalScene
     let terminal: NativeTerminalView?
     func makeUIView(context: Context) -> WorkspaceCanvasView { WorkspaceCanvasView(scene: scene) }
     func updateUIView(_ view: WorkspaceCanvasView, context: Context) { view.show(terminal) }
+    static func dismantleUIView(_ view: WorkspaceCanvasView, coordinator: ()) { view.retireNavigation() }
 }
 
-private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
+private final class WorkspaceCanvasView: UIView {
     private let canvas = UIView()
     private var controls: NativeTerminalNavigationControls?
     private weak var scene: WorkspaceTerminalScene?
@@ -1162,24 +1208,17 @@ private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor), canvas.trailingAnchor.constraint(equalTo: trailingAnchor)
         ])
         do {
-            // A machine attached to its mux steps through its panes instead
-            // (paneSwipe below); the others, and one whose session ended,
-            // keep Kit's two-finger navigation.
+            // One recognizer owns the finger-count decision and the four
+            // captured candidates. Mux panes are not flattened into machines.
             let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
                 permitsCanvasNavigation: { [weak scene] in
-                    guard let session = scene?.selectedSession else { return true }
-                    return !session.clipboardIsPresenting && (session.muxState == nil || session.phase != .live)
+                    scene?.permitsCanvasNavigation == true
+                }, canvasAction: { [weak scene] axis, direction in
+                    scene?.captureCanvasAction(axis, direction)
                 })
             controls.onFailure = { [weak scene] error in scene?.report(error) }
             self.controls = controls
         } catch { scene.report(error) }
-        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
-            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(paneSwipe(_:)))
-            swipe.direction = direction
-            swipe.numberOfTouchesRequired = 2
-            swipe.delegate = self
-            canvas.addGestureRecognizer(swipe)
-        }
         // A tap brings the keyboard back after its input generation ended.
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
         tap.cancelsTouchesInView = false
@@ -1194,23 +1233,7 @@ private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
         Task { [weak scene] in await scene?.activateKeyboard() }
     }
 
-    /// Swiping left shows the next pane, right the previous one.
-    @objc private func paneSwipe(_ swipe: UISwipeGestureRecognizer) {
-        scene?.stepPane(forward: swipe.direction == .left)
-    }
-
-    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard gestureRecognizer is UISwipeGestureRecognizer else { return super.gestureRecognizerShouldBegin(gestureRecognizer) }
-        guard let session = scene?.selectedSession else { return false }
-        return session.phase == .live && session.muxState != nil && !session.clipboardIsPresenting
-    }
-
-    /// Two fingers sliding sideways rarely keep their spacing exactly: the
-    /// terminal's pinch, which ignores small changes, must not block the swipe.
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
-                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        gestureRecognizer is UISwipeGestureRecognizer && other is UIPinchGestureRecognizer
-    }
+    func retireNavigation() { controls?.retire(suspendNavigation: false); controls = nil }
 
     /// Switching machines cross-fades between their terminals.
     func show(_ terminal: NativeTerminalView?) {
