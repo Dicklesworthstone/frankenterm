@@ -213,14 +213,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// Automatic callers have already reserved their retry budget. Keeping this
     /// separate from Connect prevents a retry from resetting its own limit.
-    private func startConnection(_ machineID: String) {
+    private func startConnection(_ machineID: String, preservingSuccessfulCandidate: Bool = false) {
         guard !closed, !inBackground,
               var target = machines.first(where: { $0.id == machineID })?.target else { return }
         if let theme = themes[machineID] { target = target.wearing(theme) }
         // A session that has not settled (starting, live, tearing down) blocks a second one.
         if let current = sessions[machineID], !current.settled { return }
-        sessions[machineID]?.discardRetainedOutput()
-        let controller = TerminalSessionController(target: target, connections: connections, focus: self)
+        let previous = sessions[machineID]
+        previous?.discardRetainedOutput()
+        let controller = TerminalSessionController(target: target, connections: connections, focus: self,
+            reconnectingFrom: preservingSuccessfulCandidate ? previous : nil)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
             switch controller.phase {
@@ -280,7 +282,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 guard reconnectPolicies[id, default: .init()].beginRetry() else { continue }
                 reconnectJobs[id] = nil
             }
-            startConnection(id); slots -= 1
+            startConnection(id, preservingSuccessfulCandidate: sessions[id] != nil); slots -= 1
         }
     }
 

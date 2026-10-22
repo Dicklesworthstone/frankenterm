@@ -1042,8 +1042,19 @@ final class MobileWorkspaceModel {
         }
         credentialReviewID = nil; credentialMessage = nil
         busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
-        let job = Task { [weak self] in
-            guard let self else { return }
+        // Seal native attempt loops before the first actor hop. A refusal
+        // already returned by the manager must not authorize the next key
+        // while this confirmed revocation is waiting to persist.
+        let affectedBeforeWrite = Set(workspaces.compactMap { saved -> UUID? in
+            guard let document = try? saved.document(),
+                  document.credentials.contains(where: { $0.fingerprint == reviewed.fingerprint }) else { return nil }
+            return saved.id
+        })
+        let sealedOwners = liveScenes.values.filter { affectedBeforeWrite.contains($0.workspaceID) }
+        for owner in sealedOwners { owner.requestClose() }
+        // The admitted operation retains its owner until exact scene cleanup
+        // finishes, including when the review sheet or app scene disappears.
+        let job = Task { [self] in
             defer {
                 if self.credentialRevocation?.id == reviewed.id {
                     self.credentialRevocation = nil; self.busy = false
@@ -1066,7 +1077,9 @@ final class MobileWorkspaceModel {
                     self.unconfirmedCredentialRevocations.remove(receipt.fingerprint)
                 }
                 else { self.unconfirmedCredentialRevocations.insert(receipt.fingerprint) }
-                let owners = self.liveScenes.values.filter { receipt.affectedWorkspaceIDs.contains($0.workspaceID) }
+                var owners = sealedOwners
+                for owner in self.liveScenes.values where receipt.affectedWorkspaceIDs.contains(owner.workspaceID)
+                    && !owners.contains(where: { $0 === owner }) { owners.append(owner) }
                 for owner in owners { owner.requestClose() }
                 for owner in owners { await owner.close() }
                 let retained = await connections.manager.connections()
@@ -1084,6 +1097,7 @@ final class MobileWorkspaceModel {
                     catch { self.credentialMessage = (self.credentialMessage ?? "") + " Device status could not be refreshed: \(error.localizedDescription)" }
                 }
             } catch {
+                for owner in sealedOwners { await owner.close() }
                 self.credentialMessage = "Revocation could not be started. \(error.localizedDescription)"
             }
         }
@@ -2845,8 +2859,8 @@ private struct MachineWorkspaceView: View {
             guard let route = document.routes.first(where: { $0.id == id }),
                   route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
                   route.jumpRoutes.isEmpty, let readiness = local.routes.first(where: { $0.routeID == id }),
-                  readiness.issues.isEmpty, let credential = readiness.usableCredentialIDs.first else { continue }
-            routes.append(.init(id: id, credentialID: credential, host: route.host, port: route.port,
+                  readiness.issues.isEmpty, !readiness.usableCredentialIDs.isEmpty else { continue }
+            routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
                                 mux: route.mode == "frankenterm_mux"))
         }
         guard !routes.isEmpty else { return scene(nil) }
