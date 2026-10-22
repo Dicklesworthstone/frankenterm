@@ -201,6 +201,53 @@ public actor OfflineRestore<C: AirGapCryptography> {
         return status()
     }
 
+    /// Save opt-in FTDC ciphertext reconstruction state during collection,
+    /// including incomplete equations. Ordinary FTSC exports remain verified-
+    /// page-only. This does not enable automatic checkpoint persistence. The caller
+    /// owns explicit protected-file publication; this actor never writes a
+    /// transfer code, decoded archive, private key or recipient request secret.
+    /// A recipient-bound scan still needs its original in-memory request key:
+    /// a checkpoint cannot recover that key after this process terminates.
+    public func exportDecoderCheckpoint(generation token: UUID) throws -> Data {
+        try check(token)
+        guard phase == .collecting, source == .optical, let receiver else { throw FTError.stale }
+        let data = try receiver.decoderCheckpoint(using: crypto)
+        try Task.checkCancellation()
+        return data
+    }
+
+    /// An explicitly selected FTDC checkpoint resumes the same optical transfer,
+    /// never a decoded review or an approved installation. Publish atomically
+    /// only after validating every saved page and partial decoder. Failed input
+    /// leaves the current idle state and any recipient request unchanged.
+    @discardableResult
+    public func acceptDecoderCheckpoint(_ data: Data, generation token: UUID) throws -> OfflineRestoreStatus {
+        try check(token)
+        guard phase == .idle else { throw WorkspaceStoreError.busy }
+        let restored = try OpticalReceiver(decoderCheckpoint: data, using: crypto)
+        if let request = recipientSession?.request,
+           restored.identity.envelopeLength > request.maximumEnvelopeBytes {
+            throw FTError.limit("recipient.envelope_limit")
+        }
+        let completed: Data?
+        let mode: FTAGMode?
+        if restored.isComplete {
+            let bytes = try restored.envelope(using: crypto)
+            let header = try FTAGHeader(envelope: bytes)
+            try checkRecipientDestination(header, envelopeLength: bytes.count)
+            completed = bytes; mode = header.mode
+        } else { completed = nil; mode = nil }
+        try Task.checkCancellation()
+        identity = restored.identity; source = .optical; candidate = nil
+        receiver = completed == nil ? restored : nil
+        envelope = completed; encryptionMode = mode
+        phase = completed == nil ? .collecting : .locked
+        // An already queued camera callback from the file-selection screen may
+        // not mutate the newly selected transfer, even with the same identity.
+        generation = UUID()
+        return status()
+    }
+
     /// Export only hash-verified ciphertext pages from this active optical scan.
     /// The caller must separately obtain consent before persisting the result;
     /// this method never writes storage and returns nil before the first page.
