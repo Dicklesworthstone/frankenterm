@@ -128,3 +128,265 @@ private struct TerminalReadOnlyOutput: UIViewRepresentable {
     func updateUIView(_ view: NativeTerminalCopyTextView, context: Context) {}
     static func dismantleUIView(_ view: NativeTerminalCopyTextView, coordinator: ()) { view.clearSnapshot() }
 }
+
+/// Searches a machine's scrollback where it lives, on the machine's mux
+/// server: the whole history of the pane on screen, or of every pane at once,
+/// newest matches first. A match opens the rows around it; Show Pane puts
+/// that pane on screen.
+struct MuxSearchScreen: View {
+    let session: TerminalSessionController
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var scope = Scope.pane
+    @State private var caseSensitive = false
+    @State private var regex = false
+    @State private var typing: Task<Void, Never>?
+    @State private var opened: MuxSearchHit?
+
+    enum Scope: Hashable { case pane, machine }
+
+    private var state: TerminalMuxControl.State? { session.muxState }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let search = state?.search { results(search) } else { hint }
+            }
+            .listStyle(.plain)
+            .searchable(text: $text, placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: scope == .pane ? "Search this pane's history" : "Search every pane's history")
+            .searchScopes($scope) {
+                Text("This Pane").tag(Scope.pane)
+                Text("All Panes").tag(Scope.machine)
+            }
+            .textInputAutocapitalization(.never).autocorrectionDisabled()
+            .onSubmit(of: .search) { run(after: .zero) }
+            .onChange(of: text) { run(after: .milliseconds(350)) }
+            .onChange(of: scope) { run(after: .zero) }
+            .onChange(of: caseSensitive) { run(after: .zero) }
+            .onChange(of: regex) { run(after: .zero) }
+            .navigationTitle(session.target.machineName).navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Menu {
+                        Toggle("Match Case", systemImage: "textformat", isOn: $caseSensitive)
+                        Toggle("Regular Expression", systemImage: "asterisk", isOn: $regex)
+                    } label: { Label("Options", systemImage: "line.3.horizontal.decrease.circle") }
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+            .navigationDestination(item: $opened) { hit in
+                MuxSearchContextScreen(session: session, hit: hit, pane: pane(hit.pane)) { dismiss() }
+            }
+        }
+        .onDisappear { session.muxControl?.clearSearch(); typing?.cancel() }
+    }
+
+    private var hint: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Searches the full scrollback on \(session.target.machineName), not just what this phone has drawn.",
+                  systemImage: "magnifyingglass")
+            Text("Pick This Pane or All Panes above the results.").foregroundStyle(.secondary)
+        }
+        .font(.callout).listRowSeparator(.hidden).padding(.vertical, 8)
+    }
+
+    /// Runs the search `delay` after the last change to it; a new one replaces it.
+    private func run(after delay: Duration) {
+        typing?.cancel()
+        let query = text.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty, let control = session.muxControl, let state else {
+            session.muxControl?.clearSearch(); return
+        }
+        let panes: [Int]
+        switch scope {
+        case .pane: panes = state.shown.map { [$0] } ?? []
+        case .machine:
+            // The pane on screen answers first.
+            let all = state.panes.map(\.paneId)
+            if let shown = state.shown { panes = [shown] + all.filter { $0 != shown } } else { panes = all }
+        }
+        guard !panes.isEmpty else { return }
+        let request = TerminalMuxControl.SearchQuery(text: query, caseSensitive: caseSensitive, regex: regex)
+        typing = Task {
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled else { return }
+            control.search(request, panes: panes)
+        }
+    }
+
+    private func pane(_ id: Int) -> TerminalMuxPane? { state?.panes.first { $0.paneId == id } }
+
+    @ViewBuilder private func results(_ search: TerminalMuxControl.Search) -> some View {
+        let answered = search.panes.compactMap { id in search.results[id].map { (id, $0) } }
+        let total = answered.reduce(0) { $0 + $1.1.matches.count }
+        Section {
+            HStack(spacing: 8) {
+                if !search.pending.isEmpty { ProgressView().controlSize(.small) }
+                Text(summary(search, total: total)).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        ForEach(answered.filter { !$0.1.matches.isEmpty || $0.1.error != nil || search.panes.count == 1 }, id: \.0) { id, result in
+            Section {
+                if let error = result.error {
+                    Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
+                } else if result.matches.isEmpty {
+                    Text("No matches in the last \(result.searchedRows.formatted()) rows.").font(.callout).foregroundStyle(.secondary)
+                }
+                ForEach(result.matches) { match in
+                    Button { opened = MuxSearchHit(pane: id, match: match, query: search.query) } label: {
+                        MuxSearchMatchRow(match: match, query: search.query)
+                    }
+                }
+            } header: {
+                MuxPaneHeader(pane: pane(id), count: result.matches.count, shown: id == state?.shown)
+            }
+        }
+    }
+
+    private func summary(_ search: TerminalMuxControl.Search, total: Int) -> String {
+        let panes = search.panes.count == 1 ? "this pane" : "\(search.panes.count) panes"
+        if !search.pending.isEmpty {
+            return "Searching \(panes)… \(total) match\(total == 1 ? "" : "es") so far"
+        }
+        return total == 0 ? "No matches in \(panes)." : "\(total) match\(total == 1 ? "" : "es") in \(panes), newest first"
+    }
+}
+
+/// One match opened from the results.
+struct MuxSearchHit: Hashable, Identifiable {
+    let pane: Int
+    let match: TerminalMuxSearchMatch
+    let query: TerminalMuxControl.SearchQuery
+    var id: String { "\(pane):\(match.id)" }
+    static func == (a: Self, b: Self) -> Bool { a.id == b.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+private struct MuxPaneHeader: View {
+    let pane: TerminalMuxPane?
+    let count: Int
+    let shown: Bool
+    var body: some View {
+        HStack(spacing: 6) {
+            if shown { Image(systemName: "eye").accessibilityLabel("On screen") }
+            Text(verbatim: pane.map(Self.name) ?? "Closed pane").lineLimit(1)
+            Spacer()
+            Text("\(count)").monospacedDigit()
+        }
+    }
+    /// The project directory, then the program's title.
+    static func name(_ pane: TerminalMuxPane) -> String {
+        let directory = pane.workingDir.flatMap { URL(string: $0)?.lastPathComponent }.flatMap { $0.isEmpty || $0 == "/" ? nil : $0 }
+        let title = pane.title.trimmingCharacters(in: .whitespaces)
+        switch (directory, title.isEmpty) {
+        case let (directory?, false) where directory != title: return "\(directory) · \(title)"
+        case let (directory?, _): return directory
+        default: return title.isEmpty ? "Pane \(pane.paneId)" : title
+        }
+    }
+}
+
+/// A match's first row with the matched cells marked.
+private struct MuxSearchMatchRow: View {
+    let match: TerminalMuxSearchMatch
+    let query: TerminalMuxControl.SearchQuery
+    var body: some View {
+        Text(MuxSearchHighlight.marked(match.text.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? "",
+                                       from: match.startColumn, to: match.endRow == match.row ? match.endColumn : nil))
+            .font(.system(.footnote, design: .monospaced)).lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+enum MuxSearchHighlight {
+    /// `line` with cells `start..<end` marked (to the line's end without
+    /// `end`), and the long lead-in before a far-right match shortened.
+    static func marked(_ line: String, from start: Int, to end: Int?) -> AttributedString {
+        let characters = Array(line)
+        let lower = min(max(start, 0), characters.count)
+        let upper = min(max(end ?? characters.count, lower), characters.count)
+        let lead = lower > 24 ? "…" + String(characters[(lower - 20)..<lower]) : String(characters[..<lower])
+        var text = AttributedString(lead)
+        var hit = AttributedString(String(characters[lower..<upper]))
+        hit.backgroundColor = .yellow.opacity(0.45)
+        hit.font = .system(.footnote, design: .monospaced).bold()
+        text += hit
+        text += AttributedString(String(characters[upper...]))
+        return text
+    }
+}
+
+/// The rows around one match, read from the server, with the match's row
+/// marked. Copy takes them all; Show Pane puts the pane on screen.
+private struct MuxSearchContextScreen: View {
+    let session: TerminalSessionController
+    let hit: MuxSearchHit
+    let pane: TerminalMuxPane?
+    let close: () -> Void
+    @State private var copied = false
+
+    private var context: TerminalMuxControl.Context? {
+        session.muxState?.context.flatMap { $0.pane == hit.pane && $0.row == hit.match.row ? $0 : nil }
+    }
+
+    var body: some View {
+        ScrollViewReader { reader in
+            ScrollView([.vertical, .horizontal]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if let lines = context?.lines {
+                        if lines.isEmpty { Text("These rows are no longer on the machine.").padding() }
+                        ForEach(lines) { line in
+                            row(line).id(line.row)
+                        }
+                    } else {
+                        ProgressView("Reading the rows around it…").padding()
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+            .onChange(of: context?.lines?.count) {
+                reader.scrollTo(hit.match.row, anchor: .center)
+            }
+        }
+        .navigationTitle(pane.map(MuxPaneHeader.name) ?? "Pane \(hit.pane)").navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .bottomBar) {
+                Button(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc") { copy() }
+                    .disabled(context?.lines?.isEmpty ?? true)
+                Spacer()
+                Button("Show Pane", systemImage: "rectangle.portrait.and.arrow.right") {
+                    session.showPane(hit.pane); close()
+                }.buttonStyle(.borderedProminent)
+            }
+        }
+        .onAppear { session.muxControl?.readContext(pane: hit.pane, row: hit.match.row) }
+        .onDisappear { session.muxControl?.clearContext() }
+    }
+
+    @ViewBuilder private func row(_ line: TerminalMuxContextLine) -> some View {
+        let matched = line.row == hit.match.row
+        Group {
+            if matched {
+                Text(MuxSearchHighlight.marked(line.text, from: hit.match.startColumn,
+                                               to: hit.match.endRow == hit.match.row ? hit.match.endColumn : nil))
+            } else {
+                Text(verbatim: line.text.isEmpty ? " " : line.text)
+            }
+        }
+        .font(.system(.footnote, design: .monospaced))
+        .textSelection(.enabled)
+        .padding(.horizontal, 12).padding(.vertical, 1)
+        .frame(minWidth: 0, alignment: .leading)
+        .background(matched ? Color.accentColor.opacity(0.15) : .clear)
+    }
+
+    /// The rows as plain text; like other copies, it stays on this device and
+    /// expires after two minutes.
+    private func copy() {
+        guard let lines = context?.lines, !lines.isEmpty else { return }
+        UIPasteboard.general.setItems([["public.utf8-plain-text": lines.map(\.text).joined(separator: "\n")]],
+            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+        copied = true
+    }
+}

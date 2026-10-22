@@ -89,6 +89,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 return .paneTitle(paneID: paneID, title: String(decoding: payload, as: UTF8.self))
             case UInt32(FT_MUX_EVENT_PANE_GONE): return .paneGone(paneID: paneID)
             case UInt32(FT_MUX_EVENT_FAILED): return .failed(String(decoding: payload, as: UTF8.self))
+            case UInt32(FT_MUX_EVENT_SEARCH_RESULTS):
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                return .searchResults(paneID: paneID, try decoder.decode(TerminalMuxSearchResults.self, from: payload))
+            case UInt32(FT_MUX_EVENT_CONTEXT):
+                return .context(paneID: paneID, try JSONDecoder().decode(TerminalMuxContext.self, from: payload))
             default: throw TerminalModelError.invalid
             }
         }
@@ -121,4 +127,25 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     }
 
     public func restoreSize(pane: Int) throws { try call { ft_mux_v1_restore_size($0, UInt64(pane)) } }
+
+    public func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {
+        let bytes = Data(text.utf8)
+        guard (1...4096).contains(bytes.count) else { throw TerminalModelError.invalid }
+        let flags = (caseSensitive ? UInt32(FT_MUX_SEARCH_CASE_SENSITIVE) : 0) | (regex ? UInt32(FT_MUX_SEARCH_REGEX) : 0)
+        var search: UInt64 = 0
+        try bytes.withUnsafeBytes { buffer in
+            try call {
+                ft_mux_v1_search($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress,
+                                 UInt32(bytes.count), flags, &search)
+            }
+        }
+        return search
+    }
+
+    public func context(pane: Int, firstRow: Int64, count: Int) throws -> UInt64 {
+        guard (1...1000).contains(count) else { throw TerminalModelError.invalid }
+        var request: UInt64 = 0
+        try call { ft_mux_v1_context($0, UInt64(pane), firstRow, UInt32(count), &request) }
+        return request
+    }
 }

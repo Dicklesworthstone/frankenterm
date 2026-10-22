@@ -481,6 +481,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 }
 
+extension TerminalSessionController: Identifiable {}
+
 /// How a live scene reads and records theme picks; the workspace owns them.
 struct SceneThemeSource {
     let themes: @MainActor () -> MachineThemes?
@@ -520,6 +522,8 @@ struct WorkspaceTerminalScreen: View {
     @State private var pickingTheme = false
     @State private var historyInspection: TerminalHistoryInspection?
     @State private var retainedOutput: TerminalRetainedOutput?
+    /// A machine attached to its mux searches its panes' history on the server.
+    @State private var muxSearch: TerminalSessionController?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -561,6 +565,7 @@ struct WorkspaceTerminalScreen: View {
         }
         .toolbarBackground(background, for: .navigationBar)
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
+        .sheet(item: $muxSearch) { session in MuxSearchScreen(session: session) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
@@ -582,8 +587,11 @@ struct WorkspaceTerminalScreen: View {
                     Button("Return to Previous View", systemImage: "arrow.uturn.backward") { session.returnFromHistorySearch() }
                         .disabled(session.clipboardIsPresenting)
                 }
-                Button("Search Output", systemImage: "magnifyingglass") { historyInspection = session.inspectHistory() }
+                Button("Search Output", systemImage: "magnifyingglass") {
+                    if session.muxControl != nil { muxSearch = session } else { historyInspection = session.inspectHistory() }
+                }
                     .disabled(session.clipboardIsPresenting)
+                    .keyboardShortcut("f", modifiers: .command)
                     .accessibilityIdentifier("terminal.history.open")
                 Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
                     .disabled(session.clipboardIsPresenting)

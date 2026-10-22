@@ -403,6 +403,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var showing = false
         var segments: [Segment] = []
         var outgoing = Data()
+        /// The client's search and row-read ids, to the screen's requests.
+        var searches: [UInt64: (id: UUID, pane: Int)] = [:]
+        var contexts: [UInt64: UUID] = [:]
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry) {
             self.client = client; self.control = control; self.geometry = geometry
             queued = geometry; applied = geometry
@@ -535,6 +538,14 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
                 if state.shown == pane { state.shown = nil; state.showing = false }
+            case .searchResults(let pane, let results):
+                if let request = state.searches.removeValue(forKey: results.search) {
+                    state.control.deliver(search: request.id, pane: pane, results: results)
+                }
+            case .context(_, let context):
+                if let id = state.contexts.removeValue(forKey: context.request) {
+                    state.control.deliver(context: id, lines: context.lines)
+                }
             case .failed(let reason):
                 throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.failed(reason)
             }
@@ -560,6 +571,28 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         if state.shown == nil, let next = state.panes.first(where: \.isActive) ?? state.panes.first {
             state.shown = next.paneId; state.showing = false
             state.control.publish(shown: next.paneId)
+        }
+        // Searches run on the server, each pane's scrollback where it lives.
+        if let search = state.control.takeSearch() {
+            state.searches.removeAll()
+            for pane in search.panes {
+                do {
+                    let id = try state.client.search(pane: pane, text: search.query.text,
+                        caseSensitive: search.query.caseSensitive, regex: search.query.regex)
+                    state.searches[id] = (search.id, pane)
+                } catch {
+                    state.control.deliver(search: search.id, pane: pane, results: TerminalMuxSearchResults(
+                        search: 0, matches: [], searchedRows: 0, error: "The search could not be sent."))
+                }
+            }
+        }
+        if let context = state.control.takeContext() {
+            state.contexts.removeAll()
+            if let id = try? state.client.context(pane: context.pane, firstRow: max(context.first, 0), count: context.count) {
+                state.contexts[id] = context.id
+            } else {
+                state.control.deliver(context: context.id, lines: [])
+            }
         }
         guard let pane = state.shown else { return }
         let visible = state.control.current.visible

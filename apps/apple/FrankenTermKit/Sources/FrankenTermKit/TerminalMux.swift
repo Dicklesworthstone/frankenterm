@@ -31,6 +31,36 @@ public struct TerminalMuxPane: Decodable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// One scrollback match: from `startColumn` of `row` to `endColumn` of
+/// `endRow` (cells), with the text of the rows it spans.
+public struct TerminalMuxSearchMatch: Decodable, Equatable, Sendable, Identifiable {
+    public let row: Int64, startColumn: Int, endRow: Int64, endColumn: Int
+    public let text: String
+    public var id: String { "\(row):\(startColumn)" }
+}
+
+/// A pane's answer to a search: its newest matches, newest first.
+public struct TerminalMuxSearchResults: Decodable, Equatable, Sendable {
+    public let search: UInt64
+    public let matches: [TerminalMuxSearchMatch]
+    /// How many of the pane's newest rows were searched.
+    public let searchedRows: Int
+    public let error: String?
+    public init(search: UInt64, matches: [TerminalMuxSearchMatch], searchedRows: Int, error: String?) {
+        self.search = search; self.matches = matches; self.searchedRows = searchedRows; self.error = error
+    }
+}
+
+public struct TerminalMuxContextLine: Decodable, Equatable, Sendable, Identifiable {
+    public let row: Int64, text: String
+    public var id: Int64 { row }
+}
+
+public struct TerminalMuxContext: Decodable, Equatable, Sendable {
+    public let request: UInt64
+    public let lines: [TerminalMuxContextLine]
+}
+
 public enum TerminalMuxEvent: Equatable, Sendable {
     case ready(serverVersion: String)
     case panes([TerminalMuxPane])
@@ -38,6 +68,8 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case output(paneID: Int, rows: Int, columns: Int, bytes: Data)
     case paneTitle(paneID: Int, title: String)
     case paneGone(paneID: Int)
+    case searchResults(paneID: Int, TerminalMuxSearchResults)
+    case context(paneID: Int, TerminalMuxContext)
     /// The session is over; the channel must close.
     case failed(String)
 }
@@ -60,6 +92,12 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// Resizes the remote pane, remembering its size before the first resize.
     func resize(pane: Int, rows: Int, columns: Int) throws
     func restoreSize(pane: Int) throws
+    /// Searches the pane's scrollback on the server, newest rows first; a
+    /// `.searchResults` event with the returned id answers.
+    func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64
+    /// The text of the pane's rows `firstRow..<firstRow+count`; a `.context`
+    /// event with the returned id answers.
+    func context(pane: Int, firstRow: Int64, count: Int) throws -> UInt64
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
@@ -84,14 +122,40 @@ public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
 /// transport acts on its next service turn. Thread-safe; callbacks are
 /// invoked outside the lock.
 public final class TerminalMuxControl: @unchecked Sendable {
+    public struct SearchQuery: Equatable, Sendable {
+        public let text: String
+        public let caseSensitive: Bool, regex: Bool
+        public init(text: String, caseSensitive: Bool, regex: Bool) {
+            self.text = text; self.caseSensitive = caseSensitive; self.regex = regex
+        }
+    }
+    /// A search across some of the machine's panes, filling in as each answers.
+    public struct Search: Equatable, Sendable {
+        public let id: UUID
+        public let query: SearchQuery
+        public let panes: [Int]
+        /// Panes that have not answered yet.
+        public var pending: Set<Int>
+        public var results: [Int: TerminalMuxSearchResults] = [:]
+    }
+    /// Rows around one match, for reading it in place.
+    public struct Context: Equatable, Sendable {
+        public let id: UUID
+        public let pane: Int, row: Int64
+        public var lines: [TerminalMuxContextLine]?
+    }
     public struct State: Equatable, Sendable {
         public var panes: [TerminalMuxPane] = []
         public var shown: Int?
         public var visible = false
+        public var search: Search?
+        public var context: Context?
     }
     private let lock = NSLock()
     private var state = State()
     private var requested: Int?
+    private var pendingSearch: Search?
+    private var pendingContext: (id: UUID, first: Int64, count: Int)?
     private var waker: (@Sendable () -> Void)?
     private var observer: (@Sendable (State) -> Void)?
 
@@ -125,7 +189,74 @@ public final class TerminalMuxControl: @unchecked Sendable {
         wake?()
     }
 
+    /// Searches `panes` (the machine's, by id); `current.search` fills in as
+    /// each answers. A new search replaces the last one.
+    @discardableResult
+    public func search(_ query: SearchQuery, panes: [Int]) -> UUID {
+        let id = UUID()
+        let search = Search(id: id, query: query, panes: panes, pending: Set(panes))
+        update { state in state.search = search }
+        lock.withLock { pendingSearch = search }
+        wake()
+        return id
+    }
+
+    public func clearSearch() {
+        lock.withLock { pendingSearch = nil; pendingContext = nil }
+        update { state in state.search = nil; state.context = nil }
+    }
+
+    /// Reads the rows around `row` of `pane` into `current.context`.
+    public func readContext(pane: Int, row: Int64, before: Int = 12, after: Int = 12) {
+        let id = UUID(), first = row - Int64(max(before, 0))
+        update { state in state.context = Context(id: id, pane: pane, row: row, lines: nil) }
+        lock.withLock { pendingContext = (id, first, max(before, 0) + max(after, 0) + 1) }
+        wake()
+    }
+
+    public func clearContext() {
+        lock.withLock { pendingContext = nil }
+        update { state in state.context = nil }
+    }
+
+    private func update(_ change: (inout State) -> Void) {
+        let (notify, snapshot) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State) in
+            change(&state); return (observer, state)
+        }
+        notify?(snapshot)
+    }
+
+    private func wake() { lock.withLock { waker }?() }
+
     // MARK: transport side
+
+    /// The search to start, once.
+    public func takeSearch() -> Search? { lock.withLock { defer { pendingSearch = nil }; return pendingSearch } }
+
+    /// The rows to read, once: the context's id, pane, first row and count.
+    public func takeContext() -> (id: UUID, pane: Int, first: Int64, count: Int)? {
+        lock.withLock {
+            defer { pendingContext = nil }
+            guard let pending = pendingContext, let context = state.context, context.id == pending.id else { return nil }
+            return (pending.id, context.pane, pending.first, pending.count)
+        }
+    }
+
+    /// One pane's answer; answers to a replaced search are dropped.
+    public func deliver(search id: UUID, pane: Int, results: TerminalMuxSearchResults) {
+        update { state in
+            guard state.search?.id == id else { return }
+            state.search?.results[pane] = results
+            state.search?.pending.remove(pane)
+        }
+    }
+
+    public func deliver(context id: UUID, lines: [TerminalMuxContextLine]) {
+        update { state in
+            guard state.context?.id == id else { return }
+            state.context?.lines = lines
+        }
+    }
 
     public func setWaker(_ waker: (@Sendable () -> Void)?) { lock.withLock { self.waker = waker } }
 
@@ -158,6 +289,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
         let (notify, snapshot) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State) in
             state.panes.removeAll { $0.paneId == pane }
             if state.shown == pane { state.shown = nil }
+            state.search?.pending.remove(pane)
             return (observer, state)
         }
         notify?(snapshot)
