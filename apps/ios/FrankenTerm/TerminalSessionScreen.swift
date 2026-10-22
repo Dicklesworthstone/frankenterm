@@ -165,6 +165,10 @@ protocol TerminalSessionFocus: AnyObject {
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
     func detach(machineID: String, source: TerminalSource) async throws
     func inputRetired(machineID: String)
+    /// A tap on the terminal asked for the keyboard back.
+    func activateKeyboard() async
+    /// The user picked a text size on one terminal; every terminal follows.
+    func fontSizeChanged(_ size: Double)
 }
 
 /// Owns one direct-SSH connection, PTY, model and native display. Keyboard
@@ -545,6 +549,11 @@ final class TerminalSessionController {
             self.clipboard = clipboard; presenter.clipboard = clipboard
             clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
             view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
+            view.onKeyboardRequest = { [weak self] in
+                guard let focus = self?.focus else { return }
+                Task { await focus.activateKeyboard() }
+            }
+            view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
@@ -623,8 +632,15 @@ final class TerminalSessionController {
     static var renderConfiguration: NativeTerminalRenderConfiguration {
         var configuration = NativeTerminalRenderConfiguration()
         if UIFont(name: "PragmasevkaNF", size: 12) != nil { configuration.fontName = "PragmasevkaNF" }
+        let saved = UserDefaults.standard.double(forKey: fontSizeKey)
+        if NativeTerminalView.fontSizes.contains(saved) { configuration.fontPointSize = saved }
         return configuration
     }
+    /// The text size the user last chose, in points, for every terminal.
+    static let fontSizeKey = "terminal.fontPointSize"
+
+    /// Shows this terminal's text at `size` points.
+    func setFontSize(_ size: Double) { terminal?.setFontPointSize(size) }
 
     /// User-facing text: an error's own description when it has one.
     static func describe(_ error: any Error) -> String {
@@ -656,7 +672,10 @@ final class TerminalSessionController {
     private func propose(_ viewport: NativeTerminalViewport) {
         guard !stopped, phase == .live, let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
-              let columns = UInt32(exactly: viewport.columns), let rows = UInt32(exactly: viewport.rows),
+              let rows = UInt32(exactly: viewport.rows),
+              // The model keeps both screens and 256 history rows in 65536
+              // cells; a small font in landscape can fit more columns than that.
+              let columns = UInt32(exactly: min(viewport.columns, 65_536 / (viewport.rows * 2 + 256))),
               viewport.pixelWidth >= 0, viewport.pixelHeight >= 0,
               let geometry = try? TerminalSessionGeometry(columns: columns, rows: rows,
                   pixelWidth: UInt32(min(viewport.pixelWidth, 65_535)),

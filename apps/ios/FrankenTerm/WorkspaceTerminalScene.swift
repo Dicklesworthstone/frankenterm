@@ -464,6 +464,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         await owner.joinSealed()
     }
 
+    func fontSizeChanged(_ size: Double) {
+        UserDefaults.standard.set(size, forKey: TerminalSessionController.fontSizeKey)
+        for session in sessions.values { session.setFontSize(size) }
+    }
+
     func inputRetired(machineID: String) {
         // A handoff retires the old keyboard itself and reports it synchronously;
         // sealing then would invalidate the switch in flight. Only a settled
@@ -582,9 +587,15 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.clipboardIsPresenting)
             }
             Menu {
-                if let session = scene.selectedSession, session.phase == .live, session.terminal != nil {
+                if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
                         .disabled(session.clipboardIsPresenting)
+                    // Pinching the terminal does the same.
+                    Menu("Text Size", systemImage: "textformat.size") {
+                        Button("Bigger", systemImage: "plus.magnifyingglass") { terminal.biggerText() }
+                        Button("Smaller", systemImage: "minus.magnifyingglass") { terminal.smallerText() }
+                        Button("Actual Size", systemImage: "1.magnifyingglass") { terminal.actualSize() }
+                    }
                 }
                 if themes != nil, machine != nil {
                     Button("Theme…", systemImage: "paintpalette") { pickingTheme = true }
@@ -946,6 +957,8 @@ private final class WorkspaceCanvasView: UIView, UIGestureRecognizerDelegate {
     required init?(coder: NSCoder) { nil }
 
     @objc private func tapped() {
+        // A live terminal handles its own taps: the keyboard, a selection.
+        guard scene?.selectedSession?.terminal == nil else { return }
         Task { [weak scene] in await scene?.activateKeyboard() }
     }
 

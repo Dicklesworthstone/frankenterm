@@ -95,7 +95,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var controlButton: UIButton?
     private var altButton: UIButton?
     private var terminalButtons: [UIButton] = []
+    private var dismissButton: UIButton?
+    private weak var accessoryBar: UIView?
+    private var theme: TerminalChromeTheme?
     private lazy var accessory = makeAccessory()
+    /// Copy (⌘C or the edit menu) of the terminal's own selection, which the
+    /// owning view keeps; this responder's document holds only composition.
+    public var canCopySelection: (@MainActor () -> Bool)?
+    public var copySelection: (@MainActor () -> Void)?
 
     public init(session: TerminalKeyboardSession) throws {
         self.session = session
@@ -495,8 +502,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         }
         // Terminal transcript selection/copy belongs to the semantic renderer,
         // not this deliberately empty local text document.
+        if action == #selector(copy(_:)) { return canCopySelection?() == true }
         return false
     }
+    public override func copy(_ sender: Any?) { copySelection?() }
     public override func paste(_ sender: Any?) {
         guard !retiring, hasGeometry, session.acceptsPaste, onPasteReview != nil, pendingPaste == nil,
               UIPasteboard.general.numberOfItems == 1, UIPasteboard.general.hasStrings else { return }
@@ -521,63 +530,112 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         if pendingPaste?.id == id { pendingPaste = nil }
     }
 
+    /// A row of keycaps over the keyboard in the terminal's own colors: the
+    /// keys a terminal needs that the software keyboard lacks, and, pinned at
+    /// the right edge, the key that puts the keyboard away.
     private func makeAccessory() -> UIInputView {
-        let view = UIInputView(frame: CGRect(x: 0, y: 0, width: 0, height: 48), inputViewStyle: .keyboard)
+        let view = UIInputView(frame: CGRect(x: 0, y: 0, width: 0, height: 50), inputViewStyle: .default)
         view.autoresizingMask = [.flexibleWidth]
+        accessoryBar = view
         let scroll = UIScrollView(); scroll.showsHorizontalScrollIndicator = false
-        let row = UIStackView(); row.axis = .horizontal; row.spacing = 5
+        let row = UIStackView(); row.axis = .horizontal; row.spacing = 6
         scroll.translatesAutoresizingMaskIntoConstraints = false; row.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scroll); scroll.addSubview(row)
+        func key(_ title: String?, symbol: String? = nil, label: String, action: @escaping @MainActor () -> Void) -> UIButton {
+            let value = UIButton(type: .system)
+            var configuration = UIButton.Configuration.filled()
+            configuration.title = title
+            configuration.image = symbol.map { UIImage(systemName: $0) } ?? nil
+            configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+            configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+                var attributes = attributes
+                attributes.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+                return attributes
+            }
+            configuration.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11)
+            configuration.background.cornerRadius = 8
+            configuration.cornerStyle = .fixed
+            value.configuration = configuration
+            value.accessibilityLabel = label
+            value.widthAnchor.constraint(greaterThanOrEqualToConstant: 42).isActive = true
+            value.addAction(UIAction { _ in action() }, for: .touchUpInside)
+            return value
+        }
+        let dismiss = key(nil, symbol: "keyboard.chevron.compact.down", label: "Hide keyboard") { [weak self] in
+            self?.retire()
+        }
+        dismiss.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(dismiss)
+        dismissButton = dismiss
         NSLayoutConstraint.activate([
+            dismiss.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -6),
+            dismiss.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            dismiss.heightAnchor.constraint(equalToConstant: 38),
             scroll.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: dismiss.leadingAnchor, constant: -4),
             scroll.topAnchor.constraint(equalTo: view.topAnchor), scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 6),
             row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -6),
-            row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 2),
-            row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -2),
-            row.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor, constant: -4)
+            row.centerYAnchor.constraint(equalTo: scroll.frameLayoutGuide.centerYAnchor),
+            row.topAnchor.constraint(greaterThanOrEqualTo: scroll.contentLayoutGuide.topAnchor),
+            row.heightAnchor.constraint(equalToConstant: 38)
         ])
-        func button(_ title: String, label: String, action: @escaping @MainActor () -> Void) -> UIButton {
-            let value = UIButton(type: .system)
-            var configuration = UIButton.Configuration.gray(); configuration.title = title
-            configuration.cornerStyle = .medium; value.configuration = configuration
-            value.accessibilityLabel = label
-            value.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
-            value.addAction(UIAction { _ in action() }, for: .touchUpInside)
-            row.addArrangedSubview(value); return value
-        }
-        controlButton = button("Ctrl", label: "Control modifier") { [weak self] in
+        func add(_ button: UIButton) -> UIButton { row.addArrangedSubview(button); return button }
+        controlButton = add(key("ctrl", label: "Control modifier") { [weak self] in
             guard let self, self.isEditable, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleControl(); self.updateAccessory()
-        }
-        altButton = button("Alt", label: "Alt modifier") { [weak self] in
+        })
+        altButton = add(key("alt", label: "Alt modifier") { [weak self] in
             guard let self, self.isEditable, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleAlt(); self.updateAccessory()
-        }
-        for (title, label, usage) in [("Esc", "Escape", UInt16(0x29)), ("Tab", "Tab", 0x2B),
-                                      ("←", "Left arrow", 0x50), ("↓", "Down arrow", 0x51),
-                                      ("↑", "Up arrow", 0x52), ("→", "Right arrow", 0x4F)] {
-            terminalButtons.append(button(title, label: label) { [weak self] in
+        })
+        for (title, symbol, label, usage) in [("esc", nil, "Escape", UInt16(0x29)), ("tab", nil, "Tab", 0x2B),
+                                              (nil, "arrow.left", "Left arrow", 0x50), (nil, "arrow.down", "Down arrow", 0x51),
+                                              (nil, "arrow.up", "Up arrow", 0x52), (nil, "arrow.right", "Right arrow", 0x4F)] {
+            terminalButtons.append(add(key(title, symbol: symbol, label: label) { [weak self] in
                 guard let self else { return }
                 self.mutate {
                     try self.session.key(TerminalHardwareKey(usage: usage, modifiers: self.accessoryModifiers.modifiers), phase: .press)
                     self.accessoryModifiers.consume()
                 }
-            })
+            }))
         }
-        _ = button("⌄", label: "Dismiss keyboard") { [weak self] in self?.retire() }
+        // Characters a shell wants that hide on the keyboard's second pages.
+        for character in ["~", "|", "/", "-"] {
+            terminalButtons.append(add(key(character, label: character) { [weak self] in self?.insertText(character) }))
+        }
         updateAccessory(); return view
     }
+
+    /// Colors the key row from the terminal's theme; the row keeps the
+    /// system's colors until the first frame names one.
+    public func applyTheme(_ theme: TerminalChromeTheme) {
+        guard self.theme != theme else { return }
+        self.theme = theme
+        updateAccessory()
+    }
+
     private func updateAccessory() {
         let enabled = !retiring && hasGeometry && session.acceptsInput && !session.document.isMarked
-        for button in terminalButtons { button.isEnabled = enabled }
+        accessoryBar?.backgroundColor = theme.map { $0.tint(0.06) } ?? .secondarySystemBackground
+        let cap = theme.map { $0.tint(0.2) } ?? .secondarySystemFill
+        let text = theme?.foreground ?? .label
+        let accent = theme?.accent ?? .tintColor
+        func style(_ button: UIButton?, active: Bool = false) {
+            button?.configuration?.baseBackgroundColor = active ? accent : cap
+            button?.configuration?.baseForegroundColor = active ? TerminalChromeTheme.label(on: accent) : text
+        }
+        for button in terminalButtons { button.isEnabled = enabled; style(button) }
+        style(dismissButton)
         func update(_ button: UIButton?, _ state: TerminalAccessoryModifiers.State) {
             button?.isEnabled = enabled
             button?.isSelected = state != .off
             button?.accessibilityValue = switch state { case .off: "Off"; case .oneShot: "Next key"; case .locked: "Locked" }
-            button?.configuration?.baseBackgroundColor = state == .off ? nil : UIColor.systemBlue
-            button?.configuration?.subtitle = state == .locked ? "Locked" : nil
+            style(button, active: state != .off)
+            // A locked modifier stays on until tapped again; show the lock.
+            button?.configuration?.image = state == .locked ? UIImage(systemName: "lock.fill") : nil
+            button?.configuration?.imagePlacement = .trailing
+            button?.configuration?.imagePadding = 4
         }
         update(controlButton, accessoryModifiers.control); update(altButton, accessoryModifiers.alt)
     }
@@ -715,6 +773,38 @@ public final class NativeTerminalView: UIView {
     private var hasActivated = false
     private var sceneActive = false
 
+    /// A tap on the terminal while the keyboard is down: the owner brings a
+    /// keyboard back (a tap while it is up puts it away).
+    public var onKeyboardRequest: (@MainActor () -> Void)?
+    /// The user changed the text size (pinch or ⌘+ / ⌘- / ⌘0); the owner keeps
+    /// it for this terminal's later sessions and the others.
+    public var onFontSizeChange: (@MainActor (Double) -> Void)?
+    /// Text sizes a pinch or key command can reach.
+    public static let fontSizes: ClosedRange<Double> = 9...30
+    /// The selected cells, by stable row; nil when nothing is selected.
+    public private(set) var selection: TerminalTextSelection?
+    public var fontPointSize: Double { renderer.configuration.fontPointSize }
+
+    private let selectionOverlay = NativeTerminalSelectionOverlay()
+    private let sizeBadge = UILabel()
+    private lazy var editMenu = UIEditMenuInteraction(delegate: self)
+    private let feedback = UISelectionFeedbackGenerator()
+    /// Rows the selection has covered while on screen, so it copies whole
+    /// even after they scroll away. Bounded by TerminalTextSelection.maximumRows.
+    private var selectionRows: [Int64: TerminalRenderRow] = [:]
+    /// What a long press or handle drag is extending, and from where.
+    private enum SelectionDrag { case word(TerminalTextSelection), handle(fixed: TerminalGridPoint, offset: CGPoint) }
+    private var drag: SelectionDrag?
+    private var dragPoint = CGPoint.zero
+    private var autoScroll: Timer?
+    private var theme: TerminalChromeTheme?
+    private var themedPalette: UInt64?
+    private var momentum: CADisplayLink?
+    private var momentumVelocity = 0.0, momentumTop = 0.0, momentumTime: CFTimeInterval = 0
+    private var momentumHistory: TerminalRenderHistory?
+    private var pinchStart: Double?
+    private var pinchApplied: CFTimeInterval = 0
+
     public init(session: TerminalKeyboardSession, bundle: Bundle = .main,
                 configuration: NativeTerminalRenderConfiguration = .init()) async throws {
         guard let source = session.originalFocus.source, session.acceptsInput else {
@@ -734,11 +824,31 @@ public final class NativeTerminalView: UIView {
         clipsToBounds = true
         renderer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         input.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        addSubview(renderer); addSubview(input)
+        addSubview(renderer); addSubview(input); addSubview(selectionOverlay)
         bindInput()
+        // One finger drags through history with momentum; a trackpad or
+        // mouse wheel scrolls it too.
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
         pan.maximumNumberOfTouches = 1; pan.delegate = panDelegate
+        pan.allowedScrollTypesMask = .all
         addGestureRecognizer(pan)
+        // Press and hold selects a word; keep dragging to select more.
+        let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
+        press.minimumPressDuration = 0.35
+        addGestureRecognizer(press)
+        // A tap clears a selection, else shows or hides the keyboard.
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
+        for handle in [selectionOverlay.startHandle, selectionOverlay.endHandle] {
+            handle.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handleDragged(_:))))
+        }
+        addInteraction(editMenu)
+        sizeBadge.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        sizeBadge.textAlignment = .center; sizeBadge.textColor = .white
+        sizeBadge.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        sizeBadge.layer.cornerRadius = 12; sizeBadge.layer.masksToBounds = true
+        sizeBadge.alpha = 0; sizeBadge.isUserInteractionEnabled = false
+        addSubview(sizeBadge)
         var button = UIButton.Configuration.filled()
         button.image = UIImage(systemName: "arrow.down.to.line"); button.cornerStyle = .capsule
         liveButton.configuration = button
@@ -749,6 +859,7 @@ public final class NativeTerminalView: UIView {
         renderer.onFrameAdmitted = { [weak self] frame in
             guard let self, !self.retired else { return }
             self.liveButton.isHidden = frame.isLive
+            self.frameAdmitted(frame)
         }
         renderer.onFailure = { [weak self] error in
             guard let self, !self.retired else { return }
@@ -797,6 +908,9 @@ public final class NativeTerminalView: UIView {
             self.onFailure?(error)
         }
         bindPasteReview()
+        input.canCopySelection = { [weak self] in self?.selection != nil }
+        input.copySelection = { [weak self] in self?.copySelection() }
+        if let theme { input.applyTheme(theme) }
         input.onRetired = { [weak self] in
             guard let self, !self.retired else { return }
             self.wantsKeyboard = false
@@ -829,20 +943,305 @@ public final class NativeTerminalView: UIView {
     }
     @objc private func panned(_ pan: UIPanGestureRecognizer) {
         guard !retired else { return }
+        let rowHeight = renderer.cellSize?.height ?? 0
         switch pan.state {
         case .began:
+            stopMomentum()
             lastHistoryRequest = nil
             guard let frame = renderer.admittedFrame, let history = frame.history,
                   history.first < history.live else { panAnchor = nil; return }
             panAnchor = (frame.viewportFirst, history)
         case .changed:
-            guard let anchor = panAnchor, let rows = renderer.admittedFrame?.rows, rows > 0,
-                  bounds.height > 0 else { return }
+            guard let anchor = panAnchor, rowHeight > 0 else { return }
             // Dragging down reveals older rows above, one row per row height.
-            let moved = pan.translation(in: self).y / (bounds.height / CGFloat(rows))
+            let moved = pan.translation(in: self).y / rowHeight
             requestHistory(top: anchor.top - Int64(moved.rounded(.towardZero)), within: anchor.history)
+        case .ended:
+            // A flick keeps going and slows like any iOS list.
+            if let anchor = panAnchor, rowHeight > 0 {
+                let top = Double(anchor.top) - Double(pan.translation(in: self).y / rowHeight)
+                startMomentum(top: top, velocity: Double(pan.velocity(in: self).y / rowHeight), history: anchor.history)
+            }
+            panAnchor = nil
         default: panAnchor = nil
         }
+    }
+
+    // MARK: Momentum
+
+    /// The display link's target, on the main run loop; it holds the view weakly.
+    @MainActor
+    private final class Ticker: NSObject {
+        weak var view: NativeTerminalView?
+        @objc func tick(_ link: CADisplayLink) { view?.momentumTick(link) }
+    }
+
+    /// `velocity` is rows per second, positive toward older rows.
+    private func startMomentum(top: Double, velocity: Double, history: TerminalRenderHistory) {
+        stopMomentum()
+        guard abs(velocity) > 4 else { return }
+        momentumTop = top; momentumVelocity = velocity; momentumHistory = history
+        momentumTime = CACurrentMediaTime()
+        let ticker = Ticker(); ticker.view = self
+        let link = CADisplayLink(target: ticker, selector: #selector(Ticker.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        momentum = link
+    }
+
+    private func stopMomentum() {
+        momentum?.invalidate(); momentum = nil; momentumHistory = nil
+    }
+
+    fileprivate func momentumTick(_ link: CADisplayLink) {
+        guard !retired, let history = momentumHistory else { stopMomentum(); return }
+        let now = link.timestamp, elapsed = min(max(now - momentumTime, 0), 1.0 / 30)
+        momentumTime = now
+        momentumTop -= momentumVelocity * elapsed
+        // UIScrollView's normal deceleration: 0.998 per millisecond.
+        momentumVelocity *= pow(0.998, elapsed * 1000)
+        let clamped = min(max(momentumTop, Double(history.first)), Double(history.live))
+        requestHistory(top: Int64(clamped.rounded()), within: history)
+        if abs(momentumVelocity) < 2 || clamped != momentumTop { stopMomentum() }
+    }
+
+    // MARK: Taps, text size
+
+    @objc private func tapped() {
+        guard !retired else { return }
+        stopMomentum()
+        if selection != nil { clearSelection(); return }
+        if input.isFirstResponder { input.retire() } else { onKeyboardRequest?() }
+    }
+
+    @objc private func pinched(_ pinch: UIPinchGestureRecognizer) {
+        guard !retired else { return }
+        switch pinch.state {
+        case .began:
+            stopMomentum(); clearSelection()
+            pinchStart = fontPointSize
+        case .changed:
+            guard let start = pinchStart else { return }
+            let size = Self.clampedFontSize(start * Double(pinch.scale))
+            showSizeBadge(size)
+            // Each size change re-lays out the terminal (and resizes the remote
+            // pane); a few per second keep the pinch live without a storm.
+            let now = CACurrentMediaTime()
+            if now - pinchApplied > 0.12 { pinchApplied = now; applyFontSize(size, notify: false) }
+        case .ended:
+            if let start = pinchStart { applyFontSize(start * Double(pinch.scale), notify: true) }
+            pinchStart = nil; hideSizeBadge()
+        default:
+            pinchStart = nil; hideSizeBadge()
+        }
+    }
+
+    private static func clampedFontSize(_ size: Double) -> Double {
+        let half = (size * 2).rounded() / 2
+        return min(max(half, fontSizes.lowerBound), fontSizes.upperBound)
+    }
+
+    /// Shows this terminal's text at `size` points (half-point steps within
+    /// `fontSizes`); the owner applies the cells that now fit, as on rotation.
+    public func setFontPointSize(_ size: Double) { applyFontSize(size, notify: false) }
+
+    private func applyFontSize(_ size: Double, notify: Bool) {
+        guard !retired else { return }
+        let clamped = Self.clampedFontSize(size)
+        var configuration = renderer.configuration
+        if configuration.fontPointSize != clamped {
+            clearSelection()
+            configuration.fontPointSize = clamped
+            configuration.fontRevision += 1
+            do { try renderer.updateConfiguration(configuration) } catch { onFailure?(error) }
+        }
+        if notify { onFontSizeChange?(clamped) }
+    }
+
+    private func showSizeBadge(_ size: Double) {
+        sizeBadge.text = size == size.rounded() ? "\(Int(size)) pt" : String(format: "%.1f pt", size)
+        bringSubviewToFront(sizeBadge)
+        UIView.animate(withDuration: 0.12) { self.sizeBadge.alpha = 1 }
+    }
+    private func hideSizeBadge() {
+        UIView.animate(withDuration: 0.4, delay: 0.5) { self.sizeBadge.alpha = 0 }
+    }
+
+    public override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(title: "Bigger Text", action: #selector(biggerText), input: "+", modifierFlags: .command),
+         UIKeyCommand(input: "=", modifierFlags: .command, action: #selector(biggerText)),
+         UIKeyCommand(title: "Smaller Text", action: #selector(smallerText), input: "-", modifierFlags: .command),
+         UIKeyCommand(title: "Actual Size", action: #selector(actualSize), input: "0", modifierFlags: .command)]
+    }
+    @objc public func biggerText() { applyFontSize(fontPointSize + 1, notify: true) }
+    @objc public func smallerText() { applyFontSize(fontPointSize - 1, notify: true) }
+    @objc public func actualSize() { applyFontSize(NativeTerminalRenderConfiguration().fontPointSize, notify: true) }
+
+    // MARK: Selection
+
+    /// The cell under `point`, by stable row; points past the edges clamp.
+    private func gridPoint(at point: CGPoint) -> TerminalGridPoint? {
+        guard let frame = renderer.admittedFrame, let cell = renderer.cellSize,
+              cell.width > 0, cell.height > 0, !frame.lines.isEmpty else { return nil }
+        let column = min(max(Int(point.x / cell.width), 0), frame.columns - 1)
+        let index = min(max(Int(point.y / cell.height), 0), frame.lines.count - 1)
+        return TerminalGridPoint(row: frame.lines[index].stableIndex, column: column)
+    }
+
+    @objc private func pressed(_ press: UILongPressGestureRecognizer) {
+        guard !retired else { return }
+        let point = press.location(in: self)
+        dragPoint = point
+        switch press.state {
+        case .began:
+            stopMomentum()
+            guard let grid = gridPoint(at: point), let frame = renderer.admittedFrame,
+                  let row = frame.lines.first(where: { $0.stableIndex == grid.row }) else { return }
+            editMenu.dismissMenu()
+            let word = TerminalTextSelection.word(at: grid.column, in: row, columns: frame.columns)
+            drag = .word(word)
+            setSelection(word)
+            feedback.selectionChanged()
+            startAutoScroll()
+        case .changed:
+            extendDrag()
+        case .ended:
+            finishDrag()
+        default:
+            finishDrag()
+        }
+    }
+
+    @objc private func handleDragged(_ pan: UIPanGestureRecognizer) {
+        guard !retired, let handle = pan.view as? NativeTerminalSelectionOverlay.SelectionHandle,
+              let current = selection, let cell = renderer.cellSize, let frame = renderer.admittedFrame else { return }
+        let point = pan.location(in: self)
+        dragPoint = point
+        switch pan.state {
+        case .began:
+            editMenu.dismissMenu()
+            // Keep the finger's offset from the cell it grabbed, so the end
+            // under the knob does not jump to the knob's position.
+            let moving = handle.atStart ? current.start : current.end
+            let index = frame.lines.firstIndex { $0.stableIndex == moving.row } ?? 0
+            let center = CGPoint(x: (CGFloat(moving.column) + 0.5) * cell.width, y: (CGFloat(index) + 0.5) * cell.height)
+            drag = .handle(fixed: handle.atStart ? current.end : current.start,
+                           offset: CGPoint(x: center.x - point.x, y: center.y - point.y))
+            startAutoScroll()
+        case .changed: extendDrag()
+        default: finishDrag()
+        }
+    }
+
+    private func extendDrag() {
+        guard let drag else { return }
+        switch drag {
+        case .word(let word):
+            guard let grid = gridPoint(at: dragPoint) else { return }
+            let next = grid < word.start ? TerminalTextSelection(grid, word.end)
+                                         : TerminalTextSelection(word.start, max(grid, word.end))
+            if next != selection { setSelection(next); feedback.selectionChanged() }
+        case let .handle(fixed, offset):
+            guard let grid = gridPoint(at: CGPoint(x: dragPoint.x + offset.x, y: dragPoint.y + offset.y)) else { return }
+            let next = TerminalTextSelection(fixed, grid)
+            if next != selection { setSelection(next); feedback.selectionChanged() }
+        }
+    }
+
+    private func finishDrag() {
+        autoScroll?.invalidate(); autoScroll = nil
+        guard drag != nil else { return }
+        drag = nil
+        showEditMenu()
+    }
+
+    /// Holding a selection drag near the top or bottom edge scrolls history,
+    /// and the selection follows the rows that pass under the finger.
+    private func startAutoScroll() {
+        autoScroll?.invalidate()
+        autoScroll = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.autoScrollTick() }
+        }
+    }
+    private func autoScrollTick() {
+        guard drag != nil, let cell = renderer.cellSize else { return }
+        let edge = max(cell.height, 24)
+        if dragPoint.y < edge { scrollHistory(byRows: -1) }
+        else if dragPoint.y > bounds.height - edge { scrollHistory(byRows: 1) }
+    }
+
+    private func setSelection(_ value: TerminalTextSelection?) {
+        selection = value
+        if value == nil { selectionRows.removeAll() } else { captureSelectionRows() }
+        drawSelection()
+    }
+
+    public func clearSelection() {
+        guard selection != nil || drag != nil else { return }
+        drag = nil; autoScroll?.invalidate(); autoScroll = nil
+        editMenu.dismissMenu()
+        setSelection(nil)
+    }
+
+    /// Selects every row on screen.
+    public func selectScreen() {
+        guard let frame = renderer.admittedFrame, let first = frame.lines.first, let last = frame.lines.last else { return }
+        setSelection(TerminalTextSelection(TerminalGridPoint(row: first.stableIndex, column: 0),
+                                           TerminalGridPoint(row: last.stableIndex, column: frame.columns - 1)))
+        showEditMenu()
+    }
+
+    /// Copies the selected text as it reads on screen, then clears the
+    /// selection. Like the Select Output panel's copies, it stays on this
+    /// device and expires after two minutes.
+    public func copySelection() {
+        guard let selection, let frame = renderer.admittedFrame else { return }
+        captureSelectionRows()
+        let text = selection.text(rows: selectionRows, columns: frame.columns)
+        guard !text.isEmpty, text.utf8.count <= 1 << 20 else { return }
+        UIPasteboard.general.setItems([["public.utf8-plain-text": text]],
+            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        clearSelection()
+    }
+
+    private func captureSelectionRows() {
+        guard let selection, let frame = renderer.admittedFrame else { return }
+        for row in frame.lines where row.stableIndex >= selection.start.row && row.stableIndex <= selection.end.row {
+            selectionRows[row.stableIndex] = row
+        }
+        if selectionRows.count > Int(TerminalTextSelection.maximumRows) {
+            selectionRows = selectionRows.filter { $0.key >= selection.start.row && $0.key <= selection.end.row }
+        }
+    }
+
+    private func drawSelection() {
+        selectionOverlay.show(selection, frame: renderer.admittedFrame, cell: renderer.cellSize,
+                              tint: theme?.accent ?? tintColor)
+    }
+
+    private func showEditMenu() {
+        guard selection != nil, let bounds = selectionOverlay.selectionBounds else { return }
+        let visible = bounds.intersection(self.bounds)
+        let anchor = visible.isNull ? CGPoint(x: self.bounds.midX, y: self.bounds.midY) : CGPoint(x: visible.midX, y: visible.minY)
+        editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: anchor))
+    }
+
+    /// Each admitted frame recolors the chrome when the palette changed, and
+    /// moves a selection with its rows as output or scrolling shifts them.
+    private func frameAdmitted(_ frame: TerminalRenderFrame) {
+        if themedPalette != frame.paletteRevision || theme == nil, let next = TerminalChromeTheme(frame: frame) {
+            themedPalette = frame.paletteRevision
+            if next != theme {
+                theme = next
+                input.applyTheme(next)
+                liveButton.configuration?.baseBackgroundColor = next.accent
+                liveButton.configuration?.baseForegroundColor = TerminalChromeTheme.label(on: next.accent)
+            }
+        }
+        guard selection != nil else { return }
+        captureSelectionRows()
+        if drag != nil { extendDrag() }
+        drawSelection()
     }
     private func bindPasteReview() {
         guard !retired, onPasteReview != nil else {
@@ -857,8 +1256,10 @@ public final class NativeTerminalView: UIView {
     }
     public override func layoutSubviews() {
         super.layoutSubviews()
-        renderer.frame = bounds; input.frame = bounds
+        renderer.frame = bounds; input.frame = bounds; selectionOverlay.frame = bounds
         liveButton.frame = CGRect(x: bounds.maxX - 60, y: bounds.maxY - 60, width: 48, height: 48)
+        sizeBadge.frame = CGRect(x: bounds.midX - 50, y: bounds.midY - 20, width: 100, height: 40)
+        drawSelection()
     }
     public override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -913,7 +1314,7 @@ public final class NativeTerminalView: UIView {
         replacement.frame = bounds
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
         input.removeFromSuperview(); input = replacement
-        bindInput(); insertSubview(replacement, belowSubview: liveButton)
+        bindInput(); insertSubview(replacement, aboveSubview: renderer)
     }
     public func confirmPaste(id: UUID) throws {
         guard !retired else { throw TerminalInputError.unavailable }
@@ -924,12 +1325,33 @@ public final class NativeTerminalView: UIView {
     /// owner separately closes its channel and settles admitted input receipts.
     public func retire() {
         guard !retired else { return }
+        clearSelection(); stopMomentum()
+        onKeyboardRequest = nil; onFontSizeChange = nil
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
+        input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
         onHistoryViewportRequest = nil; liveButton.isHidden = true
         renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil
         renderer.onCaretUnavailable = nil; renderer.onViewportChange = nil; onViewportChange = nil
         input.retire(); renderer.retire()
+    }
+}
+
+/// The selection's menu: Copy, or select the whole screen.
+extension NativeTerminalView: @preconcurrency UIEditMenuInteractionDelegate {
+    public func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                                    suggestedActions: [UIMenuElement]) -> UIMenu? {
+        guard selection != nil else { return nil }
+        return UIMenu(children: [
+            UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
+            UIAction(title: "Select All", image: UIImage(systemName: "selection.pin.in.out")) { [weak self] _ in
+                self?.selectScreen()
+            }
+        ])
+    }
+    public func editMenuInteraction(_ interaction: UIEditMenuInteraction,
+                                    targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
+        selectionOverlay.selectionBounds?.intersection(bounds) ?? .null
     }
 }
 

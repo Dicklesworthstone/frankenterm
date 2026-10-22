@@ -109,6 +109,9 @@ public final class NativeTerminalRenderView: MTKView {
 
     /// The last admitted frame: what is shown, or about to be.
     public var admittedFrame: TerminalRenderFrame? { latest }
+    /// One cell in points at the current font, once a frame has been laid
+    /// out. Cells start at the view's top-left corner.
+    public private(set) var cellSize: CGSize?
 
     /// The last admitted screen, read on demand so steady output costs nothing.
     public override var accessibilityValue: String? {
@@ -261,6 +264,7 @@ public final class NativeTerminalRenderView: MTKView {
                             self.startPreparation(); return
                         }
                         self.prepared = frame
+                        self.cellSize = frame.cellSize
                         let proposal = NativeTerminalViewport(source: self.source, revision: generation,
                             columns: frame.fittingColumns, rows: frame.fittingRows,
                             pixelWidth: frame.viewport.x, pixelHeight: frame.viewport.y)
@@ -566,6 +570,8 @@ private struct NativePreparedTerminalFrame: @unchecked Sendable {
     let fontName: String
     let fontPointSize: CGFloat
     let fittingColumns: Int, fittingRows: Int
+    /// One cell in points; cells start at the view's top-left corner.
+    let cellSize: CGSize
 }
 
 private enum NativeTerminalPreparationResult: Sendable {
@@ -792,7 +798,8 @@ private final class NativeTerminalFrameBuilder {
             clear: uniform.clear.linearPremultiplied, caret: caret,
             fontName: CTFontCopyPostScriptName(baseFont) as String, fontPointSize: CGFloat(configuration.fontPointSize),
             fittingColumns: fittingColumns,
-            fittingRows: max(1, min(512, 65536 / fittingColumns, Int(Double(viewport.y) / cellHeight))))
+            fittingRows: max(1, min(512, 65536 / fittingColumns, Int(Double(viewport.y) / cellHeight))),
+            cellSize: CGSize(width: cellWidth / scale, height: cellHeight / scale))
     }
 
     private func append(_ bytes: [UInt8]) throws {
