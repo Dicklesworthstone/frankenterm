@@ -77,9 +77,15 @@ public struct TerminalSessionUpdate: Sendable {
     /// Ordinary SSH window change has no server geometry acknowledgement. This
     /// is only the transport's local completion, still bound to this source.
     public let resized: TerminalSessionGeometry?
+    /// Present only on the final chunk of one complete mux output event. The
+    /// pump acknowledges it after the canonical consumer succeeds, never merely
+    /// because the pane list or transport's selected pane changed.
+    public let muxDestination: TerminalMuxInputRouting.Destination?
     public init(output: Data, endOfOutput: Bool = false, resized: TerminalSessionGeometry? = nil,
-                completion: TerminalSessionCompletion? = nil) {
+                completion: TerminalSessionCompletion? = nil,
+                muxDestination: TerminalMuxInputRouting.Destination? = nil) {
         self.output = output; self.endOfOutput = endOfOutput; self.resized = resized; self.completion = completion
+        self.muxDestination = muxDestination
     }
 }
 
@@ -91,10 +97,14 @@ public protocol TerminalSessionTransport: TerminalByteTransport {
     var inputSignal: TerminalSessionSignal { get }
     func service() async throws -> TerminalSessionUpdate
     func wakeService() async
+    /// Local model-consumption evidence, not remote delivery or rendering proof.
+    /// Must be bounded and must not wait for this pump or perform another read.
+    func didApplyOutput(_ update: TerminalSessionUpdate) async
 }
 
 public extension TerminalSessionTransport {
     func inputAvailable() { inputSignal.notify() }
+    func didApplyOutput(_ update: TerminalSessionUpdate) async {}
 }
 
 /// The canonical terminal adapter consumes a chunk completely before returning;
@@ -285,11 +295,14 @@ public actor TerminalSessionPump {
             // A corrupt adapter cannot push an oversized receive into the parser.
             guard update.output.count <= 16_384, update.completion == nil || update.endOfOutput else { return .transportFailed }
             if signal.isFinished || Task.isCancelled { return .cancelled }
-            if !update.output.isEmpty || update.resized != nil || update.endOfOutput {
+            if !update.output.isEmpty || update.resized != nil || update.endOfOutput || update.muxDestination != nil {
                 do {
                     try await consumer.receive(update, source: source)
                     if !signal.isFinished, !Task.isCancelled, let geometry = update.resized {
                         try await onResizeApplied?(geometry, source)
+                    }
+                    if !signal.isFinished, !Task.isCancelled, !update.endOfOutput {
+                        await transport.didApplyOutput(update)
                     }
                 } catch { return signal.isFinished || Task.isCancelled ? .cancelled : .consumerFailed }
             }
