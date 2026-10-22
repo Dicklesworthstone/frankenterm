@@ -3,16 +3,18 @@
 //! returns, and reacts to [`Event`]s.
 
 use crate::frame::{self, Frame, FrameReader};
+use crate::input::{InputSplitter, Piece};
 use crate::mirror::PaneMirror;
 use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
     self, CodecVersion, GetCodecVersion, GetLines, GetPaneRenderChanges, LinesResponse, ListPanes,
     LivenessResponse, PaneList, PaneRemoved, RenderChanges, RenderHead, Resize, SearchResults,
-    SearchScrollback, SendPaste, StableRowIndex, TerminalSize, WriteToPane, ident,
+    SearchScrollback, SendKeyDown, SendPaste, StableRowIndex, TerminalSize, WriteToPane, ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use termwiz::surface::Line;
 
 /// One pane of the machine's mux, in the order the server lists them.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -39,6 +41,7 @@ pub enum Event {
     Ready {
         server_version: String,
     },
+    /// The pane list, again whenever it may have changed.
     Panes(Vec<PaneInfo>),
     /// Bytes for the pane's terminal, which must be `rows` by `cols` first.
     Output {
@@ -55,7 +58,7 @@ pub enum Event {
         pane_id: usize,
     },
     /// The answer to [`Session::search`]: the newest matches, newest first,
-    /// over the newest `searched_rows` rows; or why the server refused.
+    /// over the newest `searched_rows` rows; or why there are none.
     SearchResults {
         search: u64,
         pane_id: usize,
@@ -63,7 +66,8 @@ pub enum Event {
         searched_rows: usize,
         error: Option<String>,
     },
-    /// The answer to [`Session::context`]: the rows that exist, in order.
+    /// The answer to [`Session::context`]: the asked-for rows that exist,
+    /// in order.
     Context {
         request: u64,
         pane_id: usize,
@@ -95,7 +99,7 @@ enum Request {
     Poll {
         pane_id: usize,
     },
-    /// One block of a search walking back through a pane's scrollback.
+    /// One range of a search walking back through a pane's scrollback.
     Search {
         search: u64,
     },
@@ -106,6 +110,7 @@ enum Request {
     Context {
         request: u64,
         pane_id: usize,
+        rows: Range<StableRowIndex>,
     },
     Action,
 }
@@ -114,6 +119,17 @@ enum Request {
 #[derive(Deserialize)]
 struct PanePrefix {
     pane_id: usize,
+}
+
+/// A pane's size as the phone found it, to give back when it looks away.
+#[derive(Debug, Clone, Copy)]
+struct PaneSizing {
+    /// The size the desktop gave the pane.
+    desktop: TerminalSize,
+    /// While the phone's size may be in effect: until the restore with
+    /// this serial is answered, a listed size may still be the phone's
+    /// (`u64::MAX`: not restored yet).
+    phone_until: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -126,10 +142,16 @@ pub struct Session {
     requests: HashMap<u64, Request>,
     panes: Vec<PaneInfo>,
     mirrors: HashMap<usize, PaneMirror>,
-    original_sizes: HashMap<usize, TerminalSize>,
+    sizing: HashMap<usize, PaneSizing>,
     events: VecDeque<Event>,
     searches: HashMap<u64, SearchJob>,
+    /// Searches waiting for a pane list asked for after they began (the
+    /// serial before it), which says where each pane's newest row is.
+    unstarted: Vec<(u64, u64)>,
+    listing: bool,
+    list_again: bool,
     next_lookup: u64,
+    input: InputSplitter,
 }
 
 impl Session {
@@ -190,9 +212,16 @@ impl Session {
         self.fail("the connection to the mux server closed".to_owned());
     }
 
-    /// Asks for the pane list again; an [`Event::Panes`] answers.
+    /// Asks for the pane list again; an [`Event::Panes`] answers. While one
+    /// list is on its way, a second is asked for once it arrives.
     pub fn refresh_panes(&mut self) {
-        if self.is_ready() {
+        if !self.is_ready() {
+            return;
+        }
+        if self.listing {
+            self.list_again = true;
+        } else {
+            self.listing = true;
             self.send(ident::LIST_PANES, &ListPanes {}, Request::ListPanes);
         }
     }
@@ -224,14 +253,32 @@ impl Session {
         }
     }
 
-    /// Input for the pane, exactly as its program reads it.
+    /// What the pane's terminal typed. Keys whose encoding depends on the
+    /// program's modes go as key presses, bracketed pastes as pastes (see
+    /// [`crate::input`]), the rest as the bytes they are, in order.
     pub fn write(&mut self, pane_id: usize, data: &[u8]) {
-        if self.is_ready() && !data.is_empty() {
-            let request = WriteToPane {
-                pane_id,
-                data: data.to_vec(),
-            };
-            self.send(ident::WRITE_TO_PANE, &request, Request::Action);
+        if !self.is_ready() || data.is_empty() {
+            return;
+        }
+        for piece in self.input.split(data) {
+            match piece {
+                Piece::Bytes(data) => {
+                    self.send(
+                        ident::WRITE_TO_PANE,
+                        &WriteToPane { pane_id, data },
+                        Request::Action,
+                    );
+                }
+                Piece::Key(event) => {
+                    let press = SendKeyDown {
+                        pane_id,
+                        event,
+                        input_serial: 0,
+                    };
+                    self.send(ident::SEND_KEY_DOWN, &press, Request::Action);
+                }
+                Piece::Paste(text) => self.paste(pane_id, &text),
+            }
         }
     }
 
@@ -247,28 +294,19 @@ impl Session {
     }
 
     /// Searches the pane's scrollback on the server, walking back from its
-    /// newest rows; an [`Event::SearchResults`] with the returned id answers.
+    /// newest rows; an [`Event::SearchResults`] with the returned id
+    /// answers. The walk starts once a fresh pane list says where the
+    /// pane's newest row is.
     pub fn search(&mut self, pane_id: usize, query: &SearchQuery) -> Option<u64> {
         if !self.is_ready() || query.text.is_empty() {
             return None;
         }
-        // Rows written since the pane was listed are past its listed screen;
-        // a margin past the end costs nothing, the server has no such rows.
-        let listed = self
-            .panes
-            .iter()
-            .find(|pane| pane.pane_id == pane_id)
-            .map(|pane| {
-                pane.physical_top
-                    .saturating_add(StableRowIndex::try_from(pane.size.rows).unwrap_or(0))
-            });
-        let live = self.mirrors.get(&pane_id).and_then(PaneMirror::end_row);
-        let end = live.max(listed)?.saturating_add(1000);
         self.next_lookup += 1;
         let search = self.next_lookup;
         self.searches
-            .insert(search, SearchJob::new(pane_id, query.pattern(), end));
-        self.continue_search(search);
+            .insert(search, SearchJob::new(pane_id, query.pattern()));
+        self.unstarted.push((search, self.next_serial));
+        self.refresh_panes();
         Some(search)
     }
 
@@ -281,22 +319,61 @@ impl Session {
         let request = self.next_lookup;
         let lines = GetLines {
             pane_id,
-            lines: vec![rows],
+            lines: vec![rows.clone()],
         };
         self.send(
             ident::GET_LINES,
             &lines,
-            Request::Context { request, pane_id },
+            Request::Context {
+                request,
+                pane_id,
+                rows,
+            },
         );
         Some(request)
     }
 
-    /// Asks for the search's next block, or the text of its matches.
+    /// Starts the searches a pane list asked for at `serial` can place.
+    fn start_searches(&mut self, serial: u64) {
+        let (ready, waiting): (Vec<_>, Vec<_>) = self
+            .unstarted
+            .drain(..)
+            .partition(|(_, after)| serial > *after);
+        self.unstarted = waiting;
+        for (search, _) in ready {
+            let Some(job) = self.searches.get(&search) else {
+                continue;
+            };
+            let pane_id = job.pane_id;
+            let listed = self
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .map(|pane| {
+                    pane.physical_top
+                        .saturating_add(StableRowIndex::try_from(pane.size.rows).unwrap_or(0))
+                });
+            let live = self.mirrors.get(&pane_id).and_then(PaneMirror::end_row);
+            match live.max(listed) {
+                Some(end) if listed.is_some() => {
+                    if let Some(job) = self.searches.get_mut(&search) {
+                        job.start(end);
+                    }
+                    self.continue_search(search);
+                }
+                _ => {
+                    self.finish_search(search, &HashMap::new(), Some("The pane has closed.".into()));
+                }
+            }
+        }
+    }
+
+    /// Asks for the search's next rows, or the text of its matches.
     fn continue_search(&mut self, search: u64) {
         let Some(job) = self.searches.get_mut(&search) else {
             return;
         };
-        if let Some(range) = job.next_block() {
+        if let Some(range) = job.next_request() {
             let request = SearchScrollback {
                 pane_id: job.pane_id,
                 pattern: job.pattern.clone(),
@@ -313,7 +390,7 @@ impl Session {
         let pane_id = job.pane_id;
         let rows = SearchJob::rows(&job.best());
         if rows.is_empty() {
-            self.finish_search(search, &|_| None, None);
+            self.finish_search(search, &HashMap::new(), None);
         } else {
             let lines = GetLines {
                 pane_id,
@@ -326,7 +403,7 @@ impl Session {
     fn finish_search(
         &mut self,
         search: u64,
-        text: &impl Fn(StableRowIndex) -> Option<String>,
+        rows: &HashMap<StableRowIndex, RowText>,
         error: Option<String>,
     ) {
         let Some(job) = self.searches.remove(&search) else {
@@ -335,7 +412,7 @@ impl Session {
         let matches = if error.is_some() {
             Vec::new()
         } else {
-            SearchJob::matches(&job.best(), text)
+            SearchJob::matches(&job.best(), &|row| rows.get(&row))
         };
         self.events.push_back(Event::SearchResults {
             search,
@@ -346,23 +423,28 @@ impl Session {
         });
     }
 
-    /// Resizes the remote pane, remembering its size before the first resize
-    /// so [`Session::restore_size`] can put it back.
+    /// Resizes the remote pane, remembering the size the desktop gave it so
+    /// [`Session::restore_size`] can put that back.
     pub fn resize(&mut self, pane_id: usize, rows: usize, cols: usize) {
+        if !self.is_ready() || rows == 0 || cols == 0 {
+            return;
+        }
         let Some(pane) = self.panes.iter().find(|pane| pane.pane_id == pane_id) else {
             return;
         };
         let tab_id = pane.tab_id;
-        let original = *self.original_sizes.entry(pane_id).or_insert(pane.size);
-        if !self.is_ready() || rows == 0 || cols == 0 {
-            return;
-        }
+        let sizing = self.sizing.entry(pane_id).or_insert(PaneSizing {
+            desktop: pane.size,
+            phone_until: None,
+        });
+        sizing.phone_until = Some(u64::MAX);
+        let desktop = sizing.desktop;
         let size = TerminalSize {
             rows,
             cols,
-            pixel_width: original.pixel_width / original.cols.max(1) * cols,
-            pixel_height: original.pixel_height / original.rows.max(1) * rows,
-            dpi: original.dpi,
+            pixel_width: desktop.pixel_width / desktop.cols.max(1) * cols,
+            pixel_height: desktop.pixel_height / desktop.rows.max(1) * rows,
+            dpi: desktop.dpi,
         };
         let request = if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.expect_size(rows, cols);
@@ -373,11 +455,12 @@ impl Session {
         self.send_resize(tab_id, pane_id, size, request);
     }
 
-    /// Returns the pane to the size it had before [`Session::resize`].
+    /// Gives the pane back the size the desktop gave it, if the phone
+    /// resized it.
     pub fn restore_size(&mut self, pane_id: usize) {
-        let Some(size) = self.original_sizes.remove(&pane_id) else {
+        if !self.is_ready() {
             return;
-        };
+        }
         let Some(tab_id) = self
             .panes
             .iter()
@@ -386,11 +469,19 @@ impl Session {
         else {
             return;
         };
+        let Some(sizing) = self.sizing.get(&pane_id).copied() else {
+            return;
+        };
+        if sizing.phone_until != Some(u64::MAX) {
+            return;
+        }
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.size_settled();
         }
-        if self.is_ready() {
-            self.send_resize(tab_id, pane_id, size, Request::Action);
+        self.send_resize(tab_id, pane_id, sizing.desktop, Request::Action);
+        let restored = self.next_serial;
+        if let Some(sizing) = self.sizing.get_mut(&pane_id) {
+            sizing.phone_until = Some(restored);
         }
     }
 
@@ -418,12 +509,60 @@ impl Session {
         }
     }
 
+    /// A new pane list, asked for with `serial`.
+    fn listed(&mut self, list: &PaneList, serial: u64) {
+        self.panes = pane_infos(list);
+        // A listed size is the desktop's unless the phone's may still be in
+        // effect: after a resize, until a list asked for after the restore.
+        self.sizing
+            .retain(|pane_id, _| self.panes.iter().any(|pane| pane.pane_id == *pane_id));
+        for pane in &self.panes {
+            let sizing = self.sizing.entry(pane.pane_id).or_insert(PaneSizing {
+                desktop: pane.size,
+                phone_until: None,
+            });
+            match sizing.phone_until {
+                Some(until) if serial <= until => {}
+                _ => {
+                    sizing.desktop = pane.size;
+                    sizing.phone_until = None;
+                }
+            }
+        }
+        self.events.push_back(Event::Panes(self.panes.clone()));
+        self.start_searches(serial);
+    }
+
     fn handle(&mut self, frame: Frame) -> Result<(), crate::Error> {
         let request = if frame.serial == 0 {
             None
         } else {
             self.requests.remove(&frame.serial)
         };
+        if frame.oversized {
+            // Only a search can draw a reply this large; fail just that one.
+            return match request {
+                Some(Request::Search { search } | Request::SearchLines { search }) => {
+                    self.finish_search(
+                        search,
+                        &HashMap::new(),
+                        Some("Too many matches to show. Try a longer search.".into()),
+                    );
+                    Ok(())
+                }
+                Some(Request::Context {
+                    request, pane_id, ..
+                }) => {
+                    self.events.push_back(Event::Context {
+                        request,
+                        pane_id,
+                        lines: Vec::new(),
+                    });
+                    Ok(())
+                }
+                _ => Err(crate::Error::Frame("a reply too large to read")),
+            };
+        }
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
                 let version: CodecVersion = wire::decode(&frame.body)?;
@@ -444,8 +583,14 @@ impl Session {
             }
             ident::LIST_PANES_RESPONSE => {
                 let list: PaneList = wire::decode(&frame.body)?;
-                self.panes = pane_infos(&list);
-                self.events.push_back(Event::Panes(self.panes.clone()));
+                if matches!(request, Some(Request::ListPanes)) {
+                    self.listing = false;
+                }
+                self.listed(&list, frame.serial);
+                if self.list_again && !self.listing {
+                    self.list_again = false;
+                    self.refresh_panes();
+                }
             }
             ident::GET_PANE_RENDER_CHANGES_RESPONSE => {
                 let PanePrefix { pane_id } = wire::decode(&frame.body)?;
@@ -458,7 +603,7 @@ impl Session {
                     };
                     self.update_title(pane_id, &head.title);
                     if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
-                        mirror.apply_changes(head, lines);
+                        mirror.apply_changes(head, lines)?;
                     }
                     self.advance(pane_id);
                 }
@@ -475,19 +620,29 @@ impl Session {
                         self.advance(pane_id);
                     }
                     Some(Request::SearchLines { search }) => {
-                        let text = row_texts(lines);
-                        self.finish_search(search, &|row| text.get(&row).cloned(), None);
+                        let rows = row_texts(lines.lines);
+                        self.finish_search(search, &rows, None);
                     }
-                    Some(Request::Context { request, pane_id }) => {
-                        let mut rows: Vec<ContextLine> = row_texts(lines)
+                    Some(Request::Context {
+                        request,
+                        pane_id,
+                        rows,
+                    }) => {
+                        // The server shifts a range that runs past either end
+                        // of the pane; only the rows asked for are wanted.
+                        let mut lines: Vec<ContextLine> = row_texts(lines.lines)
                             .into_iter()
-                            .map(|(row, text)| ContextLine { row, text })
+                            .filter(|(row, _)| rows.contains(row))
+                            .map(|(row, text)| ContextLine {
+                                row,
+                                text: text.text,
+                            })
                             .collect();
-                        rows.sort_by_key(|line| line.row);
+                        lines.sort_by_key(|line| line.row);
                         self.events.push_back(Event::Context {
                             request,
                             pane_id,
-                            lines: rows,
+                            lines,
                         });
                     }
                     _ => {}
@@ -497,7 +652,7 @@ impl Session {
                 if let Some(Request::Search { search }) = request {
                     let SearchResults { results } = wire::decode(&frame.body)?;
                     if let Some(job) = self.searches.get_mut(&search) {
-                        job.add(results);
+                        job.answer(results);
                     }
                     self.continue_search(search);
                 }
@@ -523,6 +678,8 @@ impl Session {
                 self.pane_gone(pane_id);
                 self.refresh_panes();
             }
+            // A tab or split appeared or changed shape on the desktop.
+            ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW => self.refresh_panes(),
             ident::ERROR_RESPONSE => match request {
                 Some(Request::Version) => {
                     self.fail("the mux server refused the protocol check".to_owned());
@@ -545,9 +702,11 @@ impl Session {
                     let reason = wire::decode::<String>(&frame.body)
                         .unwrap_or_else(|_| "the mux server refused the search".to_owned());
                     let reason = reason.strip_prefix("Error: ").unwrap_or(&reason).to_owned();
-                    self.finish_search(search, &|_| None, Some(reason));
+                    self.finish_search(search, &HashMap::new(), Some(reason));
                 }
-                Some(Request::Context { request, pane_id }) => {
+                Some(Request::Context {
+                    request, pane_id, ..
+                }) => {
                     self.events.push_back(Event::Context {
                         request,
                         pane_id,
@@ -596,7 +755,7 @@ impl Session {
 
     fn pane_gone(&mut self, pane_id: usize) {
         self.mirrors.remove(&pane_id);
-        self.original_sizes.remove(&pane_id);
+        self.sizing.remove(&pane_id);
         self.panes.retain(|pane| pane.pane_id != pane_id);
         self.events.push_back(Event::PaneGone { pane_id });
     }
@@ -635,12 +794,66 @@ impl Session {
     }
 }
 
-/// Each fetched row's text, trailing blanks dropped.
-fn row_texts(lines: wire::LineEntries) -> HashMap<StableRowIndex, String> {
+/// One row as text, trailing blanks dropped, and where each of its cells
+/// starts in that text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowText {
+    pub text: String,
+    /// (cell column, UTF-8 offset in `text`), by column.
+    columns: Vec<(usize, usize)>,
+}
+
+impl RowText {
+    fn of(line: &Line) -> Self {
+        let mut text = String::new();
+        let mut columns = Vec::new();
+        for cell in line.visible_cells() {
+            columns.push((cell.cell_index(), text.len()));
+            text.push_str(cell.str());
+        }
+        let kept = text.trim_end().len();
+        text.truncate(kept);
+        Self { text, columns }
+    }
+
+    /// A row of one-cell characters.
+    #[cfg(test)]
+    pub fn plain(text: &str) -> Self {
+        let cells: Vec<(String, usize)> = text
+            .chars()
+            .enumerate()
+            .map(|(column, c)| (c.to_string(), column))
+            .collect();
+        let cells: Vec<(&str, usize)> = cells.iter().map(|(s, c)| (s.as_str(), *c)).collect();
+        Self::wide(&cells)
+    }
+
+    /// A row of (text, starting column) cells.
+    #[cfg(test)]
+    pub fn wide(cells: &[(&str, usize)]) -> Self {
+        let mut text = String::new();
+        let mut columns = Vec::new();
+        for (cell, column) in cells {
+            columns.push((*column, text.len()));
+            text.push_str(cell);
+        }
+        Self { text, columns }
+    }
+
+    /// The offset in `text` where the cell at `column` starts.
+    pub fn offset(&self, column: usize) -> usize {
+        self.columns
+            .iter()
+            .find(|(cell, _)| *cell >= column)
+            .map_or(self.text.len(), |(_, offset)| *offset)
+            .min(self.text.len())
+    }
+}
+
+fn row_texts(lines: Vec<(StableRowIndex, Line)>) -> HashMap<StableRowIndex, RowText> {
     lines
-        .lines
         .into_iter()
-        .map(|(row, line)| (row, line.as_str().trim_end().to_owned()))
+        .map(|(row, line)| (row, RowText::of(&line)))
         .collect()
 }
 
