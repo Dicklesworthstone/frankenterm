@@ -16,6 +16,222 @@ final class OfflineRestoreTests: XCTestCase {
         let store = WorkspaceStore(persistence: persistence, vault: vault)
         return (OfflineRestore(using: crypto, store: store), store, persistence, vault)
     }
+
+    private func pagedScan() throws -> (envelope: Data, code: TransferCode, sender: OpticalSender) {
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let findings = (0..<10).map {
+            AirGapArchive.Portability(entityID: "route", setting: "saved_scan_\($0)", disposition: 0,
+                                       reason: String(repeating: "x", count: 4000))
+        }
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest(fingerprint: fingerprint)),
+                                       keys: [key], portability: findings, using: crypto)
+        let code = try TransferCode(secret: Data(repeating: 27, count: 16))
+        let envelope = try FTAG.sealArchiveBytes(archive.encoded(), code: code,
+            transferID: Data(repeating: 28, count: 16), salt: Data(repeating: 29, count: 16),
+            nonce: Data(repeating: 30, count: 12), compress: false, using: crypto)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        XCTAssertEqual(sender.identity.pageCount, 2)
+        return (envelope, code, sender)
+    }
+
+    private func completedScan(_ envelope: Data) throws -> OpticalScanCheckpoint {
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        var receiver = OpticalReceiver(selecting: try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto)))
+        for page in 0..<sender.identity.pageCount {
+            for sequence in 1...(try sender.sourcePartCount(page: page)) {
+                try receiver.receive(OpticalFrame(text: sender.frame(page: page, sequence: UInt32(sequence), using: crypto)), using: crypto)
+            }
+        }
+        return try XCTUnwrap(receiver.checkpoint(using: crypto))
+    }
+
+    func testSavedScanResumesVerifiedPagesAndUsesNormalAuthenticationAndImport() async throws {
+        let (restore, store, persistence, vault) = environment(), exported = try pagedScan()
+        let sender = exported.sender
+        var state = await restore.status()
+        state = try await restore.observe(sender.frame(page: 0, sequence: 1, using: crypto), generation: state.generation)
+        let candidateCheckpoint = try await restore.scanCheckpoint(generation: state.generation)
+        XCTAssertNil(candidateCheckpoint)
+        state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
+        let partialCheckpoint = try await restore.scanCheckpoint(generation: state.generation)
+        XCTAssertNil(partialCheckpoint)
+        for sequence in 1...(try sender.sourcePartCount(page: 1)) {
+            state = try await restore.observe(sender.frame(page: 1, sequence: UInt32(sequence), using: crypto), generation: state.generation)
+        }
+        XCTAssertEqual(state.verifiedPages, 1); XCTAssertEqual(state.independentParts, 1)
+        let captured = try await restore.scanCheckpoint(generation: state.generation)
+        let checkpoint = try XCTUnwrap(captured)
+        let savedDisk = StoreTestPersistence()
+        let recovery = OpticalScanRecovery(persistence: savedDisk, using: crypto)
+        do { _ = try await recovery.beginSaving(checkpoint, confirmedByUser: false); XCTFail("saved without consent") }
+        catch { XCTAssertEqual(error as? OpticalScanRecoveryError, .consentRequired) }
+        _ = try await recovery.beginSaving(checkpoint, confirmedByUser: true)
+        _ = await restore.suspend(discardRecipientRequest: true)
+
+        // A fresh recovery owner and restore actor stand in for process restart.
+        let reopened = OpticalScanRecovery(persistence: savedDisk, using: crypto)
+        let savedReview = try await reopened.review()
+        let saved = try await reopened.load(XCTUnwrap(savedReview))
+        let restarted = OfflineRestore(using: crypto, store: store)
+        let initial = await restarted.status()
+        state = try await restarted.resumeScan(saved, generation: initial.generation)
+        XCTAssertNotEqual(state.generation, initial.generation)
+        XCTAssertEqual(state.source, .optical); XCTAssertEqual(state.identity, sender.identity)
+        XCTAssertEqual(state.phase, .collecting); XCTAssertEqual(state.verifiedPages, 1)
+        XCTAssertEqual(state.independentParts, 0); XCTAssertEqual(state.incompletePageIndices, [0])
+        XCTAssertEqual(state.receivedParts, try sender.sourcePartCount(page: 1))
+        do {
+            _ = try await restarted.observe(sender.frame(page: 0, sequence: 1, using: crypto), generation: initial.generation)
+            XCTFail("a pre-adoption camera callback entered the resumed scan")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+        for sequence in 1...(try sender.sourcePartCount(page: 0)) {
+            state = try await restarted.observe(sender.frame(page: 0, sequence: UInt32(sequence), using: crypto), generation: state.generation)
+        }
+        XCTAssertEqual(state.phase, .locked); XCTAssertEqual(state.verifiedBytes, exported.envelope.count)
+        XCTAssertNil(state.review); XCTAssertNil(state.receipt)
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(persistence.bytes(.catalog))
+        let wrong = try TransferCode(secret: Data(repeating: 31, count: 16)).reveal(using: crypto)
+        do { _ = try await restarted.unlock(enteredCode: wrong, generation: state.generation); XCTFail("wrong code accepted") }
+        catch { XCTAssertEqual(error as? FTError, .authentication) }
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(persistence.bytes(.catalog))
+        state = try await restarted.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
+        XCTAssertEqual(state.phase, .review); XCTAssertEqual(state.review?.findings.count, 10)
+        state = try await restarted.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+                                          sourceAndContentsConfirmed: true)
+        XCTAssertEqual(state.phase, .complete); XCTAssertEqual(vault.creates, 1)
+        XCTAssertTrue(try XCTUnwrap(state.receipt).workspace.connectLater)
+    }
+
+    func testCompleteOnePageAndReviewedScanSnapshotsNeverRestoreApproval() async throws {
+        let (restore, store, persistence, vault) = environment(), exported = try export()
+        let complete = try completedScan(exported.envelope)
+        XCTAssertEqual(complete.identity.pageCount, 1)
+        var state = await restore.status()
+        state = try await restore.resumeScan(complete, generation: state.generation)
+        XCTAssertEqual(state.phase, .locked); XCTAssertEqual(state.encryptionMode, .code)
+        let lockedSnapshot = try await restore.scanCheckpoint(generation: state.generation)
+        let locked = try XCTUnwrap(lockedSnapshot)
+        XCTAssertEqual(locked.verifiedPages, 1); XCTAssertTrue(locked.incompletePageIndices.isEmpty)
+        XCTAssertEqual(try OpticalReceiver(resuming: locked, using: crypto).envelope(using: crypto), exported.envelope)
+        state = try await restore.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
+        let previousApproval = try XCTUnwrap(state.review).token
+        let reviewedSnapshot = try await restore.scanCheckpoint(generation: state.generation)
+        let reviewed = try XCTUnwrap(reviewedSnapshot)
+        XCTAssertEqual(try reviewed.encoded(using: crypto), try locked.encoded(using: crypto),
+                       "decrypting and reviewing must not add a secret or approval to the cache")
+        _ = await restore.suspend(discardRecipientRequest: true)
+        let reopened = OfflineRestore(using: crypto, store: store)
+        state = await reopened.status()
+        state = try await reopened.resumeScan(reviewed, generation: state.generation)
+        XCTAssertEqual(state.phase, .locked); XCTAssertNil(state.review); XCTAssertNil(state.receipt)
+        do {
+            _ = try await reopened.commit(reviewToken: previousApproval, generation: state.generation, sourceAndContentsConfirmed: true)
+            XCTFail("a saved checkpoint restored an earlier import approval")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(persistence.bytes(.catalog))
+        state = try await reopened.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
+        XCTAssertNotEqual(state.review?.token, previousApproval)
+    }
+
+    func testSavedScanAdoptionRequiresIdleForegroundGenerationAndOfflineExclusion() async throws {
+        let network = WorkspaceNetworkActivity(), disk = StoreTestPersistence(), vault = StoreTestVault()
+        let restore = OfflineRestore(using: crypto, store: WorkspaceStore(persistence: disk, vault: vault), networkActivity: network)
+        let exported = try export(), checkpoint = try completedScan(exported.envelope)
+        var connection: WorkspaceNetworkLease? = try network.beginConnection()
+        let initial = await restore.status()
+        do { _ = try await restore.resumeScan(checkpoint, generation: initial.generation); XCTFail("adopted beside a live connection") }
+        catch { XCTAssertEqual(error as? WorkspaceNetworkError, .connectionsActive) }
+        XCTAssertEqual(network.accounting().connections, 1); XCTAssertEqual(network.accounting().offlineRestores, 0)
+        var state = await restore.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity)
+        withExtendedLifetime(connection) {}; connection = nil
+        state = await restore.suspend(discardRecipientRequest: true)
+        do { _ = try await restore.resumeScan(checkpoint, generation: state.generation); XCTFail("adopted while suspended") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
+        XCTAssertEqual(network.accounting().offlineRestores, 0)
+        state = await restore.resume()
+        do { _ = try await restore.resumeScan(checkpoint, generation: initial.generation); XCTFail("adopted with retired generation") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
+        let sender = try OpticalSender(envelope: exported.envelope, using: crypto)
+        state = try await restore.observe(sender.frame(page: 0, sequence: 1, using: crypto), generation: state.generation)
+        do { _ = try await restore.resumeScan(checkpoint, generation: state.generation); XCTFail("replaced an active candidate") }
+        catch { XCTAssertEqual(error as? WorkspaceStoreError, .busy) }
+        let unchanged = await restore.status()
+        XCTAssertEqual(unchanged.phase, .candidate); XCTAssertEqual(unchanged.identity, sender.identity)
+        state = try await restore.reset()
+        state = try await restore.acceptEncryptedFile(exported.envelope, generation: state.generation)
+        let fileSnapshot = try await restore.scanCheckpoint(generation: state.generation)
+        XCTAssertNil(fileSnapshot, "ordinary imported files are not opted-in camera progress")
+        let oldGeneration = state.generation
+        _ = await restore.suspend()
+        do { _ = try await restore.scanCheckpoint(generation: oldGeneration); XCTFail("captured with a retired token") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(disk.bytes(.catalog))
+    }
+
+    func testCompleteSavedScanRevalidatesWholeEnvelopeBeforeAdoptingSource() async throws {
+        let (restore, _, disk, vault) = environment(), exported = try export()
+        let complete = try completedScan(exported.envelope)
+        let identity = OpticalFrame.Identity(transferID: complete.identity.transferID,
+            envelopeDigest: Data(repeating: 0, count: 32), envelopeLength: complete.identity.envelopeLength)
+        let wrongDigest = try OpticalScanCheckpoint(identity: identity, pages: complete.pages,
+            pageDigests: complete.pageDigests, using: crypto)
+        var badHeader = exported.envelope; badHeader[4] = 99
+        let malformed = try OpticalScanCheckpoint(identity: .init(transferID: complete.identity.transferID,
+            envelopeDigest: crypto.sha256(badHeader), envelopeLength: badHeader.count),
+            pages: [0: badHeader], pageDigests: [0: crypto.sha256(badHeader)], using: crypto)
+        let initial = await restore.status()
+        for checkpoint in [wrongDigest, malformed] {
+            do { _ = try await restore.resumeScan(checkpoint, generation: initial.generation); XCTFail("accepted forged whole-envelope metadata") }
+            catch { XCTAssertNotNil(error as? FTError) }
+            let state = await restore.status()
+            XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.source); XCTAssertNil(state.identity)
+            XCTAssertEqual(state.generation, initial.generation)
+        }
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(disk.bytes(.catalog)); XCTAssertNil(disk.bytes(.journal))
+    }
+
+    func testSavedRecipientScanNeedsTheOriginalPrivateRequestAndRespectsItsBounds() async throws {
+        let (original, _, _, _) = environment()
+        var state = await original.status()
+        state = try await original.createRecipientRequest(generation: state.generation)
+        let request = try XCTUnwrap(state.recipientRequest)
+        let archive = try AirGapArchive(workspace: WorkspaceDocument(data: sampleManifest()), keys: [], using: crypto)
+        let envelope = try FTAG.seal(archive, recipient: request, confirmedRequestDigest: request.digest(using: crypto), using: crypto)
+        let checkpoint = try completedScan(envelope)
+        state = try await original.resumeScan(checkpoint, generation: state.generation)
+        XCTAssertTrue(state.canUnlockRecipient)
+        state = try await original.unlockRecipient(generation: state.generation)
+        XCTAssertEqual(state.phase, .review)
+        _ = await original.suspend(discardRecipientRequest: true)
+
+        let (restarted, _, disk, vault) = environment()
+        state = await restarted.status()
+        state = try await restarted.resumeScan(checkpoint, generation: state.generation)
+        XCTAssertEqual(state.phase, .locked); XCTAssertEqual(state.encryptionMode, .recipient)
+        XCTAssertFalse(state.canUnlockRecipient); XCTAssertNil(state.recipientRequest)
+        do { _ = try await restarted.unlockRecipient(generation: state.generation); XCTFail("resurrected a lost recipient key") }
+        catch { XCTAssertEqual(error as? FTError, .stale) }
+        let code = try TransferCode(secret: Data(repeating: 32, count: 16)).reveal(using: crypto)
+        do { _ = try await restarted.unlock(enteredCode: code, generation: state.generation); XCTFail("downgraded recipient mode") }
+        catch { XCTAssertEqual(error as? FTError, .unsupported("envelope.requires_recipient_key")) }
+        state = try await restarted.reset()
+        state = try await restarted.createRecipientRequest(generation: state.generation)
+        let replacementRequest = state.recipientRequest
+        do { _ = try await restarted.resumeScan(checkpoint, generation: state.generation); XCTFail("accepted another recipient request") }
+        catch { XCTAssertEqual(error as? FTError, .authentication) }
+        state = await restarted.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity); XCTAssertEqual(state.recipientRequest, replacementRequest)
+        state = try await restarted.reset()
+        state = try await restarted.createRecipientRequest(generation: state.generation, maximumEnvelopeBytes: 4222)
+        let oversized = try completedScan(pagedScan().envelope)
+        do { _ = try await restarted.resumeScan(oversized, generation: state.generation); XCTFail("ignored the recipient allocation ceiling") }
+        catch { XCTAssertEqual(error as? FTError, .limit("recipient.envelope_limit")) }
+        state = await restarted.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity); XCTAssertEqual(state.verifiedPages, 0)
+        XCTAssertEqual(vault.creates, 0); XCTAssertNil(disk.bytes(.catalog))
+    }
+
     func testOpticalSourceSelectionRepairDecodeReviewAndCommit() async throws {
         let (restore, store, _, vault) = environment(), exported = try export()
         let sender = try OpticalSender(envelope: exported.envelope, using: crypto)

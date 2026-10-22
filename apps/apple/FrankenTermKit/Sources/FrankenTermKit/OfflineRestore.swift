@@ -201,6 +201,48 @@ public actor OfflineRestore<C: AirGapCryptography> {
         return status()
     }
 
+    /// Export only hash-verified ciphertext pages from this active optical scan.
+    /// The caller must separately obtain consent before persisting the result;
+    /// this method never writes storage and returns nil before the first page.
+    /// Partial equations, the transfer code, recipient key and decrypted review
+    /// are absent, including when a complete envelope is waiting for approval.
+    public func scanCheckpoint(generation token: UUID) throws -> OpticalScanCheckpoint? {
+        try check(token)
+        guard source == .optical else { return nil }
+        if let receiver { return try receiver.checkpoint(using: crypto) }
+        guard let identity, let envelope else { return nil }
+        // The receiver is released on completion. Build a bounded snapshot from
+        // the already verified envelope so one-page and final-page scans remain
+        // resumable while waiting for a code or explicit workspace review.
+        var pages: [Int: Data] = [:], digests: [Int: Data] = [:]
+        for index in 0..<identity.pageCount {
+            let offset = index * FTLimit.page
+            let bytes = Data(envelope.dropFirst(offset).prefix(FTLimit.page))
+            pages[index] = bytes; digests[index] = crypto.sha256(bytes)
+        }
+        return try OpticalScanCheckpoint(identity: identity, pages: pages, pageDigests: digests, using: crypto)
+    }
+
+    /// Adopt an explicitly reviewed saved source into an idle offline restore.
+    /// Saved progress grants no decryption or import authority. A complete cache
+    /// still follows the ordinary whole-envelope/header/destination checks and
+    /// stops locked; the caller must obtain a code or matching recipient key.
+    /// Recipient keys are never restored by this operation. With no surviving
+    /// request, recipient mode stays locked and canUnlockRecipient remains false.
+    @discardableResult
+    public func resumeScan(_ checkpoint: OpticalScanCheckpoint, generation token: UUID) throws -> OfflineRestoreStatus {
+        try check(token)
+        guard phase == .idle else { throw WorkspaceStoreError.busy }
+        if let request = recipientSession?.request, checkpoint.identity.envelopeLength > request.maximumEnvelopeBytes {
+            throw FTError.limit("recipient.envelope_limit")
+        }
+        let resumed = try OpticalReceiver(resuming: checkpoint, using: crypto)
+        receiver = resumed; identity = resumed.identity; source = .optical
+        candidate = nil; phase = .collecting; generation = UUID()
+        if resumed.isComplete { try finishOpticalEnvelope(from: resumed) }
+        return status()
+    }
+
     /// An explicit file choice replaces no active scan. Reset first to change sources.
     @discardableResult
     public func acceptEncryptedFile(_ data: Data, generation token: UUID) throws -> OfflineRestoreStatus {
