@@ -34,6 +34,156 @@ fn phone<T: serde::Serialize>(ident: u64, serial: u64, body: &T) -> Vec<u8> {
     frame::encode(ident, serial, &wire::encode(body))
 }
 
+fn desktop_current(pdu: Pdu, serial: u64) -> Vec<u8> {
+    pdu.prepare_outbound_for_dialect(
+        MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
+        PduProducer::Client,
+        PduWireRole::Request,
+        None,
+        CompressionMode::Never,
+    )
+    .expect("the desktop codec plans the current request")
+    .encode_frame(serial)
+    .expect("the desktop codec encodes the current request")
+}
+
+fn key_press(pane_id: usize) -> (wire::SendKeyDown, Pdu) {
+    use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+    let event = KeyEvent {
+        key: KeyCode::UpArrow,
+        modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+    };
+    (
+        wire::SendKeyDown {
+            pane_id,
+            event: event.clone(),
+            input_serial: 0,
+        },
+        Pdu::SendKeyDown(codec::SendKeyDown {
+            pane_id,
+            event,
+            input_serial: InputSerial::empty(),
+        }),
+    )
+}
+
+#[test]
+fn key_presses_match_the_desktop_encoding_in_both_dialects() {
+    let (ours, theirs) = key_press(9);
+    let phone = phone(wire::ident::SEND_KEY_DOWN, 8, &ours);
+    assert_eq!(phone, desktop_v46(theirs, 8));
+    assert_eq!(phone, desktop_current(key_press(9).1, 8));
+}
+
+#[test]
+fn the_current_dialect_is_the_desktop_codecs_window_and_layout() {
+    assert_eq!(
+        wire::CURRENT_VERSIONS,
+        codec::CODEC_VERSION_MIN_SUPPORTED..=codec::CODEC_VERSION,
+        "a new codec window needs this client's current layouts checked again"
+    );
+    // The requests the phone sends unchanged in both dialects.
+    let cases = [
+        (
+            phone(wire::ident::GET_CODEC_VERSION, 1, &wire::GetCodecVersion {}),
+            desktop_current(Pdu::GetCodecVersion(GetCodecVersion {}), 1),
+        ),
+        (
+            phone(wire::ident::LIST_PANES, 2, &wire::ListPanes {}),
+            desktop_current(Pdu::ListPanes(ListPanes {}), 2),
+        ),
+        (
+            phone(
+                wire::ident::GET_PANE_RENDER_CHANGES,
+                3,
+                &wire::GetPaneRenderChanges { pane_id: 77 },
+            ),
+            desktop_current(
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id: 77 }),
+                3,
+            ),
+        ),
+        (
+            phone(
+                wire::ident::GET_LINES,
+                4,
+                &wire::GetLines {
+                    pane_id: 3,
+                    lines: vec![-5..2, 4000..4100],
+                },
+            ),
+            desktop_current(
+                Pdu::GetLines(GetLines {
+                    pane_id: 3,
+                    lines: vec![-5..2, 4000..4100],
+                }),
+                4,
+            ),
+        ),
+        (
+            phone(
+                wire::ident::WRITE_TO_PANE,
+                5,
+                &wire::WriteToPane {
+                    pane_id: 9,
+                    data: b"ls\r".to_vec(),
+                },
+            ),
+            desktop_current(
+                Pdu::WriteToPane(WriteToPane {
+                    pane_id: 9,
+                    data: b"ls\r".to_vec(),
+                }),
+                5,
+            ),
+        ),
+        (
+            phone(
+                wire::ident::SEARCH_SCROLLBACK,
+                6,
+                &wire::SearchScrollback {
+                    pane_id: 4,
+                    pattern: wire::Pattern::Regex("e+".into()),
+                    range: -10..5000,
+                    limit: Some(200),
+                },
+            ),
+            desktop_current(
+                Pdu::SearchScrollbackRequest(codec::SearchScrollbackRequest {
+                    pane_id: 4,
+                    pattern: mux::pane::Pattern::Regex("e+".into()),
+                    range: -10..5000,
+                    limit: Some(200),
+                }),
+                6,
+            ),
+        ),
+        // The one the dialects write differently.
+        (
+            phone(
+                wire::ident::SEND_PASTE,
+                7,
+                &wire::SendPasteCurrent {
+                    pane_id: 9,
+                    data: "héllo\nwörld 🦀",
+                    input_serial: 0,
+                },
+            ),
+            desktop_current(
+                Pdu::SendPaste(SendPaste {
+                    pane_id: 9,
+                    data: "héllo\nwörld 🦀".to_owned(),
+                    input_serial: InputSerial::empty(),
+                }),
+                7,
+            ),
+        ),
+    ];
+    for (index, (phone, desktop)) in cases.iter().enumerate() {
+        assert_eq!(phone, desktop, "request {index}");
+    }
+}
+
 #[test]
 fn requests_match_the_desktop_v46_encoding() {
     let cases = [

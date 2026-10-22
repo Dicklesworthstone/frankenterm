@@ -273,17 +273,52 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 
 #[test]
 fn a_server_on_another_protocol_is_refused() {
-    let mut harness = Harness::new(4, 20);
+    // Between v0.13 and the current window, and past it.
+    for version in [48, 71] {
+        let mut harness = Harness::new(4, 20);
+        harness.server.codec_vers = version;
+        harness.pump();
+        assert!(!harness.session.is_ready());
+        let reason = harness.events.iter().find_map(|event| match event {
+            Event::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        });
+        let reason = reason.expect("a failure");
+        assert!(
+            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("70"),
+            "{reason}"
+        );
+        assert_eq!(harness.server.requests, ["GetCodecVersion"]);
+    }
+}
+
+#[test]
+fn a_current_mux_like_a_macs_gui_is_spoken_to_in_its_own_layout() {
+    use termwiz::input::{KeyCode, Modifiers};
+    let mut harness = Harness::new(5, 24);
     harness.server.codec_vers = 70;
+    harness.quiet_output(&numbered(0, 12));
+    harness.attach();
+    assert_mirrored(&mut harness);
+    let pane = harness.server.pane_id;
+    harness
+        .session
+        .write(pane, b"ls\x1b[A\x1b[200~one\ntwo\x1b[201~");
+    harness.session.paste(pane, "three");
     harness.pump();
-    assert!(!harness.session.is_ready());
-    let reason = harness.events.iter().find_map(|event| match event {
-        Event::Failed { reason } => Some(reason.clone()),
-        _ => None,
-    });
-    let reason = reason.expect("a failure");
-    assert!(reason.contains("70") && reason.contains("46"), "{reason}");
-    assert_eq!(harness.server.requests, ["GetCodecVersion"]);
+    assert_eq!(harness.server.written, b"ls");
+    assert_eq!(
+        harness
+            .server
+            .keys
+            .iter()
+            .map(|key| (key.key, key.modifiers))
+            .collect::<Vec<_>>(),
+        [(KeyCode::UpArrow, Modifiers::NONE)]
+    );
+    assert_eq!(harness.server.pastes, ["one\ntwo", "three"]);
+    harness.output(&numbered(12, 20));
+    assert_mirrored(&mut harness);
 }
 
 #[test]

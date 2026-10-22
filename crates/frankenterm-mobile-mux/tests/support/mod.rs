@@ -209,13 +209,21 @@ impl Server {
         self.to_phone.extend_from_slice(&frame);
     }
 
-    /// Phone bytes, split into frames by the desktop codec's v46 decoder.
+    /// The layout this server reads: v46, or the current one from codec 61.
+    /// (A version outside both reads the protocol check, which is the same
+    /// in every dialect, and nothing after it.)
+    fn dialect(&self) -> MuxWireDialect {
+        MuxWireDialect::current(self.codec_vers).unwrap_or(MuxWireDialect::LEGACY46)
+    }
+
+    /// Phone bytes, split into frames by the desktop codec's decoder for the
+    /// dialect this server announced.
     pub fn receive(&mut self, bytes: &[u8]) {
         self.inbound.extend_from_slice(bytes);
         while !self.inbound.is_empty() {
             let mut cursor = std::io::Cursor::new(self.inbound.as_slice());
-            let decoded = Pdu::decode_for_dialect(&mut cursor, MuxWireDialect::LEGACY46)
-                .expect("the phone's request is a v46 frame");
+            let decoded = Pdu::decode_for_dialect(&mut cursor, self.dialect())
+                .expect("the phone's request is a frame of the server's dialect");
             let used = usize::try_from(cursor.position()).expect("position");
             self.inbound.drain(..used);
             let (serial, payload) = decoded.into_parts();
@@ -288,6 +296,12 @@ impl Server {
             MuxWireDecodedPayload::Legacy46SendPaste(paste) => {
                 self.requests.push("SendPaste");
                 self.pastes.push(paste.data().to_owned());
+                self.push();
+                self.reply(10, serial, &UnitResponse {});
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::SendPaste(paste)) => {
+                self.requests.push("SendPaste");
+                self.pastes.push(paste.data);
                 self.push();
                 self.reply(10, serial, &UnitResponse {});
             }

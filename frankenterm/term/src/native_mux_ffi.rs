@@ -525,8 +525,8 @@ mod tests {
         assert_eq!(take_outgoing(session), [2, 1, 26]);
         assert!(take_outgoing(session).is_empty());
 
-        // A v70 server's reply: codec_vers 70, version "x".
-        let reply = [5u8, 1, 27, 70, 1, b'x'];
+        // A reply from a server newer than this client: codec_vers 71, version "x".
+        let reply = [5u8, 1, 27, 71, 1, b'x'];
         // SAFETY: a live local buffer with its exact length.
         assert_eq!(
             unsafe { ft_mux_v1_receive(session, reply.as_ptr(), reply.len() as u32) },
@@ -552,7 +552,7 @@ mod tests {
             unsafe { ft_mux_v1_event_copy(session, 0, reason.as_mut_ptr(), length, &mut written) };
         assert_eq!((status, written), (0, length));
         let reason = String::from_utf8(reason).unwrap();
-        assert!(reason.contains("70"), "{}", reason);
+        assert!(reason.contains("71"), "{}", reason);
 
         // SAFETY: live local scalars.
         let status = unsafe {

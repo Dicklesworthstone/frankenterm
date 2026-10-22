@@ -14,9 +14,35 @@ use std::ops::{Range, RangeInclusive};
 use termwiz::input::KeyEvent;
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 
-/// The dialects this client speaks: v46, and v0.13.0's v47, which only adds
-/// two PDUs the phone never sends.
-pub const CODEC_VERSIONS: RangeInclusive<usize> = 46..=47;
+/// The fleet's v0.13 servers: v46, and v0.13.0's v47, which only adds two
+/// PDUs the phone never sends.
+pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
+/// A current FrankenTerm's own mux (a Mac's GUI, reached through its relay):
+/// the rolling-upgrade window `codec::CODEC_VERSION_MIN_SUPPORTED..=
+/// CODEC_VERSION`. Every PDU the phone uses has kept one schema across it.
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=70;
+
+/// Which of the two layouts a server speaks. They differ, for this client,
+/// in SendPaste (an input serial follows the text) and ErrorResponse (a
+/// structured rejection rather than the error's text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    #[default]
+    Legacy,
+    Current,
+}
+
+impl Dialect {
+    pub fn of(codec_version: usize) -> Option<Self> {
+        if LEGACY_VERSIONS.contains(&codec_version) {
+            Some(Self::Legacy)
+        } else if CURRENT_VERSIONS.contains(&codec_version) {
+            Some(Self::Current)
+        } else {
+            None
+        }
+    }
+}
 
 /// PDU identifiers (codec's `pdu!` table).
 pub mod ident {
@@ -81,6 +107,14 @@ pub struct WriteToPane {
 pub struct SendPaste<'a> {
     pub pane_id: usize,
     pub data: &'a str,
+}
+
+/// The current PDU 13 schema: `input_serial` is codec's `InputSerial(u64)`.
+#[derive(Serialize)]
+pub struct SendPasteCurrent<'a> {
+    pub pane_id: usize,
+    pub data: &'a str,
+    pub input_serial: u64,
 }
 
 /// PDU 11: a key press the server encodes for the pane's program, in the

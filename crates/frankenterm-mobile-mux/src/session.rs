@@ -7,9 +7,10 @@ use crate::input::{InputSplitter, Piece};
 use crate::mirror::PaneMirror;
 use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
-    self, CodecVersion, GetCodecVersion, GetLines, GetPaneRenderChanges, LinesResponse, ListPanes,
-    LivenessResponse, PaneList, PaneRemoved, RenderChanges, RenderHead, Resize, SearchResults,
-    SearchScrollback, SendKeyDown, SendPaste, StableRowIndex, TerminalSize, WriteToPane, ident,
+    self, CodecVersion, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges, LinesResponse,
+    ListPanes, LivenessResponse, PaneList, PaneRemoved, RenderChanges, RenderHead, Resize,
+    SearchResults, SearchScrollback, SendKeyDown, SendPaste, SendPasteCurrent, StableRowIndex,
+    TerminalSize, WriteToPane, ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -138,6 +139,7 @@ pub struct Session {
     reader: FrameReader,
     outgoing: Vec<u8>,
     ready: bool,
+    dialect: Dialect,
     failed: bool,
     requests: HashMap<u64, Request>,
     panes: Vec<PaneInfo>,
@@ -295,12 +297,25 @@ impl Session {
 
     /// Pasted text; the server brackets it when the pane's program asked.
     pub fn paste(&mut self, pane_id: usize, text: &str) {
-        if self.is_ready() && !text.is_empty() {
-            let request = SendPaste {
-                pane_id,
-                data: text,
-            };
-            self.send(ident::SEND_PASTE, &request, Request::Action);
+        if !self.is_ready() || text.is_empty() {
+            return;
+        }
+        match self.dialect {
+            Dialect::Legacy => {
+                let request = SendPaste {
+                    pane_id,
+                    data: text,
+                };
+                self.send(ident::SEND_PASTE, &request, Request::Action);
+            }
+            Dialect::Current => {
+                let request = SendPasteCurrent {
+                    pane_id,
+                    data: text,
+                    input_serial: 0,
+                };
+                self.send(ident::SEND_PASTE, &request, Request::Action);
+            }
         }
     }
 
@@ -581,7 +596,8 @@ impl Session {
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
                 let version: CodecVersion = wire::decode(&frame.body)?;
-                if wire::CODEC_VERSIONS.contains(&version.codec_vers) {
+                if let Some(dialect) = Dialect::of(version.codec_vers) {
+                    self.dialect = dialect;
                     self.ready = true;
                     self.events.push_back(Event::Ready {
                         server_version: version.version_string,
@@ -589,10 +605,12 @@ impl Session {
                     self.refresh_panes();
                 } else {
                     self.fail(format!(
-                        "the mux server speaks protocol {}, and this app speaks {} to {}",
+                        "the mux server speaks protocol {}, and this app speaks {} to {} and {} to {}",
                         version.codec_vers,
-                        wire::CODEC_VERSIONS.start(),
-                        wire::CODEC_VERSIONS.end()
+                        wire::LEGACY_VERSIONS.start(),
+                        wire::LEGACY_VERSIONS.end(),
+                        wire::CURRENT_VERSIONS.start(),
+                        wire::CURRENT_VERSIONS.end()
                     ));
                 }
             }
@@ -695,41 +713,49 @@ impl Session {
             }
             // A tab or split appeared or changed shape on the desktop.
             ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW => self.refresh_panes(),
-            ident::ERROR_RESPONSE => match request {
-                Some(Request::Version) => {
-                    self.fail("the mux server refused the protocol check".to_owned());
-                }
-                Some(Request::ListPanes) => {
-                    self.fail("the mux server could not list its panes".to_owned());
-                }
-                Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) => {
-                    self.pane_gone(pane_id);
-                }
-                Some(Request::Resize { pane_id }) => self.poll(pane_id),
-                Some(Request::Lines { pane_id, ranges }) => {
-                    if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
-                        mirror.apply_lines(wire::LineEntries::default(), &ranges);
+            ident::ERROR_RESPONSE => {
+                match request {
+                    Some(Request::Version) => {
+                        self.fail("the mux server refused the protocol check".to_owned());
                     }
-                    self.advance(pane_id);
+                    Some(Request::ListPanes) => {
+                        self.fail("the mux server could not list its panes".to_owned());
+                    }
+                    Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) => {
+                        self.pane_gone(pane_id);
+                    }
+                    Some(Request::Resize { pane_id }) => self.poll(pane_id),
+                    Some(Request::Lines { pane_id, ranges }) => {
+                        if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                            mirror.apply_lines(wire::LineEntries::default(), &ranges);
+                        }
+                        self.advance(pane_id);
+                    }
+                    // An invalid regular expression, or a pane that just closed.
+                    // Only the legacy rejection carries the error's text.
+                    Some(Request::Search { search } | Request::SearchLines { search }) => {
+                        let text = match self.dialect {
+                            Dialect::Legacy => wire::decode::<String>(&frame.body).ok(),
+                            Dialect::Current => None,
+                        };
+                        let reason = text.map_or_else(
+                        || "The mux server refused the search (is the regular expression valid?).".to_owned(),
+                        |text| text.strip_prefix("Error: ").unwrap_or(&text).to_owned(),
+                    );
+                        self.finish_search(search, &HashMap::new(), Some(reason));
+                    }
+                    Some(Request::Context {
+                        request, pane_id, ..
+                    }) => {
+                        self.events.push_back(Event::Context {
+                            request,
+                            pane_id,
+                            lines: Vec::new(),
+                        });
+                    }
+                    Some(Request::Action) | None => {}
                 }
-                // An invalid regular expression, or a pane that just closed.
-                Some(Request::Search { search } | Request::SearchLines { search }) => {
-                    let reason = wire::decode::<String>(&frame.body)
-                        .unwrap_or_else(|_| "the mux server refused the search".to_owned());
-                    let reason = reason.strip_prefix("Error: ").unwrap_or(&reason).to_owned();
-                    self.finish_search(search, &HashMap::new(), Some(reason));
-                }
-                Some(Request::Context {
-                    request, pane_id, ..
-                }) => {
-                    self.events.push_back(Event::Context {
-                        request,
-                        pane_id,
-                        lines: Vec::new(),
-                    });
-                }
-                Some(Request::Action) | None => {}
-            },
+            }
             // Unit replies, palettes, alerts and title notices need nothing.
             _ => {}
         }
