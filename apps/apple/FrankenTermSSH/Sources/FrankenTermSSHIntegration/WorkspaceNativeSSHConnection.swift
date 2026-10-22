@@ -393,13 +393,6 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var nextLivenessProbe: ContinuousClock.Instant?
     private var mux: MuxAttachment?
 
-    /// Bytes for the phone's terminal, applied after their resize.
-    private struct Segment {
-        var resize: TerminalSessionGeometry?
-        var bytes: Data
-        var destination: TerminalMuxInputRouting.Destination? = nil
-    }
-
     /// One attachment to the machine's mux over this SSH command channel.
     /// Only the transport actor touches it.
     private final class MuxAttachment {
@@ -408,20 +401,19 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         let queries: TerminalMuxQueryDriver
         /// The phone terminal's size as the screen last asked for it.
         var geometry: TerminalSessionGeometry
-        /// The model's size once every queued segment is applied, and as
-        /// already applied.
-        var queued: TerminalSessionGeometry, applied: TerminalSessionGeometry
+        /// One event plus one coalesced pixel-only resize. Do not read more
+        /// network data or pull another event until the consumer drains it.
+        var output: TerminalMuxOutputBuffer
         var panes: [TerminalMuxPane] = []
         var listed = false, ready = false, flushing = false
         var shown: Int?
         /// The shown pane is sized to the phone and drawing.
         var showing = false
-        var segments: [Segment] = []
         var outgoing = Data()
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry) {
             self.client = client; self.control = control; self.geometry = geometry
             queries = TerminalMuxQueryDriver(client: client, control: control)
-            queued = geometry; applied = geometry
+            output = TerminalMuxOutputBuffer(geometry: geometry)
         }
     }
 
@@ -466,6 +458,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             let deadline = ContinuousClock.now + .seconds(15)
             while !state.listed {
                 guard ContinuousClock.now < deadline else { throw TerminalMuxError.unavailable }
+                let drained = try drainMux()
+                if state.listed { break }
+                if !drained {
+                    await Task.yield()
+                    try await validateForeground()
+                    continue
+                }
                 _ = try await pumpMux(timeout: .seconds(5), driver: driver)
                 try await validateForeground()
             }
@@ -488,34 +487,50 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard let state = mux else { throw NativeSSHError.closed }
         try await flushMux(driver: driver)
         let event = try await session.service(timeout: state.queries.waitTimeout(maximum: timeout), driver: driver)
+        guard !closed else { throw NativeSSHError.closed }
         if !event.output.isEmpty { try state.client.receive(event.output) }
         if event.endOfOutput {
             try state.client.channelClosed()
             throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.unavailable
         }
-        try drainMux()
+        _ = try drainMux()
         return event
     }
 
     /// Admits queued protocol bytes to the channel's single native slot.
-    private func flushMux(driver: NativeSSHDriver) async throws {
-        guard let state = mux, !state.flushing else { return }
+    /// One turn admits at most four native slots. True proves that both local
+    /// and client egress are empty; a busy/blocked/yielded turn returns false.
+    @discardableResult
+    private func flushMux(driver: NativeSSHDriver) async throws -> Bool {
+        guard let state = mux, !state.flushing else { return false }
         state.flushing = true
         defer { state.flushing = false }
-        while true {
-            if state.outgoing.isEmpty { state.outgoing = try state.client.outgoing(limit: 1 << 20) }
-            guard !state.outgoing.isEmpty else { return }
+        for _ in 0..<4 {
+            if state.outgoing.isEmpty {
+                state.outgoing = try state.client.outgoing(limit: NativeSSHSession.maximumWriteBytes)
+                guard state.outgoing.count <= NativeSSHSession.maximumWriteBytes else { throw TerminalInputError.capacity }
+            }
+            guard !state.outgoing.isEmpty else { return true }
             let chunk = Data(state.outgoing.prefix(NativeSSHSession.maximumWriteBytes))
             switch try await session.admit(chunk, driver: driver) {
-            case .accepted(let count): state.outgoing.removeFirst(count)
-            case .wouldBlock: return
+            case .accepted(let count):
+                guard count > 0, count <= chunk.count else { throw TerminalInputError.invalidWriteSize }
+                state.outgoing.removeFirst(count)
+            case .wouldBlock: return false
             }
         }
+        inputSignal.notify()
+        return false
     }
 
-    private func drainMux() throws {
-        guard let state = mux else { return }
-        while let event = try state.client.nextEvent() {
+    /// True only after observing an empty native event queue. A model backlog
+    /// or 64-event control burst yields instead, without another socket read.
+    /// Output remains in the native queue until its bounded Swift slot is free.
+    private func drainMux() throws -> Bool {
+        guard let state = mux else { throw NativeSSHError.closed }
+        guard state.output.isEmpty else { return false }
+        for _ in 0..<64 {
+            guard let event = try state.client.nextEvent() else { return true }
             switch event {
             case .ready:
                 state.ready = true
@@ -540,10 +555,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 let cellHeight = state.geometry.pixelHeight / max(state.geometry.rows, 1)
                 let size = try TerminalSessionGeometry(columns: UInt32(columns), rows: UInt32(rows),
                     pixelWidth: min(cellWidth * UInt32(columns), 65535), pixelHeight: min(cellHeight * UInt32(rows), 65535))
-                let resize = size == state.queued ? nil : size
-                state.queued = size
-                state.segments.append(Segment(resize: resize, bytes: bytes,
-                    destination: try state.control.inputRouting.capture()))
+                try state.output.append(bytes, geometry: size,
+                    destination: state.control.inputRouting.capture())
+                return false
             case .paneTitle(let pane, let title):
                 if let index = state.panes.firstIndex(where: { $0.paneId == pane }) {
                     let old = state.panes[index]
@@ -565,6 +579,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.failed(reason)
             }
         }
+        return false
     }
 
     /// Puts the right pane on screen: the one the user picked, sized to the
@@ -605,18 +620,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     /// The next bytes for the phone's terminal, at most one receive's worth.
     private func nextMuxUpdate() -> TerminalSessionUpdate? {
-        guard let state = mux, !state.segments.isEmpty else { return nil }
-        var segment = state.segments.removeFirst()
-        let chunk = Data(segment.bytes.prefix(16_384))
-        segment.bytes.removeFirst(chunk.count)
-        let resize = segment.resize
-        if let resize { state.applied = resize }
-        if !segment.bytes.isEmpty {
-            segment.resize = nil
-            state.segments.insert(segment, at: 0)
-        }
-        return TerminalSessionUpdate(output: chunk, resized: resize,
-            muxDestination: segment.bytes.isEmpty ? segment.destination : nil)
+        mux?.output.next()
     }
 
     func didApplyOutput(_ update: TerminalSessionUpdate) async {
@@ -626,7 +630,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     private func serviceMux(driver: NativeSSHDriver) async throws -> TerminalSessionUpdate {
         try reconcileMux()
+        try await flushMux(driver: driver)
+        guard !closed else { throw NativeSSHError.closed }
         if let update = nextMuxUpdate() { return update }
+        let drained = try drainMux()
+        try reconcileMux()
+        try await flushMux(driver: driver)
+        guard !closed else { throw NativeSSHError.closed }
+        if let update = nextMuxUpdate() { return update }
+        // A bounded control-only turn yields to input/cancellation. Only an
+        // observed-empty event queue permits the next receive/decode operation.
+        guard drained else { return TerminalSessionUpdate(output: Data()) }
         let event = try await pumpMux(timeout: serviceTimeout(), driver: driver)
         try await validateForeground()
         try await checkLiveness(event, driver: driver)
@@ -658,7 +672,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             // Recheck after authorization's awaits. No actor suspension occurs
             // between verifying the registration and encoding its numeric target.
             try state.control.inputRouting.validateDelivery(destination)
-            guard state.outgoing.count < 256 * 1024 else { return .wouldBlock }
+            // Do not append user data behind blocked protocol bytes in Rust's
+            // outgoing queue. An old accepted operation stays in its coordinator
+            // slot until both native/client egress have demonstrably drained.
+            guard try await flushMux(driver: driver) else { return .wouldBlock }
+            try await validateForeground()
+            try state.control.inputRouting.validateDelivery(destination)
             try state.client.write(pane: destination.paneID, bytes: bytes)
             try await flushMux(driver: driver)
             return .accepted(bytes.count)
@@ -730,10 +749,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 let size = try TerminalSessionGeometry(columns: geometry.columns, rows: geometry.rows,
                     pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight)
                 state.geometry = size
-                if (size.rows, size.columns) == (state.queued.rows, state.queued.columns) {
+                if (size.rows, size.columns) == (state.output.queuedGeometry.rows, state.output.queuedGeometry.columns) {
                     // Same cells, new pixels: nothing for the server to redraw.
-                    state.queued = size
-                    state.segments.append(Segment(resize: size, bytes: Data()))
+                    try state.output.requestPixelGeometry(size)
                 } else if let pane = state.shown, state.showing {
                     try state.client.resize(pane: pane, rows: Int(size.rows), columns: Int(size.columns))
                 }
@@ -762,12 +780,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         muxControl?.inputRouting.retire()
         muxControl?.setWaker(nil)
         mux?.queries.retire()
+        mux?.output.retire()
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
         let task = Task<Void, Never> {
             if let state = self.mux, let driver = self.driver, let pane = state.shown, state.showing {
                 try? state.client.restoreSize(pane: pane)
-                try? await self.flushMux(driver: driver)
+                _ = try? await self.flushMux(driver: driver)
                 _ = try? await session.service(timeout: .milliseconds(300), driver: driver)
             }
             await session.close()
@@ -776,6 +795,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         shutdown = task
         await task.value
         networkLease = nil
+        // Retained diagnostic owners must not retain decoded output, native
+        // event payloads or pending protocol bytes after actual shutdown joins.
+        mux = nil; driver = nil
     }
 
     func validateForeground() async throws {

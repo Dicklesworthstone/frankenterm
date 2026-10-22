@@ -57,6 +57,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         try bytes.withUnsafeMutableBytes { buffer in
             try call { ft_mux_v1_outgoing($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(capacity), &written) }
         }
+        guard written <= capacity else { throw TerminalModelError.invalid }
         bytes.count = Int(written)
         return bytes
     }
@@ -65,6 +66,15 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         try lock.withLock {
             var kind: UInt32 = 0, pane: UInt64 = 0, rows: UInt32 = 0, cols: UInt32 = 0, length: UInt32 = 0
             try Self.check(ft_mux_v1_next_event(handle, &kind, &pane, &rows, &cols, &length))
+            // Refuse before allocating or copying an event into Swift. Rust
+            // decoder allocations are a separate bound; this is the native
+            // delivery profile shared with the transport's single-event slot.
+            guard length <= TerminalMuxOutputBuffer.maximumEventBytes else { throw TerminalModelError.capacity }
+            guard let paneID = Int(exactly: pane) else { throw TerminalModelError.invalid }
+            if kind == UInt32(FT_MUX_EVENT_NONE) {
+                guard length == 0 else { throw TerminalModelError.invalid }
+                return nil
+            }
             var payload = Data(count: Int(length))
             if length > 0 {
                 var written: UInt32 = 0
@@ -74,7 +84,6 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 }
                 guard written == length else { throw TerminalModelError.invalid }
             }
-            let paneID = Int(clamping: pane)
             switch kind {
             case UInt32(FT_MUX_EVENT_NONE): return nil
             case UInt32(FT_MUX_EVENT_READY):
@@ -101,41 +110,60 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     }
 
     public func refreshPanes() throws { try call { ft_mux_v1_refresh_panes($0) } }
-    public func show(pane: Int) throws { try call { ft_mux_v1_show($0, UInt64(pane)) } }
-    public func hide(pane: Int) throws { try call { ft_mux_v1_hide($0, UInt64(pane)) } }
+    private static func paneID(_ pane: Int) throws -> UInt64 {
+        guard let value = UInt64(exactly: pane) else { throw TerminalModelError.invalid }
+        return value
+    }
+    public func show(pane: Int) throws {
+        let pane = try Self.paneID(pane)
+        try call { ft_mux_v1_show($0, pane) }
+    }
+    public func hide(pane: Int) throws {
+        let pane = try Self.paneID(pane)
+        try call { ft_mux_v1_hide($0, pane) }
+    }
 
     public func write(pane: Int, bytes: Data) throws {
+        let pane = try Self.paneID(pane)
         guard !bytes.isEmpty else { return }
         guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
         try bytes.withUnsafeBytes { buffer in
-            try call { ft_mux_v1_write($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+            try call { ft_mux_v1_write($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
         }
     }
 
     public func paste(pane: Int, text: String) throws {
+        let pane = try Self.paneID(pane)
+        guard text.utf8.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
         let bytes = Data(text.utf8)
         guard !bytes.isEmpty else { return }
         guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
         try bytes.withUnsafeBytes { buffer in
-            try call { ft_mux_v1_paste($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+            try call { ft_mux_v1_paste($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
         }
     }
 
     public func resize(pane: Int, rows: Int, columns: Int) throws {
+        let pane = try Self.paneID(pane)
         guard (1...512).contains(rows), (1...512).contains(columns) else { throw TerminalModelError.invalid }
-        try call { ft_mux_v1_resize($0, UInt64(pane), UInt32(rows), UInt32(columns)) }
+        try call { ft_mux_v1_resize($0, pane, UInt32(rows), UInt32(columns)) }
     }
 
-    public func restoreSize(pane: Int) throws { try call { ft_mux_v1_restore_size($0, UInt64(pane)) } }
+    public func restoreSize(pane: Int) throws {
+        let pane = try Self.paneID(pane)
+        try call { ft_mux_v1_restore_size($0, pane) }
+    }
 
     public func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {
+        let pane = try Self.paneID(pane)
+        guard (1...4096).contains(text.utf8.count) else { throw TerminalModelError.invalid }
         let bytes = Data(text.utf8)
         guard (1...4096).contains(bytes.count) else { throw TerminalModelError.invalid }
         let flags = (caseSensitive ? UInt32(FT_MUX_SEARCH_CASE_SENSITIVE) : 0) | (regex ? UInt32(FT_MUX_SEARCH_REGEX) : 0)
         var search: UInt64 = 0
         try bytes.withUnsafeBytes { buffer in
             try call {
-                ft_mux_v1_search($0, UInt64(pane), buffer.bindMemory(to: UInt8.self).baseAddress,
+                ft_mux_v1_search($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress,
                                  UInt32(bytes.count), flags, &search)
             }
         }
@@ -143,9 +171,11 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     }
 
     public func context(pane: Int, firstRow: Int64, count: Int) throws -> UInt64 {
+        let pane = try Self.paneID(pane)
         guard (1...1000).contains(count) else { throw TerminalModelError.invalid }
+        guard !firstRow.addingReportingOverflow(Int64(count)).overflow else { throw TerminalModelError.invalid }
         var request: UInt64 = 0
-        try call { ft_mux_v1_context($0, UInt64(pane), firstRow, UInt32(count), &request) }
+        try call { ft_mux_v1_context($0, pane, firstRow, UInt32(count), &request) }
         return request
     }
 }
