@@ -31,7 +31,11 @@ class SwiftInteropTests(unittest.TestCase):
                             "completionStatusWithoutClose": "statusWithoutClose",
                             "completionDelayedStatus": "delayedStatus", "completionReset": "resetAfterEOF",
                             "completionCancel": "eofOnly"}
-        server = fixture.LoopbackServer(key, completion=completion_modes.get(mode, "unknown"))
+        authentication_modes = {value: value for value in ["publickeyDisabled", "noneSucceeds", "unsignedSuccess",
+                                                          "disconnectOffer", "disconnectSignature", "rejectSignature", "partial"]}
+        server = fixture.LoopbackServer(key, reject=mode == "keyRefused",
+                                       completion=completion_modes.get(mode, "unknown"),
+                                       auth_mode=authentication_modes.get(mode, "normal"))
         sock = None
         if mode == "connect":
             endpoint, inherited = server.address[1], []
@@ -110,10 +114,27 @@ class SwiftInteropTests(unittest.TestCase):
                 self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
                 self.assertTrue(any(e[0] == "shell" for e in server.events))
             else:
-                self.assertFalse(any(e[0] == "shell" for e in server.events))
-                self.assertEqual(signs, 0 if mode in ["rejectHost", "cancelPeer"] else 1)
-                if mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign"]:
+                self.assertFalse(any(e[0] in ["channel", "pty", "shell"] for e in server.events))
+                unsigned = ["rejectHost", "cancelPeer", "keyRefused", "publickeyDisabled",
+                            "noneSucceeds", "unsignedSuccess", "disconnectOffer"]
+                self.assertEqual(signs, 0 if mode in unsigned else 1)
+                self.assertEqual(completed["credentialRefused"], mode == "keyRefused")
+                self.assertFalse(completed["unreachable"])
+                self.assertEqual(completed["authenticationTimedOut"], mode in ["deadlineSigner", "signerTimeout"])
+                if mode in ["rejectHost", "cancelPeer"]:
+                    self.assertFalse(any(e[0] in ["authentication-methods", "authentication"] for e in server.events))
+                if mode in ["publickeyDisabled", "noneSucceeds"]:
+                    self.assertFalse(any(e[0] == "authentication" for e in server.events))
+                if mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign", "signerFailure", "signerTimeout",
+                            "signatureMalformed", "keyRefused", "unsignedSuccess", "disconnectOffer"]:
                     self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0])
+                if mode in ["rejectSignature", "partial", "disconnectSignature"]:
+                    self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+                expected_native = {"keyRefused": -1006, "publickeyDisabled": -1010, "noneSucceeds": -1010,
+                                   "unsignedSuccess": -1010, "rejectSignature": -1011, "partial": -1011,
+                                   "disconnectOffer": -1003, "disconnectSignature": -1003, "signatureMalformed": -1007}
+                if mode in expected_native:
+                    self.assertEqual(completed["nativeError"], expected_native[mode])
         finally:
             if process.poll() is None:
                 process.kill()
@@ -151,7 +172,13 @@ class SwiftInteropTests(unittest.TestCase):
         self.run_probe("pumpCancel")
 
     def test_cancelled_expired_or_revoked_signature_cannot_reach_peer(self):
-        for mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign"]:
+        for mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign", "signerFailure", "signerTimeout", "signatureMalformed"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode)
+
+    def test_only_unsigned_key_refusal_is_eligible_for_another_configured_key(self):
+        for mode in ["keyRefused", "publickeyDisabled", "noneSucceeds", "unsignedSuccess",
+                     "rejectSignature", "partial", "disconnectOffer", "disconnectSignature"]:
             with self.subTest(mode=mode):
                 self.run_probe(mode)
 

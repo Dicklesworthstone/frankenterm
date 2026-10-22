@@ -256,6 +256,15 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
                 guard line.count <= 2048, let signature = Data(base64Encoded: line) else {
                     continuation.resume(throwing: ProbeFailure.invalid); return
                 }
+                if self.mode == "signerFailure" {
+                    continuation.resume(throwing: ProbeFailure.denied); return
+                }
+                if self.mode == "signerTimeout" {
+                    continuation.resume(throwing: NativeSSHError.timedOut); return
+                }
+                if self.mode == "signatureMalformed" {
+                    continuation.resume(returning: Data([0])); return
+                }
                 // Intentionally deliver despite cancellation to exercise the
                 // production owner's post-await generation/deadline checks.
                 continuation.resume(returning: signature)
@@ -299,7 +308,13 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
                 if case ProbeFailure.unexpected = error { throw error }
                 let stats = try await session.accounting()
                 guard stats.allocatedBytes == 0, stats.locallyAcceptedBytes == 0 else { throw ProbeFailure.invalid }
-                emit(["event": "done", "mode": mode, "closed": true]); return
+                let nativeError = error as? NativeSSHError
+                var outcome: [String: Any] = ["event": "done", "mode": mode, "closed": true,
+                    "credentialRefused": nativeError?.isCredentialRefused ?? false,
+                    "unreachable": nativeError?.isUnreachable ?? false,
+                    "authenticationTimedOut": nativeError == .authenticationTimedOut]
+                if case .native(let code)? = nativeError { outcome["nativeError"] = Int(code) }
+                emit(outcome); return
             }
             if mode == "pump" || mode == "pumpCancel" {
                 try await runPump(session: session, mode: mode)

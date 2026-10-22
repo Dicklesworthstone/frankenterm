@@ -52,11 +52,11 @@ final class MobileConnections {
     fileprivate func releaseCleanup(_ id: UUID) { pendingCleanup[id] = nil }
 }
 
-/// One ready route to a machine, with the key it uses: the first of the
-/// route's ordered references available on this device. A mux route attaches
-/// to the machine's existing FrankenTerm panes instead of starting a shell.
+/// One ready route, with its available configured keys in the workspace's
+/// order. A mux route attaches to existing FrankenTerm panes rather than
+/// starting a shell. Readiness never authorizes unrelated Keychain identities.
 struct TerminalSessionRoute: Hashable, Sendable {
-    let id: String, credentialID: String, host: String, port: UInt16
+    let id: String, credentialIDs: [String], host: String, port: UInt16
     var mux = false
 }
 
@@ -188,6 +188,7 @@ final class TerminalSessionController {
     private(set) var phase: Phase = .idle { didSet { if phase != oldValue { onChange?() } } }
     /// The route being tried, then the one connected.
     private(set) var route: TerminalSessionRoute
+    private(set) var credentialID: String?
     private(set) var terminal: NativeTerminalView?
     /// True only after every owned cleanup operation actually succeeds.
     private(set) var settled = false { didSet { if settled != oldValue { onChange?() } } }
@@ -245,11 +246,21 @@ final class TerminalSessionController {
     @ObservationIgnored private var retainedCaptureAttempted = false
     @ObservationIgnored private var retainEndedOutput = true
     @ObservationIgnored private var viewAttachment: Task<Void, Never>?
+    @ObservationIgnored private var authenticatedSelection: TerminalRouteAttemptPlan.Selection?
+    @ObservationIgnored private var reconnectSelection: TerminalRouteAttemptPlan.Selection?
 
-    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus) {
+    init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
+         reconnectingFrom previous: TerminalSessionController? = nil) {
         self.target = target; self.connections = connections; self.focus = focus
         basePalette = target.basePalette
         route = target.routes[0]
+        if let previous, previous.target.workspaceID == target.workspaceID,
+           previous.target.revision == target.revision, previous.target.machineID == target.machineID,
+           let selected = previous.authenticatedSelection ?? previous.reconnectSelection,
+           target.routes.contains(where: { $0.id == selected.routeID && $0.credentialIDs.contains(selected.credentialID) }) {
+            reconnectSelection = selected
+            shellOnly = previous.shellOnly
+        }
     }
 
     /// "Machine · Route", for labels that leave the session.
@@ -434,7 +445,9 @@ final class TerminalSessionController {
                 // newer desktop's), or it has no panes: the machine gets a
                 // shell of its own instead, as before there was a mux.
                 Self.log.info("no usable mux on \(self.target.machineID, privacy: .public) (\(String(describing: failure), privacy: .public)); opening a shell")
-                try? await connections.manager.close(connectionID: attempt.id)
+                // A failed cleanup retains this exact owner; it may not be
+                // hidden by opening another key, route, or shell.
+                try await connections.manager.close(connectionID: attempt.id)
                 self.connection = nil
                 shellOnly = true
                 try checkStarting()
@@ -597,34 +610,76 @@ final class TerminalSessionController {
     /// only the explanation.
     private static let log = Logger(subsystem: "org.frankenterm.mobile", category: "connect")
 
-    /// Tries the machine's routes in attempt order and moves on only while an
-    /// address never answers. A refused key or a changed host key ends the
-    /// attempt with its own explanation; no other route is tried after it.
+    /// A new, fully authorized transport for each configured key. Only a proven
+    /// unsigned public-key refusal advances within a route. Routes change only
+    /// for initial reachability failures, before any key has been refused.
     private func connectFirstReachable() async throws -> WorkspaceSSHConnection {
         let onTailnet = WorkspaceRouteNetwork.deviceTailnetAddress() != nil
         let device = "this \(UIDevice.current.model)"
         var unreachable: [WorkspaceConnectionHelp] = []
-        for candidate in target.attemptOrder() where !(shellOnly && candidate.mux) {
+        let candidates = target.attemptOrder().filter { !(shellOnly && $0.mux) }
+        guard !candidates.isEmpty else {
+            throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                message: "No direct SSH route is ready to open a new shell on this device.", remedy: .none))
+        }
+        // A direct route's mux-to-shell fallback and an automatic reconnect
+        // start with the key that authenticated. An explicit Retry starts over
+        // in configured order. Every preference remains in this exact target.
+        let prior = authenticatedSelection ?? reconnectSelection
+        let preferred = prior.flatMap { selected in
+            candidates.contains(where: { $0.id == selected.routeID && $0.credentialIDs.contains(selected.credentialID) })
+                ? selected : nil
+        }
+        var plan = try TerminalRouteAttemptPlan(routes: candidates.map {
+            .init(routeID: $0.id, credentialIDs: $0.credentialIDs)
+        }, preferring: preferred)
+        while let attempt = plan.current {
             try checkStarting()
+            guard let candidate = candidates.first(where: { $0.id == attempt.selection.routeID }) else {
+                throw TerminalRouteAttemptPlanError.invalidRoutes
+            }
             route = candidate
+            credentialID = attempt.selection.credentialID
             do {
-                return try await connections.manager.connect(workspaceID: target.workspaceID,
+                let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
-                    credentialID: candidate.credentialID, confirmedByUser: true, attachMux: !shellOnly)
+                    credentialID: attempt.selection.credentialID, confirmedByUser: true, attachMux: !shellOnly)
+                // Retain the owner before any following operation can throw.
+                // performStart checks cancellation before opening the channel.
+                connection = connected
+                authenticatedSelection = try plan.connected(attempt)
+                return connected
             } catch is CancellationError {
+                plan.cancel()
                 throw CancellationError()
             } catch TerminalSessionJournalError.reviewRequired {
+                try checkStarting(); plan.cancel()
                 throw TerminalSessionJournalError.reviewRequired
             } catch {
-                Self.log.error("route \(candidate.id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-                guard let failure = error as? NativeSSHError, failure.isUnreachable else {
+                // The awaited manager owns and settles the failed transport.
+                // Local cancellation wins before another candidate is selected.
+                try checkStarting()
+                Self.log.error("route \(candidate.id, privacy: .public), key \(attempt.selection.credentialID, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                if let failure = error as? NativeSSHError, failure.isCredentialRefused {
+                    if try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
                     throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
-                                                     message: Self.describe(error), remedy: .none))
+                        message: "The machine refused all available configured keys for this route. Add the intended key's public half to ~/.ssh/authorized_keys on the machine.", remedy: .none))
                 }
-                if let help = WorkspaceConnectionHelp(failure: failure, machine: target.machineName, host: candidate.host,
-                                                      port: candidate.port, onTailnet: onTailnet, device: device) {
+                if let failure = error as? NativeSSHError, failure.isUnreachable {
+                    let help = WorkspaceConnectionHelp(failure: failure, machine: target.machineName, host: candidate.host,
+                        port: candidate.port, onTailnet: onTailnet, device: device)
+                        ?? .init(title: "Couldn't connect to \(target.machineName)", message: Self.describe(error), remedy: .none)
+                    if plan.hasCredentialRefusal {
+                        _ = try plan.failed(.unreachable, attempt: attempt)
+                        throw ConnectFailure(help: help)
+                    }
                     unreachable.append(help)
+                    if try plan.failed(.unreachable, attempt: attempt) != nil { continue }
+                    break
                 }
+                _ = try plan.failed(.terminal, attempt: attempt)
+                throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                                                 message: Self.describe(error), remedy: .none))
             }
         }
         throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)

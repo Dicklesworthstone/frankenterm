@@ -89,6 +89,76 @@ class ObservedServerEvents(list):
         super().append(event)
 
 
+@unittest.skipUnless(PROBE, "provide WorkspaceSSHProbe for ordered credential scenarios")
+class OrderedWorkspaceInteropTests(unittest.TestCase):
+    def run_ordered(self, mode):
+        refused = ed25519.Ed25519PrivateKey.generate()
+        accepted = ec.generate_private_key(ec.SECP256R1())
+        server = fixture.LoopbackServer(accepted, connections=2)
+        directory = Path(tempfile.mkdtemp(prefix="frankenterm-ordered-ssh-journal-"))
+        server.events = ObservedServerEvents(directory / "catalog.json")
+        def pem(key):
+            return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+                                     serialization.NoEncryption()).decode()
+        request = {"pem": pem(refused), "secondPEM": pem(accepted), "journalDirectory": str(directory)}
+        try:
+            process = subprocess.run([PROBE, str(server.address[1]), base64.b64encode(server.host_blob).decode(), mode],
+                                     input=json.dumps(request).encode(), capture_output=True, timeout=20)
+            self.assertEqual(process.returncode, 0, process.stderr.decode(errors="replace")[:12000])
+            self.assertLess(len(process.stdout), 2048)
+            result = json.loads(process.stdout)
+            self.assertTrue(result["closed"])
+            authentication = [event for event in server.events if event[0] == "authentication"]
+            side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
+            if mode == "orderedSuccess":
+                self.assertTrue(server.done.wait(2), "second connection retained server work")
+                self.assertEqual(server.accepted_connections, 2)
+                self.assertEqual([event[1] for event in authentication], [0, 0, 1])
+                self.assertEqual([event[3] for event in authentication],
+                                 [fixture.public_blob(refused), fixture.public_blob(accepted), fixture.public_blob(accepted)])
+                self.assertEqual(side_effects, ["channel", "pty", "shell"])
+                self.assertEqual(server.events.creation_observations, 3)
+                self.assertEqual(server.received, "protected workspace → actual SSH 🦀\r\nEND-SESSION\r".encode())
+                self.assertEqual(result["bytes"], len(server.received))
+                self.assertEqual(result["signs"], 1, "the rejected first key must never sign")
+                records = json.loads((directory / "catalog.json").read_bytes())["records"]
+                self.assertEqual([record["state"] for record in records], ["acknowledged"])
+                # The first connection must have closed before this immutable
+                # listener accepted the second key's fresh transport.
+                positions = [index for index, event in enumerate(server.events) if event[0] == "connection"]
+                self.assertEqual(len(positions), 2)
+                self.assertLess(next(index for index, event in enumerate(server.events) if event[0] == "authentication"),
+                                positions[1])
+            else:
+                self.assertEqual(server.accepted_connections, 1)
+                self.assertEqual([event[1] for event in authentication], [0])
+                self.assertEqual([event[3] for event in authentication], [fixture.public_blob(refused)])
+                self.assertEqual(side_effects, [])
+                self.assertEqual(server.events.creation_observations, 0)
+                self.assertEqual(server.received, b"")
+                self.assertEqual(result["bytes"], 0)
+                self.assertEqual(result["signs"], 0)
+                if (directory / "catalog.json").exists():
+                    self.assertEqual(json.loads((directory / "catalog.json").read_bytes())["records"], [])
+        finally:
+            server.close()
+
+    def test_refused_first_key_advances_to_second_on_the_same_endpoint_and_opens_one_real_terminal(self):
+        self.run_ordered("orderedSuccess")
+
+    def test_cancelled_native_owner_cannot_offer_the_next_key(self):
+        self.run_ordered("orderedCancel")
+
+    def test_revoking_the_next_key_between_attempts_prevents_its_offer(self):
+        self.run_ordered("orderedRevokeNext")
+
+    def test_reimport_between_attempts_rejects_the_old_workspace_revision(self):
+        self.run_ordered("orderedStaleRevision")
+
+    def test_suspending_connections_between_attempts_prevents_the_next_offer(self):
+        self.run_ordered("orderedSuspend")
+
+
 @unittest.skipUnless(PROBE, "provide WorkspaceSSHProbe for protected-worker and journal scenarios")
 class ProtectedWorkspaceInteropTests(unittest.TestCase):
     def run_probe(self, mode, key=None):
