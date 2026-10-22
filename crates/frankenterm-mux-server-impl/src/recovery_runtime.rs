@@ -14,7 +14,7 @@ use frankenterm_core::session_restore::{
 };
 use frankenterm_core::snapshot_engine::{
     WholeMuxCaptureError, WholeMuxPublicationIdentity, capture_and_publish_whole_mux_recovery,
-    open_recovery_key_enrollment,
+    open_recovery_key_enrollment, reclaim_whole_mux_recovery_objects,
 };
 use frankenterm_core::snapshot_publication::{
     PredecessorBinding, PublicationLimits, SnapshotPublicationStore,
@@ -291,6 +291,27 @@ impl CaptureState {
             .inspect_err(|_| {
                 log::error!("mux recovery authority rejection stage=predecessor_selection");
             })?;
+        // Publication reclaims as it commits; this frees a store that filled
+        // before it did, which would refuse the next generation's objects.
+        match reclaim_whole_mux_recovery_objects(
+            &state.store,
+            Arc::clone(&state.key),
+            &state.identity,
+        ) {
+            Ok(reclaimed) if reclaimed.removed_objects > 0 => log::info!(
+                "mux recovery store reclaimed {} unreachable objects ({} bytes)",
+                reclaimed.removed_objects,
+                reclaimed.removed_bytes
+            ),
+            Ok(reclaimed) => log::debug!(
+                "mux recovery store reclaimed nothing: {}",
+                reclaimed.skipped.unwrap_or("no unreachable objects")
+            ),
+            Err(error) => log::warn!(
+                "mux recovery store reclamation failed: {}",
+                recovery_error_chain(&error)
+            ),
+        }
         Ok(state)
     }
 

@@ -956,6 +956,36 @@ pub fn publish_whole_mux_recovery(
     )?)
 }
 
+/// Reclaim the objects neither retained whole-mux root reads from a store
+/// that filled before publication reclaimed them (ft-6nfed): a full store
+/// refuses a new generation's objects before its root could reclaim any.
+/// Both roots verify under `expected`'s key, root identity, session and
+/// guardian custody, as publication verifies its predecessor.
+#[cfg(feature = "frankenterm-deps")]
+pub fn reclaim_whole_mux_recovery_objects(
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    key: Arc<crate::snapshot_representation::RecoveryKey>,
+    expected: &WholeMuxPublicationIdentity,
+) -> Result<crate::snapshot_publication::ObjectReclamation, WholeMuxPublicationError> {
+    use crate::session_restore::{WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig};
+
+    let repair_key = key.derive_repair_authentication_key()?;
+    let trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
+        .with_session_id(expected.session_id.clone());
+    let verifier = WholeMuxRecoveryVerifier::new_production(key, trusted);
+    #[cfg(unix)]
+    let verifier = match expected.existing_guardian_custody.as_ref() {
+        Some(token_path) => verifier.with_existing_guardian_custody(token_path.clone()),
+        None => verifier,
+    };
+    Ok(store.reclaim_unreachable_objects(
+        &verifier,
+        &format!("whole-mux-{}", hex::encode(expected.root_object_id)),
+        &expected.root_object_id,
+        repair_key.as_ref(),
+    )?)
+}
+
 #[cfg(feature = "frankenterm-deps")]
 #[derive(Debug, thiserror::Error)]
 enum WholeMuxPublicationVerifyError {
@@ -1028,6 +1058,18 @@ impl crate::snapshot_publication::RootVerifier for WholeMuxPublicationVerifier<'
     fn superseded_by_newer(&self, error: &Self::Error) -> bool {
         matches!(error, WholeMuxPublicationVerifyError::Graph(graph)
             if self.predecessor.superseded_by_newer(graph))
+    }
+
+    fn root_objects(
+        &self,
+        candidate: &crate::snapshot_publication::RootSlotCandidate,
+        store: &crate::snapshot_publication::SnapshotPublicationStore,
+    ) -> Option<Vec<String>> {
+        // Either verifier authenticates the manifest under the same key and
+        // root identity; the roles differ only in what verification pins.
+        self.predecessor
+            .root_objects_with_cx(self.cx, candidate, store)
+            .ok()
     }
 }
 

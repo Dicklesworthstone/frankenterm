@@ -62,7 +62,7 @@ use crate::mux_recovery_image::{RecoveryImageHeader, RecoveryTopology};
 use crate::snapshot_publication::{GenerationRootPublishRequest, PredecessorBinding};
 use crate::snapshot_publication::{
     PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
-    VerifiedRootSelection,
+    VerifiedRootSelection, repair_descriptor_object_id,
 };
 #[cfg(test)]
 use crate::snapshot_publication::{RecoveryObjectPayload, RootSlot, sha256_hex};
@@ -7656,6 +7656,41 @@ impl WholeMuxRecoveryVerifier {
         Ok(decoded.into_plaintext())
     }
 
+    /// Each pane checkpoint object `candidate` names and its repair
+    /// descriptor, read from the authenticated manifest alone: unlike
+    /// [`Self::verify_root_with_cx`], this needs neither the objects nor
+    /// guardian evidence, which a newer capture may have superseded.
+    pub fn root_objects_with_cx(
+        &self,
+        cx: &Cx,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Result<Vec<String>, WholeMuxRecoveryError> {
+        cx.checkpoint()
+            .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+        if candidate.manifest_bytes.len() > self.limits.max_image_bytes {
+            return Err(WholeMuxRecoveryError::TopologyValidation(format!(
+                "root manifest payload exceeds limit ({} > {})",
+                candidate.manifest_bytes.len(),
+                self.limits.max_image_bytes
+            )));
+        }
+        let (raw_image_json, _) = self.decode_and_verify_manifest_payload(cx, candidate, store)?;
+        let image = MuxRecoveryImage::from_json_slice(raw_image_json.as_slice())?;
+        image.validate()?;
+        Ok(image
+            .panes
+            .iter()
+            .flat_map(|pane| {
+                let object = &pane.checkpoint.checkpoint_ref;
+                [
+                    object.object_id.clone(),
+                    repair_descriptor_object_id(&object.payload_digest),
+                ]
+            })
+            .collect())
+    }
+
     pub fn verify_root_with_cx(
         &self,
         cx: &Cx,
@@ -8092,6 +8127,15 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
             error,
             WholeMuxRecoveryError::SupersededGuardianCheckpoint { .. }
         )
+    }
+
+    fn root_objects(
+        &self,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Option<Vec<String>> {
+        self.root_objects_with_cx(&crate::cx::for_request(), candidate, store)
+            .ok()
     }
 }
 
