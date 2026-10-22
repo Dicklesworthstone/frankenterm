@@ -117,6 +117,15 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// The text of the pane's rows `firstRow..<firstRow+count`; a `.context`
     /// event with the returned id answers.
     func context(pane: Int, firstRow: Int64, count: Int) throws -> UInt64
+    /// Turns a mouse wheel `steps` notches (negative toward older output) over
+    /// the pane's screen cell: wheel events for a program that asked for the
+    /// mouse, arrow keys for a full-screen one, nothing for others.
+    func wheel(pane: Int, steps: Int, column: Int, row: Int) throws
+}
+
+extension TerminalMuxClient {
+    /// A client without a wheel ignores it.
+    public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {}
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
@@ -186,6 +195,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private var requested: Int?
     private var pendingSearch: Search?
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
+    private var pendingScroll: (steps: Int, column: Int, row: Int)?
     private var waker: (@Sendable () -> Void)?
     private var observer: (@Sendable (State) -> Void)?
     private var queriesEnded = false
@@ -215,6 +225,28 @@ public final class TerminalMuxControl: @unchecked Sendable {
             requested = pane; return waker
         }
         wake?()
+    }
+
+    /// The most wheel notches waiting to be sent, either way.
+    public static let maximumScrollSteps = 64
+
+    /// Scrolls the program on screen like a mouse wheel over a cell of its
+    /// screen (negative steps toward older output). Notches not yet sent add
+    /// up; the transport sends them on its next turn.
+    public func scroll(steps: Int, column: Int, row: Int) {
+        guard steps != 0 else { return }
+        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
+            let total = (pendingScroll?.steps ?? 0) + max(-Self.maximumScrollSteps, min(Self.maximumScrollSteps, steps))
+            let bounded = max(-Self.maximumScrollSteps, min(Self.maximumScrollSteps, total))
+            pendingScroll = bounded == 0 ? nil : (bounded, max(column, 0), max(row, 0))
+            return waker
+        }
+        wake?()
+    }
+
+    /// The wheel notches waiting to be sent, taken.
+    public func takeScroll() -> (steps: Int, column: Int, row: Int)? {
+        lock.withLock { defer { pendingScroll = nil }; return pendingScroll }
     }
 
     /// Whether the machine is on screen. Only a visible machine's pane is

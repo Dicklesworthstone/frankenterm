@@ -53,6 +53,7 @@ pub mod ident {
     pub const WRITE_TO_PANE: u64 = 9;
     pub const UNIT_RESPONSE: u64 = 10;
     pub const SEND_KEY_DOWN: u64 = 11;
+    pub const SEND_MOUSE_EVENT: u64 = 12;
     pub const SEND_PASTE: u64 = 13;
     pub const RESIZE: u64 = 14;
     pub const GET_LINES: u64 = 22;
@@ -116,6 +117,47 @@ pub struct SendPasteCurrent<'a> {
     pub pane_id: usize,
     pub data: &'a str,
     pub input_serial: u64,
+}
+
+/// `frankenterm_term::input::MouseButton`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp(usize),
+    WheelDown(usize),
+    WheelLeft(usize),
+    WheelRight(usize),
+    None,
+}
+
+/// `frankenterm_term::input::MouseEventKind`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    Move,
+}
+
+/// `frankenterm_term::input::MouseEvent`: `x` is a column, `y` a row of
+/// the screen (not a stable row).
+#[derive(Serialize, Debug, Clone, Copy)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+    pub x: usize,
+    pub y: i64,
+    pub x_pixel_offset: isize,
+    pub y_pixel_offset: isize,
+    pub button: MouseButton,
+    pub modifiers: termwiz::input::Modifiers,
+}
+
+/// PDU 12, the same in both dialects.
+#[derive(Serialize)]
+pub struct SendMouseEvent {
+    pub pane_id: usize,
+    pub event: MouseEvent,
 }
 
 /// PDU 11: a key press the server encodes for the pane's program, in the

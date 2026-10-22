@@ -232,6 +232,12 @@ uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text
  * gave it; restore_size puts that size back. */
 uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
 uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
+/* Turns a mouse wheel steps notches (nonzero; negative toward older output,
+ * at most 64 sent per call) over the pane's screen cell column,row (each at
+ * most 4096). The server reports them to a program that asked for the
+ * mouse and sends a full-screen program arrow keys, as for the desktop's
+ * wheel; other programs ignore them. */
+uint32_t ft_mux_v1_wheel(uint64_t session, uint64_t pane_id, int32_t steps, uint32_t column, uint32_t row);
 /* Searches the pane's scrollback on the server, newest rows first, for
  * UTF-8 text (at most 4096 bytes) with FT_MUX_SEARCH_* flags; a
  * SEARCH_RESULTS event with this id answers (with an error for a pane that

@@ -159,6 +159,7 @@ pub struct Server {
     pub written: Vec<u8>,
     pub pastes: Vec<String>,
     pub keys: Vec<termwiz::input::KeyEvent>,
+    pub mouse: Vec<frankenterm_term::input::MouseEvent>,
     pub resizes: Vec<TerminalSize>,
     /// Search replies expand past the phone's frame limit.
     pub oversize_search: bool,
@@ -189,6 +190,7 @@ impl Server {
             written: Vec::new(),
             pastes: Vec::new(),
             keys: Vec::new(),
+            mouse: Vec::new(),
             resizes: Vec::new(),
             oversize_search: false,
             requests: Vec::new(),
@@ -302,6 +304,15 @@ impl Server {
             MuxWireDecodedPayload::Pdu(Pdu::SendPaste(paste)) => {
                 self.requests.push("SendPaste");
                 self.pastes.push(paste.data);
+                self.push();
+                self.reply(10, serial, &UnitResponse {});
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::SendMouseEvent(codec::SendMouseEvent {
+                event,
+                ..
+            })) => {
+                self.requests.push("SendMouseEvent");
+                self.mouse.push(event);
                 self.push();
                 self.reply(10, serial, &UnitResponse {});
             }

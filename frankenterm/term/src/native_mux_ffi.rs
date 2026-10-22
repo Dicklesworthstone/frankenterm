@@ -486,6 +486,26 @@ pub unsafe extern "C" fn ft_mux_v1_context(
 }
 
 #[no_mangle]
+pub extern "C" fn ft_mux_v1_wheel(
+    session: u64,
+    pane_id: u64,
+    steps: i32,
+    column: u32,
+    row: u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        if steps == 0 || column > 4096 || row > 4096 {
+            return Err(Error::Invalid);
+        }
+        registry
+            .session(session)?
+            .wheel(pane_id, steps, column as usize, row as usize);
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ft_mux_v1_restore_size(session: u64, pane_id: u64) -> u32 {
     boundary(Some(session), |registry| {
         let pane_id = pane(pane_id)?;
@@ -568,6 +588,11 @@ mod tests {
         assert_eq!((status, kind, length), (0, EVENT_NONE, 0));
 
         assert_eq!(ft_mux_v1_resize(session, 1, 0, 80), Error::Invalid as u32);
+        assert_eq!(ft_mux_v1_wheel(session, 1, 0, 0, 0), Error::Invalid as u32);
+        assert_eq!(
+            ft_mux_v1_wheel(session, 1, -3, 5000, 0),
+            Error::Invalid as u32
+        );
         assert_eq!(ft_mux_v1_release(session), 0);
         assert_eq!(ft_mux_v1_release(session), Error::Stale as u32);
         // SAFETY: a null pointer with length zero is the empty input.

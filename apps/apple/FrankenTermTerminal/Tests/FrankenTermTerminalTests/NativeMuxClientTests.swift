@@ -63,10 +63,11 @@ final class NativeMuxClientTests: XCTestCase {
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        try client.receive(frame(ident: 27, serial: 1, body: leb(70) + text("v0.15")))
+        // Newer than the current window this client speaks (61..70).
+        try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("v0.16")))
         let all = try events(client)
         guard case let .failed(reason)? = all.first, all.count == 1 else { return XCTFail("\(all)") }
-        XCTAssertTrue(reason.contains("70") && reason.contains("46"), reason)
+        XCTAssertTrue(reason.contains("71") && reason.contains("46") && reason.contains("70"), reason)
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "nothing more is sent")
     }
 

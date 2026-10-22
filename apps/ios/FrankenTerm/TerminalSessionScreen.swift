@@ -715,6 +715,13 @@ final class TerminalSessionController {
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
             view.onFontRevision = { [weak self] revision in self?.applyFontRevision(revision) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
+            if let control = connection?.muxControl {
+                // A drag over a full-screen program turns its wheel.
+                view.onRemoteScroll = { [weak self, weak control] steps, column, row in
+                    guard let self, !self.stopped, self.phase == .live, !self.clipboardIsPresenting else { return }
+                    control?.scroll(steps: steps, column: column, row: row)
+                }
+            }
             view.onFailure = { [weak self] error in self?.inputFailed(error) }
             view.onInputRetired = { [weak self] in
                 guard let self else { return }

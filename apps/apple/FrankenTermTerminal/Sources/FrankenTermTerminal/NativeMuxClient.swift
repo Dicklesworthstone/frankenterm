@@ -154,6 +154,13 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         try call { ft_mux_v1_restore_size($0, pane) }
     }
 
+    public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {
+        let pane = try Self.paneID(pane)
+        guard steps != 0, let steps = Int32(exactly: max(-64, min(64, steps))),
+              (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }
+        try call { ft_mux_v1_wheel($0, pane, steps, UInt32(column), UInt32(row)) }
+    }
+
     public func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {
         let pane = try Self.paneID(pane)
         guard (1...4096).contains(text.utf8.count) else { throw TerminalModelError.invalid }

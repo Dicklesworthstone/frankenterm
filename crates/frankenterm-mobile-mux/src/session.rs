@@ -8,9 +8,9 @@ use crate::mirror::PaneMirror;
 use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
     self, CodecVersion, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges, LinesResponse,
-    ListPanes, LivenessResponse, PaneList, PaneRemoved, RenderChanges, RenderHead, Resize,
-    SearchResults, SearchScrollback, SendKeyDown, SendPaste, SendPasteCurrent, StableRowIndex,
-    TerminalSize, WriteToPane, ident,
+    ListPanes, LivenessResponse, MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved,
+    RenderChanges, RenderHead, Resize, SearchResults, SearchScrollback, SendKeyDown,
+    SendMouseEvent, SendPaste, SendPasteCurrent, StableRowIndex, TerminalSize, WriteToPane, ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -115,6 +115,9 @@ enum Request {
     },
     Action,
 }
+
+/// The most wheel notches one [`Session::wheel`] call sends.
+pub const MAX_WHEEL_STEPS: u32 = 64;
 
 /// The pane id that opens PDUs 25, 30 and 37.
 #[derive(Deserialize)]
@@ -316,6 +319,38 @@ impl Session {
                 };
                 self.send(ident::SEND_PASTE, &request, Request::Action);
             }
+        }
+    }
+
+    /// Turns a mouse wheel `steps` notches over a cell of the pane's screen
+    /// (negative: toward older output), at most [`MAX_WHEEL_STEPS`] a call.
+    /// The server reports them to a program that asked for the mouse and
+    /// sends a full-screen program arrow keys instead, as for the desktop's
+    /// wheel; other programs ignore them.
+    pub fn wheel(&mut self, pane_id: usize, steps: i32, column: usize, row: usize) {
+        if !self.is_ready() || steps == 0 {
+            return;
+        }
+        let button = if steps < 0 {
+            MouseButton::WheelUp(1)
+        } else {
+            MouseButton::WheelDown(1)
+        };
+        let event = MouseEvent {
+            kind: MouseEventKind::Press,
+            x: column,
+            y: i64::try_from(row).unwrap_or(i64::MAX),
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button,
+            modifiers: termwiz::input::Modifiers::NONE,
+        };
+        for _ in 0..steps.unsigned_abs().min(MAX_WHEEL_STEPS) {
+            self.send(
+                ident::SEND_MOUSE_EVENT,
+                &SendMouseEvent { pane_id, event },
+                Request::Action,
+            );
         }
     }
 

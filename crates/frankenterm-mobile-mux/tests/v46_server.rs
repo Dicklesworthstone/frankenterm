@@ -640,6 +640,39 @@ fn keys_go_as_key_presses_and_bracketed_pastes_as_pastes_in_order() {
 }
 
 #[test]
+fn a_wheel_turns_over_the_cell_it_is_over_in_bounded_notches() {
+    use frankenterm_term::input::{MouseButton, MouseEventKind};
+    let mut harness = Harness::new(5, 30);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.wheel(pane, -2, 7, 3);
+    harness.session.wheel(pane, 1, 0, 0);
+    harness.session.wheel(pane, 0, 0, 0);
+    harness.pump();
+    let seen: Vec<_> = harness
+        .server
+        .mouse
+        .iter()
+        .map(|event| (event.kind, event.button, event.x, event.y))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (MouseEventKind::Press, MouseButton::WheelUp(1), 7, 3),
+            (MouseEventKind::Press, MouseButton::WheelUp(1), 7, 3),
+            (MouseEventKind::Press, MouseButton::WheelDown(1), 0, 0),
+        ]
+    );
+    harness.session.wheel(pane, -1000, 0, 0);
+    harness.pump();
+    assert_eq!(
+        harness.server.mouse.len(),
+        3 + frankenterm_mobile_mux::session::MAX_WHEEL_STEPS as usize
+    );
+    assert_mirrored(&mut harness);
+}
+
+#[test]
 fn an_unfinished_paste_is_sent_when_input_moves_to_another_pane() {
     let mut harness = Harness::new(4, 20);
     harness.attach();

@@ -765,9 +765,17 @@ public final class NativeTerminalView: UIView {
     /// vertical pan, the return-to-live control and typing over history ask.
     public var onHistoryViewportRequest: (@MainActor (Int64?) -> Void)?
 
+    /// A drag over a screen without history (a full-screen program's): the
+    /// owner turns that program's wheel `steps` notches (negative toward older
+    /// output) over cell (column, row). Unset, such a drag does nothing.
+    public var onRemoteScroll: (@MainActor (_ steps: Int, _ column: Int, _ row: Int) -> Void)?
+    /// Rows of drag per wheel notch: a notch scrolls a program about three rows.
+    private static let rowsPerNotch = 3
+
     private let liveButton = UIButton(type: .system)
     private let panDelegate = NativeTerminalHistoryPanDelegate()
     private var panAnchor: (top: Int64, history: TerminalRenderHistory)?
+    private var remoteScroll: (column: Int, row: Int, sent: Int)?
     private var lastHistoryRequest: Int64??
     private var lastCaret: NativeTerminalCaret?
     private var lastAppearance: (font: UIFont, foreground: UIColor)?
@@ -970,10 +978,27 @@ public final class NativeTerminalView: UIView {
         case .began:
             stopMomentum()
             lastHistoryRequest = nil
-            guard let frame = renderer.admittedFrame, let history = frame.history,
-                  history.first < history.live else { panAnchor = nil; return }
-            panAnchor = (frame.viewportFirst, history)
+            panAnchor = nil; remoteScroll = nil
+            guard let frame = renderer.admittedFrame else { return }
+            if let history = frame.history, history.first < history.live {
+                panAnchor = (frame.viewportFirst, history)
+            } else if onRemoteScroll != nil, let cell = renderer.cellSize, cell.width > 0, cell.height > 0 {
+                // Nothing to scroll here: the program itself may scroll.
+                let point = pan.location(in: self)
+                remoteScroll = (min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
+                                min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)), 0)
+            }
         case .changed:
+            if let remote = remoteScroll, rowHeight > 0 {
+                // Dragging down shows older rows: the wheel turns up.
+                let rows = Int((pan.translation(in: self).y / rowHeight).rounded(.towardZero))
+                let notches = -rows / Self.rowsPerNotch
+                if notches != remote.sent {
+                    onRemoteScroll?(notches - remote.sent, remote.column, remote.row)
+                    remoteScroll?.sent = notches
+                }
+                return
+            }
             guard let anchor = panAnchor, rowHeight > 0 else { return }
             // Dragging down reveals older rows above, one row per row height.
             let moved = pan.translation(in: self).y / rowHeight
@@ -984,8 +1009,8 @@ public final class NativeTerminalView: UIView {
                 let top = Double(anchor.top) - Double(pan.translation(in: self).y / rowHeight)
                 startMomentum(top: top, velocity: Double(pan.velocity(in: self).y / rowHeight), history: anchor.history)
             }
-            panAnchor = nil
-        default: panAnchor = nil
+            panAnchor = nil; remoteScroll = nil
+        default: panAnchor = nil; remoteScroll = nil
         }
     }
 
@@ -1372,7 +1397,7 @@ public final class NativeTerminalView: UIView {
     public func retire() {
         guard !retired else { return }
         clearSelection(); stopMomentum()
-        onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil
+        onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil; onRemoteScroll = nil
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil

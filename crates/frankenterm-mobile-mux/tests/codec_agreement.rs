@@ -76,6 +76,40 @@ fn key_presses_match_the_desktop_encoding_in_both_dialects() {
 }
 
 #[test]
+fn wheel_notches_match_the_desktop_encoding_in_both_dialects() {
+    use frankenterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
+    let ours = wire::SendMouseEvent {
+        pane_id: 5,
+        event: wire::MouseEvent {
+            kind: wire::MouseEventKind::Press,
+            x: 33,
+            y: 12,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button: wire::MouseButton::WheelUp(1),
+            modifiers: termwiz::input::Modifiers::NONE,
+        },
+    };
+    let theirs = || {
+        Pdu::SendMouseEvent(codec::SendMouseEvent {
+            pane_id: 5,
+            event: MouseEvent {
+                kind: MouseEventKind::Press,
+                x: 33,
+                y: 12,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+                button: MouseButton::WheelUp(1),
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+        })
+    };
+    let phone = phone(wire::ident::SEND_MOUSE_EVENT, 9, &ours);
+    assert_eq!(phone, desktop_v46(theirs(), 9));
+    assert_eq!(phone, desktop_current(theirs(), 9));
+}
+
+#[test]
 fn the_current_dialect_is_the_desktop_codecs_window_and_layout() {
     assert_eq!(
         wire::CURRENT_VERSIONS,

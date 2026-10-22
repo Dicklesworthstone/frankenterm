@@ -627,6 +627,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try state.client.hide(pane: pane); try state.client.restoreSize(pane: pane)
             state.showing = false
         }
+        // A drag over a full-screen program turns its wheel, as on the desktop.
+        if let scroll = state.control.takeScroll(), state.showing {
+            try state.client.wheel(pane: pane, steps: scroll.steps, column: scroll.column, row: scroll.row)
+        }
     }
 
     /// The next bytes for the phone's terminal, at most one receive's worth.
