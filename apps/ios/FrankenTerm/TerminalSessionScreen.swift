@@ -421,10 +421,11 @@ final class TerminalSessionController {
             let geometry = try TerminalSessionGeometry(columns: 80, rows: 24)
             let pump: TerminalSessionPump
             do { pump = try await attempt.openTerminal(geometry: geometry) }
-            catch TerminalMuxError.unavailable {
-                // Nothing answered at the machine's mux socket: it gets a shell
-                // of its own instead, as before there was a mux to attach to.
-                Self.log.info("no mux on \(self.target.machineID, privacy: .public); opening a shell")
+            catch let failure as TerminalMuxError {
+                // No mux answered, it speaks a protocol this app does not (a
+                // newer desktop's), or it has no panes: the machine gets a
+                // shell of its own instead, as before there was a mux.
+                Self.log.info("no usable mux on \(self.target.machineID, privacy: .public) (\(String(describing: failure), privacy: .public)); opening a shell")
                 try? await connections.manager.close(connectionID: attempt.id)
                 self.connection = nil
                 shellOnly = true
