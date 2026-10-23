@@ -130,33 +130,13 @@ private actor MacExportEngine {
                           URL(fileURLWithPath: "/Applications/FrankenTerm.app/Contents/MacOS/ft")]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }.map { ($0, ["mobile", "source"]) }
     }
-    private final class Captured: @unchecked Sendable { var data = Data() }
     private static func run(_ executable: URL, _ arguments: [String], limit: Int) throws -> Data {
-        let process = Process()
-        process.executableURL = executable; process.arguments = arguments
-        let output = Pipe(), errors = Pipe()
-        process.standardOutput = output; process.standardError = errors
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        // Drain stderr alongside stdout, and stop a helper that hangs.
-        let stderr = Captured(), drained = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async { stderr.data = errors.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
-        let watched = Captured()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [process] in
-            if process.isRunning { watched.data = Data([1]); process.terminate() }
+        do {
+            return try LocalHelperProcess.run(executable: executable, arguments: arguments,
+                                               maximumOutputBytes: limit)
+        } catch let error as LocalHelperProcessError {
+            throw MachineSourceError.failed("\(executable.lastPathComponent): \(error.localizedDescription)")
         }
-        var result = Data()
-        while let bytes = try output.fileHandleForReading.read(upToCount: 65536), !bytes.isEmpty {
-            result += bytes
-            guard result.count <= limit else { process.terminate(); throw FTError.limit("machines.source") }
-        }
-        process.waitUntilExit(); drained.wait()
-        guard watched.data.isEmpty else { throw MachineSourceError.failed("\(executable.lastPathComponent) did not finish within 30 seconds") }
-        guard process.terminationStatus == 0 else {
-            let detail = String(decoding: stderr.data.prefix(2048), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw MachineSourceError.failed("\(executable.path) \(arguments.joined(separator: " ")) failed: \(detail)")
-        }
-        return result
     }
     /// This Mac's FrankenTerm machines with every group selected, and every
     /// key their routes use included, read from the files the desktop's own
