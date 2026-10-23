@@ -1183,7 +1183,12 @@ struct WorkspaceTerminalScreen: View {
         .animation(.smooth(duration: 0.25), value: scene.selectedMachineID)
         .sensoryFeedback(.selection, trigger: scene.selectedMachineID)
         .overlay(alignment: .bottom) {
-            if let session = scene.selectedSession, let problem = session.interactionProblem {
+            if let session = scene.selectedSession, let recovery = session.localInputRecovery {
+                inputRecoveryBanner(recovery, session: session)
+            } else if scene.selectedSession?.resolvingLocalInput == true {
+                ProgressView("Resetting keyboard…")
+                    .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
+            } else if let session = scene.selectedSession, let problem = session.interactionProblem {
                 problemBanner(problem) { session.dismissInteractionProblem() }
             } else if let problem = scene.problem {
                 problemBanner(problem) { scene.dismissProblem() }
@@ -1236,25 +1241,25 @@ struct WorkspaceTerminalScreen: View {
             if let session = scene.selectedSession, session.phase == .live, session.terminal != nil {
                 if session.historyReturnBookmark != nil {
                     Button("Return to Previous View", systemImage: "arrow.uturn.backward") { session.returnFromHistorySearch() }
-                        .disabled(session.clipboardIsPresenting)
+                        .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                 }
                 Button("Search Output", systemImage: "magnifyingglass") {
                     if session.muxControl != nil { muxSearch = session } else { historyInspection = session.inspectHistory() }
                 }
-                    .disabled(session.clipboardIsPresenting)
+                    .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                     .keyboardShortcut("f", modifiers: .command)
                     .accessibilityIdentifier("terminal.history.open")
                 Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
-                    .disabled(session.clipboardIsPresenting)
+                    .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
                     Button("Compose Command", systemImage: "square.and.pencil") { session.composeCommand() }
-                        .disabled(session.clipboardIsPresenting)
+                        .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                         .keyboardShortcut("d", modifiers: [.command, .shift])
                         .accessibilityIdentifier("terminal.command.open")
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
-                        .disabled(session.clipboardIsPresenting)
+                        .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                     // Pinching the terminal does the same.
                     Menu("Text Size", systemImage: "textformat.size") {
                         Button("Bigger", systemImage: "plus.magnifyingglass") { terminal.biggerText() }
@@ -1292,6 +1297,48 @@ struct WorkspaceTerminalScreen: View {
             } label: { Label("More", systemImage: "ellipsis.circle") }
                 .accessibilityIdentifier("terminal.more")
         }
+    }
+
+    private func inputRecoveryBanner(_ recovery: TerminalKeyboardRecovery, session: TerminalSessionController) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Keyboard paused", systemImage: "keyboard.badge.ellipsis").font(.headline)
+            Text(verbatim: "\(session.target.machineName) · \(session.route.id)").font(.caption).foregroundStyle(.secondary)
+            Text("\(recovery.accounting.pendingEvents) pending local events · \(recovery.accounting.pendingUTF8Bytes) UTF-8 bytes")
+                .font(.caption).monospacedDigit()
+            Text(recovery.canRetry
+                ? "Retry sends only the pending local input to this terminal. Earlier input may already have been sent; it will not be replayed."
+                : "This input cannot be safely retried. Reset the keyboard by discarding pending local input. Earlier admitted input is unchanged.")
+                .font(.caption)
+            if recovery.accounting.compositionUTF8Bytes > 0 {
+                Text("Discard also removes the unfinished local composition.").font(.caption)
+            }
+            if let problem = session.interactionProblem { Text(verbatim: problem).font(.caption).foregroundStyle(.orange) }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    inputRecoveryActions(recovery, session: session)
+                }
+                VStack(alignment: .leading) {
+                    inputRecoveryActions(recovery, session: session)
+                }
+            }
+        }
+        .padding(14).frame(maxWidth: 520, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("terminal.input.recovery")
+    }
+
+    @ViewBuilder private func inputRecoveryActions(_ recovery: TerminalKeyboardRecovery, session: TerminalSessionController) -> some View {
+        if recovery.canRetry {
+            Button("Retry Pending Input") { session.retryLocalInput(recovery) }
+                .buttonStyle(.borderedProminent).disabled(session.resolvingLocalInput)
+                .accessibilityIdentifier("terminal.input.retry")
+        }
+        Button(recovery.accounting.pendingEvents == 0 ? "Reset Keyboard" : "Discard Pending Input", role: .destructive) {
+            session.discardLocalInput(recovery)
+        }
+        .buttonStyle(.bordered).disabled(session.resolvingLocalInput)
+        .accessibilityIdentifier("terminal.input.discard")
     }
 
     private func problemBanner(_ text: String, dismiss: @escaping () -> Void) -> some View {

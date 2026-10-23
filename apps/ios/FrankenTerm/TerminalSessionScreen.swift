@@ -210,6 +210,8 @@ final class TerminalSessionController {
     private(set) var cleanupFailure: String?
     private(set) var interruptedInput = false
     private(set) var interactionProblem: String?
+    private(set) var localInputRecovery: TerminalKeyboardRecovery?
+    private(set) var resolvingLocalInput = false
     private(set) var historyInspection: TerminalHistoryInspection?
     private(set) var historyReturnBookmark: TerminalHistoryBookmark?
     private(set) var historyReturning = false
@@ -231,6 +233,8 @@ final class TerminalSessionController {
     @ObservationIgnored private var runtime: TerminalModelRuntime?
     @ObservationIgnored private var unadoptedModel: NativeTerminalModel?
     @ObservationIgnored private var keyboard: TerminalKeyboardSession?
+    @ObservationIgnored private var keyboardRecoveryObservation: (keyboard: TerminalKeyboardSession, token: UUID)?
+    @ObservationIgnored private var localInputReset: Task<Void, Never>?
     @ObservationIgnored private weak var focus: (any TerminalSessionFocus)?
     @ObservationIgnored private var attached = false
     @ObservationIgnored private var startup: Task<Void, Never>?
@@ -307,6 +311,7 @@ final class TerminalSessionController {
     var clipboardIsPresenting: Bool {
         clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
     }
+    var localInputNeedsDecision: Bool { localInputRecovery != nil || resolvingLocalInput }
     /// A local command editor blocks input. Its explicit Review transition is
     /// the one exception: it restores this same terminal's keyboard so the
     /// existing native paste review can bind to a fresh focus generation.
@@ -321,6 +326,7 @@ final class TerminalSessionController {
         guard overviewBlocking != blocked else { return }
         overviewBlocking = blocked
         if blocked {
+            localInputReset?.cancel()
             viewAttachment?.cancel()
             terminal?.input.retire(); keyboard?.suspend()
             connection?.muxControl?.inputRouting.discardPointers()
@@ -334,7 +340,7 @@ final class TerminalSessionController {
         if let paneHandoff { await paneHandoff.value }
     }
     func beginMuxSearch() {
-        guard !stopped, phase == .live, presentationVisible else { return }
+        guard !stopped, phase == .live, presentationVisible, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = true
         viewAttachment?.cancel()
@@ -346,12 +352,12 @@ final class TerminalSessionController {
         if resumingView { showView() }
     }
     func inspectOutput() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestCopy()
     }
     func paste() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
     }
@@ -395,7 +401,7 @@ final class TerminalSessionController {
     /// The owner is captured by the sheet, never looked up again through a
     /// possibly different selected machine when that sheet is dismissed.
     func inspectHistory() -> TerminalHistoryInspection? {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision,
               let runtime, let source = pump?.source else { return nil }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil
@@ -416,7 +422,7 @@ final class TerminalSessionController {
     }
 
     func returnFromHistorySearch() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision,
               historyReturn == nil, let bookmark = historyReturnBookmark, let runtime,
               bookmark.source == pump?.source else { return }
         historyReturnBookmark = nil; historyReturning = true
@@ -442,6 +448,28 @@ final class TerminalSessionController {
     }
 
     private func inputFailed(_ error: Error) {
+        if let recovery = keyboard?.recovery,
+           error is TerminalKeyboardError || (error as? TerminalInputError) == .capacity {
+            localInputRecovery = recovery
+            interactionProblem = nil
+            return
+        }
+        // Rejected UIKit edits and local queue admission are not SSH failures.
+        // In particular TerminalKeyboardError.capacity is a different type from
+        // the coordinator's capacity error, and must not close a live terminal.
+        if let failure = error as? TerminalKeyboardError {
+            switch failure {
+            case .capacity:
+                interactionProblem = "The keyboard's local buffer is full. The rejected edit was not queued; earlier admitted input is unchanged."
+            case .invalidRange, .encoding:
+                interactionProblem = "This keyboard edit could not be encoded and was not queued. The connection is still open."
+            case .blocked:
+                interactionProblem = "The keyboard could not complete its local handoff. Pending input remains on its original terminal."
+            case .unavailable, .transitionInProgress:
+                interactionProblem = "The keyboard is unavailable or changing focus. This edit was not accepted."
+            }
+            return
+        }
         // Rejected local text is not a transport failure. In particular an
         // oversized/unsafe clipboard must not tear down a working SSH session.
         switch error as? TerminalInputError {
@@ -452,6 +480,91 @@ final class TerminalSessionController {
         case .emptyInput:
             interactionProblem = "There is no text to paste."
         default: fail(Self.describe(error))
+        }
+    }
+
+    /// Observe the actual local queue without replacing the native responder's
+    /// observer. One exact session owns this subscription through replacement.
+    private func observeKeyboardRecovery(_ keyboard: TerminalKeyboardSession) throws {
+        if let old = keyboardRecoveryObservation { old.keyboard.removeStateObserver(old.token) }
+        keyboardRecoveryObservation = nil
+        let token = try keyboard.observeState { [weak self, weak keyboard] in
+            guard let self, let keyboard, !self.stopped, self.keyboard === keyboard else { return }
+            if self.localInputRecovery != nil, keyboard.recovery == nil,
+               keyboard.phase == .suspending || keyboard.phase == .retired,
+               !self.resolvingLocalInput, self.presentationVisible {
+                self.interactionProblem = "The keyboard was interrupted. Pending local input was discarded; earlier admitted input was not replayed."
+            }
+            self.localInputRecovery = keyboard.recovery
+        }
+        keyboardRecoveryObservation = (keyboard, token)
+        localInputRecovery = keyboard.recovery
+    }
+
+    private func retireKeyboardRecovery() {
+        localInputReset?.cancel()
+        if let old = keyboardRecoveryObservation { old.keyboard.removeStateObserver(old.token) }
+        keyboardRecoveryObservation = nil; localInputRecovery = nil
+    }
+
+    /// The buttons retain both the responder identity and its single-use blocked
+    /// decision. A replacement pane/view or an old banner cannot consume them.
+    private func recoveryKeyboard(_ recovery: TerminalKeyboardRecovery, retrying: Bool) throws
+        -> (TerminalKeyboardSession, NativeTerminalView) {
+        guard !stopped, phase == .live, presentationVisible, !overviewBlocking,
+              !clipboardIsPresenting, !resolvingLocalInput, localInputReset == nil,
+              paneHandoff == nil, viewAttachment == nil, requestedMuxPane == nil,
+              focus?.shows(machineID: target.machineID) == true,
+              let keyboard, let view = terminal, view.input.session === keyboard,
+              keyboard.id == recovery.keyboardID, keyboard.originalFocus == recovery.focus,
+              keyboard.recovery == recovery, pump?.source == recovery.focus.source,
+              !retrying || view.renderer.admittedFrame?.isLive == true,
+              connection?.muxControl.map({ $0.inputRouting.current.ready
+                  && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
+            throw TerminalInputError.stale
+        }
+        return (keyboard, view)
+    }
+
+    func retryLocalInput(_ recovery: TerminalKeyboardRecovery) {
+        do {
+            let (keyboard, view) = try recoveryKeyboard(recovery, retrying: true)
+            try keyboard.retryLocalAdmission(expectedRecovery: recovery.id)
+            interactionProblem = nil
+            view.requestKeyboard(true)
+        } catch {
+            if !stopped { interactionProblem = "Pending input was not retried: \(Self.describe(error))" }
+        }
+    }
+
+    func discardLocalInput(_ recovery: TerminalKeyboardRecovery) {
+        do {
+            let (keyboard, view) = try recoveryKeyboard(recovery, retrying: false)
+            resolvingLocalInput = true
+            do { try keyboard.discardLocalAdmission(expectedRecovery: recovery.id) }
+            catch { resolvingLocalInput = false; throw error }
+            // This retires the native responder, not the SSH connection. The
+            // keyboard's existing shutdown owns releases for admitted held keys.
+            view.input.retire()
+            interactionProblem = nil
+            let source = recovery.focus.source, mux = displayedMuxDestination
+            localInputReset = Task { [weak self, weak view, keyboard] in
+                await keyboard.waitUntilSuspended()
+                guard let self else { return }
+                defer { self.localInputReset = nil; self.resolvingLocalInput = false }
+                guard !Task.isCancelled, !self.stopped, self.phase == .live,
+                      self.presentationVisible, !self.overviewBlocking, !self.clipboardIsPresenting,
+                      self.keyboard === keyboard, let view, self.terminal === view,
+                      self.pump?.source == source, self.displayedMuxDestination == mux,
+                      self.connection?.muxControl.map({ $0.inputRouting.current.ready
+                          && $0.inputRouting.current.destination == mux }) ?? true,
+                      self.focus?.shows(machineID: self.target.machineID) == true else { return }
+                // A new keyboard is created only for this still-visible source.
+                // No text, terminal opening, connection or route is retried here.
+                await self.focus?.activateKeyboard()
+            }
+        } catch {
+            if !stopped { interactionProblem = "Pending input was not discarded: \(Self.describe(error))" }
         }
     }
 
@@ -474,10 +587,15 @@ final class TerminalSessionController {
         try Task.checkCancellation()
     }
 
-    var paneNavigationBusy: Bool { paneHandoff != nil || viewAttachment != nil || requestedMuxPane != nil }
+    var paneNavigationBusy: Bool {
+        paneHandoff != nil || viewAttachment != nil || requestedMuxPane != nil || localInputReset != nil || localInputNeedsDecision
+    }
 
     private func startPaneHandoff(_ plan: TerminalMuxInputRouting.NavigationPlan) throws -> Task<Void, Never>? {
         let paneID = plan.paneID
+        // A deliberate pane switch must not silently discard a blocked queue.
+        // The operator resolves its original-source Retry/Discard decision first.
+        guard !localInputNeedsDecision else { throw TerminalKeyboardError.blocked }
         guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil,
               presentationVisible, !clipboardIsPresenting,
               focus?.shows(machineID: target.machineID) == true,
@@ -636,6 +754,7 @@ final class TerminalSessionController {
             // A delayed view/focus build must not navigate back to a machine
             // the user has already left. Its owner remains retained to join.
             viewAttachment?.cancel(); paneHandoff?.cancel()
+            localInputReset?.cancel()
             interactionProblem = nil
             historyInspection?.retire()
             historyReturn?.cancel(); historyReturnBookmark = nil
@@ -677,6 +796,7 @@ final class TerminalSessionController {
         do {
             try terminal.replaceInputSession(keyboard)
             self.keyboard = keyboard
+            try observeKeyboardRecovery(keyboard)
             clipboard?.inputInstalled()
             terminal.requestKeyboard(true)
         } catch { keyboard.suspend(); fail(Self.describe(error)) }
@@ -890,6 +1010,7 @@ final class TerminalSessionController {
             attached = true
             let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
             self.keyboard = keyboard
+            try observeKeyboardRecovery(keyboard)
             try checkLive()
             // Recreated pane views continue the canonical font revision rather
             // than resetting it to one after a prior pinch/text-size change.
@@ -936,7 +1057,10 @@ final class TerminalSessionController {
                         destination: expectedMux, control: control, view: view)
                 }
             }
-            view.onFailure = { [weak self] error in self?.inputFailed(error) }
+            view.onFailure = { [weak self, weak view] error in
+                guard let self, let view, self.terminal === view else { return }
+                self.inputFailed(error)
+            }
             view.onInputRetired = { [weak self] in
                 guard let self else { return }
                 self.connection?.muxControl?.inputRouting.discardPointers()
@@ -1168,6 +1292,7 @@ final class TerminalSessionController {
 
     private func sealLocalOwnership() {
         presentationVisible = false
+        retireKeyboardRecovery()
         muxObservation?.retire()
         connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = false
@@ -1256,6 +1381,7 @@ final class TerminalSessionController {
         if let startup { await startup.value }
         startup = nil
         if let viewAttachment { await viewAttachment.value }
+        if let localInputReset { await localInputReset.value; self.localInputReset = nil }
         if let paneHandoff { await paneHandoff.value; self.paneHandoff = nil }
         sealLocalOwnership()
         if let muxObservation { await muxObservation.close(); self.muxObservation = nil }
