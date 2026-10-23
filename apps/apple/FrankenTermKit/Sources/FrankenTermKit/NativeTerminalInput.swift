@@ -63,7 +63,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var markedTextStyle: [NSAttributedString.Key: Any]?
     public var selectionAffinity: UITextStorageDirection = .forward
     public var textInputView: UIView { self }
-    public var isEditable: Bool { session.acceptsInput && hasGeometry && !retiring }
+    public var isEditable: Bool { session.acceptsInput && hasGeometry && !retiring && !ordinaryInputBlocked }
+    /// Review keeps its exact focus alive while withholding ordinary typing.
+    /// Only confirmPaste may use this separate admission while a panel covers
+    /// the terminal; a new source/geometry still invalidates the candidate.
+    public var canReviewPaste: Bool { session.acceptsPaste && hasGeometry && !retiring }
     public var autocapitalizationType: UITextAutocapitalizationType = .none
     public var autocorrectionType: UITextAutocorrectionType = .no
     public var spellCheckingType: UITextSpellCheckingType = .no
@@ -93,6 +97,8 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var retiring = false
     private var enteredWindow = false
     private var keyboardRequested = false
+    private var reviewingPaste = false
+    private var ordinaryInputBlocked: Bool { reviewingPaste || pendingPaste != nil }
     private var controlButton: UIButton?
     private var altButton: UIButton?
     private var terminalButtons: [UIButton] = []
@@ -129,7 +135,16 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public override var inputAccessoryView: UIView? { accessory }
     // A remote shell may contain text even though our local composition is
     // empty. Keep the software Backspace enabled without mirroring that shell.
-    public var hasText: Bool { session.acceptsInput }
+    public var hasText: Bool { session.acceptsInput && !ordinaryInputBlocked }
+
+    /// Install before restoring first responder for a command's Review step.
+    /// Pending paste candidates also impose this hold automatically. Releasing
+    /// the panel's hold cannot revive a candidate cleared by source retirement.
+    public func setReviewingPaste(_ reviewing: Bool) {
+        reviewingPaste = reviewing
+        if reviewing { accessoryModifiers.clear() }
+        updateAccessory()
+    }
 
     public func updateCaret(_ value: NativeTerminalCaret) throws {
         guard value.source == session.originalFocus.source, value.revision > 0,
@@ -243,13 +258,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// UIKit-originated mutations must NOT recursively notify its input delegate.
     /// Delegate notifications are used for external lifecycle/selection changes.
     private func mutate(_ operation: () throws -> Void) {
-        guard !retiring, hasGeometry else { return }
+        guard !retiring, hasGeometry, !ordinaryInputBlocked else { return }
         do { try operation(); refreshComposition() }
         catch { onFailure?(error) }
     }
     /// Typing while no rendered projection exists (for example while history
     /// is shown) is still not sent; the owner may bring the live screen back.
     private func typed(_ operation: () throws -> Void) {
+        guard !ordinaryInputBlocked else { return }
         if !retiring, !hasGeometry { onInputWithoutProjection?() }
         mutate(operation)
     }
@@ -501,7 +517,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
 
     public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) {
-            return !retiring && hasGeometry && session.acceptsPaste && onPasteReview != nil && pendingPaste == nil && UIPasteboard.general.hasStrings
+            return canReviewPaste && !ordinaryInputBlocked && onPasteReview != nil && UIPasteboard.general.hasStrings
         }
         // Terminal transcript selection/copy belongs to the semantic renderer,
         // not this deliberately empty local text document.
@@ -510,7 +526,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
     public override func copy(_ sender: Any?) { copySelection?() }
     public override func paste(_ sender: Any?) {
-        guard !retiring, hasGeometry, session.acceptsPaste, onPasteReview != nil, pendingPaste == nil,
+        guard canReviewPaste, !ordinaryInputBlocked, onPasteReview != nil,
               UIPasteboard.general.numberOfItems == 1, UIPasteboard.general.hasStrings else { return }
         // UIPasteboard has no length-only text read. Inspect immediately after
         // this deliberate read; never copy/retain an oversized value locally.
@@ -518,19 +534,19 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         requestPasteReview(text: text)
     }
     public func requestPasteReview(text: String) {
-        guard !retiring, hasGeometry, session.acceptsPaste, let onPasteReview, pendingPaste == nil else { return }
+        guard canReviewPaste, let onPasteReview, pendingPaste == nil else { return }
         do {
             let review = try TerminalPasteReview(text: text, keyboardID: session.id, focus: session.originalFocus)
-            pendingPaste = review; onPasteReview(review)
+            pendingPaste = review; updateAccessory(); onPasteReview(review)
         } catch { onFailure?(error) }
     }
     public func confirmPaste(id: UUID) throws {
         guard !retiring, hasGeometry, let review = pendingPaste, review.id == id,
               review.keyboardID == session.id, review.focus == session.originalFocus else { throw TerminalInputError.stale }
-        try session.paste(review); pendingPaste = nil
+        try session.paste(review); pendingPaste = nil; updateAccessory()
     }
     public func cancelPaste(id: UUID) {
-        if pendingPaste?.id == id { pendingPaste = nil }
+        if pendingPaste?.id == id { pendingPaste = nil; updateAccessory() }
     }
 
     /// A row of keycaps over the keyboard in the terminal's own colors: the
@@ -619,7 +635,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
 
     private func updateAccessory() {
-        let enabled = !retiring && hasGeometry && session.acceptsInput && !session.document.isMarked
+        let enabled = isEditable && !session.document.isMarked
         accessoryBar?.backgroundColor = theme.map { $0.tint(0.06) } ?? .secondarySystemBackground
         let cap = theme.map { $0.tint(0.2) } ?? .secondarySystemFill
         let text = theme?.foreground ?? .label

@@ -12,6 +12,7 @@ public final class NativeTerminalClipboardController: NSObject {
     }
     private weak var terminal: NativeTerminalView?
     private let source: TerminalSource, destinationLabel: String
+    private let commandDestination: TerminalCommandDraftDestination
     private let review = TerminalClipboardReview<Destination>()
     private var frame: Data?
     private var active = false, retired = false
@@ -19,13 +20,31 @@ public final class NativeTerminalClipboardController: NSObject {
     private var copyTask: Task<TerminalCopyDocument, Error>?
     private var overlay: UIView?
     private var textView: UITextView?
+    private var detailLabel: UILabel?
     private var panelID: UUID?
+    private var panelGestures: [(UIGestureRecognizer, Bool)] = []
+    private var commandDraft: TerminalCommandDraft<TerminalCommandDraftDestination>?
+    private var commandTask: Task<Void, Never>?
+    private var commandTaskID: UUID?
     public var onFailure: (@MainActor (Error) -> Void)?
-    public var isPresenting: Bool { overlay != nil || copyTask != nil }
+    /// The session owner restores a fresh keyboard only for this same source
+    /// and mux visit. This callback must not connect, select or create a shell.
+    public var onCommandDraftFocus: (@MainActor () async throws -> TerminalCommandDraftDestination)?
+    public var isPresenting: Bool { overlay != nil || copyTask != nil || commandDraft != nil || commandTask != nil }
+    /// Editing owns the responder. Only the explicit, frozen Review transition
+    /// may restore terminal focus; ordinary navigation remains blocked by
+    /// isPresenting until the existing paste review takes ownership.
+    public var blocksKeyboardActivation: Bool {
+        isPresenting && commandDraft?.phase != .preparingReview
+    }
 
-    public init(terminal: NativeTerminalView, destinationLabel: String) throws {
+    public init(terminal: NativeTerminalView, destinationLabel: String,
+                commandDestination: TerminalCommandDraftDestination? = nil) throws {
         guard !destinationLabel.isEmpty, destinationLabel.utf8.count <= 1024,
               terminal.onPasteReview == nil else { throw TerminalClipboardError.unavailable }
+        let destination = commandDestination ?? TerminalCommandDraftDestination(source: terminal.source)
+        guard destination.source == terminal.source else { throw TerminalInputError.stale }
+        self.commandDestination = destination
         self.terminal = terminal; source = terminal.source; self.destinationLabel = destinationLabel
         super.init()
         terminal.onPasteReview = { [weak self] candidate in self?.offerPaste(candidate) }
@@ -58,6 +77,12 @@ public final class NativeTerminalClipboardController: NSObject {
     /// resigned to select it. A paste approval never survives that retirement.
     public func inputRetired() {
         if review.candidate != nil { dismiss() }
+    }
+    /// Called after replacement but BEFORE the session requests first responder.
+    /// Restoring review focus must not briefly expose a covered shell to Return,
+    /// IME or hardware/helper keys while the async focus callback completes.
+    public func inputInstalled() {
+        terminal?.input.setReviewingPaste(commandDraft?.phase == .preparingReview || review.candidate != nil)
     }
     private var canPresent: Bool {
         !retired && active && terminal?.window?.windowScene?.activationState == .foregroundActive
@@ -108,6 +133,113 @@ public final class NativeTerminalClipboardController: NSObject {
         terminal.input.paste(nil)
     }
 
+    /// A local multiline editor, opened only by the user's Compose action.
+    /// It reads no clipboard and sends no input. The native responder retires
+    /// before the editor appears, including any uncommitted terminal IME text.
+    public func requestCommandDraft() {
+        guard canPresent, !isPresenting, let terminal, onCommandDraftFocus != nil else { return }
+        do {
+            try TerminalCommandDraft<TerminalCommandDraftDestination>.validateOpening(keyboard: terminal.input.session,
+                liveViewport: terminal.renderer.admittedFrame?.isLive != false)
+        }
+        catch { onFailure?(error); return }
+        let draft = TerminalCommandDraft(destination: commandDestination)
+        commandDraft = draft
+        terminal.input.retire()
+        showCommandEditor(draft)
+    }
+
+    private func showCommandEditor(_ draft: TerminalCommandDraft<TerminalCommandDraftDestination>, problem: String? = nil) {
+        guard canPresent, commandDraft === draft, draft.phase == .editing, overlay == nil else { return }
+        let editor = NativeTerminalCommandTextView(draft: draft)
+        editor.onChange = { [weak self, weak draft] in
+            guard let draft else { return }
+            self?.updateCommandDetail(draft)
+        }
+        editor.onFailure = { [weak self, weak draft] error in
+            guard let draft else { return }
+            self?.updateCommandDetail(draft, problem: error.localizedDescription)
+        }
+        showPanel(id: draft.id, title: "Compose Command", detail: "", text: editor, actions: [
+            button("Discard Draft") { [weak self] in self?.cancelPanel(draft.id) },
+            button("Review Draft…") { [weak self] in self?.prepareCommandReview(draft.id) }
+        ])
+        updateCommandDetail(draft, problem: problem)
+        _ = editor.becomeFirstResponder()
+    }
+
+    private func updateCommandDetail(_ draft: TerminalCommandDraft<TerminalCommandDraftDestination>, problem: String? = nil) {
+        guard commandDraft === draft, panelID == draft.id else { return }
+        detailLabel?.text = "\(destinationLabel)\nLocal draft · \(draft.utf8Bytes) of 32,768 UTF-8 bytes. Return inserts a line break here. Review asks for confirmation before pasting; no extra Return is added."
+            + (problem.map { "\n\($0)" } ?? "")
+    }
+
+    private func prepareCommandReview(_ id: UUID) {
+        guard canPresent, commandTask == nil, let draft = commandDraft, draft.id == id,
+              let editor = textView as? NativeTerminalCommandTextView,
+              let terminal, let restoreFocus = onCommandDraftFocus else { return }
+        do {
+            // Native language entry commits only into the LOCAL editor here.
+            editor.unmarkText()
+            try draft.update(editor.text ?? "")
+            try draft.prepareReview(destination: commandDestination)
+        } catch { updateCommandDetail(draft, problem: error.localizedDescription); return }
+        removePanel()
+        let preview = PassiveClipboardTextView()
+        preview.isEditable = false; preview.isSelectable = false; preview.text = draft.text
+        preview.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        preview.accessibilityLabel = "Draft awaiting paste review"
+        showPanel(id: id, title: "Preparing Review", detail: "\(destinationLabel)\nRestoring this terminal's keyboard. No draft text has been sent.",
+                  text: preview, actions: [button("Cancel") { [weak self] in self?.cancelPanel(id) }])
+        let taskID = UUID(); commandTaskID = taskID
+        commandTask = Task { [weak self, weak terminal] in
+            guard let self, let terminal else { draft.retire(); return }
+            defer {
+                if self.commandTaskID == taskID { self.commandTask = nil; self.commandTaskID = nil }
+            }
+            do {
+                try Task.checkCancellation()
+                let restoredDestination = try await restoreFocus()
+                try Task.checkCancellation()
+                guard self.canPresent, self.commandDraft === draft, self.terminal === terminal,
+                      terminal.source == self.source, terminal.input.canReviewPaste else {
+                    throw TerminalCommandDraftError.unavailable
+                }
+                self.removePanel()
+                try draft.offerReview(destination: restoredDestination) { text in
+                    // Transfer ownership synchronously, with no event-loop gap:
+                    // only the existing source/focus-bound paste path may offer
+                    // the next decision. This does not confirm or admit it.
+                    self.commandDraft = nil; self.commandTask = nil; self.commandTaskID = nil
+                    terminal.input.requestPasteReview(text: text)
+                    guard let candidate = self.review.candidate,
+                          candidate.id == terminal.input.pendingPaste?.id else {
+                        if let pending = terminal.input.pendingPaste { terminal.cancelPaste(id: pending.id) }
+                        throw TerminalCommandDraftError.unavailable
+                    }
+                }
+            } catch {
+                guard !(error is CancellationError), !Task.isCancelled, self.canPresent else {
+                    if self.commandDraft === draft { self.dismiss() }
+                    return
+                }
+                if self.commandDraft === draft, draft.phase == .preparingReview {
+                    // An unavailable caret/keyboard leaves the draft editable
+                    // for another explicit Review. It is never retried by a
+                    // foreground, output, or focus callback.
+                    try? draft.resumeEditing(destination: self.commandDestination)
+                    self.removePanel()
+                    terminal.input.retire()
+                    self.showCommandEditor(draft, problem: "Return to live output if needed, then review again. \(error.localizedDescription)")
+                } else if self.commandDraft === draft {
+                    self.dismiss(); self.onFailure?(error)
+                } else if self.commandDraft == nil {
+                    self.dismiss(); self.onFailure?(error)
+                }
+            }
+        }
+    }
+
     private func offerPaste(_ candidate: TerminalPasteReview) {
         guard canPresent, !isPresenting, let terminal,
               candidate.focus.source == source, candidate.keyboardID == terminal.input.session.id,
@@ -117,6 +249,7 @@ public final class NativeTerminalClipboardController: NSObject {
         do {
             let destination = Destination(keyboardID: candidate.keyboardID, focus: candidate.focus)
             try review.offer(id: candidate.id, destination: destination, text: candidate.text)
+            terminal.input.setReviewingPaste(true)
             let preview = PassiveClipboardTextView()
             preview.isEditable = false; preview.isSelectable = false
             preview.text = candidate.text
@@ -131,7 +264,10 @@ public final class NativeTerminalClipboardController: NSObject {
                 button("Cancel") { [weak self] in self?.cancelPanel(id) },
                 button("Paste to This Terminal") { [weak self] in self?.confirm(id) }
             ])
-        } catch { terminal.cancelPaste(id: candidate.id); review.retire(); onFailure?(error) }
+        } catch {
+            terminal.cancelPaste(id: candidate.id); review.retire()
+            terminal.input.setReviewingPaste(false); onFailure?(error)
+        }
     }
     private func confirm(_ id: UUID) {
         guard canPresent, panelID == id, let terminal else { cancelPanel(id); return }
@@ -190,6 +326,10 @@ public final class NativeTerminalClipboardController: NSObject {
         explanation.setContentCompressionResistancePriority(.required, for: .vertical)
         panel.translatesAutoresizingMaskIntoConstraints = false; stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        // Ancestor terminal recognizers must not steal the editor's caret,
+        // text-selection or scrolling gestures (or tap a hidden remote TUI).
+        panelGestures = (terminal.gestureRecognizers ?? []).map { ($0, $0.isEnabled) }
+        for (recognizer, _) in panelGestures { recognizer.isEnabled = false }
         terminal.addSubview(panel); panel.addSubview(scroll); scroll.addSubview(stack)
         // Controls remain reachable in a short landscape viewport or with a
         // large accessibility font. Never compress the confirmation buttons to
@@ -209,26 +349,88 @@ public final class NativeTerminalClipboardController: NSObject {
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -24),
             text.heightAnchor.constraint(greaterThanOrEqualToConstant: 120), preferredTextHeight
         ])
-        overlay = panel; textView = text; panelID = id
+        overlay = panel; textView = text; detailLabel = explanation; panelID = id
         UIAccessibility.post(notification: .screenChanged, argument: heading)
     }
     private func dismiss() {
         generation = UUID(); copyTask?.cancel()
+        commandTask?.cancel(); commandDraft?.retire(); commandDraft = nil
         if let candidate = review.candidate { terminal?.cancelPaste(id: candidate.id) }
         review.retire()
+        terminal?.input.setReviewingPaste(false)
+        removePanel()
+    }
+    private func removePanel() {
         _ = textView?.resignFirstResponder()
         (textView as? NativeTerminalCopyTextView)?.clearSnapshot()
+        (textView as? NativeTerminalCommandTextView)?.clearDraft()
         textView?.text = ""; textView = nil
-        overlay?.removeFromSuperview(); overlay = nil; panelID = nil
+        overlay?.removeFromSuperview(); overlay = nil; panelID = nil; detailLabel = nil
+        for (recognizer, enabled) in panelGestures { recognizer.isEnabled = enabled }
+        panelGestures.removeAll()
     }
     public func retire() {
         guard !retired else { return }
         retired = true; active = false; dismiss(); frame = nil
         terminal?.onPasteReview = nil
-        onFailure = nil
+        onFailure = nil; onCommandDraftFocus = nil
     }
     public func waitUntilSettled() async {
         if let copyTask { _ = await copyTask.result }
+        if let commandTask { await commandTask.value }
+    }
+}
+
+/// A normal native text document with bounded edits, undo and IME. It has no
+/// terminal-input callbacks: Return, selection, cut, paste and language entry
+/// affect only the local draft. Review is a separate controller action.
+@MainActor
+public final class NativeTerminalCommandTextView: UITextView, UITextViewDelegate {
+    private var draft: TerminalCommandDraft<TerminalCommandDraftDestination>?
+    public var onChange: (@MainActor () -> Void)?
+    public var onFailure: (@MainActor (Error) -> Void)?
+
+    public init(draft: TerminalCommandDraft<TerminalCommandDraftDestination>) {
+        self.draft = draft
+        super.init(frame: .zero, textContainer: nil)
+        text = draft.text; delegate = self; isEditable = true; isSelectable = true
+        font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        autocapitalizationType = .none; autocorrectionType = .no; spellCheckingType = .no
+        smartQuotesType = .no; smartDashesType = .no; smartInsertDeleteType = .no
+        dataDetectorTypes = []; writingToolsBehavior = .none; textContentType = nil
+        textDragInteraction?.isEnabled = false
+        accessibilityLabel = "Local command draft"
+        accessibilityIdentifier = "terminal.command.editor"
+        returnKeyType = .default
+    }
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) { nil }
+    public override func didMoveToWindow() { super.didMoveToWindow(); undoManager?.levelsOfUndo = 32 }
+
+    public func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText: String) -> Bool {
+        guard let draft else { return false }
+        do {
+            if (textView.text ?? "") != draft.text { try draft.update(textView.text ?? "") }
+            _ = try draft.proposedText(replacing: range, with: replacementText)
+            return true
+        } catch { onFailure?(error); return false }
+    }
+    public func textViewDidChange(_ textView: UITextView) {
+        guard let draft else { textView.text = ""; return }
+        do { try draft.update(textView.text ?? ""); onChange?() }
+        catch {
+            // Dictation/marked-text providers can publish a whole document.
+            // Restore the last accepted draft instead of retaining an oversized
+            // or control-bearing value that bypassed a replacement callback.
+            textView.text = draft.text
+            textView.undoManager?.removeAllActions()
+            textView.selectedRange = NSRange(location: draft.text.utf16.count, length: 0)
+            onFailure?(error)
+        }
+    }
+    public func clearDraft() {
+        draft = nil; delegate = nil; onChange = nil; onFailure = nil
+        undoManager?.removeAllActions(); text = ""; isEditable = false
     }
 }
 

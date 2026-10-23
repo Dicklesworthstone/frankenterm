@@ -809,13 +809,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
     func activateKeyboard() async {
         guard !closed, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
-              selectedSession?.clipboardIsPresenting != true,
+              selectedSession?.keyboardActivationBlocked != true,
               navigation.phase == .inactive, let selection = navigation.navigation.selection,
               selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
         await owner.joinSealed()
         guard !closed, foreground, !overviewBlocksInput, !groupAppearanceBlocksInput,
               navigation.navigation.selection == selection,
-              selectedSession?.clipboardIsPresenting != true else { return }
+              selectedSession?.keyboardActivationBlocked != true else { return }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
 
@@ -1136,6 +1136,10 @@ struct WorkspaceTerminalScreen: View {
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
+                    Button("Compose Command", systemImage: "square.and.pencil") { session.composeCommand() }
+                        .disabled(session.clipboardIsPresenting)
+                        .keyboardShortcut("d", modifiers: [.command, .shift])
+                        .accessibilityIdentifier("terminal.command.open")
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
                         .disabled(session.clipboardIsPresenting)
                     // Pinching the terminal does the same.

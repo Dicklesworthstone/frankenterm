@@ -237,6 +237,66 @@ final class NativeTerminalInputTests: XCTestCase {
         XCTAssertEqual(output, Data("\u{1B}[200~echo one\necho two\u{1B}[201~".utf8))
         view.retire(); await view.session.waitUntilSuspended()
     }
+    func testPreparingAndShowingReviewBlockOrdinaryInputButKeepExplicitPasteFocus() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        let focus = view.session.originalFocus
+        var offered: TerminalPasteReview?
+        view.onPasteReview = { offered = $0 }
+        // The session installs this hold before requesting the replacement
+        // native responder, even before the draft has offered a paste candidate.
+        view.setReviewingPaste(true)
+        XCTAssertFalse(view.isEditable)
+        XCTAssertTrue(view.canReviewPaste)
+        XCTAssertTrue(view.canBecomeFirstResponder)
+        view.insertText("\n"); view.insertText("\t"); view.insertText("hidden command")
+        view.deleteBackward()
+        view.setMarkedText("候補", selectedRange: NSRange(location: 2, length: 0)); view.unmarkText()
+        XCTAssertFalse(view.session.document.isMarked)
+        XCTAssertEqual(view.session.accounting.pendingEvents, 0)
+        view.requestPasteReview(text: "reviewed\ntext")
+        let review = try XCTUnwrap(offered)
+        XCTAssertEqual(review.focus, focus)
+        view.insertText("\n"); view.insertText("hidden suffix"); view.deleteBackward()
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let before = await transport.bytes(); XCTAssertTrue(before.isEmpty)
+        try view.confirmPaste(id: review.id)
+        view.insertText("\n")
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let confirmed = await transport.bytes()
+        XCTAssertEqual(confirmed, Data("\u{1B}[200~reviewed\ntext\u{1B}[201~".utf8))
+        XCTAssertFalse(view.isEditable, "panel ownership outlives the consumed candidate")
+        view.setReviewingPaste(false)
+        XCTAssertTrue(view.isEditable)
+        XCTAssertEqual(view.session.originalFocus, focus)
+        view.insertText("visible")
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let after = await transport.bytes()
+        XCTAssertEqual(after, confirmed + Data("visible".utf8))
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+    func testPendingReviewBlocksInputUntilCancellationAndCannotSurviveRetirement() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        view.onPasteReview = { _ in }
+        view.requestPasteReview(text: "unconfirmed")
+        let review = try XCTUnwrap(view.pendingPaste)
+        // Even an adapter that has not installed a separate panel hold cannot
+        // expose the hidden shell while its native candidate is pending.
+        view.setReviewingPaste(false)
+        XCTAssertFalse(view.isEditable)
+        view.insertText("\n"); view.deleteBackward()
+        view.cancelPaste(id: review.id)
+        XCTAssertTrue(view.isEditable)
+        XCTAssertThrowsError(try view.confirmPaste(id: review.id))
+        view.setReviewingPaste(true)
+        view.requestPasteReview(text: "also unconfirmed")
+        let retiredReview = try XCTUnwrap(view.pendingPaste)
+        view.retire(); view.setReviewingPaste(false)
+        XCTAssertFalse(view.isEditable)
+        XCTAssertFalse(view.canReviewPaste)
+        XCTAssertThrowsError(try view.confirmPaste(id: retiredReview.id))
+        await view.session.waitUntilSuspended(); try await drain(coordinator, source)
+        let output = await transport.bytes(); XCTAssertTrue(output.isEmpty)
+    }
     func testUnsafePasteIsRejectedWithoutCreatingAReview() async throws {
         let (_, _, _, view) = try await setup()
         var reviews = 0, failures = 0

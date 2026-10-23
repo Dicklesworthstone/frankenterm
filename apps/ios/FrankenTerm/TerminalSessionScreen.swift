@@ -305,6 +305,12 @@ final class TerminalSessionController {
     var clipboardIsPresenting: Bool {
         clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
     }
+    /// A local command editor blocks input. Its explicit Review transition is
+    /// the one exception: it restores this same terminal's keyboard so the
+    /// existing native paste review can bind to a fresh focus generation.
+    var keyboardActivationBlocked: Bool {
+        clipboard?.blocksKeyboardActivation == true || historyInspection != nil || historyReturning || muxSearchPresented
+    }
 
     /// The fleet picker owns the text responder while open. Its machine/pane
     /// navigation may prepare a destination, but no late view build, caret or
@@ -346,6 +352,41 @@ final class TerminalSessionController {
         guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
+    }
+    func composeCommand() {
+        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+              !overviewBlocking, !paneNavigationBusy else { return }
+        connection?.muxControl?.inputRouting.discardPointers()
+        interactionProblem = nil; clipboard?.requestCommandDraft()
+    }
+
+    /// A draft is tied to the exact displayed view/source/mux visit. Returning
+    /// from its local editor may replace the retired keyboard, but never switch
+    /// machines, revisit a pane, reconnect, or create a remote terminal.
+    private func restoreCommandDraftFocus(view: NativeTerminalView, source: TerminalSource,
+                                          destination: TerminalMuxInputRouting.Destination?) async throws -> TerminalCommandDraftDestination {
+        func checkDestination() throws {
+            try Task.checkCancellation()
+            guard !stopped, phase == .live, presentationVisible, !overviewBlocking,
+                  terminal === view, pump?.source == source, displayedMuxDestination == destination,
+                  clipboard?.isPresenting == true, clipboard?.blocksKeyboardActivation == false,
+                  paneHandoff == nil, requestedMuxPane == nil,
+                  focus?.shows(machineID: target.machineID) == true,
+                  connection?.muxControl?.inputRouting.current.destination == destination,
+                  connection?.muxControl?.inputRouting.current.ready != false else {
+                throw CancellationError()
+            }
+        }
+        try checkDestination()
+        guard let focus else { throw TerminalCommandDraftError.unavailable }
+        await focus.activateKeyboard()
+        try checkDestination()
+        guard view.input.session.originalFocus.source == source,
+              view.input.canReviewPaste else {
+            throw TerminalCommandDraftError.unavailable
+        }
+        return TerminalCommandDraftDestination(source: source,
+            mux: connection?.muxControl?.inputRouting.current.destination)
     }
     func dismissInteractionProblem() { interactionProblem = nil }
 
@@ -586,7 +627,7 @@ final class TerminalSessionController {
         // An activation may have started before a read-only sheet opened and
         // completed its handoff afterwards. Seal that newly published responder
         // before it can acquire hardware input behind the inspection surface.
-        guard !overviewBlocking, !clipboardIsPresenting, paneHandoff == nil, requestedMuxPane == nil,
+        guard !overviewBlocking, !keyboardActivationBlocked, paneHandoff == nil, requestedMuxPane == nil,
               connection?.muxControl.map({ $0.inputRouting.current.ready
                   && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
             keyboard.suspend()
@@ -596,6 +637,7 @@ final class TerminalSessionController {
         do {
             try terminal.replaceInputSession(keyboard)
             self.keyboard = keyboard
+            clipboard?.inputInstalled()
             terminal.requestKeyboard(true)
         } catch { keyboard.suspend(); fail(Self.describe(error)) }
     }
@@ -842,9 +884,16 @@ final class TerminalSessionController {
             displayedMuxDestination = expectedMux
             presenter.view = view
             let clipboard = try NativeTerminalClipboardController(terminal: view,
-                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)")
+                destinationLabel: "\(target.machineName)\nMachine \(target.machineID) · Route \(route.id)"
+                    + (expectedMux.map { " · Pane \($0.paneID)" } ?? ""),
+                commandDestination: TerminalCommandDraftDestination(source: pump.source, mux: expectedMux))
             self.clipboard = clipboard; presenter.clipboard = clipboard
             clipboard.onFailure = { [weak self] error in self?.interactionProblem = Self.describe(error) }
+            let source = pump.source
+            clipboard.onCommandDraftFocus = { [weak self, weak view] in
+                guard let self, let view else { throw TerminalCommandDraftError.unavailable }
+                return try await self.restoreCommandDraftFocus(view: view, source: source, destination: expectedMux)
+            }
             view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
             view.onKeyboardRequest = { [weak self] in
                 guard let focus = self?.focus else { return }
