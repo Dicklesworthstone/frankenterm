@@ -38,6 +38,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private(set) var themes: [String: WorkspaceDocument.Theme] = [:]
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
+    /// The committed group's order, not the full connection-owner inventory.
+    /// Storing the IDs also makes same-machine group changes observable to UI.
+    private(set) var navigationMachineIDs: [String] = []
     private(set) var problem: String?
     /// A read-only snapshot picker. Its dismissal joins one owned navigation
     /// operation before the terminal keyboard can be enabled again.
@@ -71,6 +74,17 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// A retained scene can reopen at another machine. Its previous selection
     /// must not create a terminal before the requested focus handoff commits.
     @ObservationIgnored private var appearanceSelection: String?
+    private struct GroupAppearance {
+        let id: UUID
+        let machineID: String
+        let group: TerminalConnectionIntent.Group?
+        let navigationGroup: TerminalNavigationGroup?
+        let connectOnOpen: Bool
+    }
+    @ObservationIgnored private var appearanceGeneration = UUID()
+    @ObservationIgnored private var pendingGroupAppearance: GroupAppearance?
+    @ObservationIgnored private var groupAppearanceJob: (id: UUID, task: Task<Void, Never>)?
+    private var groupAppearanceBlocksInput: Bool { pendingGroupAppearance != nil || groupAppearanceJob != nil }
     /// Set by enteredBackground until the next activation.
     @ObservationIgnored private var inBackground = false
     @ObservationIgnored private var closing: Task<Void, Never>?
@@ -110,19 +124,28 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         owner = try TerminalKeyboardNavigationOwner(coordinator: connections.coordinator, sceneID: UUID(),
                                                     workspaceID: workspaceID.uuidString, bindings: [])
         let empty = try machines.map { try TerminalNavigationMachine(id: $0.id, name: $0.name, panes: []) }
+        let initialNavigationGroup = try initialGroup.map {
+            try TerminalNavigationGroup(id: $0.id, machineIDs: $0.machineIDs)
+        }
         navigation = TerminalNavigationCoordinator(
-            navigation: try TerminalNavigation(machines: empty, initialMachineID: initialMachineID), focusOwner: owner)
+            navigation: try TerminalNavigation(machines: empty, initialMachineID: initialMachineID,
+                                               group: initialNavigationGroup), focusOwner: owner)
         selectedMachineID = navigation.navigation.selection?.machineID
+        navigationMachineIDs = navigation.navigation.machines.map(\.id)
         navigation.onChange = { [weak self] in self?.navigationChanged() }
     }
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
+    var navigationMachines: [SceneMachine] {
+        let known = Dictionary(uniqueKeysWithValues: machines.map { ($0.id, $0) })
+        return navigationMachineIDs.compactMap { known[$0] }
+    }
 
     // MARK: Fleet overview
 
     func beginOverview() {
-        guard !closed, foreground, onScreen, !overviewBlocksInput,
+        guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
               navigation.phase == .ready || navigation.phase == .inactive,
               selectedSession?.clipboardIsPresenting != true,
               selectedSession?.paneNavigationBusy != true else { return }
@@ -150,7 +173,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         var inventory: [TerminalFleetOverview.Machine] = []
         var paneCount = 0
         guard machines.count <= TerminalFleetOverview.maximumMachines else { throw TerminalFleetOverview.Failure.capacity }
-        for machine in machines {
+        for machine in navigationMachines {
             let session = sessions[machine.id]
             let status: TerminalFleetOverview.Status
             switch self.status(of: machine.id) {
@@ -212,9 +235,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                                         in catalog: TerminalFleetOverview) throws {
         switch try catalog.resolve(choice) {
         case .machine(let machineID):
-            guard machines.contains(where: { $0.id == machineID }) else { throw TerminalFleetOverview.Failure.stale }
+            guard navigationMachineIDs.contains(machineID) else { throw TerminalFleetOverview.Failure.stale }
         case let .pane(machineID, sessionID, _):
-            guard let session = sessions[machineID], session.id == sessionID, session.phase == .live,
+            guard navigationMachineIDs.contains(machineID),
+                  let session = sessions[machineID], session.id == sessionID, session.phase == .live,
                   let control = session.muxControl else { throw TerminalFleetOverview.Failure.stale }
             _ = try catalog.validatePane(choice, sessionID: sessionID, routing: control.inputRouting)
         }
@@ -233,6 +257,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 if self.overviewJob?.id == id {
                     self.overviewJob = nil; self.overviewAllowsTargetPresentation = false
                     if !self.closed, self.foreground, self.onScreen { self.navigation.resume() }
+                    self.startGroupAppearance()
                     self.updatePresentationVisibility()
                     self.reconcile()
                 }
@@ -333,30 +358,104 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func appear(selecting machineID: String, active: Bool,
                 group: TerminalConnectionIntent.Group? = nil, connectOnOpen: Bool = false) {
         guard !closed else { return }
-        canvasGeneration = UUID()
+        if let keyboard = owner.keyboard,
+           keyboard.document.isMarked || keyboard.accounting.pendingEvents > 0 || keyboard.phase == .blocked {
+            problem = "Finish composing or let pending local input settle before changing groups."
+            return
+        }
+        let navigationGroup: TerminalNavigationGroup?
         do {
-            try connectionIntent.setGroup(autoConnect ? group : nil)
-            if connectOnOpen {
-                try connectionIntent.approveConnection(machineID)
-                if let session = sessions[machineID] {
-                    switch session.phase {
-                    case .ended, .failed, .couldNotConnect: requestedConnections.insert(machineID)
-                    case .idle, .connecting, .ready, .live: break
-                    }
-                } else { requestedConnections.insert(machineID) }
-                cancelReconnect(machineID)
-                reconnectPolicies[machineID, default: .init()].resetForUserRequest()
-            }
+            navigationGroup = try group.map { try .init(id: $0.id, machineIDs: $0.machineIDs) }
+            _ = try navigation.navigation.plan(group: navigationGroup, selecting: machineID)
+            // Validate networking intent without publishing it before navigation.
+            var checked = connectionIntent
+            try checked.setGroup(autoConnect ? group : nil)
         } catch { report(error); return }
-        appearanceSelection = machineID == selectedMachineID ? nil : machineID
+        cancelOverview()
+        cancelGroupAppearance()
+        canvasGeneration = UUID()
+        appearanceSelection = machineID
         onScreen = true
         setForeground(active)
-        if machineID != selectedMachineID { select(machineID) }
-        else if let session = selectedSession, session.phase == .live {
-            // Back on a live terminal: its view, or its keyboard, right away.
-            if session.terminal == nil { session.showView() } else { Task { await activateKeyboard() } }
+        let id = UUID(); appearanceGeneration = id
+        pendingGroupAppearance = GroupAppearance(id: id, machineID: machineID, group: group,
+                                                 navigationGroup: navigationGroup, connectOnOpen: connectOnOpen)
+        startGroupAppearance()
+        updatePresentationVisibility()
+    }
+
+    /// One retained worker and one latest request, even when navigation is busy.
+    /// Reappearing cancels and joins the old handoff before starting its successor.
+    /// Group membership never starts or closes a connection by itself.
+    private func startGroupAppearance() {
+        guard groupAppearanceJob == nil, let request = pendingGroupAppearance,
+              !closed, foreground, onScreen, !overviewBlocksInput else { return }
+        pendingGroupAppearance = nil
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            let previousGroup = self.navigation.navigation.group
+            var completed = false
+            defer {
+                // Cancellation may follow the core's synchronous commit. Keep
+                // imported warming intent consistent with the actual ring, but
+                // never manufacture an explicit Connect approval on that path.
+                if self.navigation.navigation.group == request.navigationGroup,
+                   completed || previousGroup != request.navigationGroup {
+                    do { try self.connectionIntent.setGroup(self.autoConnect ? request.group : nil) }
+                    catch { self.report(error) }
+                }
+                if self.groupAppearanceJob?.id == id {
+                    self.groupAppearanceJob = nil
+                    if self.pendingGroupAppearance == nil { self.appearanceSelection = nil }
+                    self.startGroupAppearance()
+                    self.navigationChanged()
+                }
+            }
+            do {
+                await self.navigation.joinSuspension()
+                try self.checkGroupAppearance(request)
+                self.navigation.resume()
+                try await self.whileBusy {
+                    try self.checkGroupAppearance(request)
+                    if let plan = try self.navigation.navigation.plan(group: request.navigationGroup,
+                                                                     selecting: request.machineID)
+                        ?? self.navigation.navigation.activationPlan() {
+                        try await self.navigation.perform(plan)
+                    }
+                }
+                try self.checkGroupAppearance(request)
+                guard self.navigation.navigation.group == request.navigationGroup,
+                      self.selectedMachineID == request.machineID else { throw TerminalNavigationError.stale }
+                if request.connectOnOpen {
+                    try self.connectionIntent.approveConnection(request.machineID)
+                    if let session = self.sessions[request.machineID] {
+                        switch session.phase {
+                        case .ended, .failed, .couldNotConnect: self.requestedConnections.insert(request.machineID)
+                        case .idle, .connecting, .ready, .live: break
+                        }
+                    } else { self.requestedConnections.insert(request.machineID) }
+                    self.cancelReconnect(request.machineID)
+                    self.reconnectPolicies[request.machineID, default: .init()].resetForUserRequest()
+                }
+                completed = true
+            } catch {
+                if !Task.isCancelled, self.appearanceGeneration == request.id, !self.closed { self.report(error) }
+            }
         }
-        reconcile()
+        groupAppearanceJob = (id, task)
+    }
+
+    private func checkGroupAppearance(_ request: GroupAppearance) throws {
+        try Task.checkCancellation()
+        guard appearanceGeneration == request.id, !closed, foreground, onScreen,
+              !overviewBlocksInput else { throw CancellationError() }
+    }
+
+    private func cancelGroupAppearance() {
+        appearanceGeneration = UUID(); pendingGroupAppearance = nil
+        groupAppearanceJob?.task.cancel()
+        if groupAppearanceJob == nil { appearanceSelection = nil }
     }
 
     /// Leaving the terminal screen keeps every session running; only the
@@ -364,6 +463,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func disappear() {
         guard !closed else { return }
         cancelOverview()
+        cancelGroupAppearance()
         onScreen = false
         canvasGeneration = UUID()
         appearanceSelection = nil
@@ -373,7 +473,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func setForeground(_ active: Bool) {
         guard !closed else { return }
-        if !active { cancelOverview() }
+        if !active { cancelOverview(); cancelGroupAppearance() }
         if foreground != active { canvasGeneration = UUID() }
         foreground = active
         if active {
@@ -387,6 +487,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         if active && onScreen && !overviewBlocksInput { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
         guard active else { return }
+        startGroupAppearance()
         reconcile()
         // Back from turning Tailscale on: try the machine that needed it, once
         // the app's own resume has let connections through again.
@@ -407,6 +508,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func enteredBackground() {
         guard !closed else { return }
         inBackground = true
+        cancelGroupAppearance()
         // iOS may stop executing immediately after its grace period. Time we
         // cannot observe a session must not count as a stable live interval.
         for id in Array(reconnectPolicies.keys) { reconnectPolicies[id]?.recordEnd() }
@@ -425,10 +527,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Switches the screen to a machine, through the same focus barrier as
     /// every other navigation.
     func select(_ machineID: String) {
-        guard !closed, !overviewBlocksInput, machineID != selectedMachineID else { return }
+        guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              navigationMachineIDs.contains(machineID), machineID != selectedMachineID else { return }
+        let appearance = appearanceGeneration
         Task {
             do {
                 try await whileBusy {
+                    guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput,
+                          self.navigationMachineIDs.contains(machineID) else { throw TerminalNavigationError.stale }
                     guard let plan = try self.navigation.navigation.plan(machineID: machineID) else { return }
                     try await self.navigation.perform(plan)
                 }
@@ -439,7 +545,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Pane traversal is a separate ring. At either end it wraps within this
     /// machine; zero or one pane never falls through to another machine.
     func stepPane(forward: Bool) {
-        guard !closed, !overviewBlocksInput, let session = selectedSession, session.phase == .live,
+        guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              let session = selectedSession, session.phase == .live,
               let control = session.muxControl else { return }
         do {
             if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
@@ -447,7 +554,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     var permitsCanvasNavigation: Bool {
-        !closed && foreground && onScreen && !overviewBlocksInput && appearanceSelection == nil
+        !closed && foreground && onScreen && !overviewBlocksInput && !groupAppearanceBlocksInput && appearanceSelection == nil
             && selectedSession?.clipboardIsPresenting != true
             && selectedSession?.paneNavigationBusy != true
             && selectedSession?.terminal?.remoteMouseGrabbed != true
@@ -500,6 +607,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     private func requestConnection(_ machineID: String, terminal: Bool) {
         guard permitsTerminalCreation,
+              navigationMachineIDs.contains(machineID),
               machines.first(where: { $0.id == machineID })?.target != nil else { return }
         if let session = sessions[machineID], !session.settled {
             switch session.phase {
@@ -700,11 +808,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Re-establishes the keyboard after its input generation ended (dismissed
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
     func activateKeyboard() async {
-        guard !closed, onScreen, !overviewBlocksInput, selectedSession?.clipboardIsPresenting != true,
+        guard !closed, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              selectedSession?.clipboardIsPresenting != true,
               navigation.phase == .inactive, let selection = navigation.navigation.selection,
               selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
         await owner.joinSealed()
-        guard !closed, foreground, !overviewBlocksInput, navigation.navigation.selection == selection,
+        guard !closed, foreground, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              navigation.navigation.selection == selection,
               selectedSession?.clipboardIsPresenting != true else { return }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
@@ -723,6 +833,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !closed else { return }
         closed = true
         cancelOverview()
+        cancelGroupAppearance()
         canvasGeneration = UUID()
         cancelReconnects()
         for job in controllerJobs.values { job.task.cancel() }
@@ -742,7 +853,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let reconnects = reconnectJobs.values.map(\.task)
         let operations = controllerJobs.values.map(\.task)
         let overview = overviewJob?.task
+        let appearance = groupAppearanceJob?.task
         let job = Task {
+            if let appearance { await appearance.value }
             if let overview { await overview.value }
             for reconnect in reconnects { await reconnect.value }
             for controller in controllers { await controller.stop() }
@@ -771,28 +884,31 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// that connected in the background gets its view now.
     private func navigationChanged() {
         let selection = navigation.navigation.selection
+        navigationMachineIDs = navigation.navigation.machines.map(\.id)
         if selectedMachineID != selection?.machineID {
             canvasGeneration = UUID()
             selectedMachineID = selection?.machineID
             do { try connectionIntent.select(selectedMachineID) } catch { report(error) }
         }
-        if appearanceSelection == selectedMachineID { appearanceSelection = nil }
+        if !groupAppearanceBlocksInput, appearanceSelection == selectedMachineID { appearanceSelection = nil }
         updatePresentationVisibility()
-        if onScreen, !overviewBlocksInput, let session = selectedSession, session.phase == .live, session.terminal == nil { session.showView() }
+        if onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
+           let session = selectedSession, session.phase == .live, session.terminal == nil { session.showView() }
         reconcile()
-        guard !overviewBlocksInput, navigation.phase == .ready, let selection, selection.paneID != nil,
+        guard !overviewBlocksInput, !groupAppearanceBlocksInput,
+              navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
         sessions[selection.machineID]?.install(keyboard)
     }
 
     private func isVisible(_ machineID: String) -> Bool {
-        !closed && foreground && !inBackground && onScreen && appearanceSelection == nil
+        !closed && foreground && !inBackground && onScreen && !groupAppearanceBlocksInput && appearanceSelection == nil
             && (!overviewBlocksInput || overviewAllowsTargetPresentation) && machineID == selectedMachineID
     }
 
     private func updatePresentationVisibility() {
         for (machineID, controller) in sessions {
-            controller.setOverviewBlocking(overviewBlocksInput)
+            controller.setOverviewBlocking(overviewBlocksInput || groupAppearanceBlocksInput)
             controller.setPresentationVisible(isVisible(machineID))
         }
     }
@@ -809,7 +925,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: TerminalSessionFocus
 
-    var permitsTerminalCreation: Bool { !closed && foreground && !inBackground && !overviewBlocksInput }
+    var permitsTerminalCreation: Bool {
+        !closed && foreground && !inBackground && !overviewBlocksInput
+            && !groupAppearanceBlocksInput && appearanceSelection == nil
+    }
 
     func shows(machineID: String) -> Bool { isVisible(machineID) }
 
@@ -835,6 +954,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for _ in 0..<200 where !foreground && !inBackground && !closed { try await Task.sleep(for: .milliseconds(50)) }
         try await whileBusy {
             guard !self.closed, self.bindings[machineID]?.source == source else { throw TerminalNavigationError.stale }
+            guard self.isVisible(machineID) else { throw CancellationError() }
             guard let plan = try self.navigation.navigation.plan(paneID: binding.paneID)
                     ?? self.navigation.navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
             try await self.navigation.perform(plan)
@@ -1236,7 +1356,7 @@ private struct MachineStrip: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(scene.machines) { machine in chip(machine).id(machine.id) }
+                    ForEach(scene.navigationMachines) { machine in chip(machine).id(machine.id) }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
@@ -1494,7 +1614,7 @@ private struct WorkspaceFleetOverviewScreen: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Browse known machines and discovered panes. This snapshot does not connect to machines or search terminal output.")
+                    Text("Browse machines in the current navigation group and their discovered panes. This snapshot does not connect to machines or search terminal output.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let catalog {
                         Text("\(catalog.machineCount) machines · \(catalog.paneCount) discovered panes")
