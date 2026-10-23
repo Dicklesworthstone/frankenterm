@@ -986,6 +986,53 @@ pub fn reclaim_whole_mux_recovery_objects(
     )?)
 }
 
+/// Lift a whole-mux store's latched publication authority once its durable
+/// outcome is known again. A publication that fails after it began writing
+/// latches the authority, since its root may or may not have committed, and
+/// every later capture in this process is refused. Holding the authority in
+/// this process and the store's publication lock across processes, the
+/// committed roots must select under `verifier` with no unresolved
+/// authority; the caller then rebinds its predecessor from that selection.
+/// Returns whether a latch was lifted. A store that still does not read
+/// cleanly keeps its latch.
+#[cfg(feature = "frankenterm-deps")]
+pub fn reconcile_whole_mux_publication_authority(
+    cx: &crate::cx::Cx,
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    verifier: &crate::session_restore::WholeMuxRecoveryVerifier,
+) -> Result<bool, WholeMuxCaptureError> {
+    snapshot_cx_checkpoint(cx)?;
+    let path = store
+        .root_path()
+        .to_str()
+        .ok_or(WholeMuxCaptureError::InvalidAuthorityPath)?;
+    let authority = shared_snapshot_authority_state(path);
+    if !authority.reconciliation_is_required() {
+        return Ok(false);
+    }
+    if authority
+        .in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(WholeMuxCaptureError::Busy);
+    }
+    let _held = SnapshotAuthorityReadGuard {
+        authority: Arc::clone(&authority),
+    };
+    let _lock = store
+        .acquire_publication_lock()
+        .map_err(|error| WholeMuxCaptureError::Publication(error.into()))?;
+    let selected =
+        crate::session_restore::select_verified_recovery_roots_with_cx(cx, store, verifier)
+            .map_err(|error| WholeMuxCaptureError::Publication(error.into()))?;
+    if selected.has_unresolved_authority() {
+        return Err(WholeMuxCaptureError::ReconciliationRequired);
+    }
+    authority.clear_reconciliation();
+    Ok(true)
+}
+
 #[cfg(feature = "frankenterm-deps")]
 #[derive(Debug, thiserror::Error)]
 enum WholeMuxPublicationVerifyError {
@@ -3789,6 +3836,27 @@ impl SnapshotAuthorityState {
 
     fn first_latched_operation(&self) -> Option<SnapshotAuthorityOperation> {
         SnapshotAuthorityOperation::from_code(self.first_latched_operation.load(Ordering::Acquire))
+    }
+
+    /// Lift the latch once the caller, holding this authority exclusively,
+    /// has proved the durable outcome the latch stood for.
+    #[cfg(feature = "frankenterm-deps")]
+    fn clear_reconciliation(self: &Arc<Self>) {
+        self.reconciliation_required.store(false, Ordering::Release);
+        self.session_cleanup_reconciliation_required
+            .store(false, Ordering::Release);
+        self.first_latched_operation.store(0, Ordering::Release);
+        self.cleanup_pause_reported.store(false, Ordering::Release);
+        let mut entries = snapshot_authority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in entries.values_mut() {
+            if matches!(entry, SnapshotAuthorityRegistryEntry::Latched(latched)
+                if Arc::ptr_eq(latched, self))
+            {
+                *entry = SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(self));
+            }
+        }
     }
 }
 
@@ -13861,6 +13929,97 @@ mod tests {
         assert_eq!(receipt.generation, 1);
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    fn whole_mux_reconciliation_lifts_a_latch_only_over_cleanly_read_roots() {
+        use crate::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+            select_verified_recovery_roots_with_cx,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let mux = mux::Mux::new(None);
+        let topology = mux.capture_topology_coherent(Default::default()).unwrap();
+        let directory = checkpoint_artifact_test_directory();
+        let store = crate::snapshot_publication::SnapshotPublicationStore::open(
+            directory.path(),
+            Default::default(),
+        )
+        .unwrap();
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([31; 32]).unwrap());
+        let mut expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "reconciliation-test".into(),
+            mux_incarnation_id: hex::encode(topology.session_incarnation.as_bytes()),
+            root_object_id: [32; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let cx = crate::cx::Cx::for_testing();
+        let publish = |expected: &WholeMuxPublicationIdentity| {
+            capture_and_publish_whole_mux_recovery(
+                &cx,
+                &mux,
+                &store,
+                Arc::clone(&key),
+                expected,
+                Duration::from_secs(1),
+            )
+        };
+        let first = publish(&expected).unwrap();
+        let verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([32; 32]).with_session_id("reconciliation-test"),
+        );
+        assert!(!reconcile_whole_mux_publication_authority(&cx, &store, &verifier).unwrap());
+
+        // A publication whose outcome is unknown latches the authority.
+        let current = select_verified_recovery_roots_with_cx(&cx, &store, &verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        expected.generation = 2;
+        expected.predecessor = Some(crate::snapshot_publication::PredecessorBinding {
+            expected_generation: 1,
+            expected_hash: hex::encode(current.root_envelope_sha256()),
+        });
+        expected.predecessor_image_digest = Some(current.image().image_digest);
+        let authority = shared_snapshot_authority_state(store.root_path().to_str().unwrap());
+        authority.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+        assert!(matches!(
+            publish(&expected),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+
+        // A root that does not read cleanly keeps the latch.
+        let private = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&first.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            reconcile_whole_mux_publication_authority(&cx, &store, &verifier),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+        assert!(authority.reconciliation_is_required());
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        assert!(matches!(
+            publish(&expected),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+
+        std::fs::set_permissions(&first.path, private).unwrap();
+        assert!(reconcile_whole_mux_publication_authority(&cx, &store, &verifier).unwrap());
+        assert!(!authority.reconciliation_is_required());
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        // A fresh lookup of the same store is no longer latched either.
+        assert!(
+            !shared_snapshot_authority_state(store.root_path().to_str().unwrap())
+                .reconciliation_is_required()
+        );
+        assert_eq!(publish(&expected).unwrap().generation, 2);
     }
 
     #[test]

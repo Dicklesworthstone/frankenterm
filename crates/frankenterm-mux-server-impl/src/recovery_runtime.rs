@@ -13,8 +13,9 @@ use frankenterm_core::session_restore::{
     WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig, select_verified_recovery_roots_with_cx,
 };
 use frankenterm_core::snapshot_engine::{
-    WholeMuxCaptureError, WholeMuxPublicationIdentity, capture_and_publish_whole_mux_recovery,
-    open_recovery_key_enrollment, reclaim_whole_mux_recovery_objects,
+    WholeMuxCaptureError, WholeMuxPublicationError, WholeMuxPublicationIdentity,
+    capture_and_publish_whole_mux_recovery, open_recovery_key_enrollment,
+    reclaim_whole_mux_recovery_objects, reconcile_whole_mux_publication_authority,
 };
 use frankenterm_core::snapshot_publication::{
     PredecessorBinding, PublicationLimits, SnapshotPublicationStore,
@@ -319,24 +320,37 @@ impl CaptureState {
         self.select_predecessor_with_restore(cx, receipt, None)
     }
 
-    fn select_predecessor_with_restore(
-        &mut self,
-        cx: &Cx,
-        receipt: Option<(u64, &str)>,
-        restored: Option<&RestoredPredecessor>,
-    ) -> anyhow::Result<()> {
+    /// Verify both retained generations under the trusted key/root/session.
+    /// A successful restore leaves the old incarnation in the previous slot;
+    /// pinning every candidate to the successor would misclassify that valid
+    /// predecessor as corruption. Selection pins the current root instead.
+    fn verifier(&self) -> WholeMuxRecoveryVerifier {
         let trusted = WholeMuxTrustedIdentityConfig::new(self.identity.root_object_id)
             .with_session_id(self.identity.session_id.clone());
-        // Verify both retained generations under the trusted key/root/session.
-        // A successful restore leaves the old incarnation in the previous slot;
-        // pinning every candidate to the successor would misclassify that valid
-        // predecessor as corruption. Pin the selected current root below instead.
         let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&self.key), trusted);
         #[cfg(unix)]
         let verifier = match self.identity.existing_guardian_custody.as_ref() {
             Some(path) => verifier.with_existing_guardian_custody(path.clone()),
             None => verifier,
         };
+        verifier
+    }
+
+    /// After a publication whose outcome is unknown: lift the store's latch
+    /// only if its roots read cleanly, then bind the next generation to them,
+    /// whether or not the failed attempt's root committed.
+    fn reconcile(&mut self, cx: &Cx) -> anyhow::Result<()> {
+        reconcile_whole_mux_publication_authority(cx, &self.store, &self.verifier())?;
+        self.select_predecessor(cx, None)
+    }
+
+    fn select_predecessor_with_restore(
+        &mut self,
+        cx: &Cx,
+        receipt: Option<(u64, &str)>,
+        restored: Option<&RestoredPredecessor>,
+    ) -> anyhow::Result<()> {
+        let verifier = self.verifier();
         let selected = select_verified_recovery_roots_with_cx(cx, &self.store, &verifier)?;
         log_unresolved_root_authority("predecessor selection", &selected);
         // Never silently fall back past corruption and overwrite a newer root.
@@ -392,7 +406,13 @@ struct AttemptResult {
     published_generation: Option<u64>,
     error: Option<&'static str>,
     terminal: bool,
+    /// The store's outcome is unknown: reconcile before the next capture.
+    reconcile: bool,
 }
+
+/// Consecutive attempts that may end needing reconciliation before periodic
+/// recovery gives up until the mux restarts.
+const MAX_UNRECONCILED_ATTEMPTS: u32 = 3;
 
 type CaptureFuture = Pin<Box<dyn Future<Output = Result<AttemptResult, String>>>>;
 
@@ -413,6 +433,8 @@ pub struct PeriodicRecovery {
     last_success: Option<Instant>,
     stopping: bool,
     failed: bool,
+    /// Consecutive attempts that ended with the store's outcome unknown.
+    unreconciled: u32,
     interval: Duration,
     rpo: Duration,
     timeout: Duration,
@@ -469,6 +491,7 @@ impl PeriodicRecovery {
             last_success: None,
             stopping: false,
             failed: false,
+            unreconciled: 0,
             interval: Duration::from_secs(interval),
             rpo: Duration::from_secs(rpo),
             timeout: Duration::from_secs(timeout),
@@ -528,8 +551,14 @@ impl PeriodicRecovery {
                 match result {
                     Ok(result) => {
                         self.state = result.state;
-                        self.failed = result.terminal;
-                        if result.terminal {
+                        self.unreconciled = if result.reconcile {
+                            self.unreconciled.saturating_add(1)
+                        } else {
+                            0
+                        };
+                        self.failed =
+                            result.terminal || self.unreconciled > MAX_UNRECONCILED_ATTEMPTS;
+                        if self.failed {
                             // No root will lift the live checkpoint gate.
                             self.mux.set_guardian_root_retention(false);
                         }
@@ -553,7 +582,7 @@ impl PeriodicRecovery {
                                 .increment(1);
                             log::error!(
                                 "mux periodic recovery outcome={error} disabled={}",
-                                result.terminal
+                                self.failed
                             );
                         }
                     }
@@ -599,6 +628,7 @@ impl PeriodicRecovery {
         let restored = self.restored.clone();
         let prior = self.state.take();
         let timeout = self.timeout;
+        let reconcile_first = self.unreconciled > 0;
         #[cfg(test)]
         let before_capture = self.before_capture.take();
         self.active = Some(Box::pin(runtime_async::spawn_blocking(move || {
@@ -623,9 +653,23 @@ impl PeriodicRecovery {
                             "authority_rejected"
                         }),
                         terminal: !retryable,
+                        reconcile: false,
                     };
                 }
             };
+            if reconcile_first && let Err(error) = state.reconcile(&cx) {
+                log::warn!(
+                    "mux periodic recovery reconciliation failed: {}",
+                    recovery_error_chain(error.as_ref())
+                );
+                return AttemptResult {
+                    state: Some(state),
+                    published_generation: None,
+                    error: Some("reconciliation_failed"),
+                    terminal: false,
+                    reconcile: true,
+                };
+            }
             #[cfg(test)]
             if let Some(before_capture) = before_capture {
                 before_capture();
@@ -654,7 +698,7 @@ impl PeriodicRecovery {
                     recovery_error_chain(error)
                 );
             }
-            let (published_generation, error, terminal) = match outcome {
+            let (published_generation, error, terminal, reconcile) = match outcome {
                 Ok(receipt) => {
                     // Verification settlement must finish even if shutdown
                     // arrived after durable publication. It never writes.
@@ -662,26 +706,48 @@ impl PeriodicRecovery {
                         &cx::for_request(),
                         Some((receipt.generation, &receipt.sha256)),
                     ) {
-                        Ok(()) => (Some(receipt.generation), None, false),
-                        Err(_) => (None, Some("published_root_verification_failed"), true),
+                        Ok(()) => (Some(receipt.generation), None, false, false),
+                        Err(_) => (
+                            None,
+                            Some("published_root_verification_failed"),
+                            true,
+                            false,
+                        ),
                     }
                 }
-                Err(WholeMuxCaptureError::Busy) => (None, Some("busy"), false),
+                Err(WholeMuxCaptureError::Busy) => (None, Some("busy"), false, false),
                 Err(
                     WholeMuxCaptureError::CaptureDeadline { .. }
                     | WholeMuxCaptureError::StaleCapture(_)
                     | WholeMuxCaptureError::Topology(_)
                     | WholeMuxCaptureError::Pane { .. }
                     | WholeMuxCaptureError::GuardianPane { .. },
-                ) => (None, Some("capture_rejected"), false),
-                Err(WholeMuxCaptureError::Context(_)) => (None, Some("cancelled"), false),
-                Err(_) => (None, Some("publication_requires_reconciliation"), true),
+                ) => (None, Some("capture_rejected"), false, false),
+                Err(WholeMuxCaptureError::Context(_)) => (None, Some("cancelled"), false, false),
+                // A store error latched the authority: its root may or may
+                // not have committed. The next attempt reads it back.
+                Err(
+                    WholeMuxCaptureError::ReconciliationRequired
+                    | WholeMuxCaptureError::Publication(WholeMuxPublicationError::Publication(_)),
+                ) => (
+                    None,
+                    Some("publication_requires_reconciliation"),
+                    false,
+                    true,
+                ),
+                Err(_) => (
+                    None,
+                    Some("publication_requires_reconciliation"),
+                    true,
+                    false,
+                ),
             };
             AttemptResult {
                 state: Some(state),
                 published_generation,
                 error,
                 terminal,
+                reconcile,
             }
         })));
     }
@@ -1188,6 +1254,46 @@ mod tests {
             published.image().topology.domains[0].domain_name,
             "busy-guardian"
         );
+        controller.request_shutdown();
+        pump_until(&mut controller, &executor, PeriodicRecovery::is_settled);
+    }
+
+    #[test]
+    fn periodic_recovery_reconciles_a_failed_publication_and_resumes() {
+        let _serial = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (_directory, options) = prepared();
+        let store = options.recovery_store.clone().unwrap();
+        let mut controller =
+            PeriodicRecovery::new(options.clone(), Arc::new(mux::Mux::new(None)), None)
+                .unwrap()
+                .unwrap();
+        pump_until(&mut controller, &executor, |c| {
+            c.last_success.is_some() && c.is_settled()
+        });
+        assert_eq!(selected(&options).generation(), 1);
+
+        // A directory the store does not own fails the next publication once
+        // it has begun, which latches the store's authority (any uid: this
+        // is the store's own census, not a permission check).
+        let objects = store.join("objects");
+        let aside = store.join("objects-aside");
+        std::fs::rename(&objects, &aside).unwrap();
+        controller.next_due = Instant::now();
+        pump_until(&mut controller, &executor, |c| {
+            c.unreconciled > 0 && c.is_settled()
+        });
+        assert!(!controller.failed);
+        assert_eq!(selected(&options).generation(), 1);
+
+        // Once the store reads cleanly, the next attempt lifts the latch and
+        // publishes on from the committed root instead of disabling itself.
+        std::fs::rename(&aside, &objects).unwrap();
+        pump_until(&mut controller, &executor, |c| {
+            c.unreconciled == 0 && c.state.as_ref().is_some_and(|s| s.identity.generation == 3)
+        });
+        assert!(!controller.failed);
+        assert_eq!(selected(&options).generation(), 2);
         controller.request_shutdown();
         pump_until(&mut controller, &executor, PeriodicRecovery::is_settled);
     }
