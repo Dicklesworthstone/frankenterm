@@ -100,7 +100,7 @@ impl Middleware for StateInjector {
 /// must not become extra body capacity for chunked requests. Checking the
 /// actual body also protects routes that never invoke a body extractor.
 #[derive(Clone)]
-pub(crate) struct BodySizeGuard {
+pub struct BodySizeGuard {
     max_request_body_bytes: usize,
 }
 

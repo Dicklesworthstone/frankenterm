@@ -7019,10 +7019,15 @@ pub fn reconstruct_tx_resume_state(
         let mut committed = HashSet::<String>::new();
         let mut compensated = HashSet::<String>::new();
         if let Some(report) = commit_report {
-            committed.extend(report.step_results.iter().filter_map(|result| {
-                (result.outcome.is_committed() && !is_unresolved(&result.step_id.0))
-                    .then(|| result.step_id.0.clone())
-            }));
+            committed.extend(
+                report
+                    .step_results
+                    .iter()
+                    .filter(|result| {
+                        result.outcome.is_committed() && !is_unresolved(&result.step_id.0)
+                    })
+                    .map(|result| result.step_id.0.clone()),
+            );
         }
         for result in partial.into_iter().flat_map(|report| &report.step_results) {
             if result.outcome.is_committed() && !is_unresolved(&result.step_id.0) {
