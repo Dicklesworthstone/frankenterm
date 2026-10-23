@@ -268,6 +268,8 @@ final class TerminalSessionController {
     @ObservationIgnored private var requestedMuxPane: Int?
     @ObservationIgnored private var requestedMuxNavigation: TerminalMuxInputRouting.NavigationPlan?
     @ObservationIgnored private var displayedMuxDestination: TerminalMuxInputRouting.Destination?
+    /// One joined presentation worker, never one MainActor task per mux event.
+    @ObservationIgnored private var muxObservation: TerminalMuxObservation?
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
          reconnectingFrom previous: TerminalSessionController? = nil) {
@@ -582,6 +584,26 @@ final class TerminalSessionController {
         showView()
     }
 
+    /// Metadata and readiness notifications are latest-value presentation, not
+    /// a transcript or input authority. The observer reads them on MainActor,
+    /// coalesces floods, and pauses UI work for offscreen machines. The exact
+    /// control and routing revision are still checked before a responder changes.
+    private func observeMux(_ control: TerminalMuxControl) {
+        muxObservation = TerminalMuxObservation(control: control, initiallyActive: presentationVisible) {
+            [weak self, weak control] state, routing in
+            guard let self, let control, !self.stopped, self.connection?.muxControl === control else { return }
+            self.muxState = state
+            self.terminal?.remoteMouseGrabbed = state.mouseGrabbed
+            if let rejected = state.rejectedNavigation, rejected == self.requestedMuxNavigation {
+                self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
+                if self.presentationVisible {
+                    self.interactionProblem = "The pane list or selection changed. The swipe was cancelled; choose the pane again."
+                }
+            }
+            self.muxInputChanged(routing, control: control)
+        }
+    }
+
     /// The machine's mux, which searches its panes' scrollback on the server;
     /// nil for a session that is a shell of its own.
     var muxControl: TerminalMuxControl? { stopped ? nil : connection?.muxControl }
@@ -589,6 +611,7 @@ final class TerminalSessionController {
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
+        muxObservation?.setActive(visible)
         // Only the machine on screen sizes its mux pane to the phone; the
         // others give their panes back to the desktop's layout.
         connection?.muxControl?.setVisible(visible)
@@ -742,28 +765,7 @@ final class TerminalSessionController {
             let connection = attempt
             self.pump = pump
             if let control = connection.muxControl {
-                control.observe { [weak self, weak control] _ in
-                    guard let control else { return }
-                    Task { @MainActor [weak self] in
-                        guard let self, !self.stopped, self.connection?.muxControl === control else { return }
-                        // Notifications run outside the control's lock and may
-                        // reorder; publish its current snapshot, not stale UI.
-                        self.muxState = control.current
-                        self.terminal?.remoteMouseGrabbed = control.current.mouseGrabbed
-                        if let rejected = control.current.rejectedNavigation,
-                           rejected == self.requestedMuxNavigation {
-                            self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
-                            if self.presentationVisible {
-                                self.interactionProblem = "The pane list or selection changed. The swipe was cancelled; choose the pane again."
-                            }
-                            self.muxInputChanged(control.inputRouting.current, control: control)
-                        }
-                    }
-                }
-                control.inputRouting.observe { [weak self, weak control] state in
-                    guard let control else { return }
-                    Task { @MainActor [weak self] in self?.muxInputChanged(state, control: control) }
-                }
+                observeMux(control)
                 control.setVisible(presentationVisible)
             }
             try checkStarting()
@@ -1149,6 +1151,7 @@ final class TerminalSessionController {
 
     private func sealLocalOwnership() {
         presentationVisible = false
+        muxObservation?.retire()
         connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = false
         clipboard?.retire()
@@ -1238,6 +1241,7 @@ final class TerminalSessionController {
         if let viewAttachment { await viewAttachment.value }
         if let paneHandoff { await paneHandoff.value; self.paneHandoff = nil }
         sealLocalOwnership()
+        if let muxObservation { await muxObservation.close(); self.muxObservation = nil }
         var failure: Error?
         if let connection {
             // Native I/O stops now; a bound epoch deliberately refuses final
