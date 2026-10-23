@@ -2350,6 +2350,40 @@ impl MissionMutationGuard {
 
 // ── Step Executor Trait ──────────────────────────────────────────────────────
 
+/// Whether a dispatched step has an authoritative outcome. An unsuccessful
+/// input alone cannot distinguish a pre-effect refusal from a lost reply after
+/// the effect was applied. Durable execution must retain its Pending record for
+/// the latter, including when the uncertain effect was a compensation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDispatchOutcome<T> {
+    /// The input is authoritative: success, or a proven unsuccessful attempt.
+    Settled(T),
+    /// The effect may have happened. Neither retry nor terminal certification
+    /// is authorized by this input.
+    Indeterminate(T),
+}
+
+impl<T> StepDispatchOutcome<T> {
+    fn input(&self) -> &T {
+        match self {
+            Self::Settled(input) | Self::Indeterminate(input) => input,
+        }
+    }
+
+    fn into_input(self) -> T {
+        match self {
+            Self::Settled(input) | Self::Indeterminate(input) => input,
+        }
+    }
+
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> StepDispatchOutcome<U> {
+        match self {
+            Self::Settled(input) => StepDispatchOutcome::Settled(map(input)),
+            Self::Indeterminate(input) => StepDispatchOutcome::Indeterminate(map(input)),
+        }
+    }
+}
+
 /// Trait for executing individual tx steps.
 ///
 /// The engine calls this to perform actual work (e.g., sending commands to panes,
@@ -2372,6 +2406,21 @@ pub trait StepExecutor {
         now_ms: i64,
     ) -> Vec<TxCommitStepInput>;
 
+    /// Execute with effect certainty preserved for the durable engine.
+    /// Executors whose failures can follow a possibly applied effect must
+    /// override this method instead of reporting those failures as settled.
+    fn execute_steps_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCommitStepInput>> {
+        self.execute_steps(contract, fail_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::Settled)
+            .collect()
+    }
+
     /// Execute compensation steps and return inputs.
     fn execute_compensations(
         &self,
@@ -2380,6 +2429,21 @@ pub trait StepExecutor {
         fail_for_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCompensationStepInput>;
+
+    /// Compensation has the same uncertainty boundary as commit: losing an
+    /// undo acknowledgement never grants permission to perform the undo again.
+    fn execute_compensations_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
+        self.execute_compensations(contract, commit_report, fail_for_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::Settled)
+            .collect()
+    }
 }
 
 mod effect_seal {
@@ -2577,7 +2641,10 @@ where
 /// Storage adapter trait for `StepAction::StoreData` execution and compensation (ft-2j3vo).
 ///
 /// Implementations provide observable, atomic, and idempotent key-value mutation
-/// for transaction steps.
+/// for transaction steps. A mutation error string does not prove that no effect
+/// occurred, so the durable engine retains Pending after an adapter error. This
+/// also applies to validation refusals reported only through these strings;
+/// error text is never retry authority.
 pub trait TxStorageAdapter: Send + Sync {
     /// Store a JSON value under `key`. Overwrites any existing value at `key`.
     fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String>;
@@ -2926,17 +2993,45 @@ fn action_has_pane(action: &crate::plan::StepAction) -> bool {
     )
 }
 
+/// Only explicit, correctly bound pre-effect refusals can retire a send's
+/// Pending record as Failed. Opaque transport errors, cancellation after
+/// admission, unknown future codes and malformed authority remain ambiguous.
+fn send_failure_proves_no_effect(error: &crate::Error, pane_id: u64) -> bool {
+    use crate::error::{MuxEffectCertainty, MuxObjectKind, MuxOperation, WeztermError};
+
+    match error {
+        crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) => {
+            rejection.has_consistent_authority()
+                && rejection.operation == MuxOperation::SendText
+                && rejection.effect == MuxEffectCertainty::NotApplied
+                && rejection
+                    .object
+                    .is_none_or(|object| object.kind == MuxObjectKind::Pane && object.id == pane_id)
+        }
+        crate::Error::Wezterm(WeztermError::PaneNotFound(missing)) => *missing == pane_id,
+        crate::Error::Wezterm(
+            WeztermError::CliNotFound
+            | WeztermError::NotRunning
+            | WeztermError::SocketNotFound(_)
+            | WeztermError::VersionSkew { .. }
+            | WeztermError::CircuitOpen { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Execute a single step action against the real backend (blocking).
 ///
-/// Spawns a one-shot runtime for async calls. If `timeout_ms` is provided, wraps
-/// the async operation in `runtime_async::timeout`. Returns `(success, reason_code, error_code)`.
+/// Spawns a one-shot runtime for sends; the backend owns its send deadline.
+/// External waits use their bounded poll loop. The input contains
+/// `(success, reason_code, error_code)`; its disposition preserves effect certainty.
 fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
     timeout_ms: Option<u64>,
     external_signals: Option<&crate::workflows::ExternalSignalRegistry>,
     storage_adapter: Option<&(dyn TxStorageAdapter + 'static)>,
-) -> (bool, String, Option<String>) {
+) -> StepDispatchOutcome<(bool, String, Option<String>)> {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
 
@@ -2951,7 +3046,7 @@ fn execute_step_action(
     // poll interval) instead of blocking on `join()` until `timeout_ms`.
     let parent_cx = crate::cx::Cx::current();
 
-    match action {
+    StepDispatchOutcome::Settled(match action {
         crate::plan::StepAction::SendText {
             pane_id,
             text,
@@ -2965,46 +3060,81 @@ fn execute_step_action(
             let result = match std::thread::Builder::new()
                 .name("ft-tx-send-step".to_string())
                 .spawn(move || {
-                    let rt = crate::runtime_async::RuntimeBuilder::current_thread()
-                        .build()
-                        .map_err(|e| format!("failed to build runtime for pane step: {e}"))?;
-                    rt.block_on(async {
-                        // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
-                        // ft-506i5: use the parent tx Cx captured on the driver
-                        // thread (thread::spawn does not propagate the task-local
-                        // Cx); fall back to a fresh request Cx only when there was
-                        // no ambient cx to begin with.
-                        let send_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
-                        let result = if no_paste {
-                            h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
-                        } else {
-                            h.send_text_with_cx(&send_cx, pane_id, &text).await
-                        };
-                        result.map_err(|e| e.to_string())
-                    })
+                    // Own the runtime, backend captures and future inside the
+                    // marked boundary, including their destruction. Recover
+                    // only finite panic evidence; the canonical helper owns
+                    // opaque payload disposal and its quarantine/poison policy.
+                    frankenterm_sigpipe::catch_recoverable(
+                        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                        std::panic::AssertUnwindSafe(move || {
+                            let rt = match crate::runtime_async::RuntimeBuilder::current_thread()
+                                .build()
+                            {
+                                Ok(rt) => rt,
+                                Err(error) => {
+                                    return StepDispatchOutcome::Settled((
+                                        false,
+                                        "send_text_runtime_failed".to_string(),
+                                        Some(format!("FTX_RUNTIME: {error}")),
+                                    ));
+                                }
+                            };
+                            rt.block_on(async move {
+                                // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
+                                // ft-506i5: use the parent tx Cx captured on the driver
+                                // thread (thread::spawn does not propagate the task-local
+                                // Cx); fall back to a fresh request Cx only when there was
+                                // no ambient cx to begin with.
+                                let send_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
+                                let result = if no_paste {
+                                    h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
+                                } else {
+                                    h.send_text_with_cx(&send_cx, pane_id, &text).await
+                                };
+                                match result {
+                                    Ok(()) => StepDispatchOutcome::Settled((
+                                        true, "send_text_succeeded".to_string(), None,
+                                    )),
+                                    Err(error) if send_failure_proves_no_effect(&error, pane_id) => {
+                                        StepDispatchOutcome::Settled((
+                                            false,
+                                            "send_text_failed".to_string(),
+                                            Some(format!("FTX_SEND: {error}")),
+                                        ))
+                                    }
+                                    Err(error) => StepDispatchOutcome::Indeterminate((
+                                        false,
+                                        "send_text_indeterminate".to_string(),
+                                        Some(format!("FTX_SEND_INDETERMINATE: {error}")),
+                                    )),
+                                }
+                            })
+                        }),
+                    )
                 }) {
-                Ok(handle) => handle.join(),
+                Ok(handle) => match handle.join() {
+                    Ok(outcome) => outcome,
+                    // This is not a recovery boundary: a panic outside the
+                    // marked worker must retain its original fatal contract.
+                    // Never drop an opaque join payload as a failed action.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
                 Err(e) => {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "send_text_thread_spawn_failed".to_string(),
                         Some(format!("FTX_THREAD: {e}")),
-                    );
+                    ));
                 }
             };
-            match result {
-                Ok(Ok(())) => (true, "send_text_succeeded".to_string(), None),
-                Ok(Err(e)) => (
-                    false,
-                    "send_text_failed".to_string(),
-                    Some(format!("FTX_SEND: {e}")),
-                ),
-                Err(_) => (
+            return match result {
+                Ok(outcome) => outcome,
+                Err(_) => StepDispatchOutcome::Indeterminate((
                     false,
                     "send_text_thread_panic".to_string(),
                     Some("FTX_PANIC".to_string()),
-                ),
-            }
+                )),
+            };
         }
         crate::plan::StepAction::WaitFor {
             pane_id,
@@ -3018,30 +3148,30 @@ fn execute_step_action(
             // aliasing the signal key into the pane-text search pattern.
             if let crate::plan::WaitCondition::External { key } = condition {
                 let Some(registry) = external_signals else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "wait_for_external_unsupported".to_string(),
                         Some(format!(
                             "FTX_WAIT_EXTERNAL_UNSUPPORTED: signal '{key}' requires registry; \
                              wire one via PaneStepExecutor::with_external_signals(registry)"
                         )),
-                    );
+                    ));
                 };
                 let deadline = std::time::Instant::now();
                 let Some(deadline) = deadline.checked_add(timeout) else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "wait_for_timeout_overflow".to_string(),
                         Some(format!(
                             "FTX_WAIT: external timeout is too large: {timeout_val}ms"
                         )),
-                    );
+                    ));
                 };
                 let mut interval = std::time::Duration::from_millis(5);
                 let max_interval = std::time::Duration::from_millis(50);
                 loop {
                     if registry.is_signaled(key) {
-                        return (true, "wait_for_external_satisfied".to_string(), None);
+                        return StepDispatchOutcome::Settled((true, "wait_for_external_satisfied".to_string(), None));
                     }
                     // ft-506i5: this external wait runs on the driver thread, so
                     // the captured `parent_cx` is the live tx Cx. Honor
@@ -3052,23 +3182,23 @@ fn execute_step_action(
                         .as_ref()
                         .is_some_and(|cx| cx.checkpoint().is_err())
                     {
-                        return (
+                        return StepDispatchOutcome::Settled((
                             false,
                             "wait_for_cancelled".to_string(),
                             Some(format!(
                                 "FTX_WAIT_CANCELLED: external signal '{key}' wait interrupted by tx cancellation or deadline"
                             )),
-                        );
+                        ));
                     }
                     let now = std::time::Instant::now();
                     if now >= deadline {
-                        return (
+                        return StepDispatchOutcome::Settled((
                             false,
                             "wait_for_timeout".to_string(),
                             Some(format!(
                                 "FTX_WAIT: external signal '{key}' not fired within {timeout_val}ms"
                             )),
-                        );
+                        ));
                     }
                     let remaining = deadline.saturating_duration_since(now);
                     let chunk = interval.min(remaining);
@@ -3112,22 +3242,22 @@ fn execute_step_action(
         }
         crate::plan::StepAction::StoreData { key, value } => {
             let Some(storage) = storage_adapter else {
-                return (
+                return StepDispatchOutcome::Settled((
                     false,
                     "store_data_unwired".to_string(),
                     Some(
                         "FTX_STORE_DATA_UNWIRED: StoreData requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
                             .to_string(),
                     ),
-                );
+                ));
             };
             match storage.store_data(key, value) {
                 Ok(()) => (true, "store_data_succeeded".to_string(), None),
-                Err(e) => (
+                Err(e) => return StepDispatchOutcome::Indeterminate((
                     false,
-                    "store_data_failed".to_string(),
-                    Some(format!("FTX_STORE_DATA_FAILED: {e}")),
-                ),
+                    "store_data_indeterminate".to_string(),
+                    Some(format!("FTX_STORE_DATA_INDETERMINATE: {e}")),
+                )),
             }
         }
         crate::plan::StepAction::AcquireLock { .. } => (
@@ -3179,30 +3309,30 @@ fn execute_step_action(
         } => {
             if action_type == "delete_data" || action_type == "delete_store_data" {
                 let Some(storage) = storage_adapter else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "delete_data_unwired".to_string(),
                         Some(
                             "FTX_DELETE_DATA_UNWIRED: delete_data requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
                                 .to_string(),
                         ),
-                    );
+                    ));
                 };
                 let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("");
                 if key.is_empty() {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "delete_data_invalid_key".to_string(),
                         Some("FTX_DELETE_DATA_INVALID_KEY: missing or empty 'key' in payload".to_string()),
-                    );
+                    ));
                 }
                 match storage.delete_data(key) {
                     Ok(_) => (true, "delete_data_succeeded".to_string(), None),
-                    Err(e) => (
+                    Err(e) => return StepDispatchOutcome::Indeterminate((
                         false,
-                        "delete_data_failed".to_string(),
-                        Some(format!("FTX_DELETE_DATA_FAILED: {e}")),
-                    ),
+                        "delete_data_indeterminate".to_string(),
+                        Some(format!("FTX_DELETE_DATA_INDETERMINATE: {e}")),
+                    )),
                 }
             } else {
                 (
@@ -3212,7 +3342,7 @@ fn execute_step_action(
                 )
             }
         }
-    }
+    })
 }
 
 impl<P, A, T> StepExecutor for PaneStepExecutor<P, A, T>
@@ -3235,6 +3365,18 @@ where
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCommitStepInput> {
+        self.execute_steps_with_outcome(contract, fail_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::into_input)
+            .collect()
+    }
+
+    fn execute_steps_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCommitStepInput>> {
         let mut results = Vec::with_capacity(contract.plan.steps.len());
         let mut had_failure = false;
 
@@ -3251,26 +3393,26 @@ where
             // Deterministic failure injection
             if fail_step == Some(step.step_id.0.as_str()) {
                 tracing::warn!(step_id = %step.step_id.0, "injecting deterministic failure");
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "commit_step_failed_injected".to_string(),
                     error_code: Some("FTX3999".to_string()),
                     completed_at_ms: now_ms,
-                });
+                }));
                 had_failure = true;
                 continue;
             }
 
             // Stop executing after first failure (failure boundary)
             if had_failure {
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "skipped_after_failure".to_string(),
                     error_code: Some("FTX_SKIPPED".to_string()),
                     completed_at_ms: now_ms,
-                });
+                }));
                 continue;
             }
 
@@ -3283,7 +3425,7 @@ where
                     remaining_steps = remaining,
                     "phase timeout exceeded, skipping remaining steps"
                 );
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "phase_timeout".to_string(),
@@ -3293,7 +3435,7 @@ where
                         phase_budget.as_millis()
                     )),
                     completed_at_ms: now_ms,
-                });
+                }));
                 had_failure = true;
                 continue;
             }
@@ -3319,13 +3461,13 @@ where
                                     tier = ?tier,
                                     "critical backpressure — deferring non-pane step"
                                 );
-                                results.push(TxCommitStepInput {
+                                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                                     step_id: step.step_id.clone(),
                                     success: false,
                                     reason_code: "backpressure_deferred".to_string(),
                                     error_code: Some("FTX_BACKPRESSURE_CRITICAL".to_string()),
                                     completed_at_ms: now_ms,
-                                });
+                                }));
                                 had_failure = true;
                                 continue;
                             }
@@ -3336,13 +3478,13 @@ where
                                 tier = ?tier,
                                 "emergency backpressure — deferring all steps"
                             );
-                            results.push(TxCommitStepInput {
+                            results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                                 step_id: step.step_id.clone(),
                                 success: false,
                                 reason_code: "backpressure_emergency".to_string(),
                                 error_code: Some("FTX_BACKPRESSURE_EMERGENCY".to_string()),
                                 completed_at_ms: now_ms,
-                            });
+                            }));
                             had_failure = true;
                             continue;
                         }
@@ -3359,7 +3501,7 @@ where
                 "executing pane step"
             );
 
-            let (success, reason_code, error_code) = execute_step_action(
+            let outcome = execute_step_action(
                 &self.handle,
                 &step.action,
                 step_timeout,
@@ -3369,21 +3511,23 @@ where
 
             tracing::info!(
                 step_id = %step.step_id.0,
-                success,
-                reason = %reason_code,
+                success = outcome.input().0,
+                reason = %outcome.input().1,
                 "pane step completed"
             );
 
-            if !success {
+            if !outcome.input().0 {
                 had_failure = true;
             }
-            results.push(TxCommitStepInput {
-                step_id: step.step_id.clone(),
-                success,
-                reason_code,
-                error_code,
-                completed_at_ms: now_ms,
-            });
+            results.push(
+                outcome.map(|(success, reason_code, error_code)| TxCommitStepInput {
+                    step_id: step.step_id.clone(),
+                    success,
+                    reason_code,
+                    error_code,
+                    completed_at_ms: now_ms,
+                }),
+            );
         }
 
         results
@@ -3396,6 +3540,19 @@ where
         fail_for_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCompensationStepInput> {
+        self.execute_compensations_with_outcome(contract, commit_report, fail_for_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::into_input)
+            .collect()
+    }
+
+    fn execute_compensations_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
         let contract_compensations = contract
             .plan
             .compensations
@@ -3415,44 +3572,45 @@ where
                     step_id = %result.step_id.0,
                     "injecting deterministic compensation failure"
                 );
-                TxCompensationStepInput {
+                StepDispatchOutcome::Settled(TxCompensationStepInput {
                     for_step_id: result.step_id.clone(),
                     success: false,
                     reason_code: "compensation_failed_injected".to_string(),
                     error_code: Some("FTX4999".to_string()),
                     completed_at_ms: now_ms,
-                }
+                })
             } else {
                 tracing::info!(step_id = %result.step_id.0, "executing pane compensation");
                 let Some(action) = contract_compensations.get(result.step_id.0.as_str()) else {
-                    inputs.push(TxCompensationStepInput {
+                    inputs.push(StepDispatchOutcome::Settled(TxCompensationStepInput {
                         for_step_id: result.step_id.clone(),
                         success: false,
                         reason_code: "compensation_action_missing".to_string(),
                         error_code: Some("FTX_COMPENSATION_MISSING".to_string()),
                         completed_at_ms: now_ms,
-                    });
+                    }));
                     break;
                 };
 
                 let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
-                let (success, reason_code, error_code) = execute_step_action(
+                execute_step_action(
                     &self.handle,
                     action,
                     step_timeout,
                     self.external_signals.as_deref(),
                     self.storage_adapter.as_deref(),
-                );
-
-                TxCompensationStepInput {
-                    for_step_id: result.step_id.clone(),
-                    success,
-                    reason_code,
-                    error_code,
-                    completed_at_ms: now_ms,
-                }
+                )
+                .map(|(success, reason_code, error_code)| {
+                    TxCompensationStepInput {
+                        for_step_id: result.step_id.clone(),
+                        success,
+                        reason_code,
+                        error_code,
+                        completed_at_ms: now_ms,
+                    }
+                })
             };
-            let success = input.success;
+            let success = input.input().success;
             inputs.push(input);
             if !success {
                 break;
@@ -5639,19 +5797,33 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 .plan
                 .compensations
                 .retain(|compensation| compensation.for_step_id == step.step_id);
-            let mut dispatched = self.executor.execute_steps(
+            let mut dispatched = self.executor.execute_steps_with_outcome(
                 &dispatch_contract,
                 self.config.fail_step.as_deref(),
                 now_ms,
             );
-            if dispatched.len() != 1 || dispatched[0].step_id != step.step_id {
+            if dispatched.len() != 1 || dispatched[0].input().step_id != step.step_id {
                 return Err(TxExecutionError::CommitPhase(format!(
                     "step executor returned {} results while dispatching commit step {}",
                     dispatched.len(),
                     step.step_id.0
                 )));
             }
-            let input = dispatched.remove(0);
+            let input = match dispatched.remove(0) {
+                StepDispatchOutcome::Settled(input) => input,
+                StepDispatchOutcome::Indeterminate(input) => {
+                    // The dispatch may have applied its effect. Leaving the
+                    // write-ahead record Pending blocks both terminal claims
+                    // and any redispatch after reopen, irrespective of TTL.
+                    return Err(TxExecutionError::DedupConflict {
+                        step_id: step.step_id.0.clone(),
+                        outcome: format!(
+                            "Pending: commit dispatch outcome is indeterminate ({})",
+                            input.reason_code
+                        ),
+                    });
+                }
+            };
             let succeeded = input.success;
             let outcome = if succeeded {
                 StepOutcome::Success {
@@ -6160,20 +6332,34 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 })?;
             compensation_keys.insert(step_result.step_id.0.clone(), idem_key.clone());
 
-            let mut dispatched = self.executor.execute_compensations(
+            let mut dispatched = self.executor.execute_compensations_with_outcome(
                 contract,
                 &dispatch_report,
                 self.config.fail_compensation_for_step.as_deref(),
                 now_ms,
             );
-            if dispatched.len() != 1 || dispatched[0].for_step_id != step_result.step_id {
+            if dispatched.len() != 1 || dispatched[0].input().for_step_id != step_result.step_id {
                 return Err(TxExecutionError::CompensationPhase(format!(
                     "step executor returned {} results while dispatching compensation for step {}",
                     dispatched.len(),
                     step_result.step_id.0
                 )));
             }
-            let input = dispatched.remove(0);
+            let input = match dispatched.remove(0) {
+                StepDispatchOutcome::Settled(input) => input,
+                StepDispatchOutcome::Indeterminate(input) => {
+                    // A failed acknowledgement is not a failed undo. Keep
+                    // the compensation key Pending so another rollback can
+                    // never repeat an undo that may already have happened.
+                    return Err(TxExecutionError::DedupConflict {
+                        step_id: step_result.step_id.0.clone(),
+                        outcome: format!(
+                            "Pending: compensation dispatch outcome is indeterminate ({})",
+                            input.reason_code
+                        ),
+                    });
+                }
+            };
             let succeeded = input.success;
             let outcome = if succeeded {
                 StepOutcome::Compensated {
@@ -12350,7 +12536,10 @@ mod tests {
         TxPrepareTargetSnapshot, WaitCondition,
     };
     use crate::policy::{PolicyDecision, PolicyInput};
-    use crate::wezterm::{MockWezterm, WeztermHandle, mock_wezterm_handle};
+    use crate::wezterm::{
+        MockWezterm, MoveDirection, PaneInfo, SpawnTarget, SplitDirection, WeztermFuture,
+        WeztermHandle, WeztermInterface, mock_wezterm_handle,
+    };
     use std::sync::Arc;
 
     /// Allow-all policy authorizer for PaneStepExecutor tests.
@@ -13094,7 +13283,7 @@ mod tests {
         ];
 
         for (action, expected_reason, expected_error) in cases {
-            let result = execute_step_action(&mock, &action, None, None, None);
+            let result = execute_step_action(&mock, &action, None, None, None).into_input();
             assert!(!result.0, "{expected_reason} must fail closed");
             assert_eq!(result.1, expected_reason);
             assert!(
@@ -13473,6 +13662,621 @@ mod tests {
     > {
         let executor = make_pane_executor(handle);
         TxExecutionEngine::new(executor, TxExecutionConfig::default())
+    }
+
+    #[test]
+    fn send_failure_certainty_requires_consistent_operation_and_target_authority() {
+        use crate::error::{
+            MuxEffectCertainty, MuxOperation, MuxRejection, MuxRejectionCode, MuxRetryAuthority,
+            WeztermError,
+        };
+
+        for refusal in [
+            WeztermError::MuxRejection(MuxRejection::backend_failure(MuxOperation::SendText)),
+            WeztermError::MuxRejection(MuxRejection::pane_not_found(MuxOperation::SendText, 7)),
+            WeztermError::PaneNotFound(7),
+            WeztermError::CliNotFound,
+            WeztermError::CircuitOpen {
+                retry_after_ms: 100,
+            },
+        ] {
+            assert!(send_failure_proves_no_effect(&refusal.into(), 7));
+        }
+
+        let mut inconsistent = MuxRejection::indeterminate(MuxOperation::SendText, None);
+        inconsistent.effect = MuxEffectCertainty::NotApplied;
+        for uncertain in [
+            WeztermError::IndeterminateMutation {
+                operation: "send-text",
+            },
+            WeztermError::MuxRejection(MuxRejection::indeterminate(MuxOperation::SendText, None)),
+            WeztermError::MuxRejection(inconsistent),
+            WeztermError::MuxRejection(MuxRejection::backend_failure(MuxOperation::KillPane)),
+            WeztermError::MuxRejection(MuxRejection::pane_not_found(MuxOperation::SendText, 8)),
+            WeztermError::PaneNotFound(8),
+            WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::UnknownFuture,
+                operation: MuxOperation::SendText,
+                object: None,
+                effect: MuxEffectCertainty::UnknownFuture,
+                retry: MuxRetryAuthority::UnknownFuture,
+            }),
+            WeztermError::Timeout(1),
+            WeztermError::ParseError("reply lost after dispatch".to_owned()),
+            WeztermError::CommandFailed("pane not found: 7".to_owned()),
+        ] {
+            assert!(!send_failure_proves_no_effect(&uncertain.into(), 7));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FileEffectFault {
+        None,
+        RefuseBeforeEffect,
+        LoseReplyAfterEffect,
+        PanicAfterEffect,
+    }
+
+    #[derive(Default)]
+    struct FileEffectPanicAudit {
+        dispatch_marked: std::sync::atomic::AtomicBool,
+        payload_dropped: std::sync::atomic::AtomicBool,
+        disposal_marked: std::sync::atomic::AtomicBool,
+    }
+
+    impl FileEffectPanicAudit {
+        fn assert_contained(&self) {
+            // Assert only on the driver thread: an assertion in the worker
+            // could itself be caught as the expected indeterminate outcome.
+            assert!(self.dispatch_marked.load(Ordering::SeqCst));
+            assert!(self.payload_dropped.load(Ordering::SeqCst));
+            assert!(self.disposal_marked.load(Ordering::SeqCst));
+        }
+    }
+
+    struct FileEffectPanicPayload(Arc<FileEffectPanicAudit>);
+
+    impl Drop for FileEffectPanicPayload {
+        fn drop(&mut self) {
+            self.0.disposal_marked.store(
+                frankenterm_sigpipe::is_recoverable_panic(),
+                Ordering::SeqCst,
+            );
+            self.0.payload_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The send path commits an observable file effect before injecting reply
+    /// loss. Other mux methods delegate to the existing mock. These tests use
+    /// the real pane executor and durable spool, not a synthetic step result.
+    struct FileEffectBackend {
+        fallback: WeztermHandle,
+        effect_path: PathBuf,
+        fault_text: &'static str,
+        fault: FileEffectFault,
+        panic_audit: Arc<FileEffectPanicAudit>,
+    }
+
+    impl FileEffectBackend {
+        fn handle(path: &Path, fault_text: &'static str, fault: FileEffectFault) -> WeztermHandle {
+            Self::handle_with_panic_audit(path, fault_text, fault, Arc::default())
+        }
+
+        fn handle_with_panic_audit(
+            path: &Path,
+            fault_text: &'static str,
+            fault: FileEffectFault,
+            panic_audit: Arc<FileEffectPanicAudit>,
+        ) -> WeztermHandle {
+            Arc::new(Self {
+                fallback: mock_wezterm_handle(),
+                effect_path: path.to_path_buf(),
+                fault_text,
+                fault,
+                panic_audit,
+            })
+        }
+
+        fn dispatch(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            let text = text.to_owned();
+            Box::pin(async move {
+                use crate::error::{MuxObjectIdentity, MuxObjectKind, MuxOperation, MuxRejection};
+                use std::io::Write;
+
+                let fault = if text == self.fault_text {
+                    self.fault
+                } else {
+                    FileEffectFault::None
+                };
+                if fault == FileEffectFault::RefuseBeforeEffect {
+                    return Err(crate::error::WeztermError::MuxRejection(
+                        MuxRejection::backend_failure(MuxOperation::SendText),
+                    )
+                    .into());
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.effect_path)
+                    .expect("open observable effect log");
+                writeln!(file, "{text}").expect("append observable effect");
+                file.sync_all().expect("persist observable effect");
+                match fault {
+                    FileEffectFault::LoseReplyAfterEffect => Err(
+                        crate::error::WeztermError::MuxRejection(MuxRejection::indeterminate(
+                            MuxOperation::SendText,
+                            Some(MuxObjectIdentity {
+                                kind: MuxObjectKind::Pane,
+                                id: pane_id,
+                            }),
+                        ))
+                        .into(),
+                    ),
+                    FileEffectFault::PanicAfterEffect => {
+                        self.panic_audit.dispatch_marked.store(
+                            frankenterm_sigpipe::is_recoverable_panic(),
+                            Ordering::SeqCst,
+                        );
+                        std::panic::panic_any(FileEffectPanicPayload(self.panic_audit.clone()));
+                    }
+                    FileEffectFault::None | FileEffectFault::RefuseBeforeEffect => Ok(()),
+                }
+            })
+        }
+    }
+
+    impl WeztermInterface for FileEffectBackend {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+            self.fallback.list_panes()
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+            self.fallback.get_pane(pane_id)
+        }
+
+        fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+            self.fallback.get_text(pane_id, escapes)
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            _no_paste: bool,
+            _no_newline: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+            self.fallback.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+            self.fallback.spawn(cwd, domain_name)
+        }
+
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            self.fallback.spawn_targeted(cwd, domain_name, target)
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            direction: SplitDirection,
+            cwd: Option<&str>,
+            percent: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            self.fallback.split_pane(pane_id, direction, cwd, percent)
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            self.fallback.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+            self.fallback.zoom_pane(pane_id, zoom)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.fallback.circuit_status()
+        }
+    }
+
+    fn file_effect_contract() -> MissionTxContract {
+        let send = |text: &str| StepAction::SendText {
+            pane_id: 0,
+            text: text.to_owned(),
+            paste_mode: None,
+        };
+        make_pane_contract_with_compensations(
+            vec![
+                ("s1".to_owned(), send("forward")),
+                ("s2".to_owned(), send("later")),
+            ],
+            vec![
+                ("s1".to_owned(), send("undo")),
+                ("s2".to_owned(), send("undo-later")),
+            ],
+        )
+    }
+
+    #[test]
+    fn durable_commit_keeps_unacknowledged_effect_pending_across_reopen() {
+        for fault in [
+            FileEffectFault::LoseReplyAfterEffect,
+            FileEffectFault::PanicAfterEffect,
+        ] {
+            let dir = tempfile::tempdir().expect("effect and ledger directory");
+            let effect_path = dir.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                dedup_ttl_ms: 100,
+                ..Default::default()
+            };
+            let mut store = IdempotencyStore::open(dir.path(), policy.clone()).unwrap();
+            let panic_audit = Arc::new(FileEffectPanicAudit::default());
+            let engine = make_pane_engine(FileEffectBackend::handle_with_panic_audit(
+                &effect_path,
+                "later",
+                fault,
+                panic_audit.clone(),
+            ));
+            let mut original_contract = file_effect_contract();
+            original_contract.plan.steps.push(TxStep {
+                step_id: TxStepId("s3".to_owned()),
+                ordinal: 2,
+                action: StepAction::SendText {
+                    pane_id: 0,
+                    text: "last".to_owned(),
+                    paste_mode: None,
+                },
+                description: "must not dispatch after uncertainty".to_owned(),
+            });
+            let mut contract = original_contract.clone();
+            let key = test_commit_key(&contract, "s2");
+
+            let error = engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .expect_err("an applied effect with no reply must stay unresolved");
+            if fault == FileEffectFault::PanicAfterEffect {
+                panic_audit.assert_contained();
+            }
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+                if step_id == "s2" && outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&test_commit_key(&contract, "s1"), 5_000),
+                Some(StepOutcome::Success { .. })
+            ));
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 5_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert!(
+                store
+                    .peek_cached_outcome(&test_commit_key(&contract, "s3"), 5_000)
+                    .is_none()
+            );
+            assert!(
+                store
+                    .peek_cached_outcome(&test_compensation_key(&contract, "s1"), 5_000)
+                    .is_none()
+            );
+            assert_eq!(contract.lifecycle_state, MissionTxState::Committing);
+            assert!(contract.receipts.iter().all(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) != Some("commit")
+            }));
+            assert_eq!(store.active_count(), 1);
+            let ledger_bytes = durable_ledger_file_snapshot(dir.path());
+            drop(store);
+
+            // A healthy replacement would apply the command if allowed. The
+            // pre-execution contract plus reopened spool models restart before
+            // any receipt could be persisted, well beyond the dedup TTL.
+            let mut store = IdempotencyStore::open(dir.path(), policy).unwrap();
+            let retry_engine = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "later",
+                FileEffectFault::None,
+            ));
+            let mut retry_contract = original_contract;
+            let error = retry_engine
+                .execute_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart cannot retry an uncertain commit");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(durable_ledger_file_snapshot(dir.path()), ledger_bytes);
+        }
+    }
+
+    #[test]
+    fn durable_rollback_keeps_unacknowledged_undo_pending_across_reopen() {
+        for fault in [
+            FileEffectFault::LoseReplyAfterEffect,
+            FileEffectFault::PanicAfterEffect,
+        ] {
+            let dir = tempfile::tempdir().expect("effect and ledger directory");
+            let effect_path = dir.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                dedup_ttl_ms: 100,
+                ..Default::default()
+            };
+            let mut store = IdempotencyStore::open(dir.path(), policy.clone()).unwrap();
+            let panic_audit = Arc::new(FileEffectPanicAudit::default());
+            let engine = make_pane_engine(FileEffectBackend::handle_with_panic_audit(
+                &effect_path,
+                "undo-later",
+                fault,
+                panic_audit.clone(),
+            ));
+            let mut contract = file_effect_contract();
+            engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .unwrap();
+            let committed_contract = contract.clone();
+            let key = test_compensation_key(&contract, "s2");
+            let receipt_count = contract.receipts.len();
+
+            let error = engine
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .expect_err("an unacknowledged undo must remain unresolved");
+            if fault == FileEffectFault::PanicAfterEffect {
+                panic_audit.assert_contained();
+            }
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+                if step_id == "s2" && outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\nundo-later\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 6_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert!(
+                store
+                    .peek_cached_outcome(&test_compensation_key(&contract, "s1"), 6_000)
+                    .is_none()
+            );
+            assert_eq!(contract.receipts.len(), receipt_count);
+            assert_ne!(contract.lifecycle_state, MissionTxState::RolledBack);
+            let ledger_bytes = durable_ledger_file_snapshot(dir.path());
+            drop(store);
+
+            let mut store = IdempotencyStore::open(dir.path(), policy).unwrap();
+            let retry_engine = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "undo-later",
+                FileEffectFault::None,
+            ));
+            let mut retry_contract = committed_contract.clone();
+            let error = retry_engine
+                .rollback_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart cannot repeat an uncertain undo");
+            assert!(
+                matches!(error, TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict, ref step_id, ref detail,
+            } if step_id == "s2" && detail.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\nundo-later\n"
+            );
+            assert_eq!(
+                serde_json::to_value(&retry_contract).unwrap(),
+                serde_json::to_value(&committed_contract).unwrap()
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(durable_ledger_file_snapshot(dir.path()), ledger_bytes);
+        }
+    }
+
+    #[test]
+    fn durable_pre_effect_compensation_refusal_remains_retryable_after_reopen() {
+        let dir = tempfile::tempdir().expect("effect and ledger directory");
+        let effect_path = dir.path().join("effects.log");
+        let mut store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo-later",
+            FileEffectFault::RefuseBeforeEffect,
+        ));
+        let mut contract = file_effect_contract();
+        engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        let first = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .unwrap();
+        assert_eq!(first.compensation_report.failed_count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&contract, "s2"), 6_000),
+            Some(StepOutcome::Failed {
+                compensated: false,
+                ..
+            })
+        ));
+        drop(store);
+
+        let mut store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+        let retry_engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo-later",
+            FileEffectFault::None,
+        ));
+        let retry = retry_engine
+            .rollback_with_store(&mut contract, &mut store, 6_050)
+            .unwrap();
+        assert!(retry.compensation_report.is_fully_rolled_back());
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo-later\nundo\n"
+        );
+    }
+
+    #[test]
+    fn durable_storage_error_after_mutation_remains_pending_across_reopen() {
+        struct AppliedStorageError {
+            inner: FileTxStorageAdapter,
+            effects: PathBuf,
+        }
+
+        impl AppliedStorageError {
+            fn record_effect(&self) {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.effects)
+                    .unwrap();
+                writeln!(file, "mutation").unwrap();
+                file.sync_all().unwrap();
+            }
+        }
+
+        impl TxStorageAdapter for AppliedStorageError {
+            fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+                self.inner.store_data(key, value)?;
+                self.record_effect();
+                Err("storage reply lost after mutation".to_owned())
+            }
+
+            fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+                self.inner.get_data(key)
+            }
+
+            fn delete_data(&self, key: &str) -> Result<bool, String> {
+                self.inner.delete_data(key)?;
+                self.record_effect();
+                Err("storage reply lost after mutation".to_owned())
+            }
+        }
+
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let inner = FileTxStorageAdapter::new(dir.path().join("data")).unwrap();
+            inner
+                .store_data("record", &serde_json::json!("before"))
+                .unwrap();
+            let effects = dir.path().join("effects.log");
+            let storage = Arc::new(AppliedStorageError {
+                inner,
+                effects: effects.clone(),
+            });
+            let action = if delete {
+                StepAction::Custom {
+                    action_type: "delete_data".to_owned(),
+                    payload: serde_json::json!({"key": "record"}),
+                }
+            } else {
+                StepAction::StoreData {
+                    key: "record".to_owned(),
+                    value: serde_json::json!("after"),
+                }
+            };
+            let original = make_pane_contract(vec![("s1".to_owned(), action)]);
+            let mut contract = original.clone();
+            let mut store =
+                IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+            let engine = TxExecutionEngine::new(
+                make_pane_executor(mock_wezterm_handle()).with_storage_adapter(storage.clone()),
+                TxExecutionConfig::default(),
+            );
+            let error = engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .expect_err("opaque adapter failure cannot certify no mutation");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending"))
+            );
+            assert_eq!(
+                storage.get_data("record").unwrap(),
+                if delete {
+                    None
+                } else {
+                    Some(serde_json::json!("after"))
+                }
+            );
+            assert_eq!(std::fs::read_to_string(&effects).unwrap(), "mutation\n");
+            drop(store);
+
+            let mut store =
+                IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+            let mut retry_contract = original;
+            let error = engine
+                .execute_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart must not repeat uncertain storage mutation");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending"))
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&test_commit_key(&contract, "s1"), 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(std::fs::read_to_string(&effects).unwrap(), "mutation\n");
+        }
     }
 
     /// Create a contract with compensations for rollback testing.
@@ -13932,6 +14736,7 @@ mod tests {
             None,
             None,
         );
+        let result = result.into_input();
         assert!(!result.0, "external wait must fail without a registry");
         assert_eq!(result.1, "wait_for_external_unsupported");
         let err = result.2.expect("error code present");
@@ -13961,6 +14766,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(result.0, "pre-fired signal must satisfy: {:?}", result);
         assert_eq!(result.1, "wait_for_external_satisfied");
         assert!(
@@ -13993,6 +14799,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(result.0, "late signal must satisfy: {:?}", result);
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -14023,6 +14830,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(!result.0, "no signal must time out");
         assert_eq!(result.1, "wait_for_timeout");
         let err = result.2.expect("error code present");
@@ -14062,6 +14870,7 @@ mod tests {
             Some(registry.as_ref()),
             None,
         );
+        let result = result.into_input();
         assert!(result.0, "external wait must succeed without a target pane");
         assert_ne!(
             result.1, "wait_for_no_pane",
@@ -14240,9 +15049,12 @@ mod tests {
                 },
             )]);
 
-            let results = executor.execute_steps(&contract, None, 1000);
-            assert!(!results[0].success, "Invalid key '{key}' must fail closed");
-            assert_eq!(results[0].reason_code, "store_data_failed");
+            let results = executor.execute_steps_with_outcome(&contract, None, 1000);
+            let StepDispatchOutcome::Indeterminate(input) = &results[0] else {
+                panic!("an opaque adapter error provides no effect certainty");
+            };
+            assert!(!input.success, "Invalid key '{key}' must fail closed");
+            assert_eq!(input.reason_code, "store_data_indeterminate");
         }
     }
 

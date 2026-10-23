@@ -2858,9 +2858,33 @@ impl WeztermClient {
                                 // Claude Code folds an Enter that arrives right
                                 // behind a multi-line paste into the paste.
                                 pause_before_paste_submit(cx, body, false).await;
-                                pool.write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
+                                match pool
+                                    .write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
                                     .await
-                                    .map(|_| ())
+                                {
+                                    Ok(_) => Ok(()),
+                                    Err(error) if !body.is_empty() => {
+                                        // The body is already in the pane. Even
+                                        // a proven refusal of Enter cannot
+                                        // certify that this composite send had
+                                        // no effect, or authorize replaying it.
+                                        // Preserve the original transport's
+                                        // health evidence before promoting the
+                                        // whole operation's effect certainty.
+                                        self.mux_circuit_record_error(&error);
+                                        return Err(WeztermError::MuxRejection(
+                                            MuxRejection::indeterminate(
+                                                MuxOperation::SendText,
+                                                Some(MuxObjectIdentity {
+                                                    kind: MuxObjectKind::Pane,
+                                                    id: pane_id,
+                                                }),
+                                            ),
+                                        )
+                                        .into());
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(e) => Err(e),
                         }
@@ -5924,6 +5948,371 @@ mod tests {
         assert_eq!(split_paste_submit("\n"), ("", true));
         assert_eq!(split_paste_submit("no newline"), ("no newline", false));
         assert_eq!(split_paste_submit(""), ("", false));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CompositeSendFault {
+        None,
+        RefusePaste,
+        RefuseEnter,
+        LoseEnterReply,
+        InitialVersionSkew,
+        VersionSkewAfterPaste,
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[derive(Debug, Default)]
+    struct CompositeSendTrace {
+        requests: Vec<(&'static str, Vec<u8>)>,
+        effects: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    /// Exercise the production client, connection pool and codec over an owned
+    /// Unix socket. The server records applied effects independently from the
+    /// replies it sends, so a lost/refused Enter cannot erase a successful paste.
+    #[cfg(all(feature = "vendored", unix))]
+    fn composite_send_fixture(
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+        fault: CompositeSendFault,
+    ) -> (Result<()>, CompositeSendTrace, CircuitBreakerStatus) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        use crate::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
+        use codec::{Pdu, PduWireIdent, StreamingPduBuffer, UnitResponse};
+
+        let directory = tempfile::tempdir().expect("composite send socket directory");
+        let socket_path = directory.path().join("composite-send.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind composite send fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("bounded fixture accept");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut trace = CompositeSendTrace::default();
+            let connections = if fault == CompositeSendFault::VersionSkewAfterPaste {
+                2
+            } else {
+                1
+            };
+            for connection in 0..connections {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture connection timed out");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking fixture stream with bounded I/O");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bounded fixture reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("bounded fixture writes");
+                let mut buffer = StreamingPduBuffer::new();
+                loop {
+                    let mut bytes = [0u8; 4096];
+                    let count = stream.read(&mut bytes).expect("read fixture request");
+                    if count == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&bytes[..count]);
+                    while let Some(decoded) =
+                        Pdu::stream_decode(&mut buffer).expect("decode request")
+                    {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let skew = fault == CompositeSendFault::InitialVersionSkew
+                                    || (fault == CompositeSendFault::VersionSkewAfterPaste
+                                        && connection == 1);
+                                Pdu::GetCodecVersionResponse(codec::GetCodecVersionResponse {
+                                    codec_vers: if skew {
+                                        codec::CODEC_VERSION + 1
+                                    } else {
+                                        codec::CODEC_VERSION
+                                    },
+                                    version_string: "frankenterm-composite-send-test".to_owned(),
+                                    executable_path: std::path::PathBuf::from(
+                                        "/fixture/frankenterm",
+                                    ),
+                                    config_file_path: None,
+                                    min_supported: if skew {
+                                        codec::CODEC_VERSION + 1
+                                    } else {
+                                        codec::CODEC_VERSION_MIN_SUPPORTED
+                                    },
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::SendPaste(request) => {
+                                assert_eq!(request.pane_id, 77);
+                                let effect = ("paste", request.data.into_bytes());
+                                trace.requests.push(effect.clone());
+                                if fault == CompositeSendFault::RefusePaste {
+                                    Pdu::ErrorResponse(codec::ErrorResponse::policy_rejected(
+                                        <codec::SendPaste as PduWireIdent>::IDENT,
+                                    ))
+                                } else {
+                                    trace.effects.push(effect);
+                                    Pdu::UnitResponse(UnitResponse {})
+                                }
+                            }
+                            Pdu::WriteToPane(request) => {
+                                assert_eq!(request.pane_id, 77);
+                                let effect = ("write", request.data);
+                                trace.requests.push(effect.clone());
+                                if fault == CompositeSendFault::RefuseEnter {
+                                    Pdu::ErrorResponse(codec::ErrorResponse::policy_rejected(
+                                        <codec::WriteToPane as PduWireIdent>::IDENT,
+                                    ))
+                                } else {
+                                    trace.effects.push(effect);
+                                    if fault == CompositeSendFault::LoseEnterReply {
+                                        return trace;
+                                    }
+                                    Pdu::UnitResponse(UnitResponse {})
+                                }
+                            }
+                            other => panic!("unexpected composite fixture request: {other:?}"),
+                        };
+                        let mut encoded = Vec::new();
+                        response
+                            .encode(&mut encoded, decoded.serial)
+                            .expect("encode fixture reply");
+                        stream.write_all(&encoded).expect("write fixture reply");
+                    }
+                }
+            }
+            trace
+        });
+
+        let mut result = None;
+        let mut circuit_status = None;
+        run_async_test(async {
+            let pool = Arc::new(MuxPool::new(MuxPoolConfig {
+                pool: crate::pool::PoolConfig {
+                    max_size: 1,
+                    idle_timeout: if fault == CompositeSendFault::VersionSkewAfterPaste {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(60)
+                    },
+                    acquire_timeout: Duration::from_secs(2),
+                },
+                mux: DirectMuxClientConfig {
+                    connect_timeout: Duration::from_secs(2),
+                    read_timeout: Duration::from_secs(2),
+                    write_timeout: Duration::from_secs(2),
+                    ..DirectMuxClientConfig::default().with_socket_path(&socket_path)
+                },
+                ..MuxPoolConfig::default()
+            }));
+            let mut client = isolated_cli_client_with_socket(socket_path.to_string_lossy())
+                .with_mux_pool(Arc::clone(&pool));
+            // A framed refusal must clear an earlier backend failure, while a
+            // lost reply must add one. Effect uncertainty is a separate axis.
+            let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::default());
+            circuit.record_failure();
+            client.mux_circuit_breaker = Arc::new(Mutex::new(circuit));
+            let cx = crate::cx::for_testing();
+            result = Some(
+                client
+                    .send_text_with_options_with_cx(&cx, 77, text, no_paste, no_newline)
+                    .await,
+            );
+            circuit_status = Some(client.mux_circuit_breaker.lock().unwrap().status());
+            let stats = pool.stats_with_cx(&cx).await.expect("fixture pool stats");
+            assert_eq!(
+                stats.connections_created,
+                if fault == CompositeSendFault::InitialVersionSkew {
+                    0
+                } else {
+                    1
+                }
+            );
+            assert_eq!(
+                stats.connections_failed,
+                u64::from(matches!(
+                    fault,
+                    CompositeSendFault::InitialVersionSkew
+                        | CompositeSendFault::VersionSkewAfterPaste
+                ))
+            );
+            assert_eq!(stats.recovery_attempts, 0, "mutations must not replay");
+            drop(client);
+            drop(pool);
+        });
+        let trace = server.join().expect("composite send fixture completes");
+        (result.unwrap(), trace, circuit_status.unwrap())
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_retains_uncertainty_after_the_body_is_applied() {
+        for fault in [
+            CompositeSendFault::RefuseEnter,
+            CompositeSendFault::LoseEnterReply,
+        ] {
+            let (result, trace, health) = composite_send_fixture("command", false, false, fault);
+            let error = result.expect_err("a partial composite send cannot certify failure");
+            let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+                panic!("whole-operation uncertainty must retain typed authority");
+            };
+            assert_eq!(
+                rejection,
+                MuxRejection::indeterminate(
+                    MuxOperation::SendText,
+                    Some(MuxObjectIdentity {
+                        kind: MuxObjectKind::Pane,
+                        id: 77
+                    }),
+                )
+            );
+            assert_eq!(
+                trace.requests,
+                vec![("paste", b"command".to_vec()), ("write", b"\r".to_vec())]
+            );
+            if fault == CompositeSendFault::RefuseEnter {
+                assert_eq!(trace.effects, vec![("paste", b"command".to_vec())]);
+                assert_eq!(
+                    health.consecutive_failures, 0,
+                    "framed refusal proves mux health"
+                );
+            } else {
+                assert_eq!(trace.effects, trace.requests);
+                assert_eq!(
+                    health.consecutive_failures, 2,
+                    "lost reply retains backend failure evidence"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_preserves_single_operation_refusal_authority() {
+        for (text, no_paste, no_newline, fault, request) in [
+            (
+                "command",
+                false,
+                false,
+                CompositeSendFault::RefusePaste,
+                ("paste", b"command".to_vec()),
+            ),
+            (
+                "",
+                false,
+                false,
+                CompositeSendFault::RefuseEnter,
+                ("write", b"\r".to_vec()),
+            ),
+            (
+                "command",
+                true,
+                false,
+                CompositeSendFault::RefuseEnter,
+                ("write", b"command\n".to_vec()),
+            ),
+            (
+                "command",
+                false,
+                true,
+                CompositeSendFault::RefusePaste,
+                ("paste", b"command".to_vec()),
+            ),
+        ] {
+            let (result, trace, health) = composite_send_fixture(text, no_paste, no_newline, fault);
+            let error = result.expect_err("server refused before applying any input");
+            let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+                panic!("pre-effect refusal must retain typed authority");
+            };
+            // The pool conservatively marks an admitted operation uncertain,
+            // even for a remote refusal. Preserve that existing authority:
+            // without an acknowledged body, there is no composite promotion.
+            assert_eq!(
+                rejection,
+                MuxRejection::indeterminate(MuxOperation::SendText, None)
+            );
+            assert!(rejection.has_consistent_authority());
+            assert_eq!(trace.requests, vec![request]);
+            assert!(trace.effects.is_empty());
+            assert_eq!(health.consecutive_failures, 0);
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_reconnect_failure_cannot_erase_the_applied_body() {
+        // The production multiline pause lets the zero-idle-timeout pool
+        // replace the acknowledged paste's connection before sending Enter.
+        // Version skew proves Enter was never admitted, but the prior paste
+        // still makes replaying the entire command unsafe.
+        let body = "line one\nline two";
+        let (result, trace, health) = composite_send_fixture(
+            body,
+            false,
+            false,
+            CompositeSendFault::VersionSkewAfterPaste,
+        );
+        let error = result.expect_err("reconnecting for Enter failed after paste committed");
+        let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+            panic!("second-leg version skew must become whole-send uncertainty");
+        };
+        assert_eq!(
+            rejection,
+            MuxRejection::indeterminate(
+                MuxOperation::SendText,
+                Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id: 77
+                })
+            )
+        );
+        assert_eq!(trace.requests, vec![("paste", body.as_bytes().to_vec())]);
+        assert_eq!(trace.effects, trace.requests);
+        assert_eq!(health.consecutive_failures, 2);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_initial_version_skew_preserves_pre_effect_authority() {
+        let (result, trace, health) = composite_send_fixture(
+            "command",
+            false,
+            false,
+            CompositeSendFault::InitialVersionSkew,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::Error::Wezterm(WeztermError::VersionSkew { .. }))
+        ));
+        assert!(trace.requests.is_empty());
+        assert!(trace.effects.is_empty());
+        assert_eq!(health.consecutive_failures, 2);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_success_preserves_body_then_enter_order() {
+        let (result, trace, health) =
+            composite_send_fixture("command", false, false, CompositeSendFault::None);
+        result.expect("both paste and Enter were acknowledged");
+        assert_eq!(
+            trace.requests,
+            vec![("paste", b"command".to_vec()), ("write", b"\r".to_vec())]
+        );
+        assert_eq!(trace.effects, trace.requests);
+        assert_eq!(health.consecutive_failures, 0);
     }
 
     fn isolated_cli_client() -> WeztermClient {
