@@ -66,13 +66,14 @@ const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
 /// half-megabyte image took more than two seconds to reach it on macOS.
 const GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT: Duration = Duration::from_millis(50);
 const GUARDIAN_RESTORE_SEQUENCE_WAIT_TOTAL: Duration = Duration::from_secs(20);
-/// A guardian out of replay snapshots refuses a restore's Open before
-/// admitting anything; other panes' replays hold them until their pages are
-/// acknowledged. A successor restoring 40 panes met this while earlier panes'
-/// readers held 32, and the refusal ended the whole mux, then the put-back
-/// mux the same way (ft-4wrv7 e2e). The restore waits for a snapshot instead,
-/// as the live reader does: doubling from the first wait to a second, for
-/// this long in all, within the restore budget.
+/// A guardian out of replay snapshots (or request bindings) refuses a
+/// restore's request before admitting anything; other panes' replays hold
+/// them until their pages are acknowledged. A successor restoring 40 panes met
+/// this while earlier panes' readers held 32, and the refusal ended the whole
+/// mux, then the put-back mux the same way (ft-udi9a). The restore repeats the
+/// exact request instead, as the live reader does: doubling from the first
+/// wait to a second, for this long in all per request, within the restore
+/// budget.
 const GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 const GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL: Duration = Duration::from_secs(20);
@@ -4000,6 +4001,43 @@ fn replay_page_with_exact_retry(
     ))
 }
 
+/// Repeat one restore exchange the guardian refused for want of replay
+/// snapshots or request bindings. The refusal admitted nothing, so the exact
+/// request runs again after a wait (see `GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT`).
+/// Reopening the snapshot instead would leave the half-read one holding its
+/// slot with a page no ack can release.
+fn restore_waiting_for_capacity<T>(
+    mut exchange: impl FnMut() -> Result<T, GuardianProxyError>,
+) -> Result<T, GuardianProxyError> {
+    let mut waited = Duration::ZERO;
+    let mut wait = GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT;
+    loop {
+        match exchange() {
+            Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::CapacityExhausted,
+            ))) if waited < GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL => {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_exact_retry_total",
+                    "operation" => "restore_capacity",
+                )
+                .increment(1);
+                std::thread::sleep(wait);
+                waited += wait;
+                wait = (wait * 2).min(Duration::from_secs(1));
+            }
+            result => {
+                if result.is_ok() && !waited.is_zero() {
+                    log::info!(
+                        "guardian restore waited {} ms for replay capacity",
+                        waited.as_millis()
+                    );
+                }
+                return result;
+            }
+        }
+    }
+}
+
 fn replay_ack_with_exact_retry(
     transport: &mut dyn GuardianReplayTransport,
     plan: &GuardianReplayAckPlan,
@@ -4253,7 +4291,10 @@ fn consume_one_guardian_replay_snapshot(
     let mut boundary = None;
 
     for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
-        let page = replay_page_with_exact_retry(transport, Uuid::new_v4(), request)?;
+        let request_id = Uuid::new_v4();
+        let page = restore_waiting_for_capacity(|| {
+            replay_page_with_exact_retry(&mut *transport, request_id, request)
+        })?;
         let page_identity = validate_replay_page_identity(&page, identity)?;
         let snapshot_id = page.header().snapshot_id();
         let snapshot_digest = page.header().snapshot_digest();
@@ -4312,7 +4353,9 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     base.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
 
                 if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
                     let restored = restore_inert_checkpoint(
@@ -4381,7 +4424,9 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     current.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
                 boundary = Some(current);
             }
             GuardianReplayPageBodyDelivery::Complete {
@@ -4428,7 +4473,9 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     terminal_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
                 // The output so far ends inside an escape sequence (an
                 // image's, most often), whose end is still on its way. The
                 // acknowledgement released the snapshot; one reopened once
@@ -4508,8 +4555,6 @@ fn consume_guardian_replay_for_restore(
     let mut expired = 0;
     let mut waited = Duration::ZERO;
     let mut wait = GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT;
-    let mut capacity_waited = Duration::ZERO;
-    let mut capacity_wait = GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT;
     loop {
         match consume_one_guardian_replay_snapshot(
             transport,
@@ -4541,29 +4586,11 @@ fn consume_guardian_replay_for_restore(
                 waited += wait;
                 wait = (wait * 2).min(Duration::from_secs(1));
             }
-            Err(GuardianProxyError::Client(GuardianClientError::Rejected(
-                GuardianRejectionCode::CapacityExhausted,
-            ))) if capacity_waited < GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL => {
-                metrics::counter!(
-                    "mux.guardian_proxy.replay_snapshot_reopen_total",
-                    "phase" => "restore_capacity",
-                )
-                .increment(1);
-                std::thread::sleep(capacity_wait);
-                capacity_waited += capacity_wait;
-                capacity_wait = (capacity_wait * 2).min(Duration::from_secs(1));
-            }
             result => {
                 if result.is_ok() && !waited.is_zero() {
                     log::info!(
                         "guardian restore waited {} ms for an escape sequence its replay ended inside",
                         waited.as_millis()
-                    );
-                }
-                if result.is_ok() && !capacity_waited.is_zero() {
-                    log::info!(
-                        "guardian restore waited {} ms for a replay snapshot",
-                        capacity_waited.as_millis()
                     );
                 }
                 return result;
@@ -12992,11 +13019,19 @@ mod tests {
         );
     }
 
-    /// Refuses the first `refusals` replay requests as a guardian out of
-    /// replay snapshots does, before admitting anything.
+    /// Refuses the first `refusals` replay requests and the first
+    /// `ack_refusals` acks as a guardian out of replay snapshots or request
+    /// bindings does, before admitting anything.
     struct CapacityRefusingReplayTransport {
         inner: FakeReplayTransport,
         refusals: usize,
+        ack_refusals: usize,
+    }
+
+    fn capacity_refused() -> GuardianProxyError {
+        GuardianProxyError::Client(GuardianClientError::Rejected(
+            GuardianRejectionCode::CapacityExhausted,
+        ))
     }
 
     impl GuardianReplayTransport for CapacityRefusingReplayTransport {
@@ -13007,9 +13042,7 @@ mod tests {
         ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
             if self.refusals > 0 {
                 self.refusals -= 1;
-                return Err(GuardianProxyError::Client(GuardianClientError::Rejected(
-                    GuardianRejectionCode::CapacityExhausted,
-                )));
+                return Err(capacity_refused());
             }
             self.inner.replay(request_id, request)
         }
@@ -13019,13 +13052,18 @@ mod tests {
             request_id: Uuid,
             ack: GuardianReplayAckV1,
         ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+            if self.ack_refusals > 0 {
+                self.ack_refusals -= 1;
+                return Err(capacity_refused());
+            }
             self.inner.replay_ack(request_id, ack)
         }
     }
 
     /// A successor restoring a fleet host's panes found the guardian's replay
     /// snapshots held by other panes' readers, and the refusal ended the whole
-    /// mux. Restore waits for a snapshot, within a bounded total.
+    /// mux. Restore repeats the refused request, within a bounded total,
+    /// without reopening the snapshot it was reading.
     #[test]
     fn restore_waits_for_a_replay_snapshot_the_guardian_is_out_of() {
         let (descriptor, checkpoint) = genesis_checkpoint_fixture();
@@ -13041,6 +13079,7 @@ mod tests {
                 state: Arc::clone(&state),
             },
             refusals: 3,
+            ack_refusals: 2,
         };
         let restored = consume_guardian_replay_for_restore(
             &mut transport,
@@ -13051,9 +13090,22 @@ mod tests {
             None,
         )
         .expect("restore once a replay snapshot frees up");
-        assert_eq!(transport.refusals, 0);
+        assert_eq!((transport.refusals, transport.ack_refusals), (0, 0));
         assert_eq!(restored.boundary.next_sequence, 2);
-        assert!(state.lock().pages.is_empty());
+        {
+            let state = state.lock();
+            assert!(state.pages.is_empty());
+            // One request per page and one released snapshot: nothing reopened.
+            assert_eq!(state.requests.len(), 3);
+            assert_eq!(
+                state
+                    .acks
+                    .iter()
+                    .filter(|(_, ack)| ack.release_if_complete())
+                    .count(),
+                1
+            );
+        }
 
         // A guardian that stays full still fails the restore, after the wait.
         let (descriptor, checkpoint) = genesis_checkpoint_fixture();
@@ -13071,6 +13123,7 @@ mod tests {
                     state: Arc::clone(&state),
                 },
                 refusals: usize::MAX,
+                ack_refusals: 0,
             },
             identity(),
             size(24, 80),
@@ -13085,6 +13138,7 @@ mod tests {
             )))
         ));
         assert!(started.elapsed() >= GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL);
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(state.lock().requests.is_empty());
     }
 
