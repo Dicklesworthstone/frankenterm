@@ -41,6 +41,21 @@ public struct TerminalNavigationMachine: Equatable, Sendable, Identifiable {
     }
 }
 
+/// An imported group's explicit order, independent of connection eligibility.
+/// Offline/manual machines remain members. A nil group means the full workspace.
+public struct TerminalNavigationGroup: Equatable, Sendable {
+    public let id: String
+    public let machineIDs: [String]
+    public init(id: String, machineIDs: [String]) throws {
+        guard !id.isEmpty, id.utf8.count <= 128, machineIDs.count <= 128,
+              Set(machineIDs).count == machineIDs.count,
+              machineIDs.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 }) else {
+            throw TerminalNavigationError.invalidInventory
+        }
+        self.id = id; self.machineIDs = machineIDs
+    }
+}
+
 public struct TerminalNavigationSelection: Equatable, Sendable {
     public let machineID: String
     public let paneID: TerminalNavigationPaneID?
@@ -81,6 +96,8 @@ public struct TerminalNavigationPlan: Equatable, Sendable {
     public let destination: TerminalNavigationSelection
     public let axis: TerminalNavigationAxis
     public let wraps: Bool
+    /// Published atomically with the new selection, never ahead of its handoff.
+    public let group: TerminalNavigationGroup?
 }
 
 /// One model per scene and active workspace/group. It has no transport, parser,
@@ -89,20 +106,27 @@ public struct TerminalNavigationPlan: Equatable, Sendable {
 public struct TerminalNavigation: Sendable {
     private let owner = UUID()
     private var topology: UInt64 = 1, focus: UInt64 = 1
-    public private(set) var machines: [TerminalNavigationMachine]
+    fileprivate var inventory: [TerminalNavigationMachine]
+    public private(set) var group: TerminalNavigationGroup?
+    /// The active ring only. The full inventory remains owned independently so
+    /// changing groups does not forget another machine's pane or viewport.
+    public var machines: [TerminalNavigationMachine] { machines(in: group) }
     public private(set) var selection: TerminalNavigationSelection?
     private var remembered: [String: TerminalNavigationPaneID] = [:]
     private var viewports: [TerminalNavigationPaneID: TerminalNavigationViewport] = [:]
 
-    public init(machines: [TerminalNavigationMachine], initialMachineID: String? = nil) throws {
+    public init(machines: [TerminalNavigationMachine], initialMachineID: String? = nil,
+                group: TerminalNavigationGroup? = nil) throws {
         try Self.validate(machines)
-        self.machines = machines
+        try Self.validate(group, in: machines)
+        inventory = machines; self.group = group
+        let ring = self.machines
         if let initialMachineID {
-            guard let machine = machines.first(where: { $0.id == initialMachineID }) else {
+            guard let machine = ring.first(where: { $0.id == initialMachineID }) else {
                 throw TerminalNavigationError.invalidInventory
             }
             selection = .init(machineID: machine.id, paneID: machine.panes.first?.id)
-        } else if let first = machines.first {
+        } else if let first = ring.first {
             selection = .init(machineID: first.id, paneID: first.panes.first?.id)
         }
         if let selection, let pane = selection.paneID { remembered[selection.machineID] = pane }
@@ -120,6 +144,17 @@ public struct TerminalNavigation: Sendable {
             }
         }
     }
+    private static func validate(_ group: TerminalNavigationGroup?, in inventory: [TerminalNavigationMachine]) throws {
+        guard let group else { return }
+        guard Set(group.machineIDs).isSubset(of: Set(inventory.map(\.id))) else {
+            throw TerminalNavigationError.invalidInventory
+        }
+    }
+    private func machines(in group: TerminalNavigationGroup?) -> [TerminalNavigationMachine] {
+        guard let group else { return inventory }
+        let known = Dictionary(uniqueKeysWithValues: inventory.map { ($0.id, $0) })
+        return group.machineIDs.compactMap { known[$0] }
+    }
 
     /// Returns true when the old selected source disappeared. The caller must
     /// seal that source's input immediately. No replacement source is selected:
@@ -127,7 +162,7 @@ public struct TerminalNavigation: Sendable {
     @discardableResult
     public mutating func replaceInventory(_ incoming: [TerminalNavigationMachine]) throws -> Bool {
         try Self.validate(incoming)
-        guard incoming != machines else { return false }
+        guard incoming != inventory else { return false }
         guard topology < UInt64.max, focus < UInt64.max else { throw TerminalNavigationError.exhausted }
         let old = selection
         let map = Dictionary(uniqueKeysWithValues: incoming.map { ($0.id, $0) })
@@ -141,7 +176,7 @@ public struct TerminalNavigation: Sendable {
         }
         remembered = remembered.filter { machine, pane in map[machine]?.panes.contains(where: { $0.id == pane }) == true }
         viewports = viewports.filter { panes.contains($0.key) }
-        machines = incoming; topology += 1
+        inventory = incoming; topology += 1
         if old != selection { focus += 1 }
         return old != selection
     }
@@ -163,9 +198,26 @@ public struct TerminalNavigation: Sendable {
                       wraps: Bool = false) -> TerminalNavigationPlan? {
         guard destination != selection else { return nil }
         return .init(owner: owner, topology: topology, focus: focus, source: selection,
-                     destination: destination, axis: axis, wraps: wraps)
+                     destination: destination, axis: axis, wraps: wraps, group: group)
     }
 
+    /// A group switch is a real focus transaction, even when the same machine
+    /// belongs to both groups. A failed/cancelled handoff changes neither ring
+    /// nor selection; callers must not publish group UI or connection intent early.
+    public func plan(group: TerminalNavigationGroup?, selecting machineID: String) throws -> TerminalNavigationPlan? {
+        try Self.validate(group, in: inventory)
+        guard let machine = machines(in: group).first(where: { $0.id == machineID }) else {
+            throw TerminalNavigationError.unavailable
+        }
+        // Keep a deliberately empty selected pane empty in an overlapping group.
+        // Group membership alone must not replace a disappeared source.
+        let target: TerminalNavigationSelection
+        if let selection, selection.machineID == machineID { target = selection }
+        else { target = destination(machine) }
+        guard self.group != group || target != selection else { return nil }
+        return .init(owner: owner, topology: topology, focus: focus, source: selection,
+                     destination: target, axis: .machine, wraps: false, group: group)
+    }
     public func plan(machineID: String) throws -> TerminalNavigationPlan? {
         guard let machine = machines.first(where: { $0.id == machineID }) else { throw TerminalNavigationError.unavailable }
         return plan(destination(machine), axis: .machine)
@@ -182,10 +234,11 @@ public struct TerminalNavigation: Sendable {
     public func activationPlan() -> TerminalNavigationPlan? {
         guard let selection else { return nil }
         return .init(owner: owner, topology: topology, focus: focus, source: selection,
-                     destination: selection, axis: .pane, wraps: false)
+                     destination: selection, axis: .pane, wraps: false, group: group)
     }
     public func plan(axis: TerminalNavigationAxis, direction: TerminalNavigationDirection,
                      wrap: Bool = true) throws -> TerminalNavigationPlan? {
+        let machines = self.machines
         guard let selection, let machineIndex = machines.firstIndex(where: { $0.id == selection.machineID }) else {
             return nil
         }
@@ -214,7 +267,7 @@ public struct TerminalNavigation: Sendable {
     public func validate(_ plan: TerminalNavigationPlan) throws {
         guard plan.owner == owner, plan.topology == topology, plan.focus == focus,
               plan.source == selection,
-              let machine = machines.first(where: { $0.id == plan.destination.machineID }),
+              let machine = machines(in: plan.group).first(where: { $0.id == plan.destination.machineID }),
               plan.destination.paneID == nil || machine.panes.contains(where: { $0.id == plan.destination.paneID }) else {
             throw TerminalNavigationError.stale
         }
@@ -222,7 +275,8 @@ public struct TerminalNavigation: Sendable {
     @discardableResult
     public mutating func commit(_ plan: TerminalNavigationPlan) throws -> TerminalNavigationSelection {
         try validate(plan)
-        guard focus < UInt64.max else { throw TerminalNavigationError.exhausted }
+        guard focus < UInt64.max, group == plan.group || topology < UInt64.max else { throw TerminalNavigationError.exhausted }
+        if group != plan.group { group = plan.group; topology += 1 }
         selection = plan.destination; focus += 1
         if let pane = plan.destination.paneID { remembered[plan.destination.machineID] = pane }
         return plan.destination
@@ -381,7 +435,9 @@ public final class TerminalNavigationCoordinator {
         // Validate atomically before changing any live input or pending task.
         var replacement = navigation
         let disappeared = try replacement.replaceInventory(machines)
-        let topologyChanged = replacement.machines != navigation.machines
+        // An in-flight group change can target a machine outside the old ring.
+        // Invalidation must compare the complete inventories, not just that ring.
+        let topologyChanged = replacement.inventory != navigation.inventory
         navigation = replacement
         if disappeared || topologyChanged && operation != nil {
             operation?.task.cancel(); focusOwner.seal(); startCleanup()
