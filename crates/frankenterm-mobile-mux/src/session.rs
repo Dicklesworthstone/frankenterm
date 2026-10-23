@@ -3,7 +3,7 @@
 //! returns, and reacts to [`Event`]s.
 
 use crate::frame::{self, Frame, FrameReader};
-use crate::input::{InputSplitter, Piece};
+use crate::input::{PaneInput, Piece};
 use crate::mirror::PaneMirror;
 use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
@@ -175,9 +175,9 @@ pub struct Session {
     listing: bool,
     list_again: bool,
     next_lookup: u64,
-    input: InputSplitter,
-    /// The pane an unfinished paste is for.
-    paste_pane: Option<usize>,
+    /// Incomplete paste state belongs to its original observed registration,
+    /// never the most recently written or currently visible pane.
+    input: PaneInput,
 }
 
 impl Session {
@@ -286,15 +286,15 @@ impl Session {
         if !self.is_ready() || data.is_empty() {
             return;
         }
-        // Input for another pane means the unfinished paste's writer
-        // stopped: what arrived of it goes to its pane as it is.
-        if self.paste_pane.is_some_and(|pane| pane != pane_id) {
-            if let (Some(pane), Some(text)) = (self.paste_pane.take(), self.input.take_pending()) {
-                self.paste(pane, &text);
+        let pieces = match self.input.split(pane_id, data) {
+            Ok(pieces) => pieces,
+            Err(reason) => {
+                // Resource failure is explicit. Never flush an incomplete
+                // command, emit a prefix from this call, or retry the bytes.
+                self.fail(reason.to_owned());
+                return;
             }
-        }
-        let pieces = self.input.split(data);
-        self.paste_pane = self.input.in_paste().then_some(pane_id);
+        };
         for piece in pieces {
             match piece {
                 Piece::Bytes(data) => {
@@ -312,7 +312,7 @@ impl Session {
                     };
                     self.send(ident::SEND_KEY_DOWN, &press, Request::Action);
                 }
-                Piece::Paste(text) => self.paste(pane_id, &text),
+                Piece::Paste(text) => self.send_paste(pane_id, &text),
             }
         }
     }
@@ -320,6 +320,19 @@ impl Session {
     /// Pasted text; the server brackets it when the pane's program asked.
     pub fn paste(&mut self, pane_id: usize, text: &str) {
         if !self.is_ready() || text.is_empty() {
+            return;
+        }
+        if self.input.in_paste(pane_id) {
+            self.fail("a direct paste cannot overtake unfinished input for its pane".to_owned());
+            return;
+        }
+        self.send_paste(pane_id, text);
+    }
+
+    /// A splitter-produced piece is already ordered inside its destination's
+    /// paste. The public typed-paste entry point must not jump ahead of it.
+    fn send_paste(&mut self, pane_id: usize, text: &str) {
+        if text.is_empty() {
             return;
         }
         match self.dialect {
@@ -654,6 +667,7 @@ impl Session {
     fn fail(&mut self, reason: String) {
         if !self.failed {
             self.failed = true;
+            self.input.clear();
             self.events.push_back(Event::Failed { reason });
         }
     }
@@ -661,6 +675,8 @@ impl Session {
     /// A new pane list, asked for with `serial`.
     fn listed(&mut self, list: &PaneList, serial: u64) {
         self.panes = pane_infos(list);
+        self.input
+            .retain(|pane_id| self.panes.iter().any(|pane| pane.pane_id == pane_id));
         // A listed size is the desktop's unless the phone's may still be in
         // effect: after a resize, until a list asked for after the restore.
         self.sizing
@@ -918,6 +934,7 @@ impl Session {
     }
 
     fn pane_gone(&mut self, pane_id: usize) {
+        self.input.remove(pane_id);
         self.mirrors.remove(&pane_id);
         self.grabs.remove(&pane_id);
         let phone_sized = self
@@ -1056,4 +1073,150 @@ fn pane_infos(list: &PaneList) -> Vec<PaneInfo> {
         }));
     }
     infos
+}
+
+#[cfg(test)]
+mod paste_routing_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct PasteBody {
+        pane_id: usize,
+        data: String,
+    }
+
+    #[derive(Deserialize)]
+    struct BytesBody {
+        pane_id: usize,
+        data: Vec<u8>,
+    }
+
+    fn ready(dialect: Dialect) -> Session {
+        Session {
+            ready: true,
+            dialect,
+            ..Session::default()
+        }
+    }
+
+    /// Decode the real outbound protocol bytes, not the splitter's pieces.
+    /// The paste prefix is shared by both dialects; Current's serial follows it.
+    fn writes(session: &mut Session) -> Vec<(u64, usize, Vec<u8>)> {
+        let mut reader = FrameReader::default();
+        reader.push(&session.take_outgoing());
+        let mut result = Vec::new();
+        while let Some(frame) = reader.next_frame().expect("valid encoded frame") {
+            match frame.ident {
+                ident::SEND_PASTE => {
+                    let body: PasteBody = wire::decode(&frame.body).expect("valid paste");
+                    result.push((frame.ident, body.pane_id, body.data.into_bytes()));
+                }
+                ident::WRITE_TO_PANE => {
+                    let body: BytesBody = wire::decode(&frame.body).expect("valid input");
+                    result.push((frame.ident, body.pane_id, body.data));
+                }
+                other => panic!("unexpected PDU {other}"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn interleaved_pastes_remain_whole_and_bound_in_both_dialects() {
+        for dialect in [Dialect::Legacy, Dialect::Current] {
+            let mut session = ready(dialect);
+            session.write(10, b"\x1b[200~first ");
+            assert!(writes(&mut session).is_empty());
+            session.write(20, b"x");
+            assert_eq!(writes(&mut session), [(ident::WRITE_TO_PANE, 20, b"x".to_vec())]);
+            session.write(20, b"\x1b[200~second ");
+            assert!(writes(&mut session).is_empty());
+            session.write(10, b"pane\x1b[201~");
+            session.write(20, b"pane\x1b[201~");
+            assert_eq!(writes(&mut session), [
+                (ident::SEND_PASTE, 10, b"first pane".to_vec()),
+                (ident::SEND_PASTE, 20, b"second pane".to_vec()),
+            ]);
+        }
+    }
+
+    #[test]
+    fn hiding_a_pane_does_not_terminate_its_paste() {
+        let mut session = ready(Dialect::Legacy);
+        session.write(1, b"\x1b[200~before ");
+        session.hide(1);
+        session.write(2, b"other");
+        assert_eq!(writes(&mut session), [(ident::WRITE_TO_PANE, 2, b"other".to_vec())]);
+        session.write(1, b"after\x1b[201~");
+        assert_eq!(writes(&mut session), [(ident::SEND_PASTE, 1, b"before after".to_vec())]);
+    }
+
+    #[test]
+    fn removed_pane_cannot_carry_its_paste_into_an_observed_successor() {
+        let mut session = ready(Dialect::Current);
+        session.write(1, b"\x1b[200~discard me");
+        session.write(2, b"\x1b[200~keep me");
+        session.pane_gone(1);
+        assert!(writes(&mut session).is_empty());
+        // The actual transport independently validates the new registration.
+        // Its fresh input must not continue the removed registration's paste.
+        session.write(1, b"fresh");
+        session.write(2, b"\x1b[201~");
+        assert_eq!(writes(&mut session), [
+            (ident::WRITE_TO_PANE, 1, b"fresh".to_vec()),
+            (ident::SEND_PASTE, 2, b"keep me".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn inventory_removal_discards_a_paste_without_sending_it() {
+        let mut session = ready(Dialect::Legacy);
+        session.write(1, b"\x1b[200~old registration");
+        session.listed(&PaneList {
+            tabs: Vec::new(),
+            tab_titles: Vec::new(),
+            window_titles: HashMap::new(),
+        }, 1);
+        assert!(writes(&mut session).is_empty());
+        session.write(1, b"new registration");
+        assert_eq!(writes(&mut session), [
+            (ident::WRITE_TO_PANE, 1, b"new registration".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn close_and_capacity_failure_never_flush_pending_text() {
+        let mut session = ready(Dialect::Legacy);
+        session.write(1, b"\x1b[200~not a command yet");
+        session.closed();
+        assert!(writes(&mut session).is_empty());
+        assert!(!session.is_ready());
+        session.write(1, b"\x1b[201~");
+        assert!(writes(&mut session).is_empty());
+
+        let mut session = ready(Dialect::Current);
+        for pane in 0..17 {
+            session.write(pane, b"\x1b[200~unfinished");
+        }
+        assert!(!session.is_ready());
+        assert!(writes(&mut session).is_empty());
+        assert!(matches!(session.next_event(), Some(Event::Failed { .. })));
+        assert!(session.next_event().is_none());
+    }
+
+    #[test]
+    fn direct_paste_is_independent_but_cannot_overtake_its_own_partial_input() {
+        for dialect in [Dialect::Legacy, Dialect::Current] {
+            let mut session = ready(dialect);
+            session.write(1, b"\x1b[200~first");
+            session.paste(2, "independent");
+            assert_eq!(writes(&mut session), [
+                (ident::SEND_PASTE, 2, b"independent".to_vec()),
+            ]);
+            session.paste(1, "must not overtake");
+            assert!(!session.is_ready());
+            assert!(writes(&mut session).is_empty());
+            assert!(matches!(session.next_event(), Some(Event::Failed { .. })));
+        }
+    }
 }

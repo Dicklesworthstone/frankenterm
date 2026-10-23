@@ -29,7 +29,7 @@ pub enum Piece {
 /// One destination's input stream. An Escape key is deliberately not held for
 /// lookahead: decoding arbitrary fragments of key/opening-marker sequences
 /// would require an explicit semantic operation boundary from the caller.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InputSplitter {
     paste: Option<Vec<u8>>,
 }
@@ -90,17 +90,18 @@ impl InputSplitter {
         self.paste.is_some()
     }
 
-    /// Explicitly ends this splitter's pending paste. Normal pane navigation
-    /// must not call this: the registration-scoped owner retains that state.
-    pub fn take_pending(&mut self) -> Option<String> {
-        self.paste
-            .take()
-            .filter(|bytes| !bytes.is_empty())
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    }
-
     fn retained_capacity(&self) -> usize {
         self.paste.as_ref().map_or(0, Vec::capacity)
+    }
+}
+
+impl std::fmt::Debug for InputSplitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InputSplitter")
+            .field("in_paste", &self.in_paste())
+            .field("retained_capacity", &self.retained_capacity())
+            .finish()
     }
 }
 
@@ -108,13 +109,27 @@ impl InputSplitter {
 /// is not an end-of-paste marker. Removing a pane or closing the connection
 /// discards its unfinished local fragment; neither action sends more commands.
 /// This tracks observed registrations, not a server-supplied incarnation.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PaneInput {
     pending: HashMap<usize, InputSplitter>,
     retained_capacity: usize,
 }
 
+impl std::fmt::Debug for PaneInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaneInput")
+            .field("pending_panes", &self.pending.len())
+            .field("retained_capacity", &self.retained_capacity)
+            .finish()
+    }
+}
+
 impl PaneInput {
+    pub fn in_paste(&self, pane: usize) -> bool {
+        self.pending.contains_key(&pane)
+    }
+
     pub fn split(&mut self, pane: usize, data: &[u8]) -> Result<Vec<Piece>, &'static str> {
         let mut input = self.pending.remove(&pane).unwrap_or_default();
         self.retained_capacity -= input.retained_capacity();
@@ -479,5 +494,18 @@ mod tests {
         assert!(input.retained_capacity > 0);
         input.remove(3);
         assert_eq!(input.retained_capacity, 0);
+    }
+
+    #[test]
+    fn debug_output_never_contains_pending_input() {
+        let secret = b"\x1b[200~private-command-123";
+        let mut splitter = InputSplitter::default();
+        splitter.split(secret);
+        let mut panes = PaneInput::default();
+        panes.split(1, secret).unwrap();
+        for text in [format!("{splitter:?}"), format!("{panes:?}")] {
+            assert!(!text.contains("private-command"));
+            assert!(text.contains("retained_capacity"));
+        }
     }
 }
