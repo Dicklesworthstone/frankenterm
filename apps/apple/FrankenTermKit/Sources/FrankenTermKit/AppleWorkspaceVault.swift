@@ -32,48 +32,83 @@ public struct WorkspaceVaultError: LocalizedError, Equatable, Sendable {
 /// No wildcard queries, access groups, synchronizable items, or keychain exports.
 /// SecItem calls run on WorkspaceStore's actor, never a SwiftUI/MainActor callback.
 ///
-/// Each account is two items: the private key, and its public details
+/// Each account has a private key and its public details
 /// (fingerprint and comment). Both stay on this device only (never synced or
 /// carried by a backup to another device) and are readable only while it is
 /// unlocked and has a passcode; removing the passcode deletes them. Signing
 /// asks for no Face ID: the operator's call, so a workspace's machines all
 /// connect without a prompt each. A key stored earlier behind user presence
-/// is asked for once more and then stored this way (storeWithoutPresence).
+/// is asked for once more and then copied to the current private-item generation
+/// before its legacy item is retired (storeWithoutPresence).
 public struct AppleWorkspaceVault: WorkspaceCredentialVault {
-    private static let keyService = "org.frankenterm.mobile.workspace-keys.v1"
     private static let detailsService = "org.frankenterm.mobile.workspace-key-details.v1"
+    // Store mutations and the signing worker share this lock. It is never held
+    // across an interactive read: a prompt may outlive removal of its account.
+    private static let mutationLock = NSLock()
     public init() {}
 
-    fileprivate func query(account: String, service: String = keyService) throws -> [String: Any] {
+    fileprivate func query(account: String, service: String = WorkspacePrivateKeyGeneration.current.service,
+                           context: LAContext? = nil) throws -> [String: Any] {
         let parts = account.split(separator: ":", omittingEmptySubsequences: false)
         guard parts.count == 3, parts[0] == "ft-import", let transaction = UUID(uuidString: String(parts[1])),
               parts[1] == Substring(transaction.uuidString), let index = Int(parts[2]), (0..<256).contains(index),
               parts[2] == Substring(String(index)) else { throw FTError.malformed("vault.account") }
-        return [kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecAttrAccount as String: account,
-                kSecAttrSynchronizable as String: false]
+        var result: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service,
+                                    kSecAttrAccount as String: account,
+                                    kSecAttrSynchronizable as String: false]
+        if let context { result[kSecUseAuthenticationContext as String] = context }
+        return result
+    }
+    private static func withMutation<T>(_ body: (LAContext) throws -> T) rethrows -> T {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        let context = LAContext(); context.interactionNotAllowed = true
+        defer { context.invalidate() }
+        return try body(context)
+    }
+    private func contains(account: String, service: String, context: LAContext) throws -> Bool {
+        var request = try query(account: account, service: service, context: context)
+        request[kSecReturnAttributes as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return false }
+        try WorkspaceVaultError.check(status, "locate")
+        guard result is [String: Any] else { throw FTError.storage }
+        return true
     }
     public func create(account: String, privateContainer: Data, fingerprint: String) throws {
         guard !privateContainer.isEmpty, privateContainer.count <= FTLimit.key,
               fingerprint.utf8.count == 50, fingerprint.hasPrefix("SHA256:") else { throw FTError.limit("vault.item") }
         let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: privateContainer)
         guard identity.fingerprint == fingerprint else { throw SSHAuthenticationError.identityMismatch }
-        var item = try query(account: account)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
-        item[kSecValueData as String] = privateContainer
-        // Add only. A duplicate must never overwrite an identity.
-        try WorkspaceVaultError.check(SecItemAdd(item as CFDictionary, nil), "store")
-        // The key first: a missing details item reads as absent, which only an
-        // uncommitted transaction's cleanup acts on.
-        let metadata = WorkspaceCredentialMetadata(identity: identity)
-        var details = try query(account: account, service: Self.detailsService)
-        details[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
-        details[kSecAttrGeneric as String] = metadata.fingerprintBytes
-        if let comment = metadata.publicComment { details[kSecAttrComment as String] = comment }
-        details[kSecValueData as String] = Data()
-        do { try WorkspaceVaultError.check(SecItemAdd(details as CFDictionary, nil), "store the details of") }
-        catch { _ = SecItemDelete(try query(account: account) as CFDictionary); throw error }
+        try Self.withMutation { context in
+            // One logical account cannot acquire a new identity by choosing a
+            // different generation or by replacing an orphaned details item.
+            for service in WorkspacePrivateKeyGeneration.allCases.map(\.service) + [Self.detailsService] {
+                if try contains(account: account, service: service, context: context) {
+                    try WorkspaceVaultError.check(errSecDuplicateItem, "store")
+                }
+            }
+            var item = try query(account: account, context: context)
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+            item[kSecValueData as String] = privateContainer
+            // Add only. A duplicate must never overwrite an identity.
+            try WorkspaceVaultError.check(SecItemAdd(item as CFDictionary, nil), "store")
+            // The key first: a missing details item reads as absent, which only
+            // an uncommitted transaction's cleanup acts on.
+            let metadata = WorkspaceCredentialMetadata(identity: identity)
+            var details = try query(account: account, service: Self.detailsService, context: context)
+            details[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+            details[kSecAttrGeneric as String] = metadata.fingerprintBytes
+            if let comment = metadata.publicComment { details[kSecAttrComment as String] = comment }
+            details[kSecValueData as String] = Data()
+            do { try WorkspaceVaultError.check(SecItemAdd(details as CFDictionary, nil), "store the details of") }
+            catch {
+                _ = SecItemDelete(try query(account: account, context: context) as CFDictionary)
+                throw error
+            }
+        }
     }
     public func fingerprint(account: String) throws -> String? {
         try metadata(account: account)?.fingerprint
@@ -87,25 +122,32 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
     /// update, which touches only the details item: the private key item's
     /// value, accessibility and ACL are never update fields.
     public func enrichPublicIdentity(account: String, identity: SSHPublicIdentity) throws -> Bool {
-        guard let existing = try metadata(account: account), existing.fingerprint == identity.fingerprint else {
-            throw SSHAuthenticationError.identityMismatch
-        }
-        if let known = existing.identity {
-            guard known == identity else { throw SSHAuthenticationError.identityMismatch }
+        try Self.withMutation { context in
+            guard let existing = try metadata(account: account, context: context), existing.fingerprint == identity.fingerprint else {
+                throw SSHAuthenticationError.identityMismatch
+            }
+            if let known = existing.identity {
+                guard known == identity else { throw SSHAuthenticationError.identityMismatch }
+                return true
+            }
+            guard let comment = WorkspaceCredentialMetadata(identity: identity).publicComment else { throw FTError.storage }
+            var request = try query(account: account, service: Self.detailsService, context: context)
+            request[kSecAttrGeneric as String] = existing.fingerprintBytes
+            let changes = [kSecAttrComment as String: comment]
+            try WorkspaceVaultError.check(SecItemUpdate(request as CFDictionary, changes as CFDictionary), "update")
+            guard try metadata(account: account, context: context)?.identity == identity else { throw FTError.storage }
             return true
         }
-        guard let comment = WorkspaceCredentialMetadata(identity: identity).publicComment else { throw FTError.storage }
-        var request = try query(account: account, service: Self.detailsService)
-        request[kSecAttrGeneric as String] = existing.fingerprintBytes
-        let changes = [kSecAttrComment as String: comment]
-        try WorkspaceVaultError.check(SecItemUpdate(request as CFDictionary, changes as CFDictionary), "update")
-        guard try publicIdentity(account: account) == identity else { throw FTError.storage }
-        return true
     }
 
     /// The public details, read without touching the private key item.
     private func metadata(account: String) throws -> WorkspaceCredentialMetadata? {
-        var request = try query(account: account, service: Self.detailsService)
+        let context = LAContext(); context.interactionNotAllowed = true
+        defer { context.invalidate() }
+        return try metadata(account: account, context: context)
+    }
+    private func metadata(account: String, context: LAContext) throws -> WorkspaceCredentialMetadata? {
+        var request = try query(account: account, service: Self.detailsService, context: context)
         request[kSecReturnAttributes as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -126,31 +168,86 @@ public struct AppleWorkspaceVault: WorkspaceCredentialVault {
         } else { comment = nil }
         return try WorkspaceCredentialMetadata(fingerprintBytes: fingerprint, publicComment: comment)
     }
-    /// Replaces a key item stored behind user presence with the same key
-    /// stored the current way, once its owner has unlocked it. If the new
-    /// item cannot be added, the key goes back behind user presence.
-    fileprivate func storeWithoutPresence(account: String, privateContainer: Data) throws {
-        let item = try query(account: account)
-        try WorkspaceVaultError.check(SecItemDelete(item as CFDictionary), "replace")
-        var replacement = item
-        replacement[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
-        replacement[kSecValueData as String] = privateContainer
-        let status = SecItemAdd(replacement as CFDictionary, nil)
-        if status != errSecSuccess,
-           let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, .userPresence, nil) {
-            var original = item
-            original[kSecAttrAccessControl as String] = access
-            original[kSecValueData as String] = privateContainer
-            _ = SecItemAdd(original as CFDictionary, nil)
-        }
-        try WorkspaceVaultError.check(status, "store")
+    /// Current-generation data and accessibility are returned by one exact
+    /// query. A different accessibility class or unreadable item cannot cause a
+    /// fallback to legacy storage. Legacy reads may use the reviewed prompt.
+    fileprivate func readPrivateContainer(account: String, generation: WorkspacePrivateKeyGeneration,
+                                           context: LAContext) throws -> (status: OSStatus, container: Data?) {
+        var request = try query(account: account, service: generation.service, context: context)
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        request[kSecReturnData as String] = true
+        if generation == .current { request[kSecReturnAttributes as String] = true }
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        guard status == errSecSuccess else { return (status, nil) }
+        let container: Data?
+        if generation == .current {
+            guard let attributes = result as? [String: Any],
+                  attributes[kSecAttrAccessible as String] as? String == kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly as String else {
+                throw FTError.storage
+            }
+            container = attributes[kSecValueData as String] as? Data
+        } else { container = result as? Data }
+        guard let container, !container.isEmpty, container.count <= FTLimit.key else { throw FTError.storage }
+        return (status, container)
     }
 
-    /// Deleting never prompts; the key goes before its details.
+    /// Publish the independently verified copy before touching the accepted
+    /// legacy key. Errors preserve the old item; an interruption after copy
+    /// publication is resolved by deterministic current-generation reads.
+    fileprivate func storeWithoutPresence(account: String, privateContainer: Data,
+                                           identity: SSHPublicIdentity) throws {
+        guard try SSHUserAuthenticationSigner.publicIdentity(privateContainer: privateContainer) == identity else {
+            throw SSHAuthenticationError.identityMismatch
+        }
+        try Self.withMutation { context in
+            // The signer read this identity before an interactive prompt. Check
+            // it again under the mutation lock so removal or replacement during
+            // that prompt cannot resurrect an account from an unlocked buffer.
+            guard try metadata(account: account, context: context)?.identity == identity else {
+                throw SSHAuthenticationError.identityMismatch
+            }
+            try WorkspacePrivateKeyMigration.migrate(privateContainer, maximumBytes: FTLimit.key,
+                storage: MigrationStorage(vault: self, account: account, context: context))
+        }
+    }
+
+    private struct MigrationStorage: WorkspacePrivateKeyMigrationStorage {
+        let vault: AppleWorkspaceVault
+        let account: String
+        let context: LAContext
+
+        func legacyExists() throws -> Bool {
+            try vault.contains(account: account, service: WorkspacePrivateKeyGeneration.legacy.service, context: context)
+        }
+        func publishCurrentIfAbsent(_ container: Data) throws {
+            var item = try vault.query(account: account, context: context)
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+            item[kSecValueData as String] = container
+            let status = SecItemAdd(item as CFDictionary, nil)
+            if status != errSecDuplicateItem { try WorkspaceVaultError.check(status, "store") }
+        }
+        func readCurrent() throws -> Data? {
+            let (status, container) = try vault.readPrivateContainer(account: account, generation: .current, context: context)
+            if status == errSecItemNotFound { return nil }
+            try WorkspaceVaultError.check(status, "verify")
+            return container
+        }
+        func retireLegacy() throws {
+            let request = try vault.query(account: account, service: WorkspacePrivateKeyGeneration.legacy.service, context: context)
+            let status = SecItemDelete(request as CFDictionary)
+            if status != errSecItemNotFound { try WorkspaceVaultError.check(status, "retire the legacy copy of") }
+        }
+    }
+
+    /// Deleting never prompts. Both private generations go before their details;
+    /// migration cannot race this removal and republish an unreferenced key.
     public func remove(account: String) throws {
-        for service in [Self.keyService, Self.detailsService] {
-            let status = SecItemDelete(try query(account: account, service: service) as CFDictionary)
-            if status != errSecItemNotFound { try WorkspaceVaultError.check(status, "remove") }
+        try Self.withMutation { context in
+            for service in WorkspacePrivateKeyGeneration.allCases.map(\.service) + [Self.detailsService] {
+                let status = SecItemDelete(try query(account: account, service: service, context: context) as CFDictionary)
+                if status != errSecItemNotFound { try WorkspaceVaultError.check(status, "remove") }
+            }
         }
     }
 }
@@ -285,25 +382,35 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         }
                         guard case .signature(let challenge) = operation else { return identity.blob }
                         guard identity.blob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
-                        func read(_ context: LAContext) throws -> (OSStatus, CFTypeRef?) {
-                            var query = try AppleWorkspaceVault().query(account: authorization.account)
-                            query[kSecMatchLimit as String] = kSecMatchLimitOne
-                            query[kSecReturnData as String] = true
-                            query[kSecUseAuthenticationContext as String] = context
-                            var item: CFTypeRef?
-                            let status = SecItemCopyMatching(query as CFDictionary, &item)
-                            try Self.worker.check(requestID)
-                            return (status, item)
+                        var selectedGeneration: WorkspacePrivateKeyGeneration?
+                        func read(_ context: LAContext) throws -> (status: OSStatus, container: Data?) {
+                            func copy(_ generation: WorkspacePrivateKeyGeneration) throws -> (status: OSStatus, container: Data?) {
+                                let result = try AppleWorkspaceVault().readPrivateContainer(account: authorization.account,
+                                    generation: generation, context: context)
+                                try Self.worker.check(requestID)
+                                return result
+                            }
+                            // Once a prompt starts, it remains bound to the
+                            // same generation. Removal during the prompt cannot
+                            // redirect its approval to a replacement item.
+                            if let selectedGeneration { return try copy(selectedGeneration) }
+                            let selected = try WorkspacePrivateKeyGeneration.select { generation in
+                                let result = try copy(generation)
+                                return result.status == errSecItemNotFound ? nil : result
+                            }
+                            selectedGeneration = selected?.generation
+                            return selected?.value ?? (errSecItemNotFound, nil)
                         }
                         // Keys are readable while the device is unlocked, with
                         // no prompt (see AppleWorkspaceVault).
                         let quiet = LAContext(); quiet.interactionNotAllowed = true
+                        defer { quiet.invalidate() }
                         var (status, item) = try read(quiet)
-                        quiet.invalidate()
                         // A key stored earlier behind user presence: a standing
                         // approval, or one Face ID, then it is stored the
                         // current way and never asks again.
-                        let protected = status == errSecInteractionNotAllowed || status == errSecAuthFailed
+                        let protected = selectedGeneration == .legacy
+                            && (status == errSecInteractionNotAllowed || status == errSecAuthFailed)
                         if protected, let approved = Self.worker.approvedContext() {
                             (status, item) = try read(approved)
                             if status != errSecSuccess { Self.worker.endApproval() }
@@ -318,7 +425,7 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                             }
                         }
                         try WorkspaceVaultError.check(status, "use")
-                        guard var container = item as? Data, !container.isEmpty, container.count <= FTLimit.key else {
+                        guard var container = item, !container.isEmpty, container.count <= FTLimit.key else {
                             throw FTError.storage
                         }
                         // Foundation and Security may retain other copies. This
@@ -329,9 +436,12 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                         }
                         let value = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: container)
                         try Self.worker.check(requestID)
-                        if protected {
+                        if selectedGeneration == .legacy {
+                            // Best-effort migration never deletes the accepted
+                            // copy before a verified replacement exists. A
+                            // failed migration does not invalidate this signature.
                             try? AppleWorkspaceVault().storeWithoutPresence(account: authorization.account,
-                                                                            privateContainer: container)
+                                privateContainer: container, identity: identity)
                         }
                         return value
                     }
