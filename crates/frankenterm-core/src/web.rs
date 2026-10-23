@@ -34,6 +34,7 @@ mod ui_assets;
 mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;
+pub(crate) use middleware::BodySizeGuard;
 pub use server::{run_web_server, start_web_server};
 pub use server::{run_web_server_with_cx, start_web_server_with_cx};
 pub use sse::{

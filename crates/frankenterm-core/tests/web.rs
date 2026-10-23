@@ -31,8 +31,8 @@ mod web_tests {
     use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
     #[cfg(feature = "asupersync-runtime")]
     use frankenterm_core::web_framework::{
-        FrameworkApp, FrameworkResponse, FrameworkResponseBody, FrameworkStartupHookError,
-        FrameworkWebRuntime,
+        FrameworkApp, FrameworkAppConfig, FrameworkResponse, FrameworkResponseBody,
+        FrameworkStartupHookError, FrameworkWebRuntime,
     };
 
     fn run_async_test<F>(future: F)
@@ -440,35 +440,145 @@ mod web_tests {
         });
     }
 
-    /// A chunked body carries no Content-Length, so only the parser's own
-    /// bound can refuse it. That bound follows the advertised body cap
-    /// (64 KiB + header allowance), not the framework's 1 MiB default.
+    /// Build real chunk framing with many chunks, so the body cap is tested
+    /// against the aggregate decoded payload rather than a single chunk.
+    fn chunked_health_request(total: usize, connection: &str) -> Vec<u8> {
+        let mut request = format!(
+            "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+             Transfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
+        )
+        .into_bytes();
+        let chunk = [b'x'; 257];
+        let mut sent = 0;
+        while sent < total {
+            let len = chunk.len().min(total - sent);
+            request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            request.extend_from_slice(&chunk[..len]);
+            request.extend_from_slice(b"\r\n");
+            sent += len;
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+        request
+    }
+
+    /// The parser's wire bound includes header space. That extra allowance
+    /// must not let a slightly oversized decoded chunked body reach /health.
+    #[test]
+    fn web_decoded_body_cap_has_exact_boundaries_for_both_framings() {
+        run_async_test(async {
+            let mut limits = WebServerConfig::default().runtime_limits();
+            limits.max_request_body_bytes = 1024;
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let mut observed = Vec::new();
+            for size in [0, 1023, 1024, 1025, 16 * 1024] {
+                let chunked = fetch_raw(addr, &chunked_health_request(size, "close")).await;
+                let mut fixed = format!(
+                    "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                fixed.resize(fixed.len() + size, b'x');
+                let fixed = fetch_raw(addr, &fixed).await;
+                observed.push((size, chunked, fixed));
+            }
+            let healthy = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            for (size, chunked, fixed) in observed {
+                for response in [chunked, fixed] {
+                    let response =
+                        response.expect("bounded requests must receive a finite response");
+                    let expected = if size > 1024 { 413 } else { 200 };
+                    assert_eq!(extract_status(&response), expected, "body size {size}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(extract_body(&response)).unwrap();
+                    assert_eq!(body["ok"], size <= 1024);
+                    if size > 1024 {
+                        assert_eq!(body["error_code"], "body_too_large");
+                        assert_eq!(header_value(&response, "connection"), Some("close"));
+                    }
+                }
+            }
+            assert_eq!(extract_status(&healthy.unwrap()), 200);
+        });
+    }
+
+    /// Exercise the production runtime's admission wiring with a handler
+    /// effect counter. Middleware-only rejection is insufficient: the pinned
+    /// server overrides a middleware Connection: close response and would
+    /// otherwise dispatch the already-buffered second request.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_oversized_body_closes_before_handler_or_pipelined_followup() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let handler_effects = Arc::clone(&effects);
+            let app = FrameworkApp::builder()
+                .config(FrameworkAppConfig::new().max_body_size(1024))
+                .get("/health", move |_, _| {
+                    handler_effects.fetch_add(1, Ordering::SeqCst);
+                    async { FrameworkResponse::ok() }
+                })
+                .build();
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("production runtime should start");
+            let positive = fetch_health(addr).await;
+            let effects_after_positive = effects.load(Ordering::SeqCst);
+            let mut pipeline = chunked_health_request(1025, "keep-alive");
+            pipeline.extend_from_slice(
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+            let rejected = fetch_raw(addr, &pipeline).await;
+            let effects_after_rejection = effects.load(Ordering::SeqCst);
+            let next_connection = fetch_health(addr).await;
+            let effects_after_next = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(
+                effects_after_positive, 1,
+                "positive control must invoke the handler"
+            );
+            let response = rejected.expect("oversize admission must return a finite 413");
+            assert_eq!(extract_status(&response), 413);
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
+            assert_eq!(
+                effects_after_rejection, 1,
+                "neither the rejected request nor its pipelined follower may run"
+            );
+            assert_eq!(extract_status(&next_connection.unwrap()), 200);
+            assert_eq!(
+                effects_after_next, 2,
+                "a fresh connection must remain usable"
+            );
+        });
+    }
+
+    /// Much larger chunked requests are still refused by the parser's own
+    /// total wire bound (64 KiB + header allowance). The application guard
+    /// above does not replace that earlier bounded-collection protection.
     #[test]
     fn web_chunked_body_over_the_cap_is_refused_at_the_parser() {
-        fn chunked_request(total: usize) -> Vec<u8> {
-            let mut request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\
-                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                .to_vec();
-            let chunk = vec![b'x'; 16 * 1024];
-            let mut sent = 0;
-            while sent < total {
-                let len = chunk.len().min(total - sent);
-                request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
-                request.extend_from_slice(&chunk[..len]);
-                request.extend_from_slice(b"\r\n");
-                sent += len;
-            }
-            request.extend_from_slice(b"0\r\n\r\n");
-            request
-        }
-
         run_async_test(async {
             let server = start_web_server(WebServerConfig::default().with_port(0))
                 .await
                 .unwrap();
             let addr = server.bound_addr();
-            let small = fetch_raw(addr, &chunked_request(1024)).await;
-            let oversized = fetch_raw(addr, &chunked_request(300 * 1024)).await;
+            let small = fetch_raw(addr, &chunked_health_request(1024, "close")).await;
+            let oversized = fetch_raw(addr, &chunked_health_request(300 * 1024, "close")).await;
             let shutdown = server.shutdown().await;
             shutdown.unwrap();
 
