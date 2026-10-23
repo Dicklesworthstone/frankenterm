@@ -17,7 +17,7 @@ use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::ImageCell;
 use termwiz::surface::line::CellRef;
-use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
+use termwiz::surface::{CursorShape, CursorVisibility, SEQ_ZERO, SequenceNo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MirrorColor {
@@ -389,6 +389,12 @@ pub const RENDER_FRAME_PALETTE_COLORS: usize = 265;
 /// row and its live viewport's first stable row, the range a history viewport
 /// may select. A decoder that predates it rejects the flag rather than guess.
 pub const RENDER_FRAME_FLAG_HISTORY: u32 = 16;
+/// Header flag: bytes 192..256 are a least-significant-bit-first bitmap of
+/// canonical soft-wrap boundaries, one bit per captured row. A set bit means
+/// that row continues into the next physical row; unused bits are zero. The
+/// viewport may end before the continuation, so consumers must also validate
+/// adjacent row/source/geometry witnesses before joining copied text.
+pub const RENDER_FRAME_FLAG_SOFT_WRAPS: u32 = 32;
 
 /// These witnesses are supplied by the immutable session owner, not by remote
 /// terminal output. UUID bytes use RFC UUID order, not a platform GUID layout.
@@ -609,14 +615,17 @@ fn put_color(bytes: &mut [u8], at: usize, color: MirrorColor) {
 /// Links identify frame-local URI entries, not OSC 8 remote authority.
 ///
 /// Header offsets: magic0, version-u16@4, header-size-u16@6, total-u32@8,
-/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8/history=16), channelUUID@16,
+/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8/history=16/soft-wraps=32), channelUUID@16,
 /// transportUUID@32, route-revision-u64@48, terminal-sequence-u64@56,
 /// geometry/palette/font/frame revisions-u64@64/72/80/88, rows/cols-u32@96/100,
 /// viewport/cursor stable rows-i64@104/112, cursor-column/shape-u32@120/124,
 /// row/cell/text counts-u32@128/132/136, row/cell/text/palette offsets-u32
 /// @140/144/148/152, palette-count-u32@156, link-count/offset-u32@160/164,
 /// cursor-visible/width-u32@168/172, oldest-resident/live-first stable rows
-/// -i64@176/184 (history flag). Bytes192..256 are zero.
+/// -i64@176/184 (history flag). Bytes192..256 are the soft-wrap bitmap when
+/// flag32 is set: row N uses bit N%8 of byte 192+N/8. Bits for uncaptured rows
+/// are zero. Without flag32 all 64 bytes are zero. Table sizes and offsets are
+/// unchanged; pre-extension decoders reject the new flag rather than guess.
 ///
 /// Row24: stable-i64, sequence-u64, first-cell-u32, cell-count-u32.
 /// Cell48: column, width, text-start, text-length, flags, foreground-tag/value,
@@ -771,7 +780,8 @@ fn encode_frame(
         | if term.get_reverse_video() { 2 } else { 0 }
         | if term.is_alt_screen_active() { 4 } else { 0 }
         | if term.synchronized_output() { 8 } else { 0 }
-        | RENDER_FRAME_FLAG_HISTORY;
+        | RENDER_FRAME_FLAG_HISTORY
+        | RENDER_FRAME_FLAG_SOFT_WRAPS;
     put_u32(&mut bytes, 12, flags);
     bytes[16..32].copy_from_slice(&witness.channel_id);
     bytes[32..48].copy_from_slice(&witness.transport_id);
@@ -849,6 +859,9 @@ fn encode_frame(
     let mut link_index = 0;
     let mut uri_index = counts.text;
     for (row, line) in lines.iter().enumerate() {
+        if line.last_cell_was_wrapped() {
+            bytes[192 + row / 8] |= 1 << (row % 8);
+        }
         let row_at = rows_at + row * RENDER_FRAME_ROW_BYTES;
         let stable = first
             .checked_add(
@@ -1011,6 +1024,11 @@ mod tests {
             u32_at(&bytes, 12) & RENDER_FRAME_FLAG_HISTORY,
             RENDER_FRAME_FLAG_HISTORY
         );
+        assert_eq!(
+            u32_at(&bytes, 12) & 32,
+            32,
+            "soft-wrap metadata is declared"
+        );
         assert_eq!((i64_at(&bytes, 176), i64_at(&bytes, 184)), (0, 0));
         assert!(bytes[192..256].iter().all(|byte| *byte == 0));
         assert_eq!(u32_at(&bytes, 140), 256);
@@ -1065,6 +1083,85 @@ mod tests {
         assert_eq!(cell_text(&bytes, 1), "界");
         assert_eq!(cell_text(&bytes, 2), "🦀");
         assert_eq!(cell_text(&bytes, 3), "e\u{301}");
+    }
+
+    #[test]
+    fn soft_wrap_bitmap_distinguishes_commands_and_urls_from_real_newlines() {
+        let mut term = terminal(5, 12);
+        term.advance_bytes("curl https://example.test/a?b=1\r\nprintf done");
+        let bytes = frame(&term);
+        assert_eq!(u32_at(&bytes, 12) & 32, 32);
+        assert_eq!(
+            bytes[192], 0b0000_0011,
+            "only the two URL continuations wrap"
+        );
+        assert!(bytes[193..256].iter().all(|byte| *byte == 0));
+        assert_eq!(u32_at(&bytes, 140), 256, "v1 table offsets are unchanged");
+        assert_eq!(u32_at(&bytes, 144), 256 + 5 * 24);
+
+        let mut exact_width = terminal(3, 4);
+        exact_width.advance_bytes("abcd");
+        assert_eq!(
+            frame(&exact_width)[192],
+            0,
+            "reaching the margin is not a wrap"
+        );
+        exact_width.advance_bytes("\r\nefgh");
+        assert_eq!(frame(&exact_width)[192], 0, "explicit newline stays hard");
+        exact_width.advance_bytes("i");
+        assert_eq!(
+            frame(&exact_width)[192],
+            2,
+            "only a printed continuation wraps"
+        );
+    }
+
+    #[test]
+    fn soft_wrap_bitmap_uses_canonical_wide_and_combining_cell_columns() {
+        let mut term = terminal(3, 4);
+        term.advance_bytes("A界e\u{301}Z");
+        let bytes = frame(&term);
+        assert_eq!(bytes[192], 1);
+        assert_eq!(cell_text(&bytes, 0), "A");
+        assert_eq!(cell_text(&bytes, 1), "界");
+        assert_eq!(u32_at(&bytes, cell_at(&bytes, 1) + 4), 2);
+        assert_eq!(cell_text(&bytes, 2), "e\u{301}");
+        assert_eq!(u32_at(&bytes, cell_at(&bytes, 2)), 3);
+        let next_row_first = u32_at(&bytes, 256 + 24 + 16) as usize;
+        assert_eq!(cell_text(&bytes, next_row_first), "Z");
+        assert_eq!(u32_at(&bytes, cell_at(&bytes, next_row_first)), 0);
+
+        // A width-two grapheme that cannot fit in the final column wraps
+        // without retaining a textual spacer at the previous row's end.
+        let mut wide = terminal(3, 4);
+        wide.advance_bytes("abc界B");
+        let bytes = frame(&wide);
+        assert_eq!(bytes[192], 1);
+        assert_eq!(u32_at(&bytes, 256 + 20), 3);
+        assert_eq!(cell_text(&bytes, 2), "c");
+        let next_row_first = u32_at(&bytes, 256 + 24 + 16) as usize;
+        assert_eq!(cell_text(&bytes, next_row_first), "界");
+        assert_eq!(u32_at(&bytes, cell_at(&bytes, next_row_first)), 0);
+        assert_eq!(u32_at(&bytes, cell_at(&bytes, next_row_first) + 4), 2);
+        assert_eq!(cell_text(&bytes, next_row_first + 1), "B");
+    }
+
+    #[test]
+    fn soft_wrap_bitmap_is_relative_to_the_captured_history_viewport() {
+        let mut term = terminal(3, 4);
+        term.advance_bytes("abcdefghijklmnop");
+        let live = frame(&term);
+        assert_eq!(i64_at(&live, 104), 1);
+        assert_eq!(live[192], 0b0000_0011, "live rows 1 and 2 continue");
+        let history =
+            capture_terminal_frame(&term, witness(), Some(0), RenderFrameLimits::default())
+                .unwrap();
+        assert_eq!(i64_at(&history, 104), 0);
+        assert_eq!(
+            history[192], 0b0000_0111,
+            "row 2 continues outside this viewport"
+        );
+        assert!(history[193..256].iter().all(|byte| *byte == 0));
     }
 
     #[test]

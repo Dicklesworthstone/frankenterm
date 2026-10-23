@@ -821,6 +821,9 @@ public final class NativeTerminalView: UIView {
     private var dragOrigin = CGPoint.zero
     /// The width the selection was made at; a new width rewraps its rows.
     private var selectionColumns: Int?
+    /// Stable row numbers can be reused on another screen or geometry. Keep
+    /// the capture's source witness as well as its width while selecting.
+    private var selectionCopyContext: TerminalRowCopyContext?
     private let touchFilter = NativeTerminalTouchFilter()
     private var autoScroll: Timer?
     private var theme: TerminalChromeTheme?
@@ -1249,10 +1252,16 @@ public final class NativeTerminalView: UIView {
     }
 
     private func setSelection(_ value: TerminalTextSelection?) {
+        if value != nil {
+            guard let frame = renderer.admittedFrame, frame.flags & 8 == 0 else { return }
+        }
         selection = value
-        if value == nil { selectionRows.removeAll(); selectionColumns = nil }
+        if value == nil { selectionRows.removeAll(); selectionColumns = nil; selectionCopyContext = nil }
         else {
-            if selectionColumns == nil { selectionColumns = renderer.admittedFrame?.columns }
+            if selectionColumns == nil {
+                selectionColumns = renderer.admittedFrame?.columns
+                selectionCopyContext = renderer.admittedFrame?.lines.first?.copyContext
+            }
             captureSelectionRows()
         }
         drawSelection()
@@ -1267,7 +1276,8 @@ public final class NativeTerminalView: UIView {
 
     /// Selects every row on screen.
     public func selectScreen() {
-        guard let frame = renderer.admittedFrame, let first = frame.lines.first, let last = frame.lines.last else { return }
+        guard let frame = renderer.admittedFrame, frame.flags & 8 == 0,
+              let first = frame.lines.first, let last = frame.lines.last else { return }
         setSelection(TerminalTextSelection(TerminalGridPoint(row: first.stableIndex, column: 0),
                                            TerminalGridPoint(row: last.stableIndex, column: frame.columns - 1)))
         showEditMenu()
@@ -1277,7 +1287,7 @@ public final class NativeTerminalView: UIView {
     /// selection. Like the Select Output panel's copies, it stays on this
     /// device and expires after two minutes.
     public func copySelection() {
-        guard let selection, let frame = renderer.admittedFrame else { return }
+        guard let selection, let frame = renderer.admittedFrame, frame.flags & 8 == 0 else { return }
         captureSelectionRows()
         let text = selection.text(rows: selectionRows, columns: frame.columns)
         guard !text.isEmpty, text.utf8.count <= 1 << 20 else { return }
@@ -1288,7 +1298,7 @@ public final class NativeTerminalView: UIView {
     }
 
     private func captureSelectionRows() {
-        guard let selection, let frame = renderer.admittedFrame else { return }
+        guard let selection, let frame = renderer.admittedFrame, frame.flags & 8 == 0 else { return }
         for row in frame.lines where row.stableIndex >= selection.start.row && row.stableIndex <= selection.end.row {
             selectionRows[row.stableIndex] = row
         }
@@ -1322,8 +1332,12 @@ public final class NativeTerminalView: UIView {
             }
         }
         guard selection != nil else { return }
-        // A new width rewraps the rows: the cells no longer hold what was chosen.
+        // A new source, screen or geometry no longer holds the selected cells,
+        // even when it happens to have the same number of columns.
         if let columns = selectionColumns, columns != frame.columns { clearSelection(); return }
+        if let context = selectionCopyContext,
+           context.source != frame.source || context.geometryRevision != frame.geometryRevision
+            || context.alternateScreen != frame.alternateScreen { clearSelection(); return }
         captureSelectionRows()
         if drag != nil { extendDrag() }
         drawSelection()

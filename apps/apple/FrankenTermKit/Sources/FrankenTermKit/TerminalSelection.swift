@@ -63,34 +63,60 @@ public struct TerminalTextSelection: Equatable, Sendable {
         return owners
     }
 
-    /// The selected text as it reads on screen: each row's covered cells, with
-    /// gaps and concealed (SGR 8) cells as spaces and trailing blanks dropped,
-    /// rows joined by newlines. A wide character partly covered is included
-    /// whole. Rows not in `rows` (never shown while selecting) are skipped.
+    /// Canonical soft wraps join only adjacent, complete selected boundaries
+    /// from the same source/screen/geometry capture. Hard breaks, absent rows
+    /// and unknown metadata retain a newline. Trailing blanks at a joined wrap
+    /// are meaningful text; other row ends are trimmed as before. A partly
+    /// selected wide grapheme is included whole; concealed cells stay masked.
+    /// Invalid or oversized snapshots return no text, never a partial command.
     public func text(rows: [Int64: TerminalRenderRow], columns: Int) -> String {
-        guard columns > 0 else { return "" }
-        var lines: [String] = []
-        var row = start.row
-        let last = min(end.row, start.row + Self.maximumRows - 1)
-        while row <= last {
-            defer { row += 1 }
-            guard let range = self.columns(onRow: row, width: columns), let source = rows[row] else { continue }
-            var line = "", column = range.lowerBound
+        guard (1...512).contains(columns) else { return "" }
+        let distance = end.row.subtractingReportingOverflow(start.row)
+        guard !distance.overflow, distance.partialValue < Self.maximumRows else { return "" }
+        let maximumBytes = 1_048_576
+        var result = "", usedBytes = 0
+        var previous: (row: TerminalRenderRow, range: ClosedRange<Int>)?
+        for offset in 0..<Self.maximumRows {
+            let step = start.row.addingReportingOverflow(offset)
+            guard !step.overflow, step.partialValue <= end.row else { break }
+            let row = step.partialValue
+            guard let range = self.columns(onRow: row, width: columns), let source = rows[row],
+                  source.stableIndex == row else { continue }
+            guard source.cells.count <= columns else { return "" }
+            if let previous, !(previous.range.upperBound == columns - 1 && range.lowerBound == 0
+                && previous.row.joins(source, columns: columns)) {
+                guard usedBytes < maximumBytes else { return "" }
+                result.append("\n"); usedBytes += 1
+            }
+            var line = "", column = range.lowerBound, lineBytes = 0
             for cell in source.cells.sorted(by: { $0.column < $1.column }) {
-                let cellEnd = cell.column + max(cell.width, 1) - 1
+                guard cell.column >= 0, cell.column < columns, (1...2).contains(cell.width),
+                      cell.width <= columns - cell.column, cell.text.utf8.count <= 4096 else { return "" }
+                let cellEnd = cell.column + cell.width - 1
                 guard cellEnd >= range.lowerBound, cell.column <= range.upperBound else { continue }
-                if cell.column > column { line.append(String(repeating: " ", count: cell.column - column)) }
+                let gap = max(0, cell.column - column)
                 let visible = cell.invisible || cell.text.isEmpty
-                    ? String(repeating: " ", count: max(cell.width, 1))
+                    ? String(repeating: " ", count: cell.width)
                     : String(String.UnicodeScalarView(cell.text.unicodeScalars.filter {
                         $0.value >= 32 && !(127...159).contains($0.value)
                     }))
-                line.append(visible)
-                column = cell.column + max(cell.width, 1)
+                let count = visible.utf8.count
+                guard gap <= maximumBytes - usedBytes - lineBytes,
+                      count <= maximumBytes - usedBytes - lineBytes - gap else { return "" }
+                line.append(String(repeating: " ", count: gap)); line.append(visible)
+                lineBytes += gap + count; column = cell.column + cell.width
             }
-            while line.last == " " { line.removeLast() }
-            lines.append(line)
+            // Preserve spaces before a proven continuation, but never join a
+            // wrap whose next row is outside this selection or its row budget.
+            let next = row.addingReportingOverflow(1)
+            let joinsNext = offset + 1 < Self.maximumRows && !next.overflow && next.partialValue <= end.row
+                && range.upperBound == columns - 1
+                && self.columns(onRow: next.partialValue, width: columns)?.lowerBound == 0
+                && rows[next.partialValue].map { source.joins($0, columns: columns) } == true
+            if !joinsNext { while line.last == " " { line.removeLast() } }
+            result.append(line); usedBytes += line.utf8.count
+            previous = (source, range)
         }
-        return lines.joined(separator: "\n")
+        return result
     }
 }

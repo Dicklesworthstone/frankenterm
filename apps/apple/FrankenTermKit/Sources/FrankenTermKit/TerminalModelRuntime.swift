@@ -420,9 +420,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         if let expected = top ?? frame.history?.live, frame.viewportFirst != expected {
             throw TerminalHistorySearchError.invalidPage
         }
-        return try TerminalCopyDocument(rows: frame.lines.map { row in
-            row.cells.map { .init(column: $0.column, width: $0.width, text: $0.text, concealed: $0.invisible) }
-        }, columns: frame.columns)
+        return try TerminalCopyDocument(frame: frame)
     }
 
     private func searchPage(top: Int64?) throws -> TerminalSearchPage<TerminalSource> {

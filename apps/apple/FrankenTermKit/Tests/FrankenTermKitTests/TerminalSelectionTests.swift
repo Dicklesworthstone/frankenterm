@@ -55,4 +55,23 @@ final class TerminalSelectionTests: XCTestCase {
         let line = TerminalRenderRow(stableIndex: 0, sequence: 1, cells: [cell(0, "a"), cell(1, "\u{1b}"), cell(2, "b")])
         XCTAssertEqual(TerminalTextSelection(point(0, 0), point(0, 2)).text(rows: [0: line], columns: 5), "ab")
     }
+
+    func testExtremeStableRowsCannotOverflowSelectionIteration() {
+        for stable in [Int64.min, Int64.max] {
+            let selected = TerminalTextSelection(point(stable, 0), point(stable, 3))
+            XCTAssertEqual(selected.text(rows: [stable: row(stable, "edge")], columns: 4), "edge")
+        }
+        let lastTwo = TerminalTextSelection(point(Int64.max - 1, 0), point(Int64.max, 3))
+        XCTAssertEqual(lastTwo.text(rows: [Int64.max - 1: row(Int64.max - 1, "last"),
+                                          Int64.max: row(Int64.max, "edge")], columns: 4), "last\nedge")
+        let impossible = TerminalTextSelection(point(Int64.min, 0), point(Int64.max, 3))
+        XCTAssertEqual(impossible.text(rows: [Int64.min: row(Int64.min, "edge")], columns: 4), "")
+    }
+
+    func testOversizedSelectionsReturnNoPartialCommand() {
+        let selected = TerminalTextSelection(point(0, 0), point(TerminalTextSelection.maximumRows, 3))
+        XCTAssertEqual(selected.text(rows: [0: row(0, "echo")], columns: 4), "")
+        let mismatched = TerminalTextSelection(point(0, 0), point(0, 3))
+        XCTAssertEqual(mismatched.text(rows: [0: row(1, "echo")], columns: 4), "")
+    }
 }

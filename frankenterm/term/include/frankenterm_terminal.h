@@ -146,6 +146,11 @@ uint32_t ft_terminal_v1_reply_settle(uint64_t session, uint64_t sequence, uint32
 /* Capture the canonical full-replacement FTSF v1 wire transaction. Its bytes
  * and identity/revision witnesses are immutable until frame_release or parent
  * session release. feed/resize/font changes never mutate an acquired frame.
+ * Header flag 32 assigns bytes 192..256 as a 512-bit soft-wrap bitmap:
+ * captured row N uses bit N%8 of byte 192+N/8. Unused bits are zero; without
+ * the flag the entire bitmap is zero. A set bit is canonical continuation,
+ * not permission to join missing rows or different source/geometry captures.
+ * Existing row/cell table sizes are unchanged. Reject unknown header flags.
  * Acquire returns BUSY while a frame is owned. span copies check the complete
  * range before writing; capacity may be up to MAX_FRAME_BYTES. An explicitly
  * selected history viewport that was evicted returns VIEWPORT_UNAVAILABLE;

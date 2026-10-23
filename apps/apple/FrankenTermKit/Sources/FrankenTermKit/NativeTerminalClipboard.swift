@@ -80,9 +80,7 @@ public final class NativeTerminalClipboardController: NSObject {
                 // Never expose a partial synchronized-output transaction as the
                 // completed viewport. Try again after the remote update ends.
                 guard frame.flags & 8 == 0 else { throw TerminalClipboardError.unavailable }
-                let document = try TerminalCopyDocument(rows: frame.lines.map { row in
-                    row.cells.map { .init(column: $0.column, width: $0.width, text: $0.text, concealed: $0.invisible) }
-                }, columns: frame.columns)
+                let document = try TerminalCopyDocument(frame: frame)
                 try Task.checkCancellation()
                 return document
             }

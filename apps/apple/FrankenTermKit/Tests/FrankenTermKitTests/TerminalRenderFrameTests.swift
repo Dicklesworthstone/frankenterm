@@ -53,17 +53,19 @@ final class TerminalRenderFrameTests: XCTestCase {
         (0..<4).reduce(0) { $0 | (Int(data[at + $1]) << ($1 * 8)) }
     }
 
-    private func fixture(combining: String? = nil) -> Data {
-        let cells = [
+    private func fixture(combining: String? = nil, gridRows: [[Cell]]? = nil, columns: UInt32 = 5) -> Data {
+        let rows = gridRows ?? [[
             Cell(column: 0, width: 1, text: "A", flags: 1,
                  foreground: (1, 1), underline: (2, 0xFFCCBBAA)),
             Cell(column: 1, width: 2, text: "界", flags: (3 << 2) | (1 << 7) | (1 << 8) | (1 << 9),
                  foreground: (2, 0x8038220C), background: (1, 200), link: 1),
-            Cell(column: 3, width: 1, text: combining ?? Self.combining, flags: 2 | (1 << 10)),
+            Cell(column: 3, width: 1, text: combining ?? Self.combining, flags: 2 | (1 << 10))
+        ], [
             Cell(column: 0, width: 2, text: Self.emoji, flags: 2 << 15),
             Cell(column: 2, width: 1, text: "z", flags: (2 << 5) | (1 << 11) | (1 << 12))
-        ]
-        let rowsOffset = 256, cellsOffset = rowsOffset + 2 * 24
+        ]]
+        let cells = rows.flatMap { $0 }
+        let rowsOffset = 256, cellsOffset = rowsOffset + rows.count * 24
         let linksOffset = cellsOffset + cells.count * 48, textOffset = linksOffset + 8
         let textBytes = cells.reduce(0) { $0 + $1.text.utf8.count } + Self.link.utf8.count
         let paletteOffset = textOffset + textBytes
@@ -80,20 +82,25 @@ final class TerminalRenderFrameTests: XCTestCase {
         for (offset, value): (Int, UInt64) in [(48, 7), (56, 19), (64, 11), (72, 12), (80, 13), (88, 14)] {
             u64(value, at: offset, in: &data)
         }
-        u32(2, at: 96, in: &data); u32(5, at: 100, in: &data)
-        i64(-4, at: 104, in: &data); i64(-3, at: 112, in: &data)
-        u32(2, at: 120, in: &data); u32(6, at: 124, in: &data)
-        u32(2, at: 128, in: &data); u32(UInt32(cells.count), at: 132, in: &data)
+        u32(UInt32(rows.count), at: 96, in: &data); u32(columns, at: 100, in: &data)
+        i64(-4, at: 104, in: &data); i64(-4 + Int64(min(rows.count - 1, 1)), at: 112, in: &data)
+        u32(min(2, columns - 1), at: 120, in: &data); u32(6, at: 124, in: &data)
+        u32(UInt32(rows.count), at: 128, in: &data); u32(UInt32(cells.count), at: 132, in: &data)
         u32(UInt32(textBytes), at: 136, in: &data)
         for (offset, value) in [(140, rowsOffset), (144, cellsOffset), (148, textOffset),
                                 (152, paletteOffset), (156, 265), (160, 1), (164, linksOffset),
                                 (168, 1), (172, 1)] {
             u32(UInt32(value), at: offset, in: &data)
         }
-        i64(-4, at: rowsOffset, in: &data); u64(17, at: rowsOffset + 8, in: &data)
-        u32(0, at: rowsOffset + 16, in: &data); u32(3, at: rowsOffset + 20, in: &data)
-        i64(-3, at: rowsOffset + 24, in: &data); u64(18, at: rowsOffset + 32, in: &data)
-        u32(3, at: rowsOffset + 40, in: &data); u32(2, at: rowsOffset + 44, in: &data)
+        var firstCell = 0
+        for (index, row) in rows.enumerated() {
+            let offset = rowsOffset + index * 24
+            i64(-4 + Int64(index), at: offset, in: &data)
+            u64(17 + UInt64(min(index, 2)), at: offset + 8, in: &data)
+            u32(UInt32(firstCell), at: offset + 16, in: &data)
+            u32(UInt32(row.count), at: offset + 20, in: &data)
+            firstCell += row.count
+        }
         var textPosition = 0
         for (index, cell) in cells.enumerated() {
             let offset = cellsOffset + index * 48
@@ -171,8 +178,153 @@ final class TerminalRenderFrameTests: XCTestCase {
         var unflagged = fixture(); i64(-10, at: 176, in: &unflagged)
         assertRejected(unflagged, source: source, "history bytes need their flag")
         XCTAssertNil(TerminalRenderFrame.history(ofEncoded: unflagged))
-        var unknown = data; u32(1 | 16 | 32, at: 12, in: &unknown)
+        var unknown = data; u32(1 | 16 | 64, at: 12, in: &unknown)
         assertRejected(unknown, source: source, "unknown flags are still refused")
+    }
+
+    func testSoftWrapBitmapRequiresItsFlagAndOnlyAddressesCapturedRows() async throws {
+        let source = try await source()
+        var data = fixture()
+        u32(1 | 32, at: 12, in: &data); data[192] = 1
+        let frame = try TerminalRenderFrame.decode(data, expectedSource: source)
+        XCTAssertEqual(frame.lines.map(\.wrapsToNext), [true, false])
+        XCTAssertNil(frame.history, "wrap metadata does not imply a history block")
+        var unflagged = data; u32(1, at: 12, in: &unflagged)
+        assertRejected(unflagged, source: source, "a wrap bit needs flag 32")
+        for (offset, bit): (Int, UInt8) in [(192, 4), (193, 1), (255, 128)] {
+            var unused = data; unused[offset] |= bit
+            assertRejected(unused, source: source, "bits outside the two captured rows stay reserved")
+        }
+        var unexpectedHistory = data; unexpectedHistory[176] = 1
+        assertRejected(unexpectedHistory, source: source, "history retains its separate flag")
+
+        let row = [Cell(column: 0, width: 1, text: "x", flags: 0)]
+        var maximum = fixture(gridRows: Array(repeating: row, count: 512), columns: 1)
+        u32(1 | 32, at: 12, in: &maximum); maximum[192] = 128; maximum[193] = 1; maximum[255] = 128
+        let allRows = try TerminalRenderFrame.decode(maximum, expectedSource: source)
+        XCTAssertEqual(allRows.lines.indices.filter { allRows.lines[$0].wrapsToNext }, [7, 8, 511],
+                       "bits are LSB-first across all 64 bytes, including the final captured row")
+    }
+
+    func testWrappedCommandAndUrlCopyAsOneLineWhileHardBreaksStayIntact() async throws {
+        let rows = ["curl https:/", "/example.tes", "t/a?b=1", "printf done"].map { text in
+            text.enumerated().map { Cell(column: UInt32($0.offset), width: 1, text: String($0.element), flags: 0) }
+        }
+        var data = fixture(gridRows: rows, columns: 12)
+        u32(1 | 32, at: 12, in: &data); data[192] = 3
+        let frame = try TerminalRenderFrame.decode(data, expectedSource: try await source())
+        let expected = "curl https://example.test/a?b=1\nprintf done"
+        let document = try TerminalCopyDocument(frame: frame, maximumUTF8Bytes: expected.utf8.count)
+        XCTAssertEqual(document.text, expected); XCTAssertEqual(document.physicalRows, 4)
+        XCTAssertThrowsError(try TerminalCopyDocument(frame: frame, maximumUTF8Bytes: expected.utf8.count - 1))
+        let captured = Dictionary(uniqueKeysWithValues: frame.lines.map { ($0.stableIndex, $0) })
+        let all = TerminalTextSelection(.init(row: -4, column: 0), .init(row: -1, column: 11))
+        XCTAssertEqual(all.text(rows: captured, columns: 12), expected)
+        let partial = TerminalTextSelection(.init(row: -4, column: 5), .init(row: -3, column: 3))
+        XCTAssertEqual(partial.text(rows: captured, columns: 12), "https://exa",
+                       "a selection may start/end inside the logical line without inventing a newline")
+        let oneRow = TerminalTextSelection(.init(row: -4, column: 0), .init(row: -4, column: 7))
+        XCTAssertEqual(oneRow.text(rows: captured, columns: 12), "curl htt")
+
+        var missing = captured; missing.removeValue(forKey: -3)
+        XCTAssertEqual(all.text(rows: missing, columns: 12), "curl https:/\nt/a?b=1\nprintf done",
+                       "a missing cached row must never concatenate unrelated fragments")
+        var wrongKey = captured; wrongKey[-3] = captured[-2]
+        XCTAssertEqual(all.text(rows: wrongKey, columns: 12), all.text(rows: missing, columns: 12),
+                       "a dictionary key is not a substitute for the row's stable identity")
+    }
+
+    func testJoinedRowsKeepWideAndCombiningCellsAtomicAndPreserveBoundarySpaces() async throws {
+        let rows = [[Cell(column: 0, width: 1, text: "A", flags: 0),
+                     Cell(column: 1, width: 2, text: "界", flags: 0),
+                     Cell(column: 3, width: 1, text: Self.combining, flags: 0)],
+                    [Cell(column: 0, width: 2, text: Self.emoji, flags: 0),
+                     Cell(column: 2, width: 1, text: "z", flags: 0)]]
+        var data = fixture(gridRows: rows, columns: 4)
+        u32(1 | 32, at: 12, in: &data); data[192] = 1
+        let source = try await source()
+        let frame = try TerminalRenderFrame.decode(data, expectedSource: source)
+        let document = try TerminalCopyDocument(frame: frame)
+        XCTAssertEqual(document.text, "A界\(Self.combining)\(Self.emoji)z")
+        XCTAssertEqual(try document.selectedText(in: NSRange(location: 2, length: 1)), Self.combining)
+        XCTAssertEqual(try document.selectedText(in: NSRange(location: 5, length: 1)), Self.emoji)
+        let selected = TerminalTextSelection(.init(row: -4, column: 2), .init(row: -3, column: 0))
+        XCTAssertEqual(selected.text(rows: [-4: frame.lines[0], -3: frame.lines[1]], columns: 4),
+                       "界\(Self.combining)\(Self.emoji)")
+
+        var concealed = fixture(columns: 4)
+        u32(1 | 32, at: 12, in: &concealed); concealed[192] = 1
+        let masked = try TerminalRenderFrame.decode(concealed, expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: masked).text, "A界 \(Self.emoji)z")
+        XCTAssertEqual(selected.text(rows: [-4: masked.lines[0], -3: masked.lines[1]], columns: 4),
+                       "界 \(Self.emoji)", "masking/trailing-space handling must not collapse a wrapped separator")
+        let onlyFirst = TerminalTextSelection(.init(row: -4, column: 0), .init(row: -4, column: 3))
+        XCTAssertEqual(onlyFirst.text(rows: [-4: masked.lines[0], -3: masked.lines[1]], columns: 4), "A界",
+                       "a continuation outside the selection must not change its trailing-space policy")
+
+        // A wide grapheme cannot occupy only the final column: the canonical
+        // engine leaves that column absent and wraps the complete grapheme.
+        let wideRows = [[Cell(column: 0, width: 1, text: "a", flags: 0),
+                         Cell(column: 1, width: 1, text: "b", flags: 0),
+                         Cell(column: 2, width: 1, text: "c", flags: 0)],
+                        [Cell(column: 0, width: 2, text: "界", flags: 0),
+                         Cell(column: 2, width: 1, text: "B", flags: 0)]]
+        var wide = fixture(gridRows: wideRows, columns: 4)
+        u32(1 | 32, at: 12, in: &wide); wide[192] = 1
+        let movedWide = try TerminalRenderFrame.decode(wide, expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: movedWide).text, "abc界B")
+        let allWide = TerminalTextSelection(.init(row: -4, column: 0), .init(row: -3, column: 2))
+        XCTAssertEqual(allWide.text(rows: [-4: movedWide.lines[0], -3: movedWide.lines[1]], columns: 4), "abc界B",
+                       "touch selection must not invent the absent wide-wrap spacer")
+        let fromSpacer = TerminalTextSelection(.init(row: -4, column: 3), .init(row: -3, column: 0))
+        XCTAssertEqual(fromSpacer.text(rows: [-4: movedWide.lines[0], -3: movedWide.lines[1]], columns: 4), "界")
+        let beforeSpacer = TerminalTextSelection(.init(row: -4, column: 2), .init(row: -3, column: 0))
+        XCTAssertEqual(beforeSpacer.text(rows: [-4: movedWide.lines[0], -3: movedWide.lines[1]], columns: 4), "c界")
+        var narrow = wide
+        u32(1, at: read32(wide, at: 144) + 3 * 48 + 4, in: &narrow)
+        let incompleteNarrow = try TerminalRenderFrame.decode(narrow, expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: incompleteNarrow).text, "abc\n界 B",
+                       "an arbitrary one-column hole before a narrow cell remains separate")
+    }
+
+    func testWrapBitsCannotJoinIncompleteRowsOrDifferentCaptureGenerations() async throws {
+        let source = try await source()
+        var data = fixture(columns: 4)
+        u32(1 | 32, at: 12, in: &data); data[192] = 1
+        let original = try TerminalRenderFrame.decode(data, expectedSource: source)
+        let selection = TerminalTextSelection(.init(row: -4, column: 0), .init(row: -3, column: 3))
+        for offset in [56, 64] {
+            var newer = data; u64(offset == 56 ? 20 : 12, at: offset, in: &newer)
+            let changed = try TerminalRenderFrame.decode(newer, expectedSource: source)
+            XCTAssertEqual(selection.text(rows: [-4: original.lines[0], -3: changed.lines[1]], columns: 4),
+                           "A界\n\(Self.emoji)z", "different capture sequence/geometry at \(offset)")
+        }
+        var alternate = data; u32(1 | 4 | 32, at: 12, in: &alternate)
+        var synchronized = data; u32(1 | 8 | 32, at: 12, in: &synchronized)
+        let updating = try TerminalRenderFrame.decode(synchronized, expectedSource: source)
+        let rebound = try TerminalRenderFrame.decode(data, expectedSource: try await self.source())
+        let altFrame = try TerminalRenderFrame.decode(alternate, expectedSource: source)
+        for changed in [updating, rebound, altFrame] {
+            XCTAssertEqual(selection.text(rows: [-4: original.lines[0], -3: changed.lines[1]], columns: 4),
+                           "A界\n\(Self.emoji)z", "screen, source ownership and update completeness matter")
+        }
+        XCTAssertThrowsError(try TerminalCopyDocument(frame: updating)) {
+            XCTAssertEqual($0 as? TerminalClipboardError, .unavailable)
+        }
+        var shortRow = data; u32(6, at: 100, in: &shortRow)
+        let incomplete = try TerminalRenderFrame.decode(shortRow, expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: incomplete).text, "A界 \n\(Self.emoji)z",
+                       "a wrap marker does not fill a missing right margin")
+        var missingStart = data
+        let cellsOffset = read32(data, at: 144)
+        u32(1, at: cellsOffset + 3 * 48, in: &missingStart)
+        u32(3, at: cellsOffset + 4 * 48, in: &missingStart)
+        let noLeftMargin = try TerminalRenderFrame.decode(missingStart, expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: noLeftMargin).text, "A界 \n \(Self.emoji)z",
+                       "a continuation without its left margin remains separate")
+        let old = try TerminalRenderFrame.decode(fixture(columns: 4), expectedSource: source)
+        XCTAssertEqual(try TerminalCopyDocument(frame: old).text, "A界 \n\(Self.emoji)z",
+                       "older unflagged producers keep their hard boundaries")
     }
 
     func testReadableTextKeepsRowOrderAndWithholdsTheConcealedCell() async throws {

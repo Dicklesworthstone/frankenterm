@@ -16,8 +16,8 @@ public enum TerminalClipboardError: Error, Equatable, Sendable, LocalizedError {
 /// An immutable, bounded selection document, never a terminal parser or input
 /// source. Its producer supplies canonical cell positions; Unicode display
 /// width is not recalculated. Concealed cells are replaced before retention.
-/// Rows are kept separate: FTSF v1 does not describe soft-wrap boundaries, so
-/// joining physical rows would invent logical command text.
+/// Canonical soft-wrap boundaries are joined only within one coherent capture.
+/// Rows without that metadata remain separate; text length never implies a wrap.
 public struct TerminalCopyDocument: Sendable, CustomDebugStringConvertible {
     public struct Cell: Sendable {
         public let column: Int, width: Int, text: String, concealed: Bool
@@ -33,15 +33,39 @@ public struct TerminalCopyDocument: Sendable, CustomDebugStringConvertible {
     public var utf16Count: Int { text.utf16.count }
 
     public init(rows: [[Cell]], columns: Int, maximumUTF8Bytes: Int = 131_072) throws {
+        guard (1...512).contains(rows.count) else { throw TerminalClipboardError.invalidGeometry }
+        try self.init(rows: rows, columns: columns, joinsPrevious: Array(repeating: false, count: rows.count),
+                      maximumUTF8Bytes: maximumUTF8Bytes)
+    }
+
+    /// Copy one validated semantic viewport. The frame supplies source and
+    /// geometry witnesses together with canonical soft-wrap metadata, so a
+    /// wrapped command or URL stays one line while real newlines remain intact.
+    public init(frame: TerminalRenderFrame, maximumUTF8Bytes: Int = 131_072) throws {
+        guard frame.flags & 8 == 0 else { throw TerminalClipboardError.unavailable }
+        guard frame.lines.count == frame.rows, (1...512).contains(frame.rows) else {
+            throw TerminalClipboardError.invalidGeometry
+        }
+        let joins = frame.lines.indices.map { index in
+            index > 0 && frame.lines[index - 1].joins(frame.lines[index], columns: frame.columns)
+        }
+        try self.init(rows: frame.lines.map { row in
+            row.cells.map { Cell(column: $0.column, width: $0.width, text: $0.text, concealed: $0.invisible) }
+        }, columns: frame.columns, joinsPrevious: joins, maximumUTF8Bytes: maximumUTF8Bytes)
+    }
+
+    private init(rows: [[Cell]], columns: Int, joinsPrevious: [Bool], maximumUTF8Bytes: Int) throws {
         guard (1...512).contains(columns), (1...512).contains(rows.count),
-              rows.count <= 65_536 / columns else { throw TerminalClipboardError.invalidGeometry }
+              rows.count <= 65_536 / columns, joinsPrevious.count == rows.count else {
+            throw TerminalClipboardError.invalidGeometry
+        }
         guard (1...131_072).contains(maximumUTF8Bytes) else { throw TerminalClipboardError.capacity }
         var result = "", ranges: [NSRange] = [], usedBytes = 0, usedUTF16 = 0
         var cells = 0
         for (rowIndex, row) in rows.enumerated() {
             guard row.count <= columns, row.count <= 65_536 - cells else { throw TerminalClipboardError.capacity }
             cells += row.count
-            if rowIndex > 0 {
+            if rowIndex > 0 && !joinsPrevious[rowIndex] {
                 guard usedBytes < maximumUTF8Bytes else { throw TerminalClipboardError.capacity }
                 result.append("\n"); usedBytes += 1; usedUTF16 += 1
             }

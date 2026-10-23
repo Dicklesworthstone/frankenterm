@@ -70,9 +70,43 @@ public struct TerminalRenderCell: Equatable, Sendable {
     public var verticalAlignment: UInt32 { (flags >> 12) & 3 }
 }
 
+/// Rows from separate captures may share stable indexes without representing
+/// one coherent logical line. Joining text requires the same source, screen,
+/// geometry and terminal sequence, not just matching row numbers or titles.
+struct TerminalRowCopyContext: Equatable, Sendable {
+    let source: TerminalSource
+    let geometryRevision: UInt64, terminalSequence: UInt64
+    let alternateScreen: Bool
+}
+
 public struct TerminalRenderRow: Equatable, Sendable {
     public let stableIndex: Int64, sequence: UInt64
     public let cells: [TerminalRenderCell]
+    /// Canonical continuation into the next physical row, never inferred from
+    /// text length. Unknown metadata is conservatively a hard boundary.
+    public let wrapsToNext: Bool
+    let copyContext: TerminalRowCopyContext?
+
+    init(stableIndex: Int64, sequence: UInt64, cells: [TerminalRenderCell],
+         wrapsToNext: Bool = false, copyContext: TerminalRowCopyContext? = nil) {
+        self.stableIndex = stableIndex; self.sequence = sequence; self.cells = cells
+        self.wrapsToNext = wrapsToNext; self.copyContext = copyContext
+    }
+
+    /// A partial/truncated row or a gap between cached viewports must not turn
+    /// two unrelated fragments into a command. The next row must start at the
+    /// left margin and this one must contain the complete right margin, or
+    /// end one column early for a canonical wide grapheme moved to that next
+    /// row. The absent spacer in that case is not copied as a blank.
+    func joins(_ next: Self, columns: Int) -> Bool {
+        guard wrapsToNext, stableIndex < Int64.max, next.stableIndex == stableIndex + 1,
+              let copyContext, copyContext == next.copyContext,
+              let last = cells.last, last.column >= 0, last.column < columns,
+              (1...2).contains(last.width), last.width <= columns - last.column,
+              let first = next.cells.first, first.column == 0 else { return false }
+        let remaining = columns - last.column - last.width
+        return remaining == 0 || (remaining == 1 && first.width == 2)
+    }
 
     /// The row as a reader hears it: gaps and blank cells are spaces, concealed
     /// (SGR 8) cells are withheld as spaces, and trailing blanks are dropped.
@@ -163,10 +197,12 @@ public struct TerminalRenderFrame: Equatable, Sendable {
         let bytes = [UInt8](data)
         let read = RenderBytes(bytes)
         let reportsHistory = read.u32(12) & 16 != 0
+        let reportsSoftWraps = read.u32(12) & 32 != 0
         guard Array(bytes[0..<4]) == [70, 84, 83, 70], read.u16(4) == 1,
               read.u16(6) == 256, Int(read.u32(8)) == bytes.count,
-              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(31) == 0,
-              bytes[(reportsHistory ? 192 : 176)..<256].allSatisfy({ $0 == 0 })
+              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(63) == 0,
+              reportsHistory || bytes[176..<192].allSatisfy({ $0 == 0 }),
+              reportsSoftWraps || bytes[192..<256].allSatisfy({ $0 == 0 })
         else { throw TerminalRenderError.malformed }
         let identity = expectedSource.identity
         guard Array(bytes[16..<32]) == uuidBytes(identity.channelID),
@@ -179,6 +215,13 @@ public struct TerminalRenderFrame: Equatable, Sendable {
               count <= limits.maximumCells, textCount <= limits.maximumTextBytes,
               linkCount <= limits.maximumLinks else { throw TerminalRenderError.capacity }
         guard rows * columns <= limits.maximumCells else { throw TerminalRenderError.capacity }
+        // Flag 32 assigns the former reserved bytes as a 512-bit row bitmap.
+        // Bits outside this frame's row table remain reserved and must be zero.
+        if reportsSoftWraps {
+            for row in rows..<512 where bytes[192 + row / 8] & (1 << (row % 8)) != 0 {
+                throw TerminalRenderError.malformed
+            }
+        }
         // Limits above make all following products and additions safe on both
         // supported 64-bit platforms; no integer read is used as an unchecked slice.
         let cellsOffset = 256 + rows * 24
@@ -201,6 +244,9 @@ public struct TerminalRenderFrame: Equatable, Sendable {
         }
         let pool = Array(bytes[textOffset..<paletteOffset])
         guard String(bytes: pool, encoding: .utf8) != nil else { throw TerminalRenderError.malformed }
+        let copyContext = read.u32(12) & 8 == 0 ? TerminalRowCopyContext(
+            source: expectedSource, geometryRevision: read.u64(64), terminalSequence: read.u64(56),
+            alternateScreen: read.u32(12) & 4 != 0) : nil
         var lines = [TerminalRenderRow](); lines.reserveCapacity(rows)
         var expectedCell = 0, expectedText = 0
         for row in 0..<rows {
@@ -233,7 +279,9 @@ public struct TerminalRenderFrame: Equatable, Sendable {
                 expectedText += length; nextColumn = column + width
             }
             expectedCell += rowCells
-            lines.append(TerminalRenderRow(stableIndex: first + Int64(row), sequence: read.u64(at + 8), cells: cells))
+            lines.append(TerminalRenderRow(stableIndex: first + Int64(row), sequence: read.u64(at + 8), cells: cells,
+                wrapsToNext: reportsSoftWraps && bytes[192 + row / 8] & (1 << (row % 8)) != 0,
+                copyContext: copyContext))
         }
         guard expectedCell == count else { throw TerminalRenderError.malformed }
         var links = [String](); links.reserveCapacity(linkCount)
