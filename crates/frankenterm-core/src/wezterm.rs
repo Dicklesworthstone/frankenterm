@@ -6134,11 +6134,7 @@ mod tests {
             let stats = pool.stats_with_cx(&cx).await.expect("fixture pool stats");
             assert_eq!(
                 stats.connections_created,
-                if fault == CompositeSendFault::InitialVersionSkew {
-                    0
-                } else {
-                    1
-                }
+                u64::from(fault != CompositeSendFault::InitialVersionSkew)
             );
             assert_eq!(
                 stats.connections_failed,
