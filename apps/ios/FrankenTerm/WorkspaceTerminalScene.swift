@@ -56,6 +56,15 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     var overviewSessionID: UUID? { overviewVisit }
     /// One source of truth for imported opt-ins, explicit actions and losses.
     private var connectionIntent: TerminalConnectionIntent
+    /// Cold automatically prepared connections may yield to actual demand.
+    /// The connection manager remains the app-wide admission authority.
+    private var residency: TerminalConnectionResidency
+    private(set) var capacityBlockedMachineID: String?
+    private(set) var capacityReleaseMachineID: String?
+    @ObservationIgnored private var explicitPreparations: Set<String> = []
+    @ObservationIgnored private var capacityRelease: TerminalConnectionResidency.Owner?
+    @ObservationIgnored private var capacityReleaseJob: Task<Void, Never>?
+    private(set) var failedCapacityRelease: TerminalConnectionResidency.Owner?
     /// Machines the user disconnected: navigation never revives them.
     var disconnected: Set<String> { connectionIntent.disconnected }
 
@@ -114,9 +123,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     init(workspaceID: UUID, revision: UUID, workspaceName: String, machines: [SceneMachine],
          initialMachineID: String, connections: MobileConnections,
-         initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true) throws {
+         initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true,
+         maximumRetainedConnections: Int = 16) throws {
         self.workspaceID = workspaceID; self.revision = revision; self.autoConnect = autoConnect
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
+        residency = try .init(limit: maximumRetainedConnections)
         connectionIntent = try TerminalConnectionIntent(
             machines: machines.map { .init(id: $0.id, autoConnect: $0.autoConnect) },
             selectedMachineID: initialMachineID, group: autoConnect ? initialGroup : nil)
@@ -337,6 +348,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard let session = sessions[machineID] else {
             return connectionIntent.shouldPrepare(machineID) ? .connecting : .disconnected
         }
+        if residency.wasReleased(machineID: machineID, ownerID: session.id) {
+            if !session.settled { return session.cleanupFailure == nil ? .connecting : .attention }
+            return connectionIntent.shouldPrepare(machineID) && permitsPreparation(machineID) ? .connecting : .disconnected
+        }
         switch session.phase {
         case .idle, .connecting: return .connecting
         case .ready: return .ready
@@ -429,6 +444,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                       self.selectedMachineID == request.machineID else { throw TerminalNavigationError.stale }
                 if request.connectOnOpen {
                     try self.connectionIntent.approveConnection(request.machineID)
+                    self.explicitPreparations.insert(request.machineID)
                     if let session = self.sessions[request.machineID] {
                         switch session.phase {
                         case .ended, .failed, .couldNotConnect: self.requestedConnections.insert(request.machineID)
@@ -620,6 +636,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             if terminal { try connectionIntent.requestTerminal(machineID) }
             else { try connectionIntent.approveConnection(machineID) }
         } catch { report(error); return }
+        explicitPreparations.insert(machineID)
         cancelReconnect(machineID)
         reconnectPolicies[machineID, default: .init()].resetForUserRequest()
         if sessions[machineID] == nil || sessions[machineID]?.settled == true {
@@ -645,6 +662,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             reconnectingFrom: preservingSuccessfulCandidate ? previous : nil)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
+            // Releasing an unused sign-in did not end a remote terminal and
+            // must not add the New Session gate or replenish reconnect intent.
+            if self.residency.wasReleased(machineID: machineID, ownerID: controller.id) {
+                self.reconcile(); return
+            }
             switch controller.phase {
             case .live:
                 try? self.connectionIntent.terminalOpened(machineID)
@@ -659,6 +681,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             self.reconcile()
         }
         sessions[machineID] = controller
+        residency.started(machineID)
         controller.setPresentationVisible(isVisible(machineID))
         runController(controller, machineID: machineID, starting: true)
     }
@@ -697,11 +720,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     /// Ends a machine's session; it stays disconnected until Connect.
-    func disconnect(_ machineID: String) {
-        guard !closed else { return }
+    func disconnect(_ machineID: String, expectedControllerID: UUID? = nil) {
+        guard !closed, expectedControllerID == nil || sessions[machineID]?.id == expectedControllerID else { return }
         do { try connectionIntent.disconnect(machineID) }
         catch { report(error); return }
         requestedConnections.remove(machineID)
+        explicitPreparations.remove(machineID)
         controllerJobs[machineID]?.task.cancel()
         cancelReconnect(machineID)
         reconnectPolicies[machineID] = nil
@@ -720,6 +744,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// prepares a replacement transport without authorizing a replacement PTY.
     private func reconcile() {
         guard permitsTerminalCreation else { return }
+        // Reservation precedes requestStop's synchronous callbacks. Cleanup
+        // completion, not an ended phase, is what makes the slot available.
+        guard capacityRelease == nil else { return }
+        capacityBlockedMachineID = nil
+        if let failed = failedCapacityRelease,
+           sessions[failed.machineID]?.id != failed.id || sessions[failed.machineID]?.settled == true {
+            failedCapacityRelease = nil
+        }
         let ready = Set(sessions.filter { $0.value.phase == .idle || $0.value.phase == .ready }.map(\.key))
         let readyOrder = (try? TerminalConnectionOrder.prioritize(machines.map(\.id), selected: selectedMachineID,
                                                                  including: ready)) ?? []
@@ -743,10 +775,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let order = (try? TerminalConnectionOrder.prioritize(inventory, selected: selectedMachineID, including: included)) ?? preparedOrder
         var slots = max(0, 3 - controllerJobs.count)
         for id in order {
-            guard !disconnected.contains(id), controllerJobs[id] == nil else { continue }
+            guard !disconnected.contains(id), controllerJobs[id] == nil, permitsPreparation(id) else { continue }
             if let session = sessions[id] {
                 guard session.settled else { continue }
-                if !requestedConnections.contains(id) {
+                if !requestedConnections.contains(id), !residency.wasReleased(machineID: id, ownerID: session.id) {
                     guard autoConnect, connectionIntent.permitsReconnect(id), session.dropped,
                           let delay = reconnectPolicies[id, default: .init()].nextDelay else { continue }
                     if let job = reconnectJobs[id] {
@@ -757,15 +789,94 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     }
                 }
             }
-            // The manager owns the authoritative limits. Avoid turning a large
-            // group's queued warm-up into failures when its 16 owners are full.
-            guard slots > 0, sessions.values.filter({ !$0.settled }).count < 16 else { continue }
-            let retry = sessions[id] != nil && !requestedConnections.contains(id)
+            guard slots > 0 else { continue }
+            if sessions.values.filter({ !$0.settled }).count >= residency.limit {
+                // Background warming alone must never evict another warm-up.
+                // Only visible approved demand or an explicit action may do so.
+                if (onScreen && id == selectedMachineID) || requestedConnections.contains(id) {
+                    if capacityBlockedMachineID == nil || id == selectedMachineID { capacityBlockedMachineID = id }
+                    if failedCapacityRelease == nil { releaseUnusedPreparation(for: id) }
+                }
+                if capacityRelease != nil { return }
+                continue
+            }
+            let retry = sessions[id].map { !residency.wasReleased(machineID: id, ownerID: $0.id) } == true
+                && !requestedConnections.contains(id)
             if retry {
                 guard reconnectPolicies[id, default: .init()].beginRetry() else { continue }
                 reconnectJobs[id] = nil
             }
             startConnection(id, preservingSuccessfulCandidate: retry); slots -= 1
+        }
+    }
+
+    private func permitsPreparation(_ machineID: String) -> Bool {
+        residency.permitsPreparation(machineID, selected: onScreen ? selectedMachineID : nil,
+                                     explicitlyRequested: requestedConnections.contains(machineID))
+    }
+
+    func preparationWasReleased(_ machineID: String) -> Bool {
+        sessions[machineID].map { residency.wasReleased(machineID: machineID, ownerID: $0.id) } ?? false
+    }
+
+    var connectionLimit: Int { residency.limit }
+
+    func retryCapacityCleanup(expectedControllerID: UUID) {
+        guard !closed, foreground, capacityRelease == nil,
+              let failed = failedCapacityRelease, failed.id == expectedControllerID,
+              let controller = sessions[failed.machineID], controller.id == failed.id else { return }
+        capacityRelease = failed; capacityReleaseMachineID = failed.machineID
+        joinCapacityRelease(failed, controller: controller)
+    }
+
+    /// Reclaim only exact, idle, automatic preparers. Neither a live remote
+    /// session nor a user's explicit/manual sign-in is an eviction candidate.
+    private func releaseUnusedPreparation(for machineID: String) {
+        guard capacityRelease == nil, failedCapacityRelease == nil else { return }
+        let group = navigationMachineIDs, members = Set(group)
+        let inventory = group + machines.map(\.id).filter { !members.contains($0) }
+        do {
+            let priority = try TerminalConnectionOrder.prioritize(inventory, selected: selectedMachineID,
+                                                                  including: Set(inventory))
+            let owned = sessions.compactMap { id, controller -> TerminalConnectionResidency.Owner? in
+                guard !controller.settled else { return nil }
+                let state: TerminalConnectionResidency.State
+                switch controller.phase {
+                case .ready:
+                    state = controllerJobs[id] == nil && controller.canReleaseUnusedPreparation
+                        && !explicitPreparations.contains(id) ? .automaticPreparation : .protectedPreparation
+                case .live: state = .terminal
+                case .idle, .connecting: state = .preparing
+                case .ended, .failed, .couldNotConnect: state = .settling
+                }
+                return .init(machineID: id, id: controller.id, state: state)
+            }
+            let protected = Set([selectedMachineID].compactMap { $0 }).union(explicitPreparations)
+            guard case let .release(candidate) = try residency.decision(for: machineID, priority: priority,
+                    owners: owned, protecting: protected),
+                  let controller = sessions[candidate.machineID], controller.id == candidate.id,
+                  controllerJobs[candidate.machineID] == nil else { return }
+            try residency.willRelease(candidate)
+            capacityRelease = candidate; capacityReleaseMachineID = candidate.machineID
+            // No await between exact-owner validation, reservation and sealing.
+            guard controller.requestReleaseUnusedPreparation() else {
+                residency.releaseRefused(candidate); capacityRelease = nil; capacityReleaseMachineID = nil
+                return
+            }
+            joinCapacityRelease(candidate, controller: controller)
+        } catch { report(error) }
+    }
+
+    private func joinCapacityRelease(_ candidate: TerminalConnectionResidency.Owner,
+                                     controller: TerminalSessionController) {
+        // Cleanup is deliberately not cancelled by a navigation/foreground
+        // change. It already owns a sealed connection and must finish settling.
+        capacityReleaseJob = Task { [weak self, controller] in
+            await controller.stop()
+            guard let self, self.capacityRelease == candidate else { return }
+            if !controller.settled { self.failedCapacityRelease = candidate }
+            self.capacityRelease = nil; self.capacityReleaseMachineID = nil; self.capacityReleaseJob = nil
+            self.reconcile()
         }
     }
 
@@ -854,7 +965,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let operations = controllerJobs.values.map(\.task)
         let overview = overviewJob?.task
         let appearance = groupAppearanceJob?.task
+        let release = capacityReleaseJob
         let job = Task {
+            if let release { await release.value }
             if let appearance { await appearance.value }
             if let overview { await overview.value }
             for reconnect in reconnects { await reconnect.value }
@@ -1194,6 +1307,23 @@ struct WorkspaceTerminalScreen: View {
         let accent = Color(ftHex: scene.themes[machine.id]?.accent ?? "#3B82F6")
         if scene.disconnected.contains(machine.id) {
             disconnectedCard(machine, accent: accent)
+        } else if scene.capacityBlockedMachineID == machine.id {
+            capacityCard(machine, accent: accent)
+        } else if scene.preparationWasReleased(machine.id), let session = scene.sessions[machine.id] {
+            if !session.settled, let failure = session.cleanupFailure {
+                sceneCard(symbol: "exclamationmark.triangle", title: "Sign-in cleanup needs attention",
+                          message: failure, accent: accent) {
+                    Button("Retry Cleanup") { scene.retryCapacityCleanup(expectedControllerID: session.id) }
+                }
+            } else if scene.status(of: machine.id) == .connecting {
+                connecting(machine, accent: accent, detail: session.settled ? "Waiting for a connection slot" : "Closing an unused sign-in…")
+            } else {
+                sceneCard(symbol: "bolt.horizontal.circle", title: "Unused sign-in released",
+                          message: "This automatically prepared connection made room for another machine. No terminal was opened or closed.",
+                          accent: accent) {
+                    Button("Connect") { scene.connect(machine.id) }.buttonStyle(.borderedProminent)
+                }
+            }
         } else if let session = scene.sessions[machine.id] {
             switch session.phase {
             case .idle, .connecting:
@@ -1230,6 +1360,36 @@ struct WorkspaceTerminalScreen: View {
         }
         .foregroundStyle(.white).padding(28)
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 22))
+    }
+
+    private func capacityCard(_ machine: SceneMachine, accent: Color) -> some View {
+        let releasing = scene.capacityReleaseMachineID
+        let failed = scene.failedCapacityRelease
+        return sceneCard(symbol: "network", title: releasing == nil ? "Connection slots are full" : "Making room for \(machine.name)",
+            message: releasing == nil
+                ? "This workspace is using its \(scene.connectionLimit) retained connection slots. Live terminals and explicit sign-ins are never closed automatically. Choose an existing connection to close; sessions still settling keep their slots."
+                : "Closing one unused automatic sign-in. \(machine.name) will connect only after cleanup finishes.", accent: accent) {
+            if releasing != nil { ProgressView().tint(accent) }
+            if let failed, scene.sessions[failed.machineID]?.cleanupFailure != nil {
+                Text("An unused sign-in could not finish cleanup. No further connections will be released automatically.")
+                    .font(.caption)
+                Button("Retry Cleanup") { scene.retryCapacityCleanup(expectedControllerID: failed.id) }
+                    .buttonStyle(.bordered)
+                    .disabled(releasing != nil)
+            }
+            Menu("Close a Connection…") {
+                ForEach(scene.machines) { other in
+                    if let owned = scene.sessions[other.id], !owned.settled {
+                        Button(role: .destructive) {
+                            scene.disconnect(other.id, expectedControllerID: owned.id)
+                        } label: {
+                            Text(verbatim: "\(other.name) · \(owned.phase == .live ? "disconnect live terminal" : "close connection")")
+                        }
+                    }
+                }
+            }.buttonStyle(.bordered).disabled(releasing != nil)
+                .accessibilityIdentifier("terminal.capacity.manage")
+        }
     }
 
     private func disconnectedCard(_ machine: SceneMachine, accent: Color) -> some View {

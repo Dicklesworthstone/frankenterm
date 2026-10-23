@@ -608,6 +608,23 @@ final class TerminalSessionController {
     /// nil for a session that is a shell of its own.
     var muxControl: TerminalMuxControl? { stopped ? nil : connection?.muxControl }
 
+    /// A prepared transport is disposable only before any terminal-opening
+    /// intent or resource exists. MainActor callers reserve the exact owner and
+    /// seal it in the same turn; a stale Ready snapshot is not permission.
+    var canReleaseUnusedPreparation: Bool {
+        !stopped && !settled && phase == .ready && startup == nil && connection != nil
+            && !terminalRequested && !explicitTerminalRequested && pump == nil && runtime == nil
+            && unadoptedModel == nil && !attached && keyboard == nil && terminal == nil
+            && viewAttachment == nil && paneHandoff == nil && run == nil && cleanup == nil
+    }
+
+    @discardableResult
+    func requestReleaseUnusedPreparation() -> Bool {
+        guard canReleaseUnusedPreparation else { return false }
+        requestStop()
+        return true
+    }
+
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
