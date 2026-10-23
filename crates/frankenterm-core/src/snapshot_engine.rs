@@ -18482,11 +18482,14 @@ mod tests {
             .unwrap();
             assert_eq!(automatic_receipt.complete_pane_count, 1);
 
+            // The bound only stops a hung test; this one checks prefix links,
+            // not the shutdown budget, and a saturated worker took 3.4 s to
+            // commit the checkpoint alone.
             let shutdown = engine
                 .shutdown_checkpoint_with_cx(
                     &cx,
                     &[make_test_pane(1, 30, 100)],
-                    Duration::from_secs(5),
+                    Duration::from_secs(60),
                 )
                 .await
                 .expect("shutdown capture must settle");
@@ -23170,7 +23173,9 @@ mod tests {
     /// message shape as the assertion it replaces, so a genuine "capture did not
     /// happen" bug still reports clearly rather than timing out silently.
     async fn await_checkpoint_count(db_path: &str, expected: i64, label: &str) {
-        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        // Only a failing test waits this long; a saturated full-suite worker
+        // has needed more than 10 s for a startup capture plus one more.
+        const WAIT_BUDGET: Duration = Duration::from_secs(60);
         const POLL_STEP: Duration = Duration::from_millis(20);
 
         let deadline = Instant::now() + WAIT_BUDGET;
@@ -23191,7 +23196,7 @@ mod tests {
     /// scheduler has received the blocking result and released mutation
     /// authority, so database visibility alone is not a settlement signal.
     async fn await_capture_successes(engine: &SnapshotEngine, expected: u64, label: &str) {
-        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        const WAIT_BUDGET: Duration = Duration::from_secs(60);
         const POLL_STEP: Duration = Duration::from_millis(20);
 
         let deadline = Instant::now() + WAIT_BUDGET;
@@ -23268,7 +23273,7 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // 3 x WorkCompleted = 6.0 >= 5.0
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
@@ -23907,7 +23912,7 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // Fire 5 WorkCompleted triggers (5 x 2.0 = 10.0) as fast as possible
             for _ in 0..5 {
