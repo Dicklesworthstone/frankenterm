@@ -142,7 +142,9 @@ struct RuntimePaneOutput {
     expected_sequence: Option<u64>,
     durable_plaintext_bytes: u64,
     remaining_record_capacity: u64,
+    max_append_bytes: usize,
     waiting_for_slot: bool,
+    waiting_for_capacity: bool,
     failed: bool,
 }
 
@@ -152,16 +154,40 @@ impl RuntimePaneOutput {
             expected_sequence: journal.initial_next_sequence(),
             durable_plaintext_bytes: journal.initial_cumulative_plaintext_bytes(),
             remaining_record_capacity: journal.initial_remaining_records(),
+            max_append_bytes: journal.initial_append_bytes(),
             journal,
             pending_plaintext: None,
             in_flight_bytes: 0,
             waiting_for_slot: false,
+            waiting_for_capacity: false,
             failed: false,
         }
     }
 
     fn is_quiescent(&self) -> bool {
         self.pending_plaintext.is_none() && self.in_flight_bytes == 0 && !self.failed
+    }
+
+    /// Called only after a durable completion or while a capacity-paused pane
+    /// has no append in flight. Ordinary worker-slot availability cannot lift
+    /// journal backpressure; a checkpoint must first release retained output.
+    fn refresh_append_capacity(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.expected_sequence.is_some()
+            && let Ok((remaining, append_bytes)) = self.journal.checked_append_capacity()
+        {
+            self.remaining_record_capacity = remaining;
+            self.max_append_bytes = append_bytes;
+            self.waiting_for_capacity = remaining == 0 || append_bytes == 0;
+            self.waiting_for_slot = !self.waiting_for_capacity;
+            return true;
+        }
+        self.failed = true;
+        self.waiting_for_capacity = false;
+        self.waiting_for_slot = false;
+        false
     }
 }
 
@@ -771,6 +797,7 @@ struct GenesisSpawnCompletion {
 struct CheckpointWorkerCompletion {
     route: GuardianCheckpointRoute,
     operation: GuardianOperation,
+    pane_id: Option<Uuid>,
     protocol: GuardianProtocolState,
     response: Option<GuardianResponseEnvelope>,
     worker_panicked: bool,
@@ -867,6 +894,7 @@ fn checkpoint_worker(
 ) {
     while let Ok(mut job) = jobs.recv() {
         let operation = job.request.header().operation;
+        let pane_id = job.request.header().pane_id;
         let started = std::time::Instant::now();
         let authority_valid_before = job.token_effect_authority.validate();
         let execution = authority_valid_before.then(|| {
@@ -937,6 +965,7 @@ fn checkpoint_worker(
         let completion = CheckpointWorkerCompletion {
             route: job.route,
             operation,
+            pane_id,
             protocol: job.protocol,
             response,
             worker_panicked,
@@ -3729,6 +3758,17 @@ impl GuardianRuntime {
                     }
                 }
                 self.replay_deferred_child_exits();
+                if completion.operation == GuardianOperation::CheckpointStage
+                    && !completion.worker_panicked
+                    && !completion.token_authority_failed
+                    && completion.response.as_ref().is_some_and(|response| {
+                        response.header().status
+                            == mux::guardian_protocol::GuardianResponseStatus::Success
+                    })
+                    && let Some(pane_id) = completion.pane_id
+                {
+                    self.refresh_output_capacity_after_checkpoint(pane_id);
+                }
                 GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
                     GuardianRuntimeCheckpointCompletion {
                         route: completion.route,
@@ -3817,6 +3857,7 @@ impl GuardianRuntime {
                 return;
             };
             if pane.output.failed
+                || pane.output.waiting_for_capacity
                 || pane.output.pending_plaintext.is_some()
                 || pane.output.in_flight_bytes != 0
             {
@@ -3830,8 +3871,9 @@ impl GuardianRuntime {
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             }
-            if pane.output.remaining_record_capacity == 0 {
-                pane.output.failed = true;
+            if pane.output.remaining_record_capacity == 0 || pane.output.max_append_bytes == 0 {
+                pane.output.waiting_for_capacity = true;
+                pane.output.waiting_for_slot = false;
                 self.counters.output_segment_exhaustions =
                     self.counters.output_segment_exhaustions.saturating_add(1);
                 deregister_reader(&self.registry, pane, &mut self.counters);
@@ -3849,7 +3891,9 @@ impl GuardianRuntime {
                 return;
             }
 
-            let read_len = remaining.min(OUTPUT_RECORD_BYTES);
+            let read_len = remaining
+                .min(OUTPUT_RECORD_BYTES)
+                .min(pane.output.max_append_bytes);
             let mut bytes = Zeroizing::new(Vec::new());
             if bytes.try_reserve_exact(read_len).is_err() {
                 self.counters.pty_read_failures = self.counters.pty_read_failures.saturating_add(1);
@@ -3941,9 +3985,13 @@ impl GuardianRuntime {
                                 output.durable_plaintext_bytes =
                                     receipt.cumulative_plaintext_bytes();
                                 output.expected_sequence = receipt.sequence().checked_add(1);
-                                // The journal counts what reclamation freed.
-                                output.remaining_record_capacity =
-                                    output.journal.remaining_records();
+                                if !output.refresh_append_capacity() {
+                                    self.counters.output_commit_failures =
+                                        self.counters.output_commit_failures.saturating_add(1);
+                                } else if output.waiting_for_capacity {
+                                    self.counters.output_segment_exhaustions =
+                                        self.counters.output_segment_exhaustions.saturating_add(1);
+                                }
                                 pane.pending_ack = Some(ack);
                                 self.counters.pty_bytes_durably_committed = self
                                     .counters
@@ -3986,7 +4034,6 @@ impl GuardianRuntime {
                     };
                     self.buffered_output_bytes = remaining_buffered_bytes;
                     pane.output.in_flight_bytes = 0;
-                    let failure_was_already_sticky = pane.output.failed;
                     match completion.result {
                         Ok(receipt)
                             if pane.output.journal.receipt_is_current(receipt)
@@ -3999,20 +4046,10 @@ impl GuardianRuntime {
                                     .checked_add(u64::from(receipt.payload_bytes()))
                                     == Some(receipt.cumulative_plaintext_bytes()) =>
                         {
-                            // The journal counts what reclamation freed.
-                            let remaining_record_capacity = pane.output.journal.remaining_records();
                             pane.output.durable_plaintext_bytes =
                                 receipt.cumulative_plaintext_bytes();
                             pane.output.expected_sequence = receipt.sequence().checked_add(1);
-                            pane.output.remaining_record_capacity = remaining_record_capacity;
-                            let has_append_capacity = remaining_record_capacity != 0
-                                && pane.output.journal.can_accept_min_record();
-                            pane.output.waiting_for_slot = !failure_was_already_sticky
-                                && pane.output.expected_sequence.is_some()
-                                && has_append_capacity;
-                            pane.output.failed = failure_was_already_sticky
-                                || pane.output.expected_sequence.is_none()
-                                || !has_append_capacity;
+                            let capacity_is_valid = pane.output.refresh_append_capacity();
                             self.counters.pty_bytes_drained = self
                                 .counters
                                 .pty_bytes_drained
@@ -4025,7 +4062,10 @@ impl GuardianRuntime {
                                 .counters
                                 .pty_records_durably_committed
                                 .saturating_add(1);
-                            if !has_append_capacity {
+                            if !capacity_is_valid {
+                                self.counters.output_commit_failures =
+                                    self.counters.output_commit_failures.saturating_add(1);
+                            } else if pane.output.waiting_for_capacity {
                                 self.counters.output_segment_exhaustions =
                                     self.counters.output_segment_exhaustions.saturating_add(1);
                             }
@@ -4076,6 +4116,27 @@ impl GuardianRuntime {
         }
         self.resume_output_flow();
         self.poll_broker_output();
+    }
+
+    fn refresh_output_capacity_after_checkpoint(&mut self, pane_id: Uuid) {
+        let output = if let Some(pane) = self.panes.get_mut(&pane_id) {
+            Some(&mut pane.output)
+        } else {
+            self.starting_broker_panes
+                .get_mut(&pane_id)
+                .and_then(|pane| pane.output.as_mut())
+        };
+        if let Some(output) = output
+            && output.waiting_for_capacity
+            && !output.failed
+            && output.pending_plaintext.is_none()
+            && output.in_flight_bytes == 0
+            && !output.refresh_append_capacity()
+        {
+            self.counters.output_commit_failures =
+                self.counters.output_commit_failures.saturating_add(1);
+        }
+        self.resume_output_flow();
     }
 
     fn poll_broker_output(&mut self) {
@@ -4327,7 +4388,9 @@ impl GuardianRuntime {
                                 && !pane.child_exit_observed
                                 && (pane.status_due || pane.terminal))
                                 || (!pane.terminal
+                                    && !output.waiting_for_capacity
                                     && output.remaining_record_capacity != 0
+                                    && output.max_append_bytes != 0
                                     && pane.read_due(now)))))
             };
             let pane_id = self
@@ -4380,7 +4443,12 @@ impl GuardianRuntime {
                     .max_total_output_bytes
                     .saturating_sub(self.buffered_output_bytes)
                     .min(self.config.max_output_bytes_per_pane)
-                    .min(OUTPUT_RECORD_BYTES);
+                    .min(OUTPUT_RECORD_BYTES)
+                    .min(
+                        pane.output
+                            .as_ref()
+                            .map_or(0, |output| output.max_append_bytes),
+                    );
                 if maximum_bytes == 0 {
                     continue;
                 }
@@ -4831,6 +4899,7 @@ const fn effective_pane_occupancy(pane_count: usize, indeterminate_effect: bool)
 
 fn pane_is_rearm_candidate(pane: &RuntimePane) -> bool {
     pane.output.waiting_for_slot
+        && !pane.output.waiting_for_capacity
         && !pane.output.failed
         && pane.output.pending_plaintext.is_none()
         && pane.output.in_flight_bytes == 0
@@ -5066,6 +5135,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn runtime_for_input_rejection() -> (std::path::PathBuf, Poll, GuardianRuntime) {
+        runtime_with_output_record_limits(None)
+    }
+
+    fn runtime_with_output_record_limits(
+        record_limits: Option<(u64, usize)>,
+    ) -> (std::path::PathBuf, Poll, GuardianRuntime) {
         let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("ft-guardian-runtime-input-rejection-")
@@ -5078,11 +5153,22 @@ mod tests {
         let completion_waker = Arc::new(
             Waker::new(poll.registry(), Token(1)).expect("create runtime completion waker"),
         );
-        let output_pipeline = GuardianOutputPipeline::open(
-            &directory.join("guardian.token"),
-            1,
-            Arc::clone(&completion_waker),
-        )
+        let output_pipeline = match record_limits {
+            Some((max_records, max_segments)) => {
+                GuardianOutputPipeline::open_with_record_limits_for_test(
+                    &directory.join("guardian.token"),
+                    1,
+                    Arc::clone(&completion_waker),
+                    max_records,
+                    max_segments,
+                )
+            }
+            None => GuardianOutputPipeline::open(
+                &directory.join("guardian.token"),
+                1,
+                Arc::clone(&completion_waker),
+            ),
+        }
         .expect("create runtime output pipeline");
         let config = GuardianRuntimeConfig::new(1, OUTPUT_RECORD_BYTES, OUTPUT_RECORD_BYTES, 2)
             .expect("valid runtime test limits");
@@ -7051,6 +7137,112 @@ mod tests {
 
         assert!(GuardianRuntimeConfig::new(2, 128, 257, 10).is_err());
         assert!(GuardianRuntimeConfig::new(2, usize::MAX, 1, 10).is_err());
+    }
+
+    #[test]
+    fn exhausted_output_pauses_readiness_and_resumes_after_checkpoint_reclamation() {
+        let (_directory, mut poll, mut runtime) = runtime_with_output_record_limits(Some((1, 2)));
+        let pane_id = Uuid::from_u128(31);
+        let spawn = successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
+        assert_eq!(
+            runtime
+                .dispatch(&spawn)
+                .expect("spawn response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        // A real pollable socket supplies deterministic producer records to the
+        // same readiness, bounded worker and encrypted-journal path as the PTY.
+        let (reader, mut producer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        deregister_reader(&runtime.registry, pane, &mut runtime.counters);
+        pane.reader = Box::new(reader);
+        assert!(register_reader(&runtime.registry, pane));
+        let token = pane.token;
+        let journal = pane.output.journal.clone();
+
+        let drive_until = |runtime: &mut GuardianRuntime, poll: &mut Poll, target: u64| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut events = mio::Events::with_capacity(8);
+            while runtime.counters().pty_records_durably_committed < target {
+                assert!(Instant::now() < deadline, "output completion timed out");
+                poll.poll(&mut events, Some(Duration::from_millis(10)))
+                    .unwrap();
+                for event in &events {
+                    if event.token() == token {
+                        runtime.handle_pty_ready(token);
+                    }
+                }
+                runtime.handle_output_completions();
+            }
+        };
+        producer.write_all(b"one").unwrap();
+        drive_until(&mut runtime, &mut poll, 1);
+        producer.write_all(b"two").unwrap();
+        drive_until(&mut runtime, &mut poll, 2);
+
+        let pane = &runtime.panes[&pane_id];
+        assert!(pane.output.waiting_for_capacity);
+        assert!(!pane.output.failed);
+        assert!(
+            pane.output.is_quiescent(),
+            "checkpoint capture remains available"
+        );
+        assert!(!pane.reader_registered);
+        assert!(!pane_is_rearm_candidate(pane));
+        assert_eq!(journal.checked_append_capacity().unwrap(), (0, 0));
+
+        producer.write_all(b"three").unwrap();
+        // Slot availability and stale readiness never consume bytes while the
+        // durable budget is exhausted, nor do they turn the pause into failure.
+        for _ in 0..3 {
+            runtime.resume_output_flow();
+            runtime.handle_pty_ready(token);
+        }
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(!runtime.panes[&pane_id].reader_registered);
+        assert_eq!(runtime.panes[&pane_id].output.expected_sequence, Some(3));
+        assert_eq!(runtime.buffered_output_bytes, 0);
+        let mut events = mio::Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+        assert!(events.iter().all(|event| event.token() != token));
+
+        // This is the exact journal-floor transition made by a catalog-backed
+        // CheckpointStage Ack. Its completion must re-register the paused pane.
+        journal.release_through_sequence(1);
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(runtime.panes[&pane_id].reader_registered);
+        assert!(!runtime.panes[&pane_id].output.waiting_for_capacity);
+        drive_until(&mut runtime, &mut poll, 3);
+        let pane = &runtime.panes[&pane_id];
+        assert_eq!(pane.output.expected_sequence, Some(4));
+        assert_eq!(pane.output.durable_plaintext_bytes, 11);
+        assert!(!pane.output.failed);
+        assert_eq!(runtime.counters().output_commit_failures, 0);
+        assert_eq!(runtime.counters().output_segment_exhaustions, 2);
+    }
+
+    #[test]
+    fn checkpoint_capacity_refresh_does_not_clear_failure_or_sequence_exhaustion() {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        deregister_reader(&runtime.registry, pane, &mut runtime.counters);
+        pane.output.waiting_for_capacity = true;
+        pane.output.failed = true;
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(runtime.panes[&pane_id].output.failed);
+        assert!(!runtime.panes[&pane_id].reader_registered);
+
+        let journal = runtime.panes[&pane_id].output.journal.clone();
+        let mut output = RuntimePaneOutput::new(journal);
+        output.expected_sequence = None;
+        assert!(!output.refresh_append_capacity());
+        assert!(output.failed);
+        assert!(!output.waiting_for_slot);
+        assert!(!output.waiting_for_capacity);
     }
 
     #[test]

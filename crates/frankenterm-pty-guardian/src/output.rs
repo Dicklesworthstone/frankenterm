@@ -2487,14 +2487,21 @@ impl PaneJournalAuthority {
         {
             return Err(OutputCommitError::Capacity);
         }
-        if !journal_can_append(
-            &self.current_journal,
-            self.policy.journal_limits,
-            payload.len(),
-        )? {
+        let frame_bytes = output_frame_bytes(payload.len())?;
+        let fits_durable_budget = self
+            .total_relevant_file_bytes
+            .checked_add(frame_bytes)
+            .ok_or(OutputCommitError::Capacity)?
+            <= self.policy.max_durable_pane_bytes;
+        if !fits_durable_budget
+            || !journal_can_append(
+                &self.current_journal,
+                self.policy.journal_limits,
+                payload.len(),
+            )?
+        {
             self.rollover(payload.len())?;
         }
-        let frame_bytes = output_frame_bytes(payload.len())?;
         let projected_total_log = self
             .total_committed_log_bytes
             .checked_add(frame_bytes)
@@ -2935,58 +2942,89 @@ impl PaneJournalAuthority {
             })
     }
 
-    fn can_accept_min_record(&self) -> bool {
+    /// A full, otherwise healthy journal can resume after a checkpoint releases
+    /// its retained prefix. Corrupt authority and accounting errors cannot.
+    fn append_capacity_bytes(&self) -> Result<usize, OutputCommitError> {
         if self.failed
             || self.current_journal.is_poisoned()
             || self.current_journal.tail() != GuardianOutputJournalTail::Clean
             || self.current_journal.directory_entry_sync_required()
+            || self.current_journal.next_sequence().is_none()
         {
-            return false;
+            return Err(OutputCommitError::SegmentManager);
         }
-        let Ok(frame_bytes) = output_frame_bytes(1) else {
-            return false;
-        };
-        if journal_can_append(&self.current_journal, self.policy.journal_limits, 1).unwrap_or(false)
+        let maximum_record_bytes = u64::from(self.policy.journal_limits.max_record_bytes);
+        let current_room = self
+            .policy
+            .journal_limits
+            .max_log_bytes
+            .saturating_sub(self.current_journal.committed_bytes())
+            .min(
+                self.policy
+                    .max_durable_pane_bytes
+                    .saturating_sub(self.total_relevant_file_bytes),
+            )
+            .saturating_sub(OUTPUT_V3_RECORD_OVERHEAD_BYTES)
+            .min(maximum_record_bytes);
+        if self.current_journal.record_count() < self.policy.journal_limits.max_records
+            && current_room != 0
         {
-            return self
-                .total_relevant_file_bytes
-                .checked_add(frame_bytes)
-                .is_some_and(|bytes| bytes <= self.policy.max_durable_pane_bytes);
+            return usize::try_from(current_room).map_err(|_| OutputCommitError::Capacity);
         }
         // The next record needs a rollover, which also reclaims whatever the
         // owner has released.
-        let Some(terminal) = self.current_journal.terminal_receipt() else {
-            return false;
-        };
+        let terminal = self
+            .current_journal
+            .terminal_receipt()
+            .ok_or(OutputCommitError::SegmentManager)?;
         let reclaimed = self.reclaimable_segment_count(terminal);
         let superseded_manifests = if reclaimed == 0 {
             0
         } else {
             self.manifest_history.len()
         };
-        let Ok(reclaimed_bytes) = self.reclaimable_file_bytes(reclaimed, superseded_manifests)
-        else {
-            return false;
-        };
-        self.physical_segment_files.saturating_sub(reclaimed) < self.policy.max_segments
-            && self
-                .relevant_files
-                .saturating_sub(reclaimed + 2 * superseded_manifests)
-                .checked_add(3)
-                .is_some_and(|files| files <= OUTPUT_MAX_RELEVANT_FILES_PER_PANE)
-            && self.current_journal.next_sequence().is_some()
-            && self
-                .total_relevant_file_bytes
-                .checked_sub(reclaimed_bytes)
-                .and_then(|bytes| bytes.checked_add(OUTPUT_V3_FILE_HEADER_BYTES))
-                .and_then(|bytes| {
-                    let segments = self.segments.len().checked_sub(reclaimed)?.checked_add(1)?;
-                    manifest_encoded_bytes(segments)
-                        .ok()
-                        .and_then(|manifest| bytes.checked_add(manifest))
-                })
-                .and_then(|bytes| bytes.checked_add(frame_bytes))
-                .is_some_and(|bytes| bytes <= self.policy.max_durable_pane_bytes)
+        let reclaimed_bytes = self.reclaimable_file_bytes(reclaimed, superseded_manifests)?;
+        let retained_files = self
+            .physical_segment_files
+            .checked_sub(reclaimed)
+            .ok_or(OutputCommitError::SegmentManager)?;
+        let projected_files = self
+            .relevant_files
+            .checked_sub(reclaimed + 2 * superseded_manifests)
+            .and_then(|files| files.checked_add(3))
+            .ok_or(OutputCommitError::SegmentManager)?;
+        if retained_files >= self.policy.max_segments
+            || projected_files > OUTPUT_MAX_RELEVANT_FILES_PER_PANE
+        {
+            return Ok(0);
+        }
+        let projected_segments = self
+            .segments
+            .len()
+            .checked_sub(reclaimed)
+            .and_then(|segments| segments.checked_add(1))
+            .ok_or(OutputCommitError::SegmentManager)?;
+        let manifest_bytes = manifest_encoded_bytes(projected_segments)
+            .map_err(|_| OutputCommitError::SegmentManager)?;
+        let projected_bytes = self
+            .total_relevant_file_bytes
+            .checked_sub(reclaimed_bytes)
+            .and_then(|bytes| bytes.checked_add(OUTPUT_V3_FILE_HEADER_BYTES))
+            .and_then(|bytes| bytes.checked_add(manifest_bytes))
+            .ok_or(OutputCommitError::SegmentManager)?;
+        let rollover_room = self
+            .policy
+            .max_durable_pane_bytes
+            .saturating_sub(projected_bytes)
+            .min(
+                self.policy
+                    .journal_limits
+                    .max_log_bytes
+                    .saturating_sub(OUTPUT_V3_FILE_HEADER_BYTES),
+            )
+            .saturating_sub(OUTPUT_V3_RECORD_OVERHEAD_BYTES)
+            .min(maximum_record_bytes);
+        usize::try_from(rollover_room).map_err(|_| OutputCommitError::Capacity)
     }
 
     /// Records the next rollover would reclaim.
@@ -3087,6 +3125,7 @@ pub struct GuardianPaneOutputJournal {
     initial_next_sequence: Option<u64>,
     initial_cumulative_plaintext_bytes: u64,
     initial_remaining_records: u64,
+    initial_append_bytes: usize,
 }
 
 impl GuardianPaneOutputJournal {
@@ -3109,11 +3148,24 @@ impl GuardianPaneOutputJournal {
             .unwrap_or(false)
     }
 
-    pub(crate) fn can_accept_min_record(&self) -> bool {
-        self.authority
-            .lock()
-            .map(|authority| authority.can_accept_min_record())
-            .unwrap_or(false)
+    /// Return remaining records and the largest safe next payload. A zero in
+    /// either position means bounded backpressure, not a failed journal. Keep
+    /// integrity, filesystem and accounting failures distinct so a runtime
+    /// never retries them as though a later checkpoint could repair them.
+    pub(crate) fn checked_append_capacity(&self) -> Result<(u64, usize), GuardianOutputError> {
+        let authority = self.authority.lock().map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian output authority was poisoned")
+        })?;
+        let append_bytes = authority.append_capacity_bytes().map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian output capacity authority failed")
+        })?;
+        let remaining = authority
+            .remaining_records()?
+            .checked_add(authority.reclaimable_records())
+            .ok_or(GuardianOutputError::FilesystemAuthority(
+                "guardian output record capacity overflowed",
+            ))?;
+        Ok((remaining, append_bytes))
     }
 
     /// No restore can need records through `sequence` any more, so a later
@@ -3122,21 +3174,6 @@ impl GuardianPaneOutputJournal {
         if let Ok(mut authority) = self.authority.lock() {
             authority.raise_reclaim_floor_sequence(sequence);
         }
-    }
-
-    /// Records this chain can still accept, counting what the next rollover
-    /// would reclaim.
-    pub(crate) fn remaining_records(&self) -> u64 {
-        self.authority
-            .lock()
-            .ok()
-            .and_then(|authority| {
-                authority
-                    .remaining_records()
-                    .ok()
-                    .map(|remaining| remaining.saturating_add(authority.reclaimable_records()))
-            })
-            .unwrap_or(0)
     }
 
     pub(crate) const fn initial_next_sequence(&self) -> Option<u64> {
@@ -3149,6 +3186,10 @@ impl GuardianPaneOutputJournal {
 
     pub(crate) const fn initial_remaining_records(&self) -> u64 {
         self.initial_remaining_records
+    }
+
+    pub(crate) const fn initial_append_bytes(&self) -> usize {
+        self.initial_append_bytes
     }
 
     /// Consume one freshly published single-segment chain into the persistent
@@ -9579,6 +9620,20 @@ impl GuardianOutputPipeline {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_with_record_limits_for_test(
+        token_path: &Path,
+        max_panes: usize,
+        completion_waker: Arc<Waker>,
+        max_records: u64,
+        max_segments: usize,
+    ) -> Result<Self, GuardianOutputError> {
+        let mut policy = OutputSegmentPolicy::production();
+        policy.journal_limits.max_records = max_records;
+        policy.max_segments = max_segments;
+        Self::open_with_policy(token_path, max_panes, completion_waker, policy)
+    }
+
     fn open_with_policy(
         token_path: &Path,
         max_panes: usize,
@@ -9874,9 +9929,12 @@ fn pane_journal_handle(
     let initial_next_sequence = authority.current_journal.next_sequence();
     let initial_cumulative_plaintext_bytes = authority.current_journal.cumulative_plaintext_bytes();
     let initial_remaining_records = authority.remaining_records()?;
+    let initial_append_bytes = authority.append_capacity_bytes().map_err(|_| {
+        GuardianOutputError::FilesystemAuthority("guardian output capacity authority failed")
+    })?;
     if initial_next_sequence.is_none()
         || initial_remaining_records == 0
-        || !authority.can_accept_min_record()
+        || initial_append_bytes == 0
     {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output chain has no append capacity",
@@ -9887,6 +9945,7 @@ fn pane_journal_handle(
         initial_next_sequence,
         initial_cumulative_plaintext_bytes,
         initial_remaining_records,
+        initial_append_bytes,
     })
 }
 
@@ -24514,7 +24573,7 @@ mod tests {
             durable_commit(&pipeline, pane_id, &journal, b"two")?.sequence(),
             2
         );
-        assert!(!journal.can_accept_min_record());
+        assert_eq!(journal.checked_append_capacity()?, (0, 0));
         let paths_at_capacity = pipeline.relevant_pane_paths(guardian_incarnation, pane_id)?;
         assert_eq!(paths_at_capacity.len(), 6);
 
@@ -24563,7 +24622,7 @@ mod tests {
             durable_commit(&pipeline, pane_id, &journal, &payload)?.sequence(),
             1
         );
-        assert!(!journal.can_accept_min_record());
+        assert_eq!(journal.checked_append_capacity()?.1, 0);
         let paths_at_capacity = pipeline.relevant_pane_paths(guardian_incarnation, pane_id)?;
         assert_eq!(paths_at_capacity.len(), 3);
 
@@ -24581,6 +24640,74 @@ mod tests {
             .map_err(|_| "journal authority was poisoned")?;
         assert_eq!(authority.total_relevant_file_bytes, 620);
         assert_eq!(authority.total_records, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn byte_capacity_bounds_the_next_read_and_recovers_without_filling_the_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = OutputSegmentPolicy {
+            journal_limits: GuardianOutputJournalLimits {
+                max_record_bytes: 256,
+                max_log_bytes: 1_024,
+                max_records: 10,
+            },
+            max_segments: 4,
+            max_durable_pane_bytes: 1_024,
+        };
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-byte-pause-", policy)?;
+        let pane_id = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(Uuid::new_v4(), pane_id)?;
+        durable_commit(&pipeline, pane_id, &journal, &[0x5a; 128])?;
+        durable_commit(&pipeline, pane_id, &journal, &[0x6b; 109])?;
+        // 905 bytes are already durable; one more frame costs 112 bytes,
+        // leaving seven payload bytes, rather than another 256-byte read.
+        assert_eq!(journal.checked_append_capacity()?.1, 7);
+        let receipt = durable_commit(&pipeline, pane_id, &journal, b"bounded")?;
+        assert_eq!(receipt.sequence(), 3);
+        assert_eq!(journal.checked_append_capacity()?, (37, 0));
+        {
+            let authority = journal.authority.lock().map_err(|_| "poisoned authority")?;
+            assert!(
+                journal_can_append(&authority.current_journal, policy.journal_limits, 7)
+                    .is_ok_and(|fits| fits)
+            );
+        }
+
+        journal.release_through_sequence(3);
+        assert_eq!(journal.checked_append_capacity()?.1, 256);
+        let resumed = durable_commit(&pipeline, pane_id, &journal, b"resumed")?;
+        assert_eq!(resumed.sequence(), 4);
+        assert_eq!(resumed.cumulative_plaintext_bytes(), 251);
+        let authority = journal.authority.lock().map_err(|_| "poisoned authority")?;
+        assert!(!authority.failed);
+        assert_eq!(authority.total_records, 1);
+        assert!(authority.total_relevant_file_bytes <= policy.max_durable_pane_bytes);
+        assert_eq!(recover_all_segment_bytes(&authority)?, b"resumed");
+        Ok(())
+    }
+
+    #[test]
+    fn checked_capacity_distinguishes_journal_failure_from_reclaimable_exhaustion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-output-capacity-failure-",
+            tiny_rotation_policy(2),
+        )?;
+        let pane_id = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(Uuid::new_v4(), pane_id)?;
+        durable_commit(&pipeline, pane_id, &journal, b"one")?;
+        durable_commit(&pipeline, pane_id, &journal, b"two")?;
+        assert_eq!(journal.checked_append_capacity()?, (0, 0));
+        journal.release_through_sequence(1);
+        assert!(journal.checked_append_capacity()?.1 > 0);
+        journal
+            .authority
+            .lock()
+            .map_err(|_| "poisoned authority")?
+            .failed = true;
+        assert!(journal.checked_append_capacity().is_err());
         Ok(())
     }
 
