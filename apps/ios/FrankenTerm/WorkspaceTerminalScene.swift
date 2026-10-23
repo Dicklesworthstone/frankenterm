@@ -39,6 +39,18 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
     private(set) var problem: String?
+    /// A read-only snapshot picker. Its dismissal joins one owned navigation
+    /// operation before the terminal keyboard can be enabled again.
+    private(set) var overviewPresented = false
+    @ObservationIgnored private var overviewVisit: UUID?
+    @ObservationIgnored private var overviewGeneration = UUID()
+    @ObservationIgnored private var overviewBuildID: UUID?
+    @ObservationIgnored private var overviewCatalogID: UUID?
+    @ObservationIgnored private var overviewChoice: (TerminalFleetOverview, TerminalFleetOverview.Choice)?
+    @ObservationIgnored private var overviewJob: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var overviewAllowsTargetPresentation = false
+    private var overviewBlocksInput: Bool { overviewVisit != nil || overviewJob != nil }
+    var overviewSessionID: UUID? { overviewVisit }
     /// One source of truth for imported opt-ins, explicit actions and losses.
     private var connectionIntent: TerminalConnectionIntent
     /// Machines the user disconnected: navigation never revives them.
@@ -107,6 +119,193 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
 
+    // MARK: Fleet overview
+
+    func beginOverview() {
+        guard !closed, foreground, onScreen, !overviewBlocksInput,
+              navigation.phase == .ready || navigation.phase == .inactive,
+              selectedSession?.clipboardIsPresenting != true,
+              selectedSession?.paneNavigationBusy != true else { return }
+        // A deliberate picker must not discard an unfinished IME candidate or
+        // an unadmitted local key. Previously admitted bytes keep their owner.
+        if let keyboard = owner.keyboard,
+           keyboard.document.isMarked || keyboard.accounting.pendingEvents > 0 || keyboard.phase == .blocked {
+            problem = "Finish composing or let pending local input settle before opening the overview."
+            return
+        }
+        overviewGeneration = UUID(); overviewVisit = overviewGeneration
+        overviewChoice = nil; overviewCatalogID = nil; overviewPresented = true
+        canvasGeneration = UUID()
+        navigation.suspend()
+        updatePresentationVisibility()
+    }
+
+    /// Reads already-discovered metadata only. Refresh never signs in to a
+    /// machine or asks a server for a new inventory. Indexing leaves MainActor.
+    func makeOverview() async throws -> TerminalFleetOverview {
+        guard overviewPresented, let generation = overviewVisit,
+              foreground, onScreen, !closed else { throw CancellationError() }
+        let buildID = UUID()
+        overviewBuildID = buildID; overviewCatalogID = nil
+        var inventory: [TerminalFleetOverview.Machine] = []
+        var paneCount = 0
+        guard machines.count <= TerminalFleetOverview.maximumMachines else { throw TerminalFleetOverview.Failure.capacity }
+        for machine in machines {
+            let session = sessions[machine.id]
+            let status: TerminalFleetOverview.Status
+            switch self.status(of: machine.id) {
+            case .live: status = .live
+            case .ready: status = .ready
+            case .connecting: status = .connecting
+            case .attention: status = .attention
+            case .disconnected: status = .disconnected
+            case .unavailable: status = .unavailable
+            }
+            let route = session?.route ?? machine.target?.routes.first
+            let endpoint = route.map(WorkspaceTerminalScreen.via) ?? ""
+            var panes: [TerminalFleetOverview.Pane] = []
+            var shown: Int?
+            if session?.phase == .live, let control = session?.muxControl {
+                let state = control.current
+                guard state.panes.count <= TerminalFleetOverview.maximumPanes - paneCount else {
+                    throw TerminalFleetOverview.Failure.capacity
+                }
+                panes = try state.panes.map { pane in
+                    .init(plan: try control.inputRouting.navigation(pane: pane.paneId), title: pane.title,
+                          tabTitle: pane.tabTitle, workingDirectory: pane.workingDir ?? "")
+                }
+                shown = state.shown; paneCount += panes.count
+            }
+            inventory.append(.init(id: machine.id, name: machine.name, endpoint: endpoint, status: status,
+                sessionID: session?.id, panes: panes, selectedPaneID: shown))
+        }
+        let selected = selectedMachineID
+        let frozenInventory = inventory
+        let catalog = try await withThrowingTaskGroup(of: TerminalFleetOverview.self) { group in
+            group.addTask { try TerminalFleetOverview(machines: frozenInventory, selectedMachineID: selected) }
+            guard let catalog = try await group.next() else { throw CancellationError() }
+            return catalog
+        }
+        try Task.checkCancellation()
+        guard overviewPresented, overviewVisit == generation, overviewBuildID == buildID,
+              foreground, onScreen, !closed else { throw CancellationError() }
+        overviewCatalogID = catalog.id
+        return catalog
+    }
+
+    /// Selection first records a frozen candidate. Actual navigation waits for
+    /// the sheet's dismissal; a delayed row callback cannot replace the choice.
+    func chooseOverview(_ choice: TerminalFleetOverview.Choice, in catalog: TerminalFleetOverview) throws {
+        guard overviewPresented, overviewVisit != nil, overviewCatalogID == catalog.id,
+              foreground, onScreen, !closed else { throw TerminalFleetOverview.Failure.stale }
+        try validateOverviewChoice(choice, in: catalog)
+        overviewChoice = (catalog, choice)
+        overviewPresented = false
+    }
+
+    func dismissOverview() {
+        guard overviewVisit != nil else { return }
+        overviewChoice = nil; overviewPresented = false
+    }
+
+    private func validateOverviewChoice(_ choice: TerminalFleetOverview.Choice,
+                                        in catalog: TerminalFleetOverview) throws {
+        switch try catalog.resolve(choice) {
+        case .machine(let machineID):
+            guard machines.contains(where: { $0.id == machineID }) else { throw TerminalFleetOverview.Failure.stale }
+        case let .pane(machineID, sessionID, _):
+            guard let session = sessions[machineID], session.id == sessionID, session.phase == .live,
+                  let control = session.muxControl else { throw TerminalFleetOverview.Failure.stale }
+            _ = try catalog.validatePane(choice, sessionID: sessionID, routing: control.inputRouting)
+        }
+    }
+
+    /// One retained operation owns dismissal, machine focus, and an optional
+    /// pane handoff. Backgrounding/closing invalidates it and never replays it.
+    func finishOverviewDismissal(_ expectedVisit: UUID) {
+        guard let generation = overviewVisit, generation == expectedVisit, overviewJob == nil else { return }
+        let choice = overviewChoice
+        overviewVisit = nil; overviewChoice = nil; overviewCatalogID = nil; overviewBuildID = nil
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.overviewJob?.id == id {
+                    self.overviewJob = nil; self.overviewAllowsTargetPresentation = false
+                    if !self.closed, self.foreground, self.onScreen { self.navigation.resume() }
+                    self.updatePresentationVisibility()
+                    self.reconcile()
+                }
+            }
+            do {
+                try self.checkOverviewNavigation(generation)
+                await self.navigation.joinSuspension()
+                try self.checkOverviewNavigation(generation)
+                self.navigation.resume()
+                if let (catalog, selection) = choice {
+                    try self.validateOverviewChoice(selection, in: catalog)
+                    let target = try catalog.resolve(selection)
+                    let machineID: String
+                    switch target {
+                    case .machine(let id): machineID = id
+                    case .pane(let id, _, _): machineID = id
+                    }
+                    if let plan = try self.navigation.navigation.plan(machineID: machineID) {
+                        try await self.navigation.perform(plan)
+                    }
+                    try self.checkOverviewNavigation(generation)
+                    try self.validateOverviewChoice(selection, in: catalog)
+                    guard self.selectedMachineID == machineID else { throw TerminalFleetOverview.Failure.stale }
+                    if case let .pane(_, sessionID, plan) = target {
+                        // A machine handoff may have prepared its old pane's
+                        // keyboard. It was never installed behind the picker;
+                        // retire it before selecting the requested pane.
+                        self.navigation.suspend()
+                        await self.navigation.joinSuspension()
+                        try self.checkOverviewNavigation(generation)
+                        try self.validateOverviewChoice(selection, in: catalog)
+                        guard let session = self.sessions[machineID], session.id == sessionID else {
+                            throw TerminalFleetOverview.Failure.stale
+                        }
+                        await session.waitForOverviewPresentation()
+                        try self.checkOverviewNavigation(generation)
+                        try self.validateOverviewChoice(selection, in: catalog)
+                        self.navigation.resume()
+                        self.overviewAllowsTargetPresentation = true
+                        self.updatePresentationVisibility()
+                        try await session.navigatePane(plan)
+                        try self.checkOverviewNavigation(generation)
+                    }
+                }
+                // Cancellation of the sheet is also a fresh responder visit.
+                // Install happens only after this owned task clears its fence.
+                if self.navigation.phase == .inactive, self.selectedSession?.terminal != nil,
+                   self.selectedSession?.paneNavigationBusy != true {
+                    try await self.navigation.activateSelection()
+                }
+            } catch {
+                if !Task.isCancelled, self.overviewGeneration == generation, !self.closed {
+                    self.report(error)
+                }
+            }
+        }
+        overviewJob = (id, task)
+    }
+
+    private func checkOverviewNavigation(_ generation: UUID) throws {
+        try Task.checkCancellation()
+        guard overviewGeneration == generation, !closed, foreground, onScreen else { throw CancellationError() }
+    }
+
+    private func cancelOverview() {
+        overviewGeneration = UUID(); overviewPresented = false
+        // Keep the closing sheet's slot until its exact dismissal arrives.
+        // Otherwise an old onDismiss could consume a newly opened picker.
+        if closed { overviewVisit = nil }
+        overviewChoice = nil; overviewCatalogID = nil; overviewBuildID = nil
+        overviewJob?.task.cancel()
+    }
+
     func status(of machineID: String) -> Status {
         guard machines.first(where: { $0.id == machineID })?.target != nil else { return .unavailable }
         if disconnected.contains(machineID) { return .disconnected }
@@ -164,6 +363,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// keyboard and rendering stop until it returns.
     func disappear() {
         guard !closed else { return }
+        cancelOverview()
         onScreen = false
         canvasGeneration = UUID()
         appearanceSelection = nil
@@ -173,6 +373,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func setForeground(_ active: Bool) {
         guard !closed else { return }
+        if !active { cancelOverview() }
         if foreground != active { canvasGeneration = UUID() }
         foreground = active
         if active {
@@ -183,7 +384,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             }
             inBackground = false
         }
-        if active && onScreen { navigation.resume() } else { navigation.suspend() }
+        if active && onScreen && !overviewBlocksInput { navigation.resume() } else { navigation.suspend() }
         updatePresentationVisibility()
         guard active else { return }
         reconcile()
@@ -224,7 +425,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Switches the screen to a machine, through the same focus barrier as
     /// every other navigation.
     func select(_ machineID: String) {
-        guard !closed, machineID != selectedMachineID else { return }
+        guard !closed, !overviewBlocksInput, machineID != selectedMachineID else { return }
         Task {
             do {
                 try await whileBusy {
@@ -238,7 +439,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Pane traversal is a separate ring. At either end it wraps within this
     /// machine; zero or one pane never falls through to another machine.
     func stepPane(forward: Bool) {
-        guard !closed, let session = selectedSession, session.phase == .live,
+        guard !closed, !overviewBlocksInput, let session = selectedSession, session.phase == .live,
               let control = session.muxControl else { return }
         do {
             if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
@@ -246,7 +447,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     var permitsCanvasNavigation: Bool {
-        !closed && foreground && onScreen && appearanceSelection == nil
+        !closed && foreground && onScreen && !overviewBlocksInput && appearanceSelection == nil
             && selectedSession?.clipboardIsPresenting != true
             && selectedSession?.paneNavigationBusy != true
             && selectedSession?.terminal?.remoteMouseGrabbed != true
@@ -499,11 +700,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Re-establishes the keyboard after its input generation ended (dismissed
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
     func activateKeyboard() async {
-        guard !closed, onScreen, selectedSession?.clipboardIsPresenting != true,
+        guard !closed, onScreen, !overviewBlocksInput, selectedSession?.clipboardIsPresenting != true,
               navigation.phase == .inactive, let selection = navigation.navigation.selection,
               selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
         await owner.joinSealed()
-        guard !closed, foreground, navigation.navigation.selection == selection,
+        guard !closed, foreground, !overviewBlocksInput, navigation.navigation.selection == selection,
               selectedSession?.clipboardIsPresenting != true else { return }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
@@ -521,6 +722,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func requestClose() {
         guard !closed else { return }
         closed = true
+        cancelOverview()
         canvasGeneration = UUID()
         cancelReconnects()
         for job in controllerJobs.values { job.task.cancel() }
@@ -539,7 +741,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let controllers = Array(sessions.values), navigation = self.navigation
         let reconnects = reconnectJobs.values.map(\.task)
         let operations = controllerJobs.values.map(\.task)
+        let overview = overviewJob?.task
         let job = Task {
+            if let overview { await overview.value }
             for reconnect in reconnects { await reconnect.value }
             for controller in controllers { await controller.stop() }
             for operation in operations { await operation.value }
@@ -574,19 +778,23 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
         if appearanceSelection == selectedMachineID { appearanceSelection = nil }
         updatePresentationVisibility()
-        if onScreen, let session = selectedSession, session.phase == .live, session.terminal == nil { session.showView() }
+        if onScreen, !overviewBlocksInput, let session = selectedSession, session.phase == .live, session.terminal == nil { session.showView() }
         reconcile()
-        guard navigation.phase == .ready, let selection, selection.paneID != nil,
+        guard !overviewBlocksInput, navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
         sessions[selection.machineID]?.install(keyboard)
     }
 
     private func isVisible(_ machineID: String) -> Bool {
-        permitsTerminalCreation && onScreen && appearanceSelection == nil && machineID == selectedMachineID
+        !closed && foreground && !inBackground && onScreen && appearanceSelection == nil
+            && (!overviewBlocksInput || overviewAllowsTargetPresentation) && machineID == selectedMachineID
     }
 
     private func updatePresentationVisibility() {
-        for (machineID, controller) in sessions { controller.setPresentationVisible(isVisible(machineID)) }
+        for (machineID, controller) in sessions {
+            controller.setOverviewBlocking(overviewBlocksInput)
+            controller.setPresentationVisible(isVisible(machineID))
+        }
     }
 
     /// Navigation refuses overlapping transactions; a gesture in flight ends
@@ -601,7 +809,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: TerminalSessionFocus
 
-    var permitsTerminalCreation: Bool { !closed && foreground && !inBackground }
+    var permitsTerminalCreation: Bool { !closed && foreground && !inBackground && !overviewBlocksInput }
 
     func shows(machineID: String) -> Bool { isVisible(machineID) }
 
@@ -722,6 +930,7 @@ struct WorkspaceTerminalScreen: View {
 
     var body: some View {
         let machine = scene.selectedMachine
+        let overviewSessionID = scene.overviewSessionID
         let backgroundHex = machine.flatMap { scene.themes[$0.id]?.background }
         let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
         VStack(spacing: 0) {
@@ -763,6 +972,11 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
         .sheet(item: $muxSearch) { session in MuxSearchScreen(session: session) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
+        .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
+            if !visible { scene.dismissOverview() }
+        }), onDismiss: { if let overviewSessionID { scene.finishOverviewDismissal(overviewSessionID) } }) {
+            WorkspaceFleetOverviewScreen(scene: scene)
+        }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
         .task {
@@ -783,6 +997,9 @@ struct WorkspaceTerminalScreen: View {
 
     @ToolbarContentBuilder private func toolbar(_ machine: SceneMachine?) -> some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
+            Button("Fleet Overview", systemImage: "square.grid.2x2") { scene.beginOverview() }
+                .keyboardShortcut("k", modifiers: .command)
+                .accessibilityIdentifier("terminal.fleet.open")
             if let session = scene.selectedSession, session.phase == .live, session.terminal != nil {
                 if session.historyReturnBookmark != nil {
                     Button("Return to Previous View", systemImage: "arrow.uturn.backward") { session.returnFromHistorySearch() }
@@ -1250,5 +1467,170 @@ private final class WorkspaceCanvasView: UIView {
             UIView.transition(with: canvas, duration: 0.18, options: [.transitionCrossDissolve, .allowUserInteraction],
                               animations: swap)
         } else { swap() }
+    }
+}
+
+/// Search the discovered fleet, not terminal contents. The immutable snapshot
+/// does not stream previews or silently open connections. A refresh is explicit;
+/// its source-bound choices are checked again when the sheet has dismissed.
+private struct WorkspaceFleetOverviewScreen: View {
+    let scene: WorkspaceTerminalScene
+    @State private var catalog: TerminalFleetOverview?
+    @State private var query = TerminalFleetOverview.Query()
+    @State private var results: TerminalFleetOverview.Results?
+    @State private var resultsKey: SearchKey?
+    @State private var refresh = UUID()
+    @State private var loading = false
+    @State private var loadFailure: String?
+    @State private var searchFailure: String?
+    @State private var selectionFailure: String?
+    private struct SearchKey: Hashable {
+        let catalogID: UUID?
+        let query: TerminalFleetOverview.Query
+    }
+    private var searchKey: SearchKey { .init(catalogID: catalog?.id, query: query) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("Browse known machines and discovered panes. This snapshot does not connect to machines or search terminal output.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let catalog {
+                        Text("\(catalog.machineCount) machines · \(catalog.paneCount) discovered panes")
+                            .font(.caption).monospacedDigit()
+                    }
+                    Picker("Show", selection: $query.scope) {
+                        Text("All").tag(TerminalFleetOverview.Scope.all)
+                        Text("Machines").tag(TerminalFleetOverview.Scope.machines)
+                        Text("Panes").tag(TerminalFleetOverview.Scope.panes)
+                    }.pickerStyle(.segmented)
+                    Picker("Status at refresh", selection: $query.filter) {
+                        Text("Any status").tag(TerminalFleetOverview.Filter.all)
+                        Text("Connected or signed in").tag(TerminalFleetOverview.Filter.connected)
+                        Text("Needs attention").tag(TerminalFleetOverview.Filter.attention)
+                    }
+                }
+                if let selectionFailure {
+                    Text(verbatim: selectionFailure).font(.callout).foregroundStyle(.orange)
+                }
+                if loading {
+                    ProgressView("Reading known inventory…")
+                } else if let loadFailure {
+                    Text(verbatim: loadFailure).foregroundStyle(.orange)
+                } else if catalog != nil {
+                    if let searchFailure {
+                        Text(verbatim: searchFailure).foregroundStyle(.orange)
+                    } else if let results, resultsKey == searchKey {
+                        Section {
+                            if results.rows.isEmpty {
+                                Text("No matches in this snapshot. Change the filters or refresh the inventory.")
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(results.rows) { row in
+                                Button { choose(row.id) } label: { resultRow(row) }
+                                    .buttonStyle(.plain)
+                                    .accessibilityHint(row.paneID == nil ? "Show this machine" : "Show this exact pane")
+                            }
+                        } header: {
+                            Text(results.limited
+                                ? "Showing \(results.rows.count) of \(results.matchingCount) matches. Narrow the search for more."
+                                : "\(results.matchingCount) matches")
+                        }
+                    } else { ProgressView("Filtering inventory…") }
+                }
+            }
+            .navigationTitle("Fleet Overview")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query.text, placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "Machine, host, pane, tab, or directory")
+            .textInputAutocapitalization(.never).autocorrectionDisabled()
+            .onSubmit(of: .search) {
+                // Return is an explicit shortcut only for an unambiguous result.
+                if let results, resultsKey == searchKey, results.matchingCount == 1, let row = results.rows.first {
+                    choose(row.id)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { scene.dismissOverview() }.keyboardShortcut(.cancelAction)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Refresh", systemImage: "arrow.clockwise") {
+                        catalog = nil; results = nil; resultsKey = nil
+                        selectionFailure = nil; searchFailure = nil; loadFailure = nil
+                        refresh = UUID()
+                    }.disabled(loading).accessibilityIdentifier("terminal.fleet.refresh")
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .task(id: refresh) { await reload() }
+        .task(id: searchKey) { await filter() }
+    }
+
+    private func reload() async {
+        let request = refresh
+        loading = true; loadFailure = nil
+        defer { if refresh == request { loading = false } }
+        do {
+            let snapshot = try await scene.makeOverview()
+            try Task.checkCancellation()
+            guard refresh == request, scene.overviewPresented else { return }
+            catalog = snapshot
+        } catch {
+            if !Task.isCancelled, refresh == request, scene.overviewPresented {
+                loadFailure = TerminalSessionController.describe(error)
+            }
+        }
+    }
+
+    private func filter() async {
+        let key = searchKey
+        results = nil; resultsKey = nil; searchFailure = nil
+        guard let catalog else { return }
+        do {
+            try await Task.sleep(for: .milliseconds(120))
+            let query = key.query
+            let filtered = try await withThrowingTaskGroup(of: TerminalFleetOverview.Results.self) { group in
+                group.addTask { try catalog.search(query) }
+                guard let result = try await group.next() else { throw CancellationError() }
+                return result
+            }
+            try Task.checkCancellation()
+            guard key == searchKey, scene.overviewPresented else { return }
+            results = filtered; resultsKey = key
+        } catch {
+            if !Task.isCancelled, key == searchKey, scene.overviewPresented {
+                searchFailure = TerminalSessionController.describe(error)
+            }
+        }
+    }
+
+    private func choose(_ choice: TerminalFleetOverview.Choice) {
+        guard let catalog, resultsKey == searchKey, results?.rows.contains(where: { $0.id == choice }) == true else { return }
+        do { try scene.chooseOverview(choice, in: catalog) }
+        catch { selectionFailure = TerminalSessionController.describe(error) }
+    }
+
+    private func resultRow(_ row: TerminalFleetOverview.Row) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: row.paneID == nil ? "desktopcomputer" : "rectangle.split.2x1")
+                .foregroundStyle(Color(ftHex: scene.themes[row.machineID]?.accent ?? "#3B82F6"))
+                .frame(width: 24).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                if let pane = row.paneID {
+                    Text(verbatim: "\(row.machineName) · Pane \(pane)").font(.caption).foregroundStyle(.secondary)
+                }
+                Text(verbatim: row.title).font(.body.weight(row.selected ? .semibold : .regular)).lineLimit(2)
+                if !row.detail.isEmpty { Text(verbatim: row.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
+                Text(verbatim: row.status.label).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if row.selected { Image(systemName: "checkmark.circle.fill").accessibilityLabel("Selected at refresh") }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }

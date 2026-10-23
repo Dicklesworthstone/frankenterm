@@ -244,6 +244,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var clipboard: NativeTerminalClipboardController?
     @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
     @ObservationIgnored private var presentationVisible = true
+    @ObservationIgnored private var overviewBlocking = false
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
     @ObservationIgnored private var history: TerminalHistorySelection<TerminalSource>?
     @ObservationIgnored private var lastViewportRevision: UInt64 = 0
@@ -303,6 +304,26 @@ final class TerminalSessionController {
 
     var clipboardIsPresenting: Bool {
         clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
+    }
+
+    /// The fleet picker owns the text responder while open. Its machine/pane
+    /// navigation may prepare a destination, but no late view build, caret or
+    /// responder publication can enable shell input behind that picker.
+    func setOverviewBlocking(_ blocked: Bool) {
+        guard overviewBlocking != blocked else { return }
+        overviewBlocking = blocked
+        if blocked {
+            viewAttachment?.cancel()
+            terminal?.input.retire(); keyboard?.suspend()
+            connection?.muxControl?.inputRouting.discardPointers()
+        }
+    }
+
+    /// A cancelled display build still owns its resources until it settles.
+    /// The picker joins it before starting a competing pane/view transition.
+    func waitForOverviewPresentation() async {
+        if let viewAttachment { await viewAttachment.value }
+        if let paneHandoff { await paneHandoff.value }
     }
     func beginMuxSearch() {
         guard !stopped, phase == .live, presentationVisible else { return }
@@ -565,7 +586,7 @@ final class TerminalSessionController {
         // An activation may have started before a read-only sheet opened and
         // completed its handoff afterwards. Seal that newly published responder
         // before it can acquire hardware input behind the inspection surface.
-        guard !clipboardIsPresenting, paneHandoff == nil, requestedMuxPane == nil,
+        guard !overviewBlocking, !clipboardIsPresenting, paneHandoff == nil, requestedMuxPane == nil,
               connection?.muxControl.map({ $0.inputRouting.current.ready
                   && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
             keyboard.suspend()
@@ -777,7 +798,7 @@ final class TerminalSessionController {
     /// Puts a live session on screen: the scene's keyboard, the Metal view and
     /// what follows the view. Idempotent; teardown joins it.
     func showView() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
               focus?.shows(machineID: target.machineID) == true,
               terminal == nil, viewAttachment == nil,
               paneHandoff == nil, requestedMuxPane == nil,
@@ -796,7 +817,7 @@ final class TerminalSessionController {
         let expectedMux = connection?.muxControl?.inputRouting.current.destination
         func checkLive() throws {
             try Task.checkCancellation()
-            guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+            guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
                   focus?.shows(machineID: target.machineID) == true,
                   requestedMuxPane == nil,
                   connection?.muxControl?.inputRouting.current.destination == expectedMux,
@@ -857,7 +878,7 @@ final class TerminalSessionController {
             setPresentationVisible(presentationVisible)
             view.requestKeyboard(presentationVisible)
         } catch {
-            let superseded = Task.isCancelled || stopped || !presentationVisible || clipboardIsPresenting
+            let superseded = Task.isCancelled || stopped || overviewBlocking || !presentationVisible || clipboardIsPresenting
                 || focus?.shows(machineID: target.machineID) != true
                 || connection?.muxControl?.inputRouting.current.destination != expectedMux
             if superseded || error is CancellationError {
@@ -870,7 +891,7 @@ final class TerminalSessionController {
     private func submitPointer(_ action: TerminalMuxInputRouting.PointerAction,
                                destination: TerminalMuxInputRouting.Destination,
                                control: TerminalMuxControl, view: NativeTerminalView) {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
               paneHandoff == nil, terminal === view, connection?.muxControl === control,
               displayedMuxDestination == destination else { return }
         do {
