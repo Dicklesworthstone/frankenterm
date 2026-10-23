@@ -47,10 +47,28 @@ pub(super) fn surface_to_buffer(surface: i32, scale: f64) -> i32 {
     (f64::from(surface) * scale).round() as i32
 }
 
-/// Surface-local length for a buffer length. For scales of 1 or more this
-/// inverts [`surface_to_buffer`] exactly.
+/// Surface-local length for a buffer length: the smallest surface length
+/// whose buffer ([`surface_to_buffer`]) has at least `pixels` pixels. For
+/// scales of 1 or more that inverts [`surface_to_buffer`] exactly. A length
+/// no surface produces, such as a whole number of cells the GUI asks for
+/// with `set_inner_size`, rounds up rather than to the nearest surface
+/// length: at 1.75, 888 pixels is a 508 surface (889 pixels), where 507
+/// would be one pixel short and lose the last terminal row or column.
 pub(super) fn buffer_to_surface(pixels: i32, scale: f64) -> i32 {
-    (f64::from(pixels) / scale).round() as i32
+    if pixels <= 0 {
+        return 0;
+    }
+    // round(surface * scale) >= pixels exactly when
+    // surface * scale >= pixels - 0.5.
+    let mut surface = ((f64::from(pixels) - 0.5) / scale).ceil() as i32;
+    // Settle any floating-point error against surface_to_buffer itself.
+    while surface < i32::MAX && surface_to_buffer(surface, scale) < pixels {
+        surface += 1;
+    }
+    while surface > 1 && surface_to_buffer(surface - 1, scale) >= pixels {
+        surface -= 1;
+    }
+    surface
 }
 
 /// The buffer pixel that contains a surface-local pointer coordinate.
@@ -264,6 +282,43 @@ mod tests {
                     numerator,
                     surface,
                     buffer
+                );
+            }
+        }
+    }
+
+    /// The GUI asks for a buffer size that holds a whole number of cells
+    /// (`set_inner_size` after a scale or font change, resize increments).
+    /// The surface size it is turned into must give back at least that many
+    /// pixels: one pixel short drops the last terminal row or column.
+    #[test]
+    fn a_requested_buffer_size_is_never_rounded_down() {
+        // 888 / 1.75 = 507.43; a 507 surface is only 887 pixels.
+        assert_eq!(buffer_to_surface(888, 1.75), 508);
+        assert_eq!(surface_to_buffer(508, 1.75), 889);
+        // Degenerate lengths stay defined instead of overflowing.
+        assert_eq!(buffer_to_surface(0, 1.75), 0);
+        assert_eq!(buffer_to_surface(i32::MAX, 0.5), i32::MAX);
+        for numerator in 120..=360 {
+            let scale = scale_from_wire(numerator).unwrap();
+            for pixels in 1..3000 {
+                let surface = buffer_to_surface(pixels, scale);
+                assert!(
+                    surface_to_buffer(surface, scale) >= pixels,
+                    "scale {}/120: {} pixels became surface {}, only {} pixels",
+                    numerator,
+                    pixels,
+                    surface,
+                    surface_to_buffer(surface, scale)
+                );
+                // And no larger than needed.
+                assert!(
+                    surface == 1 || surface_to_buffer(surface - 1, scale) < pixels,
+                    "scale {}/120: {} pixels became surface {}, but {} is enough",
+                    numerator,
+                    pixels,
+                    surface,
+                    surface - 1
                 );
             }
         }
