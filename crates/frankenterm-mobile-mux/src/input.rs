@@ -1,20 +1,23 @@
 //! The phone terminal's input, turned into what the desktop app sends.
 //!
-//! The phone encodes keys in its own terminal's modes, which never follow
-//! the remote program's (application cursor keys, keypad, kitty keyboard):
-//! the v46 protocol does not report them. So the sequences of keys whose
-//! encoding depends on those modes go to the server as key presses, which
-//! it encodes for the pane exactly as for the desktop. The mirror turns on
-//! bracketed paste in the phone's terminal; a bracketed paste goes to the
-//! server as a paste, which it brackets again only if the program asked.
-//! Everything else is sent as the bytes it is.
+//! Keys whose encoding depends on the remote program's modes go to the server
+//! as key presses. The mirror enables bracketed paste locally; pasted text goes
+//! to the server as a paste, which it brackets only when the program asked.
+//! Other bytes retain their order. The opening paste marker and each encoded
+//! key must arrive in one write; this is not an arbitrary ANSI stream parser.
+//! Once a paste starts, its text and closing marker may span arbitrary writes.
 
+use std::collections::HashMap;
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
-/// A paste longer than this goes to the server in parts as it arrives.
+/// Long pastes are sent in bounded pieces, never through the middle of a valid
+/// UTF-8 scalar or a possible closing delimiter.
 const MAX_PASTE_BYTES: usize = 1 << 20;
+const MAX_PASTE_BUFFER: usize = MAX_PASTE_BYTES + PASTE_END.len();
+const MAX_PENDING_PANES: usize = 16;
+const MAX_PENDING_CAPACITY: usize = 2 * MAX_PASTE_BUFFER;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
@@ -23,7 +26,9 @@ pub enum Piece {
     Paste(String),
 }
 
-/// Splits input as it is written; a paste may span several writes.
+/// One destination's input stream. An Escape key is deliberately not held for
+/// lookahead: decoding arbitrary fragments of key/opening-marker sequences
+/// would require an explicit semantic operation boundary from the caller.
 #[derive(Debug, Default)]
 pub struct InputSplitter {
     paste: Option<Vec<u8>>,
@@ -35,25 +40,30 @@ impl InputSplitter {
         let mut text = Vec::new();
         while !rest.is_empty() {
             if let Some(paste) = &mut self.paste {
-                // Search from just before the new bytes: the end marker may
-                // have been split between two writes.
-                let from = paste.len().saturating_sub(PASTE_END.len() - 1);
-                paste.extend_from_slice(rest);
-                rest = &[];
-                if let Some(at) = find(&paste[from..], PASTE_END).map(|at| from + at) {
-                    let after = paste.split_off(at + PASTE_END.len());
-                    paste.truncate(at);
-                    let done = std::mem::take(paste);
-                    self.paste = None;
-                    pieces.push(Piece::Paste(String::from_utf8_lossy(&done).into_owned()));
-                    // The rest is processed after the paste, in order.
-                    let mut after_pieces = self.split(&after);
-                    pieces.append(&mut after_pieces);
-                    return pieces;
+                // Consume incrementally. Copying all of `rest` first can exceed
+                // the cap, and recursively processing its suffix can overflow
+                // the stack on many adjacent pastes in a single write.
+                if paste.len() == paste.capacity() {
+                    let capacity = paste.capacity().max(1024);
+                    let next = capacity.saturating_mul(2).min(MAX_PASTE_BUFFER);
+                    paste.reserve_exact(next - paste.len());
                 }
-                if paste.len() > MAX_PASTE_BYTES {
-                    let part = std::mem::take(paste);
-                    pieces.push(Piece::Paste(String::from_utf8_lossy(&part).into_owned()));
+                paste.push(rest[0]);
+                rest = &rest[1..];
+                if paste.ends_with(PASTE_END) {
+                    paste.truncate(paste.len() - PASTE_END.len());
+                    pieces.push(Piece::Paste(String::from_utf8_lossy(paste).into_owned()));
+                    self.paste = None;
+                } else if paste.len() == MAX_PASTE_BUFFER {
+                    // Six bytes of lookbehind keep every proper delimiter
+                    // prefix. Moving back by up to three further bytes keeps a
+                    // valid scalar whole when its continuation crosses the cap.
+                    let mut end = MAX_PASTE_BYTES;
+                    while end > MAX_PASTE_BYTES - 3 && paste[end] & 0xc0 == 0x80 {
+                        end -= 1;
+                    }
+                    pieces.push(Piece::Paste(String::from_utf8_lossy(&paste[..end]).into_owned()));
+                    paste.drain(..end);
                 }
                 continue;
             }
@@ -76,18 +86,77 @@ impl InputSplitter {
         pieces
     }
 
-    /// A paste has begun and its end has not arrived yet.
     pub fn in_paste(&self) -> bool {
         self.paste.is_some()
     }
 
-    /// The part of an unfinished paste received so far, ending it: its
-    /// writer stopped, or input moved on to another pane.
+    /// Explicitly ends this splitter's pending paste. Normal pane navigation
+    /// must not call this: the registration-scoped owner retains that state.
     pub fn take_pending(&mut self) -> Option<String> {
         self.paste
             .take()
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn retained_capacity(&self) -> usize {
+        self.paste.as_ref().map_or(0, Vec::capacity)
+    }
+}
+
+/// Separate unfinished pastes for separate pane registrations. Switching focus
+/// is not an end-of-paste marker. Removing a pane or closing the connection
+/// discards its unfinished local fragment; neither action sends more commands.
+/// This tracks observed registrations, not a server-supplied incarnation.
+#[derive(Debug, Default)]
+pub struct PaneInput {
+    pending: HashMap<usize, InputSplitter>,
+    retained_capacity: usize,
+}
+
+impl PaneInput {
+    pub fn split(&mut self, pane: usize, data: &[u8]) -> Result<Vec<Piece>, &'static str> {
+        let mut input = self.pending.remove(&pane).unwrap_or_default();
+        self.retained_capacity -= input.retained_capacity();
+        let pieces = input.split(data);
+        if input.in_paste() {
+            let charge = input.retained_capacity();
+            if self.pending.len() >= MAX_PENDING_PANES
+                || charge > MAX_PENDING_CAPACITY.saturating_sub(self.retained_capacity)
+            {
+                // No pieces from this call have escaped to the session. Its
+                // caller must fail the connection, never retry this write.
+                self.clear();
+                return Err("unfinished mux paste capacity exceeded");
+            }
+            self.retained_capacity += charge;
+            self.pending.insert(pane, input);
+        }
+        Ok(pieces)
+    }
+
+    pub fn remove(&mut self, pane: usize) {
+        if let Some(input) = self.pending.remove(&pane) {
+            self.retained_capacity -= input.retained_capacity();
+        }
+    }
+
+    pub fn retain(&mut self, mut is_live: impl FnMut(usize) -> bool) {
+        let mut released = 0;
+        self.pending.retain(|pane, input| {
+            if is_live(*pane) {
+                true
+            } else {
+                released += input.retained_capacity();
+                false
+            }
+        });
+        self.retained_capacity -= released;
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.retained_capacity = 0;
     }
 }
 
@@ -97,13 +166,6 @@ fn flush(pieces: &mut Vec<Piece>, text: &mut Vec<u8>) {
     }
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// The xterm modifier parameter (1 + shift 1, alt 2, ctrl 4).
 fn modifiers(parameter: u32) -> Option<Modifiers> {
     let bits = parameter.checked_sub(1)?;
     if bits > 7 {
@@ -164,8 +226,6 @@ fn tilde_key(number: u32) -> Option<KeyCode> {
     })
 }
 
-/// The key whose sequence starts `bytes`, as the phone's terminal encodes
-/// it in its default modes, and the sequence's length.
 fn key_at(bytes: &[u8]) -> Option<(KeyEvent, usize)> {
     let event = |key, modifiers| KeyEvent { key, modifiers };
     match bytes.get(..2)? {
@@ -213,6 +273,16 @@ mod tests {
 
     fn key(key: KeyCode, modifiers: Modifiers) -> Piece {
         Piece::Key(KeyEvent { key, modifiers })
+    }
+
+    fn pasted(pieces: Vec<Piece>) -> String {
+        pieces
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Paste(text) => text,
+                other => panic!("unexpected non-paste piece: {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -264,5 +334,150 @@ mod tests {
             input.split(b"\x1b[200~\x1b[A\x1b[201~"),
             [Piece::Paste("\x1b[A".into())]
         );
+    }
+
+    #[test]
+    fn end_marker_survives_every_chunk_boundary_near_the_paste_cap() {
+        for offset in 0..=PASTE_END.len() + 3 {
+            for split in 0..=PASTE_END.len() {
+                let mut input = InputSplitter::default();
+                let text = "x".repeat(MAX_PASTE_BYTES + offset);
+                let mut expected = input.split(PASTE_START);
+                expected.extend(input.split(text.as_bytes()));
+                expected.extend(input.split(&PASTE_END[..split]));
+                expected.extend(input.split(&PASTE_END[split..]));
+                assert_eq!(pasted(expected), text, "offset {offset}, split {split}");
+                assert!(!input.in_paste());
+            }
+        }
+    }
+
+    #[test]
+    fn valid_unicode_is_never_replaced_at_the_chunk_cap() {
+        for scalar in ["é", "中", "🙂"] {
+            for offset in 0..4 {
+                let text = "x".repeat(MAX_PASTE_BYTES - offset) + &scalar.repeat(16);
+                for chunk in [1, 5, 16_384, MAX_PASTE_BUFFER + 1] {
+                    let mut input = InputSplitter::default();
+                    let mut output = input.split(PASTE_START);
+                    for bytes in text.as_bytes().chunks(chunk) {
+                        output.extend(input.split(bytes));
+                    }
+                    output.extend(input.split(PASTE_END));
+                    assert_eq!(pasted(output), text, "{scalar:?}, offset {offset}, chunk {chunk}");
+                    assert!(!input.in_paste());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn many_adjacent_pastes_do_not_recurse_or_reorder_plain_text() {
+        let mut bytes = Vec::new();
+        for _ in 0..10_000 {
+            bytes.extend_from_slice(b"x\x1b[200~y\x1b[201~");
+        }
+        let output = InputSplitter::default().split(&bytes);
+        assert_eq!(output.len(), 20_000);
+        for pair in output.chunks_exact(2) {
+            assert_eq!(pair, [Piece::Bytes(b"x".to_vec()), Piece::Paste("y".into())]);
+        }
+    }
+
+    #[test]
+    fn retained_allocation_and_each_large_paste_piece_are_bounded() {
+        let mut input = InputSplitter::default();
+        input.split(PASTE_START);
+        let output = input.split(&vec![b'x'; MAX_PASTE_BYTES * 4]);
+        assert!(input.retained_capacity() <= MAX_PASTE_BUFFER);
+        for piece in &output {
+            let Piece::Paste(text) = piece else { panic!("expected paste") };
+            assert!(text.len() <= MAX_PASTE_BYTES);
+        }
+        let mut complete = output;
+        complete.extend(input.split(PASTE_END));
+        assert_eq!(pasted(complete), "x".repeat(MAX_PASTE_BYTES * 4));
+        assert_eq!(input.retained_capacity(), 0);
+    }
+
+    #[test]
+    fn marker_like_text_is_not_consumed_as_a_delimiter() {
+        let text = "a\u{1b}[201x\u{1b}[20\u{1b}[201\u{1b}[200~b";
+        let mut input = InputSplitter::default();
+        input.split(PASTE_START);
+        let mut output = Vec::new();
+        for byte in text.as_bytes() {
+            output.extend(input.split(&[*byte]));
+        }
+        output.extend(input.split(PASTE_END));
+        assert_eq!(pasted(output), text);
+    }
+
+    #[test]
+    fn switching_panes_does_not_finish_or_retarget_an_unfinished_paste() {
+        let mut input = PaneInput::default();
+        assert!(input.split(10, b"\x1b[200~first ").unwrap().is_empty());
+        assert_eq!(
+            input.split(20, b"command\r").unwrap(),
+            [Piece::Bytes(b"command\r".to_vec())]
+        );
+        assert!(input.split(20, b"\x1b[200~second ").unwrap().is_empty());
+        assert_eq!(
+            input.split(10, b"pane\x1b[201~").unwrap(),
+            [Piece::Paste("first pane".into())]
+        );
+        assert_eq!(
+            input.split(20, b"pane\x1b[201~").unwrap(),
+            [Piece::Paste("second pane".into())]
+        );
+        assert!(input.pending.is_empty());
+        assert_eq!(input.retained_capacity, 0);
+    }
+
+    #[test]
+    fn pane_removal_inventory_removal_and_close_discard_without_flush() {
+        let mut input = PaneInput::default();
+        input.split(1, b"\x1b[200~discard").unwrap();
+        input.split(2, b"\x1b[200~retain").unwrap();
+        input.remove(1);
+        assert_eq!(input.split(1, b"new").unwrap(), [Piece::Bytes(b"new".to_vec())]);
+        assert_eq!(input.split(2, PASTE_END).unwrap(), [Piece::Paste("retain".into())]);
+        input.split(1, b"\x1b[200~old").unwrap();
+        input.split(2, b"\x1b[200~old").unwrap();
+        input.retain(|pane| pane == 2);
+        assert!(!input.pending.contains_key(&1));
+        assert!(input.pending.contains_key(&2));
+        input.clear();
+        assert!(input.pending.is_empty());
+        assert_eq!(input.retained_capacity, 0);
+    }
+
+    #[test]
+    fn pending_pane_limit_does_not_block_other_panes_plain_input() {
+        let mut input = PaneInput::default();
+        for pane in 0..MAX_PENDING_PANES {
+            input.split(pane, PASTE_START).unwrap();
+        }
+        assert_eq!(input.split(100, b"x").unwrap(), [Piece::Bytes(b"x".to_vec())]);
+        assert!(input.split(100, PASTE_START).is_err());
+        assert!(input.pending.is_empty());
+        assert_eq!(input.retained_capacity, 0);
+    }
+
+    #[test]
+    fn pending_capacity_counts_allocations_and_is_released_with_the_pane() {
+        let mut input = PaneInput::default();
+        for pane in 0..2 {
+            input.split(pane, PASTE_START).unwrap();
+            input.split(pane, &vec![b'x'; MAX_PASTE_BYTES]).unwrap();
+        }
+        assert!(input.retained_capacity <= MAX_PENDING_CAPACITY);
+        input.split(2, PASTE_START).unwrap();
+        assert!(input.split(2, &vec![b'x'; MAX_PASTE_BYTES]).is_err());
+        assert_eq!(input.retained_capacity, 0);
+        input.split(3, b"\x1b[200~x").unwrap();
+        assert!(input.retained_capacity > 0);
+        input.remove(3);
+        assert_eq!(input.retained_capacity, 0);
     }
 }
