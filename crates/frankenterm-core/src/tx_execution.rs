@@ -3657,12 +3657,25 @@ pub struct TxRollbackExecutionResult {
     pub compensation_report: TxCompensationReport,
     /// Observability events emitted while gating and compensating.
     pub events: Vec<TxObservabilityEvent>,
-    /// Execution ledger, including its terminal phase and hash chain.
+    /// Execution ledger and hash chain. A proven-only partial rollback remains
+    /// in Compensating without a terminal disposition certificate.
     pub ledger: TxExecutionLedger,
     /// Decision-path trace for the rollback operation.
     pub decision_path: String,
     /// Globally unique, timestamp-sortable rollback execution identifier.
     pub execution_id: String,
+}
+
+/// Read-only explicit rollback preflight. The projected receipts remain local
+/// until proof, gates and durable ledger admission have all succeeded. Holding
+/// the lease set freezes every commit and declared compensation key throughout
+/// that handoff and the eventual compensation dispatch.
+struct DurableRollbackPreparation {
+    commit_report: TxCommitReport,
+    original_commit_outcomes: HashMap<String, StepOutcome>,
+    proof_leases: DurableKeyLeaseSet,
+    projected_contract: Option<MissionTxContract>,
+    unresolved_step_ids: Vec<String>,
 }
 
 /// Canonical overall outcome represented by a transaction lifecycle state.
@@ -4374,25 +4387,26 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             .validate()
             .map_err(TxExecutionError::InvalidContract)?;
         validate_tx_contract_state_outcome(contract).map_err(TxExecutionError::InvalidContract)?;
-        let logical_now_ms = checked_logical_now_ms(now_ms)?;
-        let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
-            .map_err(TxExecutionError::CompensationPhase)?;
         let mut rollback_proof_leases = None;
         let mut prevalidated_original_commit_outcomes = None;
-        if let Some(store) = store.as_deref_mut() {
-            let (outcomes, leases) = Self::acquire_atomic_compensation_proof(
-                contract,
-                &mut commit_report,
-                store,
-                logical_now_ms,
-            )?;
-            prevalidated_original_commit_outcomes = Some(outcomes);
-            rollback_proof_leases = Some(leases);
-        }
+        let mut projected_contract = None;
+        let mut unresolved_step_ids = Vec::new();
+        let commit_report = if let Some(store) = store.as_deref_mut() {
+            let prepared = Self::prepare_durable_explicit_rollback(contract, store, now_ms)?;
+            prevalidated_original_commit_outcomes = Some(prepared.original_commit_outcomes);
+            rollback_proof_leases = Some(prepared.proof_leases);
+            projected_contract = prepared.projected_contract;
+            unresolved_step_ids = prepared.unresolved_step_ids;
+            prepared.commit_report
+        } else {
+            mission_tx_rollback_commit_report(contract, now_ms)
+                .map_err(TxExecutionError::CompensationPhase)?
+        };
+        let preflight_contract = projected_contract.as_ref().unwrap_or(contract);
         validate_receipt_sequence_capacity(
-            contract,
+            preflight_contract,
             Self::compensation_receipt_headroom(
-                contract,
+                preflight_contract,
                 &commit_report,
                 rollback_proof_leases.as_ref(),
             )?,
@@ -4402,7 +4416,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let execution_id = unique_execution_id("rollback", now_ms);
         let mut events = Vec::new();
         let mut decision_path = "rollback".to_string();
-        let economic_hard_stop = contract
+        let economic_hard_stop = preflight_contract
             .economic_hard_stop_decision_current(now_ms)
             .map_err(TxExecutionError::InvalidContract)?;
         let effective_kill_switch = if economic_hard_stop.is_some() {
@@ -4416,29 +4430,44 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         // semantically wrong; dispatch uses this prepared decision just as the
         // normal prepare/commit path does.
         let gate_report = Self::compensation_gate_report(
-            contract,
+            preflight_contract,
             &commit_report,
             rollback_proof_leases.as_ref(),
         )?;
         let compensation_permit = self.validate_compensation_dispatch(
-            contract,
+            preflight_contract,
             &gate_report,
             &execution_id,
             effective_kill_switch,
             now_ms,
         )?;
-        let plan_id = contract.plan.plan_id.0.clone();
-        let compiled_plan = compiled_plan_from_contract(contract);
+        let plan_id = preflight_contract.plan.plan_id.0.clone();
+        let compiled_plan = compiled_plan_from_contract(preflight_contract);
         let mut ledger = TxExecutionLedger::new(&execution_id, &plan_id, compiled_plan.plan_hash);
         if let Some(store) = store.as_deref_mut() {
-            store
-                .abort_and_archive_matching_ledgers(&compiled_plan.plan_id, compiled_plan.plan_hash)
-                .map_err(|err| {
-                    TxExecutionError::LedgerWrite(format!(
-                        "failed to retire prior rollback ledgers for plan {}: {err}",
-                        compiled_plan.plan_id
-                    ))
+            let retirement = if unresolved_step_ids.is_empty() {
+                store.abort_and_archive_matching_ledgers(
+                    &compiled_plan.plan_id,
+                    compiled_plan.plan_hash,
+                )
+            } else {
+                let proof = rollback_proof_leases.as_ref().ok_or_else(|| {
+                    TxExecutionError::InvalidContract(
+                        "partial rollback requires continuously held durable proof".to_string(),
+                    )
                 })?;
+                store.retire_settled_ledgers_for_partial_rollback(
+                    &compiled_plan.plan_id,
+                    compiled_plan.plan_hash,
+                    proof,
+                )
+            };
+            retirement.map_err(|err| {
+                TxExecutionError::LedgerWrite(format!(
+                    "failed to retire prior rollback ledgers for plan {}: {err}",
+                    compiled_plan.plan_id
+                ))
+            })?;
             store
                 .create_ledger(&execution_id, &compiled_plan)
                 .map_err(|err| {
@@ -4460,6 +4489,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             )?;
         }
 
+        // The staged Success receipts become caller-visible only after every
+        // proof/gate/capacity check and durable ledger admission succeeds.
+        // Unknown effects have no new receipt or ledger record.
+        if let Some(projected) = projected_contract {
+            *contract = projected;
+        }
         contract.lifecycle_state = MissionTxState::Compensating;
         contract.outcome = TxOutcome::Pending;
         let (
@@ -4477,6 +4512,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             store.as_deref_mut(),
             prevalidated_original_commit_outcomes.as_ref(),
             rollback_proof_leases.as_mut(),
+            &unresolved_step_ids,
             now_ms,
         )?;
 
@@ -4499,14 +4535,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             },
         )?;
 
-        let terminal_phase = successful_terminal_ledger_phase(contract.lifecycle_state);
-        transition_execution_ledger_pair(
-            &mut ledger,
-            store.as_deref_mut(),
-            &execution_id,
-            terminal_phase,
-        )?;
-        archive_terminal_execution_ledger(&mut ledger, store, &execution_id)?;
+        if unresolved_step_ids.is_empty() {
+            let terminal_phase = successful_terminal_ledger_phase(contract.lifecycle_state);
+            transition_execution_ledger_pair(
+                &mut ledger,
+                store.as_deref_mut(),
+                &execution_id,
+                terminal_phase,
+            )?;
+            archive_terminal_execution_ledger(&mut ledger, store, &execution_id)?;
+        }
         Ok(TxRollbackExecutionResult {
             compensation_report: report,
             events,
@@ -4830,6 +4868,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     store.as_deref_mut(),
                     prevalidated_original_commit_outcomes.as_ref(),
                     compensation_proof_leases.as_mut(),
+                    &[],
                     now_ms,
                 )?;
 
@@ -5362,6 +5401,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         store: Option<&mut IdempotencyStore>,
         prevalidated_original_commit_outcomes: Option<&HashMap<String, StepOutcome>>,
         preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
+        unresolved_step_ids: &[String],
         now_ms: i64,
     ) -> Result<CompensationPhaseOutput, TxExecutionError> {
         if dispatch_permit.execution_id != execution_id
@@ -5458,6 +5498,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 .count();
         }
 
+        if !unresolved_step_ids.is_empty() {
+            report.outcome = crate::plan::TxCompensationOutcome::ReconciliationRequired;
+            report.unresolved_step_ids = unresolved_step_ids.to_vec();
+            report.reason_code = "rollback_reconciliation_required".to_string();
+            if report.error_code.is_none() {
+                report.error_code = Some("tx.compensation.reconciliation_required".to_string());
+            }
+            report.decision_path.push_str("->unresolved_commit_effects");
+        }
+
         let reason = match &report.outcome {
             crate::plan::TxCompensationOutcome::FullyRolledBack => {
                 "tx.compensation.fully_rolled_back"
@@ -5465,6 +5515,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             crate::plan::TxCompensationOutcome::CompensationFailed => "tx.compensation.failed",
             crate::plan::TxCompensationOutcome::NothingToCompensate => {
                 "tx.compensation.nothing_to_compensate"
+            }
+            crate::plan::TxCompensationOutcome::ReconciliationRequired => {
+                "tx.compensation.reconciliation_required"
             }
         };
 
@@ -5857,6 +5910,178 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         }
 
         Ok(commit_inputs)
+    }
+
+    fn prepare_durable_explicit_rollback(
+        contract: &MissionTxContract,
+        store: &mut IdempotencyStore,
+        now_ms: i64,
+    ) -> Result<DurableRollbackPreparation, TxExecutionError> {
+        let mut keys = contract
+            .plan
+            .steps
+            .iter()
+            .map(|step| commit_idempotency_key(contract, &step.step_id.0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for compensation in &contract.plan.compensations {
+            keys.push(compensation_idempotency_key(
+                contract,
+                &compensation.for_step_id.0,
+            )?);
+        }
+        let leases = store
+            .acquire_durable_key_leases(keys, checked_logical_now_ms(now_ms)?)
+            .map_err(classify_rollback_proof_lease_error)?;
+        let mut observed_commits = HashMap::new();
+        let mut first_pending = None;
+        for step in &contract.plan.steps {
+            let key = commit_idempotency_key(contract, &step.step_id.0)?;
+            let observed = leases
+                .get(&key)
+                .ok_or_else(|| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "explicit rollback proof omits commit key for {}",
+                        step.step_id.0
+                    ))
+                })?
+                .observed_outcome()
+                .cloned();
+            if matches!(observed, Some(StepOutcome::Pending)) && first_pending.is_none() {
+                first_pending = Some(step.step_id.0.clone());
+            }
+            observed_commits.insert(step.step_id.0.clone(), observed);
+        }
+
+        // This capability is specific to an orphaned Pending action. Ordinary
+        // rollback retains its strict complete-receipt and durable-proof rules.
+        let Some(first_pending) = first_pending else {
+            let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
+                .map_err(TxExecutionError::CompensationPhase)?;
+            let outcomes = Self::authoritative_commit_outcomes_with_leases(contract, &leases)?;
+            Self::restore_durable_already_compensated_candidates(&mut commit_report, &outcomes)?;
+            Self::validate_authoritative_compensation_outcomes_with_leases(
+                contract,
+                &commit_report,
+                &outcomes,
+                &leases,
+            )?;
+            return Ok(DurableRollbackPreparation {
+                commit_report,
+                original_commit_outcomes: outcomes,
+                proof_leases: leases,
+                projected_contract: None,
+                unresolved_step_ids: Vec::new(),
+            });
+        };
+
+        let mut outcomes = HashMap::new();
+        let mut unproven_step_ids = HashSet::new();
+        let mut unresolved_step_ids = Vec::new();
+        for step in &contract.plan.steps {
+            let observed = observed_commits
+                .get(&step.step_id.0)
+                .and_then(Option::as_ref);
+            match observed {
+                Some(outcome @ StepOutcome::Success { .. }) => {
+                    outcomes.insert(step.step_id.0.clone(), outcome.clone());
+                }
+                Some(StepOutcome::Pending | StepOutcome::Skipped { .. }) | None => {
+                    unproven_step_ids.insert(step.step_id.0.clone());
+                    unresolved_step_ids.push(step.step_id.0.clone());
+                }
+                Some(StepOutcome::Failed {
+                    compensated: false, ..
+                }) => {
+                    // Settled failures do not authorize an undo. They also do
+                    // not need invented receipts just to populate this report.
+                    unproven_step_ids.insert(step.step_id.0.clone());
+                }
+                Some(other) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step.step_id.0.clone(),
+                        detail: format!(
+                            "invalid durable action outcome during partial rollback: {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        for receipt in contract.receipts.iter().filter(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                && receipt.get("outcome").and_then(serde_json::Value::as_str) == Some("committed")
+        }) {
+            let step_id = receipt
+                .get("step_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    TxExecutionError::InvalidContract(
+                        "committed receipt lacks a step identifier".to_string(),
+                    )
+                })?;
+            if !outcomes.contains_key(step_id) {
+                return Err(TxExecutionError::RollbackProof {
+                    kind: RollbackProofKind::Conflict,
+                    step_id: step_id.to_string(),
+                    detail: format!(
+                        "rollback requires authoritative durable commit Success, got {:?}; partial rollback cannot promote an unknown effect",
+                        observed_commits.get(step_id).and_then(Option::as_ref)
+                    ),
+                });
+            }
+        }
+        // Inspect every declared undo, including those whose commit was not
+        // proven. A hidden Pending/Compensated undo is contradictory authority,
+        // never permission to skip its key and compensate something else.
+        for compensation in &contract.plan.compensations {
+            let step_id = &compensation.for_step_id.0;
+            let key = compensation_idempotency_key(contract, step_id)?;
+            let lease = leases.get(&key).ok_or_else(|| {
+                TxExecutionError::LedgerWrite(format!(
+                    "explicit rollback proof omits compensation key for {step_id}"
+                ))
+            })?;
+            if !outcomes.contains_key(step_id) && lease.observed_outcome().is_some() {
+                return Err(TxExecutionError::RollbackProof {
+                    kind: RollbackProofKind::Conflict,
+                    step_id: step_id.clone(),
+                    detail: "durable compensation exists without a proven successful commit"
+                        .to_string(),
+                });
+            }
+        }
+        if outcomes.is_empty() {
+            return Err(TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                step_id: first_pending,
+                detail: "Pending commit requires reconciliation and the receipt history does not identify a committed effect; no durable successful effect can be compensated".to_string(),
+            });
+        }
+
+        let successful_step_ids = outcomes.keys().cloned().collect::<HashSet<_>>();
+        let recovered = recovered_commit_success_report(contract, &successful_step_ids, now_ms)?;
+        let mut projected = contract.clone();
+        projected.receipts.extend(recovered.receipts);
+        let mut commit_report = crate::plan::mission_tx_proven_rollback_commit_report(
+            &projected,
+            now_ms,
+            &unproven_step_ids,
+        )
+        .map_err(TxExecutionError::CompensationPhase)?;
+        Self::restore_durable_already_compensated_candidates(&mut commit_report, &outcomes)?;
+        Self::validate_authoritative_compensation_outcomes_with_leases(
+            &projected,
+            &commit_report,
+            &outcomes,
+            &leases,
+        )?;
+        Ok(DurableRollbackPreparation {
+            commit_report,
+            original_commit_outcomes: outcomes,
+            proof_leases: leases,
+            projected_contract: Some(projected),
+            unresolved_step_ids,
+        })
     }
 
     fn acquire_atomic_compensation_proof(
@@ -6908,6 +7133,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         commit_report: &TxCommitReport,
         compensation_report: Option<&TxCompensationReport>,
     ) -> (MissionTxState, TxOutcome) {
+        if compensation_report.is_some_and(|report| {
+            report.outcome == crate::plan::TxCompensationOutcome::ReconciliationRequired
+                || !report.unresolved_step_ids.is_empty()
+        }) {
+            return (MissionTxState::Compensating, TxOutcome::Pending);
+        }
         if commit_report.is_fully_committed() {
             return (MissionTxState::Committed, TxOutcome::Committed);
         }
@@ -10807,6 +11038,7 @@ mod tests {
                 Some(&mut store),
                 Some(&duplicate_original_proof),
                 Some(&mut duplicate_proof_leases),
+                &[],
                 8_000,
             )
             .map_err(|err| err.to_string())?;
@@ -11788,6 +12020,7 @@ mod tests {
             failed_count: 0,
             no_compensation_count: 0,
             skipped_count: 0,
+            unresolved_step_ids: Vec::new(),
             step_results: Vec::new(),
             decision_path: "test".to_string(),
             reason_code: "rollback_complete".to_string(),
@@ -13932,6 +14165,527 @@ mod tests {
                 ("s2".to_owned(), send("undo-later")),
             ],
         )
+    }
+
+    fn orphaned_file_effects(
+        directory: &Path,
+        policy: IdempotencyPolicy,
+    ) -> (MissionTxContract, IdempotencyStore) {
+        let effect_path = directory.join("effects.log");
+        let mut store = IdempotencyStore::open(directory, policy).unwrap();
+        let original = file_effect_contract();
+        let mut interrupted = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "later",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .execute_with_store(&mut interrupted, &mut store, 5_000)
+        .expect_err("second effect applies before its reply is lost");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        // Return the pre-dispatch contract to model a crash before even the
+        // confirmed first effect's receipt could reach the contract file.
+        (original, store)
+    }
+
+    #[test]
+    fn partial_rollback_compensates_only_proven_effect_once_across_restarts() {
+        use crate::plan::{TxCompensationOutcome, reconstruct_tx_resume_state};
+        use crate::tx_idempotency::TerminalDispositionKind;
+
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy {
+            max_active_ledgers: 2,
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let (original, store) = orphaned_file_effects(directory.path(), policy.clone());
+        let original_spool = durable_ledger_file_snapshot(directory.path());
+        drop(store);
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let mut contract = original.clone();
+
+        let mut contender = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let locked_keys = [
+            test_commit_key(&original, "s1"),
+            test_commit_key(&original, "s2"),
+            test_compensation_key(&original, "s1"),
+            test_compensation_key(&original, "s2"),
+        ];
+        set_rollback_post_proof_lease_test_hook(Some(Box::new(move || {
+            for key in locked_keys {
+                assert!(matches!(
+                    contender.acquire_durable_reservation(
+                        "contending-partial-rollback",
+                        &key,
+                        9_000
+                    ),
+                    Err(crate::tx_idempotency::IdempotencyError::ReservationInProgress { .. })
+                ));
+            }
+        })));
+
+        let first = engine
+            .rollback_with_store(&mut contract, &mut store, 9_000)
+            .unwrap();
+        assert_eq!(
+            first.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(first.compensation_report.compensated_count, 1);
+        assert_eq!(first.compensation_report.unresolved_step_ids, ["s2"]);
+        assert!(first.compensation_report.has_residual_risk());
+        assert!(!first.compensation_report.is_fully_rolled_back());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert_eq!(first.ledger.phase(), TxPhase::Compensating);
+        assert!(first.ledger.terminal_certificate().is_none());
+        assert_eq!(first.ledger.record_count(), 1);
+        assert!(matches!(
+            first.ledger.records()[0].outcome,
+            StepOutcome::Compensated { .. }
+        ));
+        assert!(contract.receipts.iter().all(|receipt| {
+            receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("s1")
+        }));
+        assert!(
+            mission_tx_rollback_commit_report(&contract, 9_000).is_err(),
+            "receipt-only rollback must remain strict about the missing s2 proof"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+
+        let known_commit =
+            recovered_commit_success_report(&contract, &HashSet::from(["s1".to_owned()]), 9_000)
+                .unwrap();
+        let resume = reconstruct_tx_resume_state(
+            &contract,
+            Some(&known_commit),
+            Some(&first.compensation_report),
+            9_000,
+        );
+        assert_eq!(
+            TxExecutionEngine::<SyntheticStepExecutor>::determine_final_outcome(
+                contract.lifecycle_state,
+                &known_commit,
+                Some(&first.compensation_report),
+            ),
+            (MissionTxState::Compensating, TxOutcome::Pending)
+        );
+        assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+        assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+        assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+        assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+        assert!(resume.has_pending_work());
+        assert!(!resume.needs_compensation);
+
+        let mut previous_execution = first.execution_id;
+        // First discard the newly recovered receipts too, then repeat with
+        // them present. Both restart cases must consult durable undo proof.
+        for now_ms in [10_000, 11_000] {
+            drop(store);
+            store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+            if now_ms == 10_000 {
+                contract = original.clone();
+            }
+            let repeat = engine
+                .rollback_with_store(&mut contract, &mut store, now_ms)
+                .unwrap();
+            assert_eq!(
+                repeat.compensation_report.outcome,
+                TxCompensationOutcome::ReconciliationRequired
+            );
+            assert_eq!(repeat.compensation_report.unresolved_step_ids, ["s2"]);
+            assert!(repeat.compensation_report.step_results.is_empty());
+            assert_eq!(repeat.compensation_report.compensated_count, 0);
+            assert_eq!(
+                store.active_count(),
+                2,
+                "settled attempts must not exhaust the active budget"
+            );
+            assert_eq!(repeat.ledger.phase(), TxPhase::Compensating);
+            assert!(repeat.ledger.terminal_certificate().is_none());
+            let retired: TxExecutionLedger = serde_json::from_slice(
+                &std::fs::read(
+                    directory
+                        .path()
+                        .join("tx_ledgers")
+                        .join(format!("{previous_execution}.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(retired.phase(), TxPhase::Aborted);
+            assert_eq!(
+                retired.terminal_certificate().unwrap().disposition,
+                TerminalDispositionKind::Aborted
+            );
+            let snapshot = durable_ledger_file_snapshot(directory.path());
+            for (name, bytes) in &original_spool {
+                assert_eq!(
+                    snapshot.get(name),
+                    Some(bytes),
+                    "unknown predecessor must not be rewritten"
+                );
+            }
+            let resume = reconstruct_tx_resume_state(
+                &contract,
+                None,
+                Some(&repeat.compensation_report),
+                now_ms,
+            );
+            assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+            assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+            assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+            assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+            assert!(!resume.needs_compensation && resume.has_pending_work());
+            previous_execution = repeat.execution_id;
+        }
+        let error = engine
+            .execute_with_store(&mut original.clone(), &mut store, 12_000)
+            .expect_err("partial compensation never permits ordinary commit replay");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+            if outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&test_commit_key(&contract, "s2"), 12_000),
+            Some(StepOutcome::Pending)
+        ));
+    }
+
+    #[test]
+    fn partial_rollback_resume_remains_pending_with_complete_stale_receipts_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let contract_path = directory.path().join("contract.json");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let original = file_effect_contract();
+        let mut prior = original.clone();
+        let first = TxExecutionEngine::new(
+            make_pane_executor(FileEffectBackend::handle(
+                &effect_path,
+                "later",
+                FileEffectFault::RefuseBeforeEffect,
+            )),
+            TxExecutionConfig {
+                auto_compensate: false,
+                ..Default::default()
+            },
+        )
+        .execute_with_store(&mut prior, &mut store, 5_000)
+        .unwrap();
+        assert_eq!(first.commit_report.unwrap().failed_count, 1);
+        assert_eq!(std::fs::read_to_string(&effect_path).unwrap(), "forward\n");
+
+        // A real earlier refusal supplied a complete receipt history. Once
+        // that retryable failure expires, only s2 is retried; its lost reply
+        // must take precedence over the older failed receipt after restart.
+        let mut interrupted = original;
+        interrupted.receipts = prior.receipts;
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "later",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .execute_with_store(&mut interrupted, &mut store, 6_000)
+        .unwrap_err();
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Pending"))
+        );
+        let rollback = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut interrupted, &mut store, 7_000)
+        .unwrap();
+        assert_eq!(rollback.compensation_report.unresolved_step_ids, ["s2"]);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        std::fs::write(&contract_path, serde_json::to_vec(&interrupted).unwrap()).unwrap();
+        drop(store);
+
+        let store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let reopened: MissionTxContract =
+            serde_json::from_slice(&std::fs::read(contract_path).unwrap()).unwrap();
+        assert_eq!(reopened.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(reopened.outcome, TxOutcome::Pending);
+        assert!(matches!(
+            store.peek_cached_outcome(&test_commit_key(&reopened, "s2"), 9_000),
+            Some(StepOutcome::Pending)
+        ));
+        let stale_report = mission_tx_rollback_commit_report(&reopened, 9_000)
+            .expect("old complete receipts alone cannot reveal the new Pending effect");
+        for commit_report in [None, Some(&stale_report)] {
+            let resume =
+                crate::plan::reconstruct_tx_resume_state(&reopened, commit_report, None, 9_000);
+            assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+            assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+            assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+            assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+            assert!(!resume.is_fully_resolved() && resume.has_pending_work());
+            assert!(!resume.needs_compensation);
+        }
+    }
+
+    #[test]
+    fn partial_rollback_never_retries_an_unacknowledged_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let mut contract = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_000)
+        .expect_err("uncertain undo retains its write-ahead Pending record");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s1" && outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        let snapshot = durable_ledger_file_snapshot(directory.path());
+        drop(store);
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let mut retry = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut retry, &mut store, 9_000)
+        .expect_err("orphaned undo cannot be redispatched after restart or TTL");
+        assert!(
+            matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+            if step_id == "s1" && detail.contains("Pending"))
+        );
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(durable_ledger_file_snapshot(directory.path()), snapshot);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+    }
+
+    #[test]
+    fn partial_rollback_retries_proven_pre_effect_refusal_without_settling_unknown_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let (mut contract, mut store) =
+            orphaned_file_effects(directory.path(), IdempotencyPolicy::default());
+        let first = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo",
+            FileEffectFault::RefuseBeforeEffect,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_000)
+        .unwrap();
+        assert_eq!(first.compensation_report.failed_count, 1);
+        assert_eq!(first.compensation_report.unresolved_step_ids, ["s2"]);
+        assert!(
+            crate::plan::reconstruct_tx_resume_state(
+                &contract,
+                None,
+                Some(&first.compensation_report),
+                6_000,
+            )
+            .needs_compensation
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        drop(store);
+        let mut store =
+            IdempotencyStore::open(directory.path(), IdempotencyPolicy::default()).unwrap();
+        let retry = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_050)
+        .unwrap();
+        assert_eq!(retry.compensation_report.compensated_count, 1);
+        assert!(retry.compensation_report.has_residual_risk());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+    }
+
+    #[test]
+    fn partial_rollback_rejects_hidden_undo_for_unproven_commit_before_mutation() {
+        for pending in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let effect_path = directory.path().join("effects.log");
+            let (mut contract, mut store) =
+                orphaned_file_effects(directory.path(), IdempotencyPolicy::default());
+            let execution = "txe-contradictory-undo";
+            store
+                .create_ledger(execution, &compiled_plan_from_contract(&contract))
+                .unwrap();
+            store
+                .transition_phase(execution, TxPhase::Preparing)
+                .unwrap();
+            let key = test_compensation_key(&contract, "s2");
+            if pending {
+                let mut reservation = store
+                    .acquire_durable_reservation(execution, &key, 5_500)
+                    .unwrap();
+                store
+                    .record_execution_reserved(
+                        &mut reservation,
+                        execution,
+                        key,
+                        StepOutcome::Pending,
+                        StepRisk::High,
+                        "test-agent",
+                        5_500,
+                    )
+                    .unwrap();
+            } else {
+                record_durable_test_outcome(
+                    &mut store,
+                    execution,
+                    key,
+                    StepOutcome::Compensated {
+                        original_outcome: Box::new(StepOutcome::Success { result: None }),
+                        compensation_result: "unsupported original effect claim".to_owned(),
+                    },
+                    StepRisk::High,
+                    "test-agent",
+                    5_500,
+                )
+                .unwrap();
+            }
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(directory.path());
+            let error = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "",
+                FileEffectFault::None,
+            ))
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("even an omitted undo key must pass authority preflight");
+            assert!(
+                matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+                if step_id == "s2" && detail.contains("without a proven successful commit"))
+            );
+            assert_eq!(serde_json::to_value(&contract).unwrap(), original_contract);
+            assert_eq!(
+                durable_ledger_file_snapshot(directory.path()),
+                original_spool
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_rollback_rejected_preflight_preserves_contract_and_pending_spool() {
+        for rejection in ["gate", "capacity", "forged_receipt"] {
+            let directory = tempfile::tempdir().unwrap();
+            let effect_path = directory.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                max_active_ledgers: if rejection == "capacity" { 1 } else { 2 },
+                ..Default::default()
+            };
+            let (mut contract, mut store) = orphaned_file_effects(directory.path(), policy);
+            if rejection == "forged_receipt" {
+                let claimed = recovered_commit_success_report(
+                    &contract,
+                    &HashSet::from(["s2".to_owned()]),
+                    5_500,
+                )
+                .unwrap();
+                contract.receipts.extend(claimed.receipts);
+            }
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(directory.path());
+            let error = if rejection == "gate" {
+                let (executor, calls, dispatched) = CompensationGateAuditExecutor::new(true);
+                let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+                    .rollback_with_store(&mut contract, &mut store, 6_000)
+                    .unwrap_err();
+                assert_eq!(*calls.borrow(), 1);
+                assert!(dispatched.borrow().is_empty());
+                assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+                error
+            } else {
+                make_pane_engine(FileEffectBackend::handle(
+                    &effect_path,
+                    "",
+                    FileEffectFault::None,
+                ))
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .unwrap_err()
+            };
+            if rejection == "capacity" {
+                assert!(matches!(error, TxExecutionError::LedgerWrite(ref detail)
+                    if detail.contains("active ledger limit exceeded")));
+            } else if rejection == "forged_receipt" {
+                assert!(
+                    matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+                    if step_id == "s2" && detail.contains("Pending"))
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&contract).unwrap(),
+                original_contract,
+                "{rejection}: staged Success receipts must not escape a refused attempt"
+            );
+            assert_eq!(
+                durable_ledger_file_snapshot(directory.path()),
+                original_spool
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+        }
     }
 
     #[test]

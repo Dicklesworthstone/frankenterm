@@ -58322,7 +58322,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         contract_lock.authoritative_path();
 
                                     let now_ms = mission_now_ms();
-                                    let commit_report = match build_robot_tx_rollback_commit_report(
+                                    let commit_report = match tx_rollback_receipt_hint(
                                         &contract, now_ms,
                                     ) {
                                         Ok(report) => report,
@@ -58343,10 +58343,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
                                     };
                                     if let Some(step_id) = fail_compensation_for_step.as_deref()
-                                        && !commit_report.step_results.iter().any(|result| {
-                                            result.step_id.0 == step_id
-                                                && result.outcome.is_committed()
-                                        })
+                                        && !tx_rollback_has_compensation_candidate(
+                                            &contract,
+                                            commit_report.as_ref(),
+                                            step_id,
+                                        )
                                     {
                                         let response =
                                             RobotResponse::<RobotTxRollbackData>::error_with_code(
@@ -58368,7 +58369,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         &layout,
                                         tx_rollback_requires_terminal_backend(
                                             &contract,
-                                            &commit_report,
+                                            commit_report.as_ref(),
                                         ),
                                     )
                                     .await;
@@ -78005,6 +78006,9 @@ fn tx_compensation_outcome_label(
         frankenterm_core::plan::TxCompensationOutcome::NothingToCompensate => {
             "nothing_to_compensate"
         }
+        frankenterm_core::plan::TxCompensationOutcome::ReconciliationRequired => {
+            "reconciliation_required"
+        }
     }
 }
 
@@ -78191,19 +78195,74 @@ fn tx_run_requires_terminal_backend(contract: &frankenterm_core::plan::MissionTx
         .any(tx_action_requires_terminal_backend)
 }
 
+/// Receipt reconstruction can narrow a runtime probe, but it cannot decide
+/// durable rollback admission. A crash can leave authoritative Success/Pending
+/// records before any commit receipts were saved. The engine freezes and
+/// validates that proof before it authorizes a single compensation.
+fn tx_rollback_receipt_hint(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    now_ms: i64,
+) -> Result<Option<frankenterm_core::plan::TxCommitReport>, String> {
+    contract.validate()?;
+    if !contract.lifecycle_state.is_terminal()
+        && contract.outcome == frankenterm_core::plan::TxOutcome::Pending
+    {
+        // Even a complete receipt history can belong to an earlier attempt:
+        // its failed/skipped step may now be durably successful while another
+        // dispatch is still Pending. Probe and validate declared candidates
+        // conservatively; only the engine's live proof may narrow dispatch.
+        return Ok(None);
+    }
+    match build_robot_tx_rollback_commit_report(contract, now_ms) {
+        Ok(report) => Ok(Some(report)),
+        Err(error)
+            if matches!(
+                contract.lifecycle_state,
+                frankenterm_core::plan::MissionTxState::RolledBack
+                    | frankenterm_core::plan::MissionTxState::Compensated
+            ) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn tx_rollback_has_compensation_candidate(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    commit_report: Option<&frankenterm_core::plan::TxCommitReport>,
+    step_id: &str,
+) -> bool {
+    contract
+        .plan
+        .compensations
+        .iter()
+        .any(|compensation| compensation.for_step_id.0 == step_id)
+        && commit_report.is_none_or(|report| {
+            report
+                .step_results
+                .iter()
+                .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
+        })
+}
+
 fn tx_rollback_requires_terminal_backend(
     contract: &frankenterm_core::plan::MissionTxContract,
-    commit_report: &frankenterm_core::plan::TxCommitReport,
+    commit_report: Option<&frankenterm_core::plan::TxCommitReport>,
 ) -> bool {
-    let committed_steps = commit_report
-        .step_results
-        .iter()
-        .filter(|result| result.outcome.is_committed())
-        .map(|result| result.step_id.clone())
-        .collect::<std::collections::HashSet<_>>();
+    let committed_steps = commit_report.map(|report| {
+        report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+            .map(|result| result.step_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+    });
 
     contract.plan.compensations.iter().any(|compensation| {
-        committed_steps.contains(&compensation.for_step_id)
+        committed_steps
+            .as_ref()
+            .is_none_or(|steps| steps.contains(&compensation.for_step_id))
             && tx_action_requires_terminal_backend(&compensation.action)
     })
 }
@@ -80452,7 +80511,7 @@ async fn handle_tx_command(
             let execution_contract_path = contract_lock.authoritative_path();
 
             let now_ms = mission_now_ms();
-            let commit_report = match build_robot_tx_rollback_commit_report(&contract, now_ms) {
+            let commit_report = match tx_rollback_receipt_hint(&contract, now_ms) {
                 Ok(report) => report,
                 Err(err) => emit_mission_error(
                     output_format,
@@ -80468,10 +80527,11 @@ async fn handle_tx_command(
                 ),
             };
             if let Some(step_id) = fail_compensation_for_step.as_deref()
-                && !commit_report
-                    .step_results
-                    .iter()
-                    .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
+                && !tx_rollback_has_compensation_candidate(
+                    &contract,
+                    commit_report.as_ref(),
+                    step_id,
+                )
             {
                 emit_mission_error(
                     output_format,
@@ -80490,7 +80550,7 @@ async fn handle_tx_command(
             let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                 config,
                 layout,
-                tx_rollback_requires_terminal_backend(&contract, &commit_report),
+                tx_rollback_requires_terminal_backend(&contract, commit_report.as_ref()),
             )
             .await;
             let executor_label = if real_runtime.is_some() {
@@ -80613,7 +80673,7 @@ async fn handle_tx_command(
                 elapsed_ms = started.elapsed().as_millis(),
                 "tx rollback completed"
             );
-            let plain_lines = vec![
+            let mut plain_lines = vec![
                 format!("Tx rollback summary for {}", data.tx_id),
                 format!("  File: {}", data.contract_file),
                 format!("  Plan: {}", data.plan_id),
@@ -80630,6 +80690,12 @@ async fn handle_tx_command(
                 ),
                 format!("  Final state: {}", data.final_state),
             ];
+            if !data.compensation_report.unresolved_step_ids.is_empty() {
+                plain_lines.push(format!(
+                    "  Reconciliation required for steps: {}",
+                    data.compensation_report.unresolved_step_ids.join(", ")
+                ));
+            }
             let plain_lines =
                 if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
                     let mut lines = plain_lines;
@@ -107553,6 +107619,7 @@ reason = "overly conservative pending threshold"
     struct RecordingStepExecutor {
         calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         execute_contract_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        uncertain_commit_step: Option<&'static str>,
     }
 
     impl RecordingStepExecutor {
@@ -107611,6 +107678,31 @@ reason = "overly conservative pending threshold"
                 .expect("recorded calls lock")
                 .push("execute_compensations");
             build_robot_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+
+        fn execute_steps_with_outcome(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<
+            frankenterm_core::tx_execution::StepDispatchOutcome<
+                frankenterm_core::plan::TxCommitStepInput,
+            >,
+        > {
+            use frankenterm_core::tx_execution::StepDispatchOutcome;
+            self.execute_steps(contract, fail_step, now_ms)
+                .into_iter()
+                .map(|mut input| {
+                    if self.uncertain_commit_step == Some(input.step_id.0.as_str()) {
+                        input.success = false;
+                        input.reason_code = "test_lost_commit_reply".to_owned();
+                        StepDispatchOutcome::Indeterminate(input)
+                    } else {
+                        StepDispatchOutcome::Settled(input)
+                    }
+                })
+                .collect()
         }
     }
 
@@ -108370,6 +108462,230 @@ reason = "overly conservative pending threshold"
             compensation_report.outcome.target_tx_state()
         );
         assert_eq!(data.final_state, contract.lifecycle_state);
+    }
+
+    #[test]
+    fn tx_rollback_helpers_recover_proven_work_despite_incomplete_receipts() {
+        use frankenterm_core::plan::{MissionTxState, TxCompensationOutcome, TxOutcome};
+        let mut contract = sample_robot_tx_contract();
+        let (_directory, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let interrupted = RecordingStepExecutor {
+            uncertain_commit_step: Some("tx-step:2"),
+            ..Default::default()
+        };
+        execute_tx_run_with_executor(
+            interrupted,
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            7_171,
+        )
+        .expect_err("an indeterminate second commit must remain pending");
+        let mut contract = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let hint = tx_rollback_receipt_hint(&contract, 8_181).unwrap();
+        assert!(
+            hint.is_none(),
+            "the command must defer incomplete receipt admission to durable proof"
+        );
+        assert!(tx_rollback_requires_terminal_backend(
+            &contract,
+            hint.as_ref()
+        ));
+        assert!(tx_rollback_has_compensation_candidate(
+            &contract,
+            hint.as_ref(),
+            "tx-step:1"
+        ));
+        assert!(!tx_rollback_has_compensation_candidate(
+            &contract,
+            hint.as_ref(),
+            "missing-step"
+        ));
+        let executor = RecordingStepExecutor::default();
+        let data = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            8_181,
+        )
+        .expect("durable Success permits only the first undo");
+        assert_eq!(
+            data.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(data.compensation_report.compensated_count, 1);
+        assert_eq!(data.compensation_report.unresolved_step_ids, ["tx-step:2"]);
+        assert_eq!(data.final_state, MissionTxState::Compensating);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["compensation_report"]["unresolved_step_ids"],
+            serde_json::json!(["tx-step:2"])
+        );
+        let mut persisted = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(persisted.outcome, TxOutcome::Pending);
+        assert!(
+            persisted
+                .receipts
+                .iter()
+                .filter(|receipt| {
+                    matches!(
+                        receipt.get("phase").and_then(serde_json::Value::as_str),
+                        Some("commit" | "compensate")
+                    )
+                })
+                .all(
+                    |receipt| receipt.get("step_id").and_then(serde_json::Value::as_str)
+                        == Some("tx-step:1")
+                )
+        );
+        assert!(
+            tx_rollback_receipt_hint(&persisted, 9_191)
+                .unwrap()
+                .is_none()
+        );
+        let repeated = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut persisted,
+            None,
+            9_191,
+        )
+        .expect("reopened durable undo proof prevents redispatch");
+        assert_eq!(repeated.compensation_report.compensated_count, 0);
+        assert_eq!(
+            repeated.compensation_report.unresolved_step_ids,
+            ["tx-step:2"]
+        );
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_compensations")
+                .count(),
+            1
+        );
+
+        persisted.lifecycle_state = MissionTxState::RolledBack;
+        persisted.outcome = TxOutcome::Compensated;
+        assert!(
+            tx_rollback_receipt_hint(&persisted, 10_000).is_err(),
+            "already terminal rollback remains refused at the command boundary"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_pending_hint_ignores_complete_stale_failure_receipts() {
+        use frankenterm_core::plan::{
+            MissionKillSwitchLevel, MissionTxState, TxCompensationOutcome,
+        };
+        let mut contract = sample_robot_tx_contract();
+        let mut old_attempt = contract.clone();
+        old_attempt.lifecycle_state = MissionTxState::Prepared;
+        let old_inputs = build_robot_tx_commit_step_inputs(&old_attempt, Some("tx-step:1"), 6_000);
+        let old_report = frankenterm_core::plan::execute_commit_phase(
+            &old_attempt,
+            &old_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            6_000,
+        )
+        .unwrap();
+        assert_eq!(old_report.failed_count, 1);
+        assert_eq!(old_report.skipped_count, 1);
+        contract.receipts = old_report.receipts;
+        let (_directory, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor {
+                uncertain_commit_step: Some("tx-step:2"),
+                ..Default::default()
+            },
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            7_171,
+        )
+        .expect_err("fresh first commit succeeds before the second reply is lost");
+        let mut persisted = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let stale = build_robot_tx_rollback_commit_report(&persisted, 8_181).unwrap();
+        assert_eq!(
+            stale.committed_count, 0,
+            "complete older receipts hide the fresh Success"
+        );
+        assert!(!tx_rollback_requires_terminal_backend(
+            &persisted,
+            Some(&stale)
+        ));
+        assert!(!tx_rollback_has_compensation_candidate(
+            &persisted,
+            Some(&stale),
+            "tx-step:1"
+        ));
+
+        let hint = tx_rollback_receipt_hint(&persisted, 8_181).unwrap();
+        assert!(
+            hint.is_none(),
+            "pending recovery cannot trust even a complete receipt hint"
+        );
+        assert!(tx_rollback_requires_terminal_backend(
+            &persisted,
+            hint.as_ref()
+        ));
+        assert!(tx_rollback_has_compensation_candidate(
+            &persisted,
+            hint.as_ref(),
+            "tx-step:1"
+        ));
+        let executor = RecordingStepExecutor::default();
+        let result = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut persisted,
+            None,
+            8_181,
+        )
+        .unwrap();
+        assert_eq!(
+            result.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(result.compensation_report.compensated_count, 1);
+        assert_eq!(
+            result.compensation_report.unresolved_step_ids,
+            ["tx-step:2"]
+        );
+        let mut reopened = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let repeated = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut reopened,
+            None,
+            9_191,
+        )
+        .unwrap();
+        assert_eq!(repeated.compensation_report.compensated_count, 0);
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_compensations")
+                .count(),
+            1
+        );
     }
 
     #[test]

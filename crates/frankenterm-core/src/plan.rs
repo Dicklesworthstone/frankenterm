@@ -3026,6 +3026,9 @@ pub enum TxCompensationOutcome {
     FullyRolledBack,
     CompensationFailed,
     NothingToCompensate,
+    /// Proven effects were eligible for compensation, but other commit
+    /// effects still lack settlement authority. This is never terminal.
+    ReconciliationRequired,
 }
 
 impl TxCompensationOutcome {
@@ -3036,6 +3039,7 @@ impl TxCompensationOutcome {
             Self::FullyRolledBack => MissionTxState::RolledBack,
             Self::NothingToCompensate => MissionTxState::Compensated,
             Self::CompensationFailed => MissionTxState::Failed,
+            Self::ReconciliationRequired => MissionTxState::Compensating,
         }
     }
 }
@@ -3749,6 +3753,10 @@ pub struct TxCompensationReport {
     #[serde(default)]
     pub no_compensation_count: usize,
     pub skipped_count: usize,
+    /// Commit effects whose outcome remains unknown after an explicit
+    /// proven-only rollback. These are diagnostics, never dispatch receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_step_ids: Vec<String>,
     #[serde(default)]
     pub step_results: Vec<TxCommitStepResult>,
     pub decision_path: String,
@@ -3796,26 +3804,40 @@ impl TxCompensationReport {
     /// Whether compensation fully removed committed effects.
     #[must_use]
     pub fn is_fully_rolled_back(&self) -> bool {
-        matches!(self.outcome, TxCompensationOutcome::FullyRolledBack)
+        self.unresolved_step_ids.is_empty()
+            && matches!(self.outcome, TxCompensationOutcome::FullyRolledBack)
     }
 
     /// Whether rollback left unresolved work behind.
     #[must_use]
     pub fn has_residual_risk(&self) -> bool {
-        matches!(self.outcome, TxCompensationOutcome::CompensationFailed)
+        !self.unresolved_step_ids.is_empty()
+            || matches!(
+                self.outcome,
+                TxCompensationOutcome::CompensationFailed
+                    | TxCompensationOutcome::ReconciliationRequired
+            )
     }
 
     /// Deterministic canonical string for replay comparison.
     #[must_use]
     pub fn canonical_string(&self) -> String {
-        format!(
+        let mut canonical = format!(
             "compensate:{:?}:c={},f={},s={}:{}",
             self.outcome,
             self.compensated_count,
             self.failed_count,
             self.skipped_count,
             self.decision_path
-        )
+        );
+        if !self.unresolved_step_ids.is_empty() {
+            canonical.push_str(":unresolved=");
+            canonical.push_str(
+                &serde_json::to_string(&self.unresolved_step_ids)
+                    .expect("step identifiers serialize as strings"),
+            );
+        }
+        canonical
     }
 }
 
@@ -4804,6 +4826,19 @@ pub fn mission_tx_rollback_commit_report(
     contract: &MissionTxContract,
     completed_at_ms: i64,
 ) -> Result<TxCommitReport, String> {
+    mission_tx_proven_rollback_commit_report(contract, completed_at_ms, &HashSet::new())
+}
+
+/// The durable executor may exclude unproven commit effects from an explicit
+/// rollback after freezing every action/compensation key under its plan proof
+/// lease. Exclusions add only internal report diagnostics: they cannot create
+/// receipts or authorize either an effect or a terminal transaction state.
+/// Ordinary receipt-only reconstruction above remains complete and strict.
+pub(crate) fn mission_tx_proven_rollback_commit_report(
+    contract: &MissionTxContract,
+    completed_at_ms: i64,
+    unproven_step_ids: &HashSet<String>,
+) -> Result<TxCommitReport, String> {
     if matches!(
         contract.lifecycle_state,
         MissionTxState::RolledBack | MissionTxState::Compensated
@@ -4886,6 +4921,28 @@ pub fn mission_tx_rollback_commit_report(
     let mut report_completed_at_ms = completed_at_ms;
 
     for step in &contract.plan.steps {
+        if unproven_step_ids.contains(&step.step_id.0) {
+            if latest_successful_commit_receipts.contains_key(&step.step_id.0)
+                || steps_with_compensation_attempts.contains(&step.step_id.0)
+            {
+                return Err(format!(
+                    "unproven rollback step {} has a claimed commit or compensation effect",
+                    step.step_id.0
+                ));
+            }
+            skipped_count += 1;
+            failure_boundary.get_or_insert_with(|| step.step_id.0.clone());
+            step_results.push(TxCommitStepResult {
+                step_id: step.step_id.clone(),
+                ordinal: step.ordinal,
+                outcome: TxCommitStepOutcome::Skipped {
+                    reason_code: "rollback_commit_not_proven".to_string(),
+                },
+                decision_path: "rollback_durable_proof->commit_not_proven".to_string(),
+                completed_at_ms,
+            });
+            continue;
+        }
         let latest_receipt = latest_commit_receipts.get(&step.step_id.0).ok_or_else(|| {
             format!(
                 "rollback requires a commit receipt for step {}",
@@ -4972,7 +5029,12 @@ pub fn mission_tx_rollback_commit_report(
         });
     }
 
-    let (outcome, reason_code) = if failed_count == 0 {
+    let (outcome, reason_code) = if !unproven_step_ids.is_empty() {
+        (
+            TxCommitOutcome::PartialFailure,
+            "rollback_commit_not_proven",
+        )
+    } else if failed_count == 0 {
         (TxCommitOutcome::FullyCommitted, "fully_committed")
     } else if committed_count == 0 {
         (TxCommitOutcome::ImmediateFailure, "immediate_failure")
@@ -5574,6 +5636,7 @@ pub fn execute_compensation_phase(
             failed_count: 0,
             no_compensation_count: 0,
             skipped_count: 0,
+            unresolved_step_ids: Vec::new(),
             step_results: Vec::new(),
             decision_path: "compensation_phase->nothing_to_compensate".to_string(),
             reason_code: "nothing_to_compensate".to_string(),
@@ -5707,6 +5770,7 @@ pub fn execute_compensation_phase(
         failed_count,
         no_compensation_count: 0,
         skipped_count,
+        unresolved_step_ids: Vec::new(),
         step_results,
         decision_path: "compensation_phase".to_string(),
         reason_code: if all_ok {
@@ -6917,6 +6981,105 @@ pub fn reconstruct_tx_resume_state(
         .map(|s| s.step_id.clone())
         .collect();
 
+    let partial = comp_report.filter(|report| {
+        report.outcome == TxCompensationOutcome::ReconciliationRequired
+            || !report.unresolved_step_ids.is_empty()
+    });
+    let persisted_compensation_pending = comp_report.is_none()
+        && contract.lifecycle_state == MissionTxState::Compensating
+        && contract.outcome == TxOutcome::Pending;
+    if partial.is_some() || persisted_compensation_pending {
+        // A partial rollback report never completes either phase, even when a
+        // caller also supplies a commit report. Repeated rollback can have no
+        // new step results because every proven undo was already durable.
+        // After restart there may be no report at all. A persisted pending
+        // compensation state cannot become terminal from older failed/skipped
+        // receipts: a later dispatch may still be Pending in the durable spool.
+        let claimed_commits = validate_persisted_tx_receipts(contract)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, receipt)| {
+                (receipt.phase == "commit" && receipt.outcome == "committed")
+                    .then_some(receipt.step_id)
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+        let unresolved = partial.map_or_else(
+            || {
+                all_step_ids
+                    .iter()
+                    .filter(|step_id| !claimed_commits.contains(&step_id.0))
+                    .map(|step_id| step_id.0.clone())
+                    .collect::<HashSet<_>>()
+            },
+            |report| report.unresolved_step_ids.iter().cloned().collect(),
+        );
+        let all_unknown = partial.is_some_and(|report| report.unresolved_step_ids.is_empty());
+        let is_unresolved = |step_id: &str| all_unknown || unresolved.contains(step_id);
+        let mut committed = HashSet::<String>::new();
+        let mut compensated = HashSet::<String>::new();
+        if let Some(report) = commit_report {
+            committed.extend(report.step_results.iter().filter_map(|result| {
+                (result.outcome.is_committed() && !is_unresolved(&result.step_id.0))
+                    .then(|| result.step_id.0.clone())
+            }));
+        }
+        for result in partial.into_iter().flat_map(|report| &report.step_results) {
+            if result.outcome.is_committed() && !is_unresolved(&result.step_id.0) {
+                committed.insert(result.step_id.0.clone());
+                compensated.insert(result.step_id.0.clone());
+            }
+        }
+        let unproven = all_step_ids
+            .iter()
+            .filter(|step_id| {
+                is_unresolved(&step_id.0) || !claimed_commits.contains(step_id.0.as_str())
+            })
+            .map(|step_id| step_id.0.clone())
+            .collect::<HashSet<_>>();
+        if let Ok(receipts) = mission_tx_proven_rollback_commit_report(contract, now_ms, &unproven)
+        {
+            for result in receipts.step_results {
+                match result.outcome {
+                    TxCommitStepOutcome::Committed { .. } => {
+                        committed.insert(result.step_id.0);
+                    }
+                    TxCommitStepOutcome::Skipped { reason_code }
+                        if reason_code == "already_compensated" =>
+                    {
+                        committed.insert(result.step_id.0.clone());
+                        compensated.insert(result.step_id.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let known_steps = |ids: &HashSet<String>| {
+            all_step_ids
+                .iter()
+                .filter(|step_id| ids.contains(&step_id.0) && !is_unresolved(&step_id.0))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let committed_step_ids = known_steps(&committed);
+        let compensated_step_ids = known_steps(&compensated);
+        return TxResumeState {
+            pending_step_ids: all_step_ids
+                .iter()
+                .filter(|step_id| is_unresolved(&step_id.0))
+                .cloned()
+                .collect(),
+            needs_compensation: committed_step_ids
+                .iter()
+                .any(|step_id| !compensated.contains(&step_id.0)),
+            committed_step_ids,
+            compensated_step_ids,
+            commit_phase_completed: false,
+            compensation_phase_completed: false,
+            reconstructed_at_ms: now_ms,
+        };
+    }
+
     let mut committed_step_ids = Vec::new();
     let mut commit_phase_completed = false;
     let mut commit_had_failures = false;
@@ -6958,7 +7121,8 @@ pub fn reconstruct_tx_resume_state(
         let outcome_can_complete = match comp.outcome {
             TxCompensationOutcome::FullyRolledBack => true,
             TxCompensationOutcome::NothingToCompensate => committed_step_set.is_empty(),
-            TxCompensationOutcome::CompensationFailed => false,
+            TxCompensationOutcome::CompensationFailed
+            | TxCompensationOutcome::ReconciliationRequired => false,
         };
         outcome_can_complete && committed_step_set.is_subset(&compensated_step_set)
     } else {

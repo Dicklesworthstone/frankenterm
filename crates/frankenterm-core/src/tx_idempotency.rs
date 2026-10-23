@@ -4720,6 +4720,59 @@ impl IdempotencyStore {
         plan_id: &str,
         plan_hash: u64,
     ) -> Result<Vec<String>, IdempotencyError> {
+        self.retire_matching_ledgers(plan_id, plan_hash, None)
+    }
+
+    /// Make room for an explicit proven-only rollback without settling an
+    /// unknown effect. The caller must continuously own the exclusive proof
+    /// lease for every key in the exact plan. Only settled executions may be
+    /// retired; every ambiguous predecessor remains byte-for-byte unchanged.
+    ///
+    /// This is not a generic retirement bypass: an actual Pending action must
+    /// be proven in a matching plan/hash ledger, unknown compensation is
+    /// rejected, and foreign stores/plans or incomplete key sets fail before
+    /// any snapshot is published. Archived settled ledgers remain durable
+    /// replay proof if the process crashes before the new rollback is created.
+    pub(crate) fn retire_settled_ledgers_for_partial_rollback(
+        &mut self,
+        plan_id: &str,
+        plan_hash: u64,
+        proof: &DurableKeyLeaseSet,
+    ) -> Result<Vec<String>, IdempotencyError> {
+        if proof.proof_barrier.mode != ProofBarrierMode::Exclusive
+            || proof.proof_barrier.plan_id != plan_id
+        {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "partial rollback retirement requires the exact exclusive plan proof lease"
+                    .to_string(),
+            });
+        }
+        let first_key =
+            proof
+                .leases
+                .keys()
+                .next()
+                .ok_or_else(|| IdempotencyError::LedgerRecordInvariant {
+                    reason: "partial rollback retirement requires retained proof keys".to_string(),
+                })?;
+        self.validate_proof_barrier_binding(&proof.proof_barrier, first_key)?;
+        if proof.leases.iter().any(|(key, lease)| {
+            key.is_compensation() && matches!(lease.observed_outcome(), Some(StepOutcome::Pending))
+        }) {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "partial rollback cannot retire around an uncertain compensation"
+                    .to_string(),
+            });
+        }
+        self.retire_matching_ledgers(plan_id, plan_hash, Some(proof))
+    }
+
+    fn retire_matching_ledgers(
+        &mut self,
+        plan_id: &str,
+        plan_hash: u64,
+        partial_rollback_proof: Option<&DurableKeyLeaseSet>,
+    ) -> Result<Vec<String>, IdempotencyError> {
         let _plan_lock = if self.is_durable() {
             Some(self.acquire_plan_catalog_lock(plan_id, plan_hash)?)
         } else {
@@ -4746,6 +4799,7 @@ impl IdempotencyStore {
         }
 
         let mut terminal_snapshots = Vec::with_capacity(execution_ids.len());
+        let mut matching_pending_action = false;
         for execution_id in &execution_ids {
             let (mut candidate, pinned_file) = if let Some(lock) = execution_locks
                 .iter()
@@ -4762,21 +4816,82 @@ impl IdempotencyStore {
                     None,
                 )
             };
+            if let Some(proof) = partial_rollback_proof {
+                let mut ambiguous = false;
+                for record in candidate.records() {
+                    let lease = proof.get(&record.idem_key).ok_or_else(|| {
+                        IdempotencyError::LedgerRecordInvariant {
+                            reason: format!(
+                                "partial rollback proof omits a key from exact-plan execution {execution_id}"
+                            ),
+                        }
+                    })?;
+                    if record.outcome.is_ambiguous_replay_outcome() {
+                        if record.idem_key.is_compensation() {
+                            return Err(IdempotencyError::LedgerRecordInvariant {
+                                reason: format!(
+                                    "execution {execution_id} retains an ambiguous compensation"
+                                ),
+                            });
+                        }
+                        ambiguous = true;
+                        if record.outcome.is_pending() {
+                            if !matches!(lease.observed_outcome(), Some(StepOutcome::Pending)) {
+                                return Err(IdempotencyError::LedgerRecordInvariant {
+                                    reason: "partial rollback Pending witness disagrees with its held proof"
+                                        .to_string(),
+                                });
+                            }
+                            matching_pending_action = true;
+                        }
+                    }
+                }
+                if ambiguous {
+                    // Do not reserialize, rehash, change phase, or archive the
+                    // only surviving authority for an uncertain external effect.
+                    continue;
+                }
+            }
             if !candidate.phase().is_terminal() {
+                if partial_rollback_proof.is_some() {
+                    // Retiring this settled attempt does not resolve the
+                    // Pending predecessor. A compensation-only attempt would
+                    // otherwise synthesize a misleading RolledBack disposition.
+                    let mut certificate =
+                        candidate.synthesize_terminal_certificate(TxPhase::Aborted)?;
+                    certificate.disposition = TerminalDispositionKind::Aborted;
+                    candidate
+                        .validate_certificate_against_ledger(&certificate, TxPhase::Aborted)
+                        .map_err(|reason| IdempotencyError::InvalidTerminalCertificate {
+                            reason,
+                        })?;
+                    candidate.terminal_certificate = Some(certificate);
+                }
                 candidate.transition_phase(TxPhase::Aborted)?;
             }
             terminal_snapshots.push((candidate, pinned_file));
+        }
+
+        if partial_rollback_proof.is_some() && !matching_pending_action {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "partial rollback retirement has no Pending action in the exact plan/hash"
+                    .to_string(),
+            });
         }
 
         for (candidate, pinned_file) in &terminal_snapshots {
             self.persist_ledger_snapshot(candidate, pinned_file.as_ref())?;
         }
 
-        for execution_id in &execution_ids {
+        let retired_execution_ids = terminal_snapshots
+            .iter()
+            .map(|(candidate, _)| candidate.execution_id().to_string())
+            .collect::<Vec<_>>();
+        for execution_id in &retired_execution_ids {
             self.ledgers.remove(execution_id);
         }
 
-        Ok(execution_ids)
+        Ok(retired_execution_ids)
     }
 
     /// Remove a completed/aborted ledger from active tracking while retaining
@@ -8609,6 +8724,101 @@ mod tests {
         assert!(reopened.get_ledger(different_id).is_some());
 
         let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn partial_rollback_retirement_requires_bound_complete_exact_plan_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let foreign_directory = tempfile::tempdir().unwrap();
+        let plan = make_plan(2);
+        let mut store =
+            IdempotencyStore::open(directory.path(), IdempotencyPolicy::default()).unwrap();
+        let mut foreign =
+            IdempotencyStore::open(foreign_directory.path(), IdempotencyPolicy::default()).unwrap();
+        let execution = "txe-partial-proof-source";
+        store.create_ledger(execution, &plan).unwrap();
+        store
+            .transition_phase(execution, TxPhase::Preparing)
+            .unwrap();
+        let success_key = make_key(&plan.plan_id, &plan.steps[0].id);
+        let pending_key = make_key(&plan.plan_id, &plan.steps[1].id);
+        record_durable_outcome(
+            &mut store,
+            execution,
+            success_key.clone(),
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "test-agent",
+            1_000,
+        );
+        let mut reservation = store
+            .acquire_durable_reservation(execution, &pending_key, 1_001)
+            .unwrap();
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                execution,
+                pending_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "test-agent",
+                1_001,
+            )
+            .unwrap();
+        drop(reservation);
+        let path = directory
+            .path()
+            .join("tx_ledgers")
+            .join(format!("{execution}.json"));
+        let original = std::fs::read(&path).unwrap();
+        let proof = store
+            .acquire_durable_key_leases([success_key, pending_key.clone()], 1_002)
+            .unwrap();
+
+        assert!(
+            foreign
+                .retire_settled_ledgers_for_partial_rollback(&plan.plan_id, plan.plan_hash, &proof,)
+                .is_err(),
+            "proof from another store must not authorize retirement"
+        );
+        assert!(
+            store
+                .retire_settled_ledgers_for_partial_rollback(
+                    "different-plan",
+                    plan.plan_hash,
+                    &proof,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .retire_settled_ledgers_for_partial_rollback(
+                    &plan.plan_id,
+                    plan.plan_hash.wrapping_add(1),
+                    &proof,
+                )
+                .is_err(),
+            "a Pending key alone cannot authorize a different plan hash"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(proof);
+
+        let incomplete = store
+            .acquire_durable_key_leases([pending_key], 1_002)
+            .unwrap();
+        assert!(
+            store
+                .retire_settled_ledgers_for_partial_rollback(
+                    &plan.plan_id,
+                    plan.plan_hash,
+                    &incomplete,
+                )
+                .is_err(),
+            "all keys in a matching ledger must remain covered"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(store.active_count(), 1);
     }
 
     #[cfg(not(windows))]
