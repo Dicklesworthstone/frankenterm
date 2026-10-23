@@ -1284,11 +1284,11 @@ mod tests {
             c.unreconciled > 0 && c.is_settled()
         });
         assert!(!controller.failed);
-        assert_eq!(selected(&options).generation(), 1);
 
         // Once the store reads cleanly, the next attempt lifts the latch and
         // publishes on from the committed root instead of disabling itself.
         std::fs::rename(&aside, &objects).unwrap();
+        assert_eq!(selected(&options).generation(), 1);
         pump_until(&mut controller, &executor, |c| {
             c.unreconciled == 0 && c.state.as_ref().is_some_and(|s| s.identity.generation == 3)
         });
