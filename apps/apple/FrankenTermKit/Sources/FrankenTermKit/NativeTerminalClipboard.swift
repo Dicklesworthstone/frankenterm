@@ -10,14 +10,17 @@ public final class NativeTerminalClipboardController: NSObject {
         let keyboardID: UUID
         let focus: TerminalFocus
     }
+    private struct CopyCapture: Sendable {
+        let document: TerminalCopyDocument, receivedAt: Date
+    }
     private weak var terminal: NativeTerminalView?
     private let source: TerminalSource, destinationLabel: String
     private let commandDestination: TerminalCommandDraftDestination
     private let review = TerminalClipboardReview<Destination>()
-    private var frame: Data?
+    private var frame: (bytes: Data, receivedAt: Date)?
     private var active = false, retired = false
     private var generation = UUID()
-    private var copyTask: Task<TerminalCopyDocument, Error>?
+    private var copyTask: Task<CopyCapture, Error>?
     private var overlay: UIView?
     private var textView: UITextView?
     private var detailLabel: UILabel?
@@ -26,11 +29,20 @@ public final class NativeTerminalClipboardController: NSObject {
     private var commandDraft: TerminalCommandDraft<TerminalCommandDraftDestination>?
     private var commandTask: Task<Void, Never>?
     private var commandTaskID: UUID?
+    private var diagnosticExcerpt: TerminalDiagnosticExcerpt?
+    private weak var diagnosticContextButton: UIButton?
+    private weak var diagnosticShareButton: UIButton?
+    private var shareActivity: UIActivityViewController?
+    private var shareItem: NativeTerminalDiagnosticShareItem?
+    private var shareID: UUID?
     public var onFailure: (@MainActor (Error) -> Void)?
     /// The session owner restores a fresh keyboard only for this same source
     /// and mux visit. This callback must not connect, select or create a shell.
     public var onCommandDraftFocus: (@MainActor () async throws -> TerminalCommandDraftDestination)?
-    public var isPresenting: Bool { overlay != nil || copyTask != nil || commandDraft != nil || commandTask != nil }
+    public var isPresenting: Bool {
+        overlay != nil || copyTask != nil || commandDraft != nil || commandTask != nil
+            || diagnosticExcerpt != nil || shareActivity != nil
+    }
     /// Editing owns the responder. Only the explicit, frozen Review transition
     /// may restore terminal focus; ordinary navigation remains blocked by
     /// isPresenting until the existing paste review takes ownership.
@@ -66,7 +78,7 @@ public final class NativeTerminalClipboardController: NSObject {
         guard source == self.source else { throw TerminalInputError.stale }
         guard !retired, active else { return }
         guard bytes.count <= 8 * 1024 * 1024 else { throw TerminalClipboardError.capacity }
-        frame = bytes
+        frame = (bytes, Date())
     }
     public func setActive(_ active: Bool) {
         guard !retired else { return }
@@ -94,20 +106,22 @@ public final class NativeTerminalClipboardController: NSObject {
     /// cancellation. Repeated taps cannot enqueue an unbounded decoder backlog.
     public func requestCopy() {
         guard canPresent, !isPresenting else { return }
-        guard let bytes = frame else { onFailure?(TerminalClipboardError.unavailable); return }
+        guard let capture = frame else { onFailure?(TerminalClipboardError.unavailable); return }
         do {
+            guard let terminal else { throw TerminalClipboardError.unavailable }
+            try Self.validateInputForInspection(terminal.input.session)
             let permit = try ClipboardCaptureReservation()
             let source = self.source, token = UUID(); generation = token
             let job = Task.detached(priority: .userInitiated) {
                 defer { permit.release() }
                 try Task.checkCancellation()
-                let frame = try TerminalRenderFrame.decode(bytes, expectedSource: source)
+                let frame = try TerminalRenderFrame.decode(capture.bytes, expectedSource: source)
                 // Never expose a partial synchronized-output transaction as the
                 // completed viewport. Try again after the remote update ends.
                 guard frame.flags & 8 == 0 else { throw TerminalClipboardError.unavailable }
                 let document = try TerminalCopyDocument(frame: frame)
                 try Task.checkCancellation()
-                return document
+                return CopyCapture(document: document, receivedAt: capture.receivedAt)
             }
             copyTask = job
             Task { [weak self] in
@@ -116,7 +130,7 @@ public final class NativeTerminalClipboardController: NSObject {
                 self.copyTask = nil
                 guard self.generation == token, self.canPresent else { return }
                 switch result {
-                case let .success(document): self.showCopy(document)
+                case let .success(capture): self.showCopy(capture)
                 case let .failure(error): self.onFailure?(error)
                 }
             }
@@ -279,21 +293,145 @@ public final class NativeTerminalClipboardController: NSObject {
             terminal.cancelPaste(id: id); dismiss(); onFailure?(error)
         }
     }
-    private func showCopy(_ document: TerminalCopyDocument) {
-        guard canPresent, overlay == nil else { return }
+    private func showCopy(_ capture: CopyCapture) {
+        guard canPresent, overlay == nil, let terminal else { return }
+        // Capture runs away from the main actor. A key/composition may have
+        // arrived since its preflight; never discard it when inspection opens.
+        do { try Self.validateInputForInspection(terminal.input.session) }
+        catch { onFailure?(error); return }
         // Inspection is read-only. Retire the live responder before covering
         // it, so hardware text cannot go to a shell hidden behind the reader.
         // Only explicit return-to-terminal focus activation creates a new one.
-        terminal?.input.retire()
-        let text = NativeTerminalCopyTextView(document: document)
+        terminal.input.retire()
+        let text = NativeTerminalCopyTextView(document: capture.document)
         text.onFailure = { [weak self] error in self?.onFailure?(error) }
-        let id = UUID()
-        showPanel(id: id, title: "Select Output", detail: "\(destinationLabel)\nFrozen received viewport; live output continues. Screen-row breaks are preserved. Copies stay on this device and expire after two minutes.",
+        let id = UUID(), receivedAt = capture.receivedAt
+        showPanel(id: id, title: "Select Output", detail: "\(destinationLabel)\nFrozen received viewport; live output continues. Soft wraps are joined and hard line breaks preserved. Select the exact text to copy or share. Copies stay on this device and expire after two minutes.",
                   text: text, actions: [
             button("Select All") { [weak text] in text?.selectAll(nil) },
             button("Copy Selection") { [weak text] in text?.copy(nil) },
+            button("Share Selection…") { [weak self] in self?.beginDiagnosticExcerpt(id, receivedAt: receivedAt) },
             button("Done") { [weak self] in self?.cancelPanel(id) }
         ])
+    }
+
+    static func validateInputForInspection(_ keyboard: TerminalKeyboardSession) throws {
+        guard !keyboard.document.isMarked, keyboard.accounting.pendingEvents == 0,
+              keyboard.phase != .blocked else { throw TerminalClipboardError.pendingInput }
+    }
+
+    private func beginDiagnosticExcerpt(_ id: UUID, receivedAt: Date) {
+        guard canPresent, panelID == id, diagnosticExcerpt == nil,
+              let text = textView as? NativeTerminalCopyTextView else { return }
+        do {
+            let context = try TerminalDiagnosticExcerpt.Context(destinationLabel: destinationLabel, receivedAt: receivedAt)
+            let excerpt = try text.makeDiagnosticExcerpt(context: context)
+            diagnosticExcerpt = excerpt
+            // Drop the unselected viewport before editing. Later frames cannot
+            // change the excerpt, its original label, or its receipt time.
+            removePanel()
+            showDiagnosticEditor(excerpt)
+        } catch { onFailure?(error) }
+    }
+
+    private func showDiagnosticEditor(_ excerpt: TerminalDiagnosticExcerpt) {
+        guard canPresent, diagnosticExcerpt === excerpt, excerpt.phase == .editing, overlay == nil else { return }
+        let editor = NativeTerminalDiagnosticTextView(excerpt: excerpt)
+        editor.onChange = { [weak self, weak excerpt] in
+            guard let excerpt else { return }
+            self?.updateDiagnosticDetail(excerpt)
+        }
+        editor.onFailure = { [weak self, weak excerpt] error in
+            guard let excerpt else { return }
+            self?.updateDiagnosticDetail(excerpt, problem: error.localizedDescription)
+        }
+        let context = button("Include Context: Off") { [weak self, weak excerpt] in
+            guard let self, let excerpt, self.diagnosticExcerpt === excerpt else { return }
+            do { try excerpt.setIncludesContext(!excerpt.includesContext); self.updateDiagnosticDetail(excerpt) }
+            catch { self.updateDiagnosticDetail(excerpt, problem: error.localizedDescription) }
+        }
+        context.accessibilityHint = "Include the original machine, route, pane when present, and viewport receipt time in the shared text."
+        showPanel(id: excerpt.id, title: "Prepare Diagnostic Excerpt", detail: "", text: editor, actions: [
+            button("Redact Selected Text") { [weak editor] in editor?.redactSelection() },
+            context,
+            button("Review Share…") { [weak self] in self?.prepareDiagnosticReview(excerpt.id) },
+            button("Cancel") { [weak self] in self?.cancelPanel(excerpt.id) }
+        ])
+        diagnosticContextButton = context
+        updateDiagnosticDetail(excerpt)
+        _ = editor.becomeFirstResponder()
+    }
+
+    private func updateDiagnosticDetail(_ excerpt: TerminalDiagnosticExcerpt, problem: String? = nil) {
+        guard diagnosticExcerpt === excerpt, panelID == excerpt.id else { return }
+        let context = excerpt.includesContext ? "On" : "Off"
+        diagnosticContextButton?.configuration?.title = "Include Context: \(context)"
+        diagnosticContextButton?.accessibilityValue = context
+        detailLabel?.text = "\(destinationLabel)\nOnly your selected excerpt is included. Edit it or select private text and tap Redact Selected Text. No automatic secret detection is performed. \(excerpt.utf8Bytes) of 131,072 UTF-8 bytes. Context adds the original source and viewport receipt time."
+            + (problem.map { "\n\($0)" } ?? "")
+    }
+
+    private func prepareDiagnosticReview(_ id: UUID) {
+        guard canPresent, panelID == id, let excerpt = diagnosticExcerpt, excerpt.id == id,
+              let editor = textView as? NativeTerminalDiagnosticTextView else { return }
+        do {
+            editor.unmarkText()
+            try excerpt.update(editor.text ?? "")
+            let review = try excerpt.prepareReview()
+            let reviewID = review.id
+            removePanel()
+            let preview = PassiveClipboardTextView()
+            preview.isEditable = false; preview.isSelectable = false; preview.text = review.text
+            preview.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+            preview.accessibilityLabel = "Complete text to share"
+            let share = button("Share…") { [weak self] in self?.presentDiagnosticShare(id, reviewID: reviewID) }
+            share.accessibilityIdentifier = "terminal.excerpt.share"
+            let context = excerpt.includesContext ? "Original source and viewport receipt time are included." : "Source context is not included."
+            showPanel(id: id, title: "Review Diagnostic Share", detail: "\(destinationLabel)\nThis is the complete plain-text item. \(review.text.utf8.count) UTF-8 bytes. \(context) Share opens the system chooser; nothing is sent to the terminal.", text: preview, actions: [
+                button("Edit Excerpt") { [weak self, weak excerpt] in
+                    guard let self, let excerpt, self.canPresent, self.diagnosticExcerpt === excerpt,
+                          self.shareActivity == nil else { return }
+                    do {
+                        try excerpt.resumeEditing(reviewID: reviewID)
+                        self.removePanel(); self.showDiagnosticEditor(excerpt)
+                    } catch { self.onFailure?(error) }
+                },
+                share,
+                button("Cancel") { [weak self] in self?.cancelPanel(id) }
+            ])
+            diagnosticShareButton = share
+        } catch { updateDiagnosticDetail(excerpt, problem: error.localizedDescription) }
+    }
+
+    private func presentDiagnosticShare(_ id: UUID, reviewID: UUID) {
+        guard canPresent, panelID == id, let excerpt = diagnosticExcerpt, excerpt.id == id,
+              shareActivity == nil, let terminal, terminal.source == source,
+              let anchor = diagnosticShareButton, anchor.window === terminal.window else { return }
+        // Resolve only this terminal's responder chain. A process-global key
+        // window/root lookup could present the captured text in another scene.
+        var responder: UIResponder? = terminal
+        while responder != nil && !(responder is UIViewController) { responder = responder?.next }
+        guard let presenter = responder as? UIViewController,
+              presenter.viewIfLoaded?.window === terminal.window, presenter.presentedViewController == nil,
+              !presenter.isBeingDismissed, !presenter.isBeingPresented else {
+            onFailure?(TerminalDiagnosticExcerptError.unavailable); return
+        }
+        do {
+            try excerpt.share(reviewID: reviewID) { value in
+                let item = try NativeTerminalDiagnosticShareItem(text: value)
+                let activity = item.makeActivityController(anchor: anchor)
+                let token = UUID()
+                shareItem = item; shareActivity = activity; shareID = token
+                activity.completionWithItemsHandler = { [weak self] _, _, _, error in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.shareID == token else { return }
+                        self.dismiss()
+                        if let error, self.canPresent { self.onFailure?(error) }
+                    }
+                }
+                presenter.present(activity, animated: true)
+            }
+        } catch { dismiss(); onFailure?(error) }
     }
     private func cancelPanel(_ id: UUID) {
         guard panelID == id else { return }
@@ -355,6 +493,14 @@ public final class NativeTerminalClipboardController: NSObject {
     private func dismiss() {
         generation = UUID(); copyTask?.cancel()
         commandTask?.cancel(); commandDraft?.retire(); commandDraft = nil
+        diagnosticExcerpt?.retire(); diagnosticExcerpt = nil
+        // A handed-off service may already own its copy. Retiring prevents any
+        // later provider callback from retrieving our retained text or replaying
+        // the same local approval after a scene/source change.
+        shareID = nil; shareItem?.retire(); shareItem = nil
+        shareActivity?.completionWithItemsHandler = nil
+        if let shareActivity, shareActivity.presentingViewController != nil { shareActivity.dismiss(animated: false) }
+        shareActivity = nil
         if let candidate = review.candidate { terminal?.cancelPaste(id: candidate.id) }
         review.retire()
         terminal?.input.setReviewingPaste(false)
@@ -364,8 +510,10 @@ public final class NativeTerminalClipboardController: NSObject {
         _ = textView?.resignFirstResponder()
         (textView as? NativeTerminalCopyTextView)?.clearSnapshot()
         (textView as? NativeTerminalCommandTextView)?.clearDraft()
+        (textView as? NativeTerminalDiagnosticTextView)?.clearExcerpt()
         textView?.text = ""; textView = nil
         overlay?.removeFromSuperview(); overlay = nil; panelID = nil; detailLabel = nil
+        diagnosticContextButton = nil; diagnosticShareButton = nil
         for (recognizer, enabled) in panelGestures { recognizer.isEnabled = enabled }
         panelGestures.removeAll()
     }
@@ -434,6 +582,110 @@ public final class NativeTerminalCommandTextView: UITextView, UITextViewDelegate
     }
 }
 
+/// A bounded, local redaction document. The ordinary native Share/Lookup menu
+/// is withheld: only the controller's exact final preview opens a share sheet.
+@MainActor
+public final class NativeTerminalDiagnosticTextView: UITextView, UITextViewDelegate {
+    private var excerpt: TerminalDiagnosticExcerpt?
+    public var onChange: (@MainActor () -> Void)?
+    public var onFailure: (@MainActor (Error) -> Void)?
+
+    public init(excerpt: TerminalDiagnosticExcerpt) {
+        self.excerpt = excerpt
+        super.init(frame: .zero, textContainer: nil)
+        text = excerpt.text; delegate = self; isEditable = true; isSelectable = true
+        font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        autocapitalizationType = .none; autocorrectionType = .no; spellCheckingType = .no
+        smartQuotesType = .no; smartDashesType = .no; smartInsertDeleteType = .no
+        dataDetectorTypes = []; writingToolsBehavior = .none; textContentType = nil
+        textDragInteraction?.isEnabled = false
+        accessibilityLabel = "Editable diagnostic excerpt"
+        accessibilityIdentifier = "terminal.excerpt.editor"
+        returnKeyType = .default
+    }
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) { nil }
+    public override func didMoveToWindow() { super.didMoveToWindow(); undoManager?.levelsOfUndo = 16 }
+
+    public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard excerpt?.phase == .editing else { return false }
+        let editing = [#selector(paste(_:)),
+                       #selector(select(_:)), #selector(selectAll(_:)), #selector(delete(_:)),
+                       NSSelectorFromString("undo:"), NSSelectorFromString("redo:")]
+        return editing.contains(action) && super.canPerformAction(action, withSender: sender)
+    }
+    // Transcript copying stays on the bounded, local-only Copy Selection path.
+    // Block direct selectors too; sharing this editor requires its final review.
+    public override func cut(_ sender: Any?) {}
+    public override func copy(_ sender: Any?) {}
+    public func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText: String) -> Bool {
+        guard let excerpt else { return false }
+        do {
+            if (textView.text ?? "") != excerpt.text { try excerpt.update(textView.text ?? "") }
+            _ = try excerpt.proposedText(replacing: range, with: replacementText)
+            return true
+        } catch { onFailure?(error); return false }
+    }
+    public func textViewDidChange(_ textView: UITextView) {
+        guard let excerpt else { textView.text = ""; return }
+        do { try excerpt.update(textView.text ?? ""); onChange?() }
+        catch {
+            textView.text = excerpt.text
+            textView.undoManager?.removeAllActions()
+            textView.selectedRange = NSRange(location: excerpt.text.utf16.count, length: 0)
+            onFailure?(error)
+        }
+    }
+    public func redactSelection() {
+        guard let excerpt else { return }
+        do {
+            unmarkText()
+            try excerpt.update(text ?? "")
+            let range = try excerpt.redact(selectedRange)
+            text = excerpt.text; selectedRange = range
+            // Redact deliberately drops the native undo copy of removed text.
+            undoManager?.removeAllActions()
+            onChange?()
+        } catch { onFailure?(error) }
+    }
+    public func clearExcerpt() {
+        excerpt = nil; delegate = nil; onChange = nil; onFailure = nil
+        undoManager?.removeAllActions(); text = ""; isEditable = false
+    }
+}
+
+/// UIKit requests this bounded in-memory string only after explicit local
+/// review. Nothing is written to a file or clipboard. Retirement prevents late
+/// provider requests; it cannot retract a copy already accepted by a service.
+@MainActor
+final class NativeTerminalDiagnosticShareItem: NSObject, UIActivityItemSource {
+    private var text: String?
+    init(text: String) throws {
+        guard !text.isEmpty, text.utf8.count <= TerminalDiagnosticExcerpt.maximumSharedUTF8Bytes else {
+            throw TerminalDiagnosticExcerptError.capacity
+        }
+        self.text = text
+        super.init()
+    }
+    func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any { "" }
+    func activityViewController(_ activityViewController: UIActivityViewController,
+                                itemForActivityType activityType: UIActivity.ActivityType?) -> Any? { text }
+    func activityViewController(_ activityViewController: UIActivityViewController,
+                                dataTypeIdentifierForActivityType activityType: UIActivity.ActivityType?) -> String {
+        "public.utf8-plain-text"
+    }
+    func makeActivityController(anchor: UIView) -> UIActivityViewController {
+        let activity = UIActivityViewController(activityItems: [self], applicationActivities: nil)
+        // Keep copying on the original device-local, expiring path. The exact
+        // view/rect pair also makes this valid as an iPad popover.
+        activity.excludedActivityTypes = [.copyToPasteboard]
+        activity.popoverPresentationController?.sourceView = anchor
+        activity.popoverPresentationController?.sourceRect = anchor.bounds
+        return activity
+    }
+    func retire() { text = nil }
+}
+
 /// The preview must not replace/resign the responder whose exact paste request
 /// it is reviewing. This is an inline review, not a modal presentation or editor.
 @MainActor
@@ -441,9 +693,10 @@ private final class PassiveClipboardTextView: UITextView {
     override var canBecomeFirstResponder: Bool { false }
 }
 
-/// The only transcript copy path, shared by the explicit button and UIKit's
-/// selection menu / hardware Copy command. No cut, paste, share or URL detector
-/// is installed on this read-only snapshot. Tests inject a non-system writer.
+/// A transcript copy path shared by the explicit button and UIKit's selection
+/// menu / hardware Copy command. Sharing requires the controller's separate
+/// selected-excerpt review; no native Share, cut, paste or URL detector is
+/// installed on this read-only snapshot. Tests inject a non-system writer.
 @MainActor
 public final class NativeTerminalCopyTextView: UITextView {
     private var document: TerminalCopyDocument?
@@ -477,6 +730,13 @@ public final class NativeTerminalCopyTextView: UITextView {
             selectedRange = range
             writer(value)
         } catch { onFailure?(error) }
+    }
+    public func makeDiagnosticExcerpt(context: TerminalDiagnosticExcerpt.Context) throws -> TerminalDiagnosticExcerpt {
+        guard let document else { throw TerminalDiagnosticExcerptError.unavailable }
+        let range = try document.normalizedRange(selectedRange)
+        let excerpt = try TerminalDiagnosticExcerpt(document: document, selection: range, context: context)
+        selectedRange = range
+        return excerpt
     }
     public func clearSnapshot() { document = nil; text = ""; onFailure = nil }
 }

@@ -1,13 +1,14 @@
 import Foundation
 
 public enum TerminalClipboardError: Error, Equatable, Sendable, LocalizedError {
-    case invalidGeometry, capacity, invalidRange, emptySelection, unavailable
+    case invalidGeometry, capacity, invalidRange, emptySelection, pendingInput, unavailable
     public var errorDescription: String? {
         switch self {
         case .invalidGeometry: "The terminal snapshot could not be validated."
         case .capacity: "This viewport is too large to copy. Select a smaller viewport."
         case .invalidRange: "The selected text range is no longer valid."
         case .emptySelection: "Select some output to copy."
+        case .pendingInput: "Finish text composition or resolve the terminal's pending input before selecting output."
         case .unavailable: "The terminal is updating. Try copying again after its update finishes."
         }
     }
