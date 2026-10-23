@@ -442,11 +442,7 @@ private actor MacExportEngine {
         guard url.isFileURL else { throw FTError.stale }
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
-        // Deliberate new-file save only. Never overwrite another backup silently.
-        try bytes.write(to: url, options: .withoutOverwriting)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        let handle = try FileHandle(forWritingTo: url)
-        try handle.synchronize(); try handle.close()
+        try LocalExportFile.write(bytes, to: url)
     }
     func clear() {
         retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []
@@ -1106,7 +1102,9 @@ private final class MacExportModel {
         }
     }
     private func report(_ error: Error) {
-        if let error = error as? OpenSSHSourceKeyError {
+        if let error = error as? LocalExportFileError {
+            message = error.localizedDescription
+        } else if let error = error as? OpenSSHSourceKeyError {
             message = error.localizedDescription
         } else if let error = error as? FTError {
             if error == .malformed("export.recipient_confirmation") || error == .unsupported("recipient.confirmation_required") {
