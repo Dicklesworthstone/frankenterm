@@ -2530,7 +2530,7 @@ pub fn acknowledge_session_cleanup_attempt(
 /// Collapse SQLite/rusqlite failures into a finite, content-free telemetry
 /// class. Raw error displays are deliberately excluded because SQLite error
 /// messages can contain database paths, schema fragments, or persisted values.
-fn session_cleanup_database_error_class(error: &rusqlite::Error) -> &'static str {
+pub(crate) fn session_cleanup_database_error_class(error: &rusqlite::Error) -> &'static str {
     use rusqlite::ffi::ErrorCode;
 
     match error.sqlite_error_code() {

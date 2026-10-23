@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3617,6 +3617,20 @@ struct SessionCleanupSchedule {
     retry_deferred_at: Option<Instant>,
 }
 
+/// Outcome of one in-process attempt to lift a latch left by an interrupted
+/// session cleanup (ft-28hba).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCleanupReconciliation {
+    /// Snapshot authority was not latched.
+    NotLatched,
+    /// The latch stays: another cause latched it, a latched cleanup may still
+    /// be running, admission is busy, or the durable re-read failed.
+    Retained,
+    /// The latch was lifted. `retention_fenced` reports a durable cleanup
+    /// receipt that still pauses retention until an operator acknowledges it.
+    Lifted { retention_fenced: bool },
+}
+
 impl SessionCleanupSchedule {
     fn defer_retry(&mut self, now: Instant) {
         self.retry_deferred_at = Some(now);
@@ -3779,6 +3793,13 @@ struct SnapshotAuthorityState {
     reconciliation_required: AtomicBool,
     session_cleanup_reconciliation_required: AtomicBool,
     first_latched_operation: AtomicU8,
+    /// Every cause latched since the last reconciliation: one bit per
+    /// operation code, plus [`LATCHED_UNPROVEN_IDENTITY`]. Guarded by
+    /// `latched_handoffs` so a lift cannot interleave with a new latch.
+    latched_causes: AtomicU32,
+    /// Handoffs of latched attempts whose closures may still be running. A
+    /// latch is never lifted while one of them has started but not returned.
+    latched_handoffs: StdMutex<Vec<Arc<AtomicU8>>>,
     /// Whether the latched pause of session retention has been reported.
     cleanup_pause_reported: AtomicBool,
     /// Shared monotonic checkpoint-retention schedule. This prevents multiple
@@ -3809,6 +3830,8 @@ impl SnapshotAuthorityState {
             reconciliation_required: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             first_latched_operation: AtomicU8::new(0),
+            latched_causes: AtomicU32::new(0),
+            latched_handoffs: StdMutex::new(Vec::new()),
             cleanup_pause_reported: AtomicBool::new(false),
             checkpoint_cleanup_cadence: StdMutex::new(CheckpointCleanupCadence::new()),
         }
@@ -3821,16 +3844,52 @@ impl SnapshotAuthorityState {
                 .load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn latch_reconciliation(self: &Arc<Self>, operation: SnapshotAuthorityOperation) {
-        let _ = self.first_latched_operation.compare_exchange(
-            0,
-            operation.code(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.reconciliation_required.store(true, Ordering::Release);
-        self.session_cleanup_reconciliation_required
-            .store(true, Ordering::Release);
+        self.latch_causes(1 << operation.code(), operation, None);
+    }
+
+    /// Latch after a mutation attempt lost its outcome. Its handoff is kept so
+    /// a later reconciliation can tell whether the closure is still running.
+    fn latch_attempt(
+        self: &Arc<Self>,
+        operation: SnapshotAuthorityOperation,
+        handoff_state: &Arc<AtomicU8>,
+    ) {
+        self.latch_causes(1 << operation.code(), operation, Some(handoff_state));
+    }
+
+    /// Latch because the database's filesystem identity could not be proven.
+    /// No in-process reconciliation lifts this cause.
+    fn latch_unproven_identity(self: &Arc<Self>, operation: SnapshotAuthorityOperation) {
+        self.latch_causes(LATCHED_UNPROVEN_IDENTITY, operation, None);
+    }
+
+    fn latch_causes(
+        self: &Arc<Self>,
+        causes: u32,
+        operation: SnapshotAuthorityOperation,
+        handoff_state: Option<&Arc<AtomicU8>>,
+    ) {
+        {
+            let mut handoffs = self
+                .latched_handoffs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handoff_state) = handoff_state {
+                handoffs.push(Arc::clone(handoff_state));
+            }
+            self.latched_causes.fetch_or(causes, Ordering::AcqRel);
+            let _ = self.first_latched_operation.compare_exchange(
+                0,
+                operation.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.reconciliation_required.store(true, Ordering::Release);
+            self.session_cleanup_reconciliation_required
+                .store(true, Ordering::Release);
+        }
         retain_latched_snapshot_authority(self);
     }
 
@@ -3838,18 +3897,62 @@ impl SnapshotAuthorityState {
         SnapshotAuthorityOperation::from_code(self.first_latched_operation.load(Ordering::Acquire))
     }
 
+    /// Whether every latched cause is a session-retention cleanup whose
+    /// closure has returned or never started (ft-28hba).
+    fn latch_is_settled_session_cleanup(&self) -> bool {
+        let handoffs = self
+            .latched_handoffs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::settled_session_cleanup(&handoffs, self.latched_causes.load(Ordering::Acquire))
+    }
+
+    fn settled_session_cleanup(handoffs: &[Arc<AtomicU8>], causes: u32) -> bool {
+        causes == 1 << SnapshotAuthorityOperation::SessionRetentionCleanup.code()
+            && handoffs
+                .iter()
+                .all(|handoff| handoff.load(Ordering::Acquire) != AUTHORITY_HANDOFF_STARTED)
+    }
+
     /// Lift the latch once the caller, holding this authority exclusively,
     /// has proved the durable outcome the latch stood for.
     #[cfg(feature = "frankenterm-deps")]
     fn clear_reconciliation(self: &Arc<Self>) {
-        self.reconciliation_required.store(false, Ordering::Release);
-        self.session_cleanup_reconciliation_required
-            .store(false, Ordering::Release);
-        self.first_latched_operation.store(0, Ordering::Release);
-        self.cleanup_pause_reported.store(false, Ordering::Release);
+        self.clear_reconciliation_if(|_, _| true);
+    }
+
+    /// Lift the latch if `proven` still holds for the latched causes and
+    /// handoffs, checked under the same lock every latch takes, so a cause
+    /// latched after the caller's proof keeps the latch. Returns whether the
+    /// latch was lifted.
+    fn clear_reconciliation_if(
+        self: &Arc<Self>,
+        proven: impl FnOnce(&[Arc<AtomicU8>], u32) -> bool,
+    ) -> bool {
+        {
+            let mut handoffs = self
+                .latched_handoffs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !proven(&handoffs, self.latched_causes.load(Ordering::Acquire)) {
+                return false;
+            }
+            handoffs.clear();
+            self.latched_causes.store(0, Ordering::Release);
+            self.reconciliation_required.store(false, Ordering::Release);
+            self.session_cleanup_reconciliation_required
+                .store(false, Ordering::Release);
+            self.first_latched_operation.store(0, Ordering::Release);
+            self.cleanup_pause_reported.store(false, Ordering::Release);
+        }
         let mut entries = snapshot_authority_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A latch published after the lift above inserts its own entries
+        // under this lock; leave those latched.
+        if self.reconciliation_is_required() {
+            return false;
+        }
         for entry in entries.values_mut() {
             if matches!(entry, SnapshotAuthorityRegistryEntry::Latched(latched)
                 if Arc::ptr_eq(latched, self))
@@ -3857,8 +3960,13 @@ impl SnapshotAuthorityState {
                 *entry = SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(self));
             }
         }
+        true
     }
 }
+
+/// Latched-cause bit for an unproven filesystem identity; operation codes use
+/// the low bits.
+const LATCHED_UNPROVEN_IDENTITY: u32 = 1 << 31;
 
 enum SnapshotAuthorityRegistryEntry {
     Live(Weak<SnapshotAuthorityState>),
@@ -4020,9 +4128,9 @@ fn refresh_snapshot_authority_file_identities(
         conflict_count = conflicts.len(),
         "snapshot filesystem authority identity could not be proven"
     );
-    state.latch_reconciliation(operation);
+    state.latch_unproven_identity(operation);
     for conflict in conflicts {
-        conflict.latch_reconciliation(operation);
+        conflict.latch_unproven_identity(operation);
     }
     Err(error)
 }
@@ -4619,7 +4727,8 @@ impl SnapshotAuthorityAttemptGuard {
     }
 
     fn latch_and_settle(mut self) {
-        self.authority.latch_reconciliation(self.operation);
+        self.authority
+            .latch_attempt(self.operation, &self.handoff_state);
         self.settled = true;
     }
 }
@@ -4632,7 +4741,8 @@ impl Drop for SnapshotAuthorityAttemptGuard {
                 state,
                 AUTHORITY_HANDOFF_STARTED | AUTHORITY_HANDOFF_COMPLETED
             ) {
-                self.authority.latch_reconciliation(self.operation);
+                self.authority
+                    .latch_attempt(self.operation, &self.handoff_state);
             }
         }
         self.authority.in_progress.store(false, Ordering::Release);
@@ -5730,7 +5840,10 @@ impl SnapshotEngine {
         &self,
         cx: &crate::cx::Cx,
     ) -> std::result::Result<(), SnapshotError> {
-        if self.authority_reconciliation_is_required() {
+        if self.authority_reconciliation_is_required()
+            && self.reconcile_session_cleanup_latch(cx).await
+                == SessionCleanupReconciliation::Retained
+        {
             return Err(
                 self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCleanup)
             );
@@ -6602,14 +6715,18 @@ impl SnapshotEngine {
     /// completion is lost, the
     /// engine latches both `session_cleanup_reconciliation_required` and the
     /// shared snapshot-authority reconciliation state. This suppresses every
-    /// later mutation of the same authority tables for this engine instance,
-    /// including after a same-engine scheduler restart.
+    /// later mutation of the same authority tables, including after a
+    /// same-engine scheduler restart, until the cleanup has returned and
+    /// [`Self::reconcile_session_cleanup_latch`] lifts the latch.
     async fn maybe_run_session_cleanup(
         &self,
         cx: &crate::cx::Cx,
         schedule: &mut SessionCleanupSchedule,
     ) {
-        if self.authority_reconciliation_is_required() {
+        if self.authority_reconciliation_is_required()
+            && self.reconcile_session_cleanup_latch(cx).await
+                == SessionCleanupReconciliation::Retained
+        {
             self.report_latched_cleanup_pause();
             return;
         }
@@ -6701,6 +6818,15 @@ impl SnapshotEngine {
                         automatic_retry_suppressed = true,
                         "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
                     );
+                    // The scheduler captures right after this, and a capture
+                    // refused by the latch ends the scheduler. A cleanup that
+                    // returned its error can be reconciled now.
+                    if matches!(
+                        self.reconcile_session_cleanup_latch(cx).await,
+                        SessionCleanupReconciliation::Lifted { .. }
+                    ) {
+                        schedule.defer_retry(Instant::now());
+                    }
                 } else {
                     schedule.defer_retry(Instant::now());
                     tracing::warn!(
@@ -6727,9 +6853,120 @@ impl SnapshotEngine {
         }
         tracing::warn!(
             first_indeterminate_operation = ?self.snapshot_authority.first_latched_operation(),
-            remediation = "restart the watcher (ft stop && ft watch) to rebuild snapshot authority from durable state",
+            remediation = "restart the watcher (ft stop && ft watch) to rebuild snapshot authority from durable state; a latch left only by session cleanup lifts on its own once that cleanup has returned",
             "Session retention cleanup is paused: snapshot authority needs reconciliation"
         );
+    }
+
+    /// Lift a latch that only an interrupted session-retention cleanup set
+    /// (ft-28hba), so one lost cleanup outcome no longer stops every snapshot
+    /// until the watcher restarts.
+    ///
+    /// Cleanup deletes only sessions that shut down cleanly or whose owner is
+    /// proven dead, and rows whose session is gone. Whether it finished, partly
+    /// finished or never started, it leaves this process's own sessions alone,
+    /// and the engine re-reads the database before trusting its caches. What
+    /// the latch guards against is a cleanup closure that may still commit. So
+    /// it lifts only when every latched cause is session cleanup, every latched
+    /// closure has returned, this engine holds the authority exclusively, the
+    /// database is still the same file, and a fresh read finds this engine's
+    /// own session still owned by this process. The durable cleanup receipt is
+    /// left alone: an open one keeps retention fenced until an operator
+    /// acknowledges it, which no longer needs a watcher restart.
+    async fn reconcile_session_cleanup_latch(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> SessionCleanupReconciliation {
+        if !self.authority_reconciliation_is_required() {
+            return SessionCleanupReconciliation::NotLatched;
+        }
+        if !self.snapshot_authority.latch_is_settled_session_cleanup() {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let Ok(session_id) = self
+            .session_id
+            .read_with_cx(cx)
+            .await
+            .map(|session_id| (*session_id).clone())
+        else {
+            return SessionCleanupReconciliation::Retained;
+        };
+        if self
+            .snapshot_authority
+            .in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let _held = SnapshotAuthorityReadGuard {
+            authority: Arc::clone(&self.snapshot_authority),
+        };
+        if refresh_snapshot_authority_file_identities(
+            self.db_path.as_str(),
+            &self.snapshot_authority,
+            SnapshotAuthorityOperation::SessionRetentionCleanup,
+        )
+        .is_err()
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let db_path = Arc::clone(&self.db_path);
+        let owner = self.owner_identity.clone();
+        let observed = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            observe_session_cleanup_reconciliation(
+                db_path.as_str(),
+                session_id.as_deref(),
+                owner.as_ref(),
+            )
+        })
+        .await;
+        let status = match observed {
+            Ok(Ok(Some(status))) => status,
+            Ok(Ok(None)) => {
+                tracing::error!(
+                    "Snapshot authority stays latched: this engine's session is no longer owned by this process"
+                );
+                return SessionCleanupReconciliation::Retained;
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    error_class =
+                        crate::session_retention::session_cleanup_database_error_class(&error),
+                    "Snapshot authority reconciliation could not re-read the database; retrying later"
+                );
+                return SessionCleanupReconciliation::Retained;
+            }
+            Err(_) => return SessionCleanupReconciliation::Retained,
+        };
+        if !self
+            .snapshot_authority
+            .clear_reconciliation_if(SnapshotAuthorityState::settled_session_cleanup)
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let retention_fenced = status.blocks_cleanup();
+        match status {
+            crate::session_retention::SessionCleanupAttemptStatus::Open { attempt_id, .. } => {
+                tracing::warn!(
+                    attempt_id = %attempt_id,
+                    remediation = "the attempt is no longer running; acknowledge it with `ft session acknowledge-cleanup <attempt> --force` to resume retention",
+                    "Snapshots resume after an interrupted session cleanup; retention stays paused until its attempt is acknowledged"
+                );
+            }
+            crate::session_retention::SessionCleanupAttemptStatus::Malformed => {
+                tracing::warn!(
+                    remediation = "inspect `ft session doctor` and acknowledge the malformed receipt to resume retention",
+                    "Snapshots resume after an interrupted session cleanup; retention stays paused behind a malformed cleanup receipt"
+                );
+            }
+            _ => {
+                tracing::info!(
+                    "Snapshots and retention resume after an interrupted session cleanup"
+                );
+            }
+        }
+        SessionCleanupReconciliation::Lifted { retention_fenced }
     }
 
     /// Acquire exclusive authority for an automatic cleanup attempt. A second
@@ -8461,6 +8698,50 @@ fn open_snapshot_query_conn(db_path: &str) -> std::result::Result<Connection, ru
     let conn = Connection::open_with_flags(db_path, flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// Durable re-read behind lifting a session-cleanup latch. The engine's own
+/// session, when it has one, must still be owned by this process, under the
+/// same predicate a checkpoint commit updates it with. `Ok(None)` means it is
+/// not, and the latch stays. Otherwise the cleanup receipt says whether
+/// retention stays fenced.
+fn observe_session_cleanup_reconciliation(
+    db_path: &str,
+    session_id: Option<&str>,
+    owner: Option<&crate::session_retention::SessionOwnerIdentity>,
+) -> std::result::Result<
+    Option<crate::session_retention::SessionCleanupAttemptStatus>,
+    rusqlite::Error,
+> {
+    let conn = open_snapshot_query_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    if let Some(session_id) = session_id {
+        let ours: bool = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM mux_sessions
+                 WHERE session_id = ?1
+                   AND (
+                       (?2 IS NULL AND owner_pid IS NULL
+                           AND owner_process_start IS NULL
+                           AND owner_heartbeat_at IS NULL)
+                       OR (host_id = ?2
+                           AND owner_pid = ?3
+                           AND owner_process_start = ?4)
+                   )
+             )",
+            rusqlite::params![
+                session_id,
+                owner.map(|identity| identity.host_id.as_str()),
+                owner.map(|identity| identity.pid),
+                owner.map(|identity| identity.process_start),
+            ],
+            |row| row.get(0),
+        )?;
+        if !ours {
+            return Ok(None);
+        }
+    }
+    crate::session_retention::session_cleanup_attempt_status(&tx).map(Some)
 }
 
 /// Re-read and recompute the complete persisted v2 snapshot witness. The
@@ -17273,17 +17554,18 @@ mod tests {
     }
 
     #[test]
-    fn session_cleanup_reconciliation_latch_survives_same_engine_scheduler_restart() {
+    fn session_cleanup_latch_survives_scheduler_restart_until_its_cleanup_returns() {
         run_async_test(async {
-            use crate::session_retention::{SessionCleanupError, SessionCleanupIndeterminatePhase};
-
-            let engine =
-                SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
-            assert!(engine.latch_session_cleanup_reconciliation(
-                SessionCleanupError::IndeterminateCleanup {
-                    phase: SessionCleanupIndeterminatePhase::CleanupExecution,
-                }
-            ));
+            let (_tmp, db_path) = setup_test_db();
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(db_path, config);
+            // A cleanup whose result was lost while its closure still runs.
+            let running_cleanup = Arc::new(AtomicU8::new(AUTHORITY_HANDOFF_STARTED));
+            engine.snapshot_authority.latch_attempt(
+                SnapshotAuthorityOperation::SessionRetentionCleanup,
+                &running_cleanup,
+            );
 
             // A restarted scheduler begins with fresh cadence state. The
             // engine-owned latch must still stop cleanup before touching that
@@ -17305,13 +17587,211 @@ mod tests {
                     .cleanup_pause_reported
                     .load(Ordering::Acquire)
             );
+            assert!(
+                engine
+                    .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                    .await
+                    .is_err(),
+                "a cleanup that may still commit keeps every mutation refused"
+            );
+
+            // Once the closure has returned, the next pass lifts the latch
+            // and cleanup runs again.
+            running_cleanup.store(AUTHORITY_HANDOFF_COMPLETED, Ordering::Release);
             engine
                 .maybe_run_session_cleanup(&cx, &mut restarted_scheduler_schedule)
                 .await;
-            assert_eq!(
-                restarted_scheduler_schedule,
-                SessionCleanupSchedule::default()
+            assert!(!engine.authority_reconciliation_is_required());
+            assert!(
+                restarted_scheduler_schedule
+                    .last_authoritative_success
+                    .is_some(),
+                "cleanup must run once the latch lifts"
             );
+        });
+    }
+
+    /// Simulate a cleanup that returned an indeterminate outcome after
+    /// admitting its durable receipt, as a busy database mid-pipeline does.
+    async fn interrupt_session_cleanup(engine: &SnapshotEngine, cx: &crate::cx::Cx) {
+        use crate::session_retention::{
+            SESSION_CLEANUP_ATTEMPT_KEY, SessionCleanupError, SessionCleanupIndeterminatePhase,
+        };
+
+        let db_path = Arc::clone(&engine.db_path);
+        let result = engine
+            .spawn_blocking_authority_with_cx(
+                cx,
+                SnapshotAuthorityOperation::SessionRetentionCleanup,
+                move || -> std::result::Result<(), SessionCleanupError> {
+                    let conn = Connection::open(db_path.as_str()).unwrap();
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS config (
+                             key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+                         )",
+                    )
+                    .unwrap();
+                    let open_receipt = serde_json::json!({
+                        "schema": "ft.session_cleanup_attempt.v1",
+                        "attempt_id": "interrupted-1",
+                        "state": "open",
+                        "owner_pid": std::process::id(),
+                        "started_at_ms": 1,
+                        "max_age_days": 30,
+                        "max_closed_sessions": 0,
+                        "max_total_size_mb": 0,
+                        "finished_at_ms": null,
+                        "sessions_deleted": null,
+                        "orphan_rows_deleted": null,
+                    });
+                    conn.execute(
+                        "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                        rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, open_receipt.to_string()],
+                    )
+                    .unwrap();
+                    Err(SessionCleanupError::IndeterminateCleanup {
+                        phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+                    })
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SnapshotError::IndeterminateAuthorityMutation {
+                operation: SnapshotAuthorityOperation::SessionRetentionCleanup,
+            })
+        ));
+        assert!(engine.authority_reconciliation_is_required());
+    }
+
+    #[test]
+    fn an_interrupted_session_cleanup_no_longer_stops_snapshots() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            let panes = vec![make_test_pane(1, 24, 80)];
+            let first = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect("first capture creates the session");
+
+            interrupt_session_cleanup(&engine, &cx).await;
+            assert!(matches!(
+                engine.capture(&panes, SnapshotTrigger::Manual).await,
+                Err(SnapshotError::AuthorityReconciliationRequired { .. })
+            ));
+
+            // The scheduler's next pass reconciles before it touches the
+            // database, so it keeps running instead of failing.
+            engine
+                .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                .await
+                .expect("a returned cleanup's latch lifts on the next pass");
+            assert!(!engine.authority_reconciliation_is_required());
+            let next = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect("snapshots resume in the same session");
+            assert_eq!(next.session_id, first.session_id);
+            assert!(next.checkpoint_id > first.checkpoint_id);
+
+            // The open receipt still fences retention for the operator.
+            let mut schedule = SessionCleanupSchedule::default();
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
+            assert!(schedule.last_authoritative_success.is_none());
+            assert!(!engine.authority_reconciliation_is_required());
+        });
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_reports_a_still_fenced_retention() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            interrupt_session_cleanup(&engine, &cx).await;
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Lifted {
+                    retention_fenced: true
+                }
+            );
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::NotLatched
+            );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_keeps_latches_it_cannot_prove() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+
+            // Another operation also lost its outcome.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            interrupt_session_cleanup(&engine, &cx).await;
+            engine
+                .snapshot_authority
+                .latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            assert!(engine.authority_reconciliation_is_required());
+
+            // The database's identity could not be proven.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            engine
+                .snapshot_authority
+                .latch_unproven_identity(SnapshotAuthorityOperation::SessionRetentionCleanup);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+
+            // Exclusive admission is held elsewhere.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            interrupt_session_cleanup(&engine, &cx).await;
+            engine
+                .snapshot_authority
+                .in_progress
+                .store(true, Ordering::Release);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            engine
+                .snapshot_authority
+                .in_progress
+                .store(false, Ordering::Release);
+
+            // The engine's own session no longer belongs to this process.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(Arc::clone(&db_path), SnapshotConfig::default());
+            let captured = engine
+                .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+                .await
+                .expect("capture creates the session");
+            interrupt_session_cleanup(&engine, &cx).await;
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .execute(
+                    "UPDATE mux_sessions
+                     SET host_id = 'elsewhere', owner_pid = 4242424, owner_process_start = 1
+                     WHERE session_id = ?1",
+                    [&captured.session_id],
+                )
+                .unwrap();
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            assert!(engine.authority_reconciliation_is_required());
         });
     }
 
