@@ -5023,7 +5023,8 @@ impl GuardianCheckpointStageStore {
                 max_records,
                 ..
             } => {
-                let snapshot_admission = guardian_replay_plan_snapshot_admission(&state)?;
+                let snapshot_admission =
+                    guardian_replay_plan_snapshot_admission(&state, pane_id, generation)?;
                 let request_binding = guardian_replay_plan_request_binding(
                     &state,
                     request_id,
@@ -5478,19 +5479,29 @@ fn guardian_replay_authenticated_fingerprint(
 
 fn guardian_replay_plan_snapshot_admission(
     state: &GuardianReplayState,
+    pane_id: Uuid,
+    generation: u64,
 ) -> Result<GuardianReplaySnapshotAdmissionPlan, GuardianCheckpointStageStoreError> {
     if state.snapshots.len() > REPLAY_MAX_ACTIVE_SNAPSHOTS {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let evicted_snapshot_id = if state.snapshots.len() == REPLAY_MAX_ACTIVE_SNAPSHOTS {
         Some(
-            state
-                .snapshots
-                .iter()
-                .filter(|(_, snapshot)| snapshot.issued.is_some_and(|issued| issued.acknowledged))
-                .min_by_key(|(_, snapshot)| snapshot.access_epoch)
-                .map(|(snapshot_id, _)| *snapshot_id)
-                .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
+            guardian_replay_eviction_candidate(
+                state
+                    .snapshots
+                    .iter()
+                    .map(|(snapshot_id, snapshot)| GuardianReplayEvictionView {
+                        snapshot_id: *snapshot_id,
+                        pane_id: snapshot.pane_id,
+                        generation: snapshot.generation,
+                        acknowledged: snapshot.issued.is_some_and(|issued| issued.acknowledged),
+                        access_epoch: snapshot.access_epoch,
+                    }),
+                pane_id,
+                generation,
+            )
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
         )
     } else {
         None
@@ -5498,6 +5509,43 @@ fn guardian_replay_plan_snapshot_admission(
     Ok(GuardianReplaySnapshotAdmissionPlan {
         evicted_snapshot_id,
     })
+}
+
+/// What admission needs to know about one retained replay snapshot.
+#[derive(Clone, Copy)]
+struct GuardianReplayEvictionView {
+    snapshot_id: Uuid,
+    pane_id: Uuid,
+    generation: u64,
+    acknowledged: bool,
+    access_epoch: u64,
+}
+
+/// The snapshot a full store gives up for an Open by `pane_id` under lease
+/// `generation`. First the oldest snapshot of that pane under an older lease
+/// generation: its lease is fenced, so no ack can ever release it, and a mux
+/// that died with a page in flight leaves one behind on every upgrade (a
+/// successor restoring 40 panes was refused, ft-udi9a). Otherwise the least
+/// recently used snapshot whose last page was acknowledged.
+fn guardian_replay_eviction_candidate(
+    snapshots: impl Iterator<Item = GuardianReplayEvictionView>,
+    pane_id: Uuid,
+    generation: u64,
+) -> Option<Uuid> {
+    let mut fenced: Option<GuardianReplayEvictionView> = None;
+    let mut acknowledged: Option<GuardianReplayEvictionView> = None;
+    for snapshot in snapshots {
+        if snapshot.pane_id == pane_id && snapshot.generation < generation {
+            if fenced.is_none_or(|kept| snapshot.access_epoch < kept.access_epoch) {
+                fenced = Some(snapshot);
+            }
+        } else if snapshot.acknowledged
+            && acknowledged.is_none_or(|kept| snapshot.access_epoch < kept.access_epoch)
+        {
+            acknowledged = Some(snapshot);
+        }
+    }
+    fenced.or(acknowledged).map(|snapshot| snapshot.snapshot_id)
 }
 
 fn guardian_replay_commit_snapshot_admission(
@@ -20318,6 +20366,55 @@ mod tests {
         assert_ne!(reopened.snapshot_id, replay_page.snapshot_id);
         assert_ne!(reopened.checkpoint_plaintext.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn a_full_replay_store_gives_up_a_fenced_lease_snapshot_before_an_acknowledged_one() {
+        let pane = Uuid::from_u128(0xf500);
+        let other = Uuid::from_u128(0xf501);
+        let view = |id: u128, pane_id, generation, acknowledged, access_epoch| {
+            GuardianReplayEvictionView {
+                snapshot_id: Uuid::from_u128(id),
+                pane_id,
+                generation,
+                acknowledged,
+                access_epoch,
+            }
+        };
+        // A page in flight under this pane's fenced generation 1 can never be
+        // acknowledged; it goes before the oldest acknowledged snapshot.
+        let snapshots = [
+            view(1, other, 1, true, 1),
+            view(2, pane, 1, false, 5),
+            view(3, pane, 2, false, 2),
+            view(4, other, 3, false, 0),
+        ];
+        assert_eq!(
+            guardian_replay_eviction_candidate(snapshots.into_iter(), pane, 2),
+            Some(Uuid::from_u128(2))
+        );
+        // The oldest of several fenced snapshots goes first.
+        let snapshots = [view(5, pane, 1, false, 9), view(6, pane, 0, true, 7)];
+        assert_eq!(
+            guardian_replay_eviction_candidate(snapshots.into_iter(), pane, 2),
+            Some(Uuid::from_u128(6))
+        );
+        // Without a fenced one, the least recently used acknowledged snapshot.
+        let snapshots = [
+            view(7, other, 1, true, 4),
+            view(8, other, 1, true, 3),
+            view(9, pane, 2, false, 0),
+        ];
+        assert_eq!(
+            guardian_replay_eviction_candidate(snapshots.into_iter(), pane, 2),
+            Some(Uuid::from_u128(8))
+        );
+        // The current or a newer lease's page in flight is never given up.
+        let snapshots = [view(10, pane, 2, false, 0), view(11, pane, 3, false, 1)];
+        assert_eq!(
+            guardian_replay_eviction_candidate(snapshots.into_iter(), pane, 2),
+            None
+        );
     }
 
     #[test]
