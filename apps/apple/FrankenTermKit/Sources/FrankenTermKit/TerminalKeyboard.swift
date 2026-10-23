@@ -134,6 +134,23 @@ public struct TerminalKeyboardAccounting: Equatable, Sendable {
     public let admittedEvents: UInt64, discardedUnadmittedEvents: UInt64
 }
 
+/// One stopped local queue, not a transport failure or permission to replay
+/// earlier input. No text, paste payload, key identity or payload hash escapes.
+/// A new failure gets a new decision ID even on the same keyboard and focus.
+public struct TerminalKeyboardRecovery: Equatable, Sendable, Identifiable, CustomDebugStringConvertible {
+    public let id: UUID, keyboardID: UUID
+    public let focus: TerminalFocus
+    public let accounting: TerminalKeyboardAccounting
+    public let failure: TerminalKeyboardError
+    public let canRetry: Bool
+    public var debugDescription: String { "TerminalKeyboardRecovery([redacted])" }
+    fileprivate init(keyboardID: UUID, focus: TerminalFocus, accounting: TerminalKeyboardAccounting,
+                     failure: TerminalKeyboardError, canRetry: Bool) {
+        id = UUID(); self.keyboardID = keyboardID; self.focus = focus
+        self.accounting = accounting; self.failure = failure; self.canRetry = canRetry
+    }
+}
+
 /// One immutable responder context per focus generation. Synchronous UIKit
 /// callbacks enter a bounded FIFO; ONE owned pump performs the async encoding
 /// and coordinator admission. Nothing is resolved through a current-pane pointer.
@@ -145,6 +162,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     public private(set) var document: TerminalMarkedText
     public private(set) var phase: TerminalKeyboardPhase = .active
     public private(set) var lastFailure: TerminalKeyboardError?
+    public private(set) var recovery: TerminalKeyboardRecovery?
     /// Content-free receipts; consuming these must not discard the downstream
     /// coordinator's effect/uncertainty ledger. There is no receipt history here.
     public var onAdmission: (@MainActor (TerminalInputReceipt) -> Void)?
@@ -171,6 +189,9 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     private var composition: TerminalComposition?
     private var queue: [Event] = []
     private var flight: Event?
+    // Set inside the transaction, before calling external admission observers.
+    // An error from transaction teardown must not make an admitted event retryable.
+    private var flightCompleted = false
     private var held: [UInt16: TerminalHardwareKey] = [:]
     private var worker: Task<Void, Never>?
     private var transition: Task<TerminalFocus, Error>?
@@ -324,7 +345,10 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             // A release/repeat from an old UIKit responder must not manufacture
             // a key on a fresh context. Ordinary repeated down callbacks remain
             // valid; native code marks subsequent observed downs as repeats.
-            if (keyPhase == .up || keyPhase == .repeated) && held[key.usage] == nil { return }
+            if (keyPhase == .up || keyPhase == .repeated) && held[key.usage] == nil {
+                flightCompleted = true
+                return
+            }
             if keyPhase == .down && held[key.usage] == nil && held.count >= 32 { throw TerminalKeyboardError.capacity }
             let bytes = try await encode(.key(key, keyPhase))
             try checkLivePump()
@@ -341,31 +365,57 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             guard prepared.text.utf8.count <= maximumEncodedBytes else { throw TerminalKeyboardError.capacity }
             receipt = try await coordinator.paste(originalFocus, text: prepared.text, bracketed: prepared.bracketed)
         }
+        flightCompleted = true
         if admitted < UInt64.max { admitted += 1 }
         if let receipt { onAdmission?(receipt) }
     }
     private func pump() async {
         while !queue.isEmpty && (phase == .active || phase == .handingOff) {
-            let event = queue.removeFirst(); flight = event
+            let event = queue.removeFirst(); flight = event; flightCompleted = false
             do { try await process(event); flight = nil }
             catch {
-                if phase != .suspending {
+                if flightCompleted { flight = nil }
+                if phase != .suspending && phase != .retired {
                     phase = .blocked
-                    lastFailure = (error as? TerminalKeyboardError) ?? (error is TerminalInputError ? .blocked : .encoding)
-                    // Retain the unadmitted head and suffix. The operator may
-                    // retry a local rejection or discard, never silently replay.
-                } else { if discarded < UInt64.max { discarded += 1 }; flight = nil }
+                    let failure = (error as? TerminalKeyboardError)
+                        ?? ((error as? TerminalInputError) == .capacity ? .capacity
+                            : (error is TerminalInputError ? .blocked : .encoding))
+                    lastFailure = failure
+                    recovery = .init(keyboardID: id, focus: originalFocus, accounting: accounting,
+                        failure: failure, canRetry: flight != nil && Self.permitsLocalRetry(error))
+                } else if flight != nil {
+                    if discarded < UInt64.max { discarded += 1 }; flight = nil
+                }
                 break
             }
         }
         worker = nil; notifyStateChange()
     }
     public func waitUntilSettled() async { if let worker { await worker.value } }
-    /// Only retries a synchronous coordinator admission/side-effect-free encoder
-    /// rejection. It NEVER retries a transport write or a remote unknown outcome.
-    public func retryLocalAdmission() throws {
-        guard phase == .blocked, transition == nil, let failed = flight else { throw TerminalKeyboardError.unavailable }
-        queue.insert(failed, at: 0); flight = nil; lastFailure = nil; phase = .active; schedule()
+    private static func permitsLocalRetry(_ error: any Error) -> Bool {
+        if (error as? TerminalInputError) == .capacity { return true }
+        switch error as? TerminalKeyboardError {
+        case .capacity, .encoding, .blocked: return true
+        default: return false
+        }
+    }
+    /// Only retries a known local admission/side-effect-free encoder rejection.
+    /// Deferred UI actions supply the exact decision ID they displayed. Immediate
+    /// callers may omit it. This never retries writes or an unknown remote effect.
+    public func retryLocalAdmission(expectedRecovery: UUID? = nil) throws {
+        guard phase == .blocked, transition == nil, worker == nil,
+              let recovery, recovery.canRetry, let failed = flight else { throw TerminalKeyboardError.unavailable }
+        if let expectedRecovery, expectedRecovery != recovery.id { throw TerminalInputError.stale }
+        queue.insert(failed, at: 0); flight = nil; lastFailure = nil; self.recovery = nil
+        phase = .active; schedule(); notifyStateChange()
+    }
+
+    /// Discard only the unadmitted queue and local composition. Normal suspension
+    /// still owns held-key cleanup on the original source; admitted coordinator
+    /// records and their effect evidence are untouched. The connection stays open.
+    public func discardLocalAdmission(expectedRecovery: UUID) throws {
+        guard phase == .blocked, recovery?.id == expectedRecovery else { throw TerminalInputError.stale }
+        suspend()
     }
 
     /// Drains local callbacks, settles marked text, and places held-key cleanup
@@ -427,7 +477,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     /// The session owner MUST call this on OS deactivation or view disposal.
     public func suspend() {
         guard ownsFocus, phase != .suspending, phase != .retired else { return }
-        phase = .suspending; document.clear()
+        phase = .suspending; recovery = nil; document.clear()
         let count = UInt64(queue.count)
         discarded = discarded > UInt64.max - count ? UInt64.max : discarded + count
         queue.removeAll(); worker?.cancel(); transition?.cancel()
