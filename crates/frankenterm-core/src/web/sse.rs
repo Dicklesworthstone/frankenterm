@@ -12,7 +12,7 @@ use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
 use crate::runtime_async::stream::Stream;
 use crate::runtime_async::{mpsc, sleep, task};
-use crate::storage::{SegmentScanQuery, StorageHandle};
+use crate::storage::{EventStreamQuery, SegmentScanQuery, StorageHandle, StoredEvent};
 use crate::web_framework::{
     QueryString, Request, Response, StatusCode, WebStreamLifecycle, sse_stream_response,
 };
@@ -482,8 +482,8 @@ fn persisted_event_id(event: &Event) -> Option<i64> {
     }
 }
 
-/// Most persisted events replayed to one reconnecting `/stream/events` client.
-const EVENT_STREAM_REPLAY_MAX: usize = 1000;
+/// Bound memory per replay query, not the amount of recoverable history.
+const EVENT_STREAM_REPLAY_PAGE_SIZE: usize = 256;
 
 /// Where a `/stream/events` client asked to resume: the `Last-Event-ID` header
 /// a reconnecting EventSource sends, or an explicit `?since_id=`.
@@ -496,6 +496,173 @@ fn event_stream_resume_after(req: &Request, qs: &QueryString) -> Option<i64> {
     header
         .or_else(|| parse_u64(qs, "since_id").and_then(|id| i64::try_from(id).ok()))
         .filter(|id| *id >= 0)
+}
+
+/// A persisted cursor must never advance over a channel-full drop. Keep the
+/// frame owned by the body while waiting for capacity, using the connection's
+/// context for both waits. Body drop and server shutdown still dispose of the
+/// producer through `SseByteStream`; no detached retry task is created.
+async fn send_replay_sse(
+    cx: &crate::cx::Cx,
+    tx: &mpsc::Sender<SseEvent>,
+    event: SseEvent,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+) -> bool {
+    if cx.checkpoint().is_err() {
+        return false;
+    }
+    let now = Instant::now();
+    if *next_emit_at > now
+        && crate::runtime_async::sleep_with_cx(cx, *next_emit_at - now)
+            .await
+            .is_err()
+    {
+        return false;
+    }
+    if tx.send_with_cx(cx, event).await.is_err() {
+        return false;
+    }
+    *next_emit_at = Instant::now()
+        .checked_add(min_interval)
+        .unwrap_or_else(Instant::now);
+    true
+}
+
+/// Send a finite failure class without replacing Last-Event-ID. The caller
+/// then ends the stream, so reconnect retries the undelivered history instead
+/// of allowing a newer live event to conceal the failed replay.
+async fn emit_event_replay_error(
+    cx: &crate::cx::Cx,
+    tx: &mpsc::Sender<SseEvent>,
+    seq: &mut u64,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+    after_id: i64,
+    code: &'static str,
+) {
+    if !advance_stream_sequence(seq) {
+        return;
+    }
+    let frame = make_stream_frame(
+        "events",
+        "error",
+        *seq,
+        json!({ "code": code, "resume_after_id": after_id }),
+    );
+    if let Some(event) = frame_to_sse_with_event_id("error", None, frame) {
+        let _ = send_replay_sse(cx, tx, event, next_emit_at, min_interval).await;
+    }
+}
+
+/// Drain retained detections in ascending id order with bounded pages. The
+/// fetch seam is shared by production storage and failure-injection tests;
+/// tests exercise the actual framing, redaction, cursor and backpressure path.
+#[allow(clippy::too_many_arguments)]
+async fn replay_event_frames<F, Fut>(
+    cx: &crate::cx::Cx,
+    mut fetch: F,
+    pane_filter: Option<u64>,
+    after_id: &mut i64,
+    redactor: &Redactor,
+    tx: &mpsc::Sender<SseEvent>,
+    seq: &mut u64,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+) -> bool
+where
+    F: FnMut(EventStreamQuery) -> Fut,
+    Fut: Future<Output = crate::Result<Vec<StoredEvent>>>,
+{
+    loop {
+        if cx.checkpoint().is_err() {
+            return false;
+        }
+        let query = EventStreamQuery {
+            after_id: Some(*after_id),
+            limit: Some(EVENT_STREAM_REPLAY_PAGE_SIZE),
+            pane_id: pane_filter,
+            ..EventStreamQuery::default()
+        };
+        let rows = match fetch(query).await {
+            Ok(rows) => rows,
+            Err(_) => {
+                emit_event_replay_error(
+                    cx,
+                    tx,
+                    seq,
+                    next_emit_at,
+                    min_interval,
+                    *after_id,
+                    "event_replay_storage_error",
+                )
+                .await;
+                return false;
+            }
+        };
+        let page_len = rows.len();
+        // Validate the whole page before emitting any of it. A broken storage
+        // ordering/filter contract must not move the cursor past unseen rows.
+        let mut previous = *after_id;
+        let valid_page = page_len <= EVENT_STREAM_REPLAY_PAGE_SIZE
+            && rows.iter().all(|row| {
+                let valid = row.id > previous
+                    && pane_filter.is_none_or(|pane_id| row.pane_id == pane_id);
+                previous = row.id;
+                valid
+            });
+        if !valid_page {
+            emit_event_replay_error(
+                cx,
+                tx,
+                seq,
+                next_emit_at,
+                min_interval,
+                *after_id,
+                "event_replay_invalid_page",
+            )
+            .await;
+            return false;
+        }
+        for stored in rows {
+            let event_id = stored.id;
+            let event = super::server::stored_event_to_bus_event(stored);
+            let Ok(mut event_json) = serde_json::to_value(&event) else {
+                emit_event_replay_error(
+                    cx,
+                    tx,
+                    seq,
+                    next_emit_at,
+                    min_interval,
+                    *after_id,
+                    "event_replay_serialization_error",
+                )
+                .await;
+                return false;
+            };
+            redact_json_value(&mut event_json, redactor);
+            if !advance_stream_sequence(seq) {
+                return false;
+            }
+            let frame = make_stream_frame(
+                "events",
+                "event",
+                *seq,
+                json!({ "event": event_json, "replayed": true }),
+            );
+            let Some(event) = frame_to_sse_with_event_id("event", Some(event_id), frame) else {
+                return false;
+            };
+            if !send_replay_sse(cx, tx, event, next_emit_at, min_interval).await {
+                return false;
+            }
+            *after_id = event_id;
+        }
+        if page_len < EVENT_STREAM_REPLAY_PAGE_SIZE {
+            return true;
+        }
+        task::yield_now().await;
+    }
 }
 
 async fn send_rate_limited_sse(
@@ -705,12 +872,23 @@ pub(super) fn handle_stream_events(
     let replay_storage = req
         .get_extension::<super::middleware::AppState>()
         .and_then(|state| state.storage.clone());
+    let wants_detections = matches!(
+        channel,
+        EventStreamChannel::All | EventStreamChannel::Detections
+    );
 
     Box::pin(async move {
         let (event_bus, redactor) = match result {
             Ok(r) => r,
             Err(resp) => return resp,
         };
+        if resume_after.is_some() && wants_detections && replay_storage.is_none() {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "event_replay_unavailable",
+                "Persisted event storage is required to resume this stream",
+            );
+        }
 
         let Some(lifecycle) = lifecycle else {
             return json_err(
@@ -774,94 +952,27 @@ pub(super) fn handle_stream_events(
             }
 
             // Resume: replay persisted detections after the client's last
-            // seen id before going live. The subscription above was taken
-            // first, so nothing published meanwhile is lost; live events at
-            // or below the last replayed id are skipped as duplicates.
+            // seen id before going live. The subscription is taken first;
+            // anything it cannot retain during catchup is reported as lag.
+            // Replay itself is paginated, never truncated at a total-row cap.
             let mut replayed_through = resume_after.unwrap_or(i64::MIN);
-            let wants_detections = matches!(
-                channel,
-                EventStreamChannel::All | EventStreamChannel::Detections
-            );
-            if let (Some(after_id), Some(storage), true) =
+            if let (Some(_), Some(storage), true) =
                 (resume_after, replay_storage.as_ref(), wants_detections)
             {
-                let query = crate::storage::EventStreamQuery {
-                    after_id: Some(after_id),
-                    limit: Some(EVENT_STREAM_REPLAY_MAX),
-                    pane_id: pane_filter,
-                    ..crate::storage::EventStreamQuery::default()
-                };
-                let stored = match storage.get_events_stream_with_cx(&child_cx, query).await {
-                    Ok(stored) => stored,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "wa.web",
-                            error = %error,
-                            "event stream resume query failed; continuing live only"
-                        );
-                        Vec::new()
-                    }
-                };
-                let truncated = stored.len() >= EVENT_STREAM_REPLAY_MAX;
-                for stored in stored {
-                    let event_id = stored.id;
-                    let event = super::server::stored_event_to_bus_event(stored);
-                    let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
-                        json!({
-                            "error": "event_serialization_failed"
-                        })
-                    });
-                    redact_json_value(&mut event_json, &redactor);
-                    if !advance_stream_sequence(&mut seq) {
-                        return;
-                    }
-                    let frame = make_stream_frame(
-                        "events",
-                        "event",
-                        seq,
-                        json!({ "event": event_json, "replayed": true }),
-                    );
-                    replayed_through = replayed_through.max(event_id);
-                    if let Some(event) = frame_to_sse_with_event_id("event", Some(event_id), frame)
-                    {
-                        if !send_rate_limited_sse(
-                            &tx,
-                            event,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                }
-                if truncated {
-                    // More history remains than one replay carries: say so,
-                    // the same way a live lag is reported.
-                    if !advance_stream_sequence(&mut seq) {
-                        return;
-                    }
-                    let frame = make_stream_frame(
-                        "events",
-                        "lag",
-                        seq,
-                        json!({ "resume_truncated_after_id": replayed_through }),
-                    );
-                    if let Some(event) = frame_to_sse_with_event_id("lag", None, frame) {
-                        if !send_rate_limited_sse(
-                            &tx,
-                            event,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
+                if !replay_event_frames(
+                    &child_cx,
+                    |query| storage.get_events_stream_with_cx(&child_cx, query),
+                    pane_filter,
+                    &mut replayed_through,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    min_interval,
+                )
+                .await
+                {
+                    return;
                 }
             }
 
@@ -1349,6 +1460,273 @@ mod tests {
 
     fn default_limits() -> super::super::WebRuntimeLimits {
         super::super::resolve_runtime_limits(None)
+    }
+
+    fn replay_fixture(id: i64) -> crate::storage::StoredEvent {
+        crate::storage::StoredEvent {
+            id,
+            pane_id: 7,
+            rule_id: "codex.usage.reached".into(),
+            agent_type: "codex".into(),
+            event_type: "usage.reached".into(),
+            severity: "warning".into(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some("captured detection".into()),
+            segment_id: None,
+            detected_at: 1,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    fn drain_replay_frames(mut rx: mpsc::Receiver<SseEvent>) -> Vec<SseEvent> {
+        let cx = crate::cx::for_request();
+        let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut frames = Vec::new();
+        loop {
+            match rx.poll_recv(&cx, &mut poll_cx) {
+                std::task::Poll::Ready(Ok(frame)) => frames.push(frame),
+                std::task::Poll::Ready(Err(_)) => return frames,
+                std::task::Poll::Pending => panic!("sender must be dropped before draining"),
+            }
+        }
+    }
+
+    #[test]
+    fn event_replay_delivers_more_than_one_thousand_rows_in_bounded_pages() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(1101);
+            let (mut after_id, mut seq) = (0, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            let mut cursors = Vec::new();
+            let fetch = |query: crate::storage::EventStreamQuery| {
+                assert_eq!(query.pane_id, Some(7));
+                assert_eq!(query.limit, Some(super::EVENT_STREAM_REPLAY_PAGE_SIZE));
+                let cursor = query.after_id.expect("cursor is always explicit");
+                cursors.push(cursor);
+                // Non-contiguous ids model retained rows with holes.
+                let rows = (1..=1100)
+                    .map(|n| n * 2)
+                    .filter(|id| *id > cursor)
+                    .take(super::EVENT_STREAM_REPLAY_PAGE_SIZE)
+                    .map(replay_fixture)
+                    .collect();
+                std::future::ready(Ok(rows))
+            };
+            assert!(
+                super::replay_event_frames(
+                    &cx,
+                    fetch,
+                    Some(7),
+                    &mut after_id,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            );
+            assert_eq!(cursors, [0, 512, 1024, 1536, 2048]);
+            assert_eq!(after_id, 2200);
+            assert_eq!(seq, 1100);
+            drop(tx);
+            let frames = drain_replay_frames(rx);
+            assert_eq!(frames.len(), 1100);
+            for (index, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.id, Some(((index + 1) * 2).to_string()));
+                assert_eq!(frame.event_type.as_deref(), Some("event"));
+                let data: serde_json::Value =
+                    serde_json::from_str(frame.data.as_deref().unwrap()).unwrap();
+                assert_eq!(data["data"]["replayed"], true);
+            }
+        });
+    }
+
+    #[test]
+    fn event_replay_storage_failure_keeps_cursor_and_emits_no_new_id() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(super::EVENT_STREAM_REPLAY_PAGE_SIZE + 1);
+            let (mut after_id, mut seq) = (0, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            let mut calls = 0;
+            let fetch = |_: crate::storage::EventStreamQuery| {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Ok((1..=256).map(replay_fixture).collect())
+                } else {
+                    Err(crate::Error::runtime_backend(
+                        "replay test",
+                        "private backend detail",
+                    ))
+                })
+            };
+            assert!(
+                !super::replay_event_frames(
+                    &cx,
+                    fetch,
+                    None,
+                    &mut after_id,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            );
+            assert_eq!(calls, 2);
+            assert_eq!(after_id, 256);
+            drop(tx);
+            let frames = drain_replay_frames(rx);
+            assert_eq!(frames.len(), 257);
+            let error = frames.last().unwrap();
+            assert_eq!(error.id, None);
+            assert_eq!(error.event_type.as_deref(), Some("error"));
+            let data = error.data.as_deref().unwrap();
+            assert!(data.contains("event_replay_storage_error"));
+            assert!(!data.contains("private backend detail"));
+        });
+    }
+
+    #[test]
+    fn event_replay_rejects_invalid_pages_before_advancing() {
+        run_async_test_isolated(|| async {
+            let mut wrong_pane = replay_fixture(1);
+            wrong_pane.pane_id = 8;
+            for rows in [
+                vec![replay_fixture(2), replay_fixture(1)],
+                vec![replay_fixture(1), replay_fixture(1)],
+                vec![replay_fixture(0)],
+                vec![wrong_pane],
+                (1..=257).map(replay_fixture).collect(),
+            ] {
+                let cx = crate::cx::for_request();
+                let redactor = crate::policy::Redactor::new();
+                let (tx, rx) = mpsc::channel(3);
+                let (mut after_id, mut seq) = (0, 0);
+                let mut next_emit_at = std::time::Instant::now();
+                let mut rows = Some(rows);
+                assert!(
+                    !super::replay_event_frames(
+                        &cx,
+                        |_| std::future::ready(Ok(rows.take().expect("only one fetch"))),
+                        Some(7),
+                        &mut after_id,
+                        &redactor,
+                        &tx,
+                        &mut seq,
+                        &mut next_emit_at,
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+                );
+                assert_eq!(after_id, 0);
+                drop(tx);
+                let frames = drain_replay_frames(rx);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].id, None);
+                assert!(
+                    frames[0]
+                        .data
+                        .as_deref()
+                        .unwrap()
+                        .contains("event_replay_invalid_page")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn event_replay_empty_page_preserves_cursor_without_emitting() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(1);
+            let (mut after_id, mut seq) = (91, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            assert!(
+                super::replay_event_frames(
+                    &cx,
+                    |_| std::future::ready(Ok(Vec::new())),
+                    None,
+                    &mut after_id,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            );
+            assert_eq!(after_id, 91);
+            assert_eq!(seq, 0);
+            drop(tx);
+            assert!(drain_replay_frames(rx).is_empty());
+        });
+    }
+
+    #[test]
+    fn event_replay_closed_receiver_does_not_advance_cursor() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            let (mut after_id, mut seq) = (0, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            assert!(
+                !super::replay_event_frames(
+                    &cx,
+                    |_| std::future::ready(Ok(vec![replay_fixture(1)])),
+                    None,
+                    &mut after_id,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            );
+            assert_eq!(after_id, 0);
+        });
+    }
+
+    #[test]
+    fn replay_sender_waits_for_capacity_instead_of_dropping_the_event() {
+        run_async_test_isolated(|| async {
+            use std::future::Future;
+            use std::task::{Context, Poll, Waker};
+
+            let cx = crate::cx::for_request();
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.try_send(SseEvent::comment("occupied")).unwrap();
+            let mut next_emit_at = std::time::Instant::now();
+            let mut send = Box::pin(super::send_replay_sse(
+                &cx,
+                &tx,
+                SseEvent::new("retained").id("17"),
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+            ));
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            assert!(send.as_mut().poll(&mut poll_cx).is_pending());
+            assert!(matches!(rx.poll_recv(&cx, &mut poll_cx), Poll::Ready(Ok(_))));
+            assert_eq!(send.as_mut().poll(&mut poll_cx), Poll::Ready(true));
+            let Poll::Ready(Ok(delivered)) = rx.poll_recv(&cx, &mut poll_cx) else {
+                panic!("retained frame must be delivered after capacity is available");
+            };
+            assert_eq!(delivered.id.as_deref(), Some("17"));
+            assert_eq!(delivered.data.as_deref(), Some("retained"));
+        });
     }
 
     #[test]
