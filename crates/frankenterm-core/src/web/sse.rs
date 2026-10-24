@@ -516,7 +516,7 @@ async fn send_replay_sse(
     {
         return false;
     }
-    if tx.send_with_cx(cx, event).await.is_err() {
+    if tx.send(cx, event).await.is_err() {
         return false;
     }
     *next_emit_at = Instant::now()
