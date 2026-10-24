@@ -303,3 +303,186 @@ export function createPaneOutput({
     },
   };
 }
+
+// Bind native, accessible controls to the same controller exercised by tests.
+// The selected fleet row is sampled only on an explicit Open action. No pane
+// title or capture content is interpreted as markup, a link, or a VT command.
+export function mountPaneOutput({
+  document: doc = globalThis.document,
+  apiRoot,
+  getSelectedPane,
+  output = createPaneOutput({ apiRoot }),
+} = {}) {
+  const element = (id) => {
+    const node = doc.getElementById(id);
+    if (!node) throw new Error(`missing output control: ${id}`);
+    return node;
+  };
+  const workspace = element("workspace");
+  const panel = element("pane-output");
+  const title = element("pane-output-title");
+  const statusLine = element("pane-output-status");
+  const warnings = element("pane-output-warnings");
+  const transcript = element("pane-output-text");
+  const follow = element("pane-output-follow");
+  const pause = element("pane-output-pause");
+  const historyButton = element("pane-output-history");
+  const closeButton = element("pane-output-close");
+  const openButton = element("pane-output-open");
+  const paneInput = element("pane-output-id");
+  const paneForm = element("pane-output-form");
+  const paneSubmit = element("pane-output-submit");
+  const hint = element("pane-output-hint");
+  const search = element("pane-output-search");
+  const findForm = element("pane-output-find-form");
+  const previous = element("pane-output-previous");
+  const findStatus = element("pane-output-find-status");
+  const canvas = element("terminal");
+  let matchAt = -1;
+  let matchQuery = "";
+  let matchText = "";
+  const setText = (node, value) => {
+    // Avoid repeating live-region announcements on every output frame.
+    if (node.textContent !== value) node.textContent = value;
+  };
+
+  function render() {
+    const state = output.takeUpdate();
+    if (!state) return;
+    const opened = state.paneId !== null;
+    panel.hidden = !opened;
+    workspace.dataset.outputOpen = String(opened);
+    setText(title, opened ? `Pane ${state.paneId} — captured output` : "Captured output");
+    setText(statusLine, opened
+      ? `${state.status} · read-only · ${state.history ? "following retained history" : "new output since opening"}`
+      : "");
+    setText(pause, state.paused ? "Resume" : "Pause");
+    pause.setAttribute("aria-pressed", String(state.paused));
+    const notices = [];
+    if (state.discardedChars) notices.push("Older text was discarded from this bounded view.");
+    if (state.gapNotifications) notices.push(`${state.gapNotifications} capture-gap or bus-lag notifications; continuity is not guaranteed.`);
+    if (state.unanchored) notices.push("Reconnected before a received cursor existed; earlier output may be missing. Load retained history to recover what remains.");
+    if (state.error) notices.push(state.error);
+    setText(warnings, notices.join(" "));
+    warnings.hidden = notices.length === 0;
+    if (transcript.value !== state.text) {
+      const scrollTop = transcript.scrollTop;
+      const selectionStart = transcript.selectionStart;
+      const selectionEnd = transcript.selectionEnd;
+      transcript.value = state.text;
+      if (follow.checked) transcript.scrollTop = transcript.scrollHeight;
+      else {
+        transcript.setSelectionRange(Math.min(selectionStart, state.text.length), Math.min(selectionEnd, state.text.length));
+        transcript.scrollTop = scrollTop;
+      }
+      matchAt = -1;
+      findStatus.textContent = "";
+    }
+  }
+
+  function show(paneId, retainedHistory = false) {
+    try {
+      output.select(paneId, { retainedHistory });
+    } catch (_) {
+      hint.textContent = "Choose a pane or enter a valid unsigned pane ID.";
+      return;
+    }
+    paneInput.value = output.snapshot().paneId;
+    hint.textContent = "Output stays on this pane until you explicitly open another.";
+    follow.checked = true;
+    search.value = "";
+    matchAt = -1;
+    matchQuery = matchText = "";
+    findStatus.textContent = "";
+    render();
+    transcript.focus();
+  }
+
+  function openSelected() {
+    let paneId;
+    try { paneId = getSelectedPane(); } catch (_) { /* finite hint below */ }
+    if (typeof paneId !== "string") {
+      hint.textContent = "Select a pane or detection row first, or enter a pane ID.";
+      return;
+    }
+    show(paneId);
+  }
+
+  function close() {
+    output.close();
+    matchAt = -1;
+    matchQuery = matchText = "";
+    search.value = "";
+    findStatus.textContent = "";
+    hint.textContent = "Captured output is read-only; no keys are sent to a pane.";
+    render();
+    canvas.focus();
+  }
+
+  function find(backward = false) {
+    const query = search.value;
+    if (!query || query.length > 256) {
+      findStatus.textContent = "Enter 1–256 characters to find.";
+      return;
+    }
+    // Freeze admission while selecting text so subsequent output cannot move
+    // the match. Resume is explicit and uses the last received segment cursor.
+    output.pause();
+    follow.checked = false;
+    render();
+    const currentText = transcript.value;
+    const same = query === matchQuery && currentText === matchText;
+    let found;
+    if (backward) {
+      const start = same && matchAt >= 0 ? matchAt - 1 : currentText.length;
+      found = start < 0 ? -1 : currentText.lastIndexOf(query, start);
+      if (found < 0) found = currentText.lastIndexOf(query);
+    } else {
+      found = currentText.indexOf(query, same && matchAt >= 0 ? matchAt + query.length : 0);
+      if (found < 0) found = currentText.indexOf(query);
+    }
+    matchAt = found;
+    matchQuery = query;
+    matchText = currentText;
+    findStatus.textContent = found < 0 ? "Not found in retained text. Stream paused."
+      : "Match selected. Stream paused; Resume continues from the received cursor.";
+    if (found >= 0) {
+      transcript.focus();
+      transcript.setSelectionRange(found, found + query.length);
+    }
+  }
+
+  openButton.disabled = paneInput.disabled = paneSubmit.disabled = false;
+  openButton.addEventListener("click", openSelected);
+  paneForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    show(paneInput.value.trim());
+  });
+  pause.addEventListener("click", () => {
+    if (output.snapshot().paused) output.resume();
+    else output.pause();
+    render();
+  });
+  historyButton.addEventListener("click", () => {
+    const paneId = output.snapshot().paneId;
+    if (paneId !== null) show(paneId, true);
+  });
+  closeButton.addEventListener("click", close);
+  follow.addEventListener("change", () => {
+    if (follow.checked) transcript.scrollTop = transcript.scrollHeight;
+  });
+  transcript.addEventListener("scroll", () => {
+    if (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight > 8) follow.checked = false;
+  });
+  findForm.addEventListener("submit", (event) => { event.preventDefault(); find(); });
+  previous.addEventListener("click", () => find(true));
+  panel.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); close(); }
+  });
+  render();
+  return {
+    render, openSelected, close,
+    suspend() { output.suspend(); render(); },
+    restore() { output.restore(); render(); },
+  };
+}

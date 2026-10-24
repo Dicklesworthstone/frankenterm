@@ -97,3 +97,49 @@ but were not executed in the authoring environment: Rust tools and the required
 RCH execution capability were unavailable. Compile, focused runtime tests,
 Clippy, formatting, and HTTP/SQLite end-to-end verification remain required;
 source presence is not runtime proof.
+
+## Browser pane-output inspection
+
+The browser package's source now connects this endpoint to a read-only output
+panel. Select a pane or detection row and press Enter or **Inspect selected
+pane**, or enter an exact decimal pane ID in the toolbar. The output remains
+bound to that pane until another explicit Open action; moving the fleet
+selection does not retarget it. Tab leaves the fleet canvas for native controls;
+1 and 2 still select the pane and detection views.
+
+Opening starts with new output. **Load retained history** explicitly replaces
+the view and replays from `since_id=0`; large histories can take time to drain.
+The panel does not claim that a ready frame means history catch-up is complete.
+**Pause** closes the subscription while retaining the received cursor; **Resume**
+replays retained rows after it. Page suspension also closes transport, but
+resuming the page does not override an explicit pause. Closing the panel clears
+its captured text and cursor. Neither is saved to local storage for reloads.
+
+**Find text** performs literal, case-sensitive search within the currently
+retained transcript, with next/previous wraparound. Searching pauses the stream
+so matches do not move. The native read-only text area supports selection and
+copy; no input, paste, click, or terminal control sequence is sent to a pane.
+Captured HTML and escape sequences are text, not rendered markup or commands.
+
+The default local view retains at most 262,144 UTF-16 code units and 2,048
+nonempty chunks, discarding older text with a visible warning. Unicode-tail
+truncation never retains half a surrogate pair. Individual dispatched messages
+are limited to 1,048,576 code units before JSON decoding. This admission limit
+is after EventSource dispatch and does not bound the browser's internal network
+parser buffers or establish a measured process-memory envelope. Presentation
+is coalesced into the existing animation loop; transcript text is not a live
+region that announces every output chunk.
+
+Both the scoped SSE cursor and JSON identities must agree with the selected
+pane, preserving the full u64/i64 ranges without JavaScript Number rounding.
+Malformed frames do not advance the received cursor. Gap/lag notifications,
+retention truncation, server failures, and reconnection before the first cursor
+remain visible. The database-identity and retained-history limits above apply.
+
+Build and deploy a fresh browser package through the approved build lane;
+updating only HTML is insufficient because the viewer adds the `selectedPaneId`
+WASM export. The package builder includes `pane-output.mjs` in its hashed asset
+set. `node --test tests/browser/pane-output.test.mjs` exercises the production
+controller and panel with controlled transport/DOM/model dependencies. These
+tests do not establish a compiled WASM binding, native rendering, browser
+accessibility qualification, or a real FrankenTerm HTTP/SQLite end-to-end pass.

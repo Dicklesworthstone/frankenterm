@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createPaneOutput } from "../../crates/frankenterm-browser-ui/web/pane-output.mjs";
+import { createPaneOutput, mountPaneOutput } from "../../crates/frankenterm-browser-ui/web/pane-output.mjs";
+import { handleFleetKey } from "../../crates/frankenterm-browser-ui/web/app.mjs";
+import { readFileSync } from "node:fs";
 
 function fixture(options = {}) {
   const sources = [];
@@ -317,4 +319,210 @@ test("invalid bounds are rejected before a source can be opened", () => {
     { maxChars: 1.5 }, { maxChars: 9 * 1024 * 1024 }, { maxChunks: 32769 }]) {
     assert.throws(() => fixture(options), /invalid transcript limit/);
   }
+});
+
+const CONTROL_IDS = [
+  "workspace", "pane-output", "pane-output-title", "pane-output-status", "pane-output-warnings",
+  "pane-output-text", "pane-output-follow", "pane-output-pause", "pane-output-history",
+  "pane-output-close", "pane-output-open", "pane-output-id", "pane-output-form", "pane-output-submit",
+  "pane-output-hint", "pane-output-search", "pane-output-find-form", "pane-output-previous",
+  "pane-output-find-status", "terminal",
+];
+
+function panelFixture(options = {}) {
+  const f = fixture(options);
+  let focused = null;
+  let selected = "7";
+  class Element {
+    constructor(id) {
+      this.id = id; this.dataset = {}; this.hidden = false; this.disabled = true;
+      this.value = ""; this.checked = id === "pane-output-follow";
+      this.selectionStart = this.selectionEnd = this.scrollTop = 0;
+      this.scrollHeight = 1000; this.clientHeight = 100;
+      this.handlers = new Map(); this.attributes = {}; this.writes = 0; this.text = "";
+    }
+    set textContent(value) { this.text = value; this.writes++; }
+    get textContent() { return this.text; }
+    set innerHTML(_) { throw new Error("capture content must never enter innerHTML"); }
+    addEventListener(type, handler) { this.handlers.set(type, handler); }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    focus() { focused = this.id; }
+    setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+    emit(type, values = {}) {
+      const event = { ...values, prevented: false, preventDefault() { this.prevented = true; } };
+      this.handlers.get(type)?.(event); return event;
+    }
+  }
+  const nodes = Object.fromEntries(CONTROL_IDS.map((id) => [id, new Element(id)]));
+  const document = { getElementById: (id) => nodes[id] };
+  const panel = mountPaneOutput({ document, output: f.output, getSelectedPane: () => selected });
+  return { ...f, panel, nodes, focused: () => focused, selectRow: (id) => { selected = id; } };
+}
+
+test("panel opens the selected pane, renders literal text, and is frame paced", () => {
+  const f = panelFixture();
+  assert.equal(f.nodes["pane-output"].hidden, true);
+  assert.equal(f.nodes["pane-output-open"].disabled, false);
+  f.nodes["pane-output-open"].emit("click");
+  assert.equal(f.nodes.workspace.dataset.outputOpen, "true");
+  assert.equal(f.nodes["pane-output-title"].textContent, "Pane 7 — captured output");
+  assert.equal(f.focused(), "pane-output-text");
+  delta(f.latest(), "1", "<b>not HTML</b>");
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "<b>not HTML</b>");
+});
+
+test("changing fleet selection cannot retarget an already opened transcript", () => {
+  const f = panelFixture(); f.panel.openSelected(); const first = f.latest();
+  f.selectRow("8"); f.panel.render();
+  assert.equal(f.sources.length, 1);
+  delta(first, "1", "seven"); f.panel.render();
+  assert.equal(f.nodes["pane-output-title"].textContent, "Pane 7 — captured output");
+  f.panel.openSelected();
+  assert.equal(first.closed, true);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.equal(f.latest().url.searchParams.get("pane_id"), "8");
+});
+
+test("manual pane form preserves exact IDs and rejects invalid input without retargeting", () => {
+  const f = panelFixture();
+  f.nodes["pane-output-id"].value = "18446744073709551615";
+  assert.equal(f.nodes["pane-output-form"].emit("submit").prevented, true);
+  assert.equal(f.latest().url.searchParams.get("pane_id"), "18446744073709551615");
+  const first = f.latest();
+  f.nodes["pane-output-id"].value = "bad"; f.nodes["pane-output-form"].emit("submit");
+  assert.equal(f.latest(), first); assert.equal(first.closed, false);
+  assert.match(f.nodes["pane-output-hint"].textContent, /valid unsigned pane ID/);
+});
+
+test("an empty selected row does not accidentally open an all-pane stream", () => {
+  const f = panelFixture(); f.selectRow(undefined); f.panel.openSelected();
+  assert.equal(f.sources.length, 0); assert.match(f.nodes["pane-output-hint"].textContent, /Select a pane/);
+});
+
+test("history button restarts only the pinned pane with explicit replay", () => {
+  const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "100", "fresh"); f.panel.render();
+  f.selectRow("8"); f.nodes["pane-output-history"].emit("click");
+  assert.equal(f.latest().url.searchParams.get("pane_id"), "7");
+  assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.match(f.nodes["pane-output-status"].textContent, /retained history/);
+});
+
+test("panel search freezes output, selects literal matches, wraps and resumes from its cursor", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "9", "foo bar foo"); f.panel.render();
+  const original = f.latest();
+  f.nodes["pane-output-search"].value = "foo";
+  f.nodes["pane-output-find-form"].emit("submit");
+  assert.equal(original.closed, true); assert.equal(f.output.snapshot().paused, true);
+  const area = f.nodes["pane-output-text"];
+  assert.equal(area.selectionStart, 0); assert.equal(area.selectionEnd, 3);
+  f.nodes["pane-output-find-form"].emit("submit"); assert.equal(area.selectionStart, 8);
+  f.nodes["pane-output-find-form"].emit("submit"); assert.equal(area.selectionStart, 0);
+  f.nodes["pane-output-previous"].emit("click"); assert.equal(area.selectionStart, 8);
+  f.nodes["pane-output-pause"].emit("click");
+  assert.equal(f.latest().url.searchParams.get("since_id"), "9");
+  assert.equal(f.output.snapshot().paused, false);
+});
+
+test("search treats regex syntax as text and reports missing text without modifying output", () => {
+  const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "1", "prefix [a-z]+ suffix"); f.panel.render();
+  f.nodes["pane-output-search"].value = "[a-z]+"; f.nodes["pane-output-find-form"].emit("submit");
+  assert.equal(f.nodes["pane-output-text"].selectionStart, 7);
+  f.nodes["pane-output-search"].value = "absent"; f.nodes["pane-output-find-form"].emit("submit");
+  assert.match(f.nodes["pane-output-find-status"].textContent, /Not found/);
+  assert.equal(f.nodes["pane-output-text"].value, "prefix [a-z]+ suffix");
+});
+
+test("manual scrolling disables follow and updates preserve the viewport", () => {
+  const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "1", "initial"); f.panel.render();
+  const area = f.nodes["pane-output-text"];
+  area.scrollTop = 25; area.emit("scroll");
+  assert.equal(f.nodes["pane-output-follow"].checked, false);
+  area.setSelectionRange(1, 3);
+  delta(f.latest(), "2", "more"); f.panel.render();
+  assert.equal(area.scrollTop, 25); assert.equal(area.selectionStart, 1); assert.equal(area.selectionEnd, 3);
+  f.nodes["pane-output-follow"].checked = true; f.nodes["pane-output-follow"].emit("change");
+  assert.equal(area.scrollTop, area.scrollHeight);
+});
+
+test("close and Escape clear sensitive retained output and restore canvas focus", () => {
+  const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "1", "private"); f.panel.render();
+  assert.equal(f.nodes["pane-output"].emit("keydown", { key: "Escape" }).prevented, true);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.equal(f.nodes["pane-output"].hidden, true);
+  assert.equal(f.nodes.workspace.dataset.outputOpen, "false");
+  assert.equal(f.focused(), "terminal"); assert.equal(f.latest().closed, true);
+});
+
+test("suspension preserves transcript and explicit pause through panel controls", () => {
+  const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "1", "kept"); f.panel.render();
+  f.nodes["pane-output-pause"].emit("click");
+  f.panel.suspend(); f.panel.restore();
+  assert.equal(f.sources.length, 1); assert.equal(f.nodes["pane-output-pause"].textContent, "Resume");
+  assert.equal(f.nodes["pane-output-text"].value, "kept");
+});
+
+test("output floods do not repeatedly rewrite unchanged live-region status", () => {
+  const f = panelFixture({ maxChars: 5 }); f.panel.openSelected();
+  delta(f.latest(), "1", "hello"); f.panel.render();
+  const statusWrites = f.nodes["pane-output-status"].writes;
+  for (let id = 2; id <= 10; id++) { delta(f.latest(), String(id), "x"); f.panel.render(); }
+  assert.equal(f.nodes["pane-output-status"].writes, statusWrites);
+  assert.match(f.nodes["pane-output-warnings"].textContent, /Older text/);
+  control(f.latest(), "gap"); f.panel.render();
+  assert.match(f.nodes["pane-output-warnings"].textContent, /continuity is not guaranteed/);
+});
+
+function keyboardFixture() {
+  const canvas = {};
+  const calls = [];
+  const dependencies = {
+    canvas,
+    term: {
+      input: (event) => calls.push(["input", event.key]),
+      drainEncodedInputs: () => ["encoded"],
+      drainEncodedInputBytes: () => calls.push(["drain-bytes"]),
+      drainImeCompositionJsonl: () => calls.push(["drain-ime"]),
+    },
+    viewer: { pushEncodedInput: (json) => calls.push(["viewer", json]) },
+    inspector: { openSelected: () => calls.push(["inspect"]) },
+  };
+  const key = (values) => {
+    const event = { target: canvas, key: "j", prevented: false, preventDefault() { this.prevented = true; }, ...values };
+    handleFleetKey(event, dependencies); return event;
+  };
+  return { calls, key };
+}
+
+test("native controls, Tab, and browser shortcuts never reach fleet input", () => {
+  const f = keyboardFixture();
+  for (const values of [{ target: {} }, { key: "Tab" }, { metaKey: true }, { ctrlKey: true }, { altKey: true }]) {
+    assert.equal(f.key(values).prevented, false);
+  }
+  assert.deepEqual(f.calls, []);
+});
+
+test("Enter inspects once without sending input bytes; navigation stays in the viewer", () => {
+  const f = keyboardFixture();
+  assert.equal(f.key({ key: "Enter" }).prevented, true);
+  f.key({ key: "Enter", repeat: true });
+  assert.deepEqual(f.calls, [["inspect"]]);
+  assert.equal(f.key({ key: "ArrowDown" }).prevented, true);
+  assert.deepEqual(f.calls.slice(1), [["input", "ArrowDown"], ["viewer", "encoded"], ["drain-bytes"], ["drain-ime"]]);
+});
+
+test("packaged page contains the required accessible controls and module", () => {
+  const html = readFileSync(new URL("../../crates/frankenterm-browser-ui/web/index.html", import.meta.url), "utf8");
+  const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(ids.length, new Set(ids).size, "DOM IDs must be unique");
+  for (const id of CONTROL_IDS) assert.ok(ids.includes(id), `missing ${id}`);
+  assert.match(html, /<textarea[^>]*id="pane-output-text"[^>]*readonly/);
+  const builder = readFileSync(new URL("../../scripts/build-browser-ui.sh", import.meta.url), "utf8");
+  assert.ok(builder.includes('"$crate_dir/web/pane-output.mjs"'), "package must ship the imported module");
+  const wasm = readFileSync(new URL("../../crates/frankenterm-browser-ui/src/wasm.rs", import.meta.url), "utf8");
+  assert.ok(wasm.includes("js_name = selectedPaneId"));
+  assert.ok(wasm.includes("pub fn selected_pane_id(&self) -> Option<String>"));
 });

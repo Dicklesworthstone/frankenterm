@@ -3,7 +3,7 @@
 use js_sys::{Object, Reflect, Uint32Array};
 use wasm_bindgen::prelude::*;
 
-use crate::model::StreamState;
+use crate::model::{StreamState, View};
 use crate::runner::FleetRunner;
 
 /// The fleet viewer as the browser host sees it.
@@ -90,6 +90,18 @@ impl FleetViewer {
     #[wasm_bindgen(js_name = takeRefreshRequest)]
     pub fn take_refresh_request(&mut self) -> bool {
         self.inner.take_refresh_request()
+    }
+
+    /// Explicit inspection target from the selected pane or detection row.
+    /// Return a decimal string, never a JavaScript Number that rounds u64 IDs.
+    #[wasm_bindgen(js_name = selectedPaneId)]
+    pub fn selected_pane_id(&self) -> Option<String> {
+        let model = self.inner.model();
+        let pane_id = match model.active_view() {
+            View::Panes => model.panes().get(model.selected()).map(|pane| pane.pane_id),
+            View::Events => model.events().get(model.selected()).map(|event| event.pane_id),
+        };
+        pane_id.map(|id| id.to_string())
     }
 
     /// `{cells, spans}` for the renderer's `applyPatchBatchFlat(spans, cells)`.
