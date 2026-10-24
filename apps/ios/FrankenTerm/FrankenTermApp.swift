@@ -1614,10 +1614,6 @@ struct MobileWorkspaceRoot: View {
 struct OfflineRestoreSheet: View {
     @Bindable var model: MobileWorkspaceModel
     @State private var code = ""
-    @State private var allowRemoval = false
-    @State private var allowRollback = false
-    @State private var associateWithExistingWorkspace = false
-    @State private var securityChangesConfirmed = false
     @State private var repairPage = 0
     @State private var chooseFile = false
     private enum RestoreDecision {
@@ -1741,8 +1737,7 @@ struct OfflineRestoreSheet: View {
                             if [.candidate, .collecting, .locked, .documentReady, .review].contains(state.phase)
                                 || (state.phase == .idle && state.recipientRequest != nil) {
                                 Button("Start Over", role: .destructive) {
-                                    code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
-                                    associateWithExistingWorkspace = false; securityChangesConfirmed = false
+                                    code = ""; model.cameraRequested = false
                                     model.resetRestore()
                                 }
                             }
@@ -1800,18 +1795,12 @@ struct OfflineRestoreSheet: View {
         }
         .onChange(of: model.active) { _, active in
             if !active {
-                code = ""; allowRemoval = false; allowRollback = false
-                associateWithExistingWorkspace = false; securityChangesConfirmed = false
+                code = ""
                 restoreDecision = nil
             }
         }
-        .onChange(of: model.state?.review?.token) { _, _ in
-            allowRemoval = false; allowRollback = false
-            associateWithExistingWorkspace = false; securityChangesConfirmed = false
-        }
         .onDisappear {
-            code = ""; allowRemoval = false; allowRollback = false; model.cameraRequested = false
-            associateWithExistingWorkspace = false; securityChangesConfirmed = false
+            code = ""; model.cameraRequested = false
             restoreDecision = nil
         }
     }
@@ -1884,8 +1873,7 @@ struct OfflineRestoreSheet: View {
                 Text("Resume this encrypted progress and keep saving as you scan. The camera opens only when you tap Scan or Resume Camera. A complete saved scan still needs to be unlocked.")
                     .font(.footnote).foregroundStyle(.secondary)
                 Button("Resume Saved Scan") {
-                    code = ""; allowRemoval = false; allowRollback = false
-                    associateWithExistingWorkspace = false; securityChangesConfirmed = false
+                    code = ""
                     model.resumeSavedScan(saved)
                 }.buttonStyle(.borderedProminent)
             } else if state.identity != saved.identity {
@@ -1992,7 +1980,6 @@ struct OfflineRestoreSheet: View {
         if state.encryptionMode == .recipient {
             if state.canUnlockRecipient {
                 Button("Unlock") {
-                    allowRemoval = false; allowRollback = false
                     model.run { restore, state in try await restore.unlockRecipient(generation: state.generation) }
                 }.buttonStyle(.borderedProminent).controlSize(.large)
             } else {
@@ -2005,7 +1992,7 @@ struct OfflineRestoreSheet: View {
             SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
             Button("Unlock") {
-                let entered = code; code = ""; allowRemoval = false; allowRollback = false
+                let entered = code; code = ""
                 model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
             }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
             if !model.cameraRequested {
@@ -2019,7 +2006,8 @@ struct OfflineRestoreSheet: View {
     /// person might audit is one tap away under Details.
     @ViewBuilder private func reviewSummary(_ review: OfflineRestoreReview) -> some View {
         Text(verbatim: review.document.name).font(.headline)
-        Text("\(review.document.machines.count) machines · \(review.includedFingerprints.count) keys")
+        let machines = review.document.machines.count, keys = review.includedFingerprints.count
+        Text("\(machines) \(machines == 1 ? "machine" : "machines") · \(keys) \(keys == 1 ? "key" : "keys")")
             .foregroundStyle(.secondary)
         if let comparison = model.state?.comparison {
             Text(verbatim: "Transfer \(comparison)").font(.system(.body, design: .monospaced)).textSelection(.enabled)
@@ -2035,20 +2023,19 @@ struct OfflineRestoreSheet: View {
                 Text(verbatim: machine.name).lineLimit(1)
             }
         }
-        restoreDecisions(review)
-        Button(review.changeReview == nil ? "Restore" : "Replace and Restore") {
-            let token = review.token, removal = allowRemoval, rollback = allowRollback
-            let association = associateWithExistingWorkspace, security = securityChangesConfirmed
+        if let changes = review.changeReview { Text(verbatim: replacementSummary(review, changes)).font(.callout) }
+        // Replace approves exactly what the line above says: this source
+        // takes over the saved workspace with its changes, removals or
+        // older version. Every changed value is under Details.
+        Button(review.changeReview == nil ? "Restore" : "Replace") {
+            let token = review.token, removal = review.removesMachines, rollback = review.isRollback
+            let association = review.requiresSourceAssociation, security = review.requiresSecurityApproval
             model.run { restore, state in
                 try await restore.commit(reviewToken: token, generation: state.generation,
                                          sourceAndContentsConfirmed: true, allowMachineRemoval: removal, allowRollback: rollback,
                                          associateWithExistingWorkspace: association, securityChangesConfirmed: security)
             }
         }.buttonStyle(.borderedProminent).controlSize(.large).frame(maxWidth: .infinity)
-            .disabled((review.removesMachines && !allowRemoval)
-                || (review.isRollback && !allowRollback)
-                || (review.requiresSourceAssociation && !associateWithExistingWorkspace)
-                || (review.requiresSecurityApproval && !securityChangesConfirmed))
         DisclosureGroup("Details") { reviewDetails(review).padding(.top, 8) }
     }
 
@@ -2078,8 +2065,7 @@ struct OfflineRestoreSheet: View {
                 Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
             ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
-            if let changes = review.changeReview, !(review.requiresSourceAssociation || review.requiresSecurityApproval
-                                                    || review.removesMachines || review.isRollback) {
+            if let changes = review.changeReview {
                 WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
             }
             if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
@@ -2101,26 +2087,18 @@ struct OfflineRestoreSheet: View {
         }
     }
 
-    /// Only a replacement asks anything: which saved workspace this source
-    /// replaces, changed connection or trust policy, removed machines, or an
-    /// older version. A first restore asks nothing beyond Restore itself.
-    @ViewBuilder private func restoreDecisions(_ review: OfflineRestoreReview) -> some View {
-        if review.requiresSourceAssociation || review.requiresSecurityApproval || review.removesMachines || review.isRollback {
-            VStack(alignment: .leading, spacing: 10) {
-                if let changes = review.changeReview {
-                    WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
-                }
-                if review.requiresSourceAssociation {
-                    Toggle("Replace the saved “\(review.existingWorkspaceName ?? review.document.name)” with this one",
-                           isOn: $associateWithExistingWorkspace)
-                }
-                if review.requiresSecurityApproval {
-                    Toggle("Accept the changed connections and host keys above", isOn: $securityChangesConfirmed)
-                }
-                if review.removesMachines { Toggle("Remove the machines this version no longer has", isOn: $allowRemoval) }
-                if review.isRollback { Toggle("Go back to this older version", isOn: $allowRollback) }
-            }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+    /// A replacement in one line: the saved workspace it takes over, how many
+    /// settings change, and any removed machines or older version.
+    private func replacementSummary(_ review: OfflineRestoreReview, _ changes: WorkspaceChangeReview) -> String {
+        var effects = ["Replaces your saved “\(review.existingWorkspaceName ?? review.document.name)”"]
+        if !changes.changes.isEmpty {
+            let count = changes.changes.count, security = changes.securityChanges.count
+            effects.append("changes \(count) \(count == 1 ? "setting" : "settings")"
+                + (security == 0 ? "" : " (\(security) of them connections or host keys)"))
         }
+        if review.removesMachines { effects.append("removes the machines it no longer has") }
+        if review.isRollback { effects.append("goes back to an older version") }
+        return ListFormatter.localizedString(byJoining: effects) + "."
     }
 
     private func title(_ phase: OfflineRestorePhase) -> String {

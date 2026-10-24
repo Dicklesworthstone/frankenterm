@@ -317,4 +317,47 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("AGAIN-first-6", in: screen, timeout: 30, "typing after the switch reaches the first machine's shell")
         snapshot("13-back-to-first")
     }
+
+    /// A newer export of the saved workspace replaces it in one tap, as when
+    /// the Mac exports a group the phone already has. The second package
+    /// (FT_UI_REIMPORT_PATH, FT_UI_REIMPORT_CODE) is the same workspace with
+    /// changed host-trust references, so connection settings change. One
+    /// line says so; nothing else is asked, and its machine still connects.
+    @MainActor
+    func test4NewerExportReplacesTheSavedWorkspaceInOneTap() throws {
+        let inputs = try inputs()
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["FT_UI_REIMPORT_PATH"], let code = environment["FT_UI_REIMPORT_CODE"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_UI_REIMPORT_{PATH,CODE} to a newer export of the same workspace")
+        }
+        let app = launch()
+        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
+        XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
+        let field = app.secureTextFields["Transfer code"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
+        field.tap(); field.typeText(code)
+        app.buttons["Unlock"].tap()
+
+        let replace = app.buttons["Replace"]
+        XCTAssertTrue(replace.waitForExistence(timeout: 30), "a newer export of a saved workspace must reach its review")
+        let summary = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@",
+                                                           "Replaces your saved “\(inputs.workspace)”")).firstMatch
+        XCTAssertTrue(summary.exists, "one line says which saved workspace this replaces")
+        XCTAssertTrue(summary.label.contains("connections or host keys"), "and that connection settings change: \(summary.label)")
+        XCTAssertEqual(app.switches.count, 0, "replacing asks nothing beyond Replace")
+        XCTAssertTrue(replace.isEnabled, "Replace is the approval")
+        snapshot("r1-replacement-review")
+        replace.tap()
+        let done = app.buttons["Done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 30), "the replacement must publish")
+        snapshot("r2-replaced")
+        done.tap()
+
+        XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20), "the replaced workspace must be listed")
+        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", inputs.workspace)).count, 1,
+                       "the saved workspace is replaced, not added")
+        let terminal = connect(app, inputs)
+        app.typeText("echo AFTER-$((40+2))\n")
+        waitFor("AFTER-42", in: terminal, timeout: 30, "the replaced workspace's machine must connect and run commands")
+    }
 }
