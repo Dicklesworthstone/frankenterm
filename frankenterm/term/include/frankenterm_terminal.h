@@ -254,6 +254,11 @@ uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
  * server may not have applied it: closing the channel now can lose it on
  * the way. 0 once answered, or when the session has ended. */
 uint32_t ft_mux_v1_restoring(uint64_t session, uint32_t *restoring);
+/* *unanswered is 1 while input sent to the pane (write, paste, click,
+ * wheel) is unanswered, so the server may not have written it to the pane:
+ * closing the channel now can lose it on the way. After the session has
+ * ended, 1 means some of it may never have arrived. */
+uint32_t ft_mux_v1_unanswered_input(uint64_t session, uint64_t pane_id, uint32_t *unanswered);
 /* After the pane list arrives: an earlier connection left the pane at the
  * phone's size rows x cols (1..512 each) without giving back the desktop's
  * (desktop rows and cols 1..4096), as its last PHONE_SIZE event said. If the

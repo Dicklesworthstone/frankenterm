@@ -842,6 +842,62 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
     assert!(!harness.session.restoring());
 }
 
+/// The phone can tell whether what it sent reached the pane: input is
+/// unanswered until the server has written it, and stays so when the
+/// connection ends first.
+#[test]
+fn input_is_unanswered_until_the_server_has_written_it() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    assert!(!harness.session.unanswered_input(pane));
+
+    // On its way to the server, then written but the answer on its way.
+    harness.hold_requests = true;
+    harness.session.write(pane, b"ls\r");
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    assert!(harness.session.unanswered_input(pane));
+    assert!(
+        !harness.session.unanswered_input(pane + 1),
+        "only that pane's"
+    );
+    harness.hold_requests = false;
+    harness.hold = true;
+    harness.pump();
+    assert_eq!(harness.server.written, b"ls\r");
+    assert!(
+        harness.session.unanswered_input(pane),
+        "written, but the phone cannot know yet"
+    );
+    harness.hold = false;
+    harness.pump();
+    assert!(
+        !harness.session.unanswered_input(pane),
+        "answered; the resize was never input"
+    );
+
+    // A paste and a click count too, and the pane's output answers neither.
+    harness.hold_requests = true;
+    harness.session.paste(pane, "echo hi");
+    harness.session.click(pane, 1, 1);
+    harness.output(b"x");
+    assert!(harness.session.unanswered_input(pane));
+    harness.hold_requests = false;
+    harness.pump();
+    assert_eq!(harness.server.pastes, ["echo hi"]);
+    assert_eq!(harness.server.mouse.len(), 2);
+    assert!(!harness.session.unanswered_input(pane));
+
+    // A connection that ended first leaves it unanswered: it may never
+    // have arrived.
+    harness.hold_requests = true;
+    harness.session.write(pane, b"exit\r");
+    harness.pump();
+    harness.session.closed();
+    assert!(harness.session.unanswered_input(pane));
+}
+
 /// One PhoneSize event: pane, the desktop's rows and columns (none when
 /// cleared), and the phone's rows and columns.
 type PhoneSizeSeen = (usize, Option<(usize, usize)>, usize, usize);
