@@ -116,6 +116,21 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         return (rows, columns)
     }
 
+    /// Asks the shell for its size and returns what it prints (the echoed
+    /// command never matches), waiting up to 15 s for an answer other than
+    /// `previous` while the screen still shows the earlier one.
+    private func shellSize(_ app: XCUIApplication, _ terminal: XCUIElement,
+                           unlike previous: (rows: Int, columns: Int)? = nil) -> (rows: Int, columns: Int)? {
+        app.typeText("clear; echo SZ-$(stty size | tr ' ' x)\n")
+        var size: (rows: Int, columns: Int)?
+        for _ in 0..<15 {
+            size = reportedSize(terminal)
+            if let size, previous.map({ $0 != size }) ?? true { break }
+            sleep(1)
+        }
+        return size
+    }
+
     @MainActor
     func test1RestoreEncryptedWorkspaceAndConnectToItsMachine() throws {
         let inputs = try inputs()
@@ -178,22 +193,24 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         guard waitFor("READY-42", in: terminal, timeout: 30, "the shell must accept input") else { return }
 
         // Ctrl from the accessory row: without a delivered ^C the sleep keeps
-        // the typed-ahead echo waiting for 30 s, well past this wait.
+        // the typed-ahead echo waiting for 30 s, well past this wait. The
+        // row's keys are found by identifier: an iPad's keyboard has its own
+        // Tab, Escape and hide keys.
         app.typeText("sleep 30\n")
-        app.buttons["Control modifier"].tap()
+        app.buttons["terminal.key.Control modifier"].tap()
         app.typeText("c")
         app.typeText("echo CTRL-$((40+2))\n")
         waitFor("CTRL-42", in: terminal, timeout: 10, "Ctrl+C from the accessory row must interrupt the shell")
 
         // Left arrow edits the line: 402 becomes 40+2 only if the cursor moved.
         app.typeText("echo ARROW-$((402))")
-        for _ in 0..<3 { app.buttons["Left arrow"].tap() }
+        for _ in 0..<3 { app.buttons["terminal.key.Left arrow"].tap() }
         app.typeText("+\n")
         waitFor("ARROW-42", in: terminal, "the accessory Left arrow must move the line editor's cursor")
 
         // Tab completes the only /usr entry starting with "shar"; without it cd fails.
         app.typeText("cd /usr/shar")
-        app.buttons["Tab"].tap()
+        app.buttons["terminal.key.Tab"].tap()
         app.typeText(" && echo TAB-$(basename $PWD) && cd\n")
         waitFor("TAB-share", in: terminal, "the accessory Tab must reach shell completion")
 
@@ -203,7 +220,6 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         // Dismissing the keyboard retires its input; a tap on the terminal
         // establishes a new input focus on the same session.
-        // The accessory row's button; an iPad keyboard has its own of that name.
         app.buttons["terminal.keyboard.hide"].tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5), "the keyboard must go away")
         terminal.tap()
@@ -234,22 +250,17 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("\n~\n~\n~", in: terminal, "vim must draw its empty buffer")
         snapshot("7-vim")
         app.typeText("iFT-INSERT")
-        app.buttons["Escape"].tap()
+        app.buttons["terminal.key.Escape"].tap()
         app.typeText(":q!\n")
         app.typeText("echo ESC-$((40+2))\n")
         waitFor("ESC-42", in: terminal, "Esc must leave insert mode so :q! exits vim")
         XCTAssertFalse(screen(terminal).contains("FT-INSERT"), "leaving vim must restore the primary screen")
 
         // Rotation changes the remote PTY: landscape has more columns, fewer rows.
-        app.typeText("clear; echo SZ-$(stty size | tr ' ' x)\n")
-        XCTAssertTrue(waitFor("SZ-", in: terminal, "the shell must report its size"))
-        sleep(1)
-        let portrait = try XCTUnwrap(reportedSize(terminal), screen(terminal))
+        let portrait = try XCTUnwrap(shellSize(app, terminal), "the shell must report its size; screen:\n\(screen(terminal))")
         XCUIDevice.shared.orientation = .landscapeLeft
         sleep(2)
-        app.typeText("clear; echo SZ-$(stty size | tr ' ' x)\n")
-        sleep(2)
-        let landscape = try XCTUnwrap(reportedSize(terminal), screen(terminal))
+        let landscape = try XCTUnwrap(shellSize(app, terminal, unlike: portrait), screen(terminal))
         snapshot("8-landscape")
         XCTAssertGreaterThan(landscape.columns, portrait.columns, "landscape must widen the PTY")
         XCTAssertLessThan(landscape.rows, portrait.rows, "landscape must shorten the PTY")

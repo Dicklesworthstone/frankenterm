@@ -590,6 +590,9 @@ public final class NativeTerminalInputView: UIView, UITextInput {
             configuration.cornerStyle = .fixed
             value.configuration = configuration
             value.accessibilityLabel = label
+            // An iPad's keyboard has its own Tab and Escape keys; automation
+            // finds this row's by identifier.
+            value.accessibilityIdentifier = "terminal.key.\(label)"
             value.widthAnchor.constraint(greaterThanOrEqualToConstant: 42).isActive = true
             value.addAction(UIAction { _ in action() }, for: .touchUpInside)
             return value
