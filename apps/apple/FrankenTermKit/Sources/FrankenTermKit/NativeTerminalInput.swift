@@ -66,7 +66,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var markedTextStyle: [NSAttributedString.Key: Any]?
     public var selectionAffinity: UITextStorageDirection = .forward
     public var textInputView: UIView { self }
-    public var isEditable: Bool { session.acceptsInput && hasGeometry && !retiring && !ordinaryInputBlocked }
+    public var isEditable: Bool { acceptsKeys && hasGeometry }
+    /// Keys need no caret: the key row stays usable while the live screen is
+    /// redrawn, and its keys are admitted like typing (see `typed`).
+    private var acceptsKeys: Bool { session.acceptsInput && !retiring && !ordinaryInputBlocked }
     /// Review keeps its exact focus alive while withholding ordinary typing.
     /// Only confirmPaste may use this separate admission while a panel covers
     /// the terminal; a new source/geometry still invalidates the candidate.
@@ -613,11 +616,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         ])
         func add(_ button: UIButton) -> UIButton { row.addArrangedSubview(button); return button }
         controlButton = add(key("ctrl", label: "Control modifier") { [weak self] in
-            guard let self, self.isEditable, !self.session.document.isMarked else { return }
+            guard let self, self.acceptsKeys, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleControl(); self.updateAccessory()
         })
         altButton = add(key("alt", label: "Alt modifier") { [weak self] in
-            guard let self, self.isEditable, !self.session.document.isMarked else { return }
+            guard let self, self.acceptsKeys, !self.session.document.isMarked else { return }
             self.accessoryModifiers.cycleAlt(); self.updateAccessory()
         })
         for (title, symbol, label, usage) in [("esc", nil, "Escape", UInt16(0x29)), ("tab", nil, "Tab", 0x2B),
@@ -625,7 +628,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
                                               (nil, "arrow.up", "Up arrow", 0x52), (nil, "arrow.right", "Right arrow", 0x4F)] {
             terminalButtons.append(add(key(title, symbol: symbol, label: label) { [weak self] in
                 guard let self else { return }
-                self.mutate {
+                self.typed {
                     try self.session.key(TerminalHardwareKey(usage: usage, modifiers: self.accessoryModifiers.modifiers), phase: .press)
                     self.accessoryModifiers.consume()
                 }
@@ -647,7 +650,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
 
     private func updateAccessory() {
-        let enabled = isEditable && !session.document.isMarked
+        let enabled = acceptsKeys && !session.document.isMarked
         accessoryBar?.backgroundColor = theme.map { $0.tint(0.06) } ?? .secondarySystemBackground
         let cap = theme.map { $0.tint(0.2) } ?? .secondarySystemFill
         let text = theme?.foreground ?? .label

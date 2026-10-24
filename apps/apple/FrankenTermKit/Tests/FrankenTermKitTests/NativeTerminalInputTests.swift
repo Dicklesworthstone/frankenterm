@@ -67,6 +67,14 @@ final class NativeTerminalInputTests: XCTestCase {
         }
         XCTFail("native test transport failed to drain within its bound")
     }
+    /// A key-row button by its accessibility label.
+    private func accessoryButton(_ view: NativeTerminalInputView, _ label: String) -> UIButton? {
+        func find(_ root: UIView) -> UIButton? {
+            if let button = root as? UIButton, button.accessibilityLabel == label { return button }
+            return root.subviews.lazy.compactMap(find).first
+        }
+        return view.inputAccessoryView.flatMap(find)
+    }
     func testRealUITextInputCompositionSendsOnlyFinalCandidateOnce() async throws {
         let (coordinator, transport, source, view) = try await setup()
         view.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0))
@@ -189,14 +197,18 @@ final class NativeTerminalInputTests: XCTestCase {
         try view.invalidateRenderedCaret(source: source)
         XCTAssertFalse(view.isEditable)
         view.insertText("lsx"); view.deleteBackward(); view.insertText("\n")
+        // The key row's keys are keys too.
+        let left = try XCTUnwrap(accessoryButton(view, "Left arrow"))
+        XCTAssertTrue(left.isEnabled, "the key row stays usable while the screen is redrawn")
+        left.sendActions(for: .touchUpInside)
         view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
         await view.session.waitUntilSettled(); try await drain(coordinator, source)
         let sent = await transport.bytes()
-        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "lsx<key:42><key:40>")
+        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "lsx<key:42><key:40><key:80>")
         XCTAssertFalse(view.session.document.isMarked, "composition waits for a drawn caret")
 
         live = false
-        view.insertText("pwd\n")
+        view.insertText("pwd\n"); left.sendActions(for: .touchUpInside)
         await view.session.waitUntilSettled(); try await drain(coordinator, source)
         let after = await transport.bytes()
         XCTAssertEqual(after, sent, "with history shown, typing is not sent")
