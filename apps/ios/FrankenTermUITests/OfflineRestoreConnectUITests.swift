@@ -98,7 +98,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     private func reopen(_ app: XCUIApplication, _ inputs: Inputs) -> XCUIElement {
         let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
         guard terminal.waitForExistence(timeout: 20) else {
-            if savedWorkspace(app, inputs).exists {
+            // Saved already: the list or the workspace's page is showing.
+            if savedWorkspace(app, inputs).exists || app.navigationBars[inputs.workspace].exists {
                 XCTFail("a relaunch must return to the terminal the last launch showed")
             } else { restore(app, inputs) }
             return connect(app, inputs)
@@ -340,7 +341,9 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     /// the Mac exports a group the phone already has. The second package
     /// (FT_UI_REIMPORT_PATH, FT_UI_REIMPORT_CODE) is the same workspace with
     /// changed host-trust references, so connection settings change. One
-    /// line says so; nothing else is asked, and its machine still connects.
+    /// line says so; nothing else is asked. Opened over the live terminal,
+    /// the restore ends its sessions first; closing the restore, and later
+    /// the replacement, each bring that terminal back connected.
     @MainActor
     func test4NewerExportReplacesTheSavedWorkspaceInOneTap() throws {
         let inputs = try inputs()
@@ -351,12 +354,25 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         let app = launch()
         _ = reopen(app, inputs)
         // Opened from Files or AirDrop over the live terminal: an offline
-        // restore ends its sessions first, in one tap.
-        XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
-        let disconnect = app.buttons["Disconnect Sessions and Restore"]
-        XCTAssertTrue(disconnect.waitForExistence(timeout: 10), "live sessions pause the restore until disconnected")
-        disconnect.tap()
+        // restore ends its sessions first, in one tap that says what it ends.
+        func disconnectForRestore() {
+            XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
+            let disconnect = app.buttons["Disconnect Sessions and Restore"]
+            XCTAssertTrue(disconnect.waitForExistence(timeout: 10), "live sessions pause the restore until disconnected")
+            XCTAssertTrue(app.staticTexts["Ends the live sessions in “\(inputs.workspace)”."].exists,
+                          "one line names the sessions the button ends")
+            disconnect.tap()
+        }
+        disconnectForRestore()
         let field = app.secureTextFields["Transfer code"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
+        // Closing restore instead brings the terminal back, connected.
+        app.navigationBars["Restore"].buttons["Close"].tap()
+        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
+                      "the terminal a cancelled restore closed reconnects")
+        snapshot("r0-restore-cancelled")
+
+        disconnectForRestore()
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
         field.tap(); field.typeText(code)
         app.buttons["Unlock"].tap()
@@ -380,7 +396,6 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
                       "the terminal left showing reconnects after the replacement")
         let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
-        XCTAssertTrue(terminal.exists, "the terminal surface is back")
         snapshot("r3-reconnected")
         app.typeText("echo AFTER-$((40+2))\n")
         waitFor("AFTER-42", in: terminal, timeout: 30, "the replaced workspace's machine must run commands")

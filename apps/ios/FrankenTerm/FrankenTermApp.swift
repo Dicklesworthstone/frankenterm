@@ -33,19 +33,6 @@ struct FrankenTermMobileApp: App {
     }
 }
 
-/// The exact retained owners a disconnect may close, taken when it is asked
-/// for. A workspace reopened or replaced before it runs requires a new one.
-@MainActor
-struct RestoreSessionDisconnectReview {
-    let id = UUID()
-    fileprivate let epoch: UUID
-    fileprivate let owners: [WorkspaceTerminalScene]
-
-    fileprivate init(epoch: UUID, owners: [WorkspaceTerminalScene]) {
-        self.epoch = epoch; self.owners = owners
-    }
-}
-
 struct LocalCredentialRevocationReview: Identifiable {
     let id = UUID()
     let workspaceID: UUID, revision: UUID
@@ -120,7 +107,6 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var connectionLifecycle: Task<Void, Never>?
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
-    @ObservationIgnored private var disconnectReviewID: UUID?
     @ObservationIgnored private var restoreDisconnection: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var credentialReviewID: UUID?
     @ObservationIgnored private var credentialRevocation: (id: UUID, task: Task<Void, Never>)?
@@ -395,44 +381,38 @@ final class MobileWorkspaceModel {
         }
     }
 
-    var canReviewSessionsForRestore: Bool {
-        active && showRestore && offlineModeBlocked && !busy && !disconnectableScenes.isEmpty
+    /// The workspaces whose live sessions keep offline restore from starting.
+    var workspacesBlockingRestore: [String] {
+        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return [] }
+        return disconnectableScenes.map(\.workspaceName)
     }
 
-    func reviewSessionsForRestore() -> RestoreSessionDisconnectReview? {
-        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return nil }
-        let owners = disconnectableScenes
-        guard !owners.isEmpty else { return nil }
-        let reviewed = RestoreSessionDisconnectReview(epoch: epoch, owners: owners)
-        disconnectReviewID = reviewed.id
-        return reviewed
-    }
-
-    /// Validate the complete review before sealing any owner. New, unreviewed
-    /// scenes keep their sessions and can still prevent offline admission.
-    func disconnectSessionsAndRestore(_ reviewed: RestoreSessionDisconnectReview) {
+    /// One tap ends every live session so offline restore can begin.
+    func disconnectSessionsAndRestore() {
         guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return }
-        guard disconnectReviewID == reviewed.id, reviewed.epoch == epoch, !reviewed.owners.isEmpty,
-              reviewed.owners.allSatisfy({ liveScenes[$0.workspaceID] === $0 }) else {
-            message = "The workspace sessions changed. Review them again before disconnecting; this confirmation did not close any sessions."
-            return
-        }
-        disconnectReviewID = nil
+        let owners = disconnectableScenes, id = UUID(), ticket = epoch
+        guard !owners.isEmpty else { return }
         busy = true; message = nil; cameraRequested = false
-        // No actor hop may intervene between validating the owners and sealing
+        // No actor hop may intervene between choosing the owners and sealing
         // input/reconnect admission for every one of them.
-        for owner in reviewed.owners { owner.requestClose() }
+        for owner in owners { owner.requestClose() }
         let job = Task { [weak self] in
             // The model retains this task even after leaving restore. Closing
             // joins each owner's timers, startup, input and transport cleanup;
             // MobileConnections keeps any failed settlements for a later retry.
-            for owner in reviewed.owners { await owner.close() }
-            guard let self, self.restoreDisconnection?.id == reviewed.id else { return }
+            for owner in owners { await owner.close() }
+            guard let self, self.restoreDisconnection?.id == id else { return }
             self.restoreDisconnection = nil; self.busy = false
-            guard self.active, self.showRestore, self.epoch == reviewed.epoch else { return }
+            guard self.active, self.showRestore, self.epoch == ticket else { return }
             self.updateLifecycle()
         }
-        restoreDisconnection = (reviewed.id, job)
+        restoreDisconnection = (id, job)
+    }
+
+    /// Waits for the latest restore transition. Dismissing restore releases
+    /// offline exclusion there, so a connection opened after it is admitted.
+    func restoreSettled() async {
+        await lifecycle?.value
     }
 
     func requestRecipient() {
@@ -462,7 +442,6 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
-        disconnectReviewID = nil
         credentialReviewID = nil
         workspaceRefreshEpoch = UUID()
         workspaceRefresh?.cancel()
@@ -1681,13 +1660,15 @@ struct OfflineRestoreSheet: View {
                         Text(model.message ?? "Close active connections before restoring. Cancel to keep your connections open.")
                     } actions: {
                         if model.busy { ProgressView("Preparing offline restore…") }
-                        if model.canReviewSessionsForRestore {
-                            // The screen already says what this ends; the
-                            // button does it, with no second confirmation.
+                        let blocking = model.workspacesBlockingRestore
+                        if !blocking.isEmpty {
+                            // One line names what the button ends; it acts
+                            // with no second confirmation.
+                            Text(verbatim: "Ends the live sessions in "
+                                 + ListFormatter.localizedString(byJoining: blocking.map { "“\($0)”" }) + ".")
+                                .font(.footnote)
                             Button("Disconnect Sessions and Restore", role: .destructive) {
-                                if let reviewed = model.reviewSessionsForRestore() {
-                                    model.disconnectSessionsAndRestore(reviewed)
-                                }
+                                model.disconnectSessionsAndRestore()
                             }
                         }
                         Button("Retry Offline Restore") { model.retryOfflineMode() }.buttonStyle(.borderedProminent)
@@ -2054,6 +2035,9 @@ struct OfflineRestoreSheet: View {
             }
         }
         if let changes = review.changeReview { Text(verbatim: replacementSummary(review, changes)).font(.callout) }
+        // Nothing saved to replace, yet this export was restored here before
+        // (its workspace has since been removed): Restore takes it back.
+        else if review.isRollback { Text(verbatim: "This \(UIDevice.current.model) restored this export before.").font(.callout) }
         // Replace approves exactly what the line above says: this source
         // takes over the saved workspace with its changes, removals or
         // older version. Every changed value is under Details.
@@ -2123,8 +2107,9 @@ struct OfflineRestoreSheet: View {
         var effects = ["Replaces your saved “\(review.existingWorkspaceName ?? review.document.name)”"]
         if !changes.changes.isEmpty {
             let count = changes.changes.count, security = changes.securityChanges.count
-            effects.append("changes \(count) \(count == 1 ? "setting" : "settings")"
-                + (security == 0 ? "" : " (\(security) of them connections or host keys)"))
+            let which = security == count ? (count == 1 ? "a connection or host key" : "all connections or host keys")
+                : "\(security) of them connections or host keys"
+            effects.append("changes \(count) \(count == 1 ? "setting" : "settings")" + (security == 0 ? "" : " (\(which))"))
         }
         if review.removesMachines { effects.append("removes the machines it no longer has") }
         if review.isRollback { effects.append("goes back to an older version") }
@@ -2937,6 +2922,8 @@ private struct MachineWorkspaceView: View {
            let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
             VStack(alignment: .leading, spacing: 10) {
                 Button {
+                    // The user's choice ends a return still waiting for its machine.
+                    returnHandled = true
                     terminal = OpenTerminal(machineID: machine.id, local: local)
                 } label: {
                     // A session that is already running opens where it is.
@@ -2982,12 +2969,18 @@ private struct MachineWorkspaceView: View {
     /// opens again on the saved workspace, as a relaunch's return does, or
     /// gives way to this page if its machine can no longer connect.
     private func reopenClosedTerminal() {
-        guard let open = terminal, !model.showRestore, !model.hasOpenScene(workspaceID),
-              let local = model.localPolicies[workspaceID] else { return }
-        guard let machine = document.machines.first(where: { $0.id == open.machineID }), model.connections != nil,
-              !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
-              sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { terminal = nil; return }
-        terminal = OpenTerminal(machineID: open.machineID, local: local)
+        guard let closed = terminal, !model.showRestore, !model.hasOpenScene(workspaceID) else { return }
+        Task {
+            // Dismissing restore releases offline exclusion in its lifecycle
+            // step; a connection begun before that would be refused.
+            await model.restoreSettled()
+            guard terminal?.id == closed.id, !model.showRestore, !model.hasOpenScene(workspaceID),
+                  let local = model.localPolicies[workspaceID] else { return }
+            guard let machine = document.machines.first(where: { $0.id == closed.machineID }), model.connections != nil,
+                  !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+                  sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { terminal = nil; return }
+            terminal = OpenTerminal(machineID: closed.machineID, local: local)
+        }
     }
 
     /// A saved route: where it goes and anything this phone still needs for it.
