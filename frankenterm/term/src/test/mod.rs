@@ -1265,6 +1265,54 @@ fn test_resize_keeps_a_pending_wrap_on_its_line() {
     assert_eq!(cursor(&term), (1, 1));
 }
 
+/// A shell prompt redrawn after a rows-only resize (an iPad keyboard shown or
+/// hidden) keeps the output above it: zsh moves up to the prompt's blank
+/// first line, clears below and draws the prompt again. These are the bytes
+/// zsh with a one-line powerlevel10k prompt (blank line first) wrote for
+/// `clear; echo SZ-...` and for each SIGWINCH. vim earlier left a saved
+/// cursor (`?1049h`) near the bottom; it must not hold the blank rows below
+/// the prompt, which made a shorter screen scroll `SZ-...` away. A restore
+/// then lands on the last row.
+#[test]
+fn test_prompt_redrawn_after_a_rows_resize_keeps_the_output_above() {
+    let size = |rows| TerminalSize {
+        rows,
+        cols: 137,
+        ..Default::default()
+    };
+    let prompt = "\r\n~ LEFT\x1b[K\x1b[61CRIGHT\x1b[85D";
+    let redraw = format!("\r\r\x1b[A\x1b[J{prompt}");
+    let top = |term: &TestTerm| {
+        let rows = visible_text_snapshot(&term.term);
+        let first = |row: &String| row.trim_end().to_string();
+        let prompt = rows[2].starts_with("~ LEFT") && rows[2].trim_end().ends_with("RIGHT");
+        (first(&rows[0]), first(&rows[1]), prompt)
+    };
+
+    let mut term = TestTerm::new(67, 137, 256);
+    for i in 1..=60 {
+        term.print(format!("UIH-{i}\r\n"));
+    }
+    term.print("\x1b[?1049h\x1b[H\x1b[2J~\r\n~\x1b[?1049l");
+    term.print("\x1b[3J\x1b[H\x1b[2JSZ-67x137\r\n");
+    term.print(format!("%{}\r \r", " ".repeat(136)));
+    term.print(format!("\r\x1b[J{prompt}"));
+    let expected = ("SZ-67x137".to_string(), String::new(), true);
+    assert_eq!(top(&term), expected);
+    for rows in [47, 67, 72, 47] {
+        term.resize(size(rows));
+        term.print(&redraw);
+        assert_eq!(top(&term), expected, "after resizing to {rows} rows");
+        assert_eq!(term.cursor_pos().y, 2, "the cursor stays on the prompt row");
+    }
+    term.print("\x1b8");
+    assert_eq!(
+        term.cursor_pos().y,
+        46,
+        "the saved cursor rests on the last row"
+    );
+}
+
 #[test]
 fn test_resize_2162_by_2() {
     let num_lines = 4;

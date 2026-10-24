@@ -9033,13 +9033,12 @@ impl Screen {
         matches
     }
 
+    /// Only the live cursor holds rows here. A saved cursor (DECSC; vim's
+    /// `?1049h` leaves one behind) in the blank rows below must not make a
+    /// shorter screen scroll the output above the cursor away: it rests on
+    /// the last row instead (see the end of `resize_with_prepared_reflow`).
     fn prune_resize_trailing_blanks(&mut self, cursor: CursorPosition) {
-        let cursor_phys = self
-            .saved_cursor
-            .as_ref()
-            .map_or(self.phys_row(cursor.y), |saved| {
-                self.phys_row(cursor.y).max(self.phys_row(saved.position.y))
-            });
+        let cursor_phys = self.phys_row(cursor.y);
         for _ in cursor_phys + 1..self.lines.len() {
             if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
                 self.lines.pop_back();
@@ -9365,6 +9364,14 @@ impl Screen {
                     .saturating_sub(old_saved_cursor.map_or(0, |(_, row)| row as i64))
             } else {
                 row as i64 - (self.lines.len() as i64 - physical_rows as i64)
+            };
+            // A saved position in blank rows the shorter screen dropped from
+            // the bottom rests on the last row, as xterm restores it.
+            let last = physical_rows as i64 - 1;
+            let (row, saved_y) = if saved_y > last {
+                (self.lines.len() - 1, last)
+            } else {
+                (row, saved_y)
             };
             self.set_resized_saved_cursor(column, row, saved_y, seqno);
         }
