@@ -877,6 +877,69 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(second, connections: again.connections)
     }
 
+    /// M2: a new connection (the phone is back after its connection ended)
+    /// shows the pane the phone was showing, with the same program in it, not
+    /// whichever pane the desktop has active. When that pane closed meanwhile
+    /// the screen says so and shows the desktop's active pane. Needs a
+    /// disposable mux with two panes (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this
+    /// test types into them and ends one.
+    func testAMuxReconnectComesBackToTheShownPaneAndSaysWhenItClosed() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
+        let run = UUID().uuidString.prefix(8)
+        let first = try await connect(scene, "alpha")
+        let firstView = try shown(first)
+        let state = try XCTUnwrap(first.muxState)
+        guard let other = state.panes.first(where: { $0.paneId != state.shown }) else {
+            firstView.removeFromSuperview(); await scene.close()
+            throw XCTSkip("The mux needs a second pane")
+        }
+        first.showPane(other.paneId)
+        for _ in 0..<400 where first.muxState?.shown != other.paneId || first.paneNavigationBusy || first.terminal === firstView {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(first.muxState?.shown, other.paneId)
+        firstView.removeFromSuperview()
+        let view = try shown(first)
+        try await type("echo PANE-\(run)-$$ > \(out)", into: view)
+        let typed = try await hostFile(out, containing: "PANE-\(run)-")
+        let pid = try XCTUnwrap(typed.split(separator: "\n").first { $0.hasPrefix("PANE-\(run)-") }, typed)
+            .dropFirst("PANE-\(run)-".count)
+        view.removeFromSuperview()
+        await first.stop()
+        await assertReleased(first, connections: live.connections)
+
+        // Back after the connection ended: the same pane, the same program.
+        let second = try await connect(scene, "alpha")
+        for _ in 0..<200 where second.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(second.muxState?.shown, other.paneId, "the phone came back to the pane it was showing")
+        XCTAssertNil(second.interactionProblem)
+        let again = try shown(second)
+        try await type("echo AGAIN-\(run)-$$ >> \(out); echo BYE-\(run) >> \(out); sleep 3; exit", into: again)
+        let text = try await hostFile(out, containing: "BYE-\(run)")
+        XCTAssertTrue(text.contains("AGAIN-\(run)-\(pid)"), "the same program answered (\(text))")
+        again.removeFromSuperview()
+        await second.stop()
+        await assertReleased(second, connections: live.connections)
+
+        // That pane ended while the phone was away.
+        try await Task.sleep(for: .seconds(4))
+        let third = try await connect(scene, "alpha")
+        for _ in 0..<200 where third.muxState?.shown == nil || third.interactionProblem == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let now = try XCTUnwrap(third.muxState)
+        XCTAssertFalse(now.panes.contains { $0.paneId == other.paneId }, "the pane it was showing closed")
+        XCTAssertNotNil(now.shown)
+        XCTAssertNotEqual(now.shown, other.paneId)
+        XCTAssertEqual(third.interactionProblem,
+                       "The pane you were viewing closed while you were away. This is the desktop's active pane.")
+        await scene.close()
+        await assertReleased(third, connections: live.connections)
+    }
+
     /// A direct route first tries the machine's mux. The loopback host has none,
     /// so that attempt leaves an acknowledged record with no input before the
     /// shell's own record. These are the records of terminals that ran.
