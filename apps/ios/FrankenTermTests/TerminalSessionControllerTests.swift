@@ -394,8 +394,9 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// An iPad on a large display at the smallest text size has room for more
-    /// cells than the terminal can keep both screens of. The grid stops at the
-    /// largest that fits and the session keeps running; it used to end.
+    /// cells than the terminal can keep both screens of. The grid takes the
+    /// full width and as many rows as fit; it used to give up columns to keep
+    /// 256 history rows.
     func testALayoutPastTheCellBudgetShowsTheLargestGridThatFits() async throws {
         let live = try await liveScene()
         let session = try await connect(live.scene, "alpha")
@@ -522,7 +523,8 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         let frame = try XCTUnwrap(terminal.renderer.admittedFrame)
-        XCTAssertGreaterThan(frame.columns, columns, "the terminal never drew the larger grid")
+        XCTAssertGreaterThan(frame.columns, columns, "the terminal never drew the larger grid (drawable "
+            + "\(terminal.renderer.drawableSize), cell \(String(describing: terminal.renderer.cellSize)))")
         return frame
     }
 
@@ -1071,9 +1073,8 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A 13-inch iPad in landscape at the smallest text size: the pane takes
-    /// that grid and the phone draws it. The phone used to hold a pane only
-    /// with 256 rows of history beside both screens, so it asked the pane back
-    /// to this same size after every output and never drew it.
+    /// the whole grid and the phone draws it. The phone used to narrow its grid
+    /// to keep 256 history rows beside both screens, using under half the width.
     func testAMuxPaneShownOnALargeScreenAtASmallSizeIsDrawnAtThatSize() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")

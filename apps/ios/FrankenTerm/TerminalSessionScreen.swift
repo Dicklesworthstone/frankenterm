@@ -1277,9 +1277,9 @@ final class TerminalSessionController {
         guard !stopped, phase == .live, let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
               let rows = UInt32(exactly: viewport.rows),
-              // The model keeps both screens and 256 history rows in 65536
-              // cells; a small font in landscape can fit more columns than that.
-              let columns = UInt32(exactly: min(viewport.columns, 65_536 / (viewport.rows * 2 + 256))),
+              // At most TerminalSessionGeometry.maximumShownCells: the model
+              // keeps both screens of it and the history that still fits.
+              let columns = UInt32(exactly: viewport.columns),
               viewport.pixelWidth >= 0, viewport.pixelHeight >= 0,
               let geometry = try? TerminalSessionGeometry(columns: columns, rows: rows,
                   pixelWidth: UInt32(min(viewport.pixelWidth, 65_535)),
