@@ -480,11 +480,14 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var outgoing = Data()
         /// Panes left at the phone's size on this machine, across connections.
         let sizes: TerminalMuxPhoneSizes
+        /// The pane shown on this machine, across connections.
+        let shownPane: TerminalMuxShownPane
         /// Which panes' programs have asked for the mouse.
         var grabs: [Int: Bool] = [:]
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry,
-             sizes: TerminalMuxPhoneSizes) {
+             sizes: TerminalMuxPhoneSizes, shownPane: TerminalMuxShownPane) {
             self.client = client; self.control = control; self.geometry = geometry; self.sizes = sizes
+            self.shownPane = shownPane
             queries = TerminalMuxQueryDriver(client: client, control: control)
             output = TerminalMuxOutputBuffer(geometry: geometry)
         }
@@ -526,7 +529,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             let state = MuxAttachment(client: client, control: control, geometry: try TerminalSessionGeometry(
                 columns: geometry.columns, rows: geometry.rows,
                 pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight),
-                sizes: TerminalMuxPhoneSizes(workspace: identity.workspaceID, machine: identity.machineID))
+                sizes: TerminalMuxPhoneSizes(workspace: identity.workspaceID, machine: identity.machineID),
+                shownPane: TerminalMuxShownPane(workspace: identity.workspaceID, machine: identity.machineID))
             mux = state
             // The server's protocol check and its pane list.
             let deadline = ContinuousClock.now + .seconds(15)
@@ -542,8 +546,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 _ = try await pumpMux(timeout: .seconds(5), driver: driver)
                 try await validateForeground()
             }
-            guard let first = state.panes.first(where: \.isActive) ?? state.panes.first else {
-                throw TerminalMuxError.noPanes
+            // Back to the pane this phone was showing when it is still there.
+            let (chosen, lost) = state.shownPane.choose(from: state.panes)
+            guard let first = chosen else { throw TerminalMuxError.noPanes }
+            if lost {
+                control.recordNotice("The pane you were viewing closed while you were away. This is the desktop's active pane.")
             }
             // Panes an earlier connection left at the phone's size get the
             // desktop's back; the one about to be shown is resized anyway, and
@@ -554,7 +561,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 if pane != first.paneId { try client.restoreSize(pane: pane) }
             }
             state.sizes.removeAll()
-            state.shown = first.paneId
+            state.shown = first.paneId; state.shownPane.set(first)
             try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
             let signal = inputSignal
@@ -623,8 +630,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 let present = Set(panes.map(\.paneId))
                 state.grabs = state.grabs.filter { present.contains($0.key) }
                 state.panes = panes; state.listed = true
-                if let shown = state.shown, !panes.contains(where: { $0.paneId == shown }) {
-                    state.shown = nil; state.showing = false
+                if let shown = state.shown {
+                    // The record follows a pane the desktop moved; one that left clears it.
+                    let listed = panes.first { $0.paneId == shown }
+                    if listed == nil { state.shown = nil; state.showing = false }
+                    state.shownPane.set(listed)
                 }
                 state.control.publish(panes: panes, shown: state.shown)
             case .output(let pane, let rows, let columns, let bytes):
@@ -671,7 +681,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.grabs[pane] = nil
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
-                if state.shown == pane { state.shown = nil; state.showing = false }
+                if state.shown == pane { state.shown = nil; state.showing = false; state.shownPane.set(nil) }
             case .searchResults(let pane, let results):
                 state.queries.receive(pane: pane, results: results)
             case .context(let pane, let context):
@@ -704,6 +714,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try state.client.hide(pane: old); try state.client.restoreSize(pane: old)
             }
             state.shown = requested; state.showing = false
+            state.shownPane.set(state.panes.first { $0.paneId == requested })
             try state.control.inputRouting.select(pane: requested)
             // Finish already-decoded output events before the replacement.
             // Dropping a chunk's suffix could strand the canonical parser in

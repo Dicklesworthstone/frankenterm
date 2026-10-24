@@ -153,6 +153,54 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     }
 }
 
+/// The pane the phone was showing on one machine, kept across connections
+/// and launches: a connection that dropped while the phone was away comes
+/// back to that pane, not to whichever one the desktop has active.
+///
+/// A pane is the same one only under the same pane, tab and window numbers.
+/// A running server never reuses a pane number; one that restarted would have
+/// to rebuild the same layout to repeat all three. Nothing typed before is
+/// ever replayed into the pane a new connection shows.
+public final class TerminalMuxShownPane: @unchecked Sendable {
+    public struct Record: Codable, Equatable, Sendable {
+        public let paneId: Int, tabId: Int, windowId: Int
+        public init(_ pane: TerminalMuxPane) { paneId = pane.paneId; tabId = pane.tabId; windowId = pane.windowId }
+    }
+    private let lock = NSLock()
+    private let defaults: UserDefaults
+    private let key: String
+
+    public init(workspace: String, machine: String, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        key = "frankenterm.mux.shownPane.\(workspace).\(machine)"
+    }
+
+    public var record: Record? {
+        lock.withLock { defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) } }
+    }
+
+    /// Remembers the pane now shown, or that none is (it closed).
+    public func set(_ pane: TerminalMuxPane?) {
+        let next = pane.map(Record.init)
+        lock.withLock {
+            let stored = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) }
+            guard stored != next else { return }
+            if let next, let data = try? JSONEncoder().encode(next) { defaults.set(data, forKey: key) }
+            else { defaults.removeObject(forKey: key) }
+        }
+    }
+
+    /// The pane a new connection shows from the server's list: the remembered
+    /// one while it is still there, else the desktop's active pane. `lost`
+    /// says a remembered pane is gone, which the screen should tell.
+    public func choose(from panes: [TerminalMuxPane]) -> (pane: TerminalMuxPane?, lost: Bool) {
+        let fallback = panes.first(where: \.isActive) ?? panes.first
+        guard let record else { return (fallback, false) }
+        if let same = panes.first(where: { Record($0) == record }) { return (same, false) }
+        return (fallback, true)
+    }
+}
+
 /// The protocol state of one connection to a machine's mux server, the same
 /// server the desktop attaches to. It does no I/O: the owner passes in what
 /// the channel delivered, sends what `outgoing` returns, and drains events.
@@ -268,6 +316,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// Why the mux server ended an attached session (a reply this app
         /// could not read, say), when it was not the connection dropping.
         public var failure: String?
+        /// What changed while the phone was away that the screen should say,
+        /// such as the pane it was showing having closed.
+        public var notice: String?
         /// The shown pane's program has asked for the mouse: a tap clicks.
         public var mouseGrabbed = false
         /// A captured request expired before the transport could apply it. The
@@ -477,6 +528,14 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func recordFailure(_ reason: String) {
         update { state in
             state.failure = Self.boundedError(reason)
+            return true
+        }
+    }
+
+    /// Something the screen should say once about this attachment.
+    public func recordNotice(_ notice: String) {
+        update { state in
+            state.notice = notice
             return true
         }
     }

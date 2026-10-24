@@ -416,6 +416,46 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(first.records.count, TerminalMuxPhoneSizes.maximumRecords, "bounded")
     }
 
+    func testANewConnectionComesBackToTheShownPaneOnlyWhileItIsStillThere() throws {
+        let suite = "frankenterm.tests.shownPane.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func pane(_ id: Int, tab: Int, active: Bool = false) -> TerminalMuxPane {
+            TerminalMuxPane(paneId: id, tabId: tab, windowId: 0, tabTitle: "", title: "p\(id)", workspace: "default",
+                            workingDir: nil, size: .init(rows: 24, cols: 80), isActive: active, isZoomed: false)
+        }
+        let listed = [pane(1, tab: 0, active: true), pane(4, tab: 2), pane(7, tab: 3)]
+        let first = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
+        // Nothing remembered: the desktop's active pane, and nothing to say.
+        XCTAssertEqual(first.choose(from: listed).pane, listed[0])
+        XCTAssertFalse(first.choose(from: listed).lost)
+        first.set(listed[1])
+
+        // The next connection to the same machine comes back to it.
+        let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
+        XCTAssertEqual(next.record, .init(listed[1]))
+        XCTAssertEqual(next.choose(from: listed).pane, listed[1])
+        XCTAssertFalse(next.choose(from: listed).lost)
+        XCTAssertNil(TerminalMuxShownPane(workspace: "w", machine: "ts2", defaults: defaults).record)
+
+        // Gone, or its number in another tab (a restarted server): the active
+        // pane, and the screen says the one being viewed closed.
+        for panes in [[listed[0], listed[2]], [listed[0], pane(4, tab: 9), listed[2]]] {
+            let choice = next.choose(from: panes)
+            XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost)
+        }
+        XCTAssertNil(next.choose(from: []).pane)
+        // A pane that closed while shown is forgotten: nothing to say later.
+        next.set(nil)
+        XCTAssertNil(first.record)
+        XCTAssertFalse(first.choose(from: [listed[0]]).lost)
+
+        let control = TerminalMuxControl()
+        XCTAssertNil(control.current.notice)
+        control.recordNotice("The pane you were viewing closed while you were away.")
+        XCTAssertEqual(control.current.notice, "The pane you were viewing closed while you were away.")
+    }
+
     func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {
         let control = TerminalMuxControl()
         final class Seen: @unchecked Sendable { let lock = NSLock(); var failures: [String?] = [] }

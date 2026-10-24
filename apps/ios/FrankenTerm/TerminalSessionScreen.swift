@@ -220,6 +220,8 @@ final class TerminalSessionController {
     /// The machine's mux panes and the one on screen, when this session is
     /// attached to its FrankenTerm mux rather than a shell of its own.
     private(set) var muxState: TerminalMuxControl.State?
+    /// The attachment whose notice the screen has shown; each says it once.
+    @ObservationIgnored private weak var noticedMux: TerminalMuxControl?
     /// No mux answered on this machine, so this session is a new shell.
     private(set) var shellOnly = false
     let target: TerminalSessionTarget
@@ -712,6 +714,10 @@ final class TerminalSessionController {
             guard let self, let control, !self.stopped, self.connection?.muxControl === control else { return }
             self.muxState = state
             self.terminal?.remoteMouseGrabbed = state.mouseGrabbed
+            if let notice = state.notice, self.noticedMux !== control {
+                self.noticedMux = control
+                self.interactionProblem = notice
+            }
             if let rejected = state.rejectedNavigation, rejected == self.requestedMuxNavigation {
                 self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
                 if self.presentationVisible {
