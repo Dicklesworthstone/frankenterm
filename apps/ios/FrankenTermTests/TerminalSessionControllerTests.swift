@@ -152,8 +152,19 @@ final class TerminalSessionControllerTests: XCTestCase {
         let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision, workspaceName: "Scene",
                                                machines: machines, initialMachineID: "alpha", connections: connections,
                                                autoConnect: false)
-        scene.appear(selecting: "alpha", active: true)
+        try await appear(scene, selecting: "alpha")
         return LiveScene(connections: connections, scene: scene, outPath: outPath)
+    }
+
+    /// Appearing commits its group and selection asynchronously, and the scene
+    /// refuses terminal actions until it has.
+    private func appear(_ scene: WorkspaceTerminalScene, selecting machineID: String) async throws {
+        scene.appear(selecting: machineID, active: true)
+        for _ in 0..<400 where !scene.permitsTerminalCreation {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(scene.permitsTerminalCreation, "the scene finished appearing")
+        XCTAssertEqual(scene.selectedMachineID, machineID)
     }
 
     /// Existing display/input tests deliberately create a terminal, including
@@ -164,6 +175,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         let session = try XCTUnwrap(scene.sessions[machine])
         for _ in 0..<400 where session.phase == .idle || session.phase == .connecting {
             try await Task.sleep(for: .milliseconds(50))
+        }
+        // A session goes live before the machine on screen gets its view.
+        for _ in 0..<400 where session.phase == .live && session.terminal == nil && scene.shows(machineID: machine) {
+            try await Task.sleep(for: .milliseconds(25))
         }
         return session
     }
@@ -230,7 +245,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(opened.count, 1)
         if !session.shellOnly { XCTAssertEqual(opened.map(\.id), prepared.map(\.id)) }
         let records = try await live.connections.journal.records()
-        XCTAssertEqual(records.count, 1, "repeated actions open one terminal epoch")
+        XCTAssertEqual(terminalRecords(records).count, 1, "repeated actions open one terminal epoch: \(describe(records))")
+        XCTAssertEqual(records.count, session.shellOnly ? 2 : 1, describe(records))
         await scene.close()
         await assertReleased(session, connections: live.connections)
     }
@@ -359,8 +375,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty, "closing the scene must settle the connection through the manager")
         await assertReleased(try XCTUnwrap(live.scene.sessions["alpha"]), connections: connections)
         let history = try await connections.journal.records()
-        let record = try XCTUnwrap(history.first)
-        XCTAssertEqual(record.state, .interrupted)
+        let record = try XCTUnwrap(terminalRecords(history).first, describe(history))
+        XCTAssertEqual(terminalRecords(history).count, 1, describe(history))
+        XCTAssertEqual(record.state, .interrupted, describe(history))
         XCTAssertTrue(record.canResolve)
         XCTAssertTrue(record.inputEvidence.contains(.transportAccepted))
         XCTAssertTrue(record.inputEvidence.mayHaveRemoteEffect)
@@ -390,6 +407,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(first, connections: connections)
 
         // The ended session's record is acknowledged as the next one starts.
+        let earlier = Set(try await connections.journal.records().map(\.id))
+        XCTAssertFalse(earlier.isEmpty)
         let second = try await connect(scene, "alpha")
         XCTAssertNil(first.retainedOutput, "replacing a controller releases its volatile output")
         let again = try shown(second)
@@ -397,8 +416,11 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await type("echo AGAIN-$((40+2)) > \(live.outPath)", into: again)
         let output = try await hostFile(live.outPath, containing: "AGAIN-42")
         XCTAssertTrue(output.contains("AGAIN-42"), "the new session must run commands (output: \(output))")
-        let unresolved = try await connections.journal.records().filter { $0.requiresReview }
-        XCTAssertTrue(unresolved.isEmpty, "starting the new session acknowledged the earlier one")
+        // The new session's own record stays open while it is live.
+        let records = try await connections.journal.records()
+        let unresolved = records.filter { earlier.contains($0.id) && $0.requiresReview }
+        XCTAssertTrue(unresolved.isEmpty, "starting the new session acknowledged the earlier one: \(describe(records))")
+        XCTAssertEqual(terminalRecords(records).filter(\.requiresReview).count, 1, describe(records))
         await scene.close()
         XCTAssertTrue(second.settled)
         await assertReleased(second, connections: connections)
@@ -787,6 +809,17 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
+    /// A direct route first tries the machine's mux. The loopback host has none,
+    /// so that attempt leaves an acknowledged record with no input before the
+    /// shell's own record. These are the records of terminals that ran.
+    private func terminalRecords(_ records: [TerminalSessionRecord]) -> [TerminalSessionRecord] {
+        records.filter { $0.state != .acknowledged || !$0.inputEvidence.isEmpty }
+    }
+
+    private func describe(_ records: [TerminalSessionRecord]) -> String {
+        "\(records.map { "\($0.state) \($0.inputEvidence)" })"
+    }
+
     private func assertReleased(_ controller: TerminalSessionController, connections: MobileConnections,
                                 file: StaticString = #filePath, line: UInt = #line) async {
         XCTAssertTrue(controller.settled, file: file, line: line)
@@ -866,7 +899,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await journal.markInterrupted(epoch: earlier)
         let elsewhere = try await journal.beginCreation(scope: scope("other-machine"))
         try await journal.markInterrupted(epoch: elsewhere)
-        scene.appear(selecting: "machine", active: true)
+        try await appear(scene, selecting: "machine")
         let attempt = try await connect(scene, "machine")
         XCTAssertNotEqual(attempt.phase, .idle)
         let records = try await journal.records()
