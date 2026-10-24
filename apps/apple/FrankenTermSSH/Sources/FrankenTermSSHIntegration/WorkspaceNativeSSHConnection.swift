@@ -651,7 +651,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // The phone's terminal holds what fits its cell budget. A pane
                 // someone else made larger is asked back to the phone's size.
                 guard (1...512).contains(rows), (1...512).contains(columns),
-                      (rows * 2 + 256) * columns <= 65536 else {
+                      rows * columns <= TerminalSessionGeometry.maximumShownCells else {
                     // The mirror counts this output as drawn; draw the pane
                     // again from scratch once it is back at the phone's size.
                     try state.client.resize(pane: pane, rows: Int(state.geometry.rows),

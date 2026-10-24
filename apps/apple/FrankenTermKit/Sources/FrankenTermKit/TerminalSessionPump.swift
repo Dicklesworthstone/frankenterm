@@ -45,6 +45,10 @@ public final class TerminalSessionSignal: @unchecked Sendable {
 
 public struct TerminalSessionGeometry: Equatable, Sendable {
     public let columns: UInt32, rows: UInt32, pixelWidth: UInt32, pixelHeight: UInt32
+    /// The most cells a grid the phone's terminal shows may have: its model
+    /// keeps both screens (primary and alternate) within 65,536 resident
+    /// cells, beside whatever history still fits, and refuses a larger grid.
+    public static let maximumShownCells = 32768
     public init(columns: UInt32, rows: UInt32, pixelWidth: UInt32 = 0, pixelHeight: UInt32 = 0) throws {
         guard (1...512).contains(columns), (1...512).contains(rows), columns * rows <= 65536,
               pixelWidth <= 65535, pixelHeight <= 65535 else { throw TerminalInputError.invalidLimits }

@@ -804,7 +804,8 @@ private final class NativeTerminalFrameBuilder {
             clear: uniform.clear.linearPremultiplied, caret: caret,
             fontName: CTFontCopyPostScriptName(baseFont) as String, fontPointSize: CGFloat(configuration.fontPointSize),
             fittingColumns: fittingColumns,
-            fittingRows: max(1, min(512, 65536 / fittingColumns, Int(Double(viewport.y) / cellHeight))),
+            fittingRows: max(1, min(512, TerminalSessionGeometry.maximumShownCells / fittingColumns,
+                                    Int(Double(viewport.y) / cellHeight))),
             cellSize: CGSize(width: cellWidth / scale, height: cellHeight / scale))
     }
 
