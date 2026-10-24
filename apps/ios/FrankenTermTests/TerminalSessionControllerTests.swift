@@ -393,6 +393,34 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(record.inputEvidence.mayHaveRemoteEffect)
     }
 
+    /// An iPad on a large display at the smallest text size has room for more
+    /// cells than the terminal can keep both screens of. The grid stops at the
+    /// largest that fits and the session keeps running; it used to end.
+    func testALayoutPastTheCellBudgetShowsTheLargestGridThatFits() async throws {
+        let live = try await liveScene()
+        let session = try await connect(live.scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        // History for the larger grid to trim.
+        try await type("seq 1 400", into: terminal)
+        _ = try await screen(terminal, containing: "400")
+        let height = 1200.0
+        let frame = try await enlarge(terminal, to: CGSize(width: 1800, height: height), beyond: 300)
+        let cell = try XCTUnwrap(terminal.renderer.cellSize)
+        XCTAssertGreaterThan(Int(height / cell.height) * frame.columns, TerminalSessionGeometry.maximumShownCells,
+                             "the view has room for more cells than the terminal keeps")
+        XCTAssertLessThanOrEqual(frame.rows * frame.columns, TerminalSessionGeometry.maximumShownCells)
+        try await type("stty size > \(live.outPath); echo FIT-$((6*7)) | tee -a \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "FIT-42")
+        XCTAssertEqual(output.split(separator: "\n").first.map(String.init), "\(frame.rows) \(frame.columns)",
+                       "the remote shell has the grid the phone draws (output: \(output))")
+        let drawn = try await screen(terminal, containing: "FIT-42")
+        XCTAssertTrue(drawn.contains("FIT-42"), "the larger grid shows the shell's output (screen: \(drawn))")
+        XCTAssertEqual(session.phase, .live)
+        await live.scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// A shell that exits ends the session from inside the pump task; teardown
     /// must still finish there, and the next session on the machine needs the
     /// user's acknowledgement of the first one's unknown outcome.
@@ -481,6 +509,21 @@ final class TerminalSessionControllerTests: XCTestCase {
             text = terminal.renderer.accessibilityValue ?? ""
         }
         return text
+    }
+
+    /// Lays the terminal out at `size` points with the smallest text, as an
+    /// iPad on a large display can, and returns the first frame drawn wider
+    /// than `columns`.
+    private func enlarge(_ terminal: NativeTerminalView, to size: CGSize,
+                         beyond columns: Int) async throws -> TerminalRenderFrame {
+        terminal.frame = CGRect(origin: .zero, size: size)
+        terminal.setFontPointSize(NativeTerminalView.fontSizes.lowerBound)
+        for _ in 0..<200 where (terminal.renderer.admittedFrame?.columns ?? 0) <= columns {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let frame = try XCTUnwrap(terminal.renderer.admittedFrame)
+        XCTAssertGreaterThan(frame.columns, columns, "the terminal never drew the larger grid")
+        return frame
     }
 
     /// The first view of `type` inside `root` matching `match`, waiting up to ~5 s.
@@ -1024,6 +1067,31 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(title(), "TITLE-\(run)", "the pane strip shows the unshown pane's new title")
         view.removeFromSuperview()
         await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    /// A 13-inch iPad in landscape at the smallest text size: the pane takes
+    /// that grid and the phone draws it. The phone used to hold a pane only
+    /// with 256 rows of history beside both screens, so it asked the pane back
+    /// to this same size after every output and never drew it.
+    func testAMuxPaneShownOnALargeScreenAtASmallSizeIsDrawnAtThatSize() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), out = live.outPath
+        let session = try await connect(live.scene, "alpha")
+        let view = try shown(session)
+        let frame = try await enlarge(view, to: CGSize(width: 1376, height: 1032), beyond: 250)
+        XCTAssertGreaterThan((frame.rows * 2 + 256) * frame.columns, 65536, "a grid the old budget refused")
+        let run = UUID().uuidString.prefix(8)
+        try await type("stty size > \(out); echo PANE-\(run)-$((6*7)) | tee -a \(out)", into: view)
+        let output = try await hostFile(out, containing: "PANE-\(run)-42")
+        XCTAssertEqual(output.split(separator: "\n").first.map(String.init), "\(frame.rows) \(frame.columns)",
+                       "the pane has the grid the phone draws (output: \(output))")
+        let drawn = try await screen(view, containing: "PANE-\(run)-42")
+        XCTAssertTrue(drawn.contains("PANE-\(run)-42"), "the phone draws the pane's output (screen: \(drawn))")
+        view.removeFromSuperview()
+        await live.scene.close()
         await assertReleased(session, connections: live.connections)
     }
 
