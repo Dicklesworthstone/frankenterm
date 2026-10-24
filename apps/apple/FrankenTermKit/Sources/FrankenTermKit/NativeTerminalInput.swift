@@ -594,6 +594,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         let dismiss = key(nil, symbol: "keyboard.chevron.compact.down", label: "Hide keyboard") { [weak self] in
             self?.retire()
         }
+        dismiss.accessibilityIdentifier = "terminal.keyboard.hide"
         dismiss.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(dismiss)
         dismissButton = dismiss

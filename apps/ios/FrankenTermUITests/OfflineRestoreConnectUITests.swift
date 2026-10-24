@@ -78,7 +78,11 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(connect.waitForExistence(timeout: 20), "a ready direct SSH route must offer Connect")
         snapshot("4-machine")
         connect.tap()
-        app.tap() // lets the interruption monitor handle a first-use Face ID alert
+        // A first-use Face ID permission is a system alert. It is answered
+        // there: a tap on the app could land on a terminal that is already
+        // shown (a prepared connection) and put its keyboard away.
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["OK"]
+        if allow.waitForExistence(timeout: 3) { allow.tap() }
 
         let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
         XCTAssertTrue(terminal.waitForExistence(timeout: 60), "the terminal surface must appear")
@@ -113,7 +117,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     }
 
     @MainActor
-    func testRestoreEncryptedWorkspaceAndConnectToItsMachine() throws {
+    func test1RestoreEncryptedWorkspaceAndConnectToItsMachine() throws {
         let inputs = try inputs()
         let app = launch()
         restore(app, inputs)
@@ -165,7 +169,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     }
 
     @MainActor
-    func testTerminalKeysFullScreenRotationAndBackground() throws {
+    func test2TerminalKeysFullScreenRotationAndBackground() throws {
         let inputs = try inputs()
         let app = launch()
         if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
@@ -199,7 +203,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         // Dismissing the keyboard retires its input; a tap on the terminal
         // establishes a new input focus on the same session.
-        app.buttons["Dismiss keyboard"].tap()
+        // The accessory row's button; an iPad keyboard has its own of that name.
+        app.buttons["terminal.keyboard.hide"].tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5), "the keyboard must go away")
         terminal.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "a tap must bring the keyboard back")
@@ -264,13 +269,14 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         snapshot("10-kept")
     }
 
-    /// M1 through the machine strip (named to run after the journeys above):
-    /// with two machines restored, opening the first connects the second in
-    /// the background; switching to it shows its own shell at once, and
-    /// switching back finds the first as it was. Typing reaches only the
-    /// machine on screen.
+    /// M1 through the machine strip (numbered to run after the journeys above;
+    /// XCTest runs a class's tests in name order, and only the first imports):
+    /// with two machines restored, opening the first signs the second in
+    /// in the background; choosing it opens its own shell, and switching
+    /// back finds the first as it was. Typing reaches only the machine on
+    /// screen.
     @MainActor
-    func testMachineStripSwitchesBetweenConnectedMachines() throws {
+    func test3MachineStripSwitchesBetweenConnectedMachines() throws {
         let inputs = try inputs()
         guard let second = ProcessInfo.processInfo.environment["FT_UI_SECOND_MACHINE_NAME"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_UI_SECOND_MACHINE_NAME for a package with a second machine")
@@ -281,9 +287,10 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("export FT_WHO=first; echo WHO-$FT_WHO-$((1+1))\n")
         waitFor("WHO-first-2", in: terminal, timeout: 30, "the first machine's shell must run")
 
-        let secondChip = chip(app, second, "connected")
-        XCTAssertTrue(secondChip.waitForExistence(timeout: 60), "the second machine connects in the background")
-        snapshot("11-second-machine-live")
+        let secondChip = app.buttons.matching(NSPredicate(format: "label IN %@",
+            ["\(second), signed in, terminal not open", "\(second), connected"])).firstMatch
+        XCTAssertTrue(secondChip.waitForExistence(timeout: 60), "the second machine signs in in the background")
+        snapshot("11-second-machine-ready")
         secondChip.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "the second session must take the keyboard")
         let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
