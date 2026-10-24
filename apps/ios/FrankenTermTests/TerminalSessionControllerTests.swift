@@ -502,6 +502,26 @@ final class TerminalSessionControllerTests: XCTestCase {
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
+    /// A layout change (the keyboard's bar on iPad, a window resized) redraws
+    /// the live screen; keys typed before its caret is drawn again still run.
+    func testKeysTypedWhileTheScreenIsRedrawnReachTheShell() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo READY-$((40+2))", into: terminal)
+        _ = try await screen(terminal, containing: "READY-42")
+
+        terminal.frame.size.height -= 120
+        terminal.layoutIfNeeded()
+        XCTAssertFalse(terminal.input.isEditable, "the caret waits for the redrawn screen")
+        terminal.input.insertText("echo REDRAWN-$((40+2)) > \(live.outPath)"); terminal.input.insertText("\n")
+        let output = try await hostFile(live.outPath, containing: "REDRAWN-42")
+        XCTAssertTrue(output.contains("REDRAWN-42"), "keys typed during the redraw must reach the shell")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// The rendered screen once it shows `marker` (or after ~10 s).
     private func screen(_ terminal: NativeTerminalView, containing marker: String) async throws -> String {
         var text = ""

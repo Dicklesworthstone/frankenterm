@@ -177,6 +177,32 @@ final class NativeTerminalInputTests: XCTestCase {
         view.retire(); other.retire()
         await view.session.waitUntilSuspended(); await other.session.waitUntilSuspended()
     }
+    /// A resize or new text size redraws the live screen: keys typed meanwhile
+    /// still reach the shell. Composition waits for the drawn caret, and with
+    /// history shown nothing is sent.
+    func testTypingWhileTheLiveScreenIsRedrawnIsSent() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        var live = true
+        view.onInputWithoutProjection = { live }
+        try view.updateCaret(NativeTerminalCaret(source: source, revision: 2,
+                                                  rect: CGRect(x: 30, y: 40, width: 2, height: 20)))
+        try view.invalidateRenderedCaret(source: source)
+        XCTAssertFalse(view.isEditable)
+        view.insertText("lsx"); view.deleteBackward(); view.insertText("\n")
+        view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let sent = await transport.bytes()
+        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "lsx<key:42><key:40>")
+        XCTAssertFalse(view.session.document.isMarked, "composition waits for a drawn caret")
+
+        live = false
+        view.insertText("pwd\n")
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let after = await transport.bytes()
+        XCTAssertEqual(after, sent, "with history shown, typing is not sent")
+        view.retire()
+        await view.session.waitUntilSuspended()
+    }
     func testInvalidatedGeometryRevokesPasteReviewAndBlocksOutgoingInputUntilRestored() async throws {
         let (coordinator, transport, source, view) = try await setup()
         var offered: [TerminalPasteReview] = []

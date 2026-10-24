@@ -54,7 +54,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)?
     public var onRetired: (@MainActor () -> Void)?
-    public var onInputWithoutProjection: (@MainActor () -> Void)?
+    /// Asked when a key arrives while no caret is drawn: true while the live
+    /// screen is still the one shown, only being redrawn (a resize or new
+    /// text size), so typing still reaches it.
+    public var onInputWithoutProjection: (@MainActor () -> Bool)?
     public private(set) var accessoryModifiers = TerminalAccessoryModifiers()
     public private(set) var pendingPaste: TerminalPasteReview?
 
@@ -264,9 +267,17 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
     /// Typing while no rendered projection exists (for example while history
     /// is shown) is still not sent; the owner may bring the live screen back.
-    private func typed(_ operation: () throws -> Void) {
+    /// While the live screen is only being redrawn, committed text and keys
+    /// are sent: they need no caret geometry. Composition still waits for it.
+    private func typed(composing: Bool = false, _ operation: () throws -> Void) {
         guard !ordinaryInputBlocked else { return }
-        if !retiring, !hasGeometry { onInputWithoutProjection?() }
+        if !retiring, !hasGeometry {
+            let live = onInputWithoutProjection?() == true
+            guard live, !composing, !session.document.isMarked else { return }
+            do { try operation(); refreshComposition() }
+            catch { onFailure?(error) }
+            return
+        }
         mutate(operation)
     }
     public func text(in range: UITextRange) -> String? {
@@ -283,7 +294,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
         // Helper modifiers never silently transform a native language candidate.
         // Starting IME returns them to the visibly inactive state.
-        typed {
+        typed(composing: true) {
             try session.setMarkedText(markedText, selectedRange: selectedRange)
             accessoryModifiers.clear()
         }
@@ -967,8 +978,11 @@ public final class NativeTerminalView: UIView {
             self.onInputRetired?()
         }
         input.onInputWithoutProjection = { [weak self] in
-            guard let self, !self.retired, self.renderer.admittedFrame?.isLive == false else { return }
+            guard let self, !self.retired, self.sceneActive, let frame = self.renderer.admittedFrame else { return false }
+            // A resize or new text size redraws the live screen it shows.
+            if frame.isLive { return true }
             self.returnToLiveOutput()
+            return false
         }
     }
 
