@@ -7514,6 +7514,18 @@ pub async fn wait_for_cancellation(cx: &crate::cx::Cx) -> Result<(), Box<Context
     }
 }
 
+/// [`wait_for_cancellation`] boxed as a `Send` trait object.
+///
+/// For a cancellation watcher raced against another future inside a widely
+/// used `async fn`: the trait object keeps that function's future type
+/// shallow, so the `Send` checks downstream crates run on it stay within the
+/// default recursion limit.
+pub fn wait_for_cancellation_boxed(
+    cx: &crate::cx::Cx,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Box<ContextError>>> + Send + '_>> {
+    Box::pin(wait_for_cancellation(cx))
+}
+
 /// Maximum number of concurrently admitted interruptible timer registrations.
 ///
 /// One entry consists of one asupersync wheel entry plus one inline

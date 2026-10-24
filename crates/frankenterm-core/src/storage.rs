@@ -1628,14 +1628,6 @@ pub struct StorageConfig {
     /// `FT_MOONSHOT_GROUP_COMMIT_EVENTS` env var (OR'd with this field at writer
     /// construction); tests set this directly for a deterministic A/B.
     pub group_commit_events: bool,
-    /// [round-4 Q2] Park the writer thread on a condvar that the command
-    /// sender signals after each enqueue, instead of polling with a fixed
-    /// 1 ms sleep. Default `false` keeps the legacy 1 ms `try_recv` park. A
-    /// bounded `wait_timeout` floor guarantees forward progress even if a
-    /// wake is ever missed, so correctness never depends on the signal — only
-    /// wake latency and idle CPU change. Production opt-in is via the
-    /// `FT_MOONSHOT_WRITER_BLOCKING_RECV` env var.
-    pub writer_blocking_recv: bool,
     /// [round-4 M8] Make the writer's batch size + linger timer adaptive via a
     /// Pollaczek-Khinchine / Kingman M/G/1 controller driven by observed arrival
     /// and service rates (`group_commit = adaptive` vs the default `fixed`).
@@ -1643,7 +1635,7 @@ pub struct StorageConfig {
     /// `false` (fixed) keeps the legacy greedy drain with no linger — byte-
     /// identical to the prior writer. When `true`, after the greedy drain empties
     /// the queue the writer may linger up to a Kingman-bounded `tau` (always
-    /// `<= the current park`) to accumulate a batch sized by Little's law, so
+    /// `<= ADAPTIVE_LINGER_CEILING`) to accumulate a batch sized by Little's law, so
     /// more commands share one group-commit transaction (fewer fsyncs) under
     /// load. The set of durable writes, their order, and their results are
     /// unchanged — only batch grouping + timing move, so a DB dump is identical.
@@ -1661,7 +1653,6 @@ impl Default for StorageConfig {
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
             group_commit_events: false,
-            writer_blocking_recv: false,
             group_commit_adaptive: false,
         }
     }
@@ -1692,19 +1683,23 @@ const FT_STORAGE_MMAP_DIR_ENV: &str = "FT_STORAGE_MMAP_DIR";
 
 /// [round-4 Q2] Env opt-in for [`StorageConfig::group_commit_events`].
 const FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_EVENTS";
-/// [round-4 Q2] Env opt-in for [`StorageConfig::writer_blocking_recv`].
-const FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV: &str = "FT_MOONSHOT_WRITER_BLOCKING_RECV";
 /// [round-4 M8] Env opt-in for [`StorageConfig::group_commit_adaptive`].
 const FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE";
 
-/// Park ceiling for the condvar-driven writer wake (`writer_blocking_recv`).
+/// Longest an idle writer stays parked on its condvar without a wake.
 ///
-/// The sender's notify drives sub-millisecond wakeups under load; this timeout
-/// only bounds the worst case if a notification is ever missed and caps how long
-/// a bare sender-drop (a disconnect with no `Shutdown` command) can delay loop
-/// teardown. Graceful shutdown enqueues a `Shutdown` command, which notifies and
-/// wakes the writer immediately, so this ceiling never gates clean shutdown.
-const WRITER_BLOCKING_RECV_PARK_MS: u64 = 25;
+/// Every enqueue notifies the writer, and the last command sender's drop
+/// notifies it too, so work and disconnects wake it immediately. This ceiling
+/// is only a safety net against a missed notification; it is not a poll
+/// interval. (The writer used to sleep 1 ms per empty `try_recv`, about 1,000
+/// idle wakeups a second: frankenterm#135.)
+const WRITER_IDLE_PARK_CEILING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Upper bound on the adaptive group-commit linger (`group_commit_adaptive`).
+///
+/// It equals the 1 ms idle poll the writer used before it parked on a condvar,
+/// so lingering never holds a batch longer than that poll could delay it.
+const ADAPTIVE_LINGER_CEILING: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Read a boolean moonshot/tuning env flag using the shared truthy vocabulary.
 ///
@@ -1726,9 +1721,10 @@ fn storage_env_flag_enabled(name: &str) -> bool {
 }
 
 /// Condvar-based wakeup shared between [`WriteCommandSender`] and the storage
-/// writer thread, used only when `writer_blocking_recv` is enabled.
+/// writer thread.
 ///
-/// The sender calls [`WriterWakeup::notify`] after enqueuing a command; the
+/// The sender calls [`WriterWakeup::notify`] after enqueuing a command (and
+/// [`WriterDisconnectWake`] calls it when the last sender is dropped); the
 /// writer calls [`WriterWakeup::park_for_work`] when `try_recv` returns empty.
 /// The park re-checks the shared `queued_depth` counter under the lock before
 /// sleeping, which closes the classic enqueue/park lost-wakeup race: any command
@@ -1739,6 +1735,9 @@ fn storage_env_flag_enabled(name: &str) -> bool {
 struct WriterWakeup {
     lock: Mutex<()>,
     condvar: std::sync::Condvar,
+    /// `park_for_work` calls, so tests can prove an idle writer stays parked.
+    #[cfg(test)]
+    parks: AtomicUsize,
 }
 
 impl WriterWakeup {
@@ -1746,6 +1745,8 @@ impl WriterWakeup {
         Self {
             lock: Mutex::new(()),
             condvar: std::sync::Condvar::new(),
+            #[cfg(test)]
+            parks: AtomicUsize::new(0),
         }
     }
 
@@ -1763,6 +1764,8 @@ impl WriterWakeup {
     /// Park until notified or `timeout` elapses, skipping the sleep entirely if
     /// `queued_depth` already shows pending work.
     fn park_for_work(&self, timeout: std::time::Duration, queued_depth: &AtomicUsize) {
+        #[cfg(test)]
+        self.parks.fetch_add(1, AtomicOrdering::Relaxed);
         let guard = self
             .lock
             .lock()
@@ -1791,6 +1794,22 @@ impl WriterWakeup {
         }
         let _ = self.condvar.wait_timeout(guard, timeout);
         false
+    }
+}
+
+/// Wakes the parked writer when the last [`WriteCommandSender`] clone drops.
+///
+/// Every sender clone shares one `Arc` of this guard. It is declared after the
+/// sender's channel handle, so by the time the last guard drops the channel is
+/// already disconnected, and the woken writer observes `Disconnected` and exits
+/// instead of sleeping out [`WRITER_IDLE_PARK_CEILING`].
+struct WriterDisconnectWake {
+    wakeup: Arc<WriterWakeup>,
+}
+
+impl Drop for WriterDisconnectWake {
+    fn drop(&mut self) {
+        self.wakeup.notify();
     }
 }
 
@@ -2110,13 +2129,15 @@ struct WriteCommandSender {
     terminal_admission_gate: Arc<AtomicUsize>,
     max_capacity: usize,
     terminal_drain_wakeup: Arc<WriterWakeup>,
-    /// [round-4 Q2] Present only when `writer_blocking_recv` is enabled; signals
-    /// the condvar-parked writer after each successful enqueue. `None` keeps the
-    /// legacy 1 ms-poll writer untouched (zero added cost on the send path).
-    wakeup: Option<Arc<WriterWakeup>>,
+    /// Signals the condvar-parked writer after each successful enqueue.
+    wakeup: Arc<WriterWakeup>,
     /// The writer's storage IO scheduler summary, published at each batch
     /// boundary for the resource cockpit's `storage_io` domain.
     io_summary: Arc<Mutex<Option<StorageIoOperatorSummary>>>,
+    /// Wakes the writer when the last clone drops. Keep this field after
+    /// `inner`: fields drop in declaration order, so the channel is already
+    /// disconnected when the writer wakes.
+    _disconnect_wake: Arc<WriterDisconnectWake>,
 }
 
 struct WriterQueueAdmission<'a> {
@@ -2522,6 +2543,7 @@ impl Drop for StorageWriterForwardingWaker {
 
 impl WriteCommandSender {
     fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
+        let wakeup = Arc::new(WriterWakeup::new());
         Self {
             inner,
             #[cfg(test)]
@@ -2531,7 +2553,10 @@ impl WriteCommandSender {
             terminal_admission_gate: Arc::new(AtomicUsize::new(0)),
             max_capacity,
             terminal_drain_wakeup: Arc::new(WriterWakeup::new()),
-            wakeup: None,
+            _disconnect_wake: Arc::new(WriterDisconnectWake {
+                wakeup: Arc::clone(&wakeup),
+            }),
+            wakeup,
             io_summary: Arc::new(Mutex::new(None)),
         }
     }
@@ -2706,12 +2731,9 @@ impl WriteCommandSender {
         match permit.try_send(command) {
             Ok(()) => {
                 admission.transfer_to_receiver();
-                // [round-4 Q2] Wake the condvar-parked writer once the command
-                // is actually visible on the channel. No-op when
-                // `writer_blocking_recv` is off (`wakeup` is `None`).
-                if let Some(wakeup) = &self.wakeup {
-                    wakeup.notify();
-                }
+                // Wake the condvar-parked writer once the command is actually
+                // visible on the channel.
+                self.wakeup.notify();
                 Ok(())
             }
             Err(err) => {
@@ -3865,30 +3887,26 @@ impl StorageHandle {
             Self::checkpoint_storage_open(cx, "before writer thread spawn")?;
         }
 
-        // [round-4 Q2] Resolve the two group-commit/condvar gates: the handle
-        // config field OR the moonshot env var. Both default off, so production
-        // stays on the legacy per-command + 1 ms-poll writer unless explicitly
-        // opted in; tests flip the config field for a deterministic A/B.
+        // [round-4 Q2] Resolve the group-commit gate: the handle config field OR
+        // the moonshot env var. It defaults off, so production stays on the
+        // per-command writer unless explicitly opted in; tests flip the config
+        // field for a deterministic A/B.
         let group_commit_events = config.group_commit_events
             || storage_env_flag_enabled(FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV);
-        let writer_blocking_recv = config.writer_blocking_recv
-            || storage_env_flag_enabled(FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV);
         // [round-4 M8] group_commit = adaptive vs fixed (default).
         let group_commit_adaptive = config.group_commit_adaptive
             || storage_env_flag_enabled(FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV);
 
         // Create bounded channel for write commands
         let (write_tx_raw, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
-        let writer_wakeup = writer_blocking_recv.then(|| Arc::new(WriterWakeup::new()));
-        let mut write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
-        write_tx.wakeup.clone_from(&writer_wakeup);
+        let write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
+        let writer_wakeup_for_writer = Arc::clone(&write_tx.wakeup);
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
         let terminal_drain_wakeup_for_writer = Arc::clone(&write_tx.terminal_drain_wakeup);
         let terminal_state_for_writer = Arc::clone(&write_tx.terminal_state);
         let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
         let io_summary_for_writer = Arc::clone(&write_tx.io_summary);
         let mmap_runtime_for_writer = mmap_runtime.clone();
-        let writer_wakeup_for_writer = writer_wakeup;
         #[cfg(test)]
         let receive_gate = Arc::clone(&write_tx.receive_gate);
 
@@ -3920,7 +3938,7 @@ impl StorageHandle {
                     &terminal_state_for_writer,
                     &terminal_admission_gate_for_writer,
                     group_commit_events,
-                    writer_wakeup_for_writer.as_deref(),
+                    &writer_wakeup_for_writer,
                     group_commit_adaptive,
                     Some(&io_summary_for_writer),
                 );
@@ -13922,7 +13940,7 @@ fn writer_loop(
     terminal_state: &AtomicU8,
     terminal_admission_gate: &AtomicUsize,
     group_commit_events: bool,
-    writer_wakeup: Option<&WriterWakeup>,
+    writer_wakeup: &WriterWakeup,
     group_commit_adaptive: bool,
     io_summary: Option<&Arc<Mutex<Option<StorageIoOperatorSummary>>>>,
 ) {
@@ -13932,15 +13950,10 @@ fn writer_loop(
 
     // [round-4 M8] The adaptive M/G/1 controller is constructed only when
     // `group_commit = adaptive`; when `None` the writer takes the byte-identical
-    // fixed path with zero added timing/branch cost. The linger ceiling tracks
-    // the active park (1 ms fixed poll vs the condvar park), honoring `tau <= park`.
-    let park_duration = if writer_wakeup.is_some() {
-        std::time::Duration::from_millis(WRITER_BLOCKING_RECV_PARK_MS)
-    } else {
-        std::time::Duration::from_millis(1)
-    };
+    // fixed path with zero added timing/branch cost. Its linger never exceeds
+    // `ADAPTIVE_LINGER_CEILING`.
     let mut adaptive =
-        group_commit_adaptive.then(|| AdaptiveGroupCommitController::new(park_duration));
+        group_commit_adaptive.then(|| AdaptiveGroupCommitController::new(ADAPTIVE_LINGER_CEILING));
 
     // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
     // bridge that ft-3tvvt's audit flagged. The writer runs on a
@@ -13950,13 +13963,14 @@ fn writer_loop(
     //
     // The fix: poll the channel with `try_recv()` (a sync, non-
     // allocating call exposed by the asupersync mpsc receiver) and
-    // park the OS thread for 1 ms when no command is queued. SQL
-    // dispatch was already sync; now the entire writer thread is
-    // sync end-to-end with no runtime dependency. Wake-up latency
-    // under no-load is bounded at 1 ms (negligible relative to
-    // SQLite per-statement autocommit cost). Channel close —
-    // whether by `Disconnected` (sender dropped) or `Cancelled`
-    // (cx-aware shutdown) — terminates the loop cleanly.
+    // park the OS thread on `writer_wakeup` when no command is
+    // queued. Senders notify after each enqueue and the last sender
+    // notifies on drop, so an idle writer sleeps until real work (it
+    // used to sleep 1 ms per empty poll, ~1,000 wakeups/s idle). SQL
+    // dispatch was already sync; the entire writer thread is sync
+    // end-to-end with no runtime dependency. Channel close — whether
+    // by `Disconnected` (sender dropped) or `Cancelled` (cx-aware
+    // shutdown) — terminates the loop cleanly.
     'main: loop {
         #[cfg(test)]
         WRITER_RECEIVE_GATE_FOR_TEST.with(|slot| {
@@ -14105,16 +14119,9 @@ fn writer_loop(
                 }
             }
             Err(mpsc::RecvError::Empty) => {
-                // Park until the sender signals fresh work, or fall back to the
-                // legacy fixed 1 ms poll when `writer_blocking_recv` is off.
-                if let Some(wakeup) = writer_wakeup {
-                    wakeup.park_for_work(
-                        std::time::Duration::from_millis(WRITER_BLOCKING_RECV_PARK_MS),
-                        queued_depth,
-                    );
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                // Park until a sender signals fresh work or the last sender
+                // drops; the ceiling only bounds a missed notification.
+                writer_wakeup.park_for_work(WRITER_IDLE_PARK_CEILING, queued_depth);
             }
             Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
                 break 'main;
@@ -15082,7 +15089,7 @@ mod writer_epoch_transaction_tests {
                 terminal_state.as_ref(),
                 terminal_admission_gate.as_ref(),
                 false,
-                None,
+                &WriterWakeup::new(),
                 true,
                 None,
             );
@@ -15171,7 +15178,7 @@ mod writer_epoch_transaction_tests {
                 terminal_state.as_ref(),
                 terminal_admission_gate.as_ref(),
                 false,
-                None,
+                &WriterWakeup::new(),
                 false,
                 None,
             );
@@ -17209,7 +17216,7 @@ mod writer_io_scheduler_tests {
                 terminal_state.as_ref(),
                 terminal_admission_gate.as_ref(),
                 false,
-                None,
+                &WriterWakeup::new(),
                 true,
                 None,
             );
@@ -17960,13 +17967,12 @@ mod writer_io_scheduler_tests {
     }
 
     #[test]
-    fn writer_blocking_recv_processes_writes_and_shuts_down() {
+    fn parked_writer_processes_writes_and_shuts_down() {
         run_storage_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let db_path = temp_dir.path().join("blocking_recv.db");
             let db_path_str = db_path.to_string_lossy().to_string();
             let config = StorageConfig {
-                writer_blocking_recv: true,
                 group_commit_events: true,
                 ..StorageConfig::default()
             };
@@ -18035,6 +18041,103 @@ mod writer_io_scheduler_tests {
             // parked writer rather than waiting out the park ceiling.
             storage.shutdown().await.expect("shutdown");
         });
+    }
+
+    fn idle_writer_test_pane() -> PaneRecord {
+        PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("idle-writer".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    /// frankenterm#135: an idle writer sleeps until work arrives. It used to
+    /// sleep 1 ms per empty `try_recv`, about 1,000 wakeups a second.
+    #[test]
+    fn idle_writer_stays_parked_until_work_arrives() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("idle_writer.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let storage = StorageHandle::with_config(&db_path_str, StorageConfig::default())
+                .await
+                .expect("open storage");
+            storage
+                .upsert_pane(idle_writer_test_pane())
+                .await
+                .expect("upsert pane");
+
+            let parks = || storage.write_tx.wakeup.parks.load(AtomicOrdering::Relaxed);
+            // Let the writer finish its batch and park.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let before = parks();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let idle_parks = parks() - before;
+            assert!(
+                idle_parks <= 2,
+                "an idle writer must stay parked; it re-parked {idle_parks} times in 400 ms"
+            );
+
+            // Work still wakes the parked writer at once.
+            let started = Instant::now();
+            storage
+                .append_segment(1, "after idle", None)
+                .await
+                .expect("append after idle");
+            assert!(
+                started.elapsed() < WRITER_IDLE_PARK_CEILING / 2,
+                "an enqueue must wake the parked writer, not its safety ceiling"
+            );
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    /// Dropping the last handle without a `Shutdown` command wakes the parked
+    /// writer, which then sees the closed channel and exits instead of
+    /// sleeping out its safety ceiling.
+    #[test]
+    fn dropping_the_last_handle_wakes_the_parked_writer() {
+        let mut dropped = None;
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("dropped_writer.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let storage = StorageHandle::with_config(&db_path_str, StorageConfig::default())
+                .await
+                .expect("open storage");
+            storage
+                .upsert_pane(idle_writer_test_pane())
+                .await
+                .expect("upsert pane");
+            // Let the writer finish its batch and park.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let join_state = Arc::clone(&storage.writer_join_state);
+            let dropped_at = Instant::now();
+            drop(storage);
+            dropped = Some((join_state, dropped_at));
+        });
+
+        let (join_state, dropped_at) = dropped.expect("storage was opened and dropped");
+        assert_eq!(
+            join_state.drive(std::time::Duration::from_secs(10)),
+            WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Joined),
+            "the writer thread exits cleanly once every handle is gone"
+        );
+        assert!(
+            dropped_at.elapsed() < WRITER_IDLE_PARK_CEILING / 2,
+            "dropping the last sender must wake the parked writer, took {:?}",
+            dropped_at.elapsed()
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -18360,7 +18463,6 @@ mod writer_io_scheduler_tests {
             let config = StorageConfig {
                 group_commit_events: true,
                 group_commit_adaptive: true,
-                writer_blocking_recv: true,
                 ..StorageConfig::default()
             };
             let storage = StorageHandle::with_config(&db_path_str, config)
@@ -44230,7 +44332,6 @@ fn storage_handle_writer_queue_processes_all() {
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
             group_commit_events: false,
-            writer_blocking_recv: false,
             group_commit_adaptive: false,
         };
         let storage = StorageHandle::with_config(&db_path_str, config)

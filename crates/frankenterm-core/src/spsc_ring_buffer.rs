@@ -14,6 +14,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::runtime_async::notify::Notify;
 use crossbeam::queue::ArrayQueue;
 
+/// Waits for `notified`, unless `cx` is cancelled (or passes its budget
+/// deadline) first.
+///
+/// Returns `true` when `notified` completed. Cancellation is observed through
+/// a registered cancellation waker, so an idle wait arms no timer beyond a
+/// finite budget's deadline (it used to re-check `cx` on a 50 ms sleep loop,
+/// frankenterm#135).
 async fn wait_notified_with_cx<F>(cx: &crate::cx::Cx, notified: F) -> bool
 where
     F: std::future::Future<Output = ()>,
@@ -21,16 +28,11 @@ where
     use futures::future::{Either, select};
 
     let notified = std::pin::pin!(notified);
-    let cancel_watcher = async {
-        loop {
-            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
-                return;
-            }
-            let _ =
-                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
+    let cancel_watcher = std::pin::pin!(async {
+        if !cx.is_cancel_requested() {
+            let _ = crate::runtime_async::wait_for_cancellation_boxed(cx).await;
         }
-    };
-    let cancel_watcher = std::pin::pin!(cancel_watcher);
+    });
 
     matches!(select(notified, cancel_watcher).await, Either::Left(_))
 }
@@ -673,6 +675,43 @@ mod tests {
                 .expect("receiver task should join");
             assert_eq!(result, None);
         });
+    }
+
+    /// frankenterm#135: an idle `recv_with_cx` watches for cancellation
+    /// through a registered waker; it must not keep a timer armed on `cx`'s
+    /// clock.
+    #[test]
+    fn spsc_idle_recv_with_cx_arms_no_timer() {
+        let clock = std::sync::Arc::new(asupersync::time::VirtualClock::starting_at(
+            asupersync::Time::ZERO,
+        ));
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+        let identity = crate::cx::Cx::for_testing();
+        let cx = crate::cx::Cx::new_with_drivers(
+            identity.region_id(),
+            identity.task_id(),
+            asupersync::Budget::INFINITE,
+            None,
+            None,
+            None,
+            Some(timer.clone()),
+            None,
+        );
+        let (_tx, rx) = channel::<u32>(1);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut recv = Box::pin(rx.recv_with_cx(&cx));
+
+        assert!(recv.as_mut().poll(&mut context).is_pending());
+        assert_eq!(timer.pending_count(), 0, "idle recv_with_cx armed a timer");
+
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("idle spsc recv cancel"),
+        );
+        assert_eq!(
+            recv.as_mut().poll(&mut context),
+            std::task::Poll::Ready(None)
+        );
     }
 
     #[test]

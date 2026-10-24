@@ -1488,7 +1488,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
         &terminal_state,
         &terminal_admission_gate,
         false,
-        None,
+        &WriterWakeup::new(),
         false,
         None,
     );
@@ -2104,7 +2104,6 @@ fn storage_handle_with_small_queue_handles_burst() {
             read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
             group_commit_events: false,
-            writer_blocking_recv: false,
             group_commit_adaptive: false,
         };
         let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
@@ -2136,7 +2135,6 @@ fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
             read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
             group_commit_events: false,
-            writer_blocking_recv: false,
             group_commit_adaptive: false,
         };
         let fts_trigger_count = |conn: &Connection| -> i64 {

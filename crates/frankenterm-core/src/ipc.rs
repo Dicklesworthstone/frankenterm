@@ -37,8 +37,13 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
 /// One-response RPC execution budget, measured from authenticated admission.
 pub const IPC_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), test))]
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Pause after a failed `accept()` so a persistent error (e.g. `EMFILE`)
+/// cannot spin the accept loop. Matches the pacing the loop had when it
+/// polled the shutdown channel for 1 ms before every accept.
+#[cfg(any(unix, windows))]
+const IPC_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(1);
 #[cfg(any(unix, windows))]
 const IPC_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 static IPC_INITIAL_REQUEST_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1606,9 +1611,9 @@ impl IpcServer {
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_context`].
     ///
     /// Threads the caller's cx into the accept loop:
-    /// - `shutdown_signal_pending_with_cx(&cx)` replaces the
-    ///   fresh-per-iteration cx with the caller's cx, so
-    ///   cancellation propagates into the shutdown-poll path.
+    /// - each iteration waits once, on the shutdown channel, the caller's
+    ///   cancellation and the next client together (see
+    ///   [`next_accept_loop_wake`]), so an idle server arms no short timer.
     /// - Socket-cleanup is always run (safety invariant) so a
     ///   cancelled cx cannot leak the socket file.
     async fn run_with_context_with_cx(
@@ -1622,31 +1627,32 @@ impl IpcServer {
         let limits = self.limits;
 
         loop {
-            if shutdown_signal_pending_with_cx(shutdown_rx, cx).await {
-                tracing::info!("IPC server shutting down (cx-first)");
-                break;
-            }
-
             if cx.checkpoint().is_err() {
                 tracing::info!("IPC server shutting down on cx cancellation");
                 break;
             }
 
-            // Tick 192 (ft-xbnl0.2.3): accept-poll now bounded by the
-            // caller's cx via timeout_with_cx, matching the pattern
-            // used by native_events::run_with_cx. Previously this
-            // used ambient `timeout` which falls back to
-            // `Cx::current()` thread-local lookup — orphan cx hole
-            // whenever the server loop runs outside a thread-local
-            // cx scope (e.g. spawned directly from CLI startup).
-            match crate::runtime_async::timeout_with_cx(
+            // One wait per iteration covers shutdown, cancellation and the
+            // next client. The loop used to poll the shutdown channel on a
+            // 1 ms timer before every accept (frankenterm#135); now
+            // `accept_poll_interval` only bounds how long finished handlers
+            // wait to be reaped while the server is idle. The wait is bound
+            // to the caller's cx (ft-xbnl0.2.3), never the thread-local one.
+            match next_accept_loop_wake(
                 cx,
-                limits.accept_poll_interval(),
+                shutdown_rx,
                 self.listener.accept(),
+                limits.accept_poll_interval(),
             )
             .await
             {
-                Ok(Ok((stream, _addr))) => {
+                AcceptLoopWake::Shutdown => {
+                    tracing::info!("IPC server shutting down (cx-first)");
+                    break;
+                }
+                // Cancellation is acted on by the checkpoint at the top.
+                AcceptLoopWake::Cancelled | AcceptLoopWake::Idle => {}
+                AcceptLoopWake::Accepted(Ok((stream, _addr))) => {
                     if cx.checkpoint().is_err() {
                         // The accept can become ready in the same scheduler
                         // turn as cancellation. Do not admit a fresh client
@@ -1714,10 +1720,10 @@ impl IpcServer {
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                AcceptLoopWake::Accepted(Err(e)) => {
                     tracing::error!(error_kind = ?e.kind(), "Failed to accept IPC connection");
+                    let _ = crate::runtime_async::sleep_with_cx(cx, IPC_ACCEPT_ERROR_BACKOFF).await;
                 }
-                Err(_elapsed) => {}
             }
 
             while let Some(join_result) = connection_tasks.try_join_next() {
@@ -1973,29 +1979,87 @@ async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
 }
 
-#[cfg(any(unix, windows))]
+/// Test probe: is a shutdown signal pending right now (within 1 ms)?
+#[cfg(all(any(unix, windows), test))]
 async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,
 ) -> bool {
-    // Tick 193 (ft-xbnl0.2.3): outer timeout now bound to the caller's
-    // cx via timeout_with_cx. Previously used ambient `timeout` which
-    // falls back to `Cx::current()` thread-local — orphan hole whenever
-    // this helper runs in a thread-local scope different from the
-    // caller's explicit cx. The inner mpsc_recv_state_with_cx already
-    // threads cx, so with this fix both the recv future AND the poll
-    // interval timer honor the caller's cx.
-    match crate::runtime_async::timeout_with_cx(
-        cx,
-        IPC_SHUTDOWN_POLL_INTERVAL,
-        mpsc_recv_state_with_cx(shutdown_rx, cx),
+    // Tick 193 (ft-xbnl0.2.3): the timeout is bound to the caller's cx,
+    // not the thread-local one.
+    matches!(
+        crate::runtime_async::timeout_with_cx(
+            cx,
+            IPC_SHUTDOWN_POLL_INTERVAL,
+            shutdown_signal_with_cx(shutdown_rx, cx),
+        )
+        .await,
+        Ok(true)
     )
-    .await
-    {
-        Ok(MpscRecvState::Value(()) | MpscRecvState::Disconnected) => true,
-        Ok(MpscRecvState::Cancelled) => false,
-        Err(_elapsed) => false,
+}
+
+/// Waits for the next shutdown-channel event. `true` means shut down (a
+/// message arrived or every sender is gone); `false` means the receive was
+/// cancelled through `cx`, which is not a shutdown request by itself.
+#[cfg(any(unix, windows))]
+async fn shutdown_signal_with_cx(shutdown_rx: &mut mpsc::Receiver<()>, cx: &crate::cx::Cx) -> bool {
+    match mpsc_recv_state_with_cx(shutdown_rx, cx).await {
+        MpscRecvState::Value(()) | MpscRecvState::Disconnected => true,
+        MpscRecvState::Cancelled => false,
     }
+}
+
+/// What ended one wait of the IPC accept loop.
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+enum AcceptLoopWake<A> {
+    /// A shutdown message arrived, or the shutdown channel closed.
+    Shutdown,
+    /// `cx` was cancelled.
+    Cancelled,
+    /// `accept()` completed.
+    Accepted(A),
+    /// The idle bound (or an earlier deadline in `cx`'s budget) elapsed.
+    Idle,
+}
+
+/// Waits for whichever comes first: a shutdown signal, cancellation of `cx`,
+/// or `accept` completing, bounded by `idle_bound`.
+///
+/// Shutdown is checked before cancellation and cancellation before
+/// `accept`, so a pending shutdown always wins. Cancellation is observed
+/// through a registered waker, so the only timer armed is `idle_bound`.
+#[cfg(any(unix, windows))]
+async fn next_accept_loop_wake<A, F>(
+    cx: &crate::cx::Cx,
+    shutdown_rx: &mut mpsc::Receiver<()>,
+    accept: F,
+    idle_bound: Duration,
+) -> AcceptLoopWake<A>
+where
+    F: std::future::Future<Output = A>,
+{
+    use std::task::Poll;
+
+    let mut shutdown = std::pin::pin!(shutdown_signal_with_cx(shutdown_rx, cx));
+    let mut cancelled = crate::runtime_async::wait_for_cancellation_boxed(cx);
+    let mut accept = std::pin::pin!(accept);
+    let wake = std::future::poll_fn(|task_cx| {
+        if let Poll::Ready(shutdown) = shutdown.as_mut().poll(task_cx) {
+            return Poll::Ready(if shutdown {
+                AcceptLoopWake::Shutdown
+            } else {
+                AcceptLoopWake::Cancelled
+            });
+        }
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(AcceptLoopWake::Cancelled);
+        }
+        accept.as_mut().poll(task_cx).map(AcceptLoopWake::Accepted)
+    });
+    crate::runtime_async::timeout_with_cx(cx, idle_bound, wake)
+        .await
+        .unwrap_or(AcceptLoopWake::Idle)
 }
 
 /// Stub IPC server for platforms without the local socket transport.
@@ -5040,6 +5104,66 @@ mod tests {
             );
 
             assert!(!shutdown_signal_pending_with_cx(&mut shutdown_rx, &cx).await);
+        });
+    }
+
+    /// frankenterm#135: one accept-loop wait covers the idle bound, a ready
+    /// client, shutdown (which wins over a ready client) and cancellation
+    /// (which ends the wait without waiting for the idle bound).
+    #[test]
+    fn next_accept_loop_wake_covers_shutdown_cancellation_and_clients() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+            let long_idle = Duration::from_secs(30);
+
+            let wake = next_accept_loop_wake(
+                &cx,
+                &mut shutdown_rx,
+                std::future::pending::<u8>(),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(matches!(wake, AcceptLoopWake::Idle), "got {wake:?}");
+
+            let wake =
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), long_idle)
+                    .await;
+            assert!(matches!(wake, AcceptLoopWake::Accepted(7)), "got {wake:?}");
+
+            send_shutdown(&shutdown_tx).await;
+            let wake =
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), long_idle)
+                    .await;
+            assert!(matches!(wake, AcceptLoopWake::Shutdown), "got {wake:?}");
+
+            let cancel_cx = cx.clone();
+            let canceller = crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(Duration::from_millis(20)).await;
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("accept loop wait cancel"),
+                );
+            });
+            let started = std::time::Instant::now();
+            let wake = next_accept_loop_wake(
+                &cx,
+                &mut shutdown_rx,
+                std::future::pending::<u8>(),
+                long_idle,
+            )
+            .await;
+            assert!(
+                matches!(wake, AcceptLoopWake::Cancelled | AcceptLoopWake::Idle),
+                "got {wake:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "cancellation must end the wait before the idle bound; took {:?}",
+                started.elapsed()
+            );
+            let _ = canceller.await;
+            drop(shutdown_tx);
         });
     }
 

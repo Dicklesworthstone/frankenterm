@@ -1731,8 +1731,6 @@ impl std::fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
-const EVENT_SUBSCRIBER_CANCEL_POLL: Duration = Duration::from_millis(50);
-
 /// Subscriber handle for receiving events from the bus
 ///
 /// Dropping the subscriber automatically unsubscribes and decrements metrics.
@@ -1777,13 +1775,13 @@ impl EventSubscriber {
             cx,
             &mut self.receiver
         ));
+        // The broadcast receiver only notices cancellation when it is polled,
+        // so watch `cx` through a registered cancellation waker. This arms no
+        // timer: an idle subscriber used to wake every 50 ms here to re-check
+        // `cx` (frankenterm#135).
         let cancel_watcher = std::pin::pin!(async {
-            loop {
-                let _ = crate::runtime_async::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
-                if cx.is_cancel_requested() {
-                    return Err::<Event, RecvError>(RecvError::Cancelled);
-                }
-            }
+            let _ = crate::runtime_async::wait_for_cancellation_boxed(cx).await;
+            Err::<Event, RecvError>(RecvError::Cancelled)
         });
 
         match select(recv_fut, cancel_watcher).await {
@@ -2935,6 +2933,43 @@ mod tests {
                 "mid-flight cancel should wake recv_cx within one poll cycle; took {elapsed:?}"
             );
         });
+    }
+
+    /// frankenterm#135: an idle `recv_cx` watches for cancellation through a
+    /// registered waker; it must not keep a timer armed on `cx`'s clock.
+    #[test]
+    fn event_subscriber_idle_recv_cx_arms_no_timer() {
+        let clock = Arc::new(asupersync::time::VirtualClock::starting_at(
+            asupersync::Time::ZERO,
+        ));
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+        let identity = crate::cx::Cx::for_testing();
+        let cx = crate::cx::Cx::new_with_drivers(
+            identity.region_id(),
+            identity.task_id(),
+            asupersync::Budget::INFINITE,
+            None,
+            None,
+            None,
+            Some(timer.clone()),
+            None,
+        );
+        let bus = EventBus::new(8);
+        let mut sub = bus.subscribe();
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut recv = Box::pin(sub.recv_cx(&cx));
+
+        assert!(recv.as_mut().poll(&mut context).is_pending());
+        assert_eq!(timer.pending_count(), 0, "idle recv_cx armed a timer");
+
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("idle event subscriber cancel"),
+        );
+        assert!(matches!(
+            recv.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(RecvError::Cancelled))
+        ));
     }
 
     fn run_async_test<F>(future: F)

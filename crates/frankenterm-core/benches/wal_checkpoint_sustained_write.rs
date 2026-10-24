@@ -62,11 +62,9 @@ impl Round5WalMode {
             Self::Fixed => {}
             Self::Q2 => {
                 config.group_commit_events = true;
-                config.writer_blocking_recv = true;
             }
             Self::Adaptive => {
                 config.group_commit_events = true;
-                config.writer_blocking_recv = true;
                 config.group_commit_adaptive = true;
             }
         }
