@@ -920,7 +920,13 @@ pub(super) fn handle_stream_events(
             let min_interval = stream_min_interval(max_hz);
             let mut next_emit_at = Instant::now();
             let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
+            // Only an explicit resume cursor defines a history boundary.
+            // Fresh bus-only streams must not unexpectedly replay old rows.
+            let resumed_storage = if resume_after.is_some() && wants_detections {
+                replay_storage.as_ref()
+            } else {
+                None
+            };
 
             if !advance_stream_sequence(&mut seq) {
                 return;
@@ -938,12 +944,12 @@ pub(super) fn handle_stream_events(
             // No SSE id on non-event frames: a sequence number here would
             // overwrite the client's Last-Event-ID with a non-event id.
             if let Some(event) = frame_to_sse_with_event_id("ready", None, ready) {
-                if !send_rate_limited_sse(
+                if !send_replay_sse(
+                    &child_cx,
                     &tx,
                     event,
                     &mut next_emit_at,
                     min_interval,
-                    &mut consecutive_drops,
                 )
                 .await
                 {
@@ -952,13 +958,11 @@ pub(super) fn handle_stream_events(
             }
 
             // Resume: replay persisted detections after the client's last
-            // seen id before going live. The subscription is taken first;
-            // anything it cannot retain during catchup is reported as lag.
-            // Replay itself is paginated, never truncated at a total-row cap.
+            // seen id before going live. Retain that ordered storage cursor
+            // for subsequent catchup; a bus notification is a wakeup, not
+            // proof that all smaller persisted ids have been delivered.
             let mut replayed_through = resume_after.unwrap_or(i64::MIN);
-            if let (Some(_), Some(storage), true) =
-                (resume_after, replay_storage.as_ref(), wants_detections)
-            {
+            if let Some(storage) = resumed_storage {
                 if !replay_event_frames(
                     &child_cx,
                     |query| storage.get_events_stream_with_cx(&child_cx, query),
@@ -976,13 +980,44 @@ pub(super) fn handle_stream_events(
                 }
             }
 
+            let keepalive_interval = Duration::from_secs(runtime_limits.stream_keepalive_secs);
+            let mut last_catchup = Instant::now();
             loop {
                 if child_cx.checkpoint().is_err() {
                     break;
                 }
+                // A lost persistence wakeup must also be repaired while
+                // unrelated bus traffic is continuous, not only when the
+                // subscriber becomes idle. Do not reset this deadline for
+                // ephemeral events or already-replayed notifications.
+                if last_catchup.elapsed() >= keepalive_interval
+                    && let Some(storage) = resumed_storage
+                {
+                    if !replay_event_frames(
+                        &child_cx,
+                        |query| storage.get_events_stream_with_cx(&child_cx, query),
+                        pane_filter,
+                        &mut replayed_through,
+                        &redactor,
+                        &tx,
+                        &mut seq,
+                        &mut next_emit_at,
+                        min_interval,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_catchup = Instant::now();
+                }
+                let wait = if resumed_storage.is_some() {
+                    keepalive_interval.saturating_sub(last_catchup.elapsed())
+                } else {
+                    keepalive_interval
+                };
                 let recv_result = crate::runtime_async::timeout_with_cx(
                     &child_cx,
-                    Duration::from_secs(runtime_limits.stream_keepalive_secs),
+                    wait,
                     subscriber.recv_cx(&child_cx),
                 )
                 .await;
@@ -994,6 +1029,32 @@ pub(super) fn handle_stream_events(
                         }
                         let event_id = persisted_event_id(&event);
                         if event_id.is_some_and(|id| id <= replayed_through) {
+                            continue;
+                        }
+                        // Publication can race across persistence callers.
+                        // A notification for id N must not skip a retained
+                        // N-1 whose notification has not arrived yet. Read
+                        // the ordered durable suffix instead of forwarding
+                        // the bus payload and advancing to N directly.
+                        if event_id.is_some()
+                            && let Some(storage) = resumed_storage
+                        {
+                            if !replay_event_frames(
+                                &child_cx,
+                                |query| storage.get_events_stream_with_cx(&child_cx, query),
+                                pane_filter,
+                                &mut replayed_through,
+                                &redactor,
+                                &tx,
+                                &mut seq,
+                                &mut next_emit_at,
+                                min_interval,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            last_catchup = Instant::now();
                             continue;
                         }
 
@@ -1014,12 +1075,12 @@ pub(super) fn handle_stream_events(
                             json!({ "event": event_json }),
                         );
                         if let Some(event) = frame_to_sse_with_event_id("event", event_id, frame) {
-                            if !send_rate_limited_sse(
+                            if !send_replay_sse(
+                                &child_cx,
                                 &tx,
                                 event,
                                 &mut next_emit_at,
                                 min_interval,
-                                &mut consecutive_drops,
                             )
                             .await
                             {
@@ -1038,24 +1099,53 @@ pub(super) fn handle_stream_events(
                             json!({ "missed_count": missed_count }),
                         );
                         if let Some(event) = frame_to_sse_with_event_id("lag", None, frame) {
-                            if !send_rate_limited_sse(
+                            if !send_replay_sse(
+                                &child_cx,
                                 &tx,
                                 event,
                                 &mut next_emit_at,
                                 min_interval,
-                                &mut consecutive_drops,
                             )
                             .await
                             {
                                 break;
                             }
                         }
+                        // The lag frame remains necessary: ephemeral bus
+                        // events cannot be recovered from detection storage.
+                        // Recover retained detections before accepting any
+                        // newer persisted SSE id on this resumed connection.
+                        if let Some(storage) = resumed_storage {
+                            if !replay_event_frames(
+                                &child_cx,
+                                |query| storage.get_events_stream_with_cx(&child_cx, query),
+                                pane_filter,
+                                &mut replayed_through,
+                                &redactor,
+                                &tx,
+                                &mut seq,
+                                &mut next_emit_at,
+                                min_interval,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            last_catchup = Instant::now();
+                        }
                     }
                     Ok(Err(RecvError::Cancelled)) => break,
                     Ok(Err(RecvError::Closed)) => break,
                     Err(_) => {
-                        if tx.try_send(SseEvent::comment("keepalive")).is_err() {
-                            break;
+                        // The due scan at the top of the loop repairs a
+                        // committed row even if its publisher died before
+                        // the final bus wakeup. Keepalives carry no cursor.
+                        match tx
+                            .try_send(SseEvent::comment("keepalive"))
+                            .map_err(mpsc::TrySendError::from)
+                        {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Closed(_)) => break,
                         }
                     }
                 }
@@ -1726,6 +1816,230 @@ mod tests {
             };
             assert_eq!(delivered.id.as_deref(), Some("17"));
             assert_eq!(delivered.data.as_deref(), Some("retained"));
+        });
+    }
+
+    #[test]
+    fn event_replay_repeated_catchup_preserves_order_and_suppresses_duplicates() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(8);
+            let (mut after_id, mut seq) = (0, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            let mut cursors = Vec::new();
+            // The second catchup models an id-5 notification arriving before
+            // id 4. Storage already contains both; the last pass represents
+            // an overlapping wakeup or a keepalive scan with no new rows.
+            for ids in [vec![1, 3], vec![1, 3, 4, 5], vec![1, 3, 4, 5]] {
+                assert!(
+                    super::replay_event_frames(
+                        &cx,
+                        |query| {
+                            let cursor = query.after_id.unwrap();
+                            cursors.push(cursor);
+                            std::future::ready(Ok(ids
+                                .iter()
+                                .copied()
+                                .filter(|id| *id > cursor)
+                                .map(replay_fixture)
+                                .collect()))
+                        },
+                        Some(7),
+                        &mut after_id,
+                        &redactor,
+                        &tx,
+                        &mut seq,
+                        &mut next_emit_at,
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+                );
+            }
+            assert_eq!(cursors, [0, 3, 5]);
+            assert_eq!(after_id, 5);
+            drop(tx);
+            let frames = drain_replay_frames(rx);
+            let delivered: Vec<_> = frames.iter().map(|frame| frame.id.as_deref()).collect();
+            assert_eq!(delivered, [Some("1"), Some("3"), Some("4"), Some("5")]);
+        });
+    }
+
+    #[test]
+    fn event_replay_body_drains_a_capacity_one_channel_without_losing_frames() {
+        run_async_test_isolated(|| async {
+            use crate::runtime_async::stream::Stream;
+            use std::pin::Pin;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicI64, Ordering};
+
+            let cx = crate::cx::for_request();
+            let producer_cx = cx.clone();
+            let (tx, rx) = mpsc::channel(1);
+            let cursor = Arc::new(AtomicI64::new(0));
+            let producer_cursor = Arc::clone(&cursor);
+            let producer = Box::pin(async move {
+                let mut after_id = 0;
+                let mut seq = 0;
+                let mut next_emit_at = std::time::Instant::now();
+                assert!(
+                    super::replay_event_frames(
+                        &producer_cx,
+                        |query| {
+                            std::future::ready(Ok((1..=65)
+                                .filter(|id| *id > query.after_id.unwrap())
+                                .map(replay_fixture)
+                                .collect()))
+                        },
+                        None,
+                        &mut after_id,
+                        &crate::policy::Redactor::new(),
+                        &tx,
+                        &mut seq,
+                        &mut next_emit_at,
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+                );
+                producer_cursor.store(after_id, Ordering::SeqCst);
+            });
+            let mut stream = super::SseByteStream::new(
+                cx.clone(),
+                rx,
+                producer,
+                Box::pin(std::future::pending()),
+            );
+            let frames = crate::runtime_async::timeout_with_cx(
+                &cx,
+                std::time::Duration::from_secs(5),
+                async {
+                    let mut frames = Vec::new();
+                    while let Some(frame) =
+                        std::future::poll_fn(|poll_cx| Pin::new(&mut stream).poll_next(poll_cx))
+                            .await
+                    {
+                        frames.push(String::from_utf8(frame).unwrap());
+                    }
+                    frames
+                },
+            )
+            .await
+            .expect("finite replay must finish even with a capacity-one channel");
+            assert_eq!(frames.len(), 65);
+            for (index, frame) in frames.iter().enumerate() {
+                let expected = format!("id: {}", index + 1);
+                assert!(frame.lines().any(|line| line == expected), "{frame}");
+            }
+            assert_eq!(cursor.load(Ordering::SeqCst), 65);
+        });
+    }
+
+    #[test]
+    fn event_replay_shutdown_drops_a_producer_waiting_for_capacity() {
+        run_async_test_isolated(|| async {
+            use crate::runtime_async::stream::Stream;
+            use crate::web_framework::WebStreamLifecycle;
+            use std::pin::Pin;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::task::{Context, Poll, Waker};
+
+            let cx = crate::cx::for_request();
+            let producer_cx = cx.clone();
+            let lifecycle = WebStreamLifecycle::new();
+            let waiter = lifecycle.shutdown_waiter(&cx);
+            let (tx, rx) = mpsc::channel(1);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let probe = ProducerDropProbe(Arc::clone(&drops));
+            let completed = Arc::new(AtomicBool::new(false));
+            let producer_completed = Arc::clone(&completed);
+            let producer = Box::pin(async move {
+                let _probe = probe;
+                let mut after_id = 0;
+                let mut seq = 0;
+                let mut next_emit_at = std::time::Instant::now();
+                let result = super::replay_event_frames(
+                    &producer_cx,
+                    |_| std::future::ready(Ok((1..=3).map(replay_fixture).collect())),
+                    None,
+                    &mut after_id,
+                    &crate::policy::Redactor::new(),
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+                producer_completed.store(result, Ordering::SeqCst);
+            });
+            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Some(first)) = Pin::new(&mut stream).poll_next(&mut poll_cx) else {
+                panic!("the first frame should be queued before the producer parks");
+            };
+            assert!(
+                String::from_utf8(first)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == "id: 1")
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(!completed.load(Ordering::SeqCst));
+            lifecycle.signal_shutdown();
+            assert_eq!(
+                Pin::new(&mut stream).poll_next(&mut poll_cx),
+                Poll::Ready(None)
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!completed.load(Ordering::SeqCst));
+            assert_eq!(
+                Pin::new(&mut stream).poll_next(&mut poll_cx),
+                Poll::Ready(None)
+            );
+        });
+    }
+
+    #[test]
+    fn event_replay_redacts_matched_text_and_nested_payloads() {
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let secret = format!("ghp_{}", "a".repeat(36));
+            assert_ne!(
+                redactor.redact(&secret),
+                secret,
+                "fixture must match a redaction rule"
+            );
+            let mut row = replay_fixture(1);
+            row.matched_text = Some(format!("visible_marker {secret}"));
+            row.extracted = Some(json!({ "nested": [{ "value": secret.clone() }] }));
+            let mut row = Some(row);
+            let (tx, rx) = mpsc::channel(1);
+            let (mut after_id, mut seq) = (0, 0);
+            let mut next_emit_at = std::time::Instant::now();
+            assert!(
+                super::replay_event_frames(
+                    &cx,
+                    |_| std::future::ready(Ok(vec![row.take().unwrap()])),
+                    None,
+                    &mut after_id,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            );
+            drop(tx);
+            let frames = drain_replay_frames(rx);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].id.as_deref(), Some("1"));
+            let data = frames[0].data.as_deref().unwrap();
+            assert!(!data.contains(&secret));
+            assert!(data.contains("visible_marker"));
+            assert!(data.contains("nested"));
+            assert!(data.contains("codex.usage.reached"));
         });
     }
 
