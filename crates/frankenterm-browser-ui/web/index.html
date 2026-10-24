@@ -9,10 +9,44 @@
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>
-<main id="container">
-  <canvas id="terminal" tabindex="0" aria-label="FrankenTerm fleet viewer (read-only)"></canvas>
+<header id="inspect-toolbar">
+  <button id="pane-output-open" type="button" disabled>Inspect selected pane (Enter)</button>
+  <form id="pane-output-form">
+    <label for="pane-output-id">Pane ID</label>
+    <input id="pane-output-id" type="text" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" autocomplete="off" required disabled>
+    <button id="pane-output-submit" type="submit" disabled>Open output</button>
+  </form>
+  <span id="pane-output-hint" role="status">Use 1/2 to switch fleet views. Captured output is read-only.</span>
+</header>
+<main id="workspace" data-output-open="false">
+  <section id="container" aria-label="Fleet inventory and detections">
+    <canvas id="terminal" tabindex="0" aria-label="FrankenTerm fleet viewer. Use arrows to select, 1 or 2 to switch views, Enter to inspect output, Tab to leave."></canvas>
+  </section>
+  <section id="pane-output" aria-labelledby="pane-output-title" hidden>
+    <div class="output-toolbar">
+      <h1 id="pane-output-title">Captured output</h1>
+      <button id="pane-output-close" type="button">Close</button>
+    </div>
+    <p id="pane-output-status" role="status"></p>
+    <div class="output-toolbar">
+      <button id="pane-output-pause" type="button" aria-pressed="false">Pause</button>
+      <button id="pane-output-history" type="button" title="Replace this view by replaying retained history from the beginning; large histories may take time.">Load retained history</button>
+      <label><input id="pane-output-follow" type="checkbox" checked> Follow output</label>
+    </div>
+    <p id="pane-output-warnings" role="status" hidden></p>
+    <form id="pane-output-find-form" class="output-toolbar">
+      <label for="pane-output-search">Find text</label>
+      <input id="pane-output-search" type="search" maxlength="256" autocomplete="off" aria-describedby="pane-output-find-help">
+      <button type="submit">Next</button>
+      <button id="pane-output-previous" type="button">Previous</button>
+    </form>
+    <span id="pane-output-find-help">Literal, case-sensitive search pauses the stream. Resume continues from the received cursor.</span>
+    <span id="pane-output-find-status" role="status"></span>
+    <textarea id="pane-output-text" readonly spellcheck="false" wrap="off" aria-label="Captured pane output, read-only" aria-describedby="pane-output-status pane-output-warnings"></textarea>
+    <p class="output-note">Bounded captured text, not a terminal emulator. Select text to copy. Escape closes this view. Deleted history and database replacement cannot be recovered here.</p>
+  </section>
 </main>
-<!-- The rendered frame as text: for screen readers and browser tests. -->
+<!-- The rendered fleet frame as text: for screen readers and browser tests. -->
 <pre id="screen-text" class="visually-hidden" aria-live="polite"></pre>
 <div id="error" role="alert" hidden></div>
 <script type="module" src="./app.mjs"></script>

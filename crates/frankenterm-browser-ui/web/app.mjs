@@ -3,12 +3,13 @@
 // This page owns all network I/O and DOM events. The WASM FleetViewer owns
 // state and renders frames; FrankenTermWeb paints their patches. The viewer is
 // read-only: nothing here writes to a pane.
+import { mountPaneOutput } from "./pane-output.mjs";
 
 const REFRESH_MS = 15_000;
 const CLOCK_MS = 1_000;
 const STREAM_RETRY_MAX_MS = 30_000;
 const STREAM = { DISCONNECTED: 0, CONNECTING: 1, LIVE: 2 };
-const FORWARDED_NAV_KEYS = new Set(["Tab", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+const FORWARDED_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
 
 // Keep persisted i64 IDs as strings: converting through Number corrupts IDs
 // above 2^53. This is the /stream/events cursor, not a delta-stream cursor.
@@ -367,6 +368,25 @@ function keyInput(event, phase) {
   };
 }
 
+// Native controls own their keys. In particular Tab must escape the canvas,
+// and typing in the pane selector/search box must not move the fleet selection.
+export function handleFleetKey(event, { canvas, term, viewer, inspector }) {
+  if (event.target !== canvas || event.metaKey || event.ctrlKey || event.altKey || event.key === "Tab") return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (!event.repeat) inspector.openSelected();
+    return;
+  }
+  try {
+    term.input(keyInput(event, "down"));
+  } finally {
+    for (const json of term.drainEncodedInputs()) viewer.pushEncodedInput(json);
+    term.drainEncodedInputBytes();
+    term.drainImeCompositionJsonl("fleet-viewer", 0n, "");
+  }
+  if (FORWARDED_NAV_KEYS.has(event.key)) event.preventDefault();
+}
+
 async function main() {
   // Dynamic imports keep the actual transport owner testable without loading
   // a generated WASM bundle, DOM, renderer or network in the Node harness.
@@ -402,17 +422,18 @@ async function main() {
   const snapshots = createFleetRefresh(viewer, { apiRoot });
   const refresh = snapshots.refresh;
   const stream = createFleetStream(snapshots, { apiRoot, onResync: refresh });
+  const inspector = mountPaneOutput({
+    apiRoot,
+    getSelectedPane: () => {
+      // Apply queued navigation before sampling its identity. Once opened,
+      // later row changes never retarget this pane's output subscription.
+      if (viewer.step()) present();
+      return viewer.selectedPaneId();
+    },
+  });
 
   window.addEventListener("keydown", (event) => {
-    if (event.metaKey || event.ctrlKey) return;
-    try {
-      term.input(keyInput(event, "down"));
-    } finally {
-      for (const json of term.drainEncodedInputs()) viewer.pushEncodedInput(json);
-      term.drainEncodedInputBytes();
-      term.drainImeCompositionJsonl("fleet-viewer", 0n, "");
-    }
-    if (FORWARDED_NAV_KEYS.has(event.key)) event.preventDefault();
+    handleFleetKey(event, { canvas, term, viewer, inspector });
   });
 
   new ResizeObserver(() => {
@@ -436,6 +457,7 @@ async function main() {
     }
     if (viewer.takeRefreshRequest()) refresh();
     if (viewer.step()) present();
+    inspector.render();
     frameHandle = requestAnimationFrame(frame);
   }
   function resume() {
@@ -443,6 +465,7 @@ async function main() {
     active = true;
     snapshots.start();
     stream.start();
+    inspector.restore();
     refresh();
     refreshTimer = setInterval(refresh, REFRESH_MS);
     frameHandle = requestAnimationFrame(frame);
@@ -451,6 +474,7 @@ async function main() {
     active = false;
     stream.stop();
     snapshots.stop();
+    inspector.suspend();
     if (refreshTimer !== null) clearInterval(refreshTimer);
     if (frameHandle !== null) cancelAnimationFrame(frameHandle);
     refreshTimer = frameHandle = null;

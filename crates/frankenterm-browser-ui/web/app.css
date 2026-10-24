@@ -13,18 +13,72 @@ html, body {
   overflow: hidden;
   background: #0a0a0a;
   color: #cccccc;
+  font: 14px/1.4 system-ui, sans-serif;
 }
 
-#container {
-  position: fixed;
-  inset: 0;
+body { display: flex; flex-direction: column; }
+[hidden] { display: none !important; }
+button, input { font: inherit; }
+button, input[type="text"], input[type="search"] {
+  color: #eeeeee;
+  background: #20242c;
+  border: 1px solid #808080;
+  border-radius: 3px;
+  padding: 5px 8px;
+}
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: 0.5; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:focus-visible {
+  outline: 2px solid #5fafff;
+  outline-offset: -2px;
 }
 
-#terminal {
-  display: block;
+#inspect-toolbar, .output-toolbar, #pane-output-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#inspect-toolbar { padding: 8px; border-bottom: 1px solid #444; }
+#pane-output-id { width: 12em; }
+#pane-output-hint { font-size: 12px; }
+#workspace {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+#workspace[data-output-open="true"] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+#container { position: relative; min-width: 0; min-height: 0; }
+#terminal { display: block; width: 100%; height: 100%; }
+#pane-output {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 10px;
+  border-left: 1px solid #444;
+  overflow: auto;
+}
+#pane-output h1 { flex: 1; font-size: 16px; margin: 0; overflow-wrap: anywhere; }
+#pane-output p { margin: 0; }
+#pane-output-status, #pane-output-find-help, #pane-output-find-status, .output-note { font-size: 12px; }
+#pane-output-warnings { color: #ffd75f; font-size: 12px; }
+#pane-output-search { min-width: 5em; width: 12em; max-width: 100%; }
+#pane-output-text {
+  flex: 1;
+  min-height: 6em;
   width: 100%;
-  height: 100%;
-  outline: none;
+  box-sizing: border-box;
+  resize: none;
+  color: #cccccc;
+  background: #0a0a0a;
+  border: 1px solid #444;
+  font: 14px/1.4 "Pragmasevka NF", ui-monospace, monospace;
+  white-space: pre;
+  direction: ltr;
+  unicode-bidi: plaintext;
 }
 
 .visually-hidden {
@@ -46,4 +100,12 @@ html, body {
   border: 1px solid #ff5f5f;
   font: 14px/1.4 ui-monospace, monospace;
   white-space: pre-wrap;
+}
+
+@media (max-width: 800px) {
+  #workspace[data-output-open="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  #pane-output { border-left: none; border-top: 1px solid #444; }
 }
