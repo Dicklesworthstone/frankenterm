@@ -2023,9 +2023,9 @@ struct OfflineRestoreSheet: View {
             .foregroundStyle(.secondary)
         if let comparison = model.state?.comparison {
             Text(verbatim: "Transfer \(comparison)").font(.system(.body, design: .monospaced)).textSelection(.enabled)
+            // Decrypting proves nothing about the sender; this code does.
+            Text("This should match the code your Mac showed for this transfer.").font(.callout)
         }
-        Text("Compare this value with your deliberately selected Mac or trusted backup record. Review the machines, routes and host policy before choosing Restore. Successful decryption alone does not identify the sender.")
-            .font(.callout)
         ForEach(review.document.machines) { machine in
             let theme = review.document.themes.first { $0.id == machine.themeID }
             HStack(spacing: 12) {
