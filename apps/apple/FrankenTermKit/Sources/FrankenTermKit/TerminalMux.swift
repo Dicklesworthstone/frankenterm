@@ -171,6 +171,9 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// Resizes the remote pane, remembering its size before the first resize.
     func resize(pane: Int, rows: Int, columns: Int) throws
     func restoreSize(pane: Int) throws
+    /// A size `restoreSize` gave back is not answered yet: the server may not
+    /// have applied it, and closing the channel now can lose it on the way.
+    func restoring() throws -> Bool
     /// Searches the pane's scrollback on the server, newest rows first; a
     /// `.searchResults` event with the returned id answers.
     func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64
@@ -197,6 +200,8 @@ extension TerminalMuxClient {
     public func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {}
     /// A client that keeps no sizes takes over none.
     public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool { false }
+    /// A client that keeps no sizes waits on no restore.
+    public func restoring() throws -> Bool { false }
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {

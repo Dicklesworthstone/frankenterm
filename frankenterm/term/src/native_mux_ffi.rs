@@ -619,6 +619,20 @@ pub extern "C" fn ft_mux_v1_restore_size(session: u64, pane_id: u64) -> u32 {
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_restoring(session: u64, restoring: *mut u32) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(restoring, 0)?;
+        }
+        let pending = registry.session(session)?.restoring();
+        unsafe {
+            output_scalar(restoring, u32::from(pending))?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +777,20 @@ mod tests {
             Error::Invalid as u32
         );
         assert_eq!(written, 0);
+        let mut restoring = 7u32;
+        // SAFETY: a live local scalar.
+        assert_eq!(unsafe { ft_mux_v1_restoring(session, &mut restoring) }, 0);
+        assert_eq!(restoring, 0, "nothing given back, nothing to wait for");
+        // SAFETY: deliberately null output; refused before use.
+        assert_eq!(
+            unsafe { ft_mux_v1_restoring(session, std::ptr::null_mut()) },
+            Error::Invalid as u32
+        );
         assert_eq!(ft_mux_v1_release(session), 0);
+        // SAFETY: a live local scalar.
+        assert_eq!(
+            unsafe { ft_mux_v1_restoring(session, &mut restoring) },
+            Error::Stale as u32
+        );
     }
 }

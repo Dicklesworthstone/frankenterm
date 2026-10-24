@@ -570,8 +570,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard let state = mux else { throw NativeSSHError.closed }
         try await flushMux(driver: driver)
         let event = try await session.service(timeout: state.queries.waitTimeout(maximum: timeout), driver: driver)
-        guard !closed else { throw NativeSSHError.closed }
+        // Even after close: it may be the answer close waits for.
         if !event.output.isEmpty { try state.client.receive(event.output) }
+        guard !closed else { throw NativeSSHError.closed }
         if event.endOfOutput {
             try state.client.channelClosed()
             throw state.ready ? TerminalTransportError.connectionLost : TerminalMuxError.unavailable
@@ -940,11 +941,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
         let task = Task<Void, Never> {
-            if let state = self.mux, let driver = self.driver, let pane = state.shown, state.showing {
-                try? state.client.restoreSize(pane: pane)
-                _ = try? await self.flushMux(driver: driver)
-                _ = try? await session.service(timeout: .milliseconds(300), driver: driver)
-            }
+            if let state = self.mux, let driver = self.driver { await self.giveSizesBack(state, driver: driver) }
             await session.close()
             withExtendedLifetime(lease) {}
         }
@@ -954,6 +951,49 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // Retained diagnostic owners must not retain decoded output, native
         // event payloads or pending protocol bytes after actual shutdown joins.
         mux = nil; driver = nil
+    }
+
+    /// The desktop gets its size back before the channel closes: this pane's,
+    /// and any an earlier hide gave back. Reads until the server has answered,
+    /// since a relay like `nc -U` drops what it has not forwarded when the
+    /// channel closes. The pump may be in its own service turn (ours is then
+    /// busy); it writes what we admit. Bounded: a dead server must not hold
+    /// teardown, and an unanswered restore keeps its record for the next
+    /// connection to give back.
+    private func giveSizesBack(_ state: MuxAttachment, driver: NativeSSHDriver) async {
+        if let pane = state.shown, state.showing {
+            try? state.client.hide(pane: pane); try? state.client.restoreSize(pane: pane)
+        }
+        var restored: [Int] = [], failed = false
+        // Nothing is on screen now; only sizes and the session's end matter.
+        func settle() {
+            while let event = try? state.client.nextEvent() {
+                switch event {
+                case .phoneSize(let pane, .none, _, _): restored.append(pane)
+                case .phoneSize(let pane, let desktop, let rows, let columns):
+                    state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
+                case .failed: failed = true
+                default: break
+                }
+            }
+        }
+        let deadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < deadline {
+            let drained = (try? await flushMux(driver: driver)) ?? false
+            settle()
+            if failed { return }
+            if drained, (try? state.client.restoring()) == false,
+               (try? await session.accounting().pendingWriteBytes) == 0 { break }
+            do {
+                let event = try await session.service(timeout: .milliseconds(100), driver: driver)
+                if !event.output.isEmpty { try state.client.receive(event.output) }
+                if event.endOfOutput { break }
+            } catch NativeSSHError.busy { try? await Task.sleep(for: .milliseconds(10)) }
+            catch { break }
+        }
+        settle()
+        guard !failed, (try? state.client.restoring()) == false else { return }
+        for pane in restored { state.sizes.set(pane: pane, desktop: nil, rows: 0, columns: 0) }
     }
 
     func validateForeground() async throws {

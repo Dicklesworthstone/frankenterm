@@ -88,7 +88,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
-                          creation: TerminalSessionCreation = .onSelect) throws -> WorkspaceDocument {
+                          creation: TerminalSessionCreation = .onSelect, muxCommand: String? = nil) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
             "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF",
@@ -99,10 +99,18 @@ final class TerminalSessionControllerTests: XCTestCase {
             "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["alpha", "beta"]]],
             "machines": ["alpha", "beta"].map { ["id": $0, "name": $0.capitalized, "theme_ref": "theme", "route_refs": ["route-\($0)"],
                                                  "preferred_route_ref": "route-\($0)", "auto_connect": false] as [String: Any] },
-            "routes": ["alpha", "beta"].map { ["id": "route-\($0)", "mode": "direct_ssh", "session_creation": creation.rawValue,
-                                               "host": "127.0.0.1", "port": Int(port), "user": user, "credential_refs": ["key"],
-                                               "authentication_methods": ["publickey"], "host_trust_ref": "trust",
-                                               "jump_routes": []] as [String: Any] },
+            "routes": ["alpha", "beta"].map { machine -> [String: Any] in
+                var route: [String: Any] = ["id": "route-\(machine)", "host": "127.0.0.1", "port": Int(port), "user": user,
+                                            "credential_refs": ["key"], "authentication_methods": ["publickey"],
+                                            "host_trust_ref": "trust", "jump_routes": []]
+                if let muxCommand {
+                    route["mode"] = "frankenterm_mux"; route["attach_policy"] = "existing_only"
+                    route["remote_command"] = muxCommand
+                } else {
+                    route["mode"] = "direct_ssh"; route["session_creation"] = creation.rawValue
+                }
+                return route
+            },
             "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
                              "requirement": "matching_private_key", "private_material": "not_included"]],
             "host_trust": [["id": "trust", "host": "127.0.0.1", "port": Int(port), "revoked_keys": [],
@@ -119,7 +127,8 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
-                           creation: TerminalSessionCreation = .onSelect) async throws -> LiveScene {
+                           creation: TerminalSessionCreation = .onSelect,
+                           muxCommand: String? = nil) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -130,7 +139,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let crypto = AppleCryptography()
         let key = try PrivateKeyRecord.fromPEM(pem, credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
-        let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user, creation: creation),
+        let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user,
+                                                            creation: creation, muxCommand: muxCommand),
                                         keys: [key], using: crypto)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-" + UUID().uuidString)
         let vault = SceneMemoryVault()
@@ -146,7 +156,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized,
                 routes: [.init(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port,
-                               sessionCreation: creation)]),
+                               mux: muxCommand != nil, sessionCreation: muxCommand != nil ? .existingOnly : creation)]),
                 unavailable: "", theme: nil)
         }
         let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision, workspaceName: "Scene",
@@ -807,6 +817,64 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
         await assertReleased(session, connections: live.connections)
         await scene.close()
+    }
+
+    /// M2 against a real FrankenTerm mux server. The phone attaches to the pane
+    /// that is already running instead of starting a shell, typing reaches that
+    /// pane's program, the pane takes the phone's size only while shown, and
+    /// closing the phone gives the desktop its size back and leaves the program
+    /// running for the next attach. TEST_RUNNER_FT_LIVE_MUX_COMMAND reaches a
+    /// disposable mux on the loopback host (for example `nc -U <socket>`).
+    /// Never point it at a mux someone uses: this test types into its first pane.
+    func testAMuxRouteAttachesToTheRunningPaneAndLeavesItRunning() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), out = live.outPath
+        let session = try await connect(live.scene, "alpha")
+        XCTAssertTrue(session.route.mux)
+        XCTAssertFalse(session.shellOnly, "a mux route never falls back to a new shell")
+        XCTAssertNotNil(session.muxControl)
+        let terminal = try shown(session)
+        // The pane outlives runs, and so does the file it writes: mark this run.
+        let run = UUID().uuidString.prefix(8)
+        try await type("trap 'stty size >> \(out)' WINCH; echo PID-$$ > \(out); stty size >> \(out); echo MUX-\(run)-$((6*7)) >> \(out)",
+                       into: terminal)
+        let typed = try await hostFile(out, containing: "MUX-\(run)-42")
+        let lines = typed.split(separator: "\n").map(String.init)
+        let pid = try XCTUnwrap(lines.first { $0.hasPrefix("PID-") }, typed)
+        let isSize = { (line: String) in line.split(separator: " ").count == 2 && line.allSatisfy { $0.isNumber || $0 == " " } }
+        let marker = try XCTUnwrap(lines.firstIndex(of: "MUX-\(run)-42"), typed)
+        XCTAssertTrue(marker > 0 && isSize(lines[marker - 1]), typed)
+
+        // Closing gives the desktop its size back; the program sees a resize.
+        let before = (try? String(contentsOfFile: out, encoding: .utf8)) ?? ""
+        terminal.removeFromSuperview()
+        await live.scene.close()
+        await assertReleased(session, connections: live.connections)
+        var after: [String] = []
+        for _ in 0..<200 where after.isEmpty {
+            try await Task.sleep(for: .milliseconds(50))
+            let text = (try? String(contentsOfFile: out, encoding: .utf8)) ?? ""
+            after = text.dropFirst(before.count).split(separator: "\n").map(String.init).filter(isSize)
+        }
+        let phoneSize = before.split(separator: "\n").map(String.init).filter(isSize).last
+        let desktopSize = try XCTUnwrap(after.last, "the pane got no resize after the phone closed (\(before))")
+        XCTAssertNotEqual(desktopSize, phoneSize, "the desktop got its own size back, not the phone's")
+
+        // The same program is still there for the next attach.
+        let again = try await liveScene(muxCommand: command)
+        let second = try await connect(again.scene, "alpha")
+        XCTAssertFalse(second.shellOnly)
+        let view = try shown(second)
+        defer { view.removeFromSuperview() }
+        // The shell expands its own $$; only the same process prints the same PID.
+        try await type("trap - WINCH; echo AGAIN-\(run)-$$ >> \(out)", into: view)
+        let reattached = try await hostFile(out, containing: "AGAIN-\(run)-\(pid.dropFirst(4))")
+        XCTAssertTrue(reattached.contains("AGAIN-\(run)-\(pid.dropFirst(4))"),
+                      "the next attach reached the same running program (\(reattached))")
+        await again.scene.close()
+        await assertReleased(second, connections: again.connections)
     }
 
     /// A direct route first tries the machine's mux. The loopback host has none,

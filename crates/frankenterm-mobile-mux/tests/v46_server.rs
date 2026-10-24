@@ -794,6 +794,54 @@ fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
     assert_eq!(harness.server.resizes.len(), count, "restored once");
 }
 
+#[test]
+fn a_restore_is_restoring_until_the_server_answers_it() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    assert!(!harness.session.restoring());
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    assert!(
+        !harness.session.restoring(),
+        "the phone's own size is not a restore"
+    );
+
+    // Still on its way to the server, then answered but the answer on its way.
+    harness.hold_requests = true;
+    harness.session.restore_size(pane);
+    harness.pump();
+    assert!(harness.session.restoring());
+    harness.hold_requests = false;
+    harness.hold = true;
+    harness.pump();
+    assert_eq!(
+        harness
+            .server
+            .resizes
+            .last()
+            .map(|size| (size.rows, size.cols)),
+        Some((6, 20))
+    );
+    assert!(
+        harness.session.restoring(),
+        "applied, but the phone cannot know yet"
+    );
+    harness.hold = false;
+    harness.pump();
+    assert!(!harness.session.restoring());
+
+    // A connection that ended waits for nothing.
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    harness.hold_requests = true;
+    harness.session.restore_size(pane);
+    harness.pump();
+    assert!(harness.session.restoring());
+    harness.session.closed();
+    assert!(!harness.session.restoring());
+}
+
 /// One PhoneSize event: pane, the desktop's rows and columns (none when
 /// cleared), and the phone's rows and columns.
 type PhoneSizeSeen = (usize, Option<(usize, usize)>, usize, usize);

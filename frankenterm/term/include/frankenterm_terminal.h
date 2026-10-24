@@ -250,6 +250,10 @@ uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text
  * gave it; restore_size puts that size back. */
 uint32_t ft_mux_v1_resize(uint64_t session, uint64_t pane_id, uint32_t rows, uint32_t cols);
 uint32_t ft_mux_v1_restore_size(uint64_t session, uint64_t pane_id);
+/* *restoring is 1 while a size restore_size gave back is unanswered, so the
+ * server may not have applied it: closing the channel now can lose it on
+ * the way. 0 once answered, or when the session has ended. */
+uint32_t ft_mux_v1_restoring(uint64_t session, uint32_t *restoring);
 /* After the pane list arrives: an earlier connection left the pane at the
  * phone's size rows x cols (1..512 each) without giving back the desktop's
  * (desktop rows and cols 1..4096), as its last PHONE_SIZE event said. If the

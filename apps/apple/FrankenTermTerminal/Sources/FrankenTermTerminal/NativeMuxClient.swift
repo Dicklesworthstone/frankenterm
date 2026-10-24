@@ -162,6 +162,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         try call { ft_mux_v1_restore_size($0, pane) }
     }
 
+    public func restoring() throws -> Bool {
+        var restoring: UInt32 = 0
+        try call { ft_mux_v1_restoring($0, &restoring) }
+        return restoring == 1
+    }
+
     public func click(pane: Int, column: Int, row: Int) throws {
         let pane = try Self.paneID(pane)
         guard (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }

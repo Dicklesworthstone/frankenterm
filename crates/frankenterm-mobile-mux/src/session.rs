@@ -648,6 +648,18 @@ impl Session {
         });
     }
 
+    /// Whether a size [`Session::restore_size`] gave back is still
+    /// unanswered, so the server may not have applied it. Closing the
+    /// connection now can lose it on the way: a relay like `nc -U` drops
+    /// what it has not forwarded when its channel closes.
+    pub fn restoring(&self) -> bool {
+        !self.failed
+            && self.sizing.values().any(|sizing| {
+                matches!(sizing.phone_until,
+                    Some(serial) if serial != u64::MAX && self.requests.contains_key(&serial))
+            })
+    }
+
     fn send_resize(&mut self, tab_id: usize, pane_id: usize, size: TerminalSize, request: Request) {
         let resize = Resize {
             containing_tab_id: tab_id,
