@@ -11,18 +11,15 @@
 //! first, so a lingering test-only copy of a needle cannot keep the guard green
 //! after the production wiring is removed.
 //!
-//! IMPORTANT — honesty about scope (verified 2026-06-15):
-//! Two components commonly grouped into this class are NOT in fact wired and are
-//! intentionally **excluded** from the asserted matrix (asserting them would be
-//! a lie):
-//!   * `RetentionManager` (recorder_retention.rs) — only test constructors
-//!     exist; tracked OPEN by ft-y7x56 ("built but never wired to any
-//!     scheduler").
-//!   * the `segment_embeddings` writer (`Storage::store_embedding*`) — has no
-//!     in-tree production caller; tracked OPEN by ft-xx5cl ("no production
-//!     writer -> semantic/hybrid search silently degrades to lexical-only").
+//! IMPORTANT — honesty about scope (verified 2026-06-15, updated 2026-10-10):
+//! `RetentionManager` (recorder_retention.rs) is NOT wired and is intentionally
+//! **excluded** from the asserted matrix (asserting it would be a lie): only
+//! test constructors exist; tracked OPEN by ft-y7x56 ("built but never wired to
+//! any scheduler"). When it lands, add its production callsite to `WIRED`.
 //!
-//! When those beads land, add their production callsites to `WIRED` below.
+//! The `segment_embeddings` writer did land (ft-xx5cl): segment appends call
+//! `index_segment_embedding_backend` on the writer transaction, which
+//! `segment_embedding_writer_has_a_production_caller` asserts below.
 
 use std::path::PathBuf;
 
@@ -141,6 +138,21 @@ fn wired_components_have_production_callsites() {
          a previously-wired component/config field is no longer consulted in \
          production:\n{}",
         missing.join("\n")
+    );
+}
+
+/// ft-xx5cl: segment appends must keep writing semantic embeddings, or
+/// semantic and hybrid search silently degrade to lexical-only. A production
+/// call differs from the definition only by the missing `fn`, so count both.
+#[test]
+fn segment_embedding_writer_has_a_production_caller() {
+    let prod = production_only(&read_src("storage.rs"));
+    let mentions = prod.matches("index_segment_embedding_backend(").count();
+    let definitions = prod.matches("fn index_segment_embedding_backend(").count();
+    assert_eq!(definitions, 1, "the embedding writer must still exist");
+    assert!(
+        mentions > definitions,
+        "no production append path calls index_segment_embedding_backend (ft-xx5cl)"
     );
 }
 

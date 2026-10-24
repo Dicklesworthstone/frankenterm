@@ -15,7 +15,7 @@
 2. **Inline CLI status bar**: Use FrankenTUI's inline mode for `ft` CLI to show pane health indicators, workflow progress, and alerts while preserving scrollback
 3. **Custom mux backend**: Implement `Backend` trait to render FrankenTUI apps into FrankenTerm mux panes
 4. **Headless widget rendering**: Use ftui-render Buffer + ftui-widgets for formatted robot mode output (tables, sparklines, progress bars)
-5. **Leverage existing PTY bridge**: ftui-pty already depends on frankenterm-core; deepen this integration
+5. ~~Leverage existing PTY bridge~~ — withdrawn: ftui-pty depends on crates.io `frankenterm-core` 0.2.0, FrankenTUI's own VT engine, not this repo's swarm core; there is no existing bridge to deepen
 
 ### Constraints
 
@@ -339,7 +339,7 @@ pub mod tui_dashboard {
 
 ### Key Advantage
 
-FrankenTUI is part of the same project ecosystem and `ftui-pty` already bridges to `frankenterm-core`. This is the most natural TUI framework choice — no external project alignment needed.
+FrankenTUI is part of the same project ecosystem. This is the most natural TUI framework choice — no external project alignment needed. (`ftui-pty`'s `frankenterm-core` dependency is FrankenTUI's own crates.io VT engine, not this repository's core.)
 
 ---
 

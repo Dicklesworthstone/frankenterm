@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "codex.usage.reached",
+    "agent_type": "codex",
+    "event_type": "usage.reached",
+    "severity": "critical",
+    "confidence": 0.95,
+    "extracted": {
+      "reset_time": "4:32 PM"
+    },
+    "matched_text": "Try again at 4:32 PM"
+  }
+]

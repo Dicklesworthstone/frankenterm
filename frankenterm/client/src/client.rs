@@ -78,7 +78,7 @@ pub(crate) const TEST_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         MuxSessionIncarnation::from_bytes([0x57; 16]),
     );
 
-fn reserve_client_main_thread(
+pub(crate) fn reserve_client_main_thread(
     service_class: MainThreadServiceClass,
     estimated_bytes: usize,
     operation: &'static str,
@@ -1334,12 +1334,14 @@ impl RpcProtocolAuthority {
         // default instead of inheriting authority from a broad `<=` cutoff.
         // Above the legacy surface, only the fenced-topology trio, the
         // explicitly coordinated reliable-input request/reply and sampled
-        // paste request, the reliable-pane-write request/reply, and the
-        // renderable coordinator's layout-fenced line request/reply and the
-        // selection coordinator's capture/resolve/release pairs are active.
+        // paste request, the reliable-pane-write request/reply, the
+        // renderable coordinator's layout-fenced line request/reply, the
+        // selection coordinator's capture/resolve/release pairs, and the
+        // user-variable hydration request/reply (115-116, codec 70), whose
+        // coordinator is the ordered `UserVarDeliveryQueue`, are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109 | 115..=116
         )
     }
 
@@ -2656,6 +2658,10 @@ struct LegacyTopologyFenceAuthority {
 #[derive(Debug)]
 enum PendingRpcReply {
     Pdu(Box<Pdu>),
+    UserVarsSnapshot {
+        response: Box<GetPaneUserVarsV1Response>,
+        applied: Receiver<anyhow::Result<()>>,
+    },
     Legacy46ListPanesResponse {
         response: Legacy46ListPanesResponse,
         authority: LegacyTopologyFenceAuthority,
@@ -2681,6 +2687,7 @@ impl PendingRpcReply {
     fn response_name(&self) -> &'static str {
         match self {
             Self::Pdu(pdu) => pdu.pdu_name(),
+            Self::UserVarsSnapshot { .. } => "GetPaneUserVarsV1Response",
             Self::Legacy46ListPanesResponse { .. } => "Legacy46ListPanesResponse",
             Self::Legacy46Rejection(_) => "Legacy46Rejection",
         }
@@ -2994,6 +3001,20 @@ impl RpcGenerationScope {
 
     pub(crate) fn is_available(&self) -> bool {
         self.generation.is_some()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.generation.is_some_and(|generation| {
+            self.rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                == generation.get()
+                && self
+                    .rpc_transport
+                    .ready_generation
+                    .load(AtomicOrdering::Acquire)
+                    == generation.get()
+        })
     }
 
     pub(crate) const fn connection_generation(&self) -> Option<NonZeroU64> {
@@ -3404,6 +3425,13 @@ impl RpcGenerationScope {
         async move {
             match request.await? {
                 PendingRpcReply::Pdu(pdu) => Ok(*pdu),
+                PendingRpcReply::UserVarsSnapshot { response, applied } => {
+                    applied
+                        .recv()
+                        .await
+                        .context("user-variable snapshot application was cancelled")??;
+                    Ok(Pdu::GetPaneUserVarsV1Response(*response))
+                }
                 PendingRpcReply::Legacy46Rejection(rejection) => {
                     Err(anyhow::Error::new(Legacy46RpcRejection {
                         request: request_name,
@@ -3695,6 +3723,9 @@ impl RpcGenerationScope {
                     other.pdu_name()
                 );
             }
+            PendingRpcReply::UserVarsSnapshot { .. } => {
+                bail!("user-variable response cannot satisfy codec-46 ListPanes");
+            }
         };
         let mut decision =
             TopologySnapshotDecisionGuard::new(Arc::clone(&self.rpc_transport), reader_abort);
@@ -3717,7 +3748,17 @@ struct ClientIncarnation;
 
 #[derive(Clone)]
 enum ClientDispatchTarget {
+    /// No local domain. Cosmetic notifications are ignored; topology
+    /// notifications are errors, because this client cannot apply them.
     Standalone,
+    /// No local domain and no client-side state at all: a one-shot client
+    /// that only sends requests and reads their replies (`frankenterm-gui
+    /// cli`, or `frankenterm-gui start` handing a spawn to a running GUI).
+    /// No notification can leave it out of date, so it ignores every one.
+    /// The server sends topology notifications to every connection,
+    /// including about the client's own spawn or move, so rejecting them
+    /// would fail such a client mid-request.
+    RequestOnly,
     Attached {
         local_domain_id: DomainId,
         mux_owner: Weak<Mux>,
@@ -3771,8 +3812,32 @@ impl ClientDispatchAuthority {
         }
     }
 
+    /// The authority of a request-only client; see
+    /// [`ClientDispatchTarget::RequestOnly`].
+    fn new_request_only(
+        client_incarnation: Arc<ClientIncarnation>,
+        connection_generation: Arc<AtomicU64>,
+        rpc_transport: Arc<RpcTransportState>,
+    ) -> Self {
+        Self {
+            target: ClientDispatchTarget::RequestOnly,
+            client_incarnation,
+            connection_generation: Arc::clone(&connection_generation),
+            rpc_transport,
+            generation: connection_generation.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    /// True for every client without a local domain.
     fn is_standalone(&self) -> bool {
-        matches!(&self.target, ClientDispatchTarget::Standalone)
+        matches!(
+            &self.target,
+            ClientDispatchTarget::Standalone | ClientDispatchTarget::RequestOnly
+        )
+    }
+
+    fn is_request_only(&self) -> bool {
+        matches!(&self.target, ClientDispatchTarget::RequestOnly)
     }
 
     fn generation_is_current(&self) -> bool {
@@ -4062,7 +4127,7 @@ impl ClientDispatchAuthority {
 
     fn captured_mux(&self) -> Option<Arc<Mux>> {
         match &self.target {
-            ClientDispatchTarget::Standalone => None,
+            ClientDispatchTarget::Standalone | ClientDispatchTarget::RequestOnly => None,
             ClientDispatchTarget::Attached { mux_owner, .. } => mux_owner.upgrade(),
         }
     }
@@ -4380,6 +4445,11 @@ macro_rules! rpc_surface {
         rpc!(ping, Ping = (), Pong);
         rpc!(list_panes, ListPanes = (), ListPanesResponse);
         rpc!(
+            get_pane_user_vars_v1,
+            GetPaneUserVarsV1,
+            GetPaneUserVarsV1Response
+        );
+        rpc!(
             list_panes_coherent,
             ListPanesCoherent,
             ListPanesCoherentResponse
@@ -4545,6 +4615,7 @@ async fn process_unilateral_inner_async(
     pane_id: PaneId,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
+    let is_user_var = is_user_var_alert(&decoded.pdu);
     let local_domain_id = dispatch.local_domain_id();
     if !dispatch.rpc_generation_is_live() {
         log::trace!(
@@ -4582,12 +4653,18 @@ async fn process_unilateral_inner_async(
                 if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
-                dispatch
+                let resolved = dispatch
                     .inner
-                    .remote_to_local_pane_id(&dispatch.mux, pane_id)
-                    .ok_or_else(|| {
-                        anyhow!("remote pane id {} does not have a local pane id", pane_id)
-                    })?
+                    .remote_to_local_pane_id(&dispatch.mux, pane_id);
+                if resolved.is_none() && is_user_var {
+                    // An exact occurrence can outlive a server pane while
+                    // topology resynchronization is in flight. It cannot be
+                    // delivered to a removed or replacement local owner.
+                    return Ok(());
+                }
+                resolved.ok_or_else(|| {
+                    anyhow!("remote pane id {} does not have a local pane id", pane_id)
+                })?
             }
         };
 
@@ -4608,12 +4685,15 @@ async fn process_unilateral_inner_async(
                     return Ok(());
                 }
 
-                let local_pane_id = dispatch
+                let resolved = dispatch
                     .inner
-                    .remote_to_local_pane_id(&dispatch.mux, pane_id)
-                    .ok_or_else(|| {
-                        anyhow!("remote pane id {} does not have a local pane id", pane_id)
-                    })?;
+                    .remote_to_local_pane_id(&dispatch.mux, pane_id);
+                if resolved.is_none() && is_user_var {
+                    return Ok(());
+                }
+                let local_pane_id = resolved.ok_or_else(|| {
+                    anyhow!("remote pane id {} does not have a local pane id", pane_id)
+                })?;
 
                 dispatch
                     .mux
@@ -4656,6 +4736,10 @@ async fn process_unilateral_inner_async(
         );
         return Ok(());
     }
+    let refresh_user_vars = matches!(&decoded.pdu,
+        Pdu::NotifyAlert(NotifyAlert { alert: wezterm_term::Alert::SetUserVar { name, .. }, .. })
+            if !client_pane.has_user_var(name)
+    );
     let result = client_pane
         .process_unilateral(&registration, &rpc, decoded.pdu)
         .await;
@@ -4663,6 +4747,17 @@ async fn process_unilateral_inner_async(
         return Ok(());
     }
     result?;
+    if refresh_user_vars && rpc.is_ready() {
+        // A terminal may evict another key when inserting this one. Preserve
+        // this historical occurrence, then converge the authoritative map via
+        // the coalesced bounded worker; never await its reply on this FIFO.
+        ClientDomain::request_pane_user_var_hydration(
+            Arc::clone(&dispatch.mux),
+            Arc::clone(&dispatch.inner),
+            rpc,
+            pane_id,
+        )?;
+    }
     Ok(())
 }
 
@@ -4691,7 +4786,17 @@ fn unilateral_without_local_domain_is_ignorable(pdu: &Pdu) -> bool {
     }
 }
 
-fn handle_unilateral_without_local_domain(decoded: &DecodedPdu) -> anyhow::Result<()> {
+fn handle_unilateral_without_local_domain(
+    authority: &ClientDispatchAuthority,
+    decoded: &DecodedPdu,
+) -> anyhow::Result<()> {
+    if authority.is_request_only() {
+        log::trace!(
+            "request-only mux client ignored {} unilateral PDU",
+            decoded.pdu.pdu_name()
+        );
+        return Ok(());
+    }
     if unilateral_without_local_domain_is_ignorable(&decoded.pdu) {
         log::trace!(
             "standalone mux client explicitly ignored {} unilateral PDU",
@@ -4714,7 +4819,7 @@ fn process_unilateral(
         return Ok(());
     }
     if authority.is_standalone() {
-        return handle_unilateral_without_local_domain(&decoded);
+        return handle_unilateral_without_local_domain(authority, &decoded);
     }
     let Some(dispatch) = authority.resolve_current()? else {
         return Ok(());
@@ -4737,7 +4842,7 @@ async fn process_unilateral_with_barrier(
         return Ok(());
     }
     if authority.is_standalone() {
-        handle_unilateral_without_local_domain(&decoded)?;
+        handle_unilateral_without_local_domain(authority, &decoded)?;
         return Ok(());
     }
     let Some(dispatch) = authority.resolve_current()? else {
@@ -4898,6 +5003,323 @@ impl QuarantinedUnilateral {
 struct PreReadyUnilateralQueue {
     waiting: VecDeque<QuarantinedUnilateral>,
     waiting_bytes: usize,
+}
+
+fn is_user_var_alert(pdu: &Pdu) -> bool {
+    matches!(
+        pdu,
+        Pdu::NotifyAlert(NotifyAlert {
+            alert: wezterm_term::Alert::SetUserVar { .. },
+            ..
+        })
+    )
+}
+
+/// One exact connection's metadata delivery stream. Snapshot replies and
+/// individual historical changes share this queue, so an asynchronous pane
+/// discovery cannot allow a later value to overtake an earlier occurrence.
+/// The serialized frames account for retained payload bytes independently of
+/// the number of panes in the attached server.
+#[derive(Default)]
+struct UserVarDeliveryQueue {
+    state: ParkingMutex<UserVarDeliveryState>,
+}
+
+#[derive(Default)]
+struct UserVarDeliveryState {
+    waiting: VecDeque<UserVarDelivery>,
+    retained_count: usize,
+    retained_bytes: usize,
+    running: bool,
+    closed: bool,
+}
+
+struct UserVarDelivery {
+    frame: Vec<u8>,
+    applied: Option<Sender<anyhow::Result<()>>>,
+    registration: Option<PaneRegistrationHandle>,
+}
+
+fn capture_user_var_registration(
+    authority: &ClientDispatchAuthority,
+    pane_id: PaneId,
+) -> anyhow::Result<Option<PaneRegistrationHandle>> {
+    Ok(authority.resolve_current()?.and_then(|dispatch| {
+        admit_client_pane(&dispatch, pane_id).map(|(_, registration)| registration)
+    }))
+}
+
+struct UserVarWorkerGuard {
+    queue: Arc<UserVarDeliveryQueue>,
+    authority: ClientDispatchAuthority,
+    armed: bool,
+}
+
+impl UserVarWorkerGuard {
+    /// A clean finish: dropping the guard then leaves the queue open.
+    ///
+    /// A method rather than `guard.armed = false` in the worker: only `Drop`
+    /// reads the flag, which rustc's liveness lint cannot see through the
+    /// async block's capture, so a bare assignment reads as dead.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UserVarWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.queue.state.lock();
+            state.closed = true;
+            state.waiting.clear();
+        }
+        if let Some(generation) = NonZeroU64::new(self.authority.generation) {
+            if let Ok(reader_abort) = self.authority.rpc_transport.reader_abort_for(generation) {
+                self.authority.rpc_transport.request_generation_abort(
+                    &reader_abort,
+                    "ordered user-variable delivery failed or was cancelled",
+                );
+            }
+        }
+    }
+}
+
+impl UserVarDeliveryState {
+    fn enqueue(
+        &mut self,
+        delivery: UserVarDelivery,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> anyhow::Result<()> {
+        if self.closed {
+            bail!("user-variable delivery queue is closed");
+        }
+        let count = self
+            .retained_count
+            .checked_add(1)
+            .context("user-variable delivery count overflow")?;
+        let bytes = self
+            .retained_bytes
+            .checked_add(delivery.frame.capacity())
+            .context("user-variable delivery byte count overflow")?;
+        if count > max_count || bytes > max_bytes {
+            bail!(
+                "user-variable delivery would retain {count} frames and {bytes} bytes, \
+                 above limits of {max_count} frames and {max_bytes} bytes"
+            );
+        }
+        self.waiting
+            .try_reserve(1)
+            .context("reserving bounded user-variable delivery")?;
+        self.retained_count = count;
+        self.retained_bytes = bytes;
+        self.waiting.push_back(delivery);
+        Ok(())
+    }
+
+    fn finish(&mut self, bytes: usize) -> anyhow::Result<()> {
+        self.retained_count = self
+            .retained_count
+            .checked_sub(1)
+            .context("user-variable delivery count underflow")?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_sub(bytes)
+            .context("user-variable delivery byte count underflow")?;
+        Ok(())
+    }
+}
+
+impl UserVarDeliveryQueue {
+    fn enqueue(
+        self: &Arc<Self>,
+        authority: &ClientDispatchAuthority,
+        decoded: &DecodedPdu,
+        applied: Option<Sender<anyhow::Result<()>>>,
+        registration: Option<PaneRegistrationHandle>,
+    ) -> anyhow::Result<()> {
+        let frame = decoded
+            .pdu
+            .encode_retained_frame(decoded.serial)
+            .context("retaining an ordered user-variable delivery")?;
+        let mut state = self.state.lock();
+        let reservation = if state.running {
+            None
+        } else {
+            Some(reserve_client_main_thread(
+                MainThreadServiceClass::Topology,
+                CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+                "ordered user-variable delivery",
+            )?)
+        };
+        state.enqueue(
+            UserVarDelivery {
+                frame,
+                applied,
+                registration,
+            },
+            MAX_TOPOLOGY_FENCE_EVENTS,
+            MAX_PRE_READY_UNILATERAL_BYTES,
+        )?;
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        state.running = true;
+        drop(state);
+        let queue = Arc::clone(self);
+        let authority = authority.clone();
+        // Construct the guard before spawning, so cancellation before the
+        // first poll also retires the queue and wakes every snapshot waiter.
+        let mut guard = UserVarWorkerGuard {
+            queue: Arc::clone(&queue),
+            authority: authority.clone(),
+            armed: true,
+        };
+        reservation
+            .spawn(async move {
+                let result = queue.drain(&authority).await;
+                match result {
+                    Ok(()) => guard.disarm(),
+                    Err(error) => log::error!("ordered user-variable delivery failed: {error:#}"),
+                }
+            })
+            .detach();
+        Ok(())
+    }
+
+    async fn drain(&self, authority: &ClientDispatchAuthority) -> anyhow::Result<()> {
+        loop {
+            let delivery = {
+                let mut state = self.state.lock();
+                match state.waiting.pop_front() {
+                    Some(delivery) => delivery,
+                    None => {
+                        state.running = false;
+                        return Ok(());
+                    }
+                }
+            };
+            let UserVarDelivery {
+                frame,
+                applied,
+                registration,
+            } = delivery;
+            let bytes = frame.capacity();
+            let result = async {
+                let decoded = Pdu::decode_retained_frame(frame.as_slice())
+                    .context("decoding ordered user-variable delivery")?;
+                apply_user_var_delivery(authority, decoded, registration).await
+            }
+            .await;
+            self.state.lock().finish(bytes)?;
+            match result {
+                Ok(()) => {
+                    if let Some(applied) = applied {
+                        let _ = applied.try_send(Ok(()));
+                    }
+                }
+                Err(error) => {
+                    if let Some(applied) = applied {
+                        let _ = applied.try_send(Err(anyhow!("{error:#}")));
+                    }
+                    return Err(error);
+                }
+            }
+            // One scheduler turn per occurrence keeps a large snapshot census
+            // or a continuous stream of changes from monopolizing the GUI.
+            let mut yielded = false;
+            poll_fn(|context| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+}
+
+async fn apply_user_var_delivery(
+    authority: &ClientDispatchAuthority,
+    decoded: DecodedPdu,
+    expected_registration: Option<PaneRegistrationHandle>,
+) -> anyhow::Result<()> {
+    if !authority.rpc_generation_is_live() {
+        return Ok(());
+    }
+    let Some(dispatch) = authority.resolve_current()? else {
+        return Ok(());
+    };
+    let pane_id = decoded
+        .pdu
+        .pane_id()
+        .context("ordered user-variable delivery has no pane")?;
+    let admitted = admit_client_pane(&dispatch, pane_id);
+    if let Some(expected) = &expected_registration {
+        let current = admitted
+            .as_ref()
+            .is_some_and(|(_, registration)| registration.same_registration(expected));
+        if !current {
+            return Ok(());
+        }
+    }
+    let Pdu::GetPaneUserVarsV1Response(response) = decoded.pdu else {
+        return process_unilateral_inner_async(dispatch, admitted, pane_id, decoded).await;
+    };
+    if expected_registration.is_none() {
+        // A reply cannot acquire a local registration that did not exist when
+        // its request entered the wire. Live unknown-pane events may discover
+        // topology; a snapshot has only its original request's authority.
+        return Ok(());
+    }
+    let Some((pane, registration)) = admitted else {
+        // The pane was removed between the request and its application. The
+        // response has no authority to recreate it or modify a successor.
+        return Ok(());
+    };
+    let client_pane = pane
+        .downcast_ref::<ClientPane>()
+        .context("user-variable snapshot target is not a client pane")?;
+    let rpc = dispatch.bootstrap_rpc_scope();
+    match response.outcome {
+        PaneUserVarsOutcomeV1::Snapshot { user_vars } => {
+            let changed = client_pane.apply_user_vars_snapshot(&registration, &rpc, user_vars)?;
+            if changed {
+                dispatch.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                    let _ = registration.try_with_current(|_| {
+                        if let Some((_, window_id, _)) =
+                            dispatch.mux.resolve_pane_id(pane.pane_id())
+                        {
+                            // This retained title refresh reaches background
+                            // tabs without manufacturing historical Lua events.
+                            dispatch
+                                .mux
+                                .notify(mux::MuxNotification::WindowInvalidated(window_id));
+                        }
+                    });
+                    Ok(())
+                })?;
+            }
+        }
+        PaneUserVarsOutcomeV1::PaneGone => {
+            client_pane
+                .process_unilateral(
+                    &registration,
+                    &rpc,
+                    Pdu::PaneRemoved(PaneRemoved {
+                        pane_id: response.pane_id,
+                    }),
+                )
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 impl PreReadyUnilateralQueue {
@@ -6176,6 +6598,7 @@ struct PendingRpc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingRpcEffect {
     Ordinary,
+    UserVarsSnapshot { pane_id: PaneId },
     CoherentTopologyFence,
     LegacyTopologyFence,
 }
@@ -7331,6 +7754,7 @@ fn route_client_unilateral_batch(
     generation: NonZeroU64,
     readiness: &RpcReadinessCoordinator,
     pre_ready_unilateral: &mut PreReadyUnilateralQueue,
+    user_vars: &Arc<UserVarDeliveryQueue>,
     decoded_pdus: Vec<DecodedPdu>,
 ) -> anyhow::Result<()> {
     for decoded in decoded_pdus {
@@ -7340,8 +7764,16 @@ fn route_client_unilateral_batch(
             .load(AtomicOrdering::Acquire)
             == generation.get();
         if generation_is_ready {
-            process_unilateral(dispatch_authority, decoded)
-                .context("processing unilateral PDU from server")?;
+            if is_user_var_alert(&decoded.pdu) && !dispatch_authority.is_standalone() {
+                let registration = capture_user_var_registration(
+                    dispatch_authority,
+                    decoded.pdu.pane_id().expect("SetUserVar has a pane"),
+                )?;
+                user_vars.enqueue(dispatch_authority, &decoded, None, registration)?;
+            } else {
+                process_unilateral(dispatch_authority, decoded)
+                    .context("processing unilateral PDU from server")?;
+            }
         } else {
             let (replayed_pdus, replayed_bytes) = readiness.replayed_in_flight();
             pre_ready_unilateral
@@ -7425,6 +7857,10 @@ async fn client_thread_async(
     let mut pre_ready_unilateral = PreReadyUnilateralQueue::default();
     let mut readiness = RpcReadinessCoordinator::default();
     let mut topology = ClientTopologyCoordinator::default();
+    let user_vars = Arc::new(UserVarDeliveryQueue::default());
+    // The pending-RPC bound also bounds these small exact-registration
+    // witnesses, including cancelled calls whose replies remain ordered work.
+    let mut user_var_requests = HashMap::new();
 
     enum NextEvent {
         Message(Result<ReaderMessage, async_channel::RecvError>),
@@ -7529,6 +7965,7 @@ async fn client_thread_async(
                         generation,
                         &readiness,
                         &mut pre_ready_unilateral,
+                        &user_vars,
                         routed,
                     ) {
                         let message = format!(
@@ -7616,6 +8053,7 @@ async fn client_thread_async(
                         generation,
                         &readiness,
                         &mut pre_ready_unilateral,
+                        &user_vars,
                         routed,
                     ) {
                         let message = format!(
@@ -7817,7 +8255,9 @@ async fn client_thread_async(
                             }
                         }
                     }
-                    let effect = if matches!(prepared.pdu(), Pdu::ListPanesCoherent(_)) {
+                    let effect = if let Pdu::GetPaneUserVarsV1(request) = prepared.pdu() {
+                        PendingRpcEffect::UserVarsSnapshot { pane_id: request.pane_id }
+                    } else if matches!(prepared.pdu(), Pdu::ListPanesCoherent(_)) {
                         PendingRpcEffect::CoherentTopologyFence
                     } else if prepared.dialect().is_legacy46()
                         && matches!(prepared.pdu(), Pdu::ListPanes(_))
@@ -7841,6 +8281,9 @@ async fn client_thread_async(
                         Err(error) => return Err(anyhow::Error::new(error)),
                     };
                     match effect {
+                        PendingRpcEffect::UserVarsSnapshot { pane_id } => {
+                            user_var_requests.insert(serial, capture_user_var_registration(dispatch_authority, pane_id)?);
+                        }
                         PendingRpcEffect::CoherentTopologyFence => {
                             topology
                                 .begin_fence(serial)
@@ -8043,6 +8486,7 @@ async fn client_thread_async(
                                             generation,
                                             &readiness,
                                             &mut pre_ready_unilateral,
+                                            &user_vars,
                                             routed,
                                         )?;
                                     }
@@ -8114,6 +8558,7 @@ async fn client_thread_async(
                                             generation,
                                             &readiness,
                                             &mut pre_ready_unilateral,
+                                            &user_vars,
                                             routed,
                                         )?;
                                     }
@@ -8151,6 +8596,7 @@ async fn client_thread_async(
                                             generation,
                                             &readiness,
                                             &mut pre_ready_unilateral,
+                                            &user_vars,
                                             routed,
                                         )?;
                                     }
@@ -8165,6 +8611,11 @@ async fn client_thread_async(
                                     )
                                 })?;
                                 let binding = pending.binding_for_correlated_response(serial);
+                                let user_var_registration = if matches!(effect, PendingRpcEffect::UserVarsSnapshot { .. }) {
+                                    user_var_requests.remove(&serial).context("user-variable reply lost its exact request registration witness")?
+                                } else {
+                                    None
+                                };
                                 let topology_action =
                                     if effect == PendingRpcEffect::CoherentTopologyFence {
                                         Some(topology.on_response(serial, &decoded.pdu)?)
@@ -8188,6 +8639,7 @@ async fn client_thread_async(
                                             generation,
                                             &readiness,
                                             &mut pre_ready_unilateral,
+                                            &user_vars,
                                             routed,
                                         )?;
                                         (false, None)
@@ -8215,8 +8667,30 @@ async fn client_thread_async(
                                         )
                                         .map_err(NotReconnectableError::ProtocolViolation)?;
                                 }
-                                let completion = pending
-                                    .complete(serial, PendingRpcReply::pdu(decoded.pdu))?;
+                                let applied = if let Pdu::GetPaneUserVarsV1Response(response) = &decoded.pdu {
+                                    if effect != (PendingRpcEffect::UserVarsSnapshot { pane_id: response.pane_id }) {
+                                        bail!("user-variable response does not match its exact request pane");
+                                    }
+                                    if dispatch_authority.is_standalone() {
+                                        None
+                                    } else {
+                                        if rpc_transport.ready_generation.load(AtomicOrdering::Acquire) != generation.get() {
+                                            bail!("user-variable hydration preceded committed pane discovery and readiness");
+                                        }
+                                        let (applied, receiver) = bounded(1);
+                                        user_vars.enqueue(dispatch_authority, &decoded, Some(applied), user_var_registration)?;
+                                        Some(receiver)
+                                    }
+                                } else {
+                                    None
+                                };
+                                let reply = match (decoded.pdu, applied) {
+                                    (Pdu::GetPaneUserVarsV1Response(response), Some(applied)) => {
+                                        PendingRpcReply::UserVarsSnapshot { response: Box::new(response), applied }
+                                    }
+                                    (pdu, _) => PendingRpcReply::pdu(pdu),
+                                };
+                                let completion = pending.complete(serial, reply)?;
                                 if awaiting_commit
                                     && completion.disposition == ReplyDisposition::Abandoned
                                 {
@@ -9676,6 +10150,17 @@ impl Client {
 
     fn new(
         local_domain_id: Option<DomainId>,
+        reconnectable: Reconnectable,
+        mux_owner: Weak<Mux>,
+    ) -> Self {
+        Self::new_with_dispatch(local_domain_id, false, reconnectable, mux_owner)
+    }
+
+    /// `request_only` makes a client without a local domain a
+    /// [`ClientDispatchTarget::RequestOnly`] one.
+    fn new_with_dispatch(
+        local_domain_id: Option<DomainId>,
+        request_only: bool,
         mut reconnectable: Reconnectable,
         mux_owner: Weak<Mux>,
     ) -> Self {
@@ -9688,13 +10173,21 @@ impl Client {
         let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
         let rpc_transport = Arc::new(RpcTransportState::new());
         let domain_reconnect_authorized = Arc::new(AtomicBool::new(local_domain_id.is_none()));
-        let initial_dispatch_authority = ClientDispatchAuthority::new(
-            local_domain_id,
-            mux_owner,
-            Arc::clone(&incarnation),
-            Arc::clone(&connection_generation),
-            Arc::clone(&rpc_transport),
-        );
+        let initial_dispatch_authority = if request_only && local_domain_id.is_none() {
+            ClientDispatchAuthority::new_request_only(
+                Arc::clone(&incarnation),
+                Arc::clone(&connection_generation),
+                Arc::clone(&rpc_transport),
+            )
+        } else {
+            ClientDispatchAuthority::new(
+                local_domain_id,
+                mux_owner,
+                Arc::clone(&incarnation),
+                Arc::clone(&connection_generation),
+                Arc::clone(&rpc_transport),
+            )
+        };
         let mut reconnect_dispatch_authority = initial_dispatch_authority.clone();
         let reconnect_authorization = Arc::clone(&domain_reconnect_authorized);
 
@@ -9761,7 +10254,13 @@ impl Client {
                         // that fence, work already bound to the dead transport
                         // can still observe its generation as current after
                         // the reconnect thread has closed.
-                        log::error!("{terminal}; won't try to reconnect");
+                        if terminal == NotReconnectableError::ClientWasDestroyed {
+                            // The owner dropped the client: an orderly end,
+                            // which a one-shot command reaches every time.
+                            log::debug!("{terminal}; closing the reconnect thread");
+                        } else {
+                            log::error!("{terminal}; won't try to reconnect");
+                        }
                         break;
                     }
                     if local_domain_id.is_some()
@@ -9891,6 +10390,8 @@ impl Client {
                                                                 return;
                                                             }
                                                             let result_ui = reattach_ui.clone();
+                                                            let domain_name =
+                                                                dispatch.domain.domain_name().to_string();
                                                             let result =
                                                                 ClientDomain::reattach_if_current(
                                                                     Arc::clone(&dispatch.mux),
@@ -9904,9 +10405,23 @@ impl Client {
                                                                 log::error!(
                                                                     "reconnected mux client reattach failed: {err:#}"
                                                                 );
-                                                                result_ui.output_str(&format!(
-                                                                    "Transport reconnected, but domain {local_domain_id} remains unavailable because codec/topology reattach failed: {err}\n"
-                                                                ));
+                                                                if crate::domain::reattach_needs_fresh_attachment(&err) {
+                                                                    // This attachment is detached next, and the
+                                                                    // auto-connect supervisor reattaches the domain
+                                                                    // in a new window. "Remains unavailable" here
+                                                                    // contradicted that window for the whole
+                                                                    // linger (ft-7lnrp).
+                                                                    result_ui.title(&format!(
+                                                                        "FrankenTerm: {domain_name} mux restarted"
+                                                                    ));
+                                                                    result_ui.output_str(&format!(
+                                                                        "The remote mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
+                                                                    ));
+                                                                } else {
+                                                                    result_ui.output_str(&format!(
+                                                                        "Transport reconnected, but domain {domain_name} remains unavailable because codec/topology reattach failed: {err:#}\n"
+                                                                    ));
+                                                                }
                                                                 return;
                                                             }
                                                             if !dispatch.rpc_generation_is_live() {
@@ -10240,7 +10755,10 @@ impl Client {
         self.local_domain_id
     }
 
-    fn compute_unix_domain(
+    /// The unix domain a command-line client talks to by default:
+    /// `$WEZTERM_UNIX_SOCKET`, else a running GUI of `class_name` (unless
+    /// `prefer_mux`), else the first configured unix domain.
+    pub fn compute_unix_domain(
         prefer_mux: bool,
         class_name: &str,
     ) -> anyhow::Result<config::UnixDomain> {
@@ -10298,6 +10816,28 @@ impl Client {
             Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
         reconnectable.connect(initial, ui, no_auto_start)?;
         Ok(Self::new(local_domain_id, reconnectable, mux_owner))
+    }
+
+    /// Connect a request-only client to `unix_dom`, for one-shot commands
+    /// such as `frankenterm-gui cli`: it has no local domain, keeps no
+    /// topology state and ignores every unilateral notification (see
+    /// [`ClientDispatchTarget::RequestOnly`]). It never starts a mux server
+    /// and never reconnects; if nothing is listening, this fails.
+    pub fn new_request_only_unix_domain(
+        unix_dom: &UnixDomain,
+        ui: &mut ConnectionUI,
+    ) -> anyhow::Result<Self> {
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
+        let initial = false;
+        let no_auto_start = true;
+        reconnectable.connect(initial, ui, no_auto_start)?;
+        Ok(Self::new_with_dispatch(
+            None,
+            true,
+            reconnectable,
+            Weak::new(),
+        ))
     }
 
     pub fn new_tls(
@@ -10556,29 +11096,60 @@ impl TestRpcPeer {
         &self,
         client: &Client,
     ) -> anyhow::Result<()> {
-        let message = self.receiver.recv().await?;
-        let ReaderMessage::SendPdu {
-            binding,
-            lease,
-            promise,
-        } = message
-        else {
-            bail!("expected queued resize request");
-        };
-        let prepared = lease
-            .claim_for_reader()?
-            .context("resize lease cancelled")?;
-        anyhow::ensure!(matches!(prepared.pdu(), Pdu::Resize(_)), "expected resize");
-        let error = client.rpc_transport.retirement_error(
-            binding,
-            RpcRetirementStage::AwaitingResponse,
-            RpcDeliveryCertainty::OutcomeUnknown,
-            "injected resize reply loss after effect became ambiguous",
-        );
-        promise
-            .try_send(Err(anyhow::Error::new(error)))
-            .map_err(|_| anyhow!("resize caller retired before injected reply failure"))?;
-        Ok(())
+        loop {
+            let message = self.receiver.recv().await?;
+            let ReaderMessage::SendPdu {
+                binding,
+                lease,
+                promise,
+            } = message
+            else {
+                bail!("expected queued resize request");
+            };
+            let prepared = lease
+                .claim_for_reader()?
+                .context("resize lease cancelled")?;
+            if let Some((_, reply)) = Self::registration_reply(prepared.pdu()) {
+                // A pane that registered before this resize can still have its
+                // bootstrap poll or palette queued ahead of it.
+                promise
+                    .send(Ok(PendingRpcReply::pdu(reply)))
+                    .await
+                    .map_err(|_| anyhow!("pane-registration RPC caller retired before response"))?;
+                continue;
+            }
+            anyhow::ensure!(matches!(prepared.pdu(), Pdu::Resize(_)), "expected resize");
+            let error = client.rpc_transport.retirement_error(
+                binding,
+                RpcRetirementStage::AwaitingResponse,
+                RpcDeliveryCertainty::OutcomeUnknown,
+                "injected resize reply loss after effect became ambiguous",
+            );
+            promise
+                .try_send(Err(anyhow::Error::new(error)))
+                .map_err(|_| anyhow!("resize caller retired before injected reply failure"))?;
+            return Ok(());
+        }
+    }
+
+    /// The request and the reply a server gives when the request is one that
+    /// pane registration sends: its palette (unit) or its bootstrap liveness
+    /// poll (alive).
+    fn registration_reply(request: &Pdu) -> Option<(Pdu, Pdu)> {
+        match request {
+            Pdu::SetPalette(request) => Some((
+                Pdu::SetPalette(request.clone()),
+                Pdu::UnitResponse(UnitResponse {}),
+            )),
+            Pdu::GetPaneRenderChanges(request) => Some((
+                Pdu::GetPaneRenderChanges(request.clone()),
+                Pdu::LivenessResponse(LivenessResponse {
+                    pane_id: request.pane_id,
+                    is_alive: true,
+                }),
+            )),
+            _ => None,
+        }
     }
 
     pub(crate) async fn discard_next_queued_rpc(&self) -> anyhow::Result<()> {
@@ -10812,6 +11383,60 @@ impl TestRpcPeer {
         Ok(request)
     }
 
+    /// Answer the next queued request, which must be one a pane sends when it
+    /// registers: its palette (unit reply) or its liveness poll (alive).
+    pub(crate) async fn respond_next_registration_request(&self) -> anyhow::Result<Pdu> {
+        let message = self
+            .receiver
+            .recv()
+            .await
+            .context("test RPC peer queue closed before pane-registration request")?;
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
+            bail!("test RPC peer received a non-PDU control message");
+        };
+        if !lease.matches(binding) {
+            bail!("test pane-registration RPC lease lost its exact binding");
+        }
+        let prepared = lease.claim_for_reader()?.ok_or_else(|| {
+            anyhow!("test pane-registration RPC was cancelled before reader claim")
+        })?;
+        let Some((request, reply)) = Self::registration_reply(prepared.pdu()) else {
+            bail!(
+                "test pane-registration RPC peer received unexpected {}",
+                prepared.pdu().pdu_name()
+            );
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(reply)))
+            .await
+            .map_err(|_| anyhow!("test pane-registration RPC caller retired before response"))?;
+        drop(prepared);
+        Ok(request)
+    }
+
+    /// Answer every request that pane registration queues (each pane's
+    /// palette and, on a current-codec connection, its bootstrap liveness
+    /// poll) until `run_until_idle` leaves the queue empty. Returns the
+    /// requests in arrival order.
+    pub(crate) fn answer_pane_registration(&self, mut run_until_idle: impl FnMut()) -> Vec<Pdu> {
+        let mut requests = Vec::new();
+        loop {
+            run_until_idle();
+            if self.receiver.is_empty() {
+                return requests;
+            }
+            requests.push(
+                promise::spawn::block_on(self.respond_next_registration_request())
+                    .expect("pane registration sends only its palette and its liveness poll"),
+            );
+        }
+    }
+
     pub(crate) async fn respond_next_lines(
         &self,
         lines: Vec<(wezterm_term::StableRowIndex, wezterm_term::Line)>,
@@ -10889,6 +11514,82 @@ impl TestRpcPeer {
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.receiver.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn queued_len(&self) -> usize {
+        self.receiver.len()
+    }
+
+    pub(crate) async fn respond_next_user_vars(
+        &self,
+        outcome: PaneUserVarsOutcomeV1,
+    ) -> anyhow::Result<PaneId> {
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = self.receiver.recv().await?
+        else {
+            bail!("expected user-variable snapshot RPC");
+        };
+        anyhow::ensure!(lease.matches(binding), "user-variable RPC lease mismatch");
+        let prepared = lease
+            .claim_for_reader()?
+            .context("user-variable RPC cancelled")?;
+        let Pdu::GetPaneUserVarsV1(request) = prepared.pdu() else {
+            bail!("unexpected user-variable RPC {}", prepared.pdu().pdu_name());
+        };
+        let pane_id = request.pane_id;
+        promise
+            .send(Ok(PendingRpcReply::pdu(Pdu::GetPaneUserVarsV1Response(
+                GetPaneUserVarsV1Response { pane_id, outcome },
+            ))))
+            .await
+            .map_err(|_| anyhow!("user-variable caller retired"))?;
+        Ok(pane_id)
+    }
+
+    /// Answers the next user-variable snapshot with an empty snapshot, or,
+    /// when `busy(pane)`, refuses it as a server does while the pane's
+    /// sources are busy (`quota_exceeded`, retry after backoff). Returns the
+    /// pane and whether it was refused.
+    pub(crate) async fn answer_next_user_vars(
+        &self,
+        busy: impl Fn(PaneId) -> bool,
+    ) -> anyhow::Result<(PaneId, bool)> {
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = self.receiver.recv().await?
+        else {
+            bail!("expected user-variable snapshot RPC");
+        };
+        anyhow::ensure!(lease.matches(binding), "user-variable RPC lease mismatch");
+        let prepared = lease
+            .claim_for_reader()?
+            .context("user-variable RPC cancelled")?;
+        let Pdu::GetPaneUserVarsV1(request) = prepared.pdu() else {
+            bail!("unexpected user-variable RPC {}", prepared.pdu().pdu_name());
+        };
+        let pane_id = request.pane_id;
+        let refused = busy(pane_id);
+        let reply = if refused {
+            Pdu::ErrorResponse(ErrorResponse::quota_exceeded(GetPaneUserVarsV1::IDENT))
+        } else {
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id,
+                outcome: PaneUserVarsOutcomeV1::Snapshot {
+                    user_vars: HashMap::new(),
+                },
+            })
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(reply)))
+            .await
+            .map_err(|_| anyhow!("user-variable caller retired"))?;
+        Ok((pane_id, refused))
     }
 }
 
@@ -13591,6 +14292,7 @@ mod tests {
         expected.extend(22..=78);
         expected.extend(81..=83);
         expected.extend(96..=109);
+        expected.extend(115..=116);
 
         let actual = Pdu::all_wire_specs()
             .iter()
@@ -13656,6 +14358,40 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// ft-bsgyk: the user-variable hydration pair is active once codec 70 is
+    /// agreed, and refused before registration or on an older dialect.
+    #[test]
+    fn user_var_endpoints_require_v70_and_registered_protocol() {
+        let generation = NonZeroU64::new(17).unwrap();
+        let request = &<GetPaneUserVarsV1 as PduWireIdent>::WIRE_SPEC;
+        let reply = &<GetPaneUserVarsV1Response as PduWireIdent>::WIRE_SPEC;
+        let current = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        for point in [
+            RpcOutboundAdmissionPoint::Preflight,
+            RpcOutboundAdmissionPoint::Enqueue,
+            RpcOutboundAdmissionPoint::Dequeue,
+        ] {
+            current.validate_outbound(request, point).unwrap();
+        }
+        current
+            .validate_inbound(reply, PduWireRole::CorrelatedReply)
+            .unwrap();
+        let bootstrap = RpcProtocolAuthority::new(generation);
+        assert!(matches!(
+            bootstrap.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+        let older = RpcProtocolAuthority::established_for_test(generation, 69);
+        assert!(matches!(
+            older.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 70, .. })
+        ));
+        assert!(matches!(
+            older.validate_inbound(reply, PduWireRole::CorrelatedReply),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 70, .. })
+        ));
     }
 
     #[test]
@@ -20195,6 +20931,215 @@ mod tests {
         assert_eq!(batch_queue.waiting_bytes, 0);
     }
 
+    #[test]
+    fn user_variable_rpc_completion_waits_for_ordered_application_acknowledgment() {
+        asupersync_block_on(async {
+            let config = ClientDomainConfig::Unix(UnixDomain::default());
+            let (client, peer) = Client::new_test_client_with_rpc_peer(Some(42), config);
+            let rpc = client.rpc_scope();
+            let mut request =
+                Box::pin(rpc.get_pane_user_vars_v1(GetPaneUserVarsV1 { pane_id: 61 }));
+            assert!(matches!(
+                poll_fn(|context| Poll::Ready(request.as_mut().poll(context))).await,
+                Poll::Pending
+            ));
+            let ReaderMessage::SendPdu {
+                binding,
+                lease,
+                promise,
+            } = peer.receiver.recv().await.unwrap()
+            else {
+                panic!("expected metadata request");
+            };
+            assert!(lease.matches(binding));
+            let prepared = lease.claim_for_reader().unwrap().unwrap();
+            assert!(matches!(
+                prepared.pdu(),
+                Pdu::GetPaneUserVarsV1(GetPaneUserVarsV1 { pane_id: 61 })
+            ));
+            let (applied, application) = bounded(1);
+            promise
+                .send(Ok(PendingRpcReply::UserVarsSnapshot {
+                    response: Box::new(GetPaneUserVarsV1Response {
+                        pane_id: 61,
+                        outcome: PaneUserVarsOutcomeV1::Snapshot {
+                            user_vars: HashMap::new(),
+                        },
+                    }),
+                    applied: application,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    poll_fn(|context| Poll::Ready(request.as_mut().poll(context))).await,
+                    Poll::Pending
+                ),
+                "wire decoding alone must not complete a hydration request"
+            );
+            applied.send(Ok(())).await.unwrap();
+            assert_eq!(request.await.unwrap().pane_id, 61);
+        });
+    }
+
+    #[test]
+    fn user_variable_delivery_preserves_snapshot_cuts_and_repeated_occurrences() {
+        let mut state = UserVarDeliveryState::default();
+        let live = || {
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 61,
+                alert: wezterm_term::Alert::SetUserVar {
+                    name: "status".into(),
+                    value: "ready".into(),
+                },
+            })
+        };
+        let expected = vec![
+            (0, live()),
+            (
+                7,
+                Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                    pane_id: 61,
+                    outcome: PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::from([("status".into(), "snapshot".into())]),
+                    },
+                }),
+            ),
+            (0, live()),
+            (0, live()),
+        ];
+        for (serial, pdu) in &expected {
+            state
+                .enqueue(
+                    UserVarDelivery {
+                        frame: pdu.encode_retained_frame(*serial).unwrap(),
+                        applied: None,
+                        registration: None,
+                    },
+                    4,
+                    4096,
+                )
+                .unwrap();
+        }
+        for (serial, pdu) in expected {
+            let delivery = state.waiting.pop_front().unwrap();
+            let decoded = Pdu::decode_retained_frame(delivery.frame.as_slice()).unwrap();
+            assert_eq!(decoded.serial, serial);
+            assert_eq!(
+                decoded.pdu, pdu,
+                "equal live values remain separate ordered occurrences"
+            );
+            state.finish(delivery.frame.capacity()).unwrap();
+        }
+        assert_eq!((state.retained_count, state.retained_bytes), (0, 0));
+    }
+
+    #[test]
+    fn user_variable_delivery_bounds_include_the_inflight_frame() {
+        let mut state = UserVarDeliveryState::default();
+        state
+            .enqueue(
+                UserVarDelivery {
+                    frame: vec![0; 12],
+                    applied: None,
+                    registration: None,
+                },
+                1,
+                12,
+            )
+            .unwrap();
+        let inflight = state.waiting.pop_front().unwrap();
+        assert!(state.waiting.is_empty());
+        assert!(
+            state
+                .enqueue(
+                    UserVarDelivery {
+                        frame: vec![0],
+                        applied: None,
+                        registration: None,
+                    },
+                    1,
+                    13
+                )
+                .is_err(),
+            "popping a frame must not release its count before application"
+        );
+        assert!(
+            state
+                .enqueue(
+                    UserVarDelivery {
+                        frame: vec![0],
+                        applied: None,
+                        registration: None,
+                    },
+                    2,
+                    12
+                )
+                .is_err(),
+            "popping a frame must not release its payload budget before application"
+        );
+        assert_eq!((state.retained_count, state.retained_bytes), (1, 12));
+        state.finish(inflight.frame.capacity()).unwrap();
+        state
+            .enqueue(
+                UserVarDelivery {
+                    frame: vec![0; 12],
+                    applied: None,
+                    registration: None,
+                },
+                1,
+                12,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cancelling_user_variable_worker_wakes_snapshot_waiters_and_fences_only_its_generation() {
+        let authority = standalone_dispatch_authority();
+        let queue = Arc::new(UserVarDeliveryQueue::default());
+        let (applied, receiver) = bounded(1);
+        queue
+            .state
+            .lock()
+            .enqueue(
+                UserVarDelivery {
+                    frame: Vec::new(),
+                    applied: Some(applied),
+                    registration: None,
+                },
+                1,
+                1,
+            )
+            .unwrap();
+        let guard = UserVarWorkerGuard {
+            queue: Arc::clone(&queue),
+            authority: authority.clone(),
+            armed: true,
+        };
+        drop(guard);
+        assert!(
+            receiver.is_closed(),
+            "cancellation before first poll must release the snapshot acknowledgment"
+        );
+        assert!(!authority.rpc_generation_is_live());
+        assert!(queue.state.lock().closed);
+
+        let old = standalone_dispatch_authority();
+        let guard = UserVarWorkerGuard {
+            queue: Arc::new(UserVarDeliveryQueue::default()),
+            authority: old.clone(),
+            armed: true,
+        };
+        let (_, reader) = unbounded();
+        let successor = old.advance_generation(&reader).unwrap();
+        successor.activate_rpc_transport().unwrap();
+        drop(guard);
+        assert!(
+            successor.rpc_generation_is_live(),
+            "a stale worker must not retire the reconnect successor"
+        );
+    }
+
     fn standalone_dispatch_authority() -> ClientDispatchAuthority {
         ClientDispatchAuthority::new(
             None,
@@ -20203,6 +21148,64 @@ mod tests {
             Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             Arc::new(RpcTransportState::new()),
         )
+    }
+
+    fn request_only_dispatch_authority() -> ClientDispatchAuthority {
+        ClientDispatchAuthority::new_request_only(
+            Arc::new(ClientIncarnation),
+            Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            Arc::new(RpcTransportState::new()),
+        )
+    }
+
+    /// The server announces topology changes to every connection, including
+    /// the tab a one-shot `cli spawn` itself created. A request-only client
+    /// must not fail on them, while a plain standalone client still does.
+    #[test]
+    fn request_only_client_ignores_every_unilateral_update() {
+        let topology = || {
+            [
+                Pdu::PaneRemoved(PaneRemoved { pane_id: 9 }),
+                Pdu::TabAddedToWindow(TabAddedToWindow {
+                    tab_id: 4,
+                    window_id: 2,
+                }),
+                Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
+                    window_id: 7,
+                    workspace: "ops".into(),
+                }),
+                Pdu::RenameWorkspace(RenameWorkspace {
+                    old_workspace: "default".into(),
+                    new_workspace: "ops".into(),
+                }),
+            ]
+        };
+
+        let request_only = request_only_dispatch_authority();
+        assert!(request_only.is_standalone());
+        assert!(request_only.captured_mux().is_none());
+        for pdu in topology() {
+            let name = pdu.pdu_name();
+            if let Err(err) = process_unilateral(&request_only, unilateral(pdu)) {
+                panic!("request-only client failed on {}: {:#}", name, err);
+            }
+        }
+        let cosmetic = Pdu::WindowTitleChanged(WindowTitleChanged {
+            window_id: 3,
+            title: "dev shell".into(),
+        });
+        assert!(process_unilateral(&request_only, unilateral(cosmetic)).is_ok());
+
+        let standalone = standalone_dispatch_authority();
+        assert!(!standalone.is_request_only());
+        for pdu in topology() {
+            let name = pdu.pdu_name();
+            assert!(
+                process_unilateral(&standalone, unilateral(pdu)).is_err(),
+                "a standalone client must still reject {}",
+                name
+            );
+        }
     }
 
     #[test]

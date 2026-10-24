@@ -31,8 +31,8 @@ mod web_tests {
     use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
     #[cfg(feature = "asupersync-runtime")]
     use frankenterm_core::web_framework::{
-        FrameworkApp, FrameworkResponse, FrameworkResponseBody, FrameworkStartupHookError,
-        FrameworkWebRuntime,
+        FrameworkApp, FrameworkAppConfig, FrameworkResponse, FrameworkResponseBody,
+        FrameworkStartupHookError, FrameworkWebRuntime,
     };
 
     fn run_async_test<F>(future: F)
@@ -323,35 +323,262 @@ mod web_tests {
         });
     }
 
-    /// A chunked body carries no Content-Length, so only the parser's own
-    /// bound can refuse it. That bound follows the advertised body cap
-    /// (64 KiB + header allowance), not the framework's 1 MiB default.
-    #[test]
-    fn web_chunked_body_over_the_cap_is_refused_at_the_parser() {
-        fn chunked_request(total: usize) -> Vec<u8> {
-            let mut request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\
-                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                .to_vec();
-            let chunk = vec![b'x'; 16 * 1024];
-            let mut sent = 0;
-            while sent < total {
-                let len = chunk.len().min(total - sent);
-                request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
-                request.extend_from_slice(&chunk[..len]);
-                request.extend_from_slice(b"\r\n");
-                sent += len;
-            }
-            request.extend_from_slice(b"0\r\n\r\n");
-            request
-        }
+    fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+        let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
 
+    async fn fetch_path(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        fetch_raw(addr, request.as_bytes()).await
+    }
+
+    /// `ft web --ui-dir` serves exactly the manifest's verified files under
+    /// `/ui/`, beside an unchanged API; nothing else on disk is reachable.
+    #[test]
+    fn web_serves_verified_ui_package_beside_the_api() {
+        use frankenterm_core::web::{UI_PACKAGE_SCHEMA, UiAssetSet};
+        use sha2::{Digest, Sha256};
+
+        let package = tempfile::tempdir().unwrap();
+        let files: &[(&str, &str)] = &[
+            ("index.html", "<!doctype html><title>fleet viewer</title>"),
+            ("app.mjs", "export const viewer = true;"),
+            ("pkg/viewer_bg.wasm", "wasm-module-bytes"),
+        ];
+        let mut listed = serde_json::Map::new();
+        for (rel, text) in files {
+            let path = package.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            listed.insert(
+                (*rel).to_string(),
+                hex::encode(Sha256::digest(text.as_bytes())).into(),
+            );
+        }
+        std::fs::write(
+            package.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"schema": UI_PACKAGE_SCHEMA, "files": listed}))
+                .unwrap(),
+        )
+        .unwrap();
+        // On disk inside the package directory, but not in the manifest.
+        std::fs::write(package.path().join("secret.txt"), "never served").unwrap();
+        let set = Arc::new(UiAssetSet::load(package.path()).expect("package verifies"));
+
+        run_async_test(async move {
+            let server =
+                start_web_server(WebServerConfig::default().with_port(0).with_ui_assets(set))
+                    .await
+                    .unwrap();
+            let addr = server.bound_addr();
+            let index = fetch_path(addr, "/ui/").await;
+            let bare = fetch_path(addr, "/ui").await;
+            let module = fetch_path(addr, "/ui/app.mjs").await;
+            let wasm = fetch_path(addr, "/ui/pkg/viewer_bg.wasm").await;
+            let unlisted = fetch_path(addr, "/ui/secret.txt").await;
+            let manifest = fetch_path(addr, "/ui/manifest.json").await;
+            let health = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            let index = index.unwrap();
+            assert_eq!(extract_status(&index), 200, "{index}");
+            assert_eq!(extract_body(&index), files[0].1);
+            assert_eq!(
+                header_value(&index, "content-type"),
+                Some("text/html; charset=utf-8")
+            );
+            let csp = header_value(&index, "content-security-policy").expect("CSP on the page");
+            assert!(
+                csp.contains("script-src 'self' 'wasm-unsafe-eval'"),
+                "{csp}"
+            );
+            assert_eq!(header_value(&index, "x-frame-options"), Some("DENY"));
+
+            let bare = bare.unwrap();
+            assert_eq!(extract_status(&bare), 308, "{bare}");
+            assert_eq!(header_value(&bare, "location"), Some("/ui/"));
+
+            let module = module.unwrap();
+            assert_eq!(extract_status(&module), 200);
+            assert_eq!(
+                header_value(&module, "content-type"),
+                Some("text/javascript; charset=utf-8")
+            );
+            assert_eq!(
+                header_value(&module, "x-content-type-options"),
+                Some("nosniff")
+            );
+            let wasm = wasm.unwrap();
+            assert_eq!(
+                header_value(&wasm, "content-type"),
+                Some("application/wasm")
+            );
+            assert_eq!(extract_body(&wasm), files[2].1);
+
+            assert_eq!(extract_status(&unlisted.unwrap()), 404);
+            assert_eq!(extract_status(&manifest.unwrap()), 404);
+            assert_eq!(extract_status(&health.unwrap()), 200);
+        });
+    }
+
+    /// Without a package there is no `/ui/` at all.
+    #[test]
+    fn web_without_ui_package_has_no_ui_routes() {
         run_async_test(async {
             let server = start_web_server(WebServerConfig::default().with_port(0))
                 .await
                 .unwrap();
             let addr = server.bound_addr();
-            let small = fetch_raw(addr, &chunked_request(1024)).await;
-            let oversized = fetch_raw(addr, &chunked_request(300 * 1024)).await;
+            let index = fetch_path(addr, "/ui/").await;
+            server.shutdown().await.unwrap();
+            assert_eq!(extract_status(&index.unwrap()), 404);
+        });
+    }
+
+    /// Build real chunk framing with many chunks, so the body cap is tested
+    /// against the aggregate decoded payload rather than a single chunk.
+    fn chunked_health_request(total: usize, connection: &str) -> Vec<u8> {
+        let mut request = format!(
+            "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+             Transfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
+        )
+        .into_bytes();
+        let chunk = [b'x'; 257];
+        let mut sent = 0;
+        while sent < total {
+            let len = chunk.len().min(total - sent);
+            request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            request.extend_from_slice(&chunk[..len]);
+            request.extend_from_slice(b"\r\n");
+            sent += len;
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+        request
+    }
+
+    /// The parser's wire bound includes header space. That extra allowance
+    /// must not let a slightly oversized decoded chunked body reach /health.
+    #[test]
+    fn web_decoded_body_cap_has_exact_boundaries_for_both_framings() {
+        run_async_test(async {
+            let mut limits = WebServerConfig::default().runtime_limits();
+            limits.max_request_body_bytes = 1024;
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let mut observed = Vec::new();
+            for size in [0, 1023, 1024, 1025, 16 * 1024] {
+                let chunked = fetch_raw(addr, &chunked_health_request(size, "close")).await;
+                let mut fixed = format!(
+                    "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                fixed.resize(fixed.len() + size, b'x');
+                let fixed = fetch_raw(addr, &fixed).await;
+                observed.push((size, chunked, fixed));
+            }
+            let healthy = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            for (size, chunked, fixed) in observed {
+                for response in [chunked, fixed] {
+                    let response =
+                        response.expect("bounded requests must receive a finite response");
+                    let expected = if size > 1024 { 413 } else { 200 };
+                    assert_eq!(extract_status(&response), expected, "body size {size}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(extract_body(&response)).unwrap();
+                    assert_eq!(body["ok"], size <= 1024);
+                    if size > 1024 {
+                        assert_eq!(body["error_code"], "body_too_large");
+                        assert_eq!(header_value(&response, "connection"), Some("close"));
+                    }
+                }
+            }
+            assert_eq!(extract_status(&healthy.unwrap()), 200);
+        });
+    }
+
+    /// Exercise the production runtime's admission wiring with a handler
+    /// effect counter. Middleware-only rejection is insufficient: the pinned
+    /// server overrides a middleware Connection: close response and would
+    /// otherwise dispatch the already-buffered second request.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_oversized_body_closes_before_handler_or_pipelined_followup() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let handler_effects = Arc::clone(&effects);
+            let app = FrameworkApp::builder()
+                .config(FrameworkAppConfig::new().max_body_size(1024))
+                .get("/health", move |_, _| {
+                    handler_effects.fetch_add(1, Ordering::SeqCst);
+                    async { FrameworkResponse::ok() }
+                })
+                .build();
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("production runtime should start");
+            let positive = fetch_health(addr).await;
+            let effects_after_positive = effects.load(Ordering::SeqCst);
+            let mut pipeline = chunked_health_request(1025, "keep-alive");
+            pipeline.extend_from_slice(
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+            let rejected = fetch_raw(addr, &pipeline).await;
+            let effects_after_rejection = effects.load(Ordering::SeqCst);
+            let next_connection = fetch_health(addr).await;
+            let effects_after_next = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(
+                effects_after_positive, 1,
+                "positive control must invoke the handler"
+            );
+            let response = rejected.expect("oversize admission must return a finite 413");
+            assert_eq!(extract_status(&response), 413);
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
+            assert_eq!(
+                effects_after_rejection, 1,
+                "neither the rejected request nor its pipelined follower may run"
+            );
+            assert_eq!(extract_status(&next_connection.unwrap()), 200);
+            assert_eq!(
+                effects_after_next, 2,
+                "a fresh connection must remain usable"
+            );
+        });
+    }
+
+    /// Much larger chunked requests are still refused by the parser's own
+    /// total wire bound (64 KiB + header allowance). The application guard
+    /// above does not replace that earlier bounded-collection protection.
+    #[test]
+    fn web_chunked_body_over_the_cap_is_refused_at_the_parser() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let small = fetch_raw(addr, &chunked_health_request(1024, "close")).await;
+            let oversized = fetch_raw(addr, &chunked_health_request(300 * 1024, "close")).await;
             let shutdown = server.shutdown().await;
             shutdown.unwrap();
 

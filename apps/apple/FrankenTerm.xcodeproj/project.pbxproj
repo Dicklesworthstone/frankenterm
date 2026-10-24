@@ -1,0 +1,272 @@
+// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {};
+    objectVersion = 56;
+    objects = {
+/* Begin PBXBuildFile section */
+        A10000000000000000000001 = {isa = PBXBuildFile; fileRef = A20000000000000000000001; };
+        A10000000000000000000002 = {isa = PBXBuildFile; fileRef = A20000000000000000000002; };
+        A10000000000000000000003 = {isa = PBXBuildFile; productRef = A90000000000000000000001; };
+        A10000000000000000000004 = {isa = PBXBuildFile; productRef = A90000000000000000000002; };
+        A10000000000000000000005 = {isa = PBXBuildFile; fileRef = A20000000000000000000005; };
+        A10000000000000000000006 = {isa = PBXBuildFile; fileRef = A20000000000000000000006; };
+        A10000000000000000000007 = {isa = PBXBuildFile; productRef = A90000000000000000000006; };
+        A10000000000000000000008 = {isa = PBXBuildFile; productRef = A90000000000000000000007; };
+        A10000000000000000000009 = {isa = PBXBuildFile; productRef = A90000000000000000000008; };
+        A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A20000000000000000000007; };
+        A1000000000000000000000B = {isa = PBXBuildFile; productRef = A90000000000000000000009; };
+        A1000000000000000000000C = {isa = PBXBuildFile; productRef = A9000000000000000000000A; };
+        A1000000000000000000000D = {isa = PBXBuildFile; fileRef = A20000000000000000000009; };
+        A1000000000000000000000E = {isa = PBXBuildFile; productRef = A9000000000000000000000B; };
+        A1000000000000000000000F = {isa = PBXBuildFile; productRef = A9000000000000000000000C; };
+        A10000000000000000000010 = {isa = PBXBuildFile; fileRef = A2000000000000000000000A; };
+        A10000000000000000000011 = {isa = PBXBuildFile; fileRef = A2000000000000000000000B; };
+        A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A2000000000000000000000C; };
+        A10000000000000000000013 = {isa = PBXBuildFile; fileRef = A2000000000000000000000D; };
+        A10000000000000000000014 = {isa = PBXBuildFile; fileRef = A2000000000000000000000F; };
+        A10000000000000000000015 = {isa = PBXBuildFile; fileRef = A20000000000000000000010; };
+        A10000000000000000000016 = {isa = PBXBuildFile; fileRef = A20000000000000000000011; };
+        A10000000000000000000017 = {isa = PBXBuildFile; fileRef = A20000000000000000000012; };
+        A10000000000000000000018 = {isa = PBXBuildFile; fileRef = A20000000000000000000013; };
+        A10000000000000000000019 = {isa = PBXBuildFile; fileRef = A20000000000000000000014; };
+        A1000000000000000000001A = {isa = PBXBuildFile; fileRef = A20000000000000000000015; };
+        A1000000000000000000001B = {isa = PBXBuildFile; fileRef = A20000000000000000000016; };
+/* End PBXBuildFile section */
+/* Begin PBXContainerItemProxy section */
+        A7000000000000000000000A = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
+        A7000000000000000000000E = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
+/* End PBXContainerItemProxy section */
+/* Begin PBXFileReference section */
+        A20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermApp.swift; path = ../ios/FrankenTerm/FrankenTermApp.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermExportApp.swift; path = ../macos/FrankenTermExport/FrankenTermExportApp.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrankenTerm.app; sourceTree = BUILT_PRODUCTS_DIR; };
+        A20000000000000000000004 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrankenTermExport.app; sourceTree = BUILT_PRODUCTS_DIR; };
+        A20000000000000000000005 = {isa = PBXFileReference; explicitFileType = text; name = background.metal; path = ../../crates/frankenterm-renderer-metal/src/shaders/background.metal; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000006 = {isa = PBXFileReference; explicitFileType = text; name = text.metal; path = ../../crates/frankenterm-renderer-metal/src/shaders/text.metal; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NativeTerminalRenderTests.swift; path = ../ios/FrankenTermTests/NativeTerminalRenderTests.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+        A20000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LiveSSHTerminalTests.swift; path = ../ios/FrankenTermTests/LiveSSHTerminalTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000D = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OfflineRestoreConnectUITests.swift; path = ../ios/FrankenTermUITests/OfflineRestoreConnectUITests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000E = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FrankenTermUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+        A2000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionControllerTests.swift; path = ../ios/FrankenTermTests/TerminalSessionControllerTests.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionScreen.swift; path = ../ios/FrankenTerm/TerminalSessionScreen.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = WorkspaceTerminalScene.swift; path = ../ios/FrankenTerm/WorkspaceTerminalScene.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalSessionHistoryPersistenceTests.swift; path = FrankenTermKit/Tests/FrankenTermKitTests/TerminalSessionHistoryPersistenceTests.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StoreTestPersistence.swift; path = FrankenTermKit/Tests/FrankenTermKitTests/StoreTestPersistence.swift; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = file; name = SymbolsNerdFontMono-Regular.ttf; path = ../../frankenterm/assets/fonts/SymbolsNerdFontMono-Regular.ttf; sourceTree = SOURCE_ROOT; };
+        A2000000000000000000000F = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = Pragmasevka-LICENSE.md; path = ../ios/FrankenTerm/Fonts/Pragmasevka-LICENSE.md; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = text; name = NerdFonts-LICENSE.txt; path = ../ios/FrankenTerm/Fonts/NerdFonts-LICENSE.txt; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = text.json; name = ThemeCatalog.json; path = ../ios/FrankenTerm/ThemeCatalog.json; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MachineThemePicker.swift; path = ../ios/FrankenTerm/MachineThemePicker.swift; sourceTree = SOURCE_ROOT; };
+        A20000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TerminalHistoryScreen.swift; path = ../ios/FrankenTerm/TerminalHistoryScreen.swift; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+/* Begin PBXFrameworksBuildPhase section */
+        A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
+        A30000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
+        A30000000000000000000004 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A30000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000E, A1000000000000000000000F,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+/* Begin PBXGroup section */
+        A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000011, A20000000000000000000015, A20000000000000000000016, A20000000000000000000014, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A20000000000000000000012, A20000000000000000000013, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
+        A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008, A2000000000000000000000E,); name = Products; sourceTree = "<group>"; };
+        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A, A2000000000000000000000F, A20000000000000000000010,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
+/* End PBXGroup section */
+/* Begin PBXNativeTarget section */
+        A50000000000000000000001 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A80000000000000000000002;
+            buildPhases = (A60000000000000000000001, A30000000000000000000001, A60000000000000000000003, A60000000000000000000007,);
+            buildRules = (); dependencies = ();
+            name = FrankenTerm;
+            packageProductDependencies = (A90000000000000000000001, A90000000000000000000006, A90000000000000000000007, A90000000000000000000008,);
+            productName = FrankenTerm; productReference = A20000000000000000000003;
+            productType = "com.apple.product-type.application";
+        };
+        A50000000000000000000002 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A80000000000000000000003;
+            buildPhases = (A60000000000000000000002, A30000000000000000000002, A60000000000000000000004, A60000000000000000000008,);
+            buildRules = (); dependencies = ();
+            name = FrankenTermExport;
+            packageProductDependencies = (A90000000000000000000002,);
+            productName = FrankenTermExport; productReference = A20000000000000000000004;
+            productType = "com.apple.product-type.application";
+        };
+        A50000000000000000000003 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A80000000000000000000004;
+            buildPhases = (A60000000000000000000005, A30000000000000000000003,);
+            buildRules = (); dependencies = (A7000000000000000000000B,);
+            name = FrankenTermTests;
+            packageProductDependencies = (A90000000000000000000009, A9000000000000000000000A, A9000000000000000000000B, A9000000000000000000000C,);
+            productName = FrankenTermTests; productReference = A20000000000000000000008;
+            productType = "com.apple.product-type.bundle.unit-test";
+        };
+        A50000000000000000000004 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A80000000000000000000005;
+            buildPhases = (A60000000000000000000006, A30000000000000000000004,);
+            buildRules = (); dependencies = (A7000000000000000000000F,);
+            name = FrankenTermUITests;
+            productName = FrankenTermUITests; productReference = A2000000000000000000000E;
+            productType = "com.apple.product-type.bundle.ui-testing";
+        };
+/* End PBXNativeTarget section */
+/* Begin PBXProject section */
+        A70000000000000000000001 = {
+            isa = PBXProject;
+            attributes = {BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 2600; TargetAttributes = {
+                A50000000000000000000001 = {CreatedOnToolsVersion = 26.0; };
+                A50000000000000000000002 = {CreatedOnToolsVersion = 26.0; };
+                A50000000000000000000003 = {CreatedOnToolsVersion = 26.0; TestTargetID = A50000000000000000000001; };
+                A50000000000000000000004 = {CreatedOnToolsVersion = 26.0; TestTargetID = A50000000000000000000001; };
+            }; };
+            buildConfigurationList = A80000000000000000000001;
+            compatibilityVersion = "Xcode 14.0";
+            developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,);
+            mainGroup = A40000000000000000000001;
+            packageReferences = (A90000000000000000000003, A90000000000000000000004, A90000000000000000000005,);
+            productRefGroup = A40000000000000000000002;
+            projectDirPath = ""; projectRoot = "";
+            targets = (A50000000000000000000001, A50000000000000000000002, A50000000000000000000003, A50000000000000000000004,);
+        };
+/* End PBXProject section */
+/* Begin PBXResourcesBuildPhase section */
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015, A10000000000000000000019,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+/* Begin PBXShellScriptBuildPhase section */
+        A60000000000000000000007 = {isa = PBXShellScriptBuildPhase; buildActionMask = 2147483647; files = ();
+            name = "Bundle Pragmasevka Nerd Font";
+            inputPaths = ("$(SRCROOT)/../../crates/frankenterm/assets/Pragmasevka_NF.zip.zst",);
+            outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-regular.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bold.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-italic.ttf", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/pragmasevka-nf-bolditalic.ttf",);
+            runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh;
+            shellScript = "# The desktop's default font (OFL 1.1; Fonts/Pragmasevka-LICENSE.md) is tracked\n# once as a zstd tar; extract the four faces rather than duplicating them in git.\nset -eu\n/usr/bin/tar -xf \"${SCRIPT_INPUT_FILE_0}\" -C \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\" pragmasevka-nf-regular.ttf pragmasevka-nf-bold.ttf pragmasevka-nf-italic.ttf pragmasevka-nf-bolditalic.ttf\n";
+        };
+        A60000000000000000000008 = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = ();
+            name = "Bundle frankenterm-machines helper";
+            inputPaths = (); outputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/frankenterm-machines",);
+            runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh;
+            shellScript = "# At launch the companion runs this helper to load this Mac's FrankenTerm\n# machines and the keys their routes use. scripts/build-apple-machines-helper.sh\n# builds it; without it the app falls back to an ft that has `ft mobile source`.\nset -eu\nhelper=\"${SRCROOT}/../macos/FrankenTermExport/Artifacts/frankenterm-machines\"\nif [ ! -x \"$helper\" ]; then\n    echo \"warning: $helper is missing; run scripts/build-apple-machines-helper.sh to bundle it\"\n    exit 0\nfi\ndestination=\"${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/frankenterm-machines\"\n/usr/bin/ditto \"$helper\" \"$destination\"\n/usr/bin/codesign --force --options runtime --timestamp=none --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"$destination\"\n";
+        };
+/* End PBXShellScriptBuildPhase section */
+/* Begin PBXSourcesBuildPhase section */
+        A60000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000011, A10000000000000000000016, A1000000000000000000001A, A1000000000000000000001B,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A, A1000000000000000000000D, A10000000000000000000012, A10000000000000000000017, A10000000000000000000018,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+/* Begin PBXTargetDependency section */
+        A7000000000000000000000B = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000A; };
+        A7000000000000000000000F = {isa = PBXTargetDependency; target = A50000000000000000000001; targetProxy = A7000000000000000000000E; };
+/* End PBXTargetDependency section */
+/* Begin XCBuildConfiguration section */
+        AB0000000000000000000001 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; SWIFT_VERSION = 6.0;
+            SWIFT_STRICT_CONCURRENCY = complete; SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+            GCC_PREPROCESSOR_DEFINITIONS = ("DEBUG=1", "$(inherited)",); SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+            DEBUG_INFORMATION_FORMAT = dwarf; ONLY_ACTIVE_ARCH = YES; ENABLE_TESTABILITY = YES;
+        }; };
+        AB0000000000000000000002 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            CLANG_ENABLE_MODULES = YES; CODE_SIGN_STYLE = Automatic; SWIFT_VERSION = 6.0;
+            SWIFT_STRICT_CONCURRENCY = complete; SWIFT_COMPILATION_MODE = wholemodule;
+            SWIFT_OPTIMIZATION_LEVEL = "-O"; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+        }; };
+        AB0000000000000000000003 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTS_MACCATALYST = NO;
+            GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ../ios/FrankenTerm/Info.plist;
+            CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks",);
+        }; };
+        AB0000000000000000000004 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTS_MACCATALYST = NO;
+            GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ../ios/FrankenTerm/Info.plist;
+            CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks",);
+        }; };
+        AB0000000000000000000005 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.offline-export; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; MACOSX_DEPLOYMENT_TARGET = 14.0;
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+            INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Hear from your iPhone when it has received your machines, so this window can say so.";
+            ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
+            LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
+        }; };
+        AB0000000000000000000006 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.offline-export; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; MACOSX_DEPLOYMENT_TARGET = 14.0;
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+            INFOPLIST_KEY_NSCameraUsageDescription = "Scan the recipient request displayed on your iPhone to encrypt an offline workspace only for that phone. Camera frames stay on this Mac.";
+            INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Hear from your iPhone when it has received your machines, so this window can say so.";
+            ENABLE_HARDENED_RUNTIME = YES; CODE_SIGN_ENTITLEMENTS = ../macos/FrankenTermExport/FrankenTermExport.entitlements;
+            LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks",);
+        }; };
+        AB0000000000000000000007 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.tests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_HOST = "$(BUILT_PRODUCTS_DIR)/FrankenTerm.app/FrankenTerm"; BUNDLE_LOADER = "$(TEST_HOST)";
+        }; };
+        AB0000000000000000000008 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.tests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_HOST = "$(BUILT_PRODUCTS_DIR)/FrankenTerm.app/FrankenTerm"; BUNDLE_LOADER = "$(TEST_HOST)";
+        }; };
+        AB0000000000000000000009 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.uitests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_TARGET_NAME = FrankenTerm;
+        }; };
+        AB000000000000000000000A = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile.uitests; PRODUCT_NAME = "$(TARGET_NAME)";
+            SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+            IPHONEOS_DEPLOYMENT_TARGET = 26.0; TARGETED_DEVICE_FAMILY = "1,2";
+            GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0;
+            TEST_TARGET_NAME = FrankenTerm;
+        }; };
+/* End XCBuildConfiguration section */
+/* Begin XCConfigurationList section */
+        A80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000001, AB0000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A80000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000003, AB0000000000000000000004,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A80000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000005, AB0000000000000000000006,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A80000000000000000000005 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000009, AB000000000000000000000A,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A80000000000000000000004 = {isa = XCConfigurationList; buildConfigurations = (AB0000000000000000000007, AB0000000000000000000008,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+/* Begin XCLocalSwiftPackageReference section */
+        A90000000000000000000003 = {isa = XCLocalSwiftPackageReference; relativePath = FrankenTermKit; };
+        A90000000000000000000004 = {isa = XCLocalSwiftPackageReference; relativePath = FrankenTermSSH; };
+        A90000000000000000000005 = {isa = XCLocalSwiftPackageReference; relativePath = FrankenTermTerminal; };
+/* End XCLocalSwiftPackageReference section */
+/* Begin XCSwiftPackageProductDependency section */
+        A90000000000000000000001 = {isa = XCSwiftPackageProductDependency; productName = FrankenTermKit; };
+        A90000000000000000000002 = {isa = XCSwiftPackageProductDependency; productName = FrankenTermKit; };
+        A90000000000000000000006 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSH; };
+        A90000000000000000000007 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSHIntegration; };
+        A90000000000000000000008 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000005; productName = FrankenTermTerminal; };
+        A90000000000000000000009 = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000003; productName = FrankenTermKit; };
+        A9000000000000000000000A = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000005; productName = FrankenTermTerminal; };
+        A9000000000000000000000B = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSH; };
+        A9000000000000000000000C = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000004; productName = FrankenTermSSHIntegration; };
+/* End XCSwiftPackageProductDependency section */
+    };
+    rootObject = A70000000000000000000001;
+}

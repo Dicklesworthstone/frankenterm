@@ -1,10 +1,12 @@
 # RCH Admission Diagnostic Contract
 
-`ft doctor rch-admission` is the target operator surface for a read-only
+`ft doctor --rch-admission` is the operator surface for a read-only
 preflight that explains whether a FrankenTerm proof lane can safely claim RCH
-remote Cargo evidence. This contract is static in `ft-69gwh.1`; it defines the
-JSON shape, stable reason-code vocabulary, fixture coverage, and forbidden
-operator actions before the live collector is wired.
+remote Cargo evidence. It runs a live host, disk and queue probe against the
+proof command (`--rch-admission-command`, default a core lib test) and prints
+the doctor text block, or the report with `--json`. This contract (first
+static in `ft-69gwh.1`) defines the JSON shape, stable reason-code vocabulary,
+fixture coverage, and forbidden operator actions.
 
 The output is advisory. It can say a command appears runnable or blocked, but it
 is never proof that Cargo, tests, clippy, benches, fuzzers, or release gates
@@ -221,7 +223,7 @@ The doctor, robot, and MCP surfaces share one rendering layer,
 distinction is expressed identically everywhere the diagnosis is exposed.
 `RchAdmissionSurface::from_report` and `from_preflight` wrap a base
 `RchAdmissionReport` (or `RchAdmissionPreflightReport`) into a stable envelope;
-`doctor_lines` renders the human `ft doctor rch-admission` text block whose first
+`doctor_lines` renders the human `ft doctor --rch-admission` text block whose first
 line is always the not-proof banner.
 
 | Envelope field | Meaning |
@@ -247,6 +249,6 @@ line is always the not-proof banner.
    `[RCH] local` / `no admissible workers` / `refusing local fallback` result is
    a blocked lane, not permission to build locally.
 
-The envelope and rendering layer landed under `ft-69gwh.5`; wiring it to the
-`ft doctor rch-admission` CLI dispatch is the thin remaining consumer step and
-must not be documented as available until that dispatch exists.
+The envelope and rendering layer landed under `ft-69gwh.5`; `ft doctor
+--rch-admission` renders its `doctor_lines`, and `ft doctor --rch-admission
+--json` prints the underlying report.

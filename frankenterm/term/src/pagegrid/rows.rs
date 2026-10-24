@@ -24,11 +24,13 @@ use std::collections::VecDeque;
 use std::ops::{Bound, Index, IndexMut, Range, RangeBounds};
 use std::sync::OnceLock;
 
-/// A retained row's legacy view.
+/// A retained row's legacy view. Boxed: every scroll pushes one view and pops
+/// another, and every native write takes the line out, so the slot stays a
+/// pointer wide rather than a whole `Line`.
 #[derive(Debug, Default)]
 struct RowView {
     /// Built when first read; dropped when the page row changes.
-    line: OnceLock<Line>,
+    line: OnceLock<Box<Line>>,
     /// A legacy operation edited the row through `&mut Line`: the view, not
     /// the page row, is the row's content.
     edited: bool,
@@ -74,12 +76,30 @@ impl PageRows {
             .list
             .effective_seqno(stable)
             .expect("a retained row has a seqno");
-        line_view(row.page, row.row, seqno)
+        let mut line = line_view(row.page, row.row, seqno);
+        // A row enters scrollback only through a scroll, which legacy
+        // compresses as it goes and the page engine compresses here, when the
+        // row is first read (`Screen::page_compress_for_scrollback`).
+        if index + self.list.viewport_rows() < self.views.len()
+            && crate::screen::scrollback_compression_enabled()
+        {
+            line.compress_for_scrollback();
+        }
+        line
+    }
+
+    /// Drops row `index`'s cached view, unless an edit made it the row's
+    /// content; the next read builds it again.
+    pub fn drop_view(&mut self, index: usize) {
+        let view = &mut self.views[index];
+        if !view.edited {
+            view.line.take();
+        }
     }
 
     fn ensure_view(&mut self, index: usize) {
         if self.views[index].line.get().is_none() {
-            let line = self.build_view(index);
+            let line = Box::new(self.build_view(index));
             let _ = self.views[index].line.set(line);
         }
     }
@@ -88,7 +108,7 @@ impl PageRows {
     pub fn line(&self, index: usize) -> &Line {
         self.views[index]
             .line
-            .get_or_init(|| self.build_view(index))
+            .get_or_init(|| Box::new(self.build_view(index)))
     }
 
     /// Row `index` for a legacy edit: its view becomes the row's content.
@@ -108,7 +128,7 @@ impl PageRows {
             .range_mut(range)
             .map(|view| {
                 view.edited = true;
-                view.line.get_mut().expect("the view was built above")
+                &mut **view.line.get_mut().expect("the view was built above")
             })
             .collect()
     }
@@ -117,7 +137,7 @@ impl PageRows {
     pub fn row_len(&self, index: usize) -> usize {
         let view = &self.views[index];
         if view.edited {
-            return view.line.get().map_or(0, Line::len);
+            return view.line.get().map_or(0, |line| line.len());
         }
         let row = self.list.row(self.stable(index)).expect("a retained row");
         row.page.row_len(row.row)
@@ -147,7 +167,28 @@ impl PageRows {
     /// (`Line::invalidate_implicit_hyperlinks`), which a page row cannot
     /// record, so the row stays a view until an edit through it has.
     pub fn page_row(&mut self, index: usize) -> Option<(&mut Page, u32)> {
-        let stable = self.stable(index);
+        let view = &self.views[index];
+        if view.edited || view.line.get().is_some() {
+            let stable = self.stable(index);
+            return self.page_row_from_view(index, stable);
+        }
+        if index + 1 == self.views.len() {
+            // The newest row, where every flood writes, is the tail page's
+            // last: no need to locate it.
+            return self.list.tail_row_mut();
+        }
+        self.list.row_mut(self.stable(index))
+    }
+
+    /// [`Self::page_row`] of a row with a view, out of line: storing an
+    /// edited view back and dropping a cached one made the frame of every
+    /// printed run's lookup, which almost never has a view.
+    #[inline(never)]
+    fn page_row_from_view(
+        &mut self,
+        index: usize,
+        stable: StableRowIndex,
+    ) -> Option<(&mut Page, u32)> {
         let view = &mut self.views[index];
         let line = view.line.take();
         if std::mem::take(&mut view.edited) {
@@ -170,8 +211,21 @@ impl PageRows {
     /// `admitted` were admitted and the next was refused (see
     /// [`PageList::scroll`]). With `hold`, nothing is trimmed.
     pub fn scroll(&mut self, n: usize, seqno: SequenceNo, hold: bool, admitted: usize) -> Scrolled {
+        self.scroll_with_row_flags(n, seqno, hold, admitted, 0)
+    }
+
+    /// [`Self::scroll`] whose new rows carry the row flags `flags` (see
+    /// [`PageList::scroll_with_row_flags`]).
+    pub fn scroll_with_row_flags(
+        &mut self,
+        n: usize,
+        seqno: SequenceNo,
+        hold: bool,
+        admitted: usize,
+        flags: u64,
+    ) -> Scrolled {
         let mut left = admitted;
-        let scrolled = self.list.scroll(n, seqno, hold, |_| {
+        let scrolled = self.list.scroll_with_row_flags(n, seqno, hold, flags, |_| {
             if left > 0 {
                 left -= 1;
                 true
@@ -187,6 +241,28 @@ impl PageRows {
         }
         debug_assert_eq!(self.views.len(), self.list.retained_rows());
         scrolled
+    }
+
+    /// [`Self::scroll_with_row_flags`] of one row with nothing held and
+    /// every trimmed row admitted ([`PageList::scroll_line`]).
+    pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
+        let scrolled = self.list.scroll_line(seqno, flags);
+        self.views.push_back(RowView::default());
+        for _ in 0..scrolled.trimmed {
+            self.views.pop_front();
+        }
+        debug_assert_eq!(self.views.len(), self.list.retained_rows());
+        scrolled
+    }
+
+    /// The row [`Self::scroll_line`] just appended, before anything built
+    /// its view: what [`Self::page_row`] of the last row returns then.
+    pub fn fresh_tail_row_mut(&mut self) -> Option<(&mut Page, u32)> {
+        debug_assert!(self
+            .views
+            .back()
+            .is_some_and(|view| !view.edited && view.line.get().is_none()));
+        self.list.tail_row_mut()
     }
 
     /// Legacy's `physical_rows + hot_scrollback_size()`, which can change
@@ -285,7 +361,7 @@ impl PageRows {
         let mut lines = VecDeque::with_capacity(self.views.len());
         for index in 0..self.views.len() {
             let line = match self.views[index].line.take() {
-                Some(line) => line,
+                Some(line) => *line,
                 None => self.build_view(index),
             };
             lines.push_back(line);
@@ -766,6 +842,53 @@ mod tests {
             .collect()
     }
 
+    /// Rows that scroll into scrollback are compressed there: legacy as they
+    /// go, the page engine when a row is first read. Whatever the text, each
+    /// row reads back as the same `Line` in the same storage form and
+    /// length, and the lazy compression leaves no row held by a view.
+    #[test]
+    fn scrollback_rows_read_back_in_legacy_storage_form() {
+        let texts = [
+            "plain ascii",
+            "e\u{301} combining",
+            "\u{4e2d}\u{6587}wide",
+            "\u{1f468}\u{200d}\u{1f469} zwj",
+            "\u{2500}\u{2502}\u{250c} box",
+            // A wide character on the last column wraps whole.
+            "abcdefghi\u{4e2d}",
+            "\u{2764}\u{fe0f}\u{200d}",
+            "x\u{301}\u{301}y",
+        ];
+        let mut bytes = Vec::new();
+        for round in 0..6 {
+            for text in texts {
+                bytes.extend_from_slice(format!("{} {}\r\n", round, text).as_bytes());
+            }
+        }
+        let mut legacy = terminal(GridEngine::Legacy);
+        let mut page = terminal(GridEngine::Page);
+        legacy.advance_bytes(&bytes);
+        page.advance_bytes(&bytes);
+        assert_eq!(page.screen().grid_engine(), GridEngine::Page);
+        assert_eq!(page.screen().rows_held_by_views(), 0);
+        assert_eq!(decoded(&page), decoded(&legacy));
+        let forms = |terminal: &Terminal| {
+            terminal
+                .screen()
+                .all_lines()
+                .iter()
+                .map(|line| (line.has_clustered_storage(), line.len()))
+                .collect::<Vec<_>>()
+        };
+        let page_forms = forms(&page);
+        assert_eq!(page_forms, forms(&legacy));
+        let scrollback = page_forms.len() - 6;
+        assert!(scrollback > texts.len());
+        assert!(page_forms[..scrollback]
+            .iter()
+            .any(|(clustered, _)| *clustered));
+    }
+
     /// ft-yccm0.3.3.4: page-engine rows decode exactly as legacy rows after
     /// the hot path's streams, whole and in 7-byte chunks, and the screen
     /// keeps its rows in pages; a resize returns them to legacy storage and
@@ -869,6 +992,35 @@ mod tests {
                     .as_bytes()
                     .to_vec(),
             ),
+            (
+                // SL and SR within the top and bottom margins, then within
+                // DECLRMM margins with a wide character at the left margin,
+                // and an SL from outside the margins, which does nothing.
+                "scroll_left_right",
+                "0123456789\r\nabcdefghij\r\nklmnopqrst\r\nuvwxyz0123\r\n\u{4e2d}\u{6587}456789\x1b[2;5r\x1b[3;1H\x1b[2 @\x1b[44m\x1b[0 A\x1b[m\x1b[ A\x1b[?69h\x1b[1;7s\x1b[5;2H\x1b[1 @\x1b[3 A\x1b[s\x1b[?69l\x1b[r\x1b[1;1H\x1b[2;4r\x1b[1;1H\x1b[ @\x1b[r"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                // DECSCA cells, wide and narrow, with SGR 0 inside the
+                // protected run, kept by DECSEL and DECSED and erased by ED
+                // in DEC mode; then DECSTR, after which DECSEL clears them.
+                "protection_decsca",
+                "\x1b[1\"qAB\x1b[1;44mC\x1b[0mD\u{4e2d}\x1b[0\"qxy\x1b[2;1H\x1b[1\"qPQ\x1b[2\"qrs\x1b[1;3H\x1b[?K\x1b[2;3H\x1b[?1K\x1b[?2J\x1b[3;1H\x1b[1\"qkeep\x1b[0\"q\x1b[3;3H\x1b[?0J\x1b[2J\x1b[4;1H\x1b[1\"qGONE\x1b[!p\x1b[?2K"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                // An SPA box that ED, EL and ECH keep, with a coloured pen;
+                // DECSCA then switches to DEC mode and ED erases it. A new
+                // SPA over a screen an ED 2 empties turns protection off, so
+                // EL erases what follows.
+                "protection_spa",
+                "\x1b[2J\x1bV\x1b[2;3HPROT\x1b[3;3HPROT\x1bW\x1b[2;1Hfree\x1b[3;9Hmore\x1b[44m\x1b[2;4H\x1b[J\x1b[1J\x1b[3;1H\x1b[2K\x1b[2;1H\x1b[8X\x1b[2J\x1b[m\x1b[0\"q\x1b[2J\x1bV\x1b[2Jlost\x1b[1;1H\x1b[2K"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            ("dec_graphics_5f", b"\x1b(0_q_\x1b(B_".to_vec()),
             (
                 "graphemes",
                 "e\u{301} \u{4e2d}\u{6587} \u{1f468}\u{200d}\u{1f469} \u{2764}\u{fe0f} ab\u{301}"

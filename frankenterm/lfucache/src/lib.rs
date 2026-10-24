@@ -29,6 +29,53 @@ impl CacheEvictionPolicy {
     }
 }
 
+/// Lookups counted before a `.rate` metric is emitted (see [`RateCounter`]).
+pub const RATE_BATCH: u32 = 256;
+
+/// A `.rate` metric counted in place and emitted in batches.
+///
+/// Each `metrics::histogram!` emission resolves the metric's handle by key
+/// (hash and compare), and the GUI recorder's `.rate` throughput then takes a
+/// mutex and reads the clock. Done per cache lookup, that cost about 5% of the
+/// GUI main thread while it rendered a flood
+/// (evidence/mac-render-perf/2026-10-12/t0-hotspots-07f454fb4). The recorder
+/// sums what it is given, so totals are unchanged: a count reaches it at most
+/// `RATE_BATCH - 1` lookups late, and the remainder when this is dropped. A
+/// quiet cache's per-second rate therefore arrives in bursts.
+pub struct RateCounter {
+    name: &'static str,
+    pending: u32,
+}
+
+impl RateCounter {
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self { name, pending: 0 }
+    }
+
+    #[inline]
+    pub fn add_one(&mut self) {
+        self.pending += 1;
+        if self.pending == RATE_BATCH {
+            self.flush();
+        }
+    }
+
+    /// Emits the pending count, if any.
+    pub fn flush(&mut self) {
+        if self.pending > 0 {
+            metrics::histogram!(self.name).record(f64::from(self.pending));
+            self.pending = 0;
+        }
+    }
+}
+
+impl Drop for RateCounter {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum S3Segment {
     Small,
@@ -64,8 +111,8 @@ pub type CapFunc = fn(&ConfigHandle) -> usize;
 /// If K is u64 you should use LfuCacheU64 instead as it has
 /// a more optimal hasher for integer keys.
 pub struct LfuCache<K, V, S = BuildHasherDefault<AHasher>> {
-    hit: &'static str,
-    miss: &'static str,
+    hits: RateCounter,
+    misses: RateCounter,
     cap: usize,
     cap_func: CapFunc,
     hasher: S,
@@ -107,8 +154,8 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         }
 
         Self {
-            hit: "hit",
-            miss: "miss",
+            hits: RateCounter::new("hit"),
+            misses: RateCounter::new("miss"),
             cap,
             cap_func: dummy_cap_func,
             buckets,
@@ -139,8 +186,8 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let hasher = S::default();
 
         Self {
-            hit,
-            miss,
+            hits: RateCounter::new(hit),
+            misses: RateCounter::new(miss),
             cap,
             cap_func,
             buckets,
@@ -540,7 +587,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 }
 
                 let entry = cursor.into_ref()?;
-                metrics::histogram!(self.hit).record(1.);
+                self.hits.add_one();
 
                 self.tick = self.tick.wrapping_add(1);
 
@@ -575,7 +622,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
 
             cursor.move_next();
         }
-        metrics::histogram!(self.miss).record(1.);
+        self.misses.add_one();
         None
     }
 
@@ -681,6 +728,97 @@ pub type LfuCacheU64<V> = LfuCache<u64, V, fnv::FnvBuildHasher>;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// `RateCounter` hands the recorder whole batches and then the remainder
+    /// on drop, so the recorder's sum is exactly the lookups counted.
+    #[test]
+    fn rate_counter_emits_batches_and_the_remainder() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Records {
+            list: Mutex<Vec<(String, f64)>>,
+        }
+        struct Named {
+            records: Arc<Records>,
+            name: String,
+        }
+        impl metrics::HistogramFn for Named {
+            fn record(&self, value: f64) {
+                self.records
+                    .list
+                    .lock()
+                    .unwrap()
+                    .push((self.name.clone(), value));
+            }
+        }
+        struct Capture(Arc<Records>);
+        impl metrics::Recorder for Capture {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::from_arc(Arc::new(Named {
+                    records: Arc::clone(&self.0),
+                    name: key.name().to_string(),
+                }))
+            }
+        }
+
+        let records = Arc::new(Records::default());
+        let recorder = Capture(Arc::clone(&records));
+        metrics::with_local_recorder(&recorder, || {
+            let mut counter = RateCounter::new("test.lookup.rate");
+            for _ in 0..(2 * RATE_BATCH + 7) {
+                counter.add_one();
+            }
+            assert_eq!(records.list.lock().unwrap().len(), 2, "whole batches only");
+            drop(counter);
+        });
+        let list = records.list.lock().unwrap();
+        let values: Vec<f64> = list.iter().map(|(_, value)| *value).collect();
+        assert_eq!(
+            values,
+            vec![f64::from(RATE_BATCH), f64::from(RATE_BATCH), 7.0]
+        );
+        assert!(list.iter().all(|(name, _)| name == "test.lookup.rate"));
+    }
 
     #[derive(Debug)]
     #[allow(dead_code)]

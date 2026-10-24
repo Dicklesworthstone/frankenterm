@@ -7,6 +7,7 @@ use config::keyassignment::{KeyAssignment, KeyTableEntry};
 use mux::pane::{Pane, PerformAssignmentResult};
 use promise::spawn::sleep;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
@@ -18,6 +19,35 @@ fn deadline_from_now(duration: Duration, label: &str) -> Instant {
         log::warn!("{label} duration {duration:?} is too large for Instant; clamping expiration");
         now.checked_add(DEADLINE_OVERFLOW_FALLBACK).unwrap_or(now)
     })
+}
+
+/// Whether the most recent key sent to a pane failed. A failure streak is
+/// logged once when it starts and once when keys are delivered again, not once
+/// per key.
+static KEY_INPUT_FAILING: AtomicBool = AtomicBool::new(false);
+
+/// Typed key events dropped at the layout-restore input gate since keys last
+/// got through it.
+static TYPED_KEYS_DROPPED_AT_LAYOUT_FENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Log the start and end of a streak of keys that could not be sent to a
+/// pane. Key contents are never logged.
+fn note_key_input_result<T>(pane: &Arc<dyn Pane>, result: &anyhow::Result<T>) {
+    match result {
+        Err(err) => {
+            if !KEY_INPUT_FAILING.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "keyboard input for pane {} was not sent: {err:#}",
+                    pane.pane_id()
+                );
+            }
+        }
+        Ok(_) => {
+            if KEY_INPUT_FAILING.swap(false, Ordering::Relaxed) {
+                log::info!("keyboard input for pane {} is being sent again", pane.pane_id());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +250,30 @@ enum OnlyKeyBindings {
 }
 
 impl super::TermWindow {
+    /// [`Self::pane_input_ready`] for typed keys, which are dropped while the
+    /// gate is closed. A run of dropped keys is logged when it starts and,
+    /// with its length, when keys are delivered again.
+    fn typed_input_ready(&self, pane: &Arc<dyn Pane>) -> bool {
+        if self.pane_input_ready(pane) {
+            let dropped = TYPED_KEYS_DROPPED_AT_LAYOUT_FENCE.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                log::info!(
+                    "typed input reaches pane {} again; {dropped} key event(s) were dropped \
+                     while its layout restore was pending",
+                    pane.pane_id()
+                );
+            }
+            return true;
+        }
+        if TYPED_KEYS_DROPPED_AT_LAYOUT_FENCE.fetch_add(1, Ordering::Relaxed) == 0 {
+            log::warn!(
+                "dropping typed input for pane {}: its layout restore is pending",
+                pane.pane_id()
+            );
+        }
+        false
+    }
+
     fn encode_win32_input(&self, pane: &Arc<dyn Pane>, key: &KeyEvent) -> Option<String> {
         if !self.config.allow_win32_input_mode
             || pane.get_keyboard_encoding() != KeyboardEncoding::Win32
@@ -408,7 +462,7 @@ impl super::TermWindow {
 
             if bypass_compose {
                 if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
-                    if !self.pane_input_ready(pane) {
+                    if !self.typed_input_ready(pane) {
                         return true;
                     }
                     let tw_raw_modifiers = raw_modifiers;
@@ -444,12 +498,13 @@ impl super::TermWindow {
                             );
                         }
 
-                        did_encode = if is_down {
+                        let sent = if is_down {
                             pane.key_down(term_key, tw_raw_modifiers)
                         } else {
                             pane.key_up(term_key, tw_raw_modifiers)
-                        }
-                        .is_ok();
+                        };
+                        note_key_input_result(pane, &sent);
+                        did_encode = sent.is_ok();
                     };
 
                     if did_encode {
@@ -730,7 +785,7 @@ impl super::TermWindow {
                     return;
                 }
 
-                if !self.pane_input_ready(&pane) {
+                if !self.typed_input_ready(&pane) {
                     return;
                 }
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
@@ -761,6 +816,7 @@ impl super::TermWindow {
                         pane.key_up(key, modifiers)
                     }
                 };
+                note_key_input_result(&pane, &res);
 
                 if res.is_ok() {
                     if window_key.key_is_down
@@ -797,10 +853,11 @@ impl super::TermWindow {
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }
-                if !self.pane_input_ready(&pane) {
+                if !self.typed_input_ready(&pane) {
                     return;
                 }
-                pane.send_user_input(s.as_bytes()).ok();
+                let sent = pane.send_user_input(s.as_bytes());
+                note_key_input_result(&pane, &sent);
                 self.maybe_scroll_to_bottom_for_input(&pane);
                 context.invalidate();
             }

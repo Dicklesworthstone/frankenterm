@@ -26,7 +26,8 @@ mod tests {
 
     #[test]
     fn openapi_discovery_matches_live_route_inventory() {
-        let app = super::super::router::build_app(None, None, resolve_runtime_limits(None), "none");
+        let app =
+            super::super::router::build_app(None, None, resolve_runtime_limits(None), "none", None);
         let spec: serde_json::Value = serde_json::from_str(
             app.openapi_spec()
                 .expect("production builder must enable route discovery"),

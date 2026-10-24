@@ -530,6 +530,12 @@ SEE ALSO:
         #[arg(long, requires = "web")]
         web_port: Option<u16>,
 
+        /// Serve the browser fleet viewer at `/ui/` from this package
+        /// directory (built by scripts/build-browser-ui.sh)
+        #[cfg(feature = "web")]
+        #[arg(long, requires = "web", value_name = "DIR")]
+        web_ui_dir: Option<PathBuf>,
+
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
@@ -817,7 +823,7 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft workflow list                  List workflow executions
     ft workflow status <id>           Show specific execution details
-    ft workflow run <name>            Manually trigger a workflow
+    ft workflow run <name> --pane <id>  Manually trigger a workflow
 
 SEE ALSO:
     ft events     Detection events that trigger workflows
@@ -833,7 +839,7 @@ SEE ALSO:
     ft mission run                     Advance mission into active execution state
     ft mission status                  Show mission lifecycle + assignment summary
     ft mission explain                 Show legal lifecycle transitions and contracts
-    ft mission pause --reason overload Pause active mission dispatch
+    ft mission pause --reason overload  Pause active mission dispatch
     ft mission resume                  Resume blocked/retry-pending mission state
     ft mission abort --reason operator_cancel
 
@@ -988,6 +994,7 @@ SEE ALSO:
     /// Explain decisions and workflows using built-in templates or recent audit trail
     #[command(after_help = r#"EXAMPLES:
     ft why deny.alt_screen            Explain alt-screen denial
+    ft why FT-1001                    Explain the error code an error message names
     ft why --list                     List all explanation templates
     ft why --recent                   Show recent deny decisions
     ft why --recent --pane 3          Recent denials for pane 3
@@ -998,8 +1005,9 @@ SEE ALSO:
     ft rules      Detection rule definitions
     ft approve    Validate approval codes"#)]
     Why {
-        /// Template ID to explain (e.g., "deny.alt_screen"), or decision type
-        /// when --recent is used (e.g., "denied", "require_approval")
+        /// Template ID (e.g., "deny.alt_screen"), FT-xxxx or robot.* error
+        /// code to explain, or decision type when --recent is used (e.g.,
+        /// "denied", "require_approval")
         template_id: Option<String>,
 
         /// Filter templates by category prefix (deny/workflow/event)
@@ -1379,7 +1387,7 @@ SEE ALSO:
     /// Secret scanning utilities
     #[command(after_help = r#"EXAMPLES:
     ft secrets scan                    Scan stored output and store a report
-    ft secrets scan --pane 3           Scope scan to a single pane
+    ft secrets scan --pane-id 3        Scope scan to a single pane
     ft secrets report                  Show latest report for scope
     ft secrets report --format json    Machine-readable output
 
@@ -1659,7 +1667,7 @@ SEE ALSO:
     /// Configuration management commands
     #[command(after_help = r#"EXAMPLES:
     ft config show                    Show current configuration
-    ft config show --effective --json Machine-readable effective config
+    ft config show --effective --json  Machine-readable effective config
     ft config init                    Create default config file
     ft config validate                Check config for errors
     ft config profile diff incident   Preview profile changes
@@ -1745,11 +1753,28 @@ SEE ALSO:
         command: StorageCommands,
     },
 
+    /// The machine inventory (machines.toml) and its iPhone export
+    #[command(after_help = r#"EXAMPLES:
+    ft mobile init css trj ts1        Start machines.toml from SSH config hosts, each in its own theme
+    ft mobile show                    The machines, resolved themes and routes
+    ft mobile export --check          Report what the phone would get, write nothing
+    ft mobile export -o fleet.ftworkspace
+    ft mobile export --group fleet -o fleet.ftworkspace
+    ft mobile themes -o ThemeCatalog.json
+
+The inventory lives beside frankenterm.lua (~/.config/frankenterm/machines.toml).
+Exports carry public keys and known_hosts pins only, never a private key; seal
+keys for the phone with the Mac companion."#)]
+    Mobile {
+        #[command(subcommand)]
+        command: MobileCommands,
+    },
+
     /// Backup and restore commands
     #[command(after_help = r#"EXAMPLES:
-    ft backup create                  Create a database backup
-    ft backup list                    List available backups
-    ft backup restore <path>          Restore from a backup file
+    ft backup export                  Export a backup to .ft/backups/
+    ft backup import <path> --verify  Verify a backup without importing
+    ft backup import <path>           Restore from a backup directory
 
 SEE ALSO:
     ft db         Database maintenance
@@ -1786,7 +1811,7 @@ SEE ALSO:
     ft session delete <id>            Delete a session
     ft session acknowledge-recovery <id> --force
                                       Allow cleanup of proven-dead recovery data
-    ft session preserve-recovery <id> Keep recovery data protected
+    ft session preserve-recovery <id>  Keep recovery data protected
     ft session doctor                 Health check on session data
     ft session acknowledge-cleanup <attempt> --force
                                       Resume retention after an interrupted cleanup
@@ -1835,7 +1860,7 @@ SEE ALSO:
     /// Extension management (list, install, remove, validate, info)
     #[command(after_help = r#"EXAMPLES:
     ft ext list                       List all extensions
-    ft ext install ./my-patterns.toml Install from local file
+    ft ext install ./my-patterns.toml  Install from local file
     ft ext remove my-patterns         Remove an extension
     ft ext validate ./pack.toml       Validate extension file
     ft ext info codex                 Show extension details
@@ -1853,8 +1878,8 @@ SEE ALSO:
     ft record export session.war                        Export to Asciinema cast
     ft record export session.war --format html -o out.html  Export to HTML player
     ft record export session.war --no-redact            Keep secrets in output
-    ft record export session.war --title "Demo Session" Set recording title
-    ft record export session.war --redact-pattern "TOKEN_\w+" Add custom redaction
+    ft record export session.war --title "Demo Session"  Set recording title
+    ft record export session.war --redact-pattern "TOKEN_\w+"  Add custom redaction
 
 SEE ALSO:
     ft reproduce    Incident bundles
@@ -1919,7 +1944,7 @@ NOTES:
     #[command(after_help = r#"EXAMPLES:
     ft reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
     ft reserve 3 --ttl 3600           Reserve for 1 hour
-    ft reserve 3 --reason "migration" Add a reason
+    ft reserve 3 --reason "migration"  Add a reason
 
 SEE ALSO:
     ft reservations   List active reservations
@@ -2010,7 +2035,7 @@ SEE ALSO:
     ft export events --pane-id 3          Export events for pane 3
     ft export audit --since 1706000000   Export audit since timestamp
     ft export audit --actor workflow      Export workflow-initiated audit actions
-    ft export audit --action auth_required Export auth-related audit entries
+    ft export audit --action auth_required  Export auth-related audit entries
     ft export workflows --limit 50        Export last 50 workflows
     ft export sessions --no-redact        Export sessions without redaction (WARNING)
     ft export reservations --pretty       Pretty-print JSON output
@@ -2110,8 +2135,13 @@ SEE ALSO:
     ft attention explain attention:ready_now:beads_ready:ft-docs --format toon
 
 NOTES:
-    This surface is input-backed and read-only. Without --input it emits a
-    degraded snapshot that explicitly marks required sources unavailable.
+    This surface is read-only. With --input it replays that recorded input
+    exactly. Without it, it reads live sources: the watcher's operating
+    envelope, the last 24 hours of policy denials and approval holds,
+    verified-submit drift, unhandled warning and critical events, operator
+    pane holds, recent crash bundles and a failed or compensating mission
+    transaction. Sources it cannot read are reported unavailable, never
+    guessed.
 
 SEE ALSO:
     ft robot attention status
@@ -2156,6 +2186,11 @@ SEE ALSO:
         /// Port override; defaults to [tuning.web] default_port
         #[arg(long)]
         port: Option<u16>,
+
+        /// Serve the browser fleet viewer at `/ui/` from this package
+        /// directory (built by scripts/build-browser-ui.sh)
+        #[arg(long, env = "FT_WEB_UI_DIR", value_name = "DIR")]
+        ui_dir: Option<PathBuf>,
     },
 
     /// Launch the interactive TUI (requires --features tui or --features ftui)
@@ -2197,7 +2232,7 @@ SEE ALSO:
     ft analytics daily                Daily breakdown table
     ft analytics by-agent             Per-agent breakdown
     ft analytics export --format csv  Export raw metrics as CSV
-    ft analytics export --format json Export raw metrics as JSON
+    ft analytics export --format json  Export raw metrics as JSON
 
 SEE ALSO:
     ft events     View detected events
@@ -3221,7 +3256,7 @@ enum RecordCommands {
         output: Option<PathBuf>,
     },
 
-    /// Stop an active recording
+    /// Explain how to stop a recording (Ctrl+C in the `ft record start` terminal)
     Stop {
         /// Pane ID to stop recording (default: current pane)
         #[arg(long)]
@@ -3370,7 +3405,7 @@ enum ReplayCommands {
     ft replay parity
     ft replay parity --pane-id 3
     ft replay parity --run-id shadow-window-20260307
-    ft replay parity --intentional-delta NTM-PARITY-012=TOON stats wording differs
+    ft replay parity --intentional-delta "NTM-PARITY-012=TOON stats wording differs"
 "#)]
     Parity {
         /// Override the parity corpus fixture path
@@ -3524,7 +3559,7 @@ enum SecretsCommands {
     /// Run a secret scan over stored segments and record the report
     #[command(after_help = r#"EXAMPLES:
     ft secrets scan
-    ft secrets scan --pane 3
+    ft secrets scan --pane-id 3
     ft secrets scan --since 1700000000000 --until 1700003600000
     ft secrets scan --format json"#)]
     Scan {
@@ -3564,7 +3599,7 @@ enum SecretsCommands {
     /// Show the latest secret scan report for a scope
     #[command(after_help = r#"EXAMPLES:
     ft secrets report
-    ft secrets report --pane 3
+    ft secrets report --pane-id 3
     ft secrets report --format json"#)]
     Report {
         /// Output format: auto, plain, or json
@@ -5117,7 +5152,7 @@ enum RobotRulesCommands {
 
     /// Show details for a specific rule
     Show {
-        /// Rule ID (e.g., "codex.usage_reached")
+        /// Rule ID (e.g., "codex.usage.reached")
         rule_id: String,
     },
 
@@ -6541,7 +6576,7 @@ enum RulesCommands {
 
     /// Show full details for a specific rule
     Show {
-        /// Rule ID (e.g., "codex.usage_reached")
+        /// Rule ID (e.g., "codex.usage.reached")
         rule_id: String,
 
         /// Output format: auto, plain, or json
@@ -8126,6 +8161,52 @@ enum ConfigProfileCommands {
 }
 
 #[derive(Subcommand)]
+enum MobileCommands {
+    /// Start a machine inventory from SSH config hosts, each in its own theme
+    Init {
+        /// Host aliases from ~/.ssh/config (default: every concrete Host)
+        hosts: Vec<String>,
+        /// Inventory to create (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
+    /// Show the resolved inventory: machines, themes and routes
+    Show {
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
+    /// Write the iPhone workspace document for the inventory
+    Export {
+        /// Only this group's machines
+        #[arg(long)]
+        group: Option<String>,
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// Where to write the .ftworkspace (default: standard output)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+        /// Report what would be exported without writing it
+        #[arg(long)]
+        check: bool,
+    },
+    /// Print what the Mac companion loads: the workspace for every group and
+    /// where each credential's private key lives (paths only, never key material)
+    Source {
+        /// Inventory file (default: machines.toml in the FrankenTerm config directory)
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+    },
+    /// Write every theme the iPhone can offer (the app bundles this catalog)
+    Themes {
+        /// Where to write the catalog (default: standard output)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum StorageCommands {
     /// Recommend a storage backend and search index strategy from workload telemetry
     Advise {
@@ -8891,7 +8972,7 @@ enum AuthCommands {
     /// Validate local browser runtime/profile evidence without launching a browser
     #[command(after_help = r#"EXAMPLES:
     ft auth test openai --account work     Validate local state for 'work'
-    ft auth test openai --timeout-secs 120 Bound the runtime readiness probe
+    ft auth test openai --timeout-secs 120  Bound the runtime readiness probe
 
 OUTCOMES:
     LocalStateReady  Runtime and persisted state are locally valid; live auth is unverified
@@ -8939,7 +9020,7 @@ OUTCOMES:
     /// Interactively bootstrap a browser profile (one-time login)
     #[command(after_help = r#"EXAMPLES:
     ft auth bootstrap openai               Bootstrap OpenAI profile
-    ft auth bootstrap openai --account work Bootstrap specific account
+    ft auth bootstrap openai --account work  Bootstrap specific account
 
 NOTE: Opens a visible browser window. You must complete login manually."#)]
     Bootstrap {
@@ -9167,6 +9248,7 @@ const ROBOT_ERR_MUX_CANCELLED: &str = "robot.mux_cancelled";
 const ROBOT_ERR_MUX_QUOTA_EXCEEDED: &str = "robot.mux_quota_exceeded";
 const ROBOT_ERR_MUX_BACKEND_FAILURE: &str = "robot.mux_backend_failure";
 const ROBOT_ERR_MUX_UNKNOWN_FUTURE: &str = "robot.mux_unknown_future";
+const ROBOT_ERR_MUX_RESOURCE_BUSY: &str = "robot.mux_resource_busy";
 const ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE: &str = "robot.wezterm_mutation_indeterminate";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
@@ -13129,12 +13211,18 @@ async fn build_cli_attention_router_payload(
     requested_item_id: Option<&str>,
 ) -> anyhow::Result<AttentionRouterSurfacePayload> {
     let mut input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
-    // A recorded --input is replayed exactly; a live run adds the watcher's
-    // operating envelope (per-governor advisories) as a real source.
+    // A recorded --input is replayed exactly; a live run adds real sources:
+    // the watcher's operating envelope (per-governor advisories); from the
+    // workspace database, the policy gate (recent denied and approval-required
+    // actions), verified-send receipts (submit-profile drift), unhandled
+    // events and operator pane holds; the crash directory; the active
+    // mission transaction contract; and the workspace's git status and
+    // ready beads.
     if input_path.is_none() {
-        let snapshot = match config.workspace_layout(Some(workspace_root)) {
-            Ok(layout) => load_runtime_health_snapshot_at(&layout.ipc_socket_path).await,
-            Err(_) => None,
+        let layout = config.workspace_layout(Some(workspace_root)).ok();
+        let snapshot = match layout.as_ref() {
+            Some(layout) => load_runtime_health_snapshot_at(&layout.ipc_socket_path).await,
+            None => None,
         };
         input.observations.push(
             frankenterm_core::attention_router::operating_envelope_observation_from_health(
@@ -13143,6 +13231,50 @@ async fn build_cli_attention_router_payload(
                 SPAWN_ADMISSION_MAX_AGE_MS,
             ),
         );
+        let audit = match layout.as_ref() {
+            Some(layout) => frankenterm_core::attention_live::read_live_attention_audit(
+                &layout.db_path,
+                input.generated_at_ms,
+            ),
+            None => frankenterm_core::attention_live::LiveAttentionAudit::unreadable(),
+        };
+        frankenterm_core::attention_live::apply_live_attention_audit(&mut input, &audit);
+        let crash_bundles = layout.as_ref().and_then(|layout| {
+            frankenterm_core::attention_live::read_recent_crash_bundles(
+                &layout.crash_dir,
+                input.generated_at_ms,
+            )
+        });
+        input.observations.push(
+            frankenterm_core::attention_router::crash_bundles_observation(
+                crash_bundles
+                    .as_ref()
+                    .map(|(bundles, _)| bundles.as_slice()),
+                crash_bundles.as_ref().is_none_or(|(_, complete)| *complete),
+                input.generated_at_ms,
+            ),
+        );
+        let active_tx = layout
+            .as_ref()
+            .and_then(|layout| frankenterm_core::attention_live::read_active_tx(&layout.ft_dir));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::active_tx_observation(
+                active_tx.as_ref().map(Option::as_ref),
+                input.generated_at_ms,
+            ));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::git_status_observation(
+                &frankenterm_core::attention_live::read_git_status(workspace_root),
+                input.generated_at_ms,
+            ));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::ready_beads_observation(
+                &frankenterm_core::attention_live::read_ready_beads(workspace_root),
+                input.generated_at_ms,
+            ));
     }
     Ok(build_attention_router_surface_payload(
         &input,
@@ -14621,6 +14753,61 @@ struct RobotWhyData {
     suggestions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     see_also: Option<Vec<String>>,
+}
+
+/// `ft why` / `ft robot why` data for a code that is not an explanation
+/// template: an `FT-xxxx` code from the error catalog, which every rendered
+/// error's footer names, or a `robot.*` error code with its recovery hint.
+fn why_data_for_error_code(code: &str) -> Option<RobotWhyData> {
+    fn category_name(category: frankenterm_core::error_codes::ErrorCategory) -> String {
+        serde_json::to_value(category)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "internal".to_string())
+    }
+
+    if let Some(def) = frankenterm_core::error_codes::get_error_code(&code.to_ascii_uppercase()) {
+        let mut explanation = def.description.to_string();
+        if !def.causes.is_empty() {
+            explanation.push_str("\n\nCommon causes:");
+            for cause in def.causes {
+                explanation.push_str("\n- ");
+                explanation.push_str(cause);
+            }
+        }
+        let suggestions: Vec<String> = def
+            .recovery_steps
+            .iter()
+            .map(|step| match &step.command {
+                Some(command) => format!("{}: {command}", step.description),
+                None => step.description.to_string(),
+            })
+            .collect();
+        return Some(RobotWhyData {
+            code: def.code.to_string(),
+            category: category_name(def.category),
+            title: def.title.to_string(),
+            explanation,
+            suggestions: (!suggestions.is_empty()).then_some(suggestions),
+            see_also: def.doc_link.map(|link| vec![link.to_string()]),
+        });
+    }
+    // robot.* wire codes are lowercase; accept any case like FT-xxxx above.
+    let robot_code = frankenterm_core::robot_types::ErrorCode::parse(&code.to_ascii_lowercase())?;
+    let hint = frankenterm_core::robot_types::hint_for(&robot_code)?;
+    Some(RobotWhyData {
+        code: robot_code.as_str().to_string(),
+        category: category_name(robot_code.category()),
+        title: if robot_code.is_retryable() {
+            "Retryable robot error"
+        } else {
+            "Robot error"
+        }
+        .to_string(),
+        explanation: hint.to_string(),
+        suggestions: None,
+        see_also: None,
+    })
 }
 
 /// Robot approve command response data (matches wa-robot-approve.json schema)
@@ -28116,6 +28303,78 @@ fn watcher_lock_diagnostic_check(status: &frankenterm_core::lock::LockStatus) ->
     }
 }
 
+const SUBMIT_IDEMPOTENCY_STORE_CHECK: &str = "submit idempotency store";
+
+/// Content-free occupancy of the verified-submit idempotency store. Settled
+/// rows are evicted past their retention horizon, so a full store is normal;
+/// only rows eviction cannot reclaim (unresolved sends and settled rows still
+/// inside their horizon) can refuse new idempotency keys.
+fn submit_idempotency_store_diagnostic_check(
+    census: Result<
+        Option<frankenterm_core::submit_idempotency_store::SubmitIdempotencyCensus>,
+        frankenterm_core::submit_idempotency_store::SubmitIdempotencyError,
+    >,
+    now_unix_ms: i64,
+) -> DiagnosticCheck {
+    let census = match census {
+        Ok(Some(census)) => census,
+        Ok(None) => {
+            return DiagnosticCheck::ok_with_detail(
+                SUBMIT_IDEMPOTENCY_STORE_CHECK,
+                "not created; no verified send has used an idempotency key yet",
+            );
+        }
+        Err(error) => {
+            return DiagnosticCheck::warning(
+                SUBMIT_IDEMPOTENCY_STORE_CHECK,
+                format!("store could not be inspected ({})", error.error_class()),
+                "Verified sends with an idempotency key fail closed until the store opens; review the .ft directory permissions",
+            );
+        }
+    };
+    let mut detail = format!(
+        "{} of {} records, {} of {} logical bytes; completed {}, retryable {}, active {}, effect pending {}, in doubt {}; {} evictable",
+        census.records(),
+        census.max_records,
+        census.logical_bytes,
+        census.max_logical_bytes,
+        census.completed,
+        census.retryable,
+        census.active_owner,
+        census.effect_applied_receipt_pending,
+        census.in_doubt,
+        census.evictable_records,
+    );
+    if let Some(oldest) = census.oldest_unresolved_updated_unix_ms {
+        let age_secs = now_unix_ms.saturating_sub(oldest).max(0) / 1000;
+        detail.push_str(&format!("; oldest unresolved {age_secs}s old"));
+    }
+    // An in-doubt key never resolves on its own: replays are refused until
+    // an operator settles or abandons it.
+    if census.in_doubt > 0 {
+        detail.push_str("; settle or abandon in-doubt keys with MCP wa.send reconcile");
+    }
+    if !census.admits_new_key() {
+        return DiagnosticCheck::error(
+            SUBMIT_IDEMPOTENCY_STORE_CHECK,
+            detail,
+            "New sends with an idempotency key fail with capacity_exceeded: unresolved and recent rows fill the store. Investigate the injector errors behind in-doubt sends, then settle or abandon each with MCP wa.send reconcile; completed receipts become evictable after 24 hours",
+        );
+    }
+    let three_quarters_pinned = census.pinned_records().saturating_mul(4)
+        >= census.max_records.saturating_mul(3)
+        || census.pinned_logical_bytes().saturating_mul(4)
+            >= census.max_logical_bytes.saturating_mul(3);
+    if three_quarters_pinned {
+        return DiagnosticCheck::warning(
+            SUBMIT_IDEMPOTENCY_STORE_CHECK,
+            detail,
+            "Three quarters of the store is pinned by unresolved or recent rows; investigate the injector errors behind in-doubt sends and settle or abandon each with MCP wa.send reconcile before new keys are refused",
+        );
+    }
+    DiagnosticCheck::ok_with_detail(SUBMIT_IDEMPOTENCY_STORE_CHECK, detail)
+}
+
 fn open_cli_read_only_connection(db_path: &str) -> rusqlite::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
@@ -39733,7 +39992,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 summary: "Fetch recent pattern detection events (with optional workflow preview)",
                 examples: vec![
                     "ft robot events",
-                    "ft robot events --rule-id codex.usage_reached",
+                    "ft robot events --rule-id codex.usage.reached",
                     "ft robot events --would-handle --dry-run",
                 ],
             },
@@ -41744,6 +42003,10 @@ fn map_mux_rejection_code_to_robot(
                 "The mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
                     .to_string(),
             ),
+        ),
+        MuxRejectionCode::ResourceBusy => (
+            ROBOT_ERR_MUX_RESOURCE_BUSY,
+            Some("The pane was too busy to serve the read; nothing was applied. Retry after backoff.".to_string()),
         ),
         MuxRejectionCode::UnknownFuture => (
             ROBOT_ERR_MUX_UNKNOWN_FUTURE,
@@ -46873,20 +47136,43 @@ async fn run_distributed_agent(
     Ok(())
 }
 
-/// Run the observation watcher daemon with crash-loop backoff.
+/// Load and verify the browser fleet viewer package for `ft web --ui-dir` /
+/// `ft watch --web-ui-dir`. A package that fails verification stops startup:
+/// serving a partial or unverified viewer is worse than serving none.
+#[cfg(feature = "web")]
+fn load_web_ui_assets(
+    dir: Option<&Path>,
+) -> anyhow::Result<Option<Arc<frankenterm_core::web::UiAssetSet>>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let set = frankenterm_core::web::UiAssetSet::load(dir)
+        .map_err(|error| anyhow::anyhow!("browser UI package {}: {error}", dir.display()))?;
+    tracing::info!(
+        files = set.len(),
+        manifest_sha256 = set.manifest_sha256(),
+        "Serving the browser fleet viewer at /ui/"
+    );
+    Ok(Some(Arc::new(set)))
+}
+
 /// How `ft watch` should serve the read-only web API, if at all.
 ///
 /// In-process serving is the only way a client sees an event at publish time:
 /// a standalone `ft web` has no in-process publisher and can only replay rows
 /// the watcher already persisted, at the storage tail's poll latency
 /// (ft-xxfwy.19).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 struct WatcherWebOptions {
     enabled: bool,
     port: Option<u16>,
+    /// Browser fleet viewer package, verified before the watcher starts.
+    #[cfg(feature = "web")]
+    ui_assets: Option<Arc<frankenterm_core::web::UiAssetSet>>,
 }
 
+/// Run the observation watcher daemon with crash-loop backoff.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher_with_backoff(
     cx: &frankenterm_core::cx::Cx,
@@ -46920,7 +47206,7 @@ async fn run_watcher_with_backoff(
             notify_only,
             notify_filter.clone(),
             notify_via.clone(),
-            web,
+            web.clone(),
             disable_lock,
             dangerous_bind_any,
         ))
@@ -47965,7 +48251,7 @@ async fn run_watcher(
         let resolved_port = web
             .port
             .unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
-        let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+        let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
             .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
             .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                 web_tuning,
@@ -47973,6 +48259,9 @@ async fn run_watcher(
             .with_storage(handle.storage.clone())
             .with_event_bus(Arc::clone(&event_bus))
             .with_storage_event_tail(false);
+        if let Some(ui_assets) = &web.ui_assets {
+            web_config = web_config.with_ui_assets(Arc::clone(ui_assets));
+        }
         let web_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         let server = frankenterm_core::web::start_web_server_with_cx(&web_cx, web_config)
@@ -48002,6 +48291,28 @@ async fn run_watcher(
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
         let task = frankenterm_core::runtime_async::task::spawn(async move {
             run_saved_search_scheduler(storage, event_bus, task_shutdown_flag).await;
+        });
+        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
+    };
+
+    // Raises submit-profile drift (W2.8) as a recorded, published event and,
+    // when metrics are served, publishes the idempotency store's backlog for
+    // /metrics. MCP keeps the store beside the database, as ft doctor reads it.
+    let verified_submit_drift_monitor_handle = {
+        let storage = scheduler_storage.clone();
+        let event_bus = Arc::clone(&event_bus);
+        let store_dir = (cfg!(feature = "metrics") && config.metrics.enabled).then(|| {
+            layout
+                .db_path
+                .parent()
+                .unwrap_or(&layout.ft_dir)
+                .to_path_buf()
+        });
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
+            run_verified_submit_drift_monitor(storage, event_bus, store_dir, task_shutdown_flag)
+                .await;
         });
         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
@@ -48431,6 +48742,16 @@ async fn run_watcher(
     {
         shutdown_failures.push(error);
     }
+    if let Err(error) = settle_watcher_background_task(
+        "verified_submit_drift_monitor",
+        verified_submit_drift_monitor_handle,
+        &background_shutdown_cx,
+        true,
+    )
+    .await
+    {
+        shutdown_failures.push(error);
+    }
     if let Some(distributed_listener_handle) = distributed_listener_handle
         && let Err(error) = settle_watcher_background_task(
             "distributed_listener",
@@ -48601,6 +48922,205 @@ fn saved_search_scheduler_state_drops_deleted_search_ids() {
     retain_live_saved_search_state(&mut state, &live_search_ids);
 
     assert_eq!(state, HashMap::from([("live".to_string(), 1_u32)]));
+}
+
+/// How often `ft watch` re-reads recent verified-send receipts for submit
+/// profile drift (W2.8, ft-7h5da.3.9).
+const VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+/// Allowed sends read per drift check. Only those that carry a receipt count,
+/// up to the attention router's receipt window.
+const VERIFIED_SUBMIT_DRIFT_SCAN_ROWS: usize = 5_000;
+/// One drift event per agent type per bucket survives watcher restarts.
+const VERIFIED_SUBMIT_DRIFT_DEDUPE_BUCKET_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Agent types whose recent verified sends newly drift, each with the pane
+/// of its newest unconfirmed receipt (0 when no receipt names a pane).
+/// `records` are allowed sends, newest first. `signaled` holds the agent
+/// types already raised; one that recovers leaves it, so a relapse raises a
+/// new event.
+fn verified_submit_drift_alerts(
+    records: &[frankenterm_core::storage::AuditActionRecord],
+    signaled: &mut std::collections::BTreeSet<String>,
+) -> Vec<(
+    u64,
+    frankenterm_core::attention_router::VerifiedSubmitAgentTally,
+)> {
+    use frankenterm_core::attention_router::{
+        VERIFIED_SUBMIT_AUDIT_MAX_ROWS, verified_submit_agent_tallies,
+        verified_submit_receipt_agent,
+    };
+    use frankenterm_core::robot_types::{SubmitReceipt, SubmitReceiptState};
+
+    let receipts: Vec<(Option<u64>, SubmitReceipt)> = records
+        .iter()
+        .filter_map(|record| {
+            let summary = record.verification_summary.as_deref()?;
+            let receipt = serde_json::from_str::<SubmitReceipt>(summary).ok()?;
+            Some((record.pane_id, receipt))
+        })
+        .take(VERIFIED_SUBMIT_AUDIT_MAX_ROWS)
+        .collect();
+    let drifting: Vec<_> =
+        verified_submit_agent_tallies(receipts.iter().map(|(_, receipt)| receipt))
+            .into_iter()
+            .filter(frankenterm_core::attention_router::VerifiedSubmitAgentTally::is_drifting)
+            .collect();
+    signaled.retain(|agent| drifting.iter().any(|tally| &tally.agent_type == agent));
+    let mut alerts = Vec::new();
+    for tally in drifting {
+        if !signaled.insert(tally.agent_type.clone()) {
+            continue;
+        }
+        let pane_of = |unconfirmed_only: bool| {
+            receipts.iter().find_map(|(pane, receipt)| {
+                let unconfirmed = matches!(
+                    receipt.state,
+                    SubmitReceiptState::StuckInComposer
+                        | SubmitReceiptState::VerificationUnavailable
+                );
+                (verified_submit_receipt_agent(receipt) == tally.agent_type
+                    && (unconfirmed || !unconfirmed_only))
+                    .then_some(*pane)
+                    .flatten()
+            })
+        };
+        let pane_id = pane_of(true).or_else(|| pane_of(false)).unwrap_or(0);
+        alerts.push((pane_id, tally));
+    }
+    alerts
+}
+
+/// Publish the verified-submit idempotency store's census for `/metrics`.
+/// The store is read only here, on the watcher's own cadence, never per
+/// scrape; a store that cannot be read withdraws the numbers instead of
+/// leaving stale ones.
+async fn publish_submit_idempotency_census(store_dir: &std::path::Path) {
+    use frankenterm_core::submit_idempotency_store as store;
+
+    let dir = store_dir.to_path_buf();
+    match frankenterm_core::runtime_async::task::spawn_blocking(move || store::census(&dir)).await {
+        Ok(Ok(census)) => store::publish_census(Some(census.unwrap_or_default())),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error_class = error.error_class(),
+                "verified-submit idempotency census failed; withdrawing its metrics"
+            );
+            store::publish_census(None);
+        }
+        Err(_) => store::publish_census(None),
+    }
+}
+
+/// Watcher task: when an agent type's recent verified sends start to stay
+/// mostly unconfirmed, record a `core.verified_submit:profile_drift` event
+/// and publish it, so notifications and workflows see the drift without
+/// anyone running `ft attention`. Uses the attention router's drift rule.
+/// With metrics enabled (`idempotency_store_dir` set) it also publishes the
+/// idempotency store's census on the same cadence.
+async fn run_verified_submit_drift_monitor(
+    storage: frankenterm_core::storage::StorageHandle,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    idempotency_store_dir: Option<std::path::PathBuf>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    use frankenterm_core::events::Event;
+    use frankenterm_core::storage::{AuditQuery, StoredEvent};
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    let mut signaled = std::collections::BTreeSet::new();
+    loop {
+        if let Some(store_dir) = idempotency_store_dir.as_deref() {
+            publish_submit_idempotency_census(store_dir).await;
+        }
+        frankenterm_core::runtime_async::select! {
+            () = frankenterm_core::runtime_async::sleep(VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL) => {}
+            () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+        }
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        let query = AuditQuery {
+            action_kind: Some("send_text".to_string()),
+            policy_decision: Some("allow".to_string()),
+            since: Some(now.saturating_sub(DAY_MS)),
+            limit: Some(VERIFIED_SUBMIT_DRIFT_SCAN_ROWS),
+            ..AuditQuery::default()
+        };
+        let records = match storage.get_audit_actions_with_cx(&storage_cx, query).await {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "verified-submit drift monitor: failed to read the audit log");
+                continue;
+            }
+        };
+        for (pane_id, tally) in verified_submit_drift_alerts(&records, &mut signaled) {
+            let detection = tally.drift_detection();
+            let stored_event = StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id.clone(),
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type.clone(),
+                severity: "warning".to_string(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted.clone()),
+                matched_text: None,
+                segment_id: None,
+                detected_at: now,
+                dedupe_key: Some(format!(
+                    "verified_submit_drift:{}:{}",
+                    tally.agent_type,
+                    now / VERIFIED_SUBMIT_DRIFT_DEDUPE_BUCKET_MS
+                )),
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            match storage
+                .record_event_outcome_with_cx(&storage_cx, stored_event)
+                .await
+            {
+                Ok(outcome) => {
+                    tracing::warn!(
+                        agent_type = %tally.agent_type,
+                        observed = tally.observed,
+                        unconfirmed = tally.unconfirmed(),
+                        "verified sends to this agent type mostly stay unconfirmed; its submit profile has probably drifted"
+                    );
+                    if let Some(event_id) = outcome.inserted_event_id() {
+                        let _ = event_bus.publish(Event::PatternDetected {
+                            pane_id,
+                            pane_uuid: None,
+                            detection,
+                            event_id: Some(event_id),
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        agent_type = %tally.agent_type,
+                        %error,
+                        "verified-submit drift monitor: failed to record the drift event"
+                    );
+                    // Retry on the next check instead of staying silent.
+                    signaled.remove(&tally.agent_type);
+                }
+            }
+        }
+    }
 }
 
 async fn run_saved_search_scheduler(
@@ -49415,6 +49935,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         return Ok(());
     }
 
+    // The machine inventory and its phone export read only the FrankenTerm
+    // config directory and SSH files: no ft config, workspace, logging or mux.
+    if let Some(Commands::Mobile { command }) = command.as_ref() {
+        return handle_mobile_command(command);
+    }
+
     // Incident recovery through a pinned older client must not depend on the
     // current config, workspace database, logging, font setup, or mux client.
     // Dispatch it before all of those surfaces so an explicit compatible
@@ -49974,6 +50500,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             web,
             #[cfg(feature = "web")]
             web_port,
+            #[cfg(feature = "web")]
+            web_ui_dir,
             dangerous_disable_lock,
             dangerous_bind_any,
         }) => {
@@ -49988,6 +50516,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let web_options = WatcherWebOptions {
                 enabled: web,
                 port: web_port,
+                ui_assets: load_web_ui_assets(web_ui_dir.as_deref())?,
             };
             #[cfg(not(feature = "web"))]
             let web_options = WatcherWebOptions::default();
@@ -50018,14 +50547,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 connect_addr,
                 agent_id,
             } => {
-                run_distributed_agent(
+                Box::pin(run_distributed_agent(
                     &layout,
                     &config,
                     resolved_config_path.as_deref(),
                     connect,
                     connect_addr,
                     agent_id,
-                )
+                ))
                 .await?;
             }
         },
@@ -57063,14 +57592,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 };
                                 let response = RobotResponse::success(data, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
+                            } else if let Some(data) = why_data_for_error_code(&code) {
+                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
                             } else {
                                 // Code not found - list available codes as hint
                                 let available = list_template_ids();
                                 let hint = if available.is_empty() {
-                                    "No explanation templates available.".to_string()
+                                    "No explanation templates available; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted.".to_string()
                                 } else {
                                     format!(
-                                        "Available codes: {}",
+                                        "Available codes: {}; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted",
                                         available[..available.len().min(10)].join(", ")
                                     )
                                 };
@@ -57790,7 +58322,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         contract_lock.authoritative_path();
 
                                     let now_ms = mission_now_ms();
-                                    let commit_report = match build_robot_tx_rollback_commit_report(
+                                    let commit_report = match tx_rollback_receipt_hint(
                                         &contract, now_ms,
                                     ) {
                                         Ok(report) => report,
@@ -57811,10 +58343,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
                                     };
                                     if let Some(step_id) = fail_compensation_for_step.as_deref()
-                                        && !commit_report.step_results.iter().any(|result| {
-                                            result.step_id.0 == step_id
-                                                && result.outcome.is_committed()
-                                        })
+                                        && !tx_rollback_has_compensation_candidate(
+                                            &contract,
+                                            commit_report.as_ref(),
+                                            step_id,
+                                        )
                                     {
                                         let response =
                                             RobotResponse::<RobotTxRollbackData>::error_with_code(
@@ -57836,7 +58369,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         &layout,
                                         tx_rollback_requires_terminal_backend(
                                             &contract,
-                                            &commit_report,
+                                            commit_report.as_ref(),
                                         ),
                                     )
                                     .await;
@@ -60916,7 +61449,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 None => {
                                     emit_bounded_error(
                                         output_format,
-                                        "Saved search has no schedule interval; use 'ft search saved schedule'.",
+                                        "Saved search has no schedule interval; use 'ft search saved schedule <name> <interval-ms>'.",
                                     );
                                     std::process::exit(1);
                                 }
@@ -62772,7 +63305,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         "Result: not started — pane {pane} is locked by workflow '{held_by_workflow}' (execution {held_by_execution})"
                                     );
                                     eprintln!(
-                                        "\nHint: Wait for the running workflow to finish, or abort it with 'ft robot workflows abort {held_by_execution}'."
+                                        "\nHint: Wait for the running workflow to finish, or abort it with 'ft robot workflow abort {held_by_execution}'."
                                     );
                                     if let Err(e) = storage.shutdown().await {
                                         tracing::warn!(
@@ -64522,10 +65055,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             }
                             std::process::exit(err.exit_code);
                         }
-                        let parsed = read_mission_file_capped(path).ok().and_then(|s| {
-                            frankenterm_core::plan::Mission::from_json_slice(s.as_bytes()).ok()
-                        });
-                        match parsed {
+                        match read_steering_live_mission(path) {
                             Some(m) => Some(m),
                             None => {
                                 eprintln!(
@@ -64610,7 +65140,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let hint = stored.tx_contract_hash.is_none().then(|| {
                         format!(
                             "receipt {} was planned without a tx contract; re-plan with \
-                             `ft steer plan --contract-file {}` to bind this contract",
+                             `ft steer plan --objective <objective> --scenario <scenario> --contract-file {}` to bind this contract",
                             stored.receipt_id,
                             execution_contract_path.display()
                         )
@@ -64643,9 +65173,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     std::process::exit(1);
                 }
 
-                contract
-                    .receipts
-                    .push(steering_receipt_tx_attachment(&stored, &live_tx_hash, now));
+                let attempt = steering_receipt_run_attempt(&contract.receipts, &stored.receipt_id);
+                contract.receipts.push(steering_receipt_tx_attachment(
+                    &stored,
+                    &live_tx_hash,
+                    now,
+                    attempt,
+                ));
 
                 let kill_switch = kill_switch.into();
                 let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
@@ -64708,7 +65242,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         SteeringReceiptRevalidatingExecutor::new(
                             executor,
                             stored.clone(),
-                            live_mission.clone(),
+                            mission_file.clone(),
                             live_tx_hash.clone(),
                         ),
                         execution_contract_path,
@@ -64736,7 +65270,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         SteeringReceiptRevalidatingExecutor::new(
                             frankenterm_core::tx_execution::SyntheticStepExecutor,
                             stored.clone(),
-                            live_mission.clone(),
+                            mission_file.clone(),
                             live_tx_hash.clone(),
                         ),
                         execution_contract_path,
@@ -65116,9 +65650,23 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let formatted = format_explanation(template, None);
                     println!("{formatted}");
                 }
+            } else if let Some(data) = why_data_for_error_code(&id) {
+                if output_format.is_json() {
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "error_code": data,
+                        "version": frankenterm_core::VERSION,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else if let Some(def) = frankenterm_core::error_codes::get_error_code(&data.code)
+                {
+                    print!("{}", def.format_plain());
+                } else {
+                    println!("{}: {}\n\n{}", data.code, data.title, data.explanation);
+                }
             } else {
                 let error = bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
-                let hint = "Use 'ft why --list' to see available templates.";
+                let hint = "Use 'ft why --list' to see available templates; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted.";
                 if output_format.is_json() {
                     let response = serde_json::json!({
                         "ok": false,
@@ -69837,6 +70385,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             handle_storage_command(command)?;
         }
 
+        Some(Commands::Mobile { .. }) => {
+            unreachable!("mobile is dispatched before workspace initialization")
+        }
+
         Some(Commands::Backup { command }) => {
             handle_backup_command(command, &layout, &workspace_root).await?;
         }
@@ -70182,12 +70734,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             }
 
             RecordCommands::Stop { pane, all } => {
-                // Stop requires IPC to the running watcher
+                // Every recording today is a foreground `ft record start`
+                // process; the watcher never records, so there is nothing to
+                // signal over IPC.
                 let _ = (pane, all);
                 eprintln!(
-                    "ft record stop: requires an active watcher with recording enabled.\n\
-                     For standalone recordings started with `ft record start`, press Ctrl+C.\n\
-                     To stop a watcher-managed recording, use `ft robot rpc record-stop`."
+                    "ft record stop: no background recordings exist to stop.\n\
+                     A recording started with `ft record start` runs in its own terminal: press Ctrl+C there to stop and save it,\n\
+                     or start it with --auto-stop <duration> (e.g. 30m)."
                 );
                 std::process::exit(1);
             }
@@ -71672,7 +72226,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let mut actions = vec![
                                         serde_json::json!({
                                             "command": format!(
-                                                "ft events --pane {} --unhandled",
+                                                "ft events --pane-id {} --unhandled",
                                                 event.pane_id
                                             ),
                                             "label": "List unhandled events"
@@ -71721,7 +72275,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             .take(120)
                                             .collect::<String>(),
                                         "action": format!(
-                                            "ft events --pane {} --unhandled",
+                                            "ft events --pane-id {} --unhandled",
                                             event.pane_id
                                         ),
                                         "actions": actions,
@@ -72175,7 +72729,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         #[cfg(feature = "web")]
-        Some(Commands::Web { port }) => {
+        Some(Commands::Web { port, ui_dir }) => {
+            let ui_assets = load_web_ui_assets(ui_dir.as_deref())?;
             let db_path = layout.db_path.to_string_lossy();
             // ft-xbnl0.2.3 tick 298/300: cx-first web server storage + orchestrator.
             let web_cx = frankenterm_core::cx::Cx::current()
@@ -72186,7 +72741,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let web_tuning = &config.tuning.web;
             let resolved_port =
                 port.unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
-            let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+            let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
                 .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
                 .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                     web_tuning,
@@ -72198,6 +72753,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .with_storage_event_tail(
                     std::env::var("FT_WEB_STORAGE_TAIL").map_or(true, |value| value != "0"),
                 );
+            if let Some(ui_assets) = ui_assets {
+                web_config = web_config.with_ui_assets(ui_assets);
+            }
             frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
 
@@ -75597,6 +76155,154 @@ fn handle_learn_command(
 }
 
 /// Handle `ft storage` subcommands.
+fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
+    use ::config::machines::{self, InventoryContext, MachineInventory, MachineRoute, RouteTarget};
+    use ::config::mobile_export;
+
+    fn write_output(output: Option<&Path>, bytes: &[u8]) -> anyhow::Result<()> {
+        match output {
+            Some(path) => {
+                std::fs::write(path, bytes)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("wrote {}", path.display());
+            }
+            None => std::io::Write::write_all(&mut std::io::stdout(), bytes)?,
+        }
+        Ok(())
+    }
+    let context_for = |path: &Path| InventoryContext {
+        directory: path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        home: ::config::HOME_DIR.clone(),
+    };
+    let inventory_path =
+        |explicit: &Option<PathBuf>| explicit.clone().unwrap_or_else(machines::default_path);
+
+    match command {
+        MobileCommands::Init { hosts, inventory } => {
+            let path = inventory_path(inventory);
+            if path.exists() {
+                anyhow::bail!(
+                    "{} already exists; edit it, or pass --inventory for a new file",
+                    path.display()
+                );
+            }
+            let hosts = if hosts.is_empty() {
+                mobile_export::ssh_config_hosts(&::config::HOME_DIR)
+            } else {
+                hosts.clone()
+            };
+            if hosts.is_empty() {
+                anyhow::bail!("no hosts given and no concrete Host entries in ~/.ssh/config");
+            }
+            let text = machines::inventory_template(&hosts);
+            // Never write an inventory that would not load.
+            MachineInventory::parse(&text, &context_for(&path))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_output(Some(&path), text.as_bytes())?;
+            eprintln!("{} machines, each in its own theme", hosts.len());
+        }
+        MobileCommands::Show { inventory } => {
+            let path = inventory_path(inventory);
+            let context = context_for(&path);
+            let inventory = MachineInventory::load(&path)?;
+            println!("{} ({})", inventory.workspace_name, path.display());
+            for group in &inventory.groups {
+                let marker = if group.id == inventory.default_group {
+                    " (default)"
+                } else {
+                    ""
+                };
+                println!(
+                    "group {}{}: {}",
+                    group.id,
+                    marker,
+                    group.machines.join(", ")
+                );
+            }
+            for machine in &inventory.machines {
+                let theme = &machine.theme;
+                println!(
+                    "{} \"{}\": theme {}{} (accent {}, background {})",
+                    machine.id,
+                    machine.name,
+                    theme.name,
+                    if theme.automatic { ", automatic" } else { "" },
+                    theme.accent,
+                    theme.palette.background
+                );
+                for route in &machine.routes {
+                    match route {
+                        MachineRoute::Ssh {
+                            id,
+                            target: RouteTarget::Alias(alias),
+                        } => {
+                            println!("  {}: ssh alias {}", id, alias);
+                        }
+                        MachineRoute::Ssh {
+                            id,
+                            target:
+                                RouteTarget::Direct {
+                                    host, user, port, ..
+                                },
+                        } => println!("  {}: ssh {}@{}:{}", id, user, host, port.unwrap_or(22)),
+                        MachineRoute::FrankenTermMux { id, .. } => {
+                            let command = machine
+                                .mux_proxy_command(id, &context)
+                                .map(|argv| argv.join(" "))
+                                .unwrap_or_default();
+                            println!("  {}: mux via {}", id, command);
+                        }
+                    }
+                }
+            }
+        }
+        MobileCommands::Export {
+            group,
+            inventory,
+            output,
+            check,
+        } => {
+            let path = inventory_path(inventory);
+            let source =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let context = context_for(&path);
+            let inventory = MachineInventory::load(&path)?;
+            let sources = mobile_export::SshSources::from_disk(&inventory, &context);
+            let export =
+                mobile_export::export(&inventory, &source, group.as_deref(), &sources, &context)?;
+            for note in &export.notes {
+                eprintln!("note: {}", note);
+            }
+            eprintln!(
+                "{} machines and {} SSH routes for the phone",
+                export.machines, export.routes
+            );
+            if !*check {
+                let mut bytes = serde_json::to_vec_pretty(&export.document)?;
+                bytes.push(b'\n');
+                write_output(output.as_deref(), &bytes)?;
+            }
+        }
+        MobileCommands::Source { inventory } => {
+            let source = mobile_export::load_companion_source(&inventory_path(inventory))?;
+            let mut bytes = serde_json::to_vec(&source)?;
+            bytes.push(b'\n');
+            write_output(None, &bytes)?;
+        }
+        MobileCommands::Themes { output } => {
+            let mut bytes = serde_json::to_vec(&mobile_export::theme_catalog_json())?;
+            bytes.push(b'\n');
+            write_output(output.as_deref(), &bytes)?;
+        }
+    }
+    Ok(())
+}
+
 fn handle_storage_command(command: StorageCommands) -> anyhow::Result<()> {
     match command {
         StorageCommands::Advise {
@@ -77300,6 +78006,9 @@ fn tx_compensation_outcome_label(
         frankenterm_core::plan::TxCompensationOutcome::NothingToCompensate => {
             "nothing_to_compensate"
         }
+        frankenterm_core::plan::TxCompensationOutcome::ReconciliationRequired => {
+            "reconciliation_required"
+        }
     }
 }
 
@@ -77486,19 +78195,74 @@ fn tx_run_requires_terminal_backend(contract: &frankenterm_core::plan::MissionTx
         .any(tx_action_requires_terminal_backend)
 }
 
+/// Receipt reconstruction can narrow a runtime probe, but it cannot decide
+/// durable rollback admission. A crash can leave authoritative Success/Pending
+/// records before any commit receipts were saved. The engine freezes and
+/// validates that proof before it authorizes a single compensation.
+fn tx_rollback_receipt_hint(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    now_ms: i64,
+) -> Result<Option<frankenterm_core::plan::TxCommitReport>, String> {
+    contract.validate()?;
+    if !contract.lifecycle_state.is_terminal()
+        && contract.outcome == frankenterm_core::plan::TxOutcome::Pending
+    {
+        // Even a complete receipt history can belong to an earlier attempt:
+        // its failed/skipped step may now be durably successful while another
+        // dispatch is still Pending. Probe and validate declared candidates
+        // conservatively; only the engine's live proof may narrow dispatch.
+        return Ok(None);
+    }
+    match build_robot_tx_rollback_commit_report(contract, now_ms) {
+        Ok(report) => Ok(Some(report)),
+        Err(error)
+            if matches!(
+                contract.lifecycle_state,
+                frankenterm_core::plan::MissionTxState::RolledBack
+                    | frankenterm_core::plan::MissionTxState::Compensated
+            ) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn tx_rollback_has_compensation_candidate(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    commit_report: Option<&frankenterm_core::plan::TxCommitReport>,
+    step_id: &str,
+) -> bool {
+    contract
+        .plan
+        .compensations
+        .iter()
+        .any(|compensation| compensation.for_step_id.0 == step_id)
+        && commit_report.is_none_or(|report| {
+            report
+                .step_results
+                .iter()
+                .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
+        })
+}
+
 fn tx_rollback_requires_terminal_backend(
     contract: &frankenterm_core::plan::MissionTxContract,
-    commit_report: &frankenterm_core::plan::TxCommitReport,
+    commit_report: Option<&frankenterm_core::plan::TxCommitReport>,
 ) -> bool {
-    let committed_steps = commit_report
-        .step_results
-        .iter()
-        .filter(|result| result.outcome.is_committed())
-        .map(|result| result.step_id.clone())
-        .collect::<std::collections::HashSet<_>>();
+    let committed_steps = commit_report.map(|report| {
+        report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+            .map(|result| result.step_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+    });
 
     contract.plan.compensations.iter().any(|compensation| {
-        committed_steps.contains(&compensation.for_step_id)
+        committed_steps
+            .as_ref()
+            .is_none_or(|steps| steps.contains(&compensation.for_step_id))
             && tx_action_requires_terminal_backend(&compensation.action)
     })
 }
@@ -77507,15 +78271,32 @@ fn steering_tx_contract_hash(contract: &frankenterm_core::plan::MissionTxContrac
     contract.compute_hash()
 }
 
+/// The attempt number of the run about to start under `receipt_id`: one more
+/// than the run attachments this contract already carries for it. A run whose
+/// engine refuses still persists its attachment, so the number is what tells
+/// repeated attempts apart.
+fn steering_receipt_run_attempt(receipts: &[serde_json::Value], receipt_id: &str) -> u64 {
+    let prior = receipts
+        .iter()
+        .filter(|attachment| {
+            attachment["kind"] == "ft.steering_receipt.run"
+                && attachment["receipt_id"].as_str() == Some(receipt_id)
+        })
+        .count();
+    u64::try_from(prior).unwrap_or(u64::MAX).saturating_add(1)
+}
+
 fn steering_receipt_tx_attachment(
     receipt: &frankenterm_core::steering::SteeringReceipt,
     live_tx_hash: &str,
     attached_at_ms: i64,
+    attempt: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "ft.steering_receipt.run",
         "schema_version": 1,
         "receipt_id": receipt.receipt_id.as_str(),
+        "attempt": attempt,
         "workspace_id": receipt.workspace_id.as_str(),
         "objective": receipt.objective.as_str(),
         "mission_contract_hash": receipt.mission_contract_hash.as_deref(),
@@ -77526,29 +78307,69 @@ fn steering_receipt_tx_attachment(
     })
 }
 
+/// The mission `ft steer run --mission-file` revalidates against, read fresh:
+/// only a regular file, opened without blocking (a FIFO swapped in mid-run
+/// must not stall a transaction between two steps), and capped like every
+/// mission read. `None` when it cannot be read or parsed.
+fn read_steering_live_mission(path: &Path) -> Option<frankenterm_core::plan::Mission> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MISSION_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MISSION_FILE_MAX_BYTES {
+        return None;
+    }
+    frankenterm_core::plan::Mission::from_json_slice(&bytes).ok()
+}
+
 #[derive(Clone)]
 struct SteeringReceiptRevalidatingExecutor<E> {
     inner: E,
     receipt: frankenterm_core::steering::SteeringReceipt,
-    live_mission: Option<frankenterm_core::plan::Mission>,
+    // Re-read at every dispatch, so a mission edited mid-run stops later
+    // steps. `None` when the run named no mission file.
+    mission_path: Option<PathBuf>,
     // Durable execution presents one-step contract views to `execute_steps`.
     // Revalidation must remain bound to the admitted full transaction identity.
     full_tx_contract_hash: String,
+    // Wall clock for the receipt's TTL. The engine's `now_ms` is the run's
+    // logical start time, the same for every step.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl<E> SteeringReceiptRevalidatingExecutor<E> {
     fn new(
         inner: E,
         receipt: frankenterm_core::steering::SteeringReceipt,
-        live_mission: Option<frankenterm_core::plan::Mission>,
+        mission_path: Option<PathBuf>,
         full_tx_contract_hash: String,
     ) -> Self {
         Self {
             inner,
             receipt,
-            live_mission,
+            mission_path,
             full_tx_contract_hash,
+            clock: Arc::new(mission_now_ms),
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 }
 
@@ -77569,11 +78390,21 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+        // Every dispatch is an effect boundary (ft-7h5da.6.8): the receipt is
+        // checked against the clock and the mission file as they are now, not
+        // as they were when the run started, so a receipt that expires or a
+        // mission that drifts mid-run stops every later step. A mission file
+        // that no longer reads fails closed when the receipt bound a mission.
+        let live_now_ms = now_ms.max((self.clock)());
+        let live_mission = self
+            .mission_path
+            .as_deref()
+            .and_then(read_steering_live_mission);
         let verdict = frankenterm_core::steer_run::steer_run_gate(
             &self.receipt,
-            self.live_mission.as_ref(),
+            live_mission.as_ref(),
             Some(&self.full_tx_contract_hash),
-            now_ms,
+            live_now_ms,
         );
         if let Some(error_code) = verdict.error_code() {
             return contract
@@ -79680,7 +80511,7 @@ async fn handle_tx_command(
             let execution_contract_path = contract_lock.authoritative_path();
 
             let now_ms = mission_now_ms();
-            let commit_report = match build_robot_tx_rollback_commit_report(&contract, now_ms) {
+            let commit_report = match tx_rollback_receipt_hint(&contract, now_ms) {
                 Ok(report) => report,
                 Err(err) => emit_mission_error(
                     output_format,
@@ -79696,10 +80527,11 @@ async fn handle_tx_command(
                 ),
             };
             if let Some(step_id) = fail_compensation_for_step.as_deref()
-                && !commit_report
-                    .step_results
-                    .iter()
-                    .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
+                && !tx_rollback_has_compensation_candidate(
+                    &contract,
+                    commit_report.as_ref(),
+                    step_id,
+                )
             {
                 emit_mission_error(
                     output_format,
@@ -79718,7 +80550,7 @@ async fn handle_tx_command(
             let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                 config,
                 layout,
-                tx_rollback_requires_terminal_backend(&contract, &commit_report),
+                tx_rollback_requires_terminal_backend(&contract, commit_report.as_ref()),
             )
             .await;
             let executor_label = if real_runtime.is_some() {
@@ -79841,7 +80673,7 @@ async fn handle_tx_command(
                 elapsed_ms = started.elapsed().as_millis(),
                 "tx rollback completed"
             );
-            let plain_lines = vec![
+            let mut plain_lines = vec![
                 format!("Tx rollback summary for {}", data.tx_id),
                 format!("  File: {}", data.contract_file),
                 format!("  Plan: {}", data.plan_id),
@@ -79858,6 +80690,12 @@ async fn handle_tx_command(
                 ),
                 format!("  Final state: {}", data.final_state),
             ];
+            if !data.compensation_report.unresolved_step_ids.is_empty() {
+                plain_lines.push(format!(
+                    "  Reconciliation required for steps: {}",
+                    data.compensation_report.unresolved_step_ids.join(", ")
+                ));
+            }
             let plain_lines =
                 if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
                     let mut lines = plain_lines;
@@ -91741,7 +92579,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     }
 
     println!("\nNext steps:");
-    println!("  ft daemon start");
+    println!("  ft watch");
     println!("  ft status");
     println!("  ft robot state");
 
@@ -99897,6 +100735,23 @@ async fn run_diagnostics(
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
 ) -> Vec<DiagnosticCheck> {
+    // Select the same mux backend used by production clients. This selection
+    // is finite: the local-version compatibility probe is timeout- and
+    // output-bounded in frankenterm-core.
+    let mux_client = frankenterm_core::wezterm::build_unified_client(config);
+    run_diagnostics_with_mux_client(cx, permission_warnings, config, layout, mux_client).await
+}
+
+/// [`run_diagnostics`] against an already-selected mux client. Tests pass a
+/// client whose socket discovery cannot see a mux running on the host
+/// (ft-u506a).
+async fn run_diagnostics_with_mux_client(
+    cx: &frankenterm_core::cx::Cx,
+    permission_warnings: &[frankenterm_core::config::PermissionWarning],
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mux_client: frankenterm_core::wezterm::UnifiedClient,
+) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
     // Check 1: frankenterm-core loaded with version
@@ -99981,7 +100836,7 @@ async fn run_diagnostics(
                                             "schema v{} (needs migration to v{})",
                                             version, target
                                         ),
-                                        "Run 'ft daemon start' to auto-migrate",
+                                        "Run 'ft db migrate' to apply pending migrations",
                                     ));
                                 }
                                 std::cmp::Ordering::Greater => {
@@ -100040,6 +100895,16 @@ async fn run_diagnostics(
         }
     }
 
+    // Check 4b: verified-submit idempotency store occupancy. No record changes
+    // and a missing store is never created. MCP keeps the store beside the
+    // database, which a configured absolute db_path can move out of .ft.
+    checks.push(submit_idempotency_store_diagnostic_check(
+        frankenterm_core::submit_idempotency_store::census(
+            layout.db_path.parent().unwrap_or(&layout.ft_dir),
+        ),
+        now_epoch_ms(),
+    ));
+
     // Check 5: Lock file (watcher status)
     let watcher_lock_status = frankenterm_core::lock::check_running(&layout.lock_path);
     checks.push(watcher_lock_diagnostic_check(&watcher_lock_status));
@@ -100085,7 +100950,9 @@ async fn run_diagnostics(
 
     // Check 7: Feature flags
     let features: Vec<&str> = [
+        (cfg!(feature = "ftui"), "ftui"),
         (cfg!(feature = "tui"), "tui"),
+        (cfg!(feature = "ftui"), "ftui"),
         (cfg!(feature = "browser"), "browser"),
         (cfg!(feature = "mcp"), "mcp"),
         (cfg!(feature = "web"), "web"),
@@ -100191,11 +101058,7 @@ async fn run_diagnostics(
         diagnostic
     }));
 
-    // Select the same mux backend used by production clients. This selection
-    // is finite: the local-version compatibility probe is timeout- and
-    // output-bounded in frankenterm-core.
     let wezterm_timeout = std::time::Duration::from_secs(5);
-    let mux_client = frankenterm_core::wezterm::build_unified_client(config);
     let backend_selection = mux_client.selection().clone();
     checks.push(mux_backend_diagnostic(&backend_selection));
     let host_is_idle = doctor_host_is_idle(
@@ -106756,6 +107619,7 @@ reason = "overly conservative pending threshold"
     struct RecordingStepExecutor {
         calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         execute_contract_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        uncertain_commit_step: Option<&'static str>,
     }
 
     impl RecordingStepExecutor {
@@ -106814,6 +107678,31 @@ reason = "overly conservative pending threshold"
                 .expect("recorded calls lock")
                 .push("execute_compensations");
             build_robot_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+
+        fn execute_steps_with_outcome(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<
+            frankenterm_core::tx_execution::StepDispatchOutcome<
+                frankenterm_core::plan::TxCommitStepInput,
+            >,
+        > {
+            use frankenterm_core::tx_execution::StepDispatchOutcome;
+            self.execute_steps(contract, fail_step, now_ms)
+                .into_iter()
+                .map(|mut input| {
+                    if self.uncertain_commit_step == Some(input.step_id.0.as_str()) {
+                        input.success = false;
+                        input.reason_code = "test_lost_commit_reply".to_owned();
+                        StepDispatchOutcome::Indeterminate(input)
+                    } else {
+                        StepDispatchOutcome::Settled(input)
+                    }
+                })
+                .collect()
         }
     }
 
@@ -107182,13 +108071,14 @@ reason = "overly conservative pending threshold"
             Some(60_000),
         );
 
-        let attachment = steering_receipt_tx_attachment(&receipt, &live_hash, 1_704_200_000_010);
+        let attachment = steering_receipt_tx_attachment(&receipt, &live_hash, 1_704_200_000_010, 1);
 
         assert_eq!(attachment["kind"], "ft.steering_receipt.run");
         assert_eq!(
             attachment["receipt_id"].as_str(),
             Some(receipt.receipt_id.as_str())
         );
+        assert_eq!(attachment["attempt"], 1);
         assert_eq!(
             attachment["live_tx_contract_hash"].as_str(),
             Some(live_hash.as_str())
@@ -107197,6 +108087,21 @@ reason = "overly conservative pending threshold"
             attachment["tx_contract_hash"].as_str(),
             Some(live_hash.as_str())
         );
+    }
+
+    #[test]
+    fn steering_receipt_run_attempts_count_only_this_receipts_runs() {
+        let receipts = vec![
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:a"}),
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:b"}),
+            serde_json::json!({"kind": "other", "receipt_id": "steer:a"}),
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:a"}),
+        ];
+
+        assert_eq!(steering_receipt_run_attempt(&[], "steer:a"), 1);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:a"), 3);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:b"), 2);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:c"), 1);
     }
 
     #[test]
@@ -107214,9 +108119,9 @@ reason = "overly conservative pending threshold"
             1_704_200_000_000,
             Some(60_000),
         );
-        contract
-            .receipts
-            .push(steering_receipt_tx_attachment(&receipt, &live_hash, 5_151));
+        contract.receipts.push(steering_receipt_tx_attachment(
+            &receipt, &live_hash, 5_151, 1,
+        ));
         let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
         let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
@@ -107227,7 +108132,8 @@ reason = "overly conservative pending threshold"
                 receipt,
                 None,
                 live_hash.clone(),
-            ),
+            )
+            .with_clock(|| 5_151),
             contract_lock.authoritative_path(),
             Some(&contract_lock),
             &mut contract,
@@ -107282,7 +108188,8 @@ reason = "overly conservative pending threshold"
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
-            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash),
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(|| 5_151),
             contract_lock.authoritative_path(),
             Some(&contract_lock),
             &mut contract,
@@ -107300,6 +108207,209 @@ reason = "overly conservative pending threshold"
             !calls.contains(&"execute_steps"),
             "stale receipt must stop before side-effecting commit steps"
         );
+        let commit_report = data.commit_report.expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        assert_eq!(
+            commit_report.error_code.as_deref(),
+            Some("robot.steer_hash_mismatch")
+        );
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_stops_later_steps_once_the_receipt_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut contract = sample_robot_tx_contract();
+        assert_eq!(contract.plan.steps.len(), 2, "fixture runs two steps");
+        let live_hash = steering_tx_contract_hash(&contract);
+        let created_at_ms = 1_704_200_000_000;
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            created_at_ms,
+            Some(60_000),
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let executor = RecordingStepExecutor::default();
+        // The first step dispatches 1 s into the receipt's 60 s TTL; the second
+        // comes two minutes in, after it expired. The engine's own clock stays
+        // at the run's start for both.
+        let clock_reads = Arc::new(AtomicUsize::new(0));
+        let clock = move || {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                created_at_ms + 1_000
+            } else {
+                created_at_ms + 120_000
+            }
+        };
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(clock),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            created_at_ms + 1_000,
+        )
+        .expect("a receipt expiring mid-run should become a tx failure report");
+
+        let dispatched = executor
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| *call == "execute_steps")
+            .count();
+        assert_eq!(dispatched, 1, "the step after expiry must not dispatch");
+        let commit_report = data.commit_report.expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        assert_eq!(
+            commit_report.error_code.as_deref(),
+            Some("robot.steer_receipt_expired")
+        );
+        assert_ne!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    /// Edits the mission file after each step it runs, as an operator
+    /// changing the mission mid-run would.
+    #[derive(Clone)]
+    struct MissionEditingStepExecutor {
+        inner: RecordingStepExecutor,
+        mission_path: PathBuf,
+    }
+
+    impl frankenterm_core::tx_execution::StepExecutor for MissionEditingStepExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+            self.inner.evaluate_gates(contract, now_ms)
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+            let inputs = self.inner.execute_steps(contract, fail_step, now_ms);
+            let mut mission =
+                read_steering_live_mission(&self.mission_path).expect("read the live mission");
+            mission.title.push_str(" (edited)");
+            std::fs::write(
+                &self.mission_path,
+                serde_json::to_vec(&mission).expect("serialize the edited mission"),
+            )
+            .expect("write the edited mission");
+            inputs
+        }
+
+        fn execute_compensations(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            commit_report: &frankenterm_core::plan::TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
+            self.inner
+                .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    /// A mission path swapped to a FIFO mid-run fails the read at once
+    /// instead of blocking the run between two steps.
+    #[cfg(unix)]
+    #[test]
+    fn steering_live_mission_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("create mission tempdir");
+        let fifo = dir.path().join("mission.json");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create mission FIFO");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_steering_live_mission(&path).is_none());
+        });
+        let refused = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO mission must not block");
+        assert!(refused, "a FIFO is not a mission file");
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_stops_later_steps_when_the_mission_drifts() {
+        let mut contract = sample_robot_tx_contract();
+        assert_eq!(contract.plan.steps.len(), 2, "fixture runs two steps");
+        let live_hash = steering_tx_contract_hash(&contract);
+        let mission = sample_robot_mission();
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            Some(&mission),
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            1_704_200_000_000,
+            Some(60_000),
+        );
+        let (dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let mission_path = dir.path().join("mission.json");
+        std::fs::write(
+            &mission_path,
+            serde_json::to_vec(&mission).expect("serialize the mission"),
+        )
+        .expect("write the mission");
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let recorder = RecordingStepExecutor::default();
+        let executor = MissionEditingStepExecutor {
+            inner: recorder.clone(),
+            mission_path: mission_path.clone(),
+        };
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(
+                executor,
+                receipt,
+                Some(mission_path),
+                live_hash,
+            )
+            .with_clock(|| 5_151),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect("a mission drifting mid-run should become a tx failure report");
+
+        // The first step ran against the receipt's mission (so the re-read
+        // parses it); the second saw the edit and refused.
+        let dispatched = recorder
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| *call == "execute_steps")
+            .count();
+        assert_eq!(dispatched, 1, "the step after the edit must not dispatch");
         let commit_report = data.commit_report.expect("commit report should be present");
         assert_eq!(commit_report.failed_count, 1);
         assert_eq!(
@@ -107352,6 +108462,230 @@ reason = "overly conservative pending threshold"
             compensation_report.outcome.target_tx_state()
         );
         assert_eq!(data.final_state, contract.lifecycle_state);
+    }
+
+    #[test]
+    fn tx_rollback_helpers_recover_proven_work_despite_incomplete_receipts() {
+        use frankenterm_core::plan::{MissionTxState, TxCompensationOutcome, TxOutcome};
+        let mut contract = sample_robot_tx_contract();
+        let (_directory, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let interrupted = RecordingStepExecutor {
+            uncertain_commit_step: Some("tx-step:2"),
+            ..Default::default()
+        };
+        execute_tx_run_with_executor(
+            interrupted,
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            7_171,
+        )
+        .expect_err("an indeterminate second commit must remain pending");
+        let mut contract = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let hint = tx_rollback_receipt_hint(&contract, 8_181).unwrap();
+        assert!(
+            hint.is_none(),
+            "the command must defer incomplete receipt admission to durable proof"
+        );
+        assert!(tx_rollback_requires_terminal_backend(
+            &contract,
+            hint.as_ref()
+        ));
+        assert!(tx_rollback_has_compensation_candidate(
+            &contract,
+            hint.as_ref(),
+            "tx-step:1"
+        ));
+        assert!(!tx_rollback_has_compensation_candidate(
+            &contract,
+            hint.as_ref(),
+            "missing-step"
+        ));
+        let executor = RecordingStepExecutor::default();
+        let data = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            8_181,
+        )
+        .expect("durable Success permits only the first undo");
+        assert_eq!(
+            data.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(data.compensation_report.compensated_count, 1);
+        assert_eq!(data.compensation_report.unresolved_step_ids, ["tx-step:2"]);
+        assert_eq!(data.final_state, MissionTxState::Compensating);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["compensation_report"]["unresolved_step_ids"],
+            serde_json::json!(["tx-step:2"])
+        );
+        let mut persisted = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(persisted.outcome, TxOutcome::Pending);
+        assert!(
+            persisted
+                .receipts
+                .iter()
+                .filter(|receipt| {
+                    matches!(
+                        receipt.get("phase").and_then(serde_json::Value::as_str),
+                        Some("commit" | "compensate")
+                    )
+                })
+                .all(
+                    |receipt| receipt.get("step_id").and_then(serde_json::Value::as_str)
+                        == Some("tx-step:1")
+                )
+        );
+        assert!(
+            tx_rollback_receipt_hint(&persisted, 9_191)
+                .unwrap()
+                .is_none()
+        );
+        let repeated = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut persisted,
+            None,
+            9_191,
+        )
+        .expect("reopened durable undo proof prevents redispatch");
+        assert_eq!(repeated.compensation_report.compensated_count, 0);
+        assert_eq!(
+            repeated.compensation_report.unresolved_step_ids,
+            ["tx-step:2"]
+        );
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_compensations")
+                .count(),
+            1
+        );
+
+        persisted.lifecycle_state = MissionTxState::RolledBack;
+        persisted.outcome = TxOutcome::Compensated;
+        assert!(
+            tx_rollback_receipt_hint(&persisted, 10_000).is_err(),
+            "already terminal rollback remains refused at the command boundary"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_pending_hint_ignores_complete_stale_failure_receipts() {
+        use frankenterm_core::plan::{
+            MissionKillSwitchLevel, MissionTxState, TxCompensationOutcome,
+        };
+        let mut contract = sample_robot_tx_contract();
+        let mut old_attempt = contract.clone();
+        old_attempt.lifecycle_state = MissionTxState::Prepared;
+        let old_inputs = build_robot_tx_commit_step_inputs(&old_attempt, Some("tx-step:1"), 6_000);
+        let old_report = frankenterm_core::plan::execute_commit_phase(
+            &old_attempt,
+            &old_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            6_000,
+        )
+        .unwrap();
+        assert_eq!(old_report.failed_count, 1);
+        assert_eq!(old_report.skipped_count, 1);
+        contract.receipts = old_report.receipts;
+        let (_directory, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor {
+                uncertain_commit_step: Some("tx-step:2"),
+                ..Default::default()
+            },
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            7_171,
+        )
+        .expect_err("fresh first commit succeeds before the second reply is lost");
+        let mut persisted = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let stale = build_robot_tx_rollback_commit_report(&persisted, 8_181).unwrap();
+        assert_eq!(
+            stale.committed_count, 0,
+            "complete older receipts hide the fresh Success"
+        );
+        assert!(!tx_rollback_requires_terminal_backend(
+            &persisted,
+            Some(&stale)
+        ));
+        assert!(!tx_rollback_has_compensation_candidate(
+            &persisted,
+            Some(&stale),
+            "tx-step:1"
+        ));
+
+        let hint = tx_rollback_receipt_hint(&persisted, 8_181).unwrap();
+        assert!(
+            hint.is_none(),
+            "pending recovery cannot trust even a complete receipt hint"
+        );
+        assert!(tx_rollback_requires_terminal_backend(
+            &persisted,
+            hint.as_ref()
+        ));
+        assert!(tx_rollback_has_compensation_candidate(
+            &persisted,
+            hint.as_ref(),
+            "tx-step:1"
+        ));
+        let executor = RecordingStepExecutor::default();
+        let result = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut persisted,
+            None,
+            8_181,
+        )
+        .unwrap();
+        assert_eq!(
+            result.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(result.compensation_report.compensated_count, 1);
+        assert_eq!(
+            result.compensation_report.unresolved_step_ids,
+            ["tx-step:2"]
+        );
+        let mut reopened = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let repeated = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut reopened,
+            None,
+            9_191,
+        )
+        .unwrap();
+        assert_eq!(repeated.compensation_report.compensated_count, 0);
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_compensations")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -123861,7 +125195,10 @@ printf x > "$MINISIGN_MARKER"
                 format!("#!/usr/bin/env bash\nprintf '{listing}'\n"),
             )
             .expect("write fake ps");
-            std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o555))
+            // Owner-writable: each census call rewrites the same fake ps, and
+            // a read-only 0o555 file refused the second write for any
+            // non-root user.
+            std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o755))
                 .expect("make fake ps executable");
             let script = format!(
                 "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES=1\nexport FT_INSTALL_TEST_FORCE_PS_CENSUS=1\nsource {}\nunset FT_INSTALL_TEST_MUX_OWNERSHIP_STATE\nSYSTEM_INSTALL=0\nDEST={}\ninstaller_mux_ownership_state\n",
@@ -129041,7 +130378,7 @@ printf x > "$MINISIGN_MARKER"
             "warning",
             "unhandled event",
             vec![
-                ("ft events --pane 3 --unhandled", "List unhandled events"),
+                ("ft events --pane-id 3 --unhandled", "List unhandled events"),
                 ("ft why --recent --pane 3", "Explain detection"),
                 ("ft show 3", "Show pane details"),
             ],
@@ -129050,7 +130387,7 @@ printf x > "$MINISIGN_MARKER"
 
         let actions = item["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0]["command"], "ft events --pane 3 --unhandled");
+        assert_eq!(actions[0]["command"], "ft events --pane-id 3 --unhandled");
         assert_eq!(actions[0]["label"], "List unhandled events");
         assert_eq!(actions[1]["command"], "ft why --recent --pane 3");
         assert_eq!(actions[2]["command"], "ft show 3");
@@ -129100,7 +130437,7 @@ printf x > "$MINISIGN_MARKER"
         let section_actions: Vec<(&str, &str)> = vec![
             ("health", "ft doctor"),
             ("crashes", "ft reproduce export --kind crash"),
-            ("events", "ft events --pane 1 --unhandled"),
+            ("events", "ft events --pane-id 1 --unhandled"),
             ("workflows", "ft workflow status wf-1"),
         ];
 
@@ -129133,7 +130470,7 @@ printf x > "$MINISIGN_MARKER"
             "error",
             "[pane 7] pattern_match: error_detect",
             vec![
-                ("ft events --pane 7 --unhandled", "List unhandled"),
+                ("ft events --pane-id 7 --unhandled", "List unhandled"),
                 ("ft why --recent --pane 7", "Explain detection"),
                 ("ft show 7", "Show pane"),
             ],
@@ -131431,6 +132768,7 @@ printf x > "$MINISIGN_MARKER"
                 MuxRejectionCode::IndeterminateMutation,
                 ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE,
             ),
+            (MuxRejectionCode::ResourceBusy, ROBOT_ERR_MUX_RESOURCE_BUSY),
             (
                 MuxRejectionCode::UnknownFuture,
                 ROBOT_ERR_MUX_UNKNOWN_FUTURE,
@@ -131460,7 +132798,8 @@ printf x > "$MINISIGN_MARKER"
             let (effect, retry) = match code {
                 MuxRejectionCode::DeadlineExceeded
                 | MuxRejectionCode::QuotaExceeded
-                | MuxRejectionCode::BackendFailure => (
+                | MuxRejectionCode::BackendFailure
+                | MuxRejectionCode::ResourceBusy => (
                     MuxEffectCertainty::NotApplied,
                     MuxRetryAuthority::SafeAfterBackoff,
                 ),
@@ -137240,6 +138579,374 @@ printf x > "$MINISIGN_MARKER"
     }
 
     #[test]
+    fn cli_attention_maps_ft_mute_records_to_router_mutes() {
+        use frankenterm_core::attention_live::attention_mute_from_record;
+        use frankenterm_core::attention_router::AttentionRouterMuteScope;
+        use frankenterm_core::storage::EventMuteRecord;
+
+        let record = |scope: &str, reason: Option<&str>| EventMuteRecord {
+            identity_key: "attention.verified_submit.drift.codex".to_string(),
+            scope: scope.to_string(),
+            created_at: 1,
+            expires_at: None,
+            created_by: None,
+            reason: reason.map(str::to_string),
+        };
+        let global = attention_mute_from_record(&record("global", Some("known drift")));
+        assert_eq!(global.identity_key, "attention.verified_submit.drift.codex");
+        assert_eq!(global.scope, AttentionRouterMuteScope::Global);
+        assert_eq!(global.reason.as_deref(), Some("known drift"));
+        let workspace = attention_mute_from_record(&record("workspace", None));
+        assert_eq!(workspace.scope, AttentionRouterMuteScope::Workspace);
+        assert_eq!(workspace.workspace, None, "applies to this workspace");
+        assert_eq!(workspace.reason, None);
+    }
+
+    #[test]
+    fn verified_submit_drift_alerts_signal_each_episode_once_on_an_unconfirmed_pane() {
+        use frankenterm_core::robot_types::{
+            SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState as State,
+        };
+        use frankenterm_core::storage::AuditActionRecord;
+
+        let row = |pane: Option<u64>, agent: &str, state: State| AuditActionRecord {
+            id: 0,
+            ts: 0,
+            actor_kind: "mcp".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: pane,
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: Some(
+                serde_json::to_string(&SubmitReceipt {
+                    state,
+                    guarantee_level: SubmitGuaranteeLevel::Submitted,
+                    guarantee_met: false,
+                    agent_type: Some(agent.to_string()),
+                    profile_id: Some(format!("{agent}.default")),
+                    profile_version: Some("1".to_string()),
+                    attempts: 1,
+                    evidence_rule_ids: Vec::new(),
+                    elapsed_ms: 1,
+                    polls: 1,
+                    cursor_before: None,
+                    cursor_after: None,
+                    idempotency_key: "k".to_string(),
+                })
+                .expect("receipt json"),
+            ),
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        // Newest first: a confirmed send on pane 4, then unconfirmed ones on
+        // pane 9 (and one with no registered pane), then older successes.
+        let mut drifting = vec![
+            row(Some(4), "codex", State::Submitted),
+            row(None, "codex", State::StuckInComposer),
+            row(Some(9), "codex", State::VerificationUnavailable),
+        ];
+        for _ in 0..4 {
+            drifting.push(row(Some(9), "codex", State::StuckInComposer));
+        }
+        drifting.push(row(Some(4), "codex", State::Submitted));
+        // A row without a receipt is not evidence.
+        let mut bare = row(Some(1), "codex", State::Submitted);
+        bare.verification_summary = None;
+        drifting.push(bare);
+
+        let mut signaled = std::collections::BTreeSet::new();
+        let alerts = verified_submit_drift_alerts(&drifting, &mut signaled);
+        assert_eq!(alerts.len(), 1);
+        let (pane, tally) = &alerts[0];
+        assert_eq!(*pane, 9, "the newest unconfirmed receipt with a pane");
+        assert_eq!((tally.observed, tally.unconfirmed()), (8, 6));
+        assert!(verified_submit_drift_alerts(&drifting, &mut signaled).is_empty());
+
+        let recovered: Vec<_> = (0..8)
+            .map(|_| row(Some(2), "codex", State::Submitted))
+            .collect();
+        assert!(verified_submit_drift_alerts(&recovered, &mut signaled).is_empty());
+        assert!(signaled.is_empty(), "recovery re-arms the signal");
+        assert_eq!(
+            verified_submit_drift_alerts(&drifting, &mut signaled).len(),
+            1,
+            "a relapse raises a new event"
+        );
+    }
+
+    /// Live attention end to end: audit rows and an `ft mute` record in a real
+    /// workspace database reach the scored payload through the CLI builder.
+    #[test]
+    fn cli_attention_live_run_reads_policy_gate_audit_and_honors_ft_mute() {
+        use frankenterm_core::storage::{AuditActionRecord, EventMuteRecord};
+
+        run_async_test(async {
+            let temp = unique_temp_dir("attention_live_policy_gate");
+            let config = frankenterm_core::config::Config::default();
+            let layout = config.workspace_layout(Some(&temp)).expect("layout");
+            std::fs::create_dir_all(&layout.ft_dir).expect("ft dir");
+            let db_path = layout.db_path.to_string_lossy().to_string();
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
+                .await
+                .expect("storage");
+            let now = now_ms_i64();
+            // (actor, action, pane, decision, rule, age_ms)
+            for (actor, action, pane, decision, rule, age) in [
+                (
+                    "BlueLake",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.destructive",
+                    1_000,
+                ),
+                (
+                    "BlueLake",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.destructive",
+                    1_000,
+                ),
+                (
+                    "GreenRiver",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.network",
+                    1_000,
+                ),
+                // Approved and then ran: resolved, so not pending.
+                (
+                    "BlueLake",
+                    "send_text",
+                    8,
+                    "require_approval",
+                    "approval.send",
+                    5_000,
+                ),
+                ("BlueLake", "send_text", 8, "allow", "approval.send", 4_000),
+                // Still waiting for a decision.
+                (
+                    "GreenRiver",
+                    "spawn",
+                    9,
+                    "require_approval",
+                    "approval.spawn",
+                    3_000,
+                ),
+            ] {
+                storage
+                    .record_audit_action(AuditActionRecord {
+                        id: 0,
+                        ts: now - age,
+                        actor_kind: "robot".to_string(),
+                        actor_id: Some(actor.to_string()),
+                        correlation_id: None,
+                        pane_id: Some(pane),
+                        domain: Some("local".to_string()),
+                        action_kind: action.to_string(),
+                        policy_decision: decision.to_string(),
+                        decision_reason: Some("blocked".to_string()),
+                        rule_id: Some(rule.to_string()),
+                        input_summary: Some("rm -rf /secret-canary".to_string()),
+                        verification_summary: None,
+                        decision_context: None,
+                        result: "recorded".to_string(),
+                    })
+                    .await
+                    .expect("record audit action");
+            }
+            // A detection storm: five identical critical events on pane 3, plus
+            // a warning whose identity the operator muted.
+            storage
+                .upsert_pane(frankenterm_core::storage::PaneRecord {
+                    pane_id: 3,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: now - 60_000,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("pane");
+            let event = |rule: &str, event_type: &str, severity: &str, age: i64| {
+                frankenterm_core::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 3,
+                    rule_id: rule.to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: event_type.to_string(),
+                    severity: severity.to_string(),
+                    confidence: 0.9,
+                    extracted: Some(serde_json::json!({"reset": "5pm"})),
+                    matched_text: Some("SECRET MATCH secret-canary".to_string()),
+                    segment_id: None,
+                    detected_at: now - age,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                }
+            };
+            for age in [1_000, 2_000, 3_000, 4_000, 5_000] {
+                storage
+                    .record_event(event(
+                        "codex.usage.reached",
+                        "usage.reached",
+                        "critical",
+                        age,
+                    ))
+                    .await
+                    .expect("storm event");
+            }
+            storage
+                .record_event(event(
+                    "claude_code.auth.login_required",
+                    "auth.login_required",
+                    "warning",
+                    1_000,
+                ))
+                .await
+                .expect("muted event");
+            let muted_event_key = frankenterm_core::events::event_identity_key(
+                &frankenterm_core::patterns::Detection {
+                    rule_id: "claude_code.auth.login_required".to_string(),
+                    agent_type: frankenterm_core::patterns::AgentType::Unknown,
+                    event_type: "auth.login_required".to_string(),
+                    severity: frankenterm_core::patterns::Severity::Info,
+                    confidence: 0.0,
+                    extracted: serde_json::json!({"reset": "5pm"}),
+                    matched_text: String::new(),
+                    span: (0, 0),
+                },
+                3,
+                None,
+            );
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: muted_event_key,
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: None,
+                    reason: None,
+                })
+                .await
+                .expect("event mute");
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key:
+                        "attention.policy_denied_audit.GreenRiver.send_text.command_gate.network"
+                            .to_string(),
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: None,
+                    reason: Some("expected network denials".to_string()),
+                })
+                .await
+                .expect("mute");
+            storage.shutdown().await.expect("storage shutdown");
+
+            let payload = build_cli_attention_router_payload(
+                &config,
+                &temp,
+                None,
+                Some(u64::try_from(now).expect("epoch ms")),
+                AttentionRouterSurface::Status,
+                "test.attention.live",
+                None,
+            )
+            .await
+            .expect("live payload");
+            let denials: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| item.reason_codes.iter().any(|code| code == "policy.denied"))
+                .collect();
+            assert_eq!(
+                denials.len(),
+                1,
+                "the muted GreenRiver group is suppressed: {denials:?}"
+            );
+            assert!(
+                denials[0].redacted_summary.contains("BlueLake"),
+                "{}",
+                denials[0].redacted_summary
+            );
+            assert!(
+                denials[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "policy_rule.command_gate.destructive")
+            );
+            let pending: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.reason_codes
+                        .iter()
+                        .any(|code| code == "approval.required")
+                })
+                .collect();
+            assert_eq!(
+                pending.len(),
+                1,
+                "an approval followed by an allowed run is resolved: {pending:?}"
+            );
+            assert!(
+                pending[0].redacted_summary.contains("GreenRiver"),
+                "{}",
+                pending[0].redacted_summary
+            );
+            let events: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.reason_codes
+                        .iter()
+                        .any(|code| code == "event.unhandled")
+                })
+                .collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "the storm is one item and the muted identity is suppressed: {events:?}"
+            );
+            assert!(
+                events[0].redacted_summary.contains(
+                    "5 unhandled codex.usage.reached event(s) on pane 3, including critical"
+                ),
+                "{}",
+                events[0].redacted_summary
+            );
+            let rendered = serde_json::to_string(&payload).expect("serialize payload");
+            assert!(
+                !rendered.contains("secret-canary") && !rendered.contains("SECRET MATCH"),
+                "no action input or matched text leaks"
+            );
+
+            let _ = std::fs::remove_dir_all(&temp);
+        });
+    }
+
+    #[test]
     fn cli_attention_plain_render_includes_nudge_plan_receipt_review_fields() {
         let input = cli_attention_ready_input();
         let payload = build_attention_router_surface_payload(
@@ -137291,6 +138998,761 @@ printf x > "$MINISIGN_MARKER"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    /// Shell-split a documented example command (quotes respected, so `""`
+    /// stays an empty word) and fill what a reader would substitute:
+    /// `<placeholder>` text and `$VARIABLE` words become `0`.
+    fn example_command_words(command: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut quote: Option<char> = None;
+        for character in command.chars() {
+            match (quote, character) {
+                (Some(open), c) if c == open => quote = None,
+                (Some(_), c) => word.push(c),
+                (None, '"' | '\'') => {
+                    quote = Some(character);
+                    in_word = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                (None, c) => {
+                    word.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        if in_word {
+            words.push(word);
+        }
+        words
+            .into_iter()
+            .map(|word| {
+                if word.starts_with('$') {
+                    return "0".to_string();
+                }
+                let mut filled = String::new();
+                let mut rest = word.as_str();
+                while let Some(start) = rest.find('<') {
+                    let Some(end) = rest[start..].find('>') else {
+                        break;
+                    };
+                    filled.push_str(&rest[..start]);
+                    filled.push('0');
+                    rest = &rest[start + end + 1..];
+                }
+                filled.push_str(rest);
+                filled
+            })
+            .collect()
+    }
+
+    /// The runnable part of a documented `ft ...` line: trailing comments,
+    /// pipes and redirections are cut, and synopsis lines (`[optional]`,
+    /// `{a|b}`, `a|b`, `...`) are skipped.
+    fn runnable_example(line: &str) -> Option<&str> {
+        if !line.starts_with("ft ") {
+            return None;
+        }
+        let mut line = line;
+        for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
+            if let Some(index) = line.find(cut) {
+                line = &line[..index];
+            }
+        }
+        let line = line.trim();
+        (!["[", "{", "...", "|"]
+            .into_iter()
+            .any(|token| line.contains(token)))
+        .then_some(line)
+    }
+
+    /// `ft ...` commands that product code hands to operators and agents:
+    /// string literals that start with `ft ` and backtick spans that do, in
+    /// the source before its unit-test module, comment lines skipped. Format
+    /// arguments (`{pane_id}`) stand in as `0`, like `<placeholders>`.
+    /// Literals passed to `contains`/`starts_with` are matchers, and a few
+    /// prose sentences start with "ft"; neither is a suggestion.
+    fn product_command_hints(source: &str) -> Vec<String> {
+        const PROSE: [&str; 6] = [
+            "ft detected ",
+            "ft monitors ",
+            "ft Master",
+            "ft <command> --help",
+            "ft version too old",
+            "ft will ",
+        ];
+        let production = source
+            .find("#[cfg(test)]\nmod ")
+            .map_or(source, |index| &source[..index]);
+        let mut candidates = Vec::new();
+        for line in production.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(start) = rest.find("\"ft ") {
+                let matcher =
+                    rest[..start].ends_with("contains(") || rest[..start].ends_with("starts_with(");
+                let mut literal = String::new();
+                let mut chars = rest[start + 1..].char_indices();
+                let mut end = rest.len();
+                while let Some((offset, character)) = chars.next() {
+                    match character {
+                        '"' => {
+                            end = start + 1 + offset + 1;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some((_, 'n' | 't' | 'r')) => literal.push(' '),
+                            Some((_, escaped)) => literal.push(escaped),
+                            None => {}
+                        },
+                        other => literal.push(other),
+                    }
+                }
+                if !matcher {
+                    candidates.push(literal);
+                }
+                rest = &rest[end..];
+            }
+            for (index, span) in line.split('`').enumerate() {
+                if index % 2 == 1 && span.starts_with("ft ") {
+                    candidates.push(span.to_string());
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|candidate| !PROSE.iter().any(|prose| candidate.starts_with(prose)))
+            .filter_map(|candidate| {
+                let mut filled = String::new();
+                let mut rest = candidate.as_str();
+                while let Some(start) = rest.find('{') {
+                    let Some(end) = rest[start..].find('}') else {
+                        break;
+                    };
+                    filled.push_str(&rest[..start]);
+                    filled.push('0');
+                    rest = &rest[start + end + 1..];
+                }
+                filled.push_str(rest);
+                runnable_example(filled.trim()).map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Runnable `ft ...` lines in a markdown file's shell fences. Within one
+    /// fence, continuations are joined; a fence that uses a `$ ` prompt counts
+    /// only its prompted lines (the rest is printed output); see
+    /// [`runnable_example`] for the cuts and skips.
+    fn doc_example_commands(markdown: &str) -> Vec<String> {
+        fn fence_commands(fence: &[&str], commands: &mut Vec<String>) {
+            let mut joined_lines = Vec::new();
+            let mut continued = String::new();
+            for raw in fence {
+                let trimmed = raw.trim();
+                if let Some(head) = trimmed.strip_suffix('\\') {
+                    continued.push_str(head);
+                    continued.push(' ');
+                    continue;
+                }
+                joined_lines.push(format!("{continued}{trimmed}").trim().to_string());
+                continued.clear();
+            }
+            let prompted = joined_lines.iter().any(|line| line.starts_with("$ "));
+            for joined in &joined_lines {
+                let mut line = joined.as_str();
+                if prompted {
+                    let Some(command) = line.strip_prefix("$ ") else {
+                        continue;
+                    };
+                    line = command.trim();
+                }
+                if let Some(command) = runnable_example(line) {
+                    commands.push(command.to_string());
+                }
+            }
+        }
+
+        let mut commands = Vec::new();
+        let mut fence: Option<(bool, Vec<&str>)> = None;
+        for raw in markdown.lines() {
+            if let Some(language) = raw.trim().strip_prefix("```") {
+                match fence.take() {
+                    Some((shell, lines)) => {
+                        if shell {
+                            fence_commands(&lines, &mut commands);
+                        }
+                    }
+                    None => {
+                        let shell = matches!(
+                            language.trim().to_ascii_lowercase().as_str(),
+                            "bash" | "sh" | "shell" | "console"
+                        );
+                        fence = Some((shell, Vec::new()));
+                    }
+                }
+                continue;
+            }
+            if let Some((_, lines)) = fence.as_mut() {
+                lines.push(raw);
+            }
+        }
+        commands
+    }
+
+    /// README and operator-doc examples are copied by humans and agents
+    /// alike; every runnable one must parse with the current CLI.
+    #[test]
+    fn documented_ft_examples_parse_with_the_current_cli() {
+        let documents = [
+            ("README.md", include_str!("../../../README.md")),
+            (
+                "docs/operator-playbook.md",
+                include_str!("../../../docs/operator-playbook.md"),
+            ),
+            (
+                "docs/operator-runbook.md",
+                include_str!("../../../docs/operator-runbook.md"),
+            ),
+            (
+                "docs/incident-bundles.md",
+                include_str!("../../../docs/incident-bundles.md"),
+            ),
+            (
+                "docs/session-persistence.md",
+                include_str!("../../../docs/session-persistence.md"),
+            ),
+            (
+                "docs/session-persistence-troubleshooting.md",
+                include_str!("../../../docs/session-persistence-troubleshooting.md"),
+            ),
+            (
+                "docs/storage-tuning.md",
+                include_str!("../../../docs/storage-tuning.md"),
+            ),
+            (
+                "docs/search-explainability.md",
+                include_str!("../../../docs/search-explainability.md"),
+            ),
+            (
+                "docs/swarm-playbook.md",
+                include_str!("../../../docs/swarm-playbook.md"),
+            ),
+            (
+                "docs/high-core-swarm-runbook.md",
+                include_str!("../../../docs/high-core-swarm-runbook.md"),
+            ),
+            (
+                "docs/noise-control.md",
+                include_str!("../../../docs/noise-control.md"),
+            ),
+            (
+                "docs/approvals.md",
+                include_str!("../../../docs/approvals.md"),
+            ),
+            (
+                "docs/explain-match.md",
+                include_str!("../../../docs/explain-match.md"),
+            ),
+            (
+                "docs/cli-reference.md",
+                include_str!("../../../docs/cli-reference.md"),
+            ),
+            (
+                "docs/frankenterm-gui-user-guide.md",
+                include_str!("../../../docs/frankenterm-gui-user-guide.md"),
+            ),
+            (
+                "docs/ft-xbnl0-5-3-blessed-tuning-playbook.md",
+                include_str!("../../../docs/ft-xbnl0-5-3-blessed-tuning-playbook.md"),
+            ),
+            (
+                "docs/flight-recorder/alerts-wa-oegrb-8-4.md",
+                include_str!("../../../docs/flight-recorder/alerts-wa-oegrb-8-4.md"),
+            ),
+            (
+                "docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md",
+                include_str!("../../../docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md"),
+            ),
+            (
+                "docs/flight-recorder/incident-response-wa-oegrb-8-5.md",
+                include_str!("../../../docs/flight-recorder/incident-response-wa-oegrb-8-5.md"),
+            ),
+            (
+                "docs/resource-pressure-cockpit-contract.md",
+                include_str!("../../../docs/resource-pressure-cockpit-contract.md"),
+            ),
+            (
+                "docs/blocker-radar-runbook.md",
+                include_str!("../../../docs/blocker-radar-runbook.md"),
+            ),
+            (
+                "docs/context-horizon-contract.md",
+                include_str!("../../../docs/context-horizon-contract.md"),
+            ),
+        ];
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for (document, markdown) in documents {
+            let commands = doc_example_commands(markdown);
+            assert!(!commands.is_empty(), "{document} lost its examples");
+            for command in commands {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&command)) {
+                    failures.push(format!("{document}: {command}: {:?}", error.kind()));
+                }
+            }
+        }
+        assert!(checked > 450, "documented examples shrank to {checked}");
+        assert!(
+            failures.is_empty(),
+            "documented examples the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// `ft ...` spans in backticks outside fenced blocks: prose often names a
+    /// command without its arguments, so only spans that name a missing
+    /// subcommand or flag, or pass a rejected value, fail. Shorthand is not a
+    /// command: alternations (`run/rollback`), wildcards, ellipses and
+    /// version strings (`ft 0.13.0`) are skipped.
+    fn inline_doc_commands(markdown: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut in_fence = false;
+        for line in markdown.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            for (index, span) in line.split('`').enumerate() {
+                if index % 2 == 0 {
+                    continue;
+                }
+                let Some(command) = runnable_example(span) else {
+                    continue;
+                };
+                let words: Vec<&str> = command.split_whitespace().collect();
+                // `ft robot <family> <action>` is a template, not a command.
+                let command_word = if words.get(1) == Some(&"robot") {
+                    words.get(2)
+                } else {
+                    words.get(1)
+                };
+                let shorthand = words.iter().any(|word| {
+                    word.contains('*')
+                        || word.contains('…')
+                        || *word == "/"
+                        || (word.contains('/')
+                            && !word.starts_with(['.', '/', '~', '$', '<'])
+                            && !word.contains('.'))
+                }) || words
+                    .get(1)
+                    .is_some_and(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+                    || command_word.is_some_and(|word| word.starts_with('<'));
+                if !shorthand {
+                    commands.push(command.to_string());
+                }
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn documented_inline_ft_commands_name_real_commands() {
+        use clap::error::ErrorKind;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut documents: Vec<std::path::PathBuf> = [
+            "README.md",
+            "docs/operator-playbook.md",
+            "docs/operator-runbook.md",
+            "docs/incident-bundles.md",
+            "docs/session-persistence.md",
+            "docs/session-persistence-troubleshooting.md",
+            "docs/storage-tuning.md",
+            "docs/search-explainability.md",
+            "docs/swarm-playbook.md",
+            "docs/high-core-swarm-runbook.md",
+            "docs/noise-control.md",
+            "docs/approvals.md",
+            "docs/explain-match.md",
+            "docs/cli-reference.md",
+            "docs/frankenterm-gui-user-guide.md",
+            "docs/ft-xbnl0-5-3-blessed-tuning-playbook.md",
+            "docs/flight-recorder/alerts-wa-oegrb-8-4.md",
+            "docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md",
+            "docs/flight-recorder/incident-response-wa-oegrb-8-5.md",
+            "docs/resource-pressure-cockpit-contract.md",
+            "docs/blocker-radar-runbook.md",
+            "docs/context-horizon-contract.md",
+            "docs/rch-admission-contract.md",
+            "docs/saved-searches-spec.md",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect();
+        let contracts = std::fs::read_dir(root.join("docs/robot-contracts"))
+            .expect("docs/robot-contracts is readable");
+        for entry in contracts {
+            let path = entry.expect("contract entry").path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                documents.push(path);
+            }
+        }
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for document in &documents {
+            let markdown = std::fs::read_to_string(document)
+                .unwrap_or_else(|error| panic!("{}: {error}", document.display()));
+            for command in inline_doc_commands(&markdown) {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&command))
+                    && !matches!(
+                        error.kind(),
+                        ErrorKind::MissingRequiredArgument
+                            | ErrorKind::MissingSubcommand
+                            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                            | ErrorKind::DisplayHelp
+                            | ErrorKind::DisplayVersion
+                    )
+                {
+                    failures.push(format!(
+                        "{}: {command}: {:?}",
+                        document.strip_prefix(&root).unwrap_or(document).display(),
+                        error.kind()
+                    ));
+                }
+            }
+        }
+        assert!(checked > 400, "inline doc commands shrank to {checked}");
+        assert!(
+            failures.is_empty(),
+            "docs name commands the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// Remediation hints, see-also lists, tutorials and error hints tell
+    /// operators and agents which `ft` command to run next; every one must
+    /// parse with the current CLI.
+    #[test]
+    fn product_command_hints_parse_with_the_current_cli() {
+        let sources = [
+            (
+                "asupersync_observability.rs",
+                include_str!("../../frankenterm-core/src/asupersync_observability.rs"),
+            ),
+            (
+                "attention_router.rs",
+                include_str!("../../frankenterm-core/src/attention_router.rs"),
+            ),
+            (
+                "crash.rs",
+                include_str!("../../frankenterm-core/src/crash.rs"),
+            ),
+            (
+                "error.rs",
+                include_str!("../../frankenterm-core/src/error.rs"),
+            ),
+            (
+                "error_codes.rs (frankenterm-core-error-types)",
+                include_str!("../../frankenterm-core-error-types/src/error_codes.rs"),
+            ),
+            (
+                "explanations.rs",
+                include_str!("../../frankenterm-core/src/explanations.rs"),
+            ),
+            (
+                "incident_bundle.rs",
+                include_str!("../../frankenterm-core/src/incident_bundle.rs"),
+            ),
+            (
+                "learn.rs",
+                include_str!("../../frankenterm-core/src/learn.rs"),
+            ),
+            (
+                "ntm_importer.rs",
+                include_str!("../../frankenterm-core/src/ntm_importer.rs"),
+            ),
+            (
+                "operating_envelope.rs",
+                include_str!("../../frankenterm-core/src/operating_envelope.rs"),
+            ),
+            (
+                "operator_runbooks.rs",
+                include_str!("../../frankenterm-core/src/operator_runbooks.rs"),
+            ),
+            (
+                "output/error_renderer.rs",
+                include_str!("../../frankenterm-core/src/output/error_renderer.rs"),
+            ),
+            (
+                "policy_diagnostics.rs",
+                include_str!("../../frankenterm-core/src/policy_diagnostics.rs"),
+            ),
+            (
+                "robot_types.rs",
+                include_str!("../../frankenterm-core/src/robot_types.rs"),
+            ),
+            (
+                "runtime_diagnostics_ux.rs",
+                include_str!("../../frankenterm-core/src/runtime_diagnostics_ux.rs"),
+            ),
+            (
+                "runtime_health.rs",
+                include_str!("../../frankenterm-core/src/runtime_health.rs"),
+            ),
+            (
+                "session_retention.rs",
+                include_str!("../../frankenterm-core/src/session_retention.rs"),
+            ),
+            (
+                "storage_workload_advisor.rs",
+                include_str!("../../frankenterm-core/src/storage_workload_advisor.rs"),
+            ),
+            (
+                "suggestions.rs",
+                include_str!("../../frankenterm-core/src/suggestions.rs"),
+            ),
+            (
+                "tui/app.rs",
+                include_str!("../../frankenterm-core/src/tui/app.rs"),
+            ),
+            (
+                "tui/ftui_backend.rs",
+                include_str!("../../frankenterm-core/src/tui/ftui_backend.rs"),
+            ),
+            (
+                "tui/query.rs",
+                include_str!("../../frankenterm-core/src/tui/query.rs"),
+            ),
+            (
+                "tui/views.rs",
+                include_str!("../../frankenterm-core/src/tui/views.rs"),
+            ),
+            (
+                "workflows/handlers.rs",
+                include_str!("../../frankenterm-core/src/workflows/handlers.rs"),
+            ),
+        ];
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for (file, source) in sources {
+            let hints = product_command_hints(source);
+            assert!(!hints.is_empty(), "{file} lost its command hints");
+            for hint in hints {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&hint))
+                    && error.kind() != clap::error::ErrorKind::DisplayVersion
+                {
+                    failures.push(format!("{file}: {hint}: {:?}", error.kind()));
+                }
+            }
+        }
+        assert!(checked > 100, "product command hints shrank to {checked}");
+        assert!(
+            failures.is_empty(),
+            "product code suggests commands the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// Every rendered error ends with "Run `ft why FT-xxxx` for more
+    /// details", so each code the renderer can emit must resolve; robot.*
+    /// codes with a recovery hint resolve too (robot help names
+    /// `ft robot why robot.policy_denied`).
+    #[test]
+    fn why_resolves_every_rendered_error_code_and_robot_codes() {
+        let renderer = include_str!("../../frankenterm-core/src/output/error_renderer.rs");
+        let production = renderer
+            .find("#[cfg(test)]\nmod ")
+            .map_or(renderer, |index| &renderer[..index]);
+        let mut codes = Vec::new();
+        let mut rest = production;
+        while let Some(start) = rest.find("\"FT-") {
+            let tail = &rest[start + 1..];
+            let end = tail.find('"').unwrap_or(tail.len());
+            codes.push(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+        codes.sort();
+        codes.dedup();
+        assert!(codes.len() > 40, "rendered codes shrank: {codes:?}");
+        let unexplained: Vec<_> = codes
+            .iter()
+            .filter(|code| why_data_for_error_code(code).is_none())
+            .collect();
+        assert!(
+            unexplained.is_empty(),
+            "ft why cannot explain rendered error codes: {unexplained:?}"
+        );
+
+        let lower = why_data_for_error_code("ft-1001").expect("codes are case-insensitive");
+        assert_eq!(lower.code, "FT-1001");
+        assert_eq!(lower.category, "wezterm");
+        assert!(lower.suggestions.is_some());
+
+        let robot = why_data_for_error_code("robot.policy_denied").expect("robot code");
+        assert_eq!(robot.category, "policy");
+        assert!(robot.explanation.contains("ft why --recent denied"));
+        let upper = why_data_for_error_code("ROBOT.POLICY_DENIED").expect("robot codes too");
+        assert_eq!(upper.code, "robot.policy_denied");
+
+        assert!(why_data_for_error_code("robot.no_such_code").is_none());
+        assert!(why_data_for_error_code("FT-0000").is_none());
+        assert!(why_data_for_error_code("deny.alt_screen").is_none());
+    }
+
+    /// Every command's `--help` EXAMPLES section must parse: each line is
+    /// `ft <args>`, then two or more spaces, then a description.
+    #[test]
+    fn cli_help_examples_parse_with_the_current_cli() {
+        fn collect(command: &clap::Command, examples: &mut Vec<(String, String)>) {
+            if let Some(help) = command.get_after_help() {
+                let mut in_examples = false;
+                for line in help.to_string().lines() {
+                    if line.trim() == "EXAMPLES:" {
+                        in_examples = true;
+                        continue;
+                    }
+                    if line.starts_with(|c: char| !c.is_whitespace()) {
+                        in_examples = false;
+                        continue;
+                    }
+                    let example = line.trim();
+                    if !in_examples {
+                        continue;
+                    }
+                    let command_text = example.split("  ").next().unwrap_or_default();
+                    if let Some(runnable) = runnable_example(command_text) {
+                        examples.push((command.get_name().to_string(), runnable.to_string()));
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                collect(subcommand, examples);
+            }
+        }
+
+        let cli = <Cli as clap::CommandFactory>::command();
+        let mut examples = Vec::new();
+        collect(&cli, &mut examples);
+        let mut failures = Vec::new();
+        for (owner, example) in &examples {
+            if let Err(error) = Cli::try_parse_from(example_command_words(example))
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                failures.push(format!("{owner}: {example}: {:?}", error.kind()));
+            }
+        }
+        assert!(
+            examples.len() > 300,
+            "help examples shrank to {}",
+            examples.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "help examples the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// Agents copy quick-start commands verbatim, so every runnable one must
+    /// still parse. `<placeholder>` text becomes `0` before parsing.
+    #[test]
+    fn robot_quick_start_commands_parse_with_the_current_cli() {
+        let quick_start = build_robot_quick_start();
+        let commands = quick_start
+            .core_loop
+            .iter()
+            .map(|step| step.command)
+            .chain(
+                quick_start
+                    .commands
+                    .iter()
+                    .flat_map(|command| command.examples.iter().copied()),
+            )
+            .filter(|command| command.starts_with("ft "));
+        let mut parsed = 0;
+        let mut failures = Vec::new();
+        for command in commands {
+            match Cli::try_parse_from(example_command_words(command)) {
+                Ok(_) => parsed += 1,
+                Err(error) => failures.push(format!("{command}: {:?}", error.kind())),
+            }
+        }
+        assert!(parsed > 50, "quick start lost its examples ({parsed})");
+        assert!(
+            failures.is_empty(),
+            "quick-start commands the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// The API schema registry, and the API reference generated from it, may
+    /// only name robot commands the CLI defines. `a / b` lists alternatives;
+    /// flags are not checked.
+    #[test]
+    fn api_schema_robot_commands_exist_in_the_cli() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        for endpoint in frankenterm_core::api_schema::SchemaRegistry::canonical().endpoints {
+            let Some(robot_command) = endpoint.robot_command.as_deref() else {
+                continue;
+            };
+            for alternative in robot_command.split(" / ") {
+                checked += 1;
+                let mut command = &cli;
+                for word in alternative
+                    .split_whitespace()
+                    .filter(|word| !word.starts_with('-'))
+                {
+                    if let Some(next) = command.find_subcommand(word) {
+                        command = next;
+                    } else {
+                        missing.push(alternative.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(checked > 20, "schema lost its robot commands ({checked})");
+        assert!(
+            missing.is_empty(),
+            "API schema names robot commands the CLI lacks: {missing:?}"
+        );
+    }
+
+    /// `ft robot help` may only name subcommand paths the CLI defines.
+    #[test]
+    fn robot_help_names_only_existing_robot_subcommands() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let robot = cli.find_subcommand("robot").expect("robot subcommand");
+        let mut missing = Vec::new();
+        for entry in build_robot_help().commands {
+            let mut command = robot;
+            for word in entry.name.split_whitespace() {
+                if let Some(next) = command.find_subcommand(word) {
+                    command = next;
+                } else {
+                    missing.push(entry.name.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "robot help names commands the CLI lacks: {missing:?}"
+        );
     }
 
     #[test]
@@ -141009,11 +143471,11 @@ A  docs/new-proof.md\n";
         let check = DiagnosticCheck::warning(
             "database",
             "schema v1 (needs migration to v2)",
-            "Run 'ft daemon start' to auto-migrate",
+            "Run 'ft db migrate' to apply pending migrations",
         );
         assert_eq!(check.status, DiagnosticStatus::Warning);
         assert!(check.detail.unwrap().contains("schema v1"));
-        assert!(check.recommendation.unwrap().contains("auto-migrate"));
+        assert!(check.recommendation.unwrap().contains("ft db migrate"));
     }
 
     #[test]
@@ -142145,7 +144607,7 @@ A  docs/new-proof.md\n";
         .with_remediation(
             frankenterm_core::runtime_health::RemediationHint::with_command(
                 "Review connector throttles",
-                "ft robot policy quarantine-list",
+                "ft reservations",
             ),
         );
 
@@ -142156,7 +144618,7 @@ A  docs/new-proof.md\n";
         assert_eq!(diagnostic.detail.as_deref(), Some("throttling active"));
         assert_eq!(
             diagnostic.recommendation.as_deref(),
-            Some("Review connector throttles: ft robot policy quarantine-list"),
+            Some("Review connector throttles: ft reservations"),
         );
     }
 
@@ -143147,12 +145609,28 @@ A  docs/new-proof.md\n";
             .expect("enable WAL for doctor fixture");
     }
 
+    /// Doctor as it runs on a host with no mux: no discovered socket, the
+    /// CLI fallback selection, and a backend that lists no panes. Production
+    /// discovery would find whatever mux this host (or a parallel test) is
+    /// running, which made the check list change between runs (ft-u506a).
     async fn run_test_diagnostics(
         config: &frankenterm_core::config::Config,
         layout: &frankenterm_core::config::WorkspaceLayout,
     ) -> Vec<DiagnosticCheck> {
+        use frankenterm_core::wezterm::{
+            BackendSelectionInputs, MockWezterm, UnifiedClient, evaluate_backend_selection,
+        };
+
+        let selection = evaluate_backend_selection(&BackendSelectionInputs {
+            vendored_feature_enabled: cfg!(feature = "vendored"),
+            allow_vendored: true,
+            compat_message: "doctor test fixture".to_string(),
+            compat_json: None,
+            socket_discovered: false,
+        });
+        let mux_client = UnifiedClient::from_handle(Arc::new(MockWezterm::new()), selection);
         let cx = frankenterm_core::cx::for_request();
-        run_diagnostics(&cx, &[], config, layout).await
+        run_diagnostics_with_mux_client(&cx, &[], config, layout, mux_client).await
     }
 
     #[test]
@@ -143472,9 +145950,88 @@ A  docs/new-proof.md\n";
                 statuses_1, statuses_2,
                 "check statuses must be deterministic"
             );
+            // A host mux never reaches the fixture's checks (ft-u506a).
+            assert!(
+                !names_1.contains(&"mux scrollback"),
+                "the fixture lists no panes, so it has no scrollback row: {names_1:?}"
+            );
 
             let _ = std::fs::remove_dir_all(&temp);
         });
+    }
+
+    #[test]
+    fn submit_idempotency_store_check_grades_only_pinned_capacity() {
+        use frankenterm_core::submit_idempotency_store::{
+            SubmitIdempotencyCensus, SubmitIdempotencyError,
+        };
+        let missing = submit_idempotency_store_diagnostic_check(Ok(None), 0);
+        assert_eq!(missing.status, DiagnosticStatus::Ok);
+
+        let base = SubmitIdempotencyCensus {
+            max_records: 100,
+            max_logical_bytes: 100 * 70_000,
+            ..SubmitIdempotencyCensus::default()
+        };
+        // A store at its record ceiling is healthy when eviction can reclaim it.
+        let full_but_evictable = SubmitIdempotencyCensus {
+            completed: 99,
+            in_doubt: 1,
+            logical_bytes: 100 * 800,
+            evictable_records: 80,
+            evictable_logical_bytes: 80 * 800,
+            oldest_unresolved_updated_unix_ms: Some(1_000),
+            ..base
+        };
+        let healthy =
+            submit_idempotency_store_diagnostic_check(Ok(Some(full_but_evictable)), 61_000);
+        assert_eq!(healthy.status, DiagnosticStatus::Ok);
+        let detail = healthy.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("100 of 100 records"), "{detail}");
+        assert!(detail.contains("in doubt 1"), "{detail}");
+        assert!(detail.contains("80 evictable"), "{detail}");
+        assert!(detail.contains("oldest unresolved 60s old"), "{detail}");
+        assert!(detail.contains("wa.send reconcile"), "{detail}");
+
+        let three_quarters_in_doubt = SubmitIdempotencyCensus {
+            in_doubt: 75,
+            logical_bytes: 75 * 800,
+            ..base
+        };
+        assert_eq!(
+            submit_idempotency_store_diagnostic_check(Ok(Some(three_quarters_in_doubt)), 0).status,
+            DiagnosticStatus::Warning
+        );
+
+        let records_pinned = SubmitIdempotencyCensus {
+            in_doubt: 100,
+            logical_bytes: 100 * 800,
+            ..base
+        };
+        let refused = submit_idempotency_store_diagnostic_check(Ok(Some(records_pinned)), 0);
+        assert_eq!(refused.status, DiagnosticStatus::Error);
+        assert!(refused.recommendation.as_deref().is_some_and(|text| {
+            text.contains("capacity_exceeded") && text.contains("wa.send reconcile")
+        }));
+
+        let bytes_pinned = SubmitIdempotencyCensus {
+            in_doubt: 10,
+            logical_bytes: base.max_logical_bytes,
+            ..base
+        };
+        assert_eq!(
+            submit_idempotency_store_diagnostic_check(Ok(Some(bytes_pinned)), 0).status,
+            DiagnosticStatus::Error
+        );
+
+        let unreadable = submit_idempotency_store_diagnostic_check(
+            Err(SubmitIdempotencyError::SchemaMismatch),
+            0,
+        );
+        assert_eq!(unreadable.status, DiagnosticStatus::Warning);
+        assert!(unreadable.detail.as_deref().is_some_and(|text| {
+            text.contains(SubmitIdempotencyError::SchemaMismatch.error_class())
+        }));
     }
 
     fn latest_release_fixture(tag: &str) -> serde_json::Value {

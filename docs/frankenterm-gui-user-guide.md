@@ -80,6 +80,8 @@ ft events --limit 20
 - `serial <port>`: open serial device session
 - `ls-fonts`: inspect font resolution and font inventory
 - `show-keys`: print effective key assignments
+- `cli`: send one request to a running GUI or mux server (`list`, `spawn`,
+  `move-pane-to-new-tab`), without opening a window
 
 Useful examples:
 
@@ -106,7 +108,23 @@ frankenterm-gui ssh deploy@10.0.0.5
 # Inspect key assignments
 frankenterm-gui show-keys
 frankenterm-gui show-keys --lua
+
+# From inside a pane: open a tab in this window, list panes, move a pane
+frankenterm-gui cli spawn --cwd ~/src -- htop
+frankenterm-gui cli list --format json
+frankenterm-gui cli move-pane-to-new-tab --pane-id 12 --new-window
 ```
+
+`frankenterm-gui cli` takes the same arguments as the matching `wezterm cli`
+subcommands and prints the same output (`spawn` prints the new pane id;
+`list --format json` adds an `is_floating` field). It connects to
+`$FRANKENTERM_UNIX_SOCKET` or `$WEZTERM_UNIX_SOCKET`, which FrankenTerm sets
+in every pane, else to a running GUI (`--class` picks one started with
+`--class`), else to the first configured unix domain; `--prefer-mux` skips
+the GUI. It never starts a server. The pane it acts on or from is `--pane-id`, else
+`$WEZTERM_PANE`, else the focused pane of the most recently active client; a
+pane id that does not exist is an error. Without `--workspace`, a new window
+gets the workspace of that pane.
 
 Default session-manager entry point:
 
@@ -161,13 +179,16 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `resize_wrap_kp_*` (optional) | unset | advanced KP tuning knobs |
 | `[[ssh_domains]]` (optional) | auto-discovered from `~/.ssh/config` | explicit named SSH targets |
 | `max_fps` | `60` | lower on constrained GPUs |
+| `unfocused_max_fps` | unset (`max_fps`) | macOS: repaint limit for windows without keyboard focus, capped at `max_fps`. With many windows showing animated agent output, `10` saves most of their repaint work; stacked translucent windows count as visible to macOS, so nothing else throttles them |
 | `front_end` | `"WebGpu"` | rendering backend; without a config file the built-in default is `"OpenGL"`. Values: `"WebGpu"`, `"OpenGL"`, `"Software"`, `"Metal"` (see below) |
 | `check_for_updates` | `false` | disable update checks by default |
 | `automatically_reload_config` | `true` | hot-reload config changes |
 
 `front_end = "Metal"` selects the native Metal renderer on macOS. It is in
-development: today it only clears the window to the background color and draws
-no terminal content, so keep `"WebGpu"` for daily use. When Metal is unavailable
+development. It draws terminal text, colors, the cursor and the tab bar, and
+builds each window's frames on its own render thread, rebuilding only changed
+rows. Pixel parity with WebGpu is still being verified, so keep `"WebGpu"` for
+daily use. When Metal is unavailable
 (not macOS, no Metal device, a GPU older than the Apple7/M1 family, or a window
 without a `CAMetalLayer`), the GUI logs
 `front_end=Metal unavailable (reason=<code>)` and falls back to WebGpu. The
@@ -318,6 +339,69 @@ fail-closed until its durable negative intent commits, preventing an older
 ### Accessibility Timing
 
 `click_interval_ms` controls how much time FrankenTerm allows between successive clicks when deciding whether a gesture counts as a double-click or triple-click selection. The default is `500`, which matches common desktop defaults, but operators who need a slower cadence can raise it to `1000`-`2000` in `frankenterm.toml`.
+
+### Text rendering
+
+Six keys shape how glyphs are rasterized and blended. They can be set in
+`frankenterm.toml` or in a Lua config.
+
+FreeType hinting and subpixel text:
+
+- `freetype_load_target` (default `"Normal"`): the hinting, one of `Normal`,
+  `Light`, `Mono`, `HorizontalLcd` or `VerticalLcd`.
+- `freetype_render_target` (default: the value of `freetype_load_target`):
+  how glyphs are rendered. `HorizontalLcd` or `VerticalLcd` gives subpixel
+  (LCD) text.
+- `freetype_lcd_filter` (default `"Default"`): the filter FreeType runs over
+  subpixel glyphs to tame color fringes. `Default` uses the taps
+  `8, 77, 86, 77, 8` (in 1/256), `Light` uses `0, 85, 86, 85, 0` and is
+  crisper with slightly more fringing, and `None` does no filtering. Current
+  FreeType has no `Legacy` filter, so neither does this key. Grayscale text
+  ignores it.
+- `freetype_lcd_filter_weights` (default unset): five taps of your own that
+  replace the filter's, for example `[16, 64, 96, 64, 16]`. Taps that add up
+  to 256 leave the brightness unchanged; a center tap of 0 turns filtering
+  off.
+
+The two filter keys are read when fonts load: a config reload picks up a
+change, a per-window override does not. They only affect text rasterized by
+FreeType. On macOS the default rasterizer is CoreText, so there they need
+`font_rasterizer = "FreeType"`.
+
+Text weight, after kitty's `text_composition_strategy`:
+
+- `text_gamma` (default unset): 0.01 or more. Values above 1 make text
+  heavier, values below 1 lighter.
+- `text_contrast` (default unset): 0 to 100, a percentage by which every
+  glyph pixel's coverage is raised.
+
+With both unset, text renders exactly as before. Setting either one does
+two things. First, glyphs are blended in linear light instead of gamma
+space, which by itself makes light text on a dark background heavier and
+dark text on a light background lighter; `text_gamma = 1` alone gives just
+that. Second, each pixel's coverage `a` is reshaped:
+
+```
+w  = (1 - luminance(text) + luminance(background)) / 2
+a' = clamp(mix(a, a^(1 / text_gamma), w) * (1 + text_contrast / 100), 0, 1)
+```
+
+So `text_gamma` acts fully on black text on white and not at all on white
+text on black, which offsets the lighter dark-on-light text that linear
+blending produces. kitty's macOS default is:
+
+```toml
+text_gamma = 1.7
+text_contrast = 30
+```
+
+The OpenGL front end blends in gamma space, so its glyph shader rescales the
+coverage to give the linear-light result. A shader cannot read the pixel it
+draws over, so it assumes the active pane's default background; text over
+other colors (a selection, a colored cell, the tab bar) comes out slightly
+different from an exact linear blend. The WebGpu front end draws to an sRGB
+surface, which already blends in linear light, so there only the curve
+applies. The Metal front end does not support these two keys yet.
 
 ## Migration Guide: WezTerm -> FrankenTerm
 
@@ -521,3 +605,18 @@ If a paste does not arrive:
   terminal's own answers to the program's queries (device attributes, cursor
   position reports and similar) are dropped once 64 KiB of them are waiting
   unread; the log then says `terminal reply backlog is full`.
+
+If the window stops responding while a pane floods output (0.15.x):
+
+- In 0.15.2 and nearby builds, each row that scrolls out of memory is written
+  to the durable scrollback store, with a full disk sync, while the terminal is
+  locked. A pane printing a large file can then stall the whole window. Newer
+  builds write the store outside the terminal lock, in batches; check what you
+  run with `ft --version` and the app's About box.
+- Until you move to a newer build, set `config.scrollback_tiered_enabled = false`
+  in `frankenterm.lua`. Scrollback then stays in memory and nothing is written to
+  the store. The cost is RAM: every pane keeps all `scrollback_lines` rows in
+  memory, so lower `scrollback_lines` (default 3,500) if you raised it; at
+  100,000 lines, dozens of agent panes can take gigabytes.
+- Remove any oversized `config.mux_output_parser_buffer_size` override; the
+  default is 128 KiB.

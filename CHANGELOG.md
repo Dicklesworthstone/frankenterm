@@ -5,7 +5,7 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release verified on 2026-09-22 is `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Version `0.15.2` was installed locally, but its GitHub release and remote tag are absent; its changes below do not establish public artifact availability.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release is `v0.15.21` (2026-10-14), the first GitHub Release since `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Versions `0.15.2` through `0.15.12` were local builds and release-candidate git tags without GitHub Releases; their changes ship in `0.15.21`.
 
 Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through the local `0.15.2` build (2026-09-05) and subsequent development. The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
@@ -15,7 +15,8 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main) | HEAD | — | Next public release |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main) | HEAD | — | Next public release |
+| [v0.15.21](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Release | 2026-10-14 | Idle GUI windows stop repainting, smaller GPU atlases, tab order kept across restarts, macOS 11+ bundles, vendored-library and rustls security updates |
 | `v0.15.2` | Local build; no current GitHub Release | 2026-09-05 | CLI finds the GUI, mux survives connects, `ft web` answers and streams live; signing and installer verification implemented |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
@@ -26,11 +27,34 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.21`; development on `main` since the local `0.15.2` build
+## [Unreleased]
 
-Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
+Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main>
 
-Version `0.15.21` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+## [0.15.21] -- 2026-10-14 (GitHub Release)
+
+Compare against the previous public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.21>
+
+Version `0.15.21` is the first GitHub Release since `v0.15.1`. It carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Entries below that say native qualification remains pending were not separately qualified for this release; diagnostic models do not establish release acceptance or measured performance gains.
+
+### Highlights from the final candidate days (2026-10-12 to 2026-10-14)
+
+- A macOS GUI window no longer repaints for output, title alerts or spinners in tabs nobody can see. On an 11-window stacked setup this took the GUI from about 340 frames per second around the clock to idle (cba902055, b48ede823, e3c78a55c, e25b71d4d). The new `unfocused_max_fps` option caps the repaint rate of unfocused windows; it is macOS only and unset by default.
+- Background gradients are generated at most 2,040 px per side instead of at window size, which shrinks each window's glyph atlas from 256 MiB to 16 MiB on a 5K display (41786968b). Windows that macOS does not show release their swapchain drawables (d79bd79e1).
+- Remote windows keep their tab order across a GUI restart, including a reorder made while a remote layout receipt is being republished; overlays of local tabs from earlier launches are pruned (7173d6d57, da422ef86, aa9dba062).
+- An upgraded GUI launched beside its predecessor publishes the default socket pointer (4a9d13946). When a remote mux restarts, the reconnect window says the domain reopens in a new window instead of "remains unavailable" (d321dbbca).
+- macOS bundles build cairo and pixman from vendored sources and link no non-system library, so a bundle built on a newer macOS declares `LSMinimumSystemVersion` 11.0 and opens on older systems (0994b643c).
+- Any OSC 52 clipboard write no longer aborts the macOS GUI (GitHub #123, bdf56294c). `ft watch` against a stock WezTerm mux no longer re-dials its socket in a hot loop (GitHub #87, 0ae4bf359). `scripts/swarm-tick.sh` reads panes from `ntm --robot-snapshot` on ntm 1.36 and later (GitHub #124, 61bda6629).
+- `ft tui` runs again (42096a1d8). Verified-submit profiles recognise codex-cli 0.162.1 and Claude Code 2.1.296 composers (ff72518ca). RPC text reads of a pane that prints continuously wait for its terminal instead of failing with `resource_busy` (338373e44, c6cc3a7b1).
+
+### Security
+
+- Vendored libssh 0.11.4 carries the upstream fix for CVE-2026-59843: a peer's maximum packet size of 0 in CHANNEL_OPEN or CHANNEL_OPEN_CONFIRMATION is refused instead of hanging channel writes (598700a51, GitHub #121).
+- Vendored font libraries: libpng 1.6.44 -> 1.6.59 (CVE-2026-46675, reachable through FreeType's PNG glyph path), zlib 1.3.1 -> 1.3.2, FreeType 2.13.3 -> 2.14.3 and HarfBuzz 11.2.1 -> 14.6.0 (2b42c6195, 55f2aa408, ad2b366bc, 267710265; GitHub #120).
+- rustls 0.23.46 (RUSTSEC-2026-0346..0349; f0bf419b6), faster-hex 0.10.1 (RUSTSEC-2026-0306) and the Wasmtime 49.0.2 family (RUSTSEC-2026-0321..0327, optional `wasm` feature only) (aba622a37; GitHub #119).
+- Known issue: lru 0.16.4 (RUSTSEC-2026-0253, missing panic safety in `LruCache::pop()`) remains, pulled in only by tantivy 0.26.2 and the pinned `ftui-text`; FrankenTerm's own crates use lru 0.18.5. The fix needs a tantivy release that accepts lru 0.18.2 or later.
+
+### Release-candidate fixes
 
 - Cold viewport hydration cancels superseded work before bounded worker admission fills, while preserving exact source and layout authority. Resize captures the viewport before sending remote dimensions, then rechecks the response before painting; native qualification remains pending.
 - Word-aware wrapping retains bounded alternative break paths when a later line changes the best maximum badness. Focused source tests cover the former pruning failure; remote runtime and native latency qualification remain pending.
@@ -1445,10 +1469,14 @@ Migration: re-run `ft setup --wezterm` to update your `wezterm.lua`. The ft-mana
 
 Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are changelog milestones reconstructed from history, not published GitHub Releases.
 
-`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.14.1` tag below has a GitHub Release; `backup-before-rewrite` does not.
+`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.15.1` tag below and `v0.15.21` have a GitHub Release; the `v0.15.2`–`v0.15.12` candidate tags and `backup-before-rewrite` do not.
 
 | Tag / Ref | Kind | Date | Points to | Description |
 |-----------|------|------|-----------|-------------|
+| [`v0.15.21`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Release | 2026-10-14 | tag `v0.15.21` | First GitHub Release since `v0.15.1`; idle-window repaint and GPU-memory cuts, tab order across restarts, macOS 11+ bundles, security updates |
+| `v0.15.2`–`v0.15.12` and their `-rc`/`-analyzer` tags | Git tags (no GitHub Release) | 2026-09-01 to 2026-09-22 | tags | Local builds and release candidates; their changes ship in `v0.15.21` |
+| [`v0.15.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | tag `v0.15.1` | Complete platform artifacts and macOS GUI installation |
+| [`v0.15.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | tag `v0.15.0` | Sampled paste tracing over additive PDU99 (source only) |
 | [`v0.14.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | tag `v0.14.1` | Pane-input argv privacy and release-contract repair |
 | [`v0.14.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) | Release | 2026-08-20 | tag `v0.14.0` | Mux authority, scheduler admission, recorder truth, and protocol hardening |
 | [`v0.13.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | [`c366f3ac9`](https://github.com/Dicklesworthstone/frankenterm/commit/c366f3ac95a2a53d6d86e438f1432bdcf4981f26) | Test-suite honesty (ft-nam3s) + tx/capture/redaction hardening; full platform matrix returns |
@@ -1520,7 +1548,8 @@ Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are chang
 ---
 
 <!-- Links -->
-[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main
+[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main
+[0.15.21]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21
 [0.13.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0
 [0.12.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0
 [0.1.0]: https://github.com/Dicklesworthstone/frankenterm/commits/main/?after=backup-before-rewrite

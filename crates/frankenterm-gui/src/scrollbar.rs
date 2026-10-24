@@ -1,4 +1,3 @@
-use mux::pane::Pane;
 use mux::renderable::RenderableDimensions;
 use wezterm_term::StableRowIndex;
 
@@ -50,15 +49,16 @@ impl ScrollHit {
 
     /// Given a new thumb top coordinate (produced by dragging the thumb),
     /// compute the equivalent viewport offset.
+    /// `render_dims` are the pane's dimensions as the caller read them; a
+    /// local pane's come from its published facts, not its terminal lock.
     pub fn thumb_top_to_scroll_top(
         thumb_top: usize,
-        pane: &dyn Pane,
+        render_dims: &RenderableDimensions,
         viewport: Option<StableRowIndex>,
         max_thumb_height: usize,
         min_thumb_size: usize,
     ) -> StableRowIndex {
-        let render_dims = pane.get_dimensions();
-        let thumb = Self::thumb(&render_dims, viewport, max_thumb_height, min_thumb_size);
+        let thumb = Self::thumb(render_dims, viewport, max_thumb_height, min_thumb_size);
         let available_height = max_thumb_height - thumb.height;
         let scroll_percent = thumb_top.min(available_height) as f32 / available_height as f32;
 

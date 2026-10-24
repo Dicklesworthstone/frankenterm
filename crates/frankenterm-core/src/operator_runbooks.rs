@@ -508,7 +508,9 @@ pub fn standard_registry() -> RunbookRegistry {
             },
             RunbookStep {
                 step_id: "launch-03".into(),
-                instruction: "Execute ft launch with selected profile".into(),
+                instruction:
+                    "Scale the fleet to the selected profile with ft robot fleet scale <program> <count>"
+                        .into(),
                 step_type: StepType::Action,
                 precondition: Some("Profile selected".into()),
                 expected_outcome: Some("Fleet launched, all panes visible".into()),
@@ -685,14 +687,14 @@ pub fn standard_registry() -> RunbookRegistry {
             },
             TutorialStep {
                 step_id: "gs-02".into(),
-                instruction: "Launch a small fleet with `ft launch --profile small`".into(),
+                instruction: "Launch a small fleet with `ft robot fleet scale codex 4`".into(),
                 hint: Some("Use --dry-run first to preview what will be created".into()),
                 validation: "Fleet launches with 4 panes visible".into(),
                 estimated_seconds: 60,
             },
             TutorialStep {
                 step_id: "gs-03".into(),
-                instruction: "Check fleet health with `ft status --fleet`".into(),
+                instruction: "Check fleet health with `ft robot fleet status`".into(),
                 hint: None,
                 validation: "All panes show Active status".into(),
                 estimated_seconds: 20,
@@ -719,7 +721,7 @@ pub fn standard_registry() -> RunbookRegistry {
             TutorialStep {
                 step_id: "ir-02".into(),
                 instruction: "Use the intervention console to pause the failing pane".into(),
-                hint: Some("Run `ft robot pause-pane --pane-id <id>`".into()),
+                hint: Some("Run `ft intervene pause <id>`".into()),
                 validation: "Pane shows Paused state".into(),
                 estimated_seconds: 60,
             },

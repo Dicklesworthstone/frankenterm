@@ -91,6 +91,27 @@ impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
         }
     }
 
+    /// A line-feed flood holds only printing, which never diverts, and line
+    /// feeds, which the gate is asked about once: a gate that diverts them
+    /// sees each one as an action instead.
+    #[inline]
+    fn line_feed_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        if self.diverting
+            || self.gate.diverts(&Action::Control(
+                frankenterm_escape_parser::ControlCode::LineFeed,
+            ))
+        {
+            return 0;
+        }
+        let taken = Handler::line_feed_flood(&mut self.performer, bytes, scan);
+        self.applied |= taken > 0;
+        taken
+    }
+
     /// Offers each setting to the gate in order, as `action` offers each
     /// action, and applies the run up to the first one it diverts.
     fn sgr(&mut self, sgrs: &[Sgr]) {
@@ -767,6 +788,25 @@ impl std::fmt::Debug for InertTerminal {
 }
 
 #[cfg(feature = "use_serde")]
+/// Whether applying `image` would read its data from a file or shared
+/// memory rather than from the output itself.
+fn kitty_image_reads_outside_journal(image: &frankenterm_escape_parser::apc::KittyImage) -> bool {
+    use frankenterm_escape_parser::apc::{KittyImage, KittyImageData};
+    match image {
+        KittyImage::TransmitData { transmit, .. }
+        | KittyImage::TransmitDataAndDisplay { transmit, .. }
+        | KittyImage::Query { transmit }
+        | KittyImage::TransmitFrame { transmit, .. } => !matches!(
+            transmit.data,
+            KittyImageData::Direct(_) | KittyImageData::DirectBin(_)
+        ),
+        KittyImage::Display { .. }
+        | KittyImage::Delete { .. }
+        | KittyImage::ComposeFrame { .. } => false,
+    }
+}
+
+#[cfg(feature = "use_serde")]
 impl InertTerminal {
     pub(crate) fn from_restored_state(
         state: TerminalState,
@@ -936,13 +976,37 @@ impl InertTerminal {
             });
         }
 
+        // Image output replays only under the graphics configuration the
+        // live terminal applied it with (a checkpoint holding graphics
+        // state), and never from a file or shared memory: restore reads
+        // nothing but the journal. A Kitty query changes nothing but its
+        // reply, which replay discards, so replay drops it rather than read
+        // what it names; with Kitty graphics disabled, the live terminal
+        // ignored every Kitty command, and replay does too.
+        let graphics = self.replay_projection.admits_graphics();
+        let kitty = self.replay_projection.replays_kitty_graphics();
+        if graphics {
+            actions.retain(|action| {
+                !matches!(
+                    action,
+                    Action::KittyImage(image)
+                        if matches!(**image, frankenterm_escape_parser::apc::KittyImage::Query { .. })
+                )
+            });
+        }
         let unsupported = actions.iter().any(|action| match action {
-            Action::Sixel(_) | Action::KittyImage(_) => true,
-            Action::OperatingSystemCommand(command) => matches!(
-                command.as_ref(),
-                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
-                    if file.inline
-            ),
+            Action::Sixel(_) => !graphics,
+            Action::KittyImage(image) => {
+                !graphics || (kitty && kitty_image_reads_outside_journal(image))
+            }
+            Action::OperatingSystemCommand(command) => {
+                !graphics
+                    && matches!(
+                        command.as_ref(),
+                        OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
+                            if file.inline
+                    )
+            }
             _ => false,
         });
         if unsupported {
@@ -983,6 +1047,16 @@ impl InertTerminal {
             self.checkpoint_limits,
         )
         .map_err(InertTerminalError::Checkpoint)
+    }
+
+    /// Let [`Self::into_live`] supersede a cold scrollback store that
+    /// advanced past this checkpoint's cold generation in the same content
+    /// epoch, instead of refusing it. Only a caller that has replayed every
+    /// output record after the checkpoint may ask: its model then holds every
+    /// row the store gained since, and activation publishes exactly that
+    /// model's cold prefix.
+    pub fn supersede_cold_scrollback_successors(&mut self) {
+        self.terminal.state.supersede_recovered_cold_successors();
     }
 
     /// Consume the off-topology model and replace its entire discard writer
@@ -1240,6 +1314,62 @@ impl Terminal {
             state: TerminalState::new(size, config, term_program, term_version, writer),
             parser: Parser::new(),
         }
+    }
+
+    /// Construct the canonical terminal with caller-drained bounded egress.
+    /// No writer thread or unbounded queue is installed. Input and parser
+    /// replies share one ordered fixed-capacity ring, with independent budgets
+    /// so reply floods cannot consume the user-input reserve.
+    ///
+    /// Each user output unit fails whole with `WouldBlock`; full reply units are
+    /// dropped and counted. Paste additionally refuses non-text controls and
+    /// observes the smaller configured bound. The caller drives
+    /// [`TerminalState::drain_bounded_output`] and owns transport scheduling.
+    /// These bounds cover output only: configure parser, screen, image and
+    /// scrollback limits separately before using this in a mobile artifact.
+    pub fn new_bounded_output(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration + Send + Sync>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+    ) -> std::io::Result<Terminal> {
+        Self::new_bounded_output_with_parser_limit(
+            size,
+            config,
+            term_program,
+            term_version,
+            limits,
+            frankenterm_escape_parser::DEFAULT_MAX_STRING_SEQUENCE_BYTES,
+        )
+    }
+
+    /// The caller-drained constructor with an additional retained parser
+    /// string cap. The parser applies this across feed calls to OSC/APC and
+    /// the lower of this cap and its protocol hard caps to Sixel, short DCS,
+    /// XTGETTCAP and tmux control-mode builders. Oversize sequences are dropped
+    /// whole by the canonical parser, never split into terminal text.
+    pub fn new_bounded_output_with_parser_limit(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration + Send + Sync>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+        maximum_string_bytes: usize,
+    ) -> std::io::Result<Terminal> {
+        if maximum_string_bytes == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        Ok(Terminal {
+            state: TerminalState::new_bounded_output(
+                size,
+                config,
+                term_program,
+                term_version,
+                limits,
+            )?,
+            parser: Parser::new_with_max_string_sequence_bytes(maximum_string_bytes),
+        })
     }
 
     /// Feed the terminal parser a slice of bytes from the output

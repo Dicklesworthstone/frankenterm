@@ -207,7 +207,7 @@ Interpretation:
 | Crossterm compatibility mode | `ftui-core` + `ftui-runtime` | `ftui-core/crossterm` + `ftui-runtime/crossterm-compat` | legacy terminal session/event source constructors | Kept as compatibility lane; harness still wires this path directly. |
 | WASM host-driven mode | `ftui-web` (+ optional `ftui-showcase-wasm`) | `ftui-web/input-parser` for encoded input parsing | backend traits implemented by web event/presenter surfaces | Deterministic host clock and event queue model. |
 | Diagnostics/orchestration mode | `doctor_frankentui` | none | CLI/report pipeline | Operational tooling outside runtime render loop. |
-| PTY integration utilities mode | `ftui-pty` | none | subprocess PTY + ws bridge utilities | Includes cross-project dependency on `frankenterm-core` (`ws-codec` feature). |
+| PTY integration utilities mode | `ftui-pty` | none | subprocess PTY + ws bridge utilities | Depends on crates.io `frankenterm-core` 0.2.0 (`ws-codec`), FrankenTUI's own VT engine — not this repo's `crates/frankenterm-core`. |
 
 Evidence:
 - `/Users/jemanuel/projects/frankentui/crates/ftui-runtime/Cargo.toml:26`
@@ -254,7 +254,7 @@ Evidence:
 - `ftui-showcase-wasm` disables `ftui-demo-showcase` defaults and composes web/input-parser explicitly, keeping wasm artifacts bounded.
 - `ftui-harness` still couples to crossterm compatibility (`ftui-core` with `crossterm`, `ftui-runtime` with `crossterm-compat`) for current test/reference behavior.
 - `ftui-demo-showcase` opts into a very broad extras surface by default, so integration plans should treat it as a high-capability reference app rather than a minimal dependency.
-- `ftui-pty` directly depends on `frankenterm-core` (`ws-codec`), which is a concrete existing seam between FrankenTUI and FrankenTerm.
+- `ftui-pty` depends on crates.io `frankenterm-core` 0.2.0 (`ws-codec`). Despite the name, that is FrankenTUI's own VT engine, not FrankenTerm's swarm core, so it is not a seam between the projects; the bridge spawns a fresh PTY per connection and cannot attach to mux panes.
 
 Evidence:
 - `/Users/jemanuel/projects/frankentui/crates/ftui-web/Cargo.toml:24`

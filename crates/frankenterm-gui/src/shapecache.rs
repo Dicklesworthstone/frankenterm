@@ -501,6 +501,8 @@ mod test {
 
     fn fake_glyph_info(seed: u32, cluster: u32, only_char: char) -> GlyphInfo {
         GlyphInfo {
+            // Present only with debug assertions; see GlyphInfo::text.
+            #[cfg(debug_assertions)]
             text: only_char.to_string(),
             only_char: Some(only_char),
             is_space: only_char == ' ',

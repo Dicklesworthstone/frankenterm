@@ -1,0 +1,11 @@
+--- mod-A.rs	2026-10-12 16:12:53
++++ mod-B.rs	2026-10-12 16:12:56
+@@ -4975,7 +4975,7 @@
+             // startup) raised its alert while no window listened, so read the
+             // titles once now: otherwise the window keeps its creation title
+             // until the next title change, which may never come.
+-            myself.update_title();
++            // ro1ht A/B arm B: startup title read removed.
+             window.show();
+             myself.emit_window_event("window-config-reloaded", None);
+             myself.emit_status_event();

@@ -1,0 +1,1 @@
+[BENCH] ingest_throughput lane=term corpus=file:color_emoji_random-67108864-000000000135288d.bin bytes=67108864 secs=0.209 MiB/s=306.2 load_avg_1m=2.67 sanity=ok

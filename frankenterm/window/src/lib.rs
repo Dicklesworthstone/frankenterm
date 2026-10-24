@@ -299,6 +299,12 @@ pub enum WindowEvent {
     /// Called when the window gains/loses focus
     FocusChanged(bool),
 
+    /// Called when the window as a whole stops or starts being visible to
+    /// the user: covered by other windows, minimized, on another space, or
+    /// its app hidden. `true` while no part of it is visible. Only macOS
+    /// reports it (ft-34at5).
+    OcclusionChanged(bool),
+
     AdviseDeadKeyStatus(DeadKeyStatus),
 
     /// Called to handle a raw key event, prior to any dead key,

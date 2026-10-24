@@ -217,11 +217,52 @@ fn bench_store_tail(c: &mut Criterion) {
     group.finish();
 }
 
+/// ft-y0gy9: ranged record reads, as the durable scrollback writer's
+/// evictions and publications make them (a 4096-row batch) and as cold
+/// scrollback loads do (32 rows), over records of 740 bytes, the size of a
+/// sealed T0 row. Run once as is (block reads) and once with
+/// FT_STORE_BLOCK_READS=0 (the 8 KiB `BufReader` path) to compare.
+fn bench_store_lines_range(c: &mut Criterion) {
+    const ROWS: u64 = 4096;
+    let mut group = c.benchmark_group("mmap_scrollback/lines_range");
+    let pane_id = 11u64;
+    let record = "r".repeat(740);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).expect("store");
+    for _ in 0..ROWS {
+        store.append_line(pane_id, &record).expect("append");
+    }
+    let path = if std::env::var_os("FT_STORE_BLOCK_READS").is_some_and(|value| value == "0") {
+        "buffered"
+    } else {
+        "blocks"
+    };
+    for rows in [ROWS, 32] {
+        let range = (ROWS - rows) / 2..(ROWS - rows) / 2 + rows;
+        group.throughput(Throughput::Bytes(rows * 741));
+        group.bench_with_input(
+            BenchmarkId::new(format!("t0_records_{path}"), rows),
+            &range,
+            |b, range| {
+                b.iter(|| {
+                    let records = store
+                        .lines_range(pane_id, range.clone(), ROWS as usize, u64::MAX)
+                        .expect("lines_range");
+                    black_box(records.len());
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_offset_build,
     bench_page_align,
     bench_store_append,
-    bench_store_tail
+    bench_store_tail,
+    bench_store_lines_range
 );
 criterion_main!(benches);

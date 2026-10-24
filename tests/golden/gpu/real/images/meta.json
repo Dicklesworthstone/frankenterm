@@ -39,7 +39,7 @@
     }
   ],
   "font_set_sha": "sha256:9b73d400a32f66d074dc9f1d66c4ad79a4508b7f18e46a0e96ea5420e0518c49",
-  "generated_at_runner": "WebGPU: name=Apple M4 Pro, device_type=IntegratedGpu, backend=Metal, vendor=0, device=0 FrankenTerm version: FrankenTerm 0.15.21 (93e9176b913fc0cc057e0f6ee22fb7a7e160bbe3)",
+  "generated_at_runner": "WebGPU: name=Apple M4 Pro, device_type=IntegratedGpu, backend=Metal, vendor=0, device=0 FrankenTerm version: FrankenTerm 0.15.21 (26f94313a53e2a71d03a5402e71fdbe392522458)",
   "harness_version": 1,
   "rasterizer": "frankenterm-gui WebGpu front end; FreeType rasterizer; HarfBuzz shaper",
   "texture_format": "presented surface (RGBA8 readback)",

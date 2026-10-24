@@ -50,10 +50,10 @@ primary_corpus = color_emoji_random
 # headless and GUI numbers in one report name the same incumbent build.
 app_path = /Applications/Ghostty.app
 app_bundle_id = com.mitchellh.ghostty
-app_short_version = 46edeee40
-app_build = 16813
+app_short_version = 8f0dd3709
+app_build = 18093
 app_binary = Contents/MacOS/ghostty
-app_binary_sha256 = 38695a64cf09b89712c38f72fbb04a4a656917ec51faea2f0b9b404d0d49c719
+app_binary_sha256 = 888267fe57e5dfa1d709c5086bf6cb0ddc7ce118632352e0c7330fbc6fb40e22
 
 # FrankenTerm arm: frankenterm-term's ingest_throughput example, lane term.
 ft_profile = release-perf

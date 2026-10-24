@@ -606,6 +606,9 @@ pub struct ShaderUniform {
     pub foreground_text_hsb: [f32; 3],
     pub milliseconds: u32,
     pub projection: [[f32; 4]; 4],
+    /// `text_gamma` / `text_contrast`: `TextCompositionUniforms::params`
+    /// from `text_composition.rs`.
+    pub text_composition: [f32; 4],
     // sampler2D atlas_nearest_sampler;
     // sampler2D atlas_linear_sampler;
 }
@@ -696,8 +699,19 @@ pub struct WebGpuState {
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
     needs_force_configure: Cell<bool>,
+    /// Alpha modes the current surface supports.
+    surface_alpha_modes: RefCell<Vec<wgpu::CompositeAlphaMode>>,
+    /// The window draws no translucent pixels; see `set_opaque_content`.
+    opaque_content: Cell<bool>,
+    /// The window is hidden and its surface is held at [`PARKED_EXTENT`];
+    /// see `park_surface`.
+    parked: Cell<bool>,
     pub handle: RawHandlePair,
 }
+
+/// The surface extent of a parked (hidden) window. Configuring it releases
+/// the layer's window-size drawables (ft-34at5).
+const PARKED_EXTENT: (u32, u32) = (1, 1);
 
 pub struct RawHandlePair {
     window: RawWindowHandle,
@@ -1202,10 +1216,20 @@ fn should_configure_surface(
     force || configured != requested || previous_requested.0 == 0 || previous_requested.1 == 0
 }
 
+/// `opaque`: the window draws no translucent pixels. On Metal, wgpu sets the
+/// CAMetalLayer's opaque flag from this mode, as the Metal front end sets it
+/// for the same windows, so the compositor need not blend the layer. It does
+/// not make the window shadow cheaper: with three shadowed windows presenting
+/// at 56 fps, WindowServer's GPU share was the same with an opaque layer
+/// (28.7%) as without (28.8%), and 6.1% with the shadow disabled
+/// (ft-yccm0.7, mac-mini-old, 2026-10-14).
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
+    opaque: bool,
 ) -> wgpu::CompositeAlphaMode {
-    if alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+    if opaque && alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+        wgpu::CompositeAlphaMode::Opaque
+    } else if alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
         wgpu::CompositeAlphaMode::PostMultiplied
     } else if alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
         wgpu::CompositeAlphaMode::PreMultiplied
@@ -1242,7 +1266,14 @@ impl WebGpuState {
         } else {
             None
         };
+        // Instruments signposts (ft-yccm0.1.5) for the stages it names.
+        let signpost = match stage {
+            "submit" => procinfo::signpost_interval(procinfo::SignpostName::Commit),
+            "present" => procinfo::signpost_interval(procinfo::SignpostName::PresentCallback),
+            _ => procinfo::SignpostInterval::inert(),
+        };
         let result = work();
+        drop(signpost);
         if let Some(begin) = begin {
             if let Some(end) = self.native_submission_mach_ns() {
                 log::debug!(
@@ -1432,6 +1463,8 @@ impl WebGpuState {
         // <https://github.com/wezterm/wezterm/issues/3565>
         let view_formats = select_surface_view_formats(format, &downlevel_caps);
         let (surface_width, surface_height) = initial_surface_extent(dimensions);
+        let opaque_content = config.window_content_is_opaque();
+        let alpha_mode = select_composite_alpha_mode(&caps.alpha_modes, opaque_content);
 
         // ft-mpc9b.10.3: log the chosen surface's color space at
         // startup. Until the per-display ICC integration beads land,
@@ -1456,7 +1489,8 @@ impl WebGpuState {
             };
         log::info!(
             "webgpu surface configured: format={format:?} \
-             color_space={:?} wide_gamut_unverified={} hdr_capable={} frame_latency={}",
+             color_space={:?} wide_gamut_unverified={} hdr_capable={} frame_latency={} \
+             alpha_mode={alpha_mode:?}",
             gamut.color_space,
             gamut.wide_gamut_unverified,
             gamut.hdr_capable,
@@ -1470,7 +1504,7 @@ impl WebGpuState {
             width: surface_width,
             height: surface_height,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: select_composite_alpha_mode(&caps.alpha_modes),
+            alpha_mode,
             view_formats,
             desired_maximum_frame_latency,
         };
@@ -1664,7 +1698,46 @@ impl WebGpuState {
             texture_nearest_sampler,
             texture_linear_sampler,
             needs_force_configure: Cell::new(false),
+            surface_alpha_modes: RefCell::new(caps.alpha_modes),
+            opaque_content: Cell::new(opaque_content),
+            parked: Cell::new(false),
         })
+    }
+
+    /// Hold a hidden window's surface at [`PARKED_EXTENT`], so the layer
+    /// drops its window-size drawables (ft-34at5: ~240 MB per 6K window),
+    /// and take no frame until [`Self::unpark_surface`]. Call it only
+    /// between frames. Returns whether the surface was not parked already.
+    pub(crate) fn park_surface(&self) -> bool {
+        if self.parked.replace(true) {
+            return false;
+        }
+        let dims = *self.dimensions.borrow();
+        if let Err(err) = self.configure_surface(dims, false) {
+            log::warn!("failed to park webgpu surface: {err:#}");
+        }
+        true
+    }
+
+    /// Let a parked surface take frames again; the configure before the next
+    /// acquisition restores the window's extent. Returns whether it was
+    /// parked.
+    pub(crate) fn unpark_surface(&self) -> bool {
+        self.parked.replace(false)
+    }
+
+    /// Record whether the window draws only opaque pixels. A change takes
+    /// effect at the next surface configure, which `prepare_surface` performs
+    /// before the next frame is acquired.
+    pub(crate) fn set_opaque_content(&self, opaque: bool) {
+        self.opaque_content.set(opaque);
+    }
+
+    fn desired_alpha_mode(&self) -> wgpu::CompositeAlphaMode {
+        select_composite_alpha_mode(
+            &self.surface_alpha_modes.borrow(),
+            self.opaque_content.get(),
+        )
     }
 
     /// Re-account the swapchain drawables after a configure applied `config`.
@@ -1766,7 +1839,11 @@ impl WebGpuState {
         let dims = self.effective_surface_dimensions(dims);
         let previous_requested = *self.dimensions.borrow();
         *self.dimensions.borrow_mut() = dims;
-        let (width, height) = resize_surface_extent(dims);
+        let (width, height) = if self.parked.get() {
+            PARKED_EXTENT
+        } else {
+            resize_surface_extent(dims)
+        };
         if width == 0 || height == 0 {
             // Preserve the last valid applied configuration.  Mutating it to
             // zero would make our model disagree with wgpu, which rejects a
@@ -1775,16 +1852,18 @@ impl WebGpuState {
         }
 
         let current = self.config.borrow().clone();
+        let alpha_mode = self.desired_alpha_mode();
         if !should_configure_surface(
             resize_surface_extent(previous_requested),
             (current.width, current.height),
             (width, height),
-            force,
+            force || current.alpha_mode != alpha_mode,
         ) {
             return Ok(SurfaceConfigureOutcome::Ready);
         }
 
         let mut next = current;
+        next.alpha_mode = alpha_mode;
         next.width = width;
         next.height = height;
         {
@@ -1818,6 +1897,11 @@ impl WebGpuState {
         dims: Dimensions,
     ) -> anyhow::Result<SurfaceConfigureOutcome> {
         self.profile_native_stage("configure", || {
+            if self.parked.get() {
+                // A hidden window takes no frame; unparking reopens it.
+                self.configure_surface(dims, false)?;
+                return Ok(SurfaceConfigureOutcome::DeferredZeroExtent);
+            }
             let outcome = self.configure_surface(dims, false)?;
             if outcome == SurfaceConfigureOutcome::Ready && self.needs_force_configure.get() {
                 return self.configure_surface(dims, true);
@@ -1878,7 +1962,7 @@ impl WebGpuState {
                 ));
             }
         }
-        next.alpha_mode = select_composite_alpha_mode(&caps.alpha_modes);
+        next.alpha_mode = select_composite_alpha_mode(&caps.alpha_modes, self.opaque_content.get());
         next.view_formats = select_surface_view_formats(next.format, &self.downlevel_caps);
         next.width = width;
         next.height = height;
@@ -1888,6 +1972,7 @@ impl WebGpuState {
         // configure precondition.
         candidate.configure(&self.device, &next);
         let old = self.surface.replace(candidate);
+        *self.surface_alpha_modes.borrow_mut() = caps.alpha_modes;
         self.record_configured_surface(next);
         *self.dimensions.borrow_mut() = dims;
         self.needs_force_configure.set(false);
@@ -1956,6 +2041,59 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::mpsc;
+
+    /// `shader.wgsl` must parse and validate, and the Rust `ShaderUniform`
+    /// that fills its uniform buffer must have the WGSL struct's exact
+    /// layout: a mismatch shifts every field after it on the GPU.
+    #[test]
+    fn shader_uniform_matches_the_wgsl_uniform_layout() {
+        use super::ShaderUniform;
+        use std::mem::{offset_of, size_of};
+        use wgpu::naga;
+
+        let module = naga::front::wgsl::parse_str(WEBGPU_SHADER_SOURCE)
+            .unwrap_or_else(|err| panic!("shader.wgsl does not parse: {err}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|err| panic!("shader.wgsl does not validate: {err:?}"));
+
+        let (_, uniform) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("ShaderUniform"))
+            .expect("shader.wgsl declares struct ShaderUniform");
+        let naga::TypeInner::Struct { members, span } = &uniform.inner else {
+            panic!("ShaderUniform is not a struct: {:?}", uniform.inner);
+        };
+        let wgsl_layout: Vec<(&str, usize)> = members
+            .iter()
+            .map(|member| {
+                (
+                    member.name.as_deref().unwrap_or("<unnamed>"),
+                    member.offset as usize,
+                )
+            })
+            .collect();
+        assert_eq!(
+            wgsl_layout,
+            vec![
+                (
+                    "foreground_text_hsb",
+                    offset_of!(ShaderUniform, foreground_text_hsb)
+                ),
+                ("milliseconds", offset_of!(ShaderUniform, milliseconds)),
+                ("projection", offset_of!(ShaderUniform, projection)),
+                (
+                    "text_composition",
+                    offset_of!(ShaderUniform, text_composition)
+                ),
+            ]
+        );
+        assert_eq!(*span as usize, size_of::<ShaderUniform>());
+    }
 
     /// ft-yccm0.1.7: drawables are accounted as wgpu-hal Metal configures
     /// them: clamp(latency, 1..=3) + 1 images of width x height texels.
@@ -2788,35 +2926,79 @@ mod tests {
 
     #[test]
     fn alpha_mode_prefers_post_then_pre_then_auto() {
+        for opaque in [false, true] {
+            assert_eq!(
+                select_composite_alpha_mode(
+                    &[
+                        wgpu::CompositeAlphaMode::Inherit,
+                        wgpu::CompositeAlphaMode::PreMultiplied,
+                    ],
+                    opaque,
+                ),
+                wgpu::CompositeAlphaMode::PreMultiplied
+            );
+            assert_eq!(
+                select_composite_alpha_mode(
+                    &[
+                        wgpu::CompositeAlphaMode::Inherit,
+                        wgpu::CompositeAlphaMode::PostMultiplied,
+                    ],
+                    opaque,
+                ),
+                wgpu::CompositeAlphaMode::PostMultiplied
+            );
+            assert_eq!(
+                select_composite_alpha_mode(&[wgpu::CompositeAlphaMode::Inherit], opaque),
+                wgpu::CompositeAlphaMode::Auto
+            );
+        }
         assert_eq!(
-            select_composite_alpha_mode(&[
-                wgpu::CompositeAlphaMode::Opaque,
-                wgpu::CompositeAlphaMode::PreMultiplied,
-            ]),
+            select_composite_alpha_mode(
+                &[
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::CompositeAlphaMode::PreMultiplied,
+                ],
+                false,
+            ),
             wgpu::CompositeAlphaMode::PreMultiplied
         );
         assert_eq!(
-            select_composite_alpha_mode(&[
-                wgpu::CompositeAlphaMode::Inherit,
-                wgpu::CompositeAlphaMode::PostMultiplied,
-            ]),
-            wgpu::CompositeAlphaMode::PostMultiplied
-        );
-        assert_eq!(
-            select_composite_alpha_mode(&[
-                wgpu::CompositeAlphaMode::Opaque,
-                wgpu::CompositeAlphaMode::Inherit,
-            ]),
+            select_composite_alpha_mode(
+                &[
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ],
+                false,
+            ),
             wgpu::CompositeAlphaMode::Auto
         );
     }
 
     #[test]
-    fn alpha_mode_defaults_to_auto_for_empty_capabilities() {
+    fn alpha_mode_is_opaque_for_opaque_content_when_supported() {
+        // wgpu-hal's Metal capabilities: the layer is opaque only in Opaque mode.
+        let metal = [
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ];
         assert_eq!(
-            select_composite_alpha_mode(&[]),
-            wgpu::CompositeAlphaMode::Auto
+            select_composite_alpha_mode(&metal, true),
+            wgpu::CompositeAlphaMode::Opaque
         );
+        assert_eq!(
+            select_composite_alpha_mode(&metal, false),
+            wgpu::CompositeAlphaMode::PostMultiplied
+        );
+    }
+
+    #[test]
+    fn alpha_mode_defaults_to_auto_for_empty_capabilities() {
+        for opaque in [false, true] {
+            assert_eq!(
+                select_composite_alpha_mode(&[], opaque),
+                wgpu::CompositeAlphaMode::Auto
+            );
+        }
     }
 
     #[test]

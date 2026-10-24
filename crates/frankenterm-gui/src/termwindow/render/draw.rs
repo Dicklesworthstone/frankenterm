@@ -9,6 +9,9 @@ use ::window::glium::uniforms::{
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use anyhow::{Context, anyhow};
 use config::FreeTypeLoadTarget;
+use frankenterm_gui::text_composition::{
+    CoverageCurve, GLSL_BACKGROUND_UNIFORM, GLSL_PARAMS_UNIFORM, TextCompositionUniforms,
+};
 
 /// The renderer stage that rejected a draw before it could be presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +63,25 @@ impl std::error::Error for DrawFailure {
 }
 
 impl crate::TermWindow {
+    /// Glyph shader uniforms for `text_gamma` / `text_contrast`. The shaders
+    /// cannot see the pixels they blend onto, so they assume text is drawn
+    /// over the default background of the active pane (of the window's own
+    /// palette without one). Text over another color, such as a selection,
+    /// a colored cell or the tab bar, is shaped for that background instead.
+    /// The pane's palette comes from its published render facts, so this
+    /// never waits on the terminal lock.
+    fn text_composition_uniforms(&mut self) -> TextCompositionUniforms {
+        let Some(curve) = CoverageCurve::from_config(&self.config) else {
+            return TextCompositionUniforms::OFF;
+        };
+        let background = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane.render_facts().palette.background,
+            None => self.palette().background,
+        }
+        .to_linear();
+        TextCompositionUniforms::new(curve, [background.0, background.1, background.2])
+    }
+
     pub(crate) fn call_draw_webgpu(&mut self, target: WebGpuDrawTarget) -> anyhow::Result<()> {
         use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
@@ -73,6 +95,8 @@ impl crate::TermWindow {
                 return Ok(());
             }
         }
+
+        let text_composition = self.text_composition_uniforms();
 
         let webgpu = self
             .webgpu
@@ -105,6 +129,7 @@ impl crate::TermWindow {
                 (view, None, Some(snapshot))
             }
         };
+        let gpu_encode = procinfo::signpost_interval(procinfo::SignpostName::GpuEncode);
         let mut encoder = webgpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -170,6 +195,7 @@ impl crate::TermWindow {
             foreground_text_hsb,
             milliseconds,
             projection,
+            text_composition: text_composition.params,
         });
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -251,8 +277,10 @@ impl crate::TermWindow {
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
         // prove asynchronous GPU completion or visible scanout.
+        let command_buffer = encoder.finish();
+        drop(gpu_encode);
         let _submission = webgpu.profile_native_stage("submit", || {
-            webgpu.queue.submit(std::iter::once(encoder.finish()))
+            webgpu.queue.submit(std::iter::once(command_buffer))
         });
         if let Some(readback) = readback {
             if let Err(err) = readback.finish(&webgpu.device) {
@@ -269,6 +297,8 @@ impl crate::TermWindow {
     pub(crate) fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
         use crate::renderstate::LedgeredTexture;
         use window::glium::texture::SrgbTexture2d;
+
+        let text_composition = self.text_composition_uniforms();
 
         let gl_state = self
             .render_state
@@ -386,6 +416,8 @@ impl crate::TermWindow {
                         uniforms.add("atlas_linear_sampler", &atlas_linear_sampler);
                         uniforms.add("foreground_text_hsb", &foreground_text_hsb);
                         uniforms.add("subpixel_aa", &subpixel_aa);
+                        uniforms.add(GLSL_PARAMS_UNIFORM, &text_composition.params);
+                        uniforms.add(GLSL_BACKGROUND_UNIFORM, &text_composition.background);
                         uniforms.add("milliseconds", &milliseconds);
                         uniforms.add_struct("cursor_blink", &cursor_blink);
                         uniforms.add_struct("blink", &blink);

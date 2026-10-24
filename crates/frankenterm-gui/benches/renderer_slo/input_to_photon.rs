@@ -31,6 +31,7 @@ use frankenterm_gui::renderer_slo::{
     InputToPhotonInputClass, InputToPhotonState, summarize_input_to_photon_traces,
     unavailable_proxy_evidence,
 };
+use frankenterm_gui::text_composition::TextCompositionUniforms;
 use futures::executor::block_on;
 use serde_json::json;
 use wgpu::util::DeviceExt;
@@ -276,6 +277,7 @@ struct BenchShaderUniform {
     foreground_text_hsb: [f32; 3],
     milliseconds: u32,
     projection: [[f32; 4]; 4],
+    text_composition: [f32; 4],
 }
 
 struct GlyphQuadGpuBench {
@@ -403,6 +405,8 @@ impl GlyphQuadGpuBench {
             foreground_text_hsb: [1.0, 1.0, 1.0],
             milliseconds: 0,
             projection: identity_projection(),
+            // text_gamma / text_contrast unset, as in the default config.
+            text_composition: TextCompositionUniforms::OFF.params,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph quad frame bench uniform buffer"),

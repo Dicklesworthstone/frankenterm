@@ -1,0 +1,8 @@
+{
+  "build_key": "a92c239d42b1523fbcb37903acd9630d77a814168ac2711f6012fcccca61d084",
+  "commit": "e500d414f2ef688d86d0228f39e8ca1a1285f72a",
+  "zig_tarball_sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+  "build_flags": "-Demit-bench -Doptimize=ReleaseFast -Demit-macos-app=false",
+  "binary_sha256": "74643d910e1a35f698aba4eaad34db4753b99ff483e629a6b65095b92e1af95a",
+  "built_utc": "2026-10-16T17:07:37Z"
+}

@@ -3,7 +3,7 @@ use super::*;
 use crate::config::{BidiMode, GridEngine, ScrollbackSnapshotGeneration, ScrollbackSpillError};
 #[cfg(feature = "use_serde")]
 use crate::config::{
-    ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
+    ScrollbackActivationError, ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
 use crate::pagegrid::cell::Glyph;
@@ -302,6 +302,16 @@ impl std::fmt::Display for ColdReadMetadataBusy {
 
 impl std::error::Error for ColdReadMetadataBusy {}
 
+/// How the cold source moved since the previous observation.
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdSourceChange {
+    Unchanged,
+    /// Only the oldest rows left; every retained row is still retained.
+    OldestEvicted,
+    Changed,
+}
+
 /// The captured source interval was invalidated before historical IO began.
 /// This does not classify an IO, authentication, or decoding failure as transient.
 #[cfg(feature = "use_serde")]
@@ -363,6 +373,8 @@ pub struct ScreenLineRead {
     cold_context: Option<Range<StableRowIndex>>,
     rendered: Option<Vec<Line>>,
     hot_top: StableRowIndex,
+    /// The first visible row when captured: rows above it were history.
+    visible_top: StableRowIndex,
     known_resident_history_start: Option<StableRowIndex>,
     wrap_policy: ResizeWrapPolicy,
     layout: Option<Arc<ColdVisualLayout>>,
@@ -436,10 +448,13 @@ pub struct PreparedColdLayout {
 
 /// Width information belongs to immutable admitted source rows, independently
 /// of the current viewport coordinates. Payload remains in the spill sink.
+/// The geometry is held inline, not behind its own `Arc`: pages are what
+/// snapshots share, and a per-row allocation (and its later free) cost every
+/// row that scrolls into the store on the parse thread (ft-yccm0.2.1.8).
 #[cfg(feature = "use_serde")]
 #[derive(Debug, Clone)]
 struct ColdGeometryRow {
-    geometry: Arc<LineWrapGeometry>,
+    geometry: LineWrapGeometry,
     wrapped: bool,
 }
 
@@ -579,9 +594,11 @@ impl ColdGeometryIndex {
         if !geometry.supports_join() {
             return None;
         }
+        // The row's slot in its page, inline struct included, is charged
+        // with the page; the row adds only its width buffer.
         let bytes = geometry
             .retained_bytes()
-            .checked_add(2 * std::mem::size_of::<usize>())?;
+            .checked_sub(std::mem::size_of::<LineWrapGeometry>())?;
         if bytes > available {
             return None;
         }
@@ -620,7 +637,7 @@ impl ColdGeometryIndex {
         self.geometry_bytes = self.geometry_bytes.checked_add(bytes)?;
         tail.geometry_bytes = tail.geometry_bytes.checked_add(bytes)?;
         tail.rows.push(ColdGeometryRow {
-            geometry: Arc::new(geometry),
+            geometry,
             wrapped: line.last_cell_was_wrapped(),
         });
         self.source.end = end;
@@ -804,6 +821,11 @@ pub struct ColdSeamReflow {
 #[derive(Debug)]
 pub(crate) struct ColdSeamCursor {
     pub before: CursorPosition,
+    /// A wrap was pending at the cursor (ft-3e1yj).
+    pub pending_wrap: bool,
+    /// The insertion point's column in `physical_row`: the cursor's, or with
+    /// a wrap pending, just past the row's last cell.
+    pub insertion_x: usize,
     pub physical_row: usize,
     pub after: Option<(usize, usize, bool)>,
 }
@@ -827,6 +849,11 @@ struct ColdReadCharge {
     used: usize,
     limit: usize,
     index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Image allocations already charged to this read, each held until the
+    /// read ends: a row dropped mid-read (the index pass keeps none) would
+    /// otherwise free its image, and a later image at the same address
+    /// would pass as charged.
+    images: HashMap<usize, Arc<frankenterm_cell::image::ImageData>>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -847,7 +874,53 @@ impl ColdReadCharge {
         }
     }
 
+    /// Charge one line: its serialized form, plus each image allocation it
+    /// holds once per read. Serializing an image cell writes its whole image,
+    /// so a durable image row (every cell of a 0.5 MB picture names it)
+    /// charged ~100 MB a row and every read that touched one failed with
+    /// `ColdReadPayloadLimit`. The image bytes a read holds are its distinct
+    /// allocations; the rows are charged without them, plus each cell's own
+    /// placement.
     fn serialize_line(&mut self, line: &Line) -> anyhow::Result<()> {
+        if !line.has_image_attachments() {
+            return self.serialize_plain_line(line);
+        }
+        let limit = |error: std::io::Error| anyhow::Error::new(error).context(ColdReadPayloadLimit);
+        let mut stripped = line.clone();
+        for cell in stripped.cells_mut_for_attr_changes_only() {
+            let Some(images) = cell.attrs().images() else {
+                continue;
+            };
+            for image in images {
+                self.charge(std::mem::size_of::<frankenterm_cell::image::ImageCell>())
+                    .map_err(limit)?;
+                let data = image.image_data();
+                let key = Arc::as_ptr(data) as usize;
+                if !self.images.contains_key(&key) {
+                    self.charge(data.len()).map_err(limit)?;
+                    self.images.insert(key, Arc::clone(data));
+                }
+            }
+            cell.attrs_mut().clear_images();
+        }
+        self.serialize_plain_line(&stripped)
+    }
+
+    fn charge(&mut self, bytes: usize) -> std::io::Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                if let Some(failed) = &self.index_failure {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                std::io::Error::other(ColdReadPayloadLimit)
+            })?;
+        Ok(())
+    }
+
+    fn serialize_plain_line(&mut self, line: &Line) -> anyhow::Result<()> {
         serde_json::to_writer(self, line).map_err(|error| {
             // This writer performs no IO: its only IO error is its byte cap.
             // Preserve a typed context explicitly; serde_json and io::Error
@@ -864,16 +937,7 @@ impl ColdReadCharge {
 #[cfg(feature = "use_serde")]
 impl std::io::Write for ColdReadCharge {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.used = self
-            .used
-            .checked_add(bytes.len())
-            .filter(|n| *n <= self.limit)
-            .ok_or_else(|| {
-                if let Some(failed) = &self.index_failure {
-                    failed.store(true, std::sync::atomic::Ordering::Release);
-                }
-                std::io::Error::other(ColdReadPayloadLimit)
-            })?;
+        self.charge(bytes.len())?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -912,6 +976,7 @@ impl ColdSeamReflow {
             used: 0,
             limit: ScreenLineRead::MAX_PAYLOAD_BYTES,
             index_failure: None,
+            images: Default::default(),
         };
         // A completed seam already owns every replacement row and its exact
         // logical-group boundary. If that complete source is still retained at
@@ -992,7 +1057,7 @@ impl ColdSeamReflow {
                 .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?;
             Some(
                 prefix
-                    .checked_add(cursor.before.x)
+                    .checked_add(cursor.insertion_x)
                     .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?,
             )
         } else {
@@ -1014,7 +1079,7 @@ impl ColdSeamReflow {
                 cells <= ScreenLineRead::MAX_PAYLOAD_BYTES / std::mem::size_of::<Cell>(),
                 "cold seam cell limit"
             );
-            serde_json::to_writer(&mut charge, source)?;
+            charge.serialize_line(source)?;
             let mut line = source.clone();
             let seqno = line.current_seqno();
             line.set_last_cell_was_wrapped(false, seqno);
@@ -1075,7 +1140,7 @@ impl ColdSeamReflow {
         }
         for line in &mut wrapped {
             let _ = line.cells_mut_for_attr_changes_only();
-            serde_json::to_writer(&mut charge, line)?;
+            charge.serialize_line(line)?;
         }
         let replacement_resident = wrapped.split_off(wrapped.len() - self.resident.len());
         anyhow::ensure!(
@@ -1126,7 +1191,7 @@ impl ColdSeamReflow {
         if let Some(previous) = &self.previous {
             for (key, line) in previous.rows.range(retained.clone()) {
                 anyhow::ensure!(!cancelled(), "cold seam cancelled");
-                serde_json::to_writer(&mut charge, line)?;
+                charge.serialize_line(line)?;
                 replacements.insert(*key, line.clone());
             }
         }
@@ -1144,7 +1209,7 @@ impl ColdSeamReflow {
             let remainder = prefix.split_off(take, seqno);
             prefix.set_last_cell_was_wrapped(true, seqno);
             let _ = prefix.cells_mut_for_attr_changes_only();
-            serde_json::to_writer(&mut charge, &prefix)?;
+            charge.serialize_line(&prefix)?;
             replacements.insert(first + index as StableRowIndex, prefix);
             prefix = remainder;
         }
@@ -1454,7 +1519,7 @@ impl ScreenLineRead {
                 replacement_geometry = rebuilt;
                 (&replacement_geometry, line.last_cell_was_wrapped())
             } else {
-                (captured.geometry.as_ref(), captured.wrapped)
+                (&captured.geometry, captured.wrapped)
             };
             cell_visits = match cell_visits.checked_add(geometry.physical_len().max(1)) {
                 Some(visits) if visits <= Self::MAX_INDEX_CELL_VISITS => visits,
@@ -1620,6 +1685,7 @@ impl ScreenLineRead {
             used: 0,
             limit,
             index_failure: Some(Arc::clone(&self.index_budget_exhausted)),
+            images: Default::default(),
         };
         while row < self.hot_top {
             anyhow::ensure!(!cancelled(), "cold index cancelled");
@@ -1775,6 +1841,11 @@ impl ScreenLineRead {
     }
     pub fn requested_row_count(&self) -> usize {
         self.end.saturating_sub(self.first) as usize
+    }
+    /// Every row of this read is resident: no cold rows and no cold layout to
+    /// hydrate, so hydration and publication need nothing but the terminal.
+    pub fn is_resident_only(&self) -> bool {
+        self.first >= self.resident_first && self.layout.is_none()
     }
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes
@@ -1941,6 +2012,7 @@ impl ScreenLineRead {
             used: 0,
             limit,
             index_failure: None,
+            images: Default::default(),
         };
         let fragment_alignment_retained = self.fragments.as_ref().is_some_and(|fragments| {
             self.cold
@@ -2874,6 +2946,16 @@ struct RecoveryScrollbackBoundary {
     #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
     expected_generation: Option<ScrollbackSnapshotGeneration>,
     original_cold_prefix_newest_exclusive: StableRowIndex,
+    /// Activation may supersede a cold store that advanced past
+    /// `expected_generation` (see
+    /// `ScrollbackSpillSink::replace_scrollback_prefix_superseding`).
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
+    supersede_cold_successors: bool,
+    /// The model erased scrollback after its checkpoint. The writer that
+    /// produced the same output committed that clear live, so the store sits
+    /// in a content epoch this model cannot name.
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
+    cleared_since_checkpoint: bool,
 }
 
 /// Semantic screen fields retained by the guardian checkpoint codec.
@@ -2937,6 +3019,10 @@ pub(crate) struct ScreenCheckpointLimits {
     pub max_cols: usize,
     pub max_visible_grid_cells: usize,
     pub max_retained_capture_bytes: usize,
+    /// Whether a line may show images: the capture holds graphics state.
+    pub allow_images: bool,
+    /// Whether a cell may be protected: the capture holds protection.
+    pub allow_protection: bool,
     pub estimated_bytes_per_line: usize,
     pub estimated_bytes_per_cell: usize,
 }
@@ -2951,6 +3037,8 @@ pub(crate) struct ScreenCheckpointUsage {
     pub hyperlink_bytes: usize,
     pub hyperlink_params: usize,
     pub retained_capture_bytes: usize,
+    /// A validated cell or pen is protected (DECSCA, SPA).
+    pub protected_attributes: bool,
 }
 
 #[cfg(feature = "use_serde")]
@@ -2965,6 +3053,7 @@ pub(crate) enum ScreenCheckpointCaptureError {
     ResourceAllocation(&'static str),
     InvalidLineGeometry,
     UnsupportedGraphicsState,
+    UnsupportedCharacterProtection,
     ColdScrollbackMetadataInconsistent,
     ColdScrollbackSnapshot(ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
@@ -4082,7 +4171,14 @@ fn cold_geometry_capture_enabled() -> bool {
     })
 }
 
-fn scrollback_compression_enabled() -> bool {
+/// What a line-feed flood's scrolls share, from
+/// [`Screen::flood_scroll_plan`] (ft-wd6cy).
+pub(crate) struct FloodScroll {
+    max_allowed: usize,
+    compress: bool,
+}
+
+pub(crate) fn scrollback_compression_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         scrollback_switch_on(std::env::var_os("FT_SCROLLBACK_WARM_COMPRESS").as_deref())
@@ -4131,7 +4227,7 @@ fn inspect_checkpoint_line(
     limits: &ScreenCheckpointLimits,
     usage: &mut ScreenCheckpointUsage,
 ) -> Result<(), ScreenCheckpointCaptureError> {
-    if line.has_image_attachments() {
+    if !limits.allow_images && line.has_image_attachments() {
         return Err(ScreenCheckpointCaptureError::UnsupportedGraphicsState);
     }
     accumulate_checkpoint_usage(&mut usage.lines, 1, limits.max_total_lines, "screen_lines")?;
@@ -4171,6 +4267,10 @@ fn inspect_checkpoint_line(
         let width = cell.width();
         if !(1..=2).contains(&width) {
             return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
+        }
+        // A protected cell would come back unprotected.
+        if !limits.allow_protection && cell.attrs().protected() {
+            return Err(ScreenCheckpointCaptureError::UnsupportedCharacterProtection);
         }
         semantic_cells = semantic_cells.checked_add(width).ok_or(
             ScreenCheckpointCaptureError::ArithmeticOverflow("semantic_line_cells"),
@@ -4723,6 +4823,8 @@ impl Screen {
             cold_context: None,
             rendered: None,
             hot_top,
+            visible_top: self
+                .phys_to_stable_row_index(self.lines.len().saturating_sub(self.physical_rows)),
             known_resident_history_start: (oldest_is_known && oldest == hot_top).then_some(hot_top),
             wrap_policy: self.resize_wrap_policy,
             layout,
@@ -4981,10 +5083,18 @@ impl Screen {
         read: &ScreenLineRead,
     ) -> Result<bool, ColdReadMetadataBusy> {
         use crate::config::ScrollbackIntervalCapture;
-        if !self.matches_coordinate_witness(&read.witness)
-            || !self.same_cold_fragments(&read.fragments)
-        {
-            return Ok(false);
+        // Which check refused a read: enable with
+        // RUST_LOG=frankenterm_term::line_read=debug (a refused chunk is
+        // what makes a text read restart, ft-ukqe3).
+        let refused = |reason: &str| {
+            log::debug!(target: "frankenterm_term::line_read", "line read refused: {reason}");
+            Ok(false)
+        };
+        if !self.matches_coordinate_witness(&read.witness) {
+            return refused("coordinate witness replaced");
+        }
+        if !self.same_cold_fragments(&read.fragments) {
+            return refused("cold row fragments changed");
         }
         if read.first < read.resident_first || read.layout.is_some() {
             if read.layout.as_ref().is_some_and(|layout| {
@@ -4994,7 +5104,7 @@ impl Screen {
                 // Canonical visual rows are anchored to the complete cold
                 // frontier. New source rows can have a different wrapped row
                 // count and shift even a closed prefix's visual origin.
-                return Ok(false);
+                return refused("canonical layout frontier moved");
             }
             if read.layout.as_ref().is_some_and(|layout| {
                 matches!(
@@ -5009,7 +5119,7 @@ impl Screen {
                 // The old bytes are retained, but this cached logical context
                 // ended at an open seam. Newly spilled rows may continue or
                 // close that same logical group; never certify its old end.
-                return Ok(false);
+                return refused("context ended at an open seam that has since spilled");
             }
             if read.layout_seqno != self.cold_visual_seqno {
                 // Another worker may have published while this read was in
@@ -5036,17 +5146,17 @@ impl Screen {
                             || now.extends(before)
                     });
                 if !compatible {
-                    return Ok(false);
+                    return refused("cold visual layout replaced incompatibly");
                 }
             }
             let Some((source, before)) = &read.cold else {
-                return Ok(false);
+                return refused("cold rows read without a cold source");
             };
             let Some(current) = self.config.scrollback_spill_sink() else {
-                return Ok(false);
+                return refused("cold sink removed");
             };
             if !Arc::ptr_eq(source, &current) {
-                return Ok(false);
+                return refused("cold sink replaced");
             }
             match current.try_capture_scrollback_interval() {
                 ScrollbackIntervalCapture::Ready(now)
@@ -5062,27 +5172,67 @@ impl Screen {
                             .unwrap_or(read.first..read.resident_first),
                     ) => {}
                 ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
-                _ => return Ok(false),
+                ScrollbackIntervalCapture::Ready(_) => {
+                    return refused("cold store moved its start or no longer retains the rows")
+                }
+                ScrollbackIntervalCapture::Unavailable => {
+                    return refused("cold store interval unavailable")
+                }
             }
         }
         if !read.resident.is_empty() {
-            let Some(start) = self.stable_row_to_phys(read.resident_first) else {
-                return Ok(false);
-            };
-            if start
-                .checked_add(read.resident.len())
-                .is_none_or(|end| end > self.lines.len())
-            {
-                return Ok(false);
+            // While the coordinate witness holds, history rows never change:
+            // only a resize, rewrap, clear or region scroll rewrites them,
+            // and each replaces the witness. A busy pane does spill its
+            // oldest hot rows to cold storage as it prints, and those rows
+            // are still the ones this read took. Requiring them to stay
+            // resident refused every multi-chunk read of a pane printing
+            // faster than a chunk could hydrate (ft-ukqe3). A spilled row
+            // must have been history when read, and still be retained; rows
+            // still resident must be unchanged.
+            let resident_now = self.phys_to_stable_row_index(0);
+            let spilled = usize::try_from(resident_now.saturating_sub(read.resident_first).max(0))
+                .unwrap_or(usize::MAX)
+                .min(read.resident.len());
+            if spilled != 0 {
+                let spilled_end = read.resident_first + spilled as StableRowIndex;
+                if spilled_end > read.visible_top {
+                    return refused("rows visible when read have spilled");
+                }
+                let Some(sink) = self.config.scrollback_spill_sink() else {
+                    return refused("spilled rows without a cold sink");
+                };
+                match sink.try_capture_scrollback_interval() {
+                    ScrollbackIntervalCapture::Ready(now)
+                        if now.rows().is_some_and(|rows| {
+                            rows.start <= read.resident_first && rows.end >= spilled_end
+                        }) => {}
+                    ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+                    _ => return refused("spilled rows no longer retained"),
+                }
             }
-            if !self
-                .lines
-                .iter()
-                .skip(start)
-                .zip(&read.resident)
-                .all(|(now, before)| now == before)
-            {
-                return Ok(false);
+            let unspilled = &read.resident[spilled..];
+            if !unspilled.is_empty() {
+                let Some(start) =
+                    self.stable_row_to_phys(read.resident_first + spilled as StableRowIndex)
+                else {
+                    return refused("resident rows evicted");
+                };
+                if start
+                    .checked_add(unspilled.len())
+                    .is_none_or(|end| end > self.lines.len())
+                {
+                    return refused("resident rows out of range");
+                }
+                if !self
+                    .lines
+                    .iter()
+                    .skip(start)
+                    .zip(unspilled)
+                    .all(|(now, before)| now == before)
+                {
+                    return refused("resident rows changed");
+                }
             }
         }
         Ok(true)
@@ -5169,38 +5319,79 @@ impl Screen {
     pub fn refresh_cold_source_observation(
         &mut self,
     ) -> Result<Option<bool>, ColdReadMetadataBusy> {
+        Ok(self
+            .refresh_cold_source()?
+            .map(|change| change != ColdSourceChange::Unchanged))
+    }
+
+    /// [`Self::refresh_cold_source_observation`], reporting only changes that
+    /// can move the coordinates of retained rows (ft-wpgjw). Evicting the
+    /// oldest cold rows cannot: retained rows keep their stable index, and
+    /// reads validate retention of their exact rows separately. Once the
+    /// scrollback is full every spill evicts, so counting eviction as a change
+    /// moved a pane's line-layout floor on almost every observation under
+    /// heavy output and no layout-fenced read survived its round trip. An
+    /// installed cold visual layout is anchored at the interval's start, so
+    /// while one exists eviction still counts.
+    #[cfg(feature = "use_serde")]
+    pub fn refresh_cold_source_coordinates(
+        &mut self,
+    ) -> Result<Option<bool>, ColdReadMetadataBusy> {
+        Ok(self.refresh_cold_source()?.map(|change| match change {
+            ColdSourceChange::Unchanged => false,
+            ColdSourceChange::OldestEvicted => self.cold_visual_layout_for_comparison().is_some(),
+            ColdSourceChange::Changed => true,
+        }))
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn refresh_cold_source(&mut self) -> Result<Option<ColdSourceChange>, ColdReadMetadataBusy> {
         let Some(sink) = self
             .config
             .scrollback_spill_sink()
             .filter(|_| self.allow_scrollback)
         else {
-            return Ok(Some(self.cold_source_observation.take().is_some()));
+            return Ok(Some(if self.cold_source_observation.take().is_some() {
+                ColdSourceChange::Changed
+            } else {
+                ColdSourceChange::Unchanged
+            }));
         };
         let now = match sink.try_capture_scrollback_interval() {
             crate::config::ScrollbackIntervalCapture::Ready(now) => now,
             crate::config::ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
             crate::config::ScrollbackIntervalCapture::Unavailable => return Ok(None),
         };
-        let changed = self
-            .cold_source_observation
-            .as_ref()
-            .is_none_or(|(before_sink, before)| {
-                !Arc::ptr_eq(before_sink, &sink)
-                    || match (before.rows(), now.rows()) {
-                        (Some(before_rows), Some(now_rows)) => {
-                            before_rows.start != now_rows.start
-                                || now_rows.end < before_rows.end
-                                || !now.retains(before, before_rows)
+        let change = match self.cold_source_observation.as_ref() {
+            Some((before_sink, before)) if Arc::ptr_eq(before_sink, &sink) => {
+                match (before.rows(), now.rows()) {
+                    (Some(before_rows), Some(now_rows)) => {
+                        if before_rows.start == now_rows.start
+                            && now_rows.end >= before_rows.end
+                            && now.retains(before, before_rows.clone())
+                        {
+                            ColdSourceChange::Unchanged
+                        } else if before_rows.start < now_rows.start
+                            && now_rows.start < before_rows.end
+                            && now_rows.end >= before_rows.end
+                            && now.retains(before, now_rows.start..before_rows.end)
+                        {
+                            ColdSourceChange::OldestEvicted
+                        } else {
+                            ColdSourceChange::Changed
                         }
-                        (None, None) => false,
-                        _ => true,
                     }
-            });
-        if changed {
+                    (None, None) => ColdSourceChange::Unchanged,
+                    _ => ColdSourceChange::Changed,
+                }
+            }
+            _ => ColdSourceChange::Changed,
+        };
+        if change != ColdSourceChange::Unchanged {
             self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         }
         self.cold_source_observation = Some((sink, now));
-        Ok(Some(changed))
+        Ok(Some(change))
     }
 
     /// Authoritative scrollback geometry derived from the active cold observation,
@@ -5900,6 +6091,14 @@ impl Screen {
         Ok(())
     }
 
+    /// The resident lines that show an image.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn lines_with_images(&self) -> impl Iterator<Item = &Line> {
+        self.lines
+            .iter()
+            .filter(|line| line.has_image_attachments())
+    }
+
     #[cfg(feature = "use_serde")]
     pub(crate) fn checkpoint_parts_staged(
         &self,
@@ -6229,6 +6428,8 @@ impl Screen {
         screen.recovery_scrollback = Some(RecoveryScrollbackBoundary {
             expected_generation: parts.cold_snapshot_generation,
             original_cold_prefix_newest_exclusive,
+            supersede_cold_successors: false,
+            cleared_since_checkpoint: false,
         });
         screen.keyboard_stack = parts.keyboard_stack;
         screen.saved_cursor = parts.saved_cursor;
@@ -6481,6 +6682,17 @@ impl Screen {
             .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)
     }
 
+    /// Let activation supersede a cold store that advanced past the
+    /// checkpoint's generation, through any clear the model replayed. Only a
+    /// caller whose model is authoritative past the checkpoint may ask for
+    /// this.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn supersede_recovered_cold_successors(&mut self) {
+        if let Some(recovery) = self.recovery_scrollback.as_mut() {
+            recovery.supersede_cold_successors = true;
+        }
+    }
+
     #[cfg(feature = "use_serde")]
     pub(crate) fn finish_recovery_without_scrollback(&mut self) {
         debug_assert!(!self.allow_scrollback);
@@ -6491,6 +6703,14 @@ impl Screen {
     /// recovered resident row. Every fallible calculation and sink operation
     /// precedes the in-memory split, so an error leaves the complete model
     /// available for retry.
+    ///
+    /// Recovered rows stay resident while a replay runs, so a model can hold
+    /// more scrollback than the live configuration retains: a child that
+    /// printed thousands of lines during its guardian birth, or a busy pane
+    /// replaying what it printed during an upgrade. Those oldest rows are the
+    /// ones the live terminal would have dropped as they scrolled, so they
+    /// are dropped here and never published. Refusing them instead failed the
+    /// pane's spawn or restore outright (ft-gufg7).
     #[cfg(feature = "use_serde")]
     pub(crate) fn activate_recovered_scrollback(
         &mut self,
@@ -6501,12 +6721,15 @@ impl Screen {
             return Err(ScrollbackActivationError::InvalidRecoveryBoundary);
         }
 
-        let resident_scrollback = self.lines.len().saturating_sub(self.physical_rows);
+        let recovered_scrollback = self.lines.len().saturating_sub(self.physical_rows);
         let live_policy = ScrollbackPolicy::capture(live_config.as_ref());
         let configured_scrollback = live_policy.size;
-        if resident_scrollback > configured_scrollback {
-            return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
-        }
+        let evicted = recovered_scrollback.saturating_sub(configured_scrollback);
+        let resident_scrollback = recovered_scrollback - evicted;
+        let retained_offset = self
+            .stable_row_index_offset
+            .checked_add(evicted)
+            .ok_or(ScrollbackActivationError::InvalidRecoveryBoundary)?;
 
         let tier = live_policy.tier;
         let desired_hot_rows = if tier.enabled {
@@ -6524,8 +6747,7 @@ impl Screen {
             return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
         }
 
-        let new_resident_oldest = self
-            .stable_row_index_offset
+        let new_resident_oldest = retained_offset
             .checked_add(cold_prefix_line_count)
             .ok_or(ScrollbackActivationError::InvalidRecoveryBoundary)?;
         let newest_stable_row_exclusive = StableRowIndex::try_from(new_resident_oldest)
@@ -6534,7 +6756,7 @@ impl Screen {
             None
         } else {
             Some(
-                StableRowIndex::try_from(self.stable_row_index_offset)
+                StableRowIndex::try_from(retained_offset)
                     .map_err(|_| ScrollbackActivationError::InvalidRecoveryBoundary)?,
             )
         };
@@ -6550,28 +6772,45 @@ impl Screen {
 
         let next_coordinate_identity = ScreenCoordinateIdentity::default();
         if let Some(sink) = sink {
+            // The prefix is the recovered rows after the evicted ones.
             let (first, second) = self.lines.legacy_mut().as_slices();
-            let first_count = first.len().min(cold_prefix_line_count);
-            let second_count = cold_prefix_line_count.saturating_sub(first_count);
+            let prefix_end = evicted + cold_prefix_line_count;
             let prefix = ScrollbackPrefix::from_slices(
                 oldest_stable_row,
                 newest_stable_row_exclusive,
-                &first[..first_count],
-                &second[..second_count],
+                &first[evicted.min(first.len())..prefix_end.min(first.len())],
+                &second
+                    [evicted.saturating_sub(first.len())..prefix_end.saturating_sub(first.len())],
             )
             .map_err(ScrollbackActivationError::Spill)?;
-            let commit = sink
-                .replace_scrollback_prefix(recovery.expected_generation, prefix, max_retained_rows)
-                .map_err(ScrollbackActivationError::Spill)?;
-            let generation_is_valid = match recovery.expected_generation {
-                Some(expected) => {
+            let ancestry = recovery
+                .expected_generation
+                .filter(|_| recovery.supersede_cold_successors)
+                .map(|ancestor| ScrollbackAncestry {
+                    ancestor,
+                    cleared_since: recovery.cleared_since_checkpoint,
+                });
+            let commit = match ancestry {
+                Some(ancestry) => {
+                    sink.replace_scrollback_prefix_superseding(ancestry, prefix, max_retained_rows)
+                }
+                None => sink.replace_scrollback_prefix(
+                    recovery.expected_generation,
+                    prefix,
+                    max_retained_rows,
+                ),
+            }
+            .map_err(ScrollbackActivationError::Spill)?;
+            let generation_is_valid = match (ancestry, recovery.expected_generation) {
+                (Some(ancestry), _) => ancestry.admits_receipt(commit.generation()),
+                (None, Some(expected)) => {
                     commit.generation().content_epoch() == expected.content_epoch()
                         && expected
                             .revision()
                             .checked_add(1)
                             .is_some_and(|revision| commit.generation().revision() == revision)
                 }
-                None => commit.generation().revision() == 1,
+                (None, None) => commit.generation().revision() == 1,
             };
             if !generation_is_valid
                 || commit.oldest_stable_row() != oldest_stable_row
@@ -6584,8 +6823,14 @@ impl Screen {
         // The sink receipt is now verified. These operations are allocation
         // free and infallible: publish-before-remove is the activation commit
         // order, and no later step may strand the only copy of a row.
+        if evicted != 0 {
+            warn!(
+                "recovered scrollback held {recovered_scrollback} rows; the configured \
+                 {configured_scrollback} retains the newest, as the live terminal would have"
+            );
+        }
         self.coordinate_identity = next_coordinate_identity;
-        self.lines.drain(..cold_prefix_line_count);
+        self.lines.drain(..evicted + cold_prefix_line_count);
         self.stable_row_index_offset = new_resident_oldest;
         self.scrollback_tiering.reset();
         self.recovery_scrollback = None;
@@ -6741,6 +6986,24 @@ impl Screen {
         line: &Line,
         seqno: SequenceNo,
     ) -> bool {
+        // The row has left `lines`, and the scroll offering it adds one.
+        let rows_left = self.lines.len().saturating_add(1);
+        self.record_scrollback_spill_leaving(stable_row, line, seqno, rows_left)
+    }
+
+    /// [`Self::record_scrollback_spill`], where `rows_left` is how many rows
+    /// the screen holds once the offered row has gone, counting rows the
+    /// scroll still adds; only a pane without a store reads it (ft-qvt9l.1).
+    /// scroll_up's move loop has removed the row and adds one (`len + 1`),
+    /// its extra removals add none (`len`), and page_scroll_up removes its
+    /// rows only after offering them all.
+    fn record_scrollback_spill_leaving(
+        &mut self,
+        stable_row: StableRowIndex,
+        line: &Line,
+        seqno: SequenceNo,
+        rows_left: usize,
+    ) -> bool {
         if !self.allow_scrollback {
             return true;
         }
@@ -6754,7 +7017,21 @@ impl Screen {
         let max_retained_rows = self.cold_sink_retention_rows();
         if max_retained_rows > 0 {
             let Some(sink) = self.config.scrollback_spill_sink() else {
-                return false;
+                // ft-qvt9l: no store ever opened for this pane (a full disk,
+                // a directory it cannot create). Keep classic bounded
+                // scrollback: hold rows until the whole `scrollback_lines`
+                // is resident, then let the oldest go, instead of holding
+                // every row in memory for the pane's life. The row goes
+                // while the rows left would still reach the limit. Counting a
+                // new row for scroll_up's extra removals too freed one more
+                // row on one scroll and refused the next, so at the limit
+                // every other new row was allocated, not recycled; the page
+                // engine, offering rows before removing any, dropped every row
+                // above the hot tier at once (ft-qvt9l.1).
+                let resident_limit = self
+                    .physical_rows
+                    .saturating_add(self.scrollback_policy.size);
+                return rows_left >= resident_limit;
             };
             #[cfg(not(feature = "use_serde"))]
             if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
@@ -7060,7 +7337,21 @@ impl Screen {
             .saturating_mul(LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER.max(1))
     }
 
+    /// Every cell write lands here; with no frame retained (the usual case)
+    /// it is one inlined check.
+    #[inline]
     fn invalidate_last_good_frame(
+        &mut self,
+        transition: LastGoodFrameTransition,
+        seqno: Option<SequenceNo>,
+    ) {
+        if self.last_good_frame.is_some() {
+            self.invalidate_retained_last_good_frame(transition, seqno);
+        }
+    }
+
+    #[inline(never)]
+    fn invalidate_retained_last_good_frame(
         &mut self,
         transition: LastGoodFrameTransition,
         seqno: Option<SequenceNo>,
@@ -9329,7 +9620,9 @@ impl Screen {
     #[cfg(test)]
     pub(crate) fn rows_held_by_views(&self) -> usize {
         self.lines.page().map_or(0, |rows| {
-            (0..rows.len()).filter(|&index| rows.is_edited(index)).count()
+            (0..rows.len())
+                .filter(|&index| rows.is_edited(index))
+                .count()
         })
     }
 
@@ -9531,12 +9824,55 @@ impl Screen {
         line.set_cell_grapheme(x, text, width, attr, seqno);
     }
 
+    /// [`Self::set_cell_grapheme`] of each `(text, width)` in `cells`, one
+    /// after the other from column `x` of row `y`, each `width` (1 or 2)
+    /// columns past the one before: the print path's run of graphemes on
+    /// one row. A page-engine row that the run appends to takes it in one
+    /// write (ft-yccm0.3.2.6).
+    pub fn set_cell_grapheme_run(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        cells: &[crate::pagegrid::RunGrapheme<'_>],
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        if cells.is_empty() {
+            return;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        let line_idx = self.phys_row(y);
+        let mut col = x;
+        if self.lines.page_mut().is_none() {
+            let line = self.line_mut(line_idx);
+            for run in cells {
+                let width = usize::from(run.width);
+                line.set_cell_grapheme(col, run.text, width, attr.clone(), seqno);
+                col += width;
+            }
+            return;
+        }
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::set_grapheme_run(page, row, x, cells, attr, seqno) {
+                return;
+            }
+        }
+        // Declined: cell by cell, as `set_cell_grapheme` writes each (a
+        // cell the page declines goes through the row's `Line` view, and
+        // the next one back to the page).
+        for run in cells {
+            let width = usize::from(run.width);
+            self.set_cell_grapheme(col, y, run.text, width, attr.clone(), seqno);
+            col += width;
+        }
+    }
+
     pub fn set_ascii_cell_run(
         &mut self,
         x: usize,
         y: VisibleRowIndex,
         text: &str,
-        attr: CellAttributes,
+        attr: &CellAttributes,
         seqno: SequenceNo,
     ) {
         debug_assert!(text.is_ascii());
@@ -9547,10 +9883,48 @@ impl Screen {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         if let Some((page, row)) = self.page_row(line_idx) {
-            if native::set_ascii_run(page, row, x, text, &attr, seqno) {
+            if native::set_ascii_run(page, row, x, text, attr, seqno) {
                 return;
             }
         }
+        self.set_ascii_cell_run_in_line(line_idx, x, text, attr, seqno);
+    }
+
+    /// [`Self::set_ascii_cell_run`] for a line-feed flood's run (ft-wd6cy),
+    /// its pen classified once for the flood: what that writes, where the
+    /// run appends to a page-engine row. Returns false, having written
+    /// nothing, wherever [`Self::set_ascii_cell_run`] must decide.
+    pub(crate) fn flood_ascii_cell_run(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        text: &[u8],
+        pen: &native::FloodPen,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(text.iter().all(|byte| matches!(byte, 0x20..=0x7e)));
+        let line_idx = self.phys_row(y);
+        let Some((page, row)) = self.page_row(line_idx) else {
+            return false;
+        };
+        if !native::append_ascii_run(page, row, x, text, pen, seqno) {
+            return false;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        true
+    }
+
+    /// [`Self::set_ascii_cell_run`] on a legacy `Line`, out of line: inline,
+    /// it made the frame of every page-engine run.
+    #[inline(never)]
+    fn set_ascii_cell_run_in_line(
+        &mut self,
+        line_idx: PhysRowIndex,
+        x: usize,
+        text: &str,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
         let line = self.line_mut(line_idx);
         if ascii_cluster_run_append_enabled()
             && line.append_ascii_cell_run(x, text, attr.clone(), seqno)
@@ -9744,6 +10118,106 @@ impl Screen {
     /// Blank rows are added at the bottom.
     /// If left and right margins are set smaller than the screen width, scrolled rows
     /// will not be placed into scrollback, because they are not complete rows.
+    /// [`Self::scroll_up_within_margins`] of one row with the default blank
+    /// (a pen whose `clone_sgr_only` is blank), when the region and margins
+    /// are the whole screen and the page engine's line feed path
+    /// ([`Self::page_scroll_up_line`]) applies: the line feed at the bottom
+    /// of the screen, without the general path's blank and region
+    /// arguments (ft-yccm0.3.2.6). Returns false, having changed nothing,
+    /// otherwise.
+    pub fn scroll_up_line(
+        &mut self,
+        scroll_region: &Range<VisibleRowIndex>,
+        left_and_right_margins: &Range<usize>,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        match self.flood_scroll_plan(scroll_region, left_and_right_margins) {
+            Some(plan) => self.flood_scroll_line(&plan, seqno, bidi_mode),
+            None => false,
+        }
+    }
+
+    /// What [`Self::scroll_up_line`] checks and derives before it scrolls,
+    /// for a line-feed flood to do once (ft-wd6cy): nothing in a flood
+    /// changes the margins, the screen or the scrollback policy. `None`
+    /// where [`Self::scroll_up_line`] declines.
+    pub(crate) fn flood_scroll_plan(
+        &self,
+        scroll_region: &Range<VisibleRowIndex>,
+        left_and_right_margins: &Range<usize>,
+    ) -> Option<FloodScroll> {
+        if self.lines.page().is_none()
+            || self.physical_rows == 0
+            || scroll_region.start != 0
+            || scroll_region.end as usize != self.physical_rows
+            || left_and_right_margins.start != 0
+            || left_and_right_margins.end != self.physical_cols
+            || !self.allow_scrollback
+            || self.recovery_scrollback.is_some()
+            || self.scrollback_policy.tier.enabled
+        {
+            return None;
+        }
+        Some(FloodScroll {
+            max_allowed: self.physical_rows + self.hot_scrollback_size(),
+            compress: scrollback_compression_enabled(),
+        })
+    }
+
+    /// [`Self::scroll_up_line`] under a plan [`Self::flood_scroll_plan`]
+    /// made for this screen as it still is.
+    pub(crate) fn flood_scroll_line(
+        &mut self,
+        plan: &FloodScroll,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        self.page_scroll_up_line_within(seqno, None, bidi_mode, plan.max_allowed, plan.compress)
+    }
+
+    /// [`Self::flood_scroll_line`], then [`Self::flood_ascii_cell_run`] of
+    /// `text` at `x` on the bottom row, which is the row the scroll added.
+    /// Where the list appended that row itself (a row left the hot cap), it
+    /// is empty, clustered and has no view, so the run goes straight into
+    /// it, without finding it again or checking it against a previous cell.
+    /// `None`: the scroll declined, and nothing changed. `Some(written)`:
+    /// it scrolled; when the run was not written, the caller writes it as
+    /// it would have.
+    pub(crate) fn flood_scroll_line_with_run(
+        &mut self,
+        plan: &FloodScroll,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+        x: usize,
+        text: &[u8],
+        pen: &native::FloodPen,
+    ) -> Option<bool> {
+        let rows_before = self.lines.len();
+        if !self.flood_scroll_line(plan, seqno, bidi_mode) {
+            return None;
+        }
+        // `page_scroll_up_line_within` built the row itself below the cap.
+        if rows_before < plan.max_allowed {
+            return Some(false);
+        }
+        debug_assert_eq!(
+            self.phys_row(self.physical_rows as VisibleRowIndex - 1),
+            self.lines.len() - 1
+        );
+        let written = self
+            .lines
+            .page_mut()
+            .and_then(PageRows::fresh_tail_row_mut)
+            .is_some_and(|(page, row)| {
+                native::append_ascii_run_to_fresh_row(page, row, x, text, pen, seqno)
+            });
+        if written {
+            self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        }
+        Some(written)
+    }
+
     pub fn scroll_up_within_margins(
         &mut self,
         scroll_region: &Range<VisibleRowIndex>,
@@ -9777,7 +10251,13 @@ impl Screen {
         if rows_to_copy > 0 {
             for dest_row in phys_scroll.start..phys_scroll.start + rows_to_copy {
                 let src_row = dest_row + num_rows;
-                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
+                self.copy_margin_band(
+                    src_row,
+                    dest_row,
+                    left_and_right_margins,
+                    &blank_attr,
+                    seqno,
+                );
             }
         }
 
@@ -9813,7 +10293,15 @@ impl Screen {
 
         // and place them into the dest
         if let Some((page, row)) = self.page_row(dest) {
-            if native::put_band(page, row, margins.start, &cells, margins.end, blank_attr, seqno) {
+            if native::put_band(
+                page,
+                row,
+                margins.start,
+                &cells,
+                margins.end,
+                blank_attr,
+                seqno,
+            ) {
                 return;
             }
         }
@@ -9966,10 +10454,10 @@ impl Screen {
                     if !self.record_scrollback_spill(stable_row, &line, seqno) {
                         self.lines.insert(remove_idx, line);
                         spill_blocked = true;
-                        if !self
+                        if self
                             .config
                             .scrollback_spill_sink()
-                            .is_some_and(|sink| sink.requires_scrollback_flush())
+                            .is_some_and(|sink| !sink.requires_scrollback_flush())
                         {
                             warn!(
                                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -9981,7 +10469,7 @@ impl Screen {
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
                 let line = if default_blank == blank_attr {
-                    Line::new(seqno)
+                    line.recycle_as_new(seqno)
                 } else {
                     // Make the line like a new one of the appropriate width
                     line.resize_and_clear(self.physical_cols, seqno, blank_attr.clone());
@@ -10012,12 +10500,14 @@ impl Screen {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
-                    if !self.record_scrollback_spill(stable_row, &removed, seqno) {
+                    let rows_left = self.lines.len();
+                    if !self.record_scrollback_spill_leaving(stable_row, &removed, seqno, rows_left)
+                    {
                         self.lines.insert(remove_idx, removed);
-                        if !self
+                        if self
                             .config
                             .scrollback_spill_sink()
-                            .is_some_and(|sink| sink.requires_scrollback_flush())
+                            .is_some_and(|sink| !sink.requires_scrollback_flush())
                         {
                             warn!(
                                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -10099,6 +10589,17 @@ impl Screen {
         if self.lines.page().is_none() {
             return false;
         }
+        if num_rows == 1
+            && self.physical_rows > 0
+            && scroll_region.start == 0
+            && scroll_region.end as usize == self.physical_rows
+            && self.allow_scrollback
+            && self.recovery_scrollback.is_none()
+            && !self.scrollback_policy.tier.enabled
+        {
+            let custom_blank = (*blank_attr != CellAttributes::blank()).then_some(blank_attr);
+            return self.page_scroll_up_line(seqno, custom_blank, &bidi_mode);
+        }
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
@@ -10155,7 +10656,14 @@ impl Screen {
                 let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                 let accepted = if self.cold_sink_retention_rows() > 0 {
                     let line = self.lines[removed_from_top].clone();
-                    self.record_scrollback_spill(stable_row, &line, seqno)
+                    // Rows are trimmed only after this loop: count the ones
+                    // already admitted and the rows the scroll appends.
+                    let rows_left = self
+                        .lines
+                        .len()
+                        .saturating_sub(removed_from_top + 1)
+                        .saturating_add(num_rows);
+                    self.record_scrollback_spill_leaving(stable_row, &line, seqno, rows_left)
                 } else {
                     // Without a cold sink only the row's length is read.
                     let len = self
@@ -10172,11 +10680,14 @@ impl Screen {
             }
             admitted += 1;
         }
+        // As in legacy scroll_up: only a store that writes synchronously
+        // failed. A deferred store refuses while its queue is full, and a
+        // pane without a store refuses rows it keeps by design (ft-qvt9l).
         if refused
-            && !self
+            && self
                 .config
                 .scrollback_spill_sink()
-                .is_some_and(|sink| sink.requires_scrollback_flush())
+                .is_some_and(|sink| !sink.requires_scrollback_flush())
         {
             warn!(
                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -10188,8 +10699,16 @@ impl Screen {
         let footer = self.physical_rows - scroll_region.end as usize;
         let rows = self.lines.page_mut().expect("page rows");
         rows.set_hot_cap(max_allowed);
+        // A new row under the default blank needs only legacy's clustered
+        // storage form from `native::new_row`; the list sets it as it appends
+        // the row, so the loop below looks that row up only for a bidi mode.
+        let appended_flags = if insert_at_end && *blank_attr == CellAttributes::blank() {
+            crate::pagegrid::RowHeader::LEGACY_FORM_C
+        } else {
+            0
+        };
         let scrolled = if insert_at_end {
-            rows.scroll(num_rows, seqno, hold, admitted)
+            rows.scroll_with_row_flags(num_rows, seqno, hold, admitted, appended_flags)
         } else {
             rows.scroll_above_footer(num_rows, footer, seqno, hold, admitted)
         };
@@ -10209,8 +10728,11 @@ impl Screen {
         let to_add = num_rows - lines_moved;
         let first_new = self.lines.len() - footer - num_rows;
         for added in 0..num_rows {
+            let bidi = (added >= lines_moved).then_some(&bidi_mode);
+            if appended_flags != 0 && bidi.is_none() {
+                continue;
+            }
             if let Some((page, row)) = self.page_row(first_new + added) {
-                let bidi = (added >= lines_moved).then_some(&bidi_mode);
                 native::new_row(page, row, cols, blank_attr, bidi, seqno);
             }
         }
@@ -10223,6 +10745,104 @@ impl Screen {
             }
         }
         true
+    }
+
+    /// [`Self::page_scroll_up`] of one row of the full screen with
+    /// scrollback, no recovery hold and no warm tier: the line feed at the
+    /// bottom of the screen, once per line of a `cat` flood (ft-yccm0.3.2.6).
+    /// It runs the general path's steps for exactly those arguments (the row
+    /// entering scrollback compressed, at most one row leaving the hot cap
+    /// with nothing read back for a spill, one row appended, and built as
+    /// the general path builds it) without the general path's region
+    /// arithmetic, which was a quarter of a line feed's cost. `custom_blank`
+    /// is the new row's blank unless it is the default one, which the line
+    /// feed path knows without comparing attributes (a tenth of this
+    /// function's cost).
+    fn page_scroll_up_line(
+        &mut self,
+        seqno: SequenceNo,
+        custom_blank: Option<&CellAttributes>,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        let max_allowed = self.physical_rows + self.hot_scrollback_size();
+        self.page_scroll_up_line_within(
+            seqno,
+            custom_blank,
+            bidi_mode,
+            max_allowed,
+            scrollback_compression_enabled(),
+        )
+    }
+
+    /// [`Self::page_scroll_up_line`] with the rows the screen keeps
+    /// (`max_allowed`) and whether rows entering scrollback are compressed
+    /// given, as a line-feed flood derives them once (ft-wd6cy).
+    fn page_scroll_up_line_within(
+        &mut self,
+        seqno: SequenceNo,
+        custom_blank: Option<&CellAttributes>,
+        bidi_mode: &BidiMode,
+        max_allowed: usize,
+        compress: bool,
+    ) -> bool {
+        let lines_removed = (self.lines.len() + 1).saturating_sub(max_allowed);
+        if lines_removed > self.lines.len() {
+            return false;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        if compress {
+            for index in self.phys_range(&(0..1)) {
+                self.page_compress_for_scrollback(index);
+            }
+        }
+        // Without a warm tier no row is offered to a sink: each one leaving
+        // the hot cap is admitted.
+        let admitted = lines_removed;
+        // Under the default blank the list appends the row in legacy's
+        // clustered form, all `native::new_row` would give it.
+        let default_blank = custom_blank.is_none();
+        let rows = self.lines.page_mut().expect("page rows");
+        rows.set_hot_cap(max_allowed);
+        // Every row leaving the cap is admitted, so the list's own count
+        // of them is `admitted`.
+        let scrolled = rows.scroll_line(
+            seqno,
+            if default_blank {
+                crate::pagegrid::RowHeader::LEGACY_FORM_C
+            } else {
+                0
+            },
+        );
+        debug_assert_eq!(scrolled.trimmed, admitted);
+        self.advance_stable_row_index_offset(admitted);
+        // A row that replaced one leaving the cap is legacy's reused row,
+        // which keeps no bidi mode; a row added below the cap is built new,
+        // with it. The region ends at the screen's bottom: no footer moves.
+        let bidi = (lines_removed == 0).then_some(bidi_mode);
+        if !default_blank || bidi.is_some() {
+            self.build_scrolled_in_row(custom_blank, bidi, seqno);
+        }
+        true
+    }
+
+    /// [`Self::page_scroll_up_line`]'s new row under a custom blank, or below
+    /// the hot cap: built as the general path builds it. Out of line: once
+    /// scrollback is full under the default pen, neither happens.
+    #[cold]
+    #[inline(never)]
+    fn build_scrolled_in_row(
+        &mut self,
+        custom_blank: Option<&CellAttributes>,
+        bidi: Option<&BidiMode>,
+        seqno: SequenceNo,
+    ) {
+        let default_blank = CellAttributes::blank();
+        let blank_attr = custom_blank.unwrap_or(&default_blank);
+        let cols = self.physical_cols;
+        let first_new = self.lines.len() - 1;
+        if let Some((page, row)) = self.page_row(first_new) {
+            native::new_row(page, row, cols, blank_attr, bidi, seqno);
+        }
     }
 
     /// Legacy [`Self::scroll_down`] on page-engine rows (ft-yccm0.3.3.4): the
@@ -10262,9 +10882,19 @@ impl Screen {
 
     /// `Line::compress_for_scrollback` on row `index`, natively when the
     /// page-engine row allows it.
+    /// Legacy's `compress_for_scrollback` on the page-engine row about to
+    /// enter scrollback. A row a legacy edit left in its view is that view,
+    /// compressed in place as legacy does. A page row is compressed lazily,
+    /// when its view is built (`PageRows::build_view`): nothing writes a
+    /// scrollback row, so the view built later is the `Line` legacy holds,
+    /// and the rows nobody reads (most of a flood) never pay for the
+    /// segmentation check, about a third of a unicode flood's ingest. A view
+    /// cached while the row was visible is dropped, so the next read builds
+    /// the compressed one.
     fn page_compress_for_scrollback(&mut self, index: PhysRowIndex) {
-        if let Some((page, row)) = self.page_row(index) {
-            if native::compress_for_scrollback(page, row) {
+        if let Some(rows) = self.lines.page_mut() {
+            if !rows.is_edited(index) {
+                rows.drop_view(index);
                 return;
             }
         }
@@ -10311,6 +10941,7 @@ impl Screen {
             recovery_boundary_after_clear,
         ) {
             recovery.original_cold_prefix_newest_exclusive = boundary;
+            recovery.cleared_since_checkpoint = true;
         }
         self.scrollback_tiering.reset();
         self.cold_scrollback_worker.reset();
@@ -10319,6 +10950,37 @@ impl Screen {
         // evicted scrollback lines indefinitely.
         self.lines.shrink_to_fit();
         Ok(())
+    }
+
+    /// Drops, now rather than on the next scroll, the oldest history rows
+    /// beyond the installed scrollback policy: the rows the next line feed
+    /// would drop, with stable row indices advancing as scrolling advances
+    /// them. A terminal that shrinks its history to fit a larger grid must be
+    /// within its memory budget when the resize returns. Only plain in-memory
+    /// history is trimmed; tiered, spilled and recovery history has somewhere
+    /// to go and is left to scrolling. Returns the number of rows dropped.
+    pub(crate) fn trim_scrollback_to_policy(&mut self, seqno: SequenceNo) -> usize {
+        if !self.allow_scrollback
+            || self.recovery_scrollback.is_some()
+            || self.scrollback_policy.tier.enabled
+            || self.config.scrollback_spill_sink().is_some()
+        {
+            return 0;
+        }
+        let limit = self
+            .physical_rows
+            .saturating_add(self.hot_scrollback_size());
+        let excess = self.lines.len().saturating_sub(limit);
+        if excess == 0 {
+            return 0;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        for _ in 0..excess {
+            self.lines.pop_front();
+        }
+        self.advance_stable_row_index_offset(excess);
+        self.lines.shrink_to_fit();
+        excess
     }
 
     /// ```text
@@ -10405,7 +11067,13 @@ impl Screen {
         if rows_to_copy > 0 {
             for src_row in (phys_scroll.start..phys_scroll.start + rows_to_copy).rev() {
                 let dest_row = src_row + num_rows;
-                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
+                self.copy_margin_band(
+                    src_row,
+                    dest_row,
+                    left_and_right_margins,
+                    &blank_attr,
+                    seqno,
+                );
             }
         }
 
@@ -10956,6 +11624,8 @@ pub(crate) mod tests {
         kp_cost_model: MonospaceKpCostModel,
         scorecard_enabled: bool,
         readability_gate: ResizeReadabilityGatePolicy,
+        /// `None` keeps the trait's choice (FT_GRID_ENGINE, else legacy).
+        grid_engine: Option<GridEngine>,
     }
 
     impl Default for TestTermConfig {
@@ -10976,6 +11646,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 0,
                     max_fallback_ratio_percent: 100,
                 },
+                grid_engine: None,
             }
         }
     }
@@ -10987,6 +11658,10 @@ pub(crate) mod tests {
 
         fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
             self.scrollback_tier
+        }
+
+        fn grid_engine(&self) -> GridEngine {
+            self.grid_engine.unwrap_or_else(GridEngine::from_env)
         }
 
         fn scrollback_spill_sink(&self) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
@@ -13857,6 +14532,73 @@ pub(crate) mod tests {
         );
     }
 
+    /// A read of history rows stays publishable when a busy pane spills them
+    /// to cold storage before it publishes: they are still the rows read. A
+    /// row that was visible when read must stay resident (ft-ukqe3).
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn line_read_survives_its_history_rows_spilling_but_not_its_visible_rows() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            scrollback: 64,
+            scrollback_tier: crate::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 4,
+                warm_max_bytes: 0,
+            },
+            cold_sink: Some(sink.clone()),
+            ..TestTermConfig::default()
+        });
+        let mut terminal = crate::Terminal::new(
+            test_size(3, 20, 96),
+            config,
+            "FrankenTerm",
+            "spilled-read-test",
+            Box::new(std::io::sink()),
+        );
+        for index in 0..12 {
+            terminal.advance_bytes(format!("row {index}\r\n").as_bytes());
+        }
+        let screen = terminal.screen();
+        let hot_top = screen.phys_to_stable_row_index(0);
+        let visible_top =
+            screen.phys_to_stable_row_index(screen.lines.len() - screen.physical_rows);
+        assert!(
+            visible_top - hot_top >= 2,
+            "the fixture keeps history rows resident"
+        );
+        let history = screen
+            .capture_line_read(hot_top..hot_top + 2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let visible = screen
+            .capture_line_read(visible_top..visible_top + 1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&history));
+        assert!(screen.validates_line_read(&visible));
+
+        // Two more lines spill the two oldest hot rows to cold storage.
+        terminal.advance_bytes(b"row 12\r\nrow 13\r\n");
+        assert!(
+            terminal.screen().phys_to_stable_row_index(0) >= hot_top + 2,
+            "the history rows spilled"
+        );
+        assert!(
+            terminal.screen().validates_line_read(&history),
+            "spilled history rows are still the rows read"
+        );
+
+        // Spill the once-visible row as well: it was not history when read.
+        for index in 14..24 {
+            terminal.advance_bytes(format!("row {index}\r\n").as_bytes());
+        }
+        assert!(terminal.screen().phys_to_stable_row_index(0) > visible_top);
+        assert!(!terminal.screen().validates_line_read(&visible));
+    }
+
     #[cfg(feature = "use_serde")]
     #[test]
     fn owned_line_read_checks_requested_rows_before_clamping() {
@@ -14389,6 +15131,15 @@ pub(crate) mod tests {
         assert!(
             !screen.validates_line_read(&older),
             "retained source is not authority to roll back a shifted layout"
+        );
+        // ft-wpgjw: the installed reflowed layout is anchored at the oldest
+        // cold row, so evicting that row is a coordinate change.
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(false)));
+        sink.state.lock().unwrap().1.remove(&0);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "eviction under an installed cold visual layout moves coordinates"
         );
     }
 
@@ -15675,6 +16426,9 @@ pub(crate) mod tests {
             terminal.cursor_pos(),
             terminal.screen().lines.back().map(Line::as_str)
         );
+        // A resize that fills the final row leaves the cursor as the wrap
+        // pending after its last grapheme (ft-3e1yj).
+        let pending = terminal.wrap_pending();
         let mut stale = terminal
             .capture_cold_seam_reflow()
             .unwrap()
@@ -15683,8 +16437,8 @@ pub(crate) mod tests {
             .unwrap();
         let before = terminal.cursor_pos();
         assert!(before.y > 0);
-        // Vertical movement preserves the virtual column just beyond the
-        // right edge; horizontal movement intentionally clamps that column.
+        // Vertical movement keeps the cursor's column; it cancels a pending
+        // wrap.
         terminal.advance_bytes(b"\x1b[A");
         let sequence = terminal.current_seqno() + 1;
         assert!(!terminal
@@ -15745,11 +16499,24 @@ pub(crate) mod tests {
             .hydrate(|| false)
             .unwrap();
         let actual: String = all.lines().map(|line| line.as_str()).collect();
-        assert_eq!(
-            actual,
-            format!("{original}!"),
-            "typing must continue at the original text offset"
-        );
+        if pending {
+            // CUU and CUD above cancelled that pending wrap, as VT510, xterm
+            // and Ghostty cancel it on any cursor movement, so "!" lands on the
+            // last grapheme's cell. Before ft-3e1yj the cursor sat in an
+            // off-screen column instead, and "!" went into an off-screen cell.
+            let last = original.char_indices().last().map_or(0, |(at, _)| at);
+            assert_eq!(
+                actual.trim_end_matches(' '),
+                format!("{}!", &original[..last]),
+                "typing must replace the last grapheme at the original text offset"
+            );
+        } else {
+            assert_eq!(
+                actual,
+                format!("{original}!"),
+                "typing must continue at the original text offset"
+            );
+        }
     }
 
     #[cfg(feature = "use_serde")]
@@ -17101,6 +17868,9 @@ pub(crate) mod tests {
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
         revision: AtomicU64,
+        /// What the last superseding replacement said about clears since its
+        /// ancestor.
+        pub(crate) last_supersede_cleared: AtomicBool,
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
@@ -17377,6 +18147,25 @@ pub(crate) mod tests {
                 prefix.oldest_stable_row(),
                 prefix.newest_stable_row_exclusive(),
             ))
+        }
+
+        fn replace_scrollback_prefix_superseding(
+            &self,
+            ancestry: crate::config::ScrollbackAncestry,
+            prefix: crate::config::ScrollbackPrefix<'_>,
+            max_retained_rows: usize,
+        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+        {
+            let current = crate::config::ScrollbackSnapshotGeneration::new(
+                [0; 16],
+                self.revision.load(Ordering::Relaxed),
+            );
+            self.last_supersede_cleared
+                .store(ancestry.cleared_since, Ordering::Relaxed);
+            if !ancestry.admits(current) {
+                return Err(crate::config::ScrollbackSpillError::SnapshotGenerationMismatch);
+            }
+            self.replace_scrollback_prefix(Some(current), prefix, max_retained_rows)
         }
 
         fn clear_scrollback(
@@ -17688,6 +18477,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 67_890,
                     max_fallback_ratio_percent: 150,
                 },
+                ..TestTermConfig::default()
             },
         );
 
@@ -18926,6 +19716,66 @@ pub(crate) mod tests {
             "pruned targets cannot authorize full logical reuse"
         );
         assert_eq!(screen.lines.back().unwrap().as_str(), "jkl");
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn a_cold_read_charges_each_image_allocation_once() {
+        use frankenterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+
+        // A 0.5 MB picture across a 64-column row, as a durable image row
+        // decodes it: every cell names the same allocation.
+        let image_row = |image: &Arc<ImageData>| {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_image(Box::new(ImageCell::new(
+                TextureCoordinate::new_f32(0.0, 0.0),
+                TextureCoordinate::new_f32(1.0, 1.0),
+                Arc::clone(image),
+            )));
+            Line::from_text(&" ".repeat(64), &attrs, 1, None)
+        };
+        let picture = || {
+            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                256,
+                512,
+                vec![7; 256 * 512 * 4],
+            )))
+        };
+        let charge = |limit| ColdReadCharge {
+            used: 0,
+            limit,
+            index_failure: None,
+            images: Default::default(),
+        };
+        let shared = picture();
+        let row = image_row(&shared);
+        let mut plain = row.clone();
+        for cell in plain.cells_mut_for_attr_changes_only() {
+            cell.attrs_mut().clear_images();
+        }
+        let mut plain_charge = charge(ScreenLineRead::MAX_PAYLOAD_BYTES);
+        plain_charge.serialize_line(&plain).unwrap();
+        let row_bytes = plain_charge.used;
+
+        // Each cell's placement is charged, its picture once per read.
+        let row_bytes = row_bytes + 64 * std::mem::size_of::<ImageCell>();
+        let mut read = charge(ScreenLineRead::MAX_PAYLOAD_BYTES);
+        for _ in 0..16 {
+            read.serialize_line(&row)
+                .expect("rows sharing one picture fit a read");
+        }
+        assert_eq!(read.used, shared.len() + 16 * row_bytes);
+        // A row decoded on its own holds its own copy, charged once more,
+        // even after that row is gone: the read holds what it charged.
+        read.serialize_line(&image_row(&picture())).unwrap();
+        assert_eq!(read.used, 2 * shared.len() + 17 * row_bytes);
+        read.serialize_line(&image_row(&picture())).unwrap();
+        assert_eq!(read.used, 3 * shared.len() + 18 * row_bytes);
+
+        // The limit still holds, with its typed error.
+        let mut tight = charge(shared.len());
+        let error = tight.serialize_line(&row).unwrap_err();
+        assert!(error.downcast_ref::<ColdReadPayloadLimit>().is_some());
     }
 
     #[test]
@@ -20392,6 +21242,123 @@ pub(crate) mod tests {
         assert_eq!(screen.scrollback_tiering.cold_spill_lines_total, 0);
     }
 
+    /// ft-qvt9l: a pane whose spill store never opened keeps classic bounded
+    /// scrollback. Rows are held until all of `scrollback_lines` is resident,
+    /// then the oldest go; before, every row past the hot tier stayed in
+    /// memory for the pane's life.
+    /// ft-qvt9l.1 on page rows: page_scroll_up offers every row past the hot
+    /// tier before trimming any, and a store-less pane at its limit admitted
+    /// them all, falling to the hot tier in one scroll. It now keeps exactly
+    /// its limit and lets one row go per scroll, as legacy rows do.
+    #[test]
+    fn page_engine_tiered_scrollback_without_cold_sink_keeps_its_limit() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: None,
+                grid_engine: Some(GridEngine::Page),
+                ..TestTermConfig::default()
+            },
+        );
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        let attrs = CellAttributes::blank();
+        for seq in 1..=40 {
+            let offset_before = screen.stable_row_index_offset;
+            screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
+            assert!(
+                screen.lines.len() <= 2 + 16,
+                "{} rows resident after {} scrolls",
+                screen.lines.len(),
+                seq
+            );
+            if seq > 16 {
+                assert_eq!(
+                    screen.lines.len(),
+                    2 + 16,
+                    "rows resident after {seq} scrolls"
+                );
+                assert_eq!(
+                    screen.stable_row_index_offset,
+                    offset_before + 1,
+                    "one row goes per scroll at the limit ({seq})"
+                );
+            }
+        }
+        assert_eq!(screen.grid_engine(), GridEngine::Page, "the page path ran");
+        assert_eq!(screen.stable_row_index_offset, 24);
+    }
+
+    #[test]
+    fn tiered_scrollback_without_cold_sink_stays_bounded_by_scrollback_lines() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: None,
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        for seq in 1..=40 {
+            let bottom = screen.phys_row(1);
+            screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            let offset_before = screen.stable_row_index_offset;
+            screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
+            assert!(
+                screen.lines.len() <= 2 + 16,
+                "{} rows resident after {} scrolls",
+                screen.lines.len(),
+                seq
+            );
+            // ft-qvt9l.1: once full, each scroll lets exactly one row go and
+            // recycles it; it used to free a second row and then refuse the
+            // next scroll, alternating 17 and 18 resident rows.
+            if seq > 16 {
+                assert_eq!(
+                    screen.lines.len(),
+                    2 + 16,
+                    "rows resident after {seq} scrolls"
+                );
+                assert_eq!(
+                    screen.stable_row_index_offset,
+                    offset_before + 1,
+                    "one row goes per scroll at the limit ({seq})"
+                );
+            }
+        }
+        let retained: Vec<_> = screen
+            .lines
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .filter(|line| line.starts_with("line-"))
+            .collect();
+        assert_eq!(
+            retained,
+            (24..=40)
+                .map(|seq| format!("line-{seq}"))
+                .collect::<Vec<_>>(),
+            "the newest rows stay"
+        );
+        assert_eq!(screen.lines.len(), 2 + 16);
+        // Rows line-1..=line-23 and the screen's first blank row went.
+        assert_eq!(screen.stable_row_index_offset, 24, "dropped rows advance");
+    }
+
     #[test]
     fn tiered_scrollback_bounds_hot_memory_during_high_output() {
         let cold_sink = Arc::new(TestColdScrollbackSink::default());
@@ -21083,6 +22050,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 2000,
                     max_fallback_ratio_percent: 20,
                 },
+                ..TestTermConfig::default()
             },
         )
     }
@@ -21696,5 +22664,73 @@ pub(crate) mod tests {
         );
         assert_eq!(unavail_screen.refresh_cold_source_observation(), Ok(None));
         assert_eq!(unavail_screen.observed_scrollback_geometry(), None);
+    }
+
+    /// ft-wpgjw: evicting the oldest cold rows keeps every retained row's
+    /// stable coordinates, so without an installed cold visual layout it is
+    /// not a coordinate change; it still refreshes the observation (geometry,
+    /// index budget). Losing newer rows or the lineage is a change.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn evicting_oldest_cold_rows_is_not_a_coordinate_change() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let source = Line::from_text("cold", &CellAttributes::blank(), 1, None);
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            for r in -6..0 {
+                rows.insert(r, source.clone());
+            }
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(true)));
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(false)));
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-6, 9)));
+
+        sink.rows.lock().unwrap().remove(&-6);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(false)),
+            "oldest-row eviction leaves retained coordinates alone"
+        );
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-5, 8)));
+        sink.rows.lock().unwrap().remove(&-5);
+        assert_eq!(
+            screen.refresh_cold_source_observation(),
+            Ok(Some(true)),
+            "the observation itself still changed"
+        );
+
+        sink.rows.lock().unwrap().remove(&-1);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "losing the newest cold row is a change"
+        );
+        *sink.interval_identity.lock().unwrap() =
+            crate::config::ScrollbackIntervalIdentity::default();
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "a new lineage is a change"
+        );
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.remove(&-4);
+            rows.remove(&-3);
+            rows.remove(&-2);
+        }
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "evicting every observed row is a change"
+        );
     }
 }

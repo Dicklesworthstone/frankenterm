@@ -15,7 +15,7 @@
 #![allow(clippy::vec_box)]
 
 use super::cell::{
-    classify, style_attributes, CellStyle, Glyph, InlineStyle, PackedCell, StyleClass,
+    classify, style_attributes, CellStyle, Glyph, InlineStyle, PackedCell, RunGrapheme, StyleClass,
 };
 use super::grapheme::GraphemeArena;
 use super::links::{attach_image, ImageMap, LinkTable};
@@ -220,6 +220,13 @@ impl Page {
         &self.graphemes
     }
 
+    /// Room for the graphemes a page like `previous` held (see
+    /// [`GraphemeArena::reserve`]).
+    pub fn reserve_graphemes_like(&mut self, previous: &Page) {
+        self.graphemes
+            .reserve(previous.graphemes.len(), previous.graphemes.arena_bytes());
+    }
+
     pub fn links(&self) -> &LinkTable {
         &self.links
     }
@@ -320,6 +327,7 @@ impl Page {
         let mut attrs = style_attributes(cell.style(), &self.styles);
         attrs.set_semantic_type(cell.semantic());
         attrs.set_wrapped(cell.is_wrapped());
+        attrs.set_protected(cell.is_protected());
         if let Some(link) = self.hyperlink(row, x) {
             attrs.set_hyperlink(Some(Arc::clone(link)));
         }
@@ -431,9 +439,7 @@ impl Page {
     pub fn store_legacy_row(&mut self, row: u32, cells: &[Cell], seqno: SequenceNo) -> bool {
         let header = self.header(row);
         let slot = header.slot();
-        for x in 0..header.len() {
-            self.release_at(slot, x);
-        }
+        self.release_range(slot, 0..header.len());
         self.set_header(
             row,
             RowHeader::with_slot(slot).with_flags(RowHeader::DIRTY, true),
@@ -522,6 +528,7 @@ impl Page {
             .with_style(style)
             .with_semantic(attrs.semantic_type())
             .with_wrapped(attrs.wrapped())
+            .with_protected(attrs.protected())
             .with_codepoint(glyph.codepoint())
             .with_wide(cell.width() >= 2);
         if !matches!(attrs.semantic_type(), SemanticType::Output) {
@@ -720,11 +727,38 @@ impl Page {
         }
     }
 
+    /// [`Self::release_at`] for every cell of `cols`, read and zeroed as one
+    /// slice: the cells are folded into one word, and only when some cell
+    /// has side entries are they released one by one (a release touches
+    /// only the side tables, never the cells). A row's truncation or
+    /// replacement released its cells one call at a time.
+    fn release_range(&mut self, slot: u32, cols: Range<usize>) {
+        if cols.is_empty() {
+            return;
+        }
+        let start = self.cell_index(slot, cols.start);
+        let end = start + cols.len();
+        let any = self.buf[start..end].iter().fold(0, |any, &bits| any | bits);
+        if PackedCell::from_bits(any).has_side_entries() {
+            for x in cols {
+                let old = self.cell_at(slot, x);
+                if old.has_side_entries() {
+                    let off = self.offset(slot, x);
+                    self.release(off, old, false);
+                }
+            }
+        }
+        self.buf[start..end].fill(PackedCell::BLANK.bits());
+    }
+
     /// Releases and zeroes one cell.
     fn release_at(&mut self, slot: u32, x: usize) {
-        let off = self.offset(slot, x);
         let old = self.cell_at(slot, x);
-        self.release(off, old, false);
+        // Releasing a cell with no side entries does nothing.
+        if old.has_side_entries() {
+            let off = self.offset(slot, x);
+            self.release(off, old, false);
+        }
         self.set_cell_at(slot, x, PackedCell::BLANK);
     }
 
@@ -992,9 +1026,10 @@ impl Page {
                 cache: &mut cache,
             },
         };
+        let wide = cell.width() >= 2;
         let write = CellWrite {
             glyph: Glyph::from_text(cell.str()),
-            wide: cell.width() >= 2,
+            wide,
             style,
             semantic: attrs.semantic_type(),
             wrapped: attrs.wrapped(),
@@ -1002,7 +1037,30 @@ impl Page {
             images: &images,
             clear_image_placements,
         };
-        self.write(row, x, write, seqno)
+        let written = self.write(row, x, write, seqno);
+        if written && attrs.protected() {
+            self.protect_cells(row, x..x + if wide { 2 } else { 1 });
+        }
+        written
+    }
+
+    /// Marks the stored cells `cols` of a row protected (legacy
+    /// `CellAttributes::protected`, DECSCA and SPA), right after a write
+    /// whose pen protects stored them. Writes themselves leave the bit
+    /// clear, so a print with no protection pays nothing for it. Cells past
+    /// the row's end are left alone.
+    pub fn protect_cells(&mut self, row: u32, cols: Range<usize>) {
+        let header = self.header(row);
+        let slot = header.slot();
+        let end = cols.end.min(header.len());
+        for x in cols.start..end {
+            let cell = self.cell_at(slot, x);
+            self.set_cell_at(slot, x, cell.with_protected(true));
+        }
+        self.debug_check_cells(
+            row,
+            cols.start.saturating_sub(1)..(end + 1).min(self.stride()),
+        );
     }
 
     /// A run of printable ASCII from column `x`, at or past the row's end,
@@ -1048,17 +1106,12 @@ impl Page {
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
             .with_hyperlink(cell.hyperlink.is_some());
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let glyph = if byte == b' ' {
-                Glyph::Blank
-            } else {
-                Glyph::Char(char::from(byte))
-            };
-            if let Some(link) = cell.hyperlink {
+        self.store_ascii_cells(slot, x, bytes, template);
+        if let Some(link) = cell.hyperlink {
+            for offset in 0..bytes.len() {
                 let off = self.offset(slot, x + offset);
                 self.links.attach(off, link);
             }
-            self.set_cell_at(slot, x + offset, template.with_codepoint(glyph.codepoint()));
         }
         // Cells past the end were zero (I2), so the padding is already
         // default blanks and nothing stored is hidden. Only the first new
@@ -1112,12 +1165,21 @@ impl Page {
             return false;
         }
         let kept = end.min(old_len);
-        if (x..kept).any(|col| {
-            let old = self.cell_at(slot, col);
-            old.is_wide() || old.is_hidden() || old.has_image()
-        }) {
+        // The cells the run overwrites, folded into one word: every check
+        // below tests one flag bit, which their OR has exactly when some
+        // cell does. Unlike `any`, the fold has no early exit, so it
+        // vectorizes; two `any` passes were a third of a repaint's overwrite.
+        let first = self.cell_index(slot, x);
+        let overwritten = PackedCell::from_bits(
+            self.buf[first..first + (kept - x)]
+                .iter()
+                .fold(0, |any, &bits| any | bits),
+        );
+        if overwritten.is_wide() || overwritten.is_hidden() || overwritten.has_image() {
             return false;
         }
+        // Releasing a cell with no side entries does nothing.
+        let releases = overwritten.has_side_entries();
         cell.glyph = Glyph::Blank;
         cell.wide = false;
         // Acquire before release (D3).
@@ -1132,26 +1194,234 @@ impl Page {
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
             .with_hyperlink(cell.hyperlink.is_some());
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let col = x + offset;
-            let off = self.offset(slot, col);
-            if col < kept {
+        if releases {
+            for col in x..kept {
                 let old = self.cell_at(slot, col);
-                self.release(off, old, false);
+                if old.has_side_entries() {
+                    let off = self.offset(slot, col);
+                    self.release(off, old, false);
+                }
             }
-            if let Some(link) = cell.hyperlink {
+        }
+        self.store_ascii_cells(slot, x, bytes, template);
+        if let Some(link) = cell.hyperlink {
+            for offset in 0..bytes.len() {
+                let off = self.offset(slot, x + offset);
                 self.links.attach(off, link);
             }
-            let glyph = if byte == b' ' {
-                Glyph::Blank
-            } else {
-                Glyph::Char(char::from(byte))
-            };
-            self.set_cell_at(slot, col, template.with_codepoint(glyph.codepoint()));
         }
         // Every cell in the run was narrow and visible and stays so, and no
         // cell after it was hidden by one of them: no hidden bit changes.
         let flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        self.set_header(
+            row,
+            header.with_len(old_len.max(end)).with_flags(flags, true),
+        );
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, x.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
+    }
+
+    /// Stores the printable-ASCII `bytes` from column `x` of slot `slot` as
+    /// [`Self::write`] stores their glyphs over `template` (whose codepoint
+    /// is 0): a space is the blank glyph, codepoint 0, and any other byte
+    /// its own codepoint. A straight store into the row's cells, which the
+    /// compiler vectorizes; per-cell index arithmetic and glyph matching
+    /// were 40% of a long-line ingest (ft-yccm0.3.2.6).
+    #[inline]
+    fn store_ascii_cells(&mut self, slot: u32, x: usize, bytes: &[u8], template: PackedCell) {
+        debug_assert_eq!(template.codepoint(), 0);
+        let base = template.bits();
+        let start = self.cell_index(slot, x);
+        for (cell, &byte) in self.buf[start..start + bytes.len()].iter_mut().zip(bytes) {
+            *cell = base | if byte == b' ' { 0 } else { u64::from(byte) };
+        }
+    }
+
+    /// A run of graphemes from column `x`, at or past the row's end, each
+    /// `(text, width)` stored as [`Self::write`] stores a cell of that text
+    /// and width (1 or 2) written there, one after the other: the style
+    /// resolved once and one header update for the run (the non-ASCII
+    /// counterpart of [`Self::append_ascii`]). `stored` is the columns the
+    /// run covers, the sum of its widths, which the caller counted while
+    /// checking the cells. `cell`'s glyph and width are ignored. Returns
+    /// false, writing nothing, for an empty run, one that starts before the
+    /// row's end or passes the page's stride, one that carries images, or a
+    /// row whose last cell is wide (`write` blanks or hides around it).
+    pub fn append_graphemes(
+        &mut self,
+        row: u32,
+        x: usize,
+        cells: &[RunGrapheme<'_>],
+        stored: usize,
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
+        debug_assert_eq!(
+            stored,
+            cells
+                .iter()
+                .map(|run| usize::from(run.width))
+                .sum::<usize>()
+        );
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let end = x.saturating_add(stored);
+        if cells.is_empty()
+            || x < old_len
+            || end > self.stride()
+            || !cell.images.is_empty()
+            || (old_len > 0 && self.cell_at(slot, old_len - 1).is_wide())
+        {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            // One reference per stored cell, spacers included; resolving
+            // took the first.
+            for _ in 1..stored {
+                self.styles.add_ref(id);
+            }
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        // Cells past the end were zero (I2), and no cell before `x` is wide,
+        // so the padding stays default blanks and only spacers are hidden.
+        // Every store is at the run's first cell plus its column, computed
+        // once: a grapheme insert between stores made each recompute it.
+        let (first_cell, first_offset) = (self.cell_index(slot, x), self.offset(slot, x));
+        let mut col = 0;
+        let mut any_cluster = false;
+        for &run in cells {
+            let (glyph, width) = (run.glyph(), run.width);
+            let wide = width == 2;
+            let off = first_offset + col as u32;
+            let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
+            if let Glyph::Cluster(text) = glyph {
+                self.graphemes.insert(off, text);
+                head = head.with_grapheme(true);
+                any_cluster = true;
+            }
+            if let Some(link) = cell.hyperlink {
+                self.links.attach(off, link);
+            }
+            self.buf[first_cell + col] = head.bits();
+            if wide {
+                if let Some(link) = cell.hyperlink {
+                    self.links.attach(off + 1, link);
+                }
+                self.buf[first_cell + col + 1] = template.with_hidden(true).bits();
+            }
+            col += usize::from(width);
+        }
+        let mut flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        if any_cluster {
+            flags |= RowHeader::GRAPHEME;
+        }
+        self.set_header(row, header.with_len(end).with_flags(flags, true));
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, old_len.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
+    }
+
+    /// [`Self::append_graphemes`] for a run that starts within the row (or
+    /// at its end) and may extend it: each old cell's side entries released
+    /// first, as [`Self::write`] releases them. `stored` is the sum of the
+    /// run's widths. Returns false, writing nothing, for an empty run, one
+    /// that starts past the end, passes the page's stride or carries
+    /// images, or one that meets a cell whose overwrite `write` handles
+    /// specially: a wide or hidden cell, or one with images, among the cells
+    /// it covers, or a wide cell just before it. Every covered cell was then
+    /// narrow and visible, so nothing past the run was hidden by one of
+    /// them, and none is by the run either.
+    pub fn put_graphemes(
+        &mut self,
+        row: u32,
+        x: usize,
+        cells: &[RunGrapheme<'_>],
+        stored: usize,
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(cells.iter().all(|run| matches!(run.width, 1 | 2)));
+        debug_assert_eq!(
+            stored,
+            cells
+                .iter()
+                .map(|run| usize::from(run.width))
+                .sum::<usize>()
+        );
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let end = x.saturating_add(stored);
+        if cells.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
+            return false;
+        }
+        if x > 0 && self.cell_at(slot, x - 1).is_wide() {
+            return false;
+        }
+        let kept = end.min(old_len);
+        if (x..kept).any(|col| {
+            let old = self.cell_at(slot, col);
+            old.is_wide() || old.is_hidden() || old.has_image()
+        }) {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        // Acquire before release (D3).
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            for _ in 1..stored {
+                self.styles.add_ref(id);
+            }
+        }
+        for col in x..kept {
+            let off = self.offset(slot, col);
+            let old = self.cell_at(slot, col);
+            self.release(off, old, false);
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        let mut col = x;
+        let mut any_cluster = false;
+        for &run in cells {
+            let (glyph, width) = (run.glyph(), run.width);
+            let wide = width == 2;
+            let off = self.offset(slot, col);
+            let mut head = template.with_codepoint(glyph.codepoint()).with_wide(wide);
+            if let Glyph::Cluster(text) = glyph {
+                self.graphemes.insert(off, text);
+                head = head.with_grapheme(true);
+                any_cluster = true;
+            }
+            if let Some(link) = cell.hyperlink {
+                self.links.attach(off, link);
+            }
+            self.set_cell_at(slot, col, head);
+            if wide {
+                if let Some(link) = cell.hyperlink {
+                    self.links.attach(off + 1, link);
+                }
+                self.set_cell_at(slot, col + 1, template.with_hidden(true));
+            }
+            col += usize::from(width);
+        }
+        let mut flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        if any_cluster {
+            flags |= RowHeader::GRAPHEME;
+        }
         self.set_header(
             row,
             header.with_len(old_len.max(end)).with_flags(flags, true),
@@ -1203,9 +1473,7 @@ impl Page {
         self.shift_cells(row, x..len, true);
         len += 1;
         if len > limit {
-            for col in limit..len {
-                self.release_at(slot, col);
-            }
+            self.release_range(slot, limit..len);
             len = limit;
         }
         let header = self.header(row);
@@ -1283,9 +1551,7 @@ impl Page {
         let header = self.header(row);
         let slot = header.slot();
         let len = header.len();
-        for col in width..len {
-            self.release_at(slot, col);
-        }
+        self.release_range(slot, width..len);
         self.set_header(
             row,
             header.with_len(width).with_flags(RowHeader::DIRTY, true),
@@ -1364,9 +1630,7 @@ impl Page {
     pub fn clear_row(&mut self, row: u32, seqno: SequenceNo) {
         let header = self.header(row);
         let slot = header.slot();
-        for x in 0..header.len() {
-            self.release_at(slot, x);
-        }
+        self.release_range(slot, 0..header.len());
         self.set_header(
             row,
             RowHeader::with_slot(slot).with_flags(RowHeader::DIRTY, true),
@@ -1378,6 +1642,12 @@ impl Page {
     /// Recycles the page (I14): zero cells and seqnos, no rows, empty side
     /// tables at standard capacity, and a fresh serial.
     pub fn reset(&mut self, serial: u64) {
+        // The whole buffer, though only used rows' prefixes can be nonzero
+        // (I2): zeroing just those measured 5-11% more cycles on a `seq`
+        // flood, because a bulk zero allocates the page's lines in cache as
+        // it clears them, and without it every row's first write missed.
+        // Zeroing each slot as `grow` hands it out instead measured 7.5%
+        // more cycles: the bulk zero runs at full streaming width.
         self.buf.fill(0);
         for slot in 0..self.rows {
             self.buf[slot as usize] = RowHeader::with_slot(slot).bits();

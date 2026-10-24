@@ -17,16 +17,20 @@
 //! nothing. Either way the list records why it is over its cap ([`OverCap`],
 //! ADR Q4), so I13 stays checkable.
 //!
-//! **Sealing (D8, I15).** Every page is held as an `Arc<Page>`. A page is
-//! sealed once it is not the tail page and each of its rows is at least
-//! [`SEAL_DISTANCE`] rows above the viewport top. Sealing is a flag: no copy,
-//! no allocation. Only sealed pages are handed out as `Arc`s, to readers
-//! such as the durability writer and the warm-tier compressor, which then
-//! read them without a lock. Active pages are never shared. A write to a
-//! sealed page goes through copy-on-write: in place while no reader holds
-//! it, otherwise into a fork under a fresh serial. Sealed pages are always a
-//! prefix of the list, because eligibility only depends on a page's last
-//! stable index.
+//! **Sealing (D8, I15).** An active page is owned outright (a `Box`), so the
+//! writes every printed run and scroll make need no atomic uniqueness check.
+//! A page is sealed once it is not the tail page and each of its rows is at
+//! least [`SEAL_DISTANCE`] rows above the viewport top; sealing moves its
+//! contents into an `Arc<Page>` (no copy of its rows), a pooled shell whose
+//! reset page goes back to the pool in its place, so that at the cap sealing
+//! allocates nothing either. A recycled sealed page becomes such a shell
+//! while no reader holds it. Only sealed
+//! pages are handed out as `Arc`s, to readers such as the durability writer
+//! and the warm-tier compressor, which then read them without a lock. A
+//! write to a sealed page goes through copy-on-write: in place while no
+//! reader holds it, otherwise into a fork under a fresh serial. Sealed pages
+//! are always a prefix of the list, because eligibility only depends on a
+//! page's last stable index.
 //!
 //! **Change tracking (ADR Q2, Q5).** A seqno-only bump of rows in sealed
 //! pages is recorded as a list-level range floor instead of a page write. A
@@ -34,6 +38,7 @@
 //! seqno is the numeric maximum of its own seqno and every floor covering
 //! it; only then does 0 mean "always changed".
 
+use super::grapheme::STD_ARENA_ENTRIES;
 use super::page::{rows_per_page, Page};
 use crate::StableRowIndex;
 use frankenterm_surface::SequenceNo;
@@ -112,12 +117,97 @@ struct PageSlot {
     first_stable: StableRowIndex,
     /// Rows at the front that have been trimmed, awaiting recycle.
     front_trim: u32,
-    page: Arc<Page>,
+    /// The page while active: owned outright, so a write needs no atomic
+    /// uniqueness check (every printed run and every scroll writes one).
+    active: Option<Box<Page>>,
+    /// The page once sealed: shareable, readers may hold it, and a write
+    /// forks it when one does (D8). Exactly one of the two is set.
+    sealed: Option<Arc<Page>>,
 }
 
 impl PageSlot {
+    fn new_active(first_stable: StableRowIndex, page: Box<Page>) -> Self {
+        Self {
+            first_stable,
+            front_trim: 0,
+            active: Some(page),
+            sealed: None,
+        }
+    }
+
+    fn page(&self) -> &Page {
+        match (&self.active, &self.sealed) {
+            (Some(page), _) => page,
+            (None, Some(page)) => page,
+            (None, None) => unreachable!("a page slot holds its page"),
+        }
+    }
+
+    /// The page, writable: an active page in place, a sealed one in place
+    /// while no reader holds it and forked under a fresh serial otherwise.
+    #[inline]
+    fn page_mut(&mut self, next_serial: &mut u64) -> &mut Page {
+        if self.active.is_some() {
+            return self.active.as_deref_mut().expect("checked above");
+        }
+        self.sealed_page_mut(next_serial)
+    }
+
+    /// [`Self::page_mut`] of a sealed page, kept out of line: every printed
+    /// run writes an active page, and the fork here made each of those
+    /// writes save and restore every register it might use.
+    #[cold]
+    #[inline(never)]
+    fn sealed_page_mut(&mut self, next_serial: &mut u64) -> &mut Page {
+        let sealed = self.sealed.as_mut().expect("a page slot holds its page");
+        if Arc::get_mut(sealed).is_none() {
+            let serial = *next_serial;
+            *next_serial += 1;
+            *sealed = Arc::new(sealed.fork(serial));
+        }
+        Arc::get_mut(sealed).expect("a page is unique once forked")
+    }
+
+    /// Seals an active page: it becomes shareable. A pooled shell takes the
+    /// page's contents (its buffers move, no row is copied), and the page's
+    /// box, now holding the shell's reset page, goes back to the pool, so
+    /// sealing allocates nothing; without a shell the page moves into a new
+    /// `Arc`.
+    #[allow(clippy::vec_box)] // A pooled box moves into an active slot as is.
+    fn seal(&mut self, shells: &mut Vec<Arc<Page>>, pool: &mut Vec<Box<Page>>) {
+        let Some(mut page) = self.active.take() else {
+            return;
+        };
+        self.sealed = Some(match shells.pop() {
+            Some(mut shell) => {
+                let reset = Arc::get_mut(&mut shell).expect("only the pool holds a shell");
+                std::mem::swap(reset, &mut *page);
+                if pool.len() < MAX_POOLED_PAGES {
+                    pool.push(page);
+                }
+                shell
+            }
+            None => Arc::from(page),
+        });
+    }
+
+    /// Unseals a sealed page: it is owned again, moved out of its `Arc`
+    /// when no reader holds it and forked under a fresh serial otherwise.
+    fn unseal(&mut self, next_serial: &mut u64) {
+        if let Some(page) = self.sealed.take() {
+            self.active = Some(match Arc::try_unwrap(page) {
+                Ok(page) => Box::new(page),
+                Err(shared) => {
+                    let serial = *next_serial;
+                    *next_serial += 1;
+                    Box::new(shared.fork(serial))
+                }
+            });
+        }
+    }
+
     fn retained(&self) -> usize {
-        (self.page.used() - self.front_trim) as usize
+        (self.page().used() - self.front_trim) as usize
     }
 
     /// One past the last retained row.
@@ -126,14 +216,20 @@ impl PageSlot {
     }
 
     fn is_full(&self) -> bool {
-        self.page.used() == self.page.capacity()
+        self.page().used() == self.page().capacity()
     }
 }
 
 pub struct PageList {
     pages: VecDeque<PageSlot>,
-    /// Reset pages of this list's geometry, each held only here.
-    pool: Vec<Arc<Page>>,
+    /// Reset pages of this list's geometry, each held only here, boxed as an
+    /// active slot holds them: taking one for a new slot moves the box, with
+    /// no allocation (D8).
+    #[allow(clippy::vec_box)]
+    pool: Vec<Box<Page>>,
+    /// Reset pages of this list's geometry in `Arc`s, each held only here:
+    /// sealing moves a page's contents into one ([`PageSlot::seal`]).
+    shells: Vec<Arc<Page>>,
     cols: u16,
     page_rows: u32,
     retained_rows: usize,
@@ -163,6 +259,7 @@ impl std::fmt::Debug for PageList {
             .field("pages", &self.pages.len())
             .field("sealed", &self.sealed)
             .field("pooled", &self.pool.len())
+            .field("shells", &self.shells.len())
             .field("retained_rows", &self.retained_rows)
             .field("hot_cap", &self.hot_cap)
             .field("over_cap", &self.over_cap)
@@ -199,6 +296,7 @@ impl PageList {
         Self {
             pages: VecDeque::new(),
             pool: Vec::with_capacity(MAX_POOLED_PAGES),
+            shells: Vec::with_capacity(MAX_POOLED_PAGES),
             cols,
             page_rows,
             retained_rows: 0,
@@ -307,20 +405,31 @@ impl PageList {
 
     /// Where `stable` lives: the page's position in the list and the row
     /// within it. O(1) for the tail page, O(log pages) otherwise.
+    #[inline]
     pub fn locate(&self, stable: StableRowIndex) -> Option<(usize, u32)> {
         if stable < self.first_stable() || stable >= self.next_stable {
             return None;
         }
         let tail = self.pages.len() - 1;
-        let index = if stable >= self.pages[tail].first_stable {
-            tail
-        } else {
-            self.pages
-                .partition_point(|slot| slot.end_stable() <= stable)
-        };
+        let slot = &self.pages[tail];
+        if stable >= slot.first_stable {
+            let row = slot.front_trim as usize + (stable - slot.first_stable) as usize;
+            return Some((tail, row as u32));
+        }
+        Some(self.locate_before_tail(stable))
+    }
+
+    /// [`Self::locate`] of a retained row before the tail page, by binary
+    /// search, out of line: inline, its frame was the tail lookup's, which
+    /// every printed run on the bottom row makes.
+    #[inline(never)]
+    fn locate_before_tail(&self, stable: StableRowIndex) -> (usize, u32) {
+        let index = self
+            .pages
+            .partition_point(|slot| slot.end_stable() <= stable);
         let slot = &self.pages[index];
         let row = slot.front_trim as usize + (stable - slot.first_stable) as usize;
-        Some((index, row as u32))
+        (index, row as u32)
     }
 
     /// The retained row at `stable`.
@@ -330,12 +439,12 @@ impl PageList {
     }
 
     fn row_ref(&self, index: usize, row: u32, stable: StableRowIndex) -> RowRef<'_> {
-        let page = &self.pages[index].page;
+        let slot = &self.pages[index];
         RowRef {
             stable,
-            page,
+            page: slot.page(),
             row,
-            sealed: (index < self.sealed).then_some(page),
+            sealed: slot.sealed.as_ref().filter(|_| index < self.sealed),
         }
     }
 
@@ -345,7 +454,7 @@ impl PageList {
             .iter()
             .enumerate()
             .flat_map(move |(index, slot)| {
-                (slot.front_trim..slot.page.used()).map(move |row| {
+                (slot.front_trim..slot.page().used()).map(move |row| {
                     let stable = slot.first_stable + (row - slot.front_trim) as StableRowIndex;
                     self.row_ref(index, row, stable)
                 })
@@ -355,31 +464,42 @@ impl PageList {
     /// The sealed pages, oldest first, with the stable index of each one's
     /// first retained row. Readers may clone these and keep them.
     pub fn sealed_pages(&self) -> impl Iterator<Item = (StableRowIndex, &Arc<Page>)> + '_ {
-        self.pages
-            .iter()
-            .take(self.sealed)
-            .map(|slot| (slot.first_stable, &slot.page))
+        self.pages.iter().take(self.sealed).map(|slot| {
+            (
+                slot.first_stable,
+                slot.sealed
+                    .as_ref()
+                    .expect("a sealed slot holds its page shared"),
+            )
+        })
     }
 
     /// The row at `stable` for writing, through copy-on-write if its page
     /// is sealed (D8). Callers bump the row's seqno through the page.
+    #[inline]
     pub fn row_mut(&mut self, stable: StableRowIndex) -> Option<(&mut Page, u32)> {
         let (index, row) = self.locate(stable)?;
         Some((self.page_mut(index), row))
     }
 
-    /// The page at `index`, writable. Active pages are never shared. A
+    /// The newest retained row, writable: the tail page's last row, the
+    /// one [`Self::scroll_line`] appended last.
+    pub fn tail_row_mut(&mut self) -> Option<(&mut Page, u32)> {
+        let tail = self.pages.len().checked_sub(1)?;
+        let page = self.page_mut(tail);
+        let row = page.used().checked_sub(1)?;
+        Some((page, row))
+    }
+
+    /// The page at `index`, writable. Active pages are owned outright. A
     /// sealed page is written in place while no reader holds it, and
     /// otherwise forked under a fresh serial, leaving readers their copy.
+    #[inline]
     fn page_mut(&mut self, index: usize) -> &mut Page {
-        let slot = &mut self.pages[index];
-        if Arc::get_mut(&mut slot.page).is_none() {
-            debug_assert!(index < self.sealed, "active page {} is shared", index);
-            let serial = self.next_serial;
-            self.next_serial += 1;
-            slot.page = Arc::new(slot.page.fork(serial));
-        }
-        Arc::get_mut(&mut slot.page).expect("a page is unique once forked")
+        let PageList {
+            pages, next_serial, ..
+        } = self;
+        pages[index].page_mut(next_serial)
     }
 
     /// Scrolls `n` rows into the list at the tail, as legacy's full-screen
@@ -393,6 +513,20 @@ impl PageList {
         n: usize,
         seqno: SequenceNo,
         hold: bool,
+        admit: impl FnMut(RowRef<'_>) -> bool,
+    ) -> Scrolled {
+        self.scroll_with_row_flags(n, seqno, hold, 0, admit)
+    }
+
+    /// [`Self::scroll`] whose new rows also carry the row flags `flags`, set
+    /// while the list holds the tail page, so a caller that would only set
+    /// them looks no new row up again.
+    pub fn scroll_with_row_flags(
+        &mut self,
+        n: usize,
+        seqno: SequenceNo,
+        hold: bool,
+        flags: u64,
         mut admit: impl FnMut(RowRef<'_>) -> bool,
     ) -> Scrolled {
         // Legacy's `lines.len() + num_rows >= max_allowed` count.
@@ -404,7 +538,7 @@ impl PageList {
         };
         let first_new = self.next_stable;
         for _ in 0..n {
-            self.append_row(seqno);
+            self.append_row(seqno, flags);
         }
         if !hold && !refused && trimmed < excess {
             // More rows scrolled in than were retained: legacy's eviction
@@ -426,6 +560,45 @@ impl PageList {
         Scrolled {
             trimmed,
             refused,
+            first_new,
+        }
+    }
+
+    /// [`Self::scroll_with_row_flags`] of one row with nothing held and
+    /// every trimmed row admitted: the line feed at the bottom of the
+    /// screen, once per line of a `cat` flood (ft-yccm0.3.2.6). With at most
+    /// one row over the cap coming in, and a front row to trim for it, this
+    /// trims that row and appends one straight through; any other shape
+    /// takes the general path.
+    pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
+        let excess = (self.retained_rows + 1).saturating_sub(self.hot_cap);
+        let front_trims = excess == 1 && self.pages.front().is_some_and(|slot| slot.retained() > 0);
+        if excess > 1 || (excess == 1 && !front_trims) {
+            return self.scroll_with_row_flags(1, seqno, false, flags, |_| true);
+        }
+        let first_new = self.next_stable;
+        if front_trims {
+            // `trim_front` of one row.
+            let slot = self.pages.front_mut().expect("checked above");
+            slot.front_trim += 1;
+            slot.first_stable += 1;
+            self.retained_rows -= 1;
+            if slot.retained() == 0 && slot.is_full() {
+                self.recycle_front();
+            }
+            if !self.range_floors.is_empty() {
+                let first = self.first_stable();
+                self.range_floors.retain(|floor| floor.end > first);
+            }
+        }
+        self.append_row(seqno, flags);
+        self.seal_eligible();
+        // The one row over the cap, if any, was trimmed.
+        self.over_cap = None;
+        self.debug_check_counts();
+        Scrolled {
+            trimmed: excess,
+            refused: false,
             first_new,
         }
     }
@@ -534,12 +707,20 @@ impl PageList {
             self.page_mut(bubble_index).swap_rows(bubble_row, other_row);
             return;
         }
-        // A temporary reference to the source page: the destination is a
-        // different page, so taking it writable cannot fork the source.
-        let source = Arc::clone(&self.pages[other_index].page);
+        // The source page is held aside while the destination, a different
+        // page, is written: an active page moved out of its slot and put
+        // back, a sealed one shared for the moment.
+        let source_slot = &mut self.pages[other_index];
+        let held_active = source_slot.active.take();
+        let held_sealed = source_slot.sealed.clone();
+        let source: &Page = held_active
+            .as_deref()
+            .or(held_sealed.as_deref())
+            .expect("a page slot holds its page");
         self.page_mut(bubble_index)
-            .copy_row_from(bubble_row, &source, other_row);
-        drop(source);
+            .copy_row_from(bubble_row, source, other_row);
+        self.pages[other_index].active = held_active;
+        drop(held_sealed);
         self.page_mut(other_index).clear_row(other_row, seqno);
     }
 
@@ -602,7 +783,10 @@ impl PageList {
     /// means "always changed".
     pub fn effective_seqno(&self, stable: StableRowIndex) -> Option<SequenceNo> {
         let (index, row) = self.locate(stable)?;
-        let mut seqno = self.pages[index].page.row_seqno(row).max(self.dirty_floor);
+        let mut seqno = self.pages[index]
+            .page()
+            .row_seqno(row)
+            .max(self.dirty_floor);
         for floor in &self.range_floors {
             if floor.covers(stable) {
                 seqno = seqno.max(floor.seqno);
@@ -638,7 +822,7 @@ impl PageList {
             if start >= end {
                 break;
             }
-            let page_max = slot.page.max_seqno();
+            let page_max = slot.page().max_seqno();
             let quiet = page_max != 0
                 && page_max <= since
                 && self.dirty_floor <= since
@@ -678,11 +862,10 @@ impl PageList {
         while self.sealed > 0 && self.pages[self.sealed - 1].end_stable() - 1 > cutoff {
             self.sealed -= 1;
             let index = self.sealed;
-            if Arc::get_mut(&mut self.pages[index].page).is_none() {
-                let serial = self.allocate_serial();
-                let slot = &mut self.pages[index];
-                slot.page = Arc::new(slot.page.fork(serial));
-            }
+            let PageList {
+                pages, next_serial, ..
+            } = self;
+            pages[index].unseal(next_serial);
         }
         self.seal_eligible();
     }
@@ -694,41 +877,70 @@ impl PageList {
 
     /// Seals every eligible page: not the tail, and every row at least
     /// [`SEAL_DISTANCE`] above the viewport top.
+    #[inline]
     fn seal_eligible(&mut self) {
         let cutoff = self.seal_cutoff();
         let tail = self.pages.len().saturating_sub(1);
+        if self.sealed < tail && self.pages[self.sealed].end_stable() - 1 <= cutoff {
+            self.seal_through(cutoff, tail);
+        }
+    }
+
+    /// [`Self::seal_eligible`]'s sealing, kept out of line: it runs once a
+    /// page, and inline its `Arc` conversion made every line feed save and
+    /// restore every register.
+    #[cold]
+    #[inline(never)]
+    fn seal_through(&mut self, cutoff: StableRowIndex, tail: usize) {
         while self.sealed < tail && self.pages[self.sealed].end_stable() - 1 <= cutoff {
+            self.pages[self.sealed].seal(&mut self.shells, &mut self.pool);
             self.sealed += 1;
         }
     }
 
-    /// Appends one empty row at the tail, taking a pooled page when the tail
-    /// page is full.
-    fn append_row(&mut self, seqno: SequenceNo) {
+    /// Appends one empty row at the tail, carrying the row flags `flags`,
+    /// taking a pooled page when the tail page is full.
+    fn append_row(&mut self, seqno: SequenceNo, flags: u64) {
         if self.pages.back().is_none_or(PageSlot::is_full) {
-            let page = match self.pool.pop() {
-                Some(page) => {
-                    self.pages_reused += 1;
-                    page
-                }
-                None => {
-                    self.pages_allocated += 1;
-                    let serial = self.allocate_serial();
-                    Arc::new(Page::new(self.cols, self.page_rows, serial))
-                }
-            };
-            self.pages.push_back(PageSlot {
-                first_stable: self.next_stable,
-                front_trim: 0,
-                page,
-            });
+            self.push_tail_page();
         }
         let tail = self.pages.len() - 1;
-        self.page_mut(tail)
-            .grow(seqno)
-            .expect("the tail page has room");
+        let page = self.page_mut(tail);
+        let row = page.grow(seqno).expect("the tail page has room");
+        if flags != 0 {
+            page.set_row_flags(row, flags, true);
+        }
         self.retained_rows += 1;
         self.next_stable += 1;
+    }
+
+    /// [`Self::append_row`]'s new tail page, from the pool or new. Out of
+    /// line: it runs once a page, and building a page inline made the frame
+    /// of every appended row.
+    #[cold]
+    #[inline(never)]
+    fn push_tail_page(&mut self) {
+        let mut page = match self.pool.pop() {
+            Some(page) => {
+                self.pages_reused += 1;
+                page
+            }
+            None => {
+                self.pages_allocated += 1;
+                let serial = self.allocate_serial();
+                Box::new(Page::new(self.cols, self.page_rows, serial))
+            }
+        };
+        // Text full of graphemes keeps filling pages with them: a fresh
+        // page takes room for as many as the page it follows, rather than
+        // regrowing its map from a reset page's capacity.
+        if let Some(previous) = self.pages.back() {
+            if previous.page().graphemes().len() > STD_ARENA_ENTRIES {
+                page.reserve_graphemes_like(previous.page());
+            }
+        }
+        self.pages
+            .push_back(PageSlot::new_active(self.next_stable, page));
     }
 
     /// Trims up to `count` rows from the front, offering each to `admit`
@@ -770,18 +982,30 @@ impl PageList {
     }
 
     /// Removes the fully trimmed front page. An unshared page is reset under
-    /// a fresh serial and pooled; a page a reader still holds is released to
-    /// that reader (the tiering hand-off).
+    /// a fresh serial and pooled: an active page in its box, a sealed one in
+    /// its `Arc`, as a shell. A sealed page a reader still holds is released
+    /// to that reader (the tiering hand-off).
     fn recycle_front(&mut self) {
         let slot = self.pages.pop_front().expect("a front page");
         self.sealed = self.sealed.saturating_sub(1);
-        let mut page = slot.page;
-        if self.pool.len() < MAX_POOLED_PAGES && Arc::get_mut(&mut page).is_some() {
-            let serial = self.allocate_serial();
-            Arc::get_mut(&mut page)
-                .expect("checked unique")
-                .reset(serial);
-            self.pool.push(page);
+        match (slot.active, slot.sealed) {
+            (Some(mut page), _) => {
+                if self.pool.len() < MAX_POOLED_PAGES {
+                    let serial = self.allocate_serial();
+                    page.reset(serial);
+                    self.pool.push(page);
+                }
+            }
+            (None, Some(mut shared)) => {
+                if self.shells.len() < MAX_POOLED_PAGES && Arc::get_mut(&mut shared).is_some() {
+                    let serial = self.allocate_serial();
+                    Arc::get_mut(&mut shared)
+                        .expect("checked above")
+                        .reset(serial);
+                    self.shells.push(shared);
+                }
+            }
+            (None, None) => {}
         }
     }
 
@@ -803,10 +1027,8 @@ impl PageList {
             return Err(format!("{} pooled pages", self.pool.len()));
         }
         let mut serials = Vec::new();
+        // Pooled pages are owned outright, so none can be shared.
         for page in &self.pool {
-            if Arc::strong_count(page) != 1 || Arc::weak_count(page) != 0 {
-                return Err(format!("pooled page {} is shared", page.serial()));
-            }
             if !page.is_clean() || page.cols() != self.cols || page.capacity() != self.page_rows {
                 return Err(format!(
                     "pooled page {} is not a reset page of this geometry",
@@ -815,11 +1037,27 @@ impl PageList {
             }
             serials.push(page.serial());
         }
+        if self.shells.len() > MAX_POOLED_PAGES {
+            return Err(format!("{} pooled shells", self.shells.len()));
+        }
+        for shell in &self.shells {
+            if Arc::strong_count(shell) != 1 || Arc::weak_count(shell) != 0 {
+                return Err(format!("pooled shell {} is shared", shell.serial()));
+            }
+            if !shell.is_clean() || shell.cols() != self.cols || shell.capacity() != self.page_rows
+            {
+                return Err(format!(
+                    "pooled shell {} is not a reset page of this geometry",
+                    shell.serial()
+                ));
+            }
+            serials.push(shell.serial());
+        }
         let mut retained = 0;
         let cutoff = self.seal_cutoff();
         let last = self.pages.len().saturating_sub(1);
         for (index, slot) in self.pages.iter().enumerate() {
-            let page = &slot.page;
+            let page = slot.page();
             let at = format!("page {} (serial {})", index, page.serial());
             if page.cols() != self.cols || page.capacity() != self.page_rows {
                 return Err(format!("{} has the wrong geometry", at));
@@ -849,8 +1087,17 @@ impl PageList {
             if !sealed && index < last && slot.end_stable() - 1 <= cutoff {
                 return Err(format!("{} is eligible but not sealed", at));
             }
-            if !sealed && (Arc::strong_count(page) != 1 || Arc::weak_count(page) != 0) {
-                return Err(format!("{} is active but shared", at));
+            if sealed != slot.sealed.is_some() || slot.active.is_some() == slot.sealed.is_some() {
+                return Err(format!(
+                    "{} is {} but held {}",
+                    at,
+                    if sealed { "sealed" } else { "active" },
+                    if slot.active.is_some() {
+                        "owned"
+                    } else {
+                        "shared"
+                    }
+                ));
             }
             page.check_invariants()
                 .map_err(|err| format!("{}: {}", at, err))?;

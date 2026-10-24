@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>CFBundleDevelopmentRegion</key><string>$(DEVELOPMENT_LANGUAGE)</string>
+ <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+ <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+ <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+ <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+ <key>CFBundlePackageType</key><string>APPL</string>
+ <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
+ <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+ <key>LSRequiresIPhoneOS</key><true/>
+ <key>NSCameraUsageDescription</key><string>Scan encrypted workspace QR frames from your Mac. Camera images are not saved or uploaded.</string>
+ <key>NSFaceIDUsageDescription</key><string>Protect access to SSH identities stored on this iPhone.</string>
+ <key>NSLocalNetworkUsageDescription</key><string>Connect over SSH to your machines on this network, and tell your Mac when your machines have arrived.</string>
+ <key>NSBonjourServices</key><array><string>_ft-xfer._tcp</string><string>_ft-xfer._udp</string></array>
+ <key>CFBundleDocumentTypes</key><array>
+  <dict><key>CFBundleTypeName</key><string>FrankenTerm Workspace</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Owner</string><key>LSItemContentTypes</key><array><string>org.frankenterm.workspace</string><string>org.frankenterm.airgap</string></array></dict>
+ </array>
+ <key>UTExportedTypeDeclarations</key><array>
+  <dict><key>UTTypeIdentifier</key><string>org.frankenterm.workspace</string><key>UTTypeDescription</key><string>FrankenTerm Public Workspace</string><key>UTTypeConformsTo</key><array><string>public.json</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ftworkspace</string></array></dict></dict>
+  <dict><key>UTTypeIdentifier</key><string>org.frankenterm.airgap</string><key>UTTypeDescription</key><string>FrankenTerm Encrypted Workspace</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ftairgap</string></array></dict></dict>
+ </array>
+ <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+ <key>UIAppFonts</key><array><string>pragmasevka-nf-regular.ttf</string><string>pragmasevka-nf-bold.ttf</string><string>pragmasevka-nf-italic.ttf</string><string>pragmasevka-nf-bolditalic.ttf</string><string>SymbolsNerdFontMono-Regular.ttf</string></array>
+ <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+ <key>UILaunchScreen</key><dict/>
+ <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+ <key>UISupportedInterfaceOrientations~ipad</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+</dict></plist>

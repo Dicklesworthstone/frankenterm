@@ -551,8 +551,8 @@ pub fn classify(profile: &WorkloadProfile) -> AdvisorReport {
     );
 
     let proof_commands = vec![
-        "ft storage doctor --json".to_string(),
-        "ft storage stats --tail-latency --p99".to_string(),
+        "ft db check -f json".to_string(),
+        "ft db stats -f json".to_string(),
     ];
 
     AdvisorReport::Recommendation(StorageRecommendation {
@@ -1017,7 +1017,7 @@ mod tests {
             migration_priority: MigrationPriority::High,
             confidence: Confidence::High,
             rationale: "test".to_string(),
-            proof_commands: vec!["ft storage doctor --json".to_string()],
+            proof_commands: vec!["ft db check -f json".to_string()],
         };
         let json = serde_json::to_string(&rec).expect("serialize");
         let back: StorageRecommendation = serde_json::from_str(&json).expect("deserialize");

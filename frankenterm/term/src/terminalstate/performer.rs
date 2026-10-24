@@ -1,15 +1,20 @@
+use crate::pagegrid::RunGrapheme;
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::print_segments::{PrintCharTable, PrintSegments};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    default_color_map, CharSet, MouseEncoding, ProtectedMode, TabStop, UnicodeVersionStackEntry,
 };
 use crate::{
     CellAttributes, ClipboardSelection, LineSize, Position, TerminalState, VisibleRowIndex, DCS, ST,
 };
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::{grapheme_column_width, is_white_space_grapheme, SemanticType};
+use frankenterm_cell::{
+    grapheme_column_width, is_white_space_grapheme, SemanticType, UnicodeVersion,
+};
 use frankenterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Sgr,
+    CharacterPath, Cursor, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
+    Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Mode, Sgr, Window,
 };
 use frankenterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -31,6 +36,12 @@ use url::Url;
 
 const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
+const LINE_FEED_FLOOD_ENV: &str = "FT_LINE_FEED_FLOOD";
+
+/// Conservative expanded cell/step work, separate from the bounded number of
+/// input bytes. One compact CSI may otherwise request u32::MAX operations.
+/// Reset for each performer (one native feed), never for each CSI command.
+pub(crate) const NATIVE_EXPANDED_WORK_BUDGET: usize = 65_536;
 
 impl TerminalState {
     /// Bytes retained by an unfinished legacy tmux title sequence.
@@ -215,6 +226,72 @@ pub(crate) struct Performer<'a> {
     /// sit in `print`, where the next printed text would be segmented
     /// together with it (see `merge_into_junction`).
     ascii_junction: Option<PrintedCell>,
+    /// The buffer of [`PendingCells`], kept empty between `flush_print`s.
+    pending_cells: Vec<RunGrapheme<'static>>,
+    native_work_remaining: Option<usize>,
+}
+
+/// Cells `flush_print` has placed but not yet written: graphemes side by
+/// side on one row, all printed with the pen, which
+/// `Screen::set_cell_grapheme_run` writes in one call (ft-yccm0.3.2.6).
+/// Anything in the print loop that reads or changes the screen otherwise
+/// writes them first, so the screen it sees is the one cell-by-cell
+/// printing would have left.
+struct PendingCells<'t> {
+    y: VisibleRowIndex,
+    x: usize,
+    /// One past the last pending cell's columns.
+    end: usize,
+    cells: Vec<RunGrapheme<'t>>,
+}
+
+impl<'t> PendingCells<'t> {
+    fn new(cells: Vec<RunGrapheme<'t>>) -> Self {
+        debug_assert!(cells.is_empty());
+        Self {
+            y: 0,
+            x: 0,
+            end: 0,
+            cells,
+        }
+    }
+
+    /// Whether a cell at (`x`, `y`) continues the pending ones.
+    fn continued_by(&self, x: usize, y: VisibleRowIndex) -> bool {
+        !self.cells.is_empty() && self.y == y && self.end == x
+    }
+
+    /// The emptied buffer, for the next `flush_print`. Collecting an
+    /// emptied `vec::IntoIter` into a `Vec` of the same layout reuses its
+    /// allocation, which frees the buffer from the text it borrowed.
+    fn into_buffer(mut self) -> Vec<RunGrapheme<'static>> {
+        self.cells.clear();
+        self.cells
+            .into_iter()
+            .map(|_| -> RunGrapheme<'static> { unreachable!("the buffer is empty") })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Writes each printed cell on its own, the oracle the batched writes of
+    /// [`PendingCells`] are checked against.
+    static FORCE_CELL_BY_CELL_PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Kill switch for batching printed cells (ft-yccm0.3.2.6): falsey writes
+/// each cell on its own.
+const PRINT_CELL_RUNS_ENV: &str = "FT_PRINT_CELL_RUNS";
+
+fn print_cell_runs_enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_CELL_BY_CELL_PRINT.with(std::cell::Cell::get) {
+        return false;
+    }
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !moonshot_env_falsey(PRINT_CELL_RUNS_ENV));
+    *ENABLED
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -287,6 +364,98 @@ impl<'a> Iterator for PrintGraphemes<'a> {
     }
 }
 
+/// Kill switch for the print path's per-character segmentation fast path
+/// (ft-yccm0.3.2.6): falsey segments with `PrintGraphemes` and computes
+/// every width.
+const PRINT_SEGMENT_FAST_PATH_ENV: &str = "FT_PRINT_SEGMENT_FAST_PATH";
+
+/// The graphemes of a print buffer, each with its column width when the
+/// segmentation already knows it: [`PrintSegments`], or with its fast path
+/// off (the kill switch, or the segmenter oracle in tests) `PrintGraphemes`,
+/// which knows no widths.
+enum PrintGraphemeWidths<'a, 't> {
+    Fast(PrintSegments<'a, 't>),
+    Plain(PrintGraphemes<'a>),
+}
+
+impl<'a, 't> PrintGraphemeWidths<'a, 't> {
+    fn new(text: &'a str, table: &'t mut PrintCharTable, version: &UnicodeVersion) -> Self {
+        #[cfg(test)]
+        if FORCE_GRAPHEME_SEGMENTER.with(|force| force.get()) {
+            return Self::Plain(PrintGraphemes::new(text));
+        }
+        static ENABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| !moonshot_env_falsey(PRINT_SEGMENT_FAST_PATH_ENV));
+        if *ENABLED {
+            Self::Fast(table.segments(text, version))
+        } else {
+            Self::Plain(PrintGraphemes::new(text))
+        }
+    }
+}
+
+impl<'a> PrintGraphemeWidths<'a, '_> {
+    /// [`PrintSegments::plain_run`]; without the fast segmentation, none.
+    fn plain_run(
+        &mut self,
+        room: usize,
+        multibyte: bool,
+        cells: &mut Vec<RunGrapheme<'a>>,
+    ) -> usize {
+        match self {
+            Self::Fast(segments) => segments.plain_run(room, multibyte, cells),
+            Self::Plain(_) => 0,
+        }
+    }
+}
+
+impl<'a> Iterator for PrintGraphemeWidths<'a, '_> {
+    type Item = (&'a str, Option<usize>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Fast(segments) => segments.next(),
+            Self::Plain(graphemes) => graphemes.next().map(|g| (g, None)),
+        }
+    }
+}
+
+/// Whether grapheme `g` may continue the cell before it with no ZWJ between
+/// them (ft-cklgg): as a regional indicator, a wide Extend such as an emoji
+/// modifier, a spacing mark, Hangul jamo or a syllable, a conjunct's
+/// consonant, or after a Prepend. Only blocks that hold none of those heads
+/// are ruled out, so that emoji, CJK, box-drawing and icon floods skip the
+/// check; segmenting with the cell before it decides the rest. After a
+/// Prepend anything continues, so a ruled-out head split from one still
+/// prints apart.
+fn may_continue_without_zwj(g: &str) -> bool {
+    g.chars().next().is_some_and(|head| {
+        !matches!(
+            u32::from(head),
+            // ASCII, which continues only a Prepend.
+            0x00..=0x7F
+                // Symbols, arrows, box drawing, shapes and dingbats.
+                | 0x2100..=0x2BFF
+                // Kana letters (the voiced sound marks are U+3099-U+309A).
+                | 0x3041..=0x3096
+                | 0x30A0..=0x30FF
+                // CJK ideographs.
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0x20000..=0x3FFFF
+                // Private use: Nerd Font and Powerline glyphs.
+                | 0xE000..=0xF8FF
+                | 0xF0000..=0x10FFFF
+                // Emoji, except the regional indicators U+1F1E6-U+1F1FF
+                // and the modifiers U+1F3FB-U+1F3FF.
+                | 0x1F000..=0x1F1E5
+                | 0x1F200..=0x1F3FA
+                | 0x1F400..=0x1FAFF
+        )
+    })
+}
+
 #[cfg(test)]
 static FORCE_SCALAR_PRINTABLE_ASCII_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -314,6 +483,14 @@ fn moonshot_env_falsey(name: &str) -> bool {
 
 fn moonshot_recommended_enabled() -> bool {
     !moonshot_env_falsey(MOONSHOT_RECOMMENDED_ENV)
+}
+
+/// Whether a new terminal takes line-feed floods on the batched path
+/// (ft-wd6cy) unless `FT_LINE_FEED_FLOOD` turns it off.
+pub(super) fn line_flood_default() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !moonshot_env_falsey(LINE_FEED_FLOOD_ENV));
+    *ENABLED
 }
 
 impl<'a> Deref for Performer<'a> {
@@ -347,16 +524,32 @@ impl<'a> Handler for Performer<'a> {
         self.perform(action);
     }
 
-    /// What `perform` does for `Action::Print`: only buffering, so the
-    /// `last_printed` shortcut stays valid.
+    /// What `perform` does for `Action::Print`. A printable ASCII character
+    /// is a run of one, which [`Handler::print_ascii_run`] writes straight
+    /// into the rows when nothing is pending, as it writes a longer run: the
+    /// parser hands over the character between two SGR sequences this way,
+    /// and buffering it only to flush it at the next SGR went through the
+    /// whole print loop for one cell. Anything else is only buffered, so
+    /// the `last_printed` shortcut stays valid.
     #[inline]
     fn print(&mut self, c: char) {
-        Performer::print(self, c);
+        if self.native_execution_limit_exceeded {
+            return;
+        }
+        if matches!(c, ' '..='~') {
+            let mut utf8 = [0; 1];
+            Handler::print_ascii_run(self, c.encode_utf8(&mut utf8));
+        } else {
+            Performer::print(self, c);
+        }
     }
 
     /// What `perform` does for `Action::PrintString`.
     #[inline]
     fn print_str(&mut self, text: &str) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         self.print_string(text);
     }
 
@@ -368,10 +561,42 @@ impl<'a> Handler for Performer<'a> {
     /// escapes, CSI, OSC, images) flushes pending print first.
     #[inline]
     fn print_ascii_run(&mut self, run: &str) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         if !self.print.is_empty() || self.accumulating_title.is_some() || !self.write_ascii_run(run)
         {
             self.print_string(run);
         }
+    }
+
+    /// What `control` and `print_ascii_run` do for a line-feed flood
+    /// (ft-wd6cy): see [`Performer::line_flood`].
+    #[inline]
+    fn line_feed_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        if self.native_execution_limit_exceeded {
+            // The parser consumes the remaining bounded input using its
+            // ordinary handlers, all of which become inert after refusal.
+            return 0;
+        }
+        self.line_flood(bytes, scan)
+    }
+
+    /// What `perform` does for `Action::Control`, with no `Action` built
+    /// (ft-yccm0.3.2.6): the control runs, and since it may move the cursor
+    /// or scroll, `last_printed` is forgotten. `perform`'s other check only
+    /// concerns OSC. A `cat` flood hands over one LF per line.
+    #[inline]
+    fn control(&mut self, code: ControlCode) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
+        Performer::control(self, code);
+        self.last_printed = None;
     }
 
     /// What `perform` does for each `Action::CSI(CSI::Sgr(_))`, with no
@@ -381,6 +606,9 @@ impl<'a> Handler for Performer<'a> {
     /// `last_printed`.
     #[inline]
     fn sgr(&mut self, sgrs: &[Sgr]) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         self.pop_tmux_title_state();
         self.flush_print();
         for sgr in sgrs {
@@ -391,12 +619,125 @@ impl<'a> Handler for Performer<'a> {
 
 impl<'a> Performer<'a> {
     pub fn new(state: &'a mut TerminalState) -> Self {
+        let native_work_remaining = (state.config.feature_profile()
+            == crate::config::TerminalFeatureProfile::NativeText)
+            .then_some(NATIVE_EXPANDED_WORK_BUDGET);
         Self {
             state,
             print: String::new(),
             last_printed: None,
             ascii_junction: None,
+            pending_cells: Vec::new(),
+            native_work_remaining,
         }
+    }
+
+    /// Refuse before a counted operation runs. Counts that saturate geometry
+    /// are charged at their exact clamp; REP and reverse wrapping remain
+    /// genuinely expansive and must never be silently truncated. Charging
+    /// shifted row widths also bounds repeated quadratic ICH/DCH/SL/SR work.
+    fn admit_native_csi_work(&mut self, csi: &CSI) -> bool {
+        if self.native_work_remaining.is_none() {
+            return true;
+        }
+        let cols = self.screen().physical_cols.max(1);
+        let rows = self.screen().physical_rows.max(1);
+        let cost = match csi {
+            CSI::Edit(Edit::Repeat(n)) => (*n as usize).saturating_mul(cols),
+            CSI::Edit(
+                Edit::InsertCharacter(n) | Edit::DeleteCharacter(n) | Edit::EraseCharacter(n),
+            ) => (*n as usize).min(cols).saturating_mul(cols),
+            CSI::Edit(Edit::ScrollLeft(n) | Edit::ScrollRight(n)) => (*n as usize)
+                .min(cols)
+                .saturating_mul(cols)
+                .saturating_mul(rows),
+            CSI::Edit(Edit::EraseInLine(_) | Edit::SelectiveEraseInLine(_)) => cols,
+            CSI::Edit(
+                Edit::EraseInDisplay(EraseInDisplay::EraseScrollback)
+                | Edit::SelectiveEraseInDisplay(EraseInDisplay::EraseScrollback),
+            ) => cols.saturating_mul(self.screen().scrollback_rows()),
+            CSI::Edit(Edit::SelectCharacterProtection(_)) => 0,
+            CSI::Edit(_) => cols.saturating_mul(rows),
+            CSI::Cursor(Cursor::ForwardTabulation(n) | Cursor::BackwardTabulation(n)) => (*n
+                as usize)
+                .min(cols.saturating_add(1))
+                .saturating_mul(cols),
+            CSI::Cursor(Cursor::Left(n)) if self.reverse_wraparound_mode && self.dec_auto_wrap => {
+                *n as usize
+            }
+            CSI::Cursor(Cursor::Left(_)) if self.cursor.x < self.left_and_right_margins.start => {
+                cols
+            }
+            CSI::Mode(
+                Mode::SetDecPrivateMode(DecPrivateMode::Code(code))
+                | Mode::ResetDecPrivateMode(DecPrivateMode::Code(code))
+                | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(code)),
+            ) if matches!(
+                code,
+                DecPrivateModeCode::Select132Columns
+                    | DecPrivateModeCode::OptEnableAlternateScreen
+                    | DecPrivateModeCode::EnableAlternateScreen
+                    | DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ) =>
+            {
+                cols.saturating_mul(rows)
+            }
+            CSI::Device(device) if matches!(device.as_ref(), Device::SoftReset) => {
+                rows.saturating_mul(2)
+            }
+            CSI::Window(window)
+                if matches!(window.as_ref(), Window::ChecksumRectangularArea { .. }) =>
+            {
+                cols.saturating_mul(rows)
+            }
+            _ => 0,
+        };
+        self.admit_native_work(cost)
+    }
+
+    fn admit_native_work(&mut self, cost: usize) -> bool {
+        let Some(remaining) = self.native_work_remaining else {
+            return true;
+        };
+        if cost > remaining {
+            self.native_execution_limit_exceeded = true;
+            self.print.clear();
+            self.last_printed = None;
+            self.ascii_junction = None;
+            return false;
+        }
+        self.native_work_remaining = Some(remaining - cost);
+        true
+    }
+
+    /// Writes the cells `flush_print` left pending; see [`PendingCells`].
+    #[inline]
+    fn write_pending_cells(&mut self, pending: &mut PendingCells<'_>, seqno: usize) {
+        if !pending.cells.is_empty() {
+            self.write_pending_cell_run(pending, seqno);
+        }
+    }
+
+    /// Kept out of `flush_print`, which checks for pending cells at every
+    /// step, so that the print loop stays small.
+    #[inline(never)]
+    fn write_pending_cell_run(&mut self, pending: &mut PendingCells<'_>, seqno: usize) {
+        let (x, y) = (pending.x, pending.y);
+        match pending.cells[..] {
+            [] => return,
+            // A lone cell (T0 prints one per SGR pair) takes the cell write.
+            [RunGrapheme { text, width, .. }] => {
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, text, usize::from(width), pen, seqno);
+            }
+            _ => {
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme_run(x, y, &pending.cells, &pen, seqno);
+            }
+        }
+        pending.cells.clear();
     }
 
     /// Records the cell the print path just wrote; see `last_printed`.
@@ -477,6 +818,31 @@ impl<'a> Performer<'a> {
     }
 
     fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
+        self.continue_grapheme_at_cursor(suffix, require_prior_trailing_zwj, false)
+            .is_some()
+    }
+
+    /// ft-cklgg: merges the prefix of `text` that continues the cell an
+    /// earlier flush wrote before the cursor, as one flush of both would
+    /// have segmented them, and returns its length. A lone regional
+    /// indicator, for one, takes only the first indicator of a run, and the
+    /// rest pairs up after it.
+    fn continue_cell_before_cursor(&mut self, text: &str) -> Option<usize> {
+        if !may_continue_without_zwj(text) {
+            return None;
+        }
+        self.continue_grapheme_at_cursor(text, false, true)
+    }
+
+    /// Joins `text` (all of it, or with `prefix_only` the part that
+    /// segments together with it) to the cell a continuation at the cursor
+    /// belongs to, and returns the length joined.
+    fn continue_grapheme_at_cursor(
+        &mut self,
+        text: &str,
+        require_prior_trailing_zwj: bool,
+        prefix_only: bool,
+    ) -> Option<usize> {
         let cursor_x = self.cursor.x;
         let cursor_y = self.cursor.y;
         let seqno = self.seqno;
@@ -494,7 +860,7 @@ impl<'a> Performer<'a> {
         if require_prior_trailing_zwj
             && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, on_cursor_cell)
         {
-            return false;
+            return None;
         }
         #[cfg(test)]
         RECLUSTER_ROW_WALKS.with(|walks| walks.set(walks.get() + 1));
@@ -524,18 +890,32 @@ impl<'a> Performer<'a> {
                 Some((cell.idx, cell.text.to_string(), cell.width, cell.attrs()))
             })
         };
-        let Some((idx, text, width, attrs)) = merge else {
-            return false;
+        let (idx, cell_text, width, attrs) = merge?;
+
+        let mut combined = format!("{cell_text}{text}");
+        let joined = if prefix_only {
+            let first = Graphemes::new(combined.as_str()).next()?.len();
+            let joined = first.checked_sub(cell_text.len()).filter(|&n| n > 0)?;
+            combined.truncate(first);
+            joined
+        } else {
+            if Graphemes::new(combined.as_str()).count() != 1 {
+                return None;
+            }
+            text.len()
         };
 
-        let combined = format!("{text}{suffix}");
-        if Graphemes::new(combined.as_str()).count() != 1 {
-            return false;
+        if combined.len() > self.batch_config.maximum_cell_grapheme_bytes {
+            self.cell_grapheme_limit_exceeded = true;
+            // Consume the refused continuation so it cannot become an
+            // unrelated replacement cell. The bounded embedding closes after
+            // this feed; no retained cell grows beyond its configured bound.
+            return Some(joined);
         }
 
         let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
         if !(width..=2).contains(&combined_width) {
-            return false;
+            return None;
         }
 
         let ends_in_zwj = combined.ends_with('\u{200d}');
@@ -544,7 +924,9 @@ impl<'a> Performer<'a> {
         }
         // ft-b35o7: widened on the right margin's column, it no longer fits.
         if self.widened_grapheme_overflows(idx, width, combined_width) {
-            return self.wrap_widened_grapheme(&combined, combined_width, attrs, seqno);
+            return self
+                .wrap_widened_grapheme(&combined, combined_width, attrs, seqno)
+                .then_some(joined);
         }
         let (cursor_x, wrap_next) = {
             let screen = self.screen_mut();
@@ -562,7 +944,7 @@ impl<'a> Performer<'a> {
         self.cursor.x = cursor_x;
         self.wrap_next = wrap_next;
         self.note_printed(cursor_y, idx, combined_width, ends_in_zwj);
-        true
+        Some(joined)
     }
 
     fn active_charset(&self) -> CharSet {
@@ -677,13 +1059,15 @@ impl<'a> Performer<'a> {
         }
 
         let y = self.cursor.y;
-        let pen = self.pen.clone();
         if Self::bulk_ascii_row_write_enabled() {
             #[cfg(test)]
             BULK_ASCII_ROW_WRITE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.screen_mut()
-                .set_ascii_cell_run(start_x, y, text, pen, seqno);
+            let state = &mut *self.state;
+            state
+                .screen
+                .set_ascii_cell_run(start_x, y, text, &state.pen, seqno);
         } else {
+            let pen = self.pen.clone();
             let screen = self.screen_mut();
             for (offset, _) in text.bytes().enumerate() {
                 let x = start_x + offset;
@@ -710,6 +1094,10 @@ impl<'a> Performer<'a> {
             || (!self.shift_out && self.g0_charset == CharSet::DecLineDrawing)
         {
             match g {
+                // 0x5F is a blank in the VT100 table (User Guide table 3-9);
+                // xterm's xtermCharSetIn (charsets.c) stores it as cell 0,
+                // the blank, ahead of dec2ucs's 0x60-0x7E (fontutils.c).
+                "_" => " ",
                 "`" => "◆",
                 "a" => "▒",
                 "b" => "␉",
@@ -755,12 +1143,28 @@ impl<'a> Performer<'a> {
         }
     }
 
+    /// Every control and SGR flushes, mostly with nothing pending (a line
+    /// feed after a direct ASCII run): that check stays inline, out of the
+    /// flush's large frame.
+    #[inline]
     fn flush_print(&mut self) {
-        // Whatever flushes also ends a direct ASCII run's junction.
-        let mut junction = self.ascii_junction.take();
-        if self.print.is_empty() {
+        if self.native_execution_limit_exceeded {
+            self.print.clear();
+            self.ascii_junction = None;
             return;
         }
+        if self.print.is_empty() {
+            // Whatever flushes also ends a direct ASCII run's junction.
+            self.ascii_junction = None;
+            return;
+        }
+        self.flush_pending_print();
+    }
+
+    #[inline(never)]
+    fn flush_pending_print(&mut self) {
+        // Whatever flushes also ends a direct ASCII run's junction.
+        let mut junction = self.ascii_junction.take();
 
         let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
@@ -782,15 +1186,128 @@ impl<'a> Performer<'a> {
             return;
         }
 
-        for g in PrintGraphemes::new(text) {
+        // ft-cklgg: `text` may continue the cell an earlier flush wrote (a
+        // PTY read may have split them), with no ZWJ between the two
+        // although both have width: a regional-indicator pair, an emoji
+        // modifier, Hangul jamo, a spacing mark, a conjunct. The junction
+        // check below settles that for a direct ASCII run's last cell.
+        let text = match junction {
+            None => self
+                .continue_cell_before_cursor(text)
+                .map_or(text, |joined| &text[joined..]),
+            Some(_) => text,
+        };
+        // Whether whatever came before `g` is settled: a cell printed from
+        // `text` (`Graphemes` broke between the two), or the check above.
+        // After a grapheme that printed nothing, `g` may yet continue the
+        // cell before it.
+        let mut printed_cell = true;
+        let mut table = std::mem::take(&mut self.print_char_table);
+        let mut graphemes = PrintGraphemeWidths::new(text, &mut table, &self.unicode_version);
+        // Cells are written in runs (`PendingCells`), except in insert mode,
+        // where each one first shifts the row, and for a lone character (T0
+        // flushes one per SGR pair), which a run would only slow down.
+        let lone = {
+            let mut chars = text.chars();
+            chars.next().is_some() && chars.next().is_none()
+        };
+        let batch = !self.insert && !lone && print_cell_runs_enabled();
+        let mut pending = PendingCells::new(if batch {
+            std::mem::take(&mut self.pending_cells)
+        } else {
+            Vec::new()
+        });
+        // No DEC or UK charset remaps a grapheme (nor insert mode, which
+        // turns batching off): the fast path below may run.
+        let plain_print = batch && self.active_charset() == CharSet::Ascii;
+        while let Some((g, known_width)) = graphemes.next() {
+            if g.len() > self.batch_config.maximum_cell_grapheme_bytes {
+                self.cell_grapheme_limit_exceeded = true;
+                continue;
+            }
+            let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
+            // The common case, decided in a few compares: a lone character
+            // (or a letter and its combining marks) whose width the
+            // segmentation knows, after a printed cell, with
+            // no junction to merge, no ZWJ tail it could continue, no
+            // pending wrap and room before the margin. It is printed exactly
+            // as the general path below prints it (a cell joining the
+            // pending run, `last_printed`, the cursor), without the checks
+            // that cannot apply to it. Per-grapheme checks were the largest
+            // part of a mixed-script flush (ft-yccm0.3.2.6).
+            //
+            // A ZWJ tail is ruled out as the general path rules it out: by
+            // the cell just printed, when it does not end in ZWJ. The
+            // terminal-wide flag alone, once a single cell anywhere ended in
+            // ZWJ, sent every later multi-byte character down the general
+            // path for the rest of the terminal's life.
+            if plain_print
+                && follows_segmented_cell
+                && junction.is_none()
+                && !self.wrap_next
+                && (g.len() == 1
+                    || !self.zwj_tail_cell_possible
+                    || self.zwj_continuation_ruled_out())
+            {
+                if let Some(width @ (1 | 2)) = known_width {
+                    let x = self.cursor.x;
+                    if !self.wide_grapheme_overflows(x, width) {
+                        let y = self.cursor.y;
+                        let next_x = x.saturating_add(width);
+                        if !pending.continued_by(x, y) {
+                            self.write_pending_cells(&mut pending, seqno);
+                            pending.y = y;
+                            pending.x = x;
+                        }
+                        pending.cells.push(RunGrapheme::new(g, width as u8));
+                        pending.end = next_x;
+                        self.note_printed(y, x, width, false);
+                        printed_cell = true;
+                        let margin = self.left_and_right_margins.end;
+                        if next_x >= margin {
+                            self.wrap_next = self.dec_auto_wrap;
+                        } else {
+                            self.cursor.x = next_x;
+                            self.wrap_next = false;
+                            // Each grapheme that follows here as the one
+                            // just printed did, ending before the margin, is
+                            // printed as this one was, with this cell's
+                            // checks settled for all of them: take the run.
+                            let multibyte =
+                                !self.zwj_tail_cell_possible || self.zwj_continuation_ruled_out();
+                            let run_from = pending.cells.len();
+                            let taken =
+                                graphemes.plain_run(margin - next_x, multibyte, &mut pending.cells);
+                            if taken > 0 {
+                                let last =
+                                    usize::from(pending.cells[pending.cells.len() - 1].width);
+                                debug_assert!(pending.cells.len() > run_from);
+                                let end = next_x + taken;
+                                pending.end = end;
+                                self.note_printed(y, end - last, last, false);
+                                self.cursor.x = end;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             if let Some(cell) = junction.take() {
+                // Only the first grapheme meets the junction: nothing pends.
+                debug_assert!(pending.cells.is_empty());
                 if self.merge_into_junction(cell, g, seqno) {
                     continue;
                 }
             }
+            let segmented = g;
             let g = self.remap_grapheme(g);
 
-            let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
+            let mut print_width = match known_width {
+                // A DEC or UK charset remaps some ASCII, whose width is then
+                // the replacement's.
+                Some(width) if std::ptr::eq(g, segmented) => width,
+                _ => grapheme_column_width(g, Some(&self.unicode_version)),
+            };
             if print_width == 0 {
                 // We got a zero-width grapheme.
 
@@ -829,6 +1346,7 @@ impl<'a> Performer<'a> {
                     // as before, while width-changing continuations such as VS16
                     // can now expand the prior cell through the same line setter
                     // used by normal double-width graphemes.
+                    self.write_pending_cells(&mut pending, seqno);
                     let attached = self.recluster_at_cursor(g, false);
                     if !attached {
                         log::trace!("Eliding zero-width grapheme {:?}", g);
@@ -839,11 +1357,22 @@ impl<'a> Performer<'a> {
 
             // A multi-byte grapheme only continues its left neighbour when that
             // cell ends in ZWJ, which cannot exist until one has been written.
-            if g.len() > 1 && self.zwj_tail_cell_possible && self.recluster_at_cursor(g, true) {
-                continue;
+            if g.len() > 1 && self.zwj_tail_cell_possible && !self.zwj_continuation_ruled_out() {
+                self.write_pending_cells(&mut pending, seqno);
+                if self.recluster_at_cursor(g, true) {
+                    continue;
+                }
+            }
+            // ft-cklgg: as above, after a grapheme that printed nothing.
+            if !follows_segmented_cell && g.len() > 1 && may_continue_without_zwj(g) {
+                self.write_pending_cells(&mut pending, seqno);
+                if self.recluster_at_cursor(g, false) {
+                    continue;
+                }
             }
 
             if self.wrap_next {
+                self.write_pending_cells(&mut pending, seqno);
                 self.wrap_before_print(seqno);
             }
 
@@ -858,30 +1387,34 @@ impl<'a> Performer<'a> {
             // narrow without it: Ghostty prints its base, then drops the
             // selector that cannot widen it, as `recluster_at_cursor` does
             // when the selector arrives in a later read.
-            let narrowed: String;
-            let (g, print_width) = if self.wide_grapheme_overflows(self.cursor.x, print_width) {
+            // `narrowed` replaces `g` as the cell's text, which then cannot
+            // pend: it lives only as long as this iteration.
+            let mut narrowed = String::new();
+            let mut narrow = false;
+            let print_width = if self.wide_grapheme_overflows(self.cursor.x, print_width) {
+                self.write_pending_cells(&mut pending, seqno);
                 if self.dec_auto_wrap {
                     self.wrap_for_wide_grapheme(seqno);
-                    (g, print_width)
+                    print_width
                 } else {
                     narrowed = g.replace('\u{fe0f}', "");
                     if narrowed.len() < g.len()
                         && grapheme_column_width(&narrowed, Some(&self.unicode_version)) == 1
                     {
-                        (narrowed.as_str(), 1)
+                        narrow = true;
+                        1
                     } else {
                         continue;
                     }
                 }
             } else {
-                (g, print_width)
+                print_width
             };
+            let cell_text = if narrow { narrowed.as_str() } else { g };
 
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
-
-            let pen = self.pen.clone();
 
             let next_x = x.saturating_add(print_width);
             let wrappable = next_x >= width;
@@ -901,16 +1434,29 @@ impl<'a> Performer<'a> {
                 y,
                 print_width,
                 width,
-                g,
+                cell_text,
                 self.pen
             );
-            let ends_in_zwj = g.ends_with('\u{200d}');
+            let ends_in_zwj = cell_text.ends_with('\u{200d}');
             if ends_in_zwj {
                 self.zwj_tail_cell_possible = true;
             }
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            if batch && !narrow && matches!(print_width, 1 | 2) {
+                if !pending.continued_by(x, y) {
+                    self.write_pending_cells(&mut pending, seqno);
+                    pending.y = y;
+                    pending.x = x;
+                }
+                pending.cells.push(RunGrapheme::new(g, print_width as u8));
+                pending.end = next_x;
+            } else {
+                self.write_pending_cells(&mut pending, seqno);
+                let pen = self.pen.clone();
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, cell_text, print_width, pen, seqno);
+            }
             self.note_printed(y, x, print_width, ends_in_zwj);
+            printed_cell = true;
 
             if !wrappable {
                 self.cursor.x = next_x;
@@ -919,9 +1465,25 @@ impl<'a> Performer<'a> {
                 self.wrap_next = self.dec_auto_wrap;
             }
         }
+        self.write_pending_cells(&mut pending, seqno);
+        if batch {
+            self.pending_cells = pending.into_buffer();
+        }
+        self.print_char_table = table;
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
+    }
+
+    /// Whether `recluster_at_cursor(_, true)` returns false without reading
+    /// the screen: with autowrap on and no wrap pending, the continuation
+    /// would join the cell left of the cursor, and `last_printed` rules out
+    /// a ZWJ tail there. Cells pending in `flush_print` then need not be
+    /// written first.
+    fn zwj_continuation_ruled_out(&self) -> bool {
+        self.dec_auto_wrap
+            && !self.wrap_next
+            && self.last_printed_rules_out_zwj_tail(self.cursor.x, self.cursor.y, false)
     }
 
     /// Whether a grapheme `width` cells wide does not fit at column `x`
@@ -1065,8 +1627,10 @@ impl<'a> Performer<'a> {
             let room = right_margin.saturating_sub(x).max(1);
             let (row, tail) = rest.split_at(room.min(rest.len()));
             let last_x = x + row.len() - 1;
-            let pen = self.pen.clone();
-            self.screen_mut().set_ascii_cell_run(x, y, row, pen, seqno);
+            let state = &mut *self.state;
+            state
+                .screen
+                .set_ascii_cell_run(x, y, row, &state.pen, seqno);
             self.note_printed(y, last_x, 1, false);
             rest = tail;
             if row.len() < room {
@@ -1082,9 +1646,10 @@ impl<'a> Performer<'a> {
                 self.wrap_next = false;
                 if !rest.is_empty() {
                     let last = &rest[rest.len() - 1..];
-                    let pen = self.pen.clone();
-                    self.screen_mut()
-                        .set_ascii_cell_run(last_x, y, last, pen, seqno);
+                    let state = &mut *self.state;
+                    state
+                        .screen
+                        .set_ascii_cell_run(last_x, y, last, &state.pen, seqno);
                     self.note_printed(y, last_x, 1, false);
                 }
                 rest = "";
@@ -1092,6 +1657,415 @@ impl<'a> Performer<'a> {
         }
         self.ascii_junction = self.last_printed;
         true
+    }
+
+    /// [`Handler::line_feed_flood`] (ft-wd6cy): the line feed at `bytes[0]`
+    /// and the complete printable-ASCII lines after it, applied as `control`
+    /// and `write_ascii_run` apply them one at a time, without the per-line
+    /// dispatch. What those re-check for every line holds for the whole
+    /// flood once checked here: nothing in it changes a mode, the margins,
+    /// the charset or the pen. Returns the bytes taken, or 0 to decline,
+    /// having done no more than the flush `control` starts with.
+    #[inline(never)]
+    fn line_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        let rows = self.screen().physical_rows;
+        let cols = self.screen().physical_cols;
+        let bottom: VisibleRowIndex = super::usize_to_i64_saturating(rows) - 1;
+        if !self.line_flood
+            || rows == 0
+            || self.insert
+            || self.newline_mode
+            || self.dec_origin_mode
+            || self.state.enable_conpty_quirks
+            // A carriage return would reset the pen's semantic type.
+            || self.clear_semantic_attribute_on_newline
+            || self.accumulating_title.is_some()
+            || self.active_charset() != CharSet::Ascii
+            || !Self::bulk_ascii_row_write_enabled()
+            || self.left_and_right_margins != (0..cols)
+            || self.top_and_bottom_margins != (0..bottom + 1)
+            || !self.pen.sgr_only_is_blank()
+        {
+            return 0;
+        }
+        debug_assert_eq!(bytes.first(), Some(&b'\n'));
+        // What `control` does first.
+        self.flush_print();
+        if self.cursor.y != bottom {
+            return 0;
+        }
+        let bidi_mode = self.get_bidi_mode();
+        let plan = {
+            let state = &*self.state;
+            state
+                .screen
+                .flood_scroll_plan(&state.top_and_bottom_margins, &state.left_and_right_margins)
+        };
+        // Nothing in a flood changes the pen: classify it once, when the
+        // first line that fits its row needs it, not per line.
+        let mut flood_pen = None;
+        // `bytes[at]` is the next line feed.
+        let mut at = 0;
+        loop {
+            // The line is plain if its first byte that is neither printable
+            // ASCII nor a tab or carriage return (a PTY ends every line in
+            // CR LF) is a line feed. A line that is not, or that `bytes` does
+            // not finish, is left whole for the parser: a line is only
+            // written once its end is known. (Validating the whole flood as
+            // UTF-8 once instead cost a second scan: 1% fewer instructions
+            // on `seq`, 1% more on long lines.)
+            let next = at + 1;
+            let end = next + scan.printable_len(&bytes[next..]);
+            // The line feed that ends a whole plain line, bare or after the
+            // carriage return a PTY puts before it.
+            let line_feed = match bytes.get(end) {
+                Some(b'\n') => Some(end),
+                Some(b'\r') if bytes.get(end + 1) == Some(&b'\n') => Some(end + 1),
+                _ => None,
+            };
+            let written = match line_feed {
+                Some(_) => self.flood_line_feed_with_run(
+                    &bytes[next..end],
+                    &mut flood_pen,
+                    plan.as_ref(),
+                    &bidi_mode,
+                ),
+                None => {
+                    self.flood_line_feed(&bidi_mode, plan.as_ref());
+                    false
+                }
+            };
+            at = next;
+            if let Some(line_feed) = line_feed.filter(|_| written) {
+                if line_feed != end {
+                    // What `flood_line_with_controls` does for the carriage
+                    // return after the line's text.
+                    Performer::control(self, ControlCode::CarriageReturn);
+                    self.last_printed = None;
+                }
+                at = line_feed;
+                continue;
+            }
+            match bytes.get(end) {
+                Some(b'\n') => {
+                    self.flood_text(
+                        &bytes[at..end],
+                        &mut flood_pen,
+                        bottom,
+                        plan.as_ref(),
+                        &bidi_mode,
+                    );
+                    at = end;
+                }
+                Some(b'\t' | b'\r') => {
+                    match self.flood_line_with_controls(
+                        bytes,
+                        at,
+                        end,
+                        scan,
+                        &mut flood_pen,
+                        bottom,
+                        plan.as_ref(),
+                        &bidi_mode,
+                    ) {
+                        Some(line_feed) => at = line_feed,
+                        None => return at,
+                    }
+                }
+                _ => return at,
+            }
+        }
+    }
+
+    /// The rest of [`Self::line_flood`] for a line starting at `at` whose
+    /// first tab or carriage return is at `first_stop`: the line feed that
+    /// ends it, once it is written, or `None` when the line is not plain
+    /// or `bytes` does not finish it. A tab or carriage return is the
+    /// control it is; like the line feed after the line, it ends whatever
+    /// the text before it printed. (Neither changes the pen: the flood
+    /// declines when a carriage return would reset its semantic type.)
+    /// Text before a control, or after the last, may be empty: writing it
+    /// is nothing. Where the first stops are is remembered, so a line is
+    /// scanned once: scanning it again control by control was a tenth of a
+    /// `long_lines` flood. Kept out of line, it leaves the loop over plain
+    /// lines its registers (inlined, `seq` ran 0.3-0.7% more instructions).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn flood_line_with_controls(
+        &mut self,
+        bytes: &[u8],
+        at: usize,
+        first_stop: usize,
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) -> Option<usize> {
+        let mut stops = [0_usize; 8];
+        let mut stop_count = 0;
+        let mut end = first_stop;
+        loop {
+            match bytes.get(end) {
+                Some(b'\t' | b'\r') => {
+                    if let Some(stop) = stops.get_mut(stop_count) {
+                        *stop = end;
+                    }
+                    stop_count += 1;
+                    end += 1;
+                }
+                Some(b'\n') => break,
+                _ => return None,
+            }
+            end += scan.printable_len(&bytes[end..]);
+        }
+        let mut start = at;
+        for index in 0..stop_count {
+            // Stops past those remembered are found again.
+            let stop = match stops.get(index) {
+                Some(&stop) => stop,
+                None => start + scan.printable_len(&bytes[start..end]),
+            };
+            self.flood_text(&bytes[start..stop], pen, bottom, plan, bidi_mode);
+            let code = if bytes[stop] == b'\t' {
+                ControlCode::HorizontalTab
+            } else {
+                ControlCode::CarriageReturn
+            };
+            Performer::control(self, code);
+            self.last_printed = None;
+            start = stop + 1;
+        }
+        self.flood_text(&bytes[start..end], pen, bottom, plan, bidi_mode);
+        Some(end)
+    }
+
+    /// One plain run of a flood line, which a tab or the line feed follows
+    /// within the flood: [`Self::flood_write`] a row at a time, wrapping as
+    /// `write_ascii_run` wraps ([`Self::flood_wrap`]), else what
+    /// `print_ascii_run` (or `print`) does with what is left.
+    #[inline]
+    fn flood_text(
+        &mut self,
+        mut text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) {
+        while !text.is_empty() {
+            if self.wrap_next {
+                self.flood_wrap(plan, bidi_mode);
+            }
+            let room = self
+                .left_and_right_margins
+                .end
+                .saturating_sub(self.cursor.x);
+            let take = room.min(text.len());
+            if take == 0 || !self.flood_write(&text[..take], pen, bottom) {
+                break;
+            }
+            text = &text[take..];
+        }
+        if text.is_empty() {
+            return;
+        }
+        // Only the general path needs the line as `str` (checking it for
+        // every line was 7% of a `seq` flood). Printable ASCII always is.
+        let owned;
+        let text = match std::str::from_utf8(text) {
+            Ok(text) => text,
+            Err(_) => {
+                owned = text
+                    .iter()
+                    .map(|&byte| char::from(byte))
+                    .collect::<String>();
+                owned.as_str()
+            }
+        };
+        if !self.write_ascii_run(text) {
+            // Unreachable under the flood's checks; the tab or line feed
+            // after it flushes it as it would have.
+            self.print_string(text);
+        }
+    }
+
+    /// `wrap_before_print` within a flood, on the bottom row of a full
+    /// screen and without conpty quirks: the row is marked as wrapped, and
+    /// `new_line(true)` scrolls and returns the cursor to the left margin.
+    fn flood_wrap(
+        &mut self,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) {
+        let seqno = self.seqno;
+        {
+            let y = self.cursor.y;
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(y);
+            screen.set_last_cell_was_wrapped(phys, true, seqno);
+        }
+        let scrolled =
+            plan.is_some_and(|plan| self.state.screen.flood_scroll_line(plan, seqno, bidi_mode));
+        if !scrolled {
+            self.scroll_up(1);
+        }
+        self.cursor.x = self.left_and_right_margins.start;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+    }
+
+    /// `write_ascii_run` for a flood line that fits the rest of the bottom
+    /// row (ft-wd6cy): the run appended under the flood's pen, with the
+    /// cursor and pending wrap `write_ascii_run` leaves. What that also
+    /// records (the printed cell, the junction) the line feed after every
+    /// flood line clears. Returns false, having written nothing, otherwise.
+    /// `pen` is the flood's, classified at its first use (`None` until
+    /// then, `Some(None)` for a pen that must take the per-run path).
+    #[inline]
+    fn flood_write(
+        &mut self,
+        text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+    ) -> bool {
+        let x = self.cursor.x;
+        let right_margin = self.left_and_right_margins.end;
+        if self.wrap_next || text.len() > right_margin.saturating_sub(x) {
+            return false;
+        }
+        let Some(pen) =
+            pen.get_or_insert_with(|| crate::pagegrid::native::FloodPen::new(&self.pen))
+        else {
+            return false;
+        };
+        let seqno = self.seqno;
+        if !self
+            .state
+            .screen
+            .flood_ascii_cell_run(x, bottom, text, pen, seqno)
+        {
+            return false;
+        }
+        self.advance_past_flood_run(x + text.len());
+        true
+    }
+
+    /// The cursor after [`Self::flood_write`] wrote a run ending before
+    /// `next_x`.
+    #[inline]
+    fn advance_past_flood_run(&mut self, next_x: usize) {
+        if next_x < self.left_and_right_margins.end {
+            self.cursor.x = next_x;
+            self.wrap_next = false;
+        } else {
+            // It ends on the right margin: a wrap pends, or without autowrap
+            // the cursor stays on that column.
+            self.cursor.x = next_x - 1;
+            self.wrap_next = self.dec_auto_wrap;
+        }
+    }
+
+    /// [`Self::flood_line_feed`] and then [`Self::flood_text`] of `text`, a
+    /// whole flood line, in one step where the line fits the rest of the
+    /// new bottom row: the scroll's new row takes the run directly
+    /// ([`crate::screen::Screen::flood_scroll_line_with_run`]). Always
+    /// performs the line feed; returns whether it wrote `text` too.
+    #[inline]
+    fn flood_line_feed_with_run(
+        &mut self,
+        text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) -> bool {
+        // Where the cursor is after the line feed, which clears any
+        // pending wrap, and where `flood_write` would write the run.
+        let x = self
+            .cursor
+            .x
+            .min(self.screen().physical_cols.saturating_sub(1));
+        let applies = !text.is_empty()
+            && text.len() <= self.left_and_right_margins.end.saturating_sub(x)
+            && self.print.is_empty()
+            && self.left_and_right_margins.contains(&self.cursor.x);
+        let Some(plan) = plan.filter(|_| applies) else {
+            self.flood_line_feed_declined(bidi_mode, plan);
+            return false;
+        };
+        let Some(flood_pen) =
+            pen.get_or_insert_with(|| crate::pagegrid::native::FloodPen::new(&self.pen))
+        else {
+            self.flood_line_feed_declined(bidi_mode, Some(plan));
+            return false;
+        };
+        let seqno = self.seqno;
+        let Some(written) = self
+            .state
+            .screen
+            .flood_scroll_line_with_run(plan, seqno, bidi_mode, x, text, flood_pen)
+        else {
+            // Nothing changed: the general line feed scrolls.
+            self.flood_line_feed_declined(bidi_mode, None);
+            return false;
+        };
+        // What `flood_line_feed` leaves, with an empty print buffer.
+        self.ascii_junction = None;
+        self.cursor.x = x;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+        self.last_printed = None;
+        if written {
+            self.advance_past_flood_run(x + text.len());
+        }
+        written
+    }
+
+    /// [`Self::flood_line_feed`] where [`Self::flood_line_feed_with_run`]
+    /// declines, out of line: inline, its three copies made the frame of
+    /// every line that takes the fused step.
+    #[cold]
+    #[inline(never)]
+    fn flood_line_feed_declined(
+        &mut self,
+        bidi_mode: &crate::config::BidiMode,
+        plan: Option<&crate::screen::FloodScroll>,
+    ) {
+        self.flood_line_feed(bidi_mode, plan);
+    }
+
+    /// `control(LineFeed)` within a line-feed flood: on the bottom row of a
+    /// full-screen region, without newline or origin mode, the line feed
+    /// scrolls and the cursor keeps its row and column.
+    #[inline]
+    fn flood_line_feed(
+        &mut self,
+        bidi_mode: &crate::config::BidiMode,
+        plan: Option<&crate::screen::FloodScroll>,
+    ) {
+        self.flush_print();
+        if !self.left_and_right_margins.contains(&self.cursor.x) {
+            Performer::control(self, ControlCode::LineFeed);
+            self.last_printed = None;
+            return;
+        }
+        let seqno = self.seqno;
+        // `scroll_up`'s page-engine path, its checks made once for the flood.
+        let scrolled =
+            plan.is_some_and(|plan| self.state.screen.flood_scroll_line(plan, seqno, bidi_mode));
+        if !scrolled {
+            self.scroll_up(1);
+        }
+        // `new_line`'s cursor move, within the bottom row.
+        let cols = self.screen().physical_cols;
+        self.cursor.x = self.cursor.x.min(cols.saturating_sub(1));
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+        self.last_printed = None;
     }
 
     /// The first grapheme flushed after `write_ascii_run` wrote a run
@@ -1138,6 +2112,10 @@ impl<'a> Performer<'a> {
         if Graphemes::new(combined.as_str()).count() != 1 {
             return false;
         }
+        if combined.len() > self.batch_config.maximum_cell_grapheme_bytes {
+            self.cell_grapheme_limit_exceeded = true;
+            return true;
+        }
         let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
         if !(width..=2).contains(&combined_width) {
             return false;
@@ -1178,13 +2156,21 @@ impl<'a> Performer<'a> {
     /// To combat this, we pop_tmux_title_state when we're obviously moving
     /// to different escape sequence parsing states.
     /// <https://github.com/wezterm/wezterm/issues/2442>
+    #[inline]
     fn pop_tmux_title_state(&mut self) {
+        // Every control and SGR lands here; the slot is almost always empty.
+        if self.accumulating_title.is_none() {
+            return;
+        }
         if let Some(title) = self.accumulating_title.take() {
             log::debug!("ST never received for pending tmux title escape sequence: {title:?}");
         }
     }
 
     pub fn perform(&mut self, action: Action) {
+        if self.native_execution_limit_exceeded {
+            return;
+        }
         debug!("perform {:?}", action);
         if self.suppress_initial_title_change {
             match &action {
@@ -1223,6 +2209,11 @@ impl<'a> Performer<'a> {
             Action::Esc(esc) => self.esc_dispatch(esc),
             Action::CSI(csi) => self.csi_dispatch(csi),
             Action::Sixel(sixel) => {
+                if self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText
+                {
+                    return;
+                }
                 // FND-017: a sixel renders an image at the current cursor, so any
                 // buffered text must be committed (and the cursor advanced) first
                 // — exactly as the KittyImage arm below already does. Without this
@@ -1237,6 +2228,11 @@ impl<'a> Performer<'a> {
             }
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
+                if self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText
+                {
+                    return;
+                }
                 self.flush_print();
                 if let Err(err) = self.kitty_img(*img) {
                     log::error!("kitty_img: {:#}", err);
@@ -1486,7 +2482,11 @@ impl<'a> Performer<'a> {
 
         if self.cursor.x < self.left_and_right_margins.start {
             for _ in 0..n {
+                let prior = (self.cursor.x, self.cursor.y, self.wrap_next);
                 self.control(ControlCode::Backspace);
+                if prior == (self.cursor.x, self.cursor.y, self.wrap_next) {
+                    break;
+                }
             }
             return;
         }
@@ -1503,6 +2503,9 @@ impl<'a> Performer<'a> {
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
+        if !self.admit_native_csi_work(&csi) {
+            return;
+        }
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::Cursor(frankenterm_escape_parser::csi::Cursor::Left(n)) => {
@@ -1566,9 +2569,11 @@ impl<'a> Performer<'a> {
                 }
             }
             CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                for _ in 0..n {
-                    self.screen_mut().keyboard_stack.pop();
-                }
+                // Popping an already empty stack is inert, including when
+                // Kitty support is disabled. Truncation preserves all effects
+                // without looping over an untrusted u32 count.
+                let stack = &mut self.screen_mut().keyboard_stack;
+                stack.truncate(stack.len().saturating_sub(n as usize));
             }
             CSI::Keyboard(Keyboard::QueryKittySupport) => {
                 if self.config.enable_kitty_keyboard() {
@@ -1595,6 +2600,21 @@ impl<'a> Performer<'a> {
     fn esc_dispatch(&mut self, esc: Esc) {
         let seqno = self.seqno;
         self.flush_print();
+        if self.native_work_remaining.is_some() {
+            let cols = self.screen().physical_cols;
+            let rows = self.screen().physical_rows;
+            let cost = match esc {
+                Esc::Code(EscCode::DecScreenAlignmentDisplay) => cols.saturating_mul(rows),
+                Esc::Code(EscCode::FullReset) => rows
+                    .saturating_mul(2)
+                    .saturating_add(self.config.scrollback_size())
+                    .saturating_mul(cols),
+                _ => 0,
+            };
+            if !self.admit_native_work(cost) {
+                return;
+            }
+        }
         if esc != Esc::Code(EscCode::StringTerminator) {
             self.pop_tmux_title_state();
         }
@@ -1642,13 +2662,28 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::DecSaveCursorPosition) => self.dec_save_cursor(),
             Esc::Code(EscCode::DecRestoreCursorPosition) => self.dec_restore_cursor(),
 
+            // SPA and EPA (ECMA-48 8.3.142, 8.3.49), as xterm's CASE_SPA and
+            // CASE_EPA (charproc.c) take them: the cells printed in between
+            // are protected, and SPA's mode makes ED, EL and ECH keep them
+            // until DECSCA, a reset or an erase of the whole screen that
+            // finds none changes the mode.
+            Esc::Code(EscCode::StartOfGuardedArea) => {
+                self.protected_mode = ProtectedMode::Iso;
+                self.pen.set_protected(true);
+            }
+            Esc::Code(EscCode::EndOfGuardedArea) => {
+                self.pen.set_protected(false);
+            }
+
             Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.set_line_size(idx, LineSize::DoubleHeightTop, seqno);
+                self.screen
+                    .set_line_size(idx, LineSize::DoubleHeightTop, seqno);
             }
             Esc::Code(EscCode::DecDoubleHeightBottomHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.set_line_size(idx, LineSize::DoubleHeightBottom, seqno);
+                self.screen
+                    .set_line_size(idx, LineSize::DoubleHeightBottom, seqno);
             }
             Esc::Code(EscCode::DecDoubleWidthLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
@@ -1683,6 +2718,7 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::FullReset) => {
                 let seqno = self.seqno;
                 self.pen = Default::default();
+                self.protected_mode = ProtectedMode::Off;
                 self.cursor = Default::default();
                 self.wrap_next = false;
                 self.clear_semantic_attribute_on_newline = false;
@@ -1911,7 +2947,13 @@ impl<'a> Performer<'a> {
                     write!(self.writer, "{}", response).ok();
                     self.writer.flush().ok();
                 }
-                ITermProprietary::File(image) => self.set_image(*image),
+                ITermProprietary::File(image) => {
+                    if self.config.feature_profile()
+                        != crate::config::TerminalFeatureProfile::NativeText
+                    {
+                        self.set_image(*image);
+                    }
+                }
                 ITermProprietary::SetUserVar { name, value } => {
                     let maximum = self.config.max_user_vars();
                     if maximum != 0 {
@@ -2329,6 +3371,17 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that switch the process-wide print paths below:
+    /// run at once, one read the other's switches (the cluster-run test
+    /// then saw no cluster-run append at all). Taken once per render, since
+    /// a render sets two switches and the lock is not reentrant.
+    fn test_switches() -> std::sync::MutexGuard<'static, ()> {
+        static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SWITCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct BulkAsciiRowWriteOverride;
 
     impl BulkAsciiRowWriteOverride {
@@ -2448,6 +3501,7 @@ mod tests {
     }
 
     fn run_gate_stream(bytes: &[u8], force_scalar: bool) -> GateRun {
+        let _switches = test_switches();
         let _scan_override = ScalarScanOverride::set(force_scalar);
         let mut parser = Parser::new();
         let actions = parser.parse_as_vec(bytes);
@@ -2743,6 +3797,136 @@ mod tests {
         }
     }
 
+    /// ft-cklgg: two pieces that join with no ZWJ between them, though both
+    /// have width, render the same whatever byte a PTY read splits them at.
+    #[test]
+    fn non_zwj_joins_render_the_same_at_every_split() {
+        let cases: &[&str] = &[
+            // Regional-indicator pair (GB12/13), and flags then a lone one.
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}\u{1F1EB}",
+            // Emoji modifier, an Extend two cells wide (GB9).
+            "\u{1F469}\u{1F3FD}",
+            // Hangul L + V and L + LV syllable (GB6).
+            "\u{1100}\u{1161}",
+            "\u{1100}\u{AC00}",
+            // Spacing marks (GB9a): Devanagari AA, and Thai SARA AM, which
+            // has width.
+            "\u{0915}\u{093E}",
+            "\u{0E01}\u{0E33}",
+            // Halfwidth voiced sound mark, an Extend with width.
+            "\u{FF76}\u{FF9E}",
+            // Devanagari conjunct (GB9c).
+            "\u{0915}\u{094D}\u{0937}",
+        ];
+        let mixed = format!("ab{}\x1b[31m{}cd{}", cases.concat(), cases[0], cases[2]);
+        let render = |chunks: &[&[u8]]| {
+            let mut term = make_terminal();
+            for chunk in chunks {
+                term.advance_bytes(chunk);
+            }
+            let mut snapshot = snapshot_terminal(&term);
+            // Each call stamps the lines it changes with a new seqno.
+            for line in &mut snapshot.all_lines {
+                line.seqno = 0;
+            }
+            snapshot
+        };
+        for stream in cases.iter().copied().chain(std::iter::once(mixed.as_str())) {
+            let bytes = stream.as_bytes();
+            let whole = render(&[bytes]);
+            for split in 1..bytes.len() {
+                assert_eq!(
+                    render(&[&bytes[..split], &bytes[split..]]),
+                    whole,
+                    "{:?} split at byte {}",
+                    stream,
+                    split
+                );
+            }
+            for size in 1..=7 {
+                let chunks: Vec<&[u8]> = bytes.chunks(size).collect();
+                assert_eq!(
+                    render(&chunks),
+                    whole,
+                    "{:?} in {}-byte chunks",
+                    stream,
+                    size
+                );
+            }
+        }
+        // The pairs this is about do form one cell when whole.
+        for (stream, x) in [("\u{1F1FA}\u{1F1F8}", 2), ("\u{1F469}\u{1F3FD}", 2)] {
+            let mut term = make_terminal();
+            term.advance_bytes(stream.as_bytes());
+            assert_eq!(term.cursor_pos().x, x, "{:?}", stream);
+        }
+    }
+
+    /// ft-cklgg: by the segmenter itself, no head `may_continue_without_zwj`
+    /// rules out continues a tail that does not end in ZWJ (that path's) or
+    /// a Prepend (left apart, as documented). Sampled, since unoptimized
+    /// segmenter lookups are slow; the blocks' first and last characters are
+    /// always checked.
+    #[test]
+    fn ruled_out_heads_never_continue_a_non_zwj_tail() {
+        let tails = [
+            "a",
+            "\u{1F1FA}",
+            "\u{1F600}",
+            "\u{1F469}\u{1F3FD}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{11A8}",
+            "\u{AC00}",
+            "\u{AC01}",
+            "\u{0915}\u{094D}",
+            "e\u{0301}",
+            "\u{0E01}",
+        ];
+        let edges = [
+            0x2100, 0x2BFF, 0x3041, 0x3096, 0x30A0, 0x30FF, 0x3400, 0x4DBF, 0x4E00, 0x9FFF, 0xE000,
+            0xF8FF, 0x1F000, 0x1F1E5, 0x1F200, 0x1F3FA, 0x1F400, 0x1FAFF, 0x20000, 0x3FFFF,
+            0xF0000, 0x10FFFF,
+        ];
+        let mut checked = 0;
+        for cp in (0x20_u32..0x7F)
+            .chain((0x2000..=0x10FFFF).step_by(29))
+            .chain(edges)
+        {
+            let Some(head) = char::from_u32(cp) else {
+                continue;
+            };
+            let head = head.to_string();
+            if may_continue_without_zwj(&head) {
+                continue;
+            }
+            checked += 1;
+            for tail in tails {
+                let pair = format!("{}{}", tail, head);
+                assert_ne!(
+                    Graphemes::new(&pair).count(),
+                    1,
+                    "U+{:X} continued {:?}",
+                    cp,
+                    tail
+                );
+            }
+        }
+        assert!(checked > 5_000, "only {} heads checked", checked);
+        for head in [
+            "\u{1F1F8}",
+            "\u{1F3FD}",
+            "\u{1161}",
+            "\u{AC00}",
+            "\u{FF9E}",
+            "\u{0E33}",
+            "\u{0937}",
+        ] {
+            assert!(may_continue_without_zwj(head), "{:?}", head);
+        }
+    }
+
     /// ft-yccm0.2.14 batch verify 4: the differential stream above panicked in
     /// `Line::erase_cell_with_margin` ("removal index should be < len"). A
     /// grapheme that clusters with the previous cell but arrives in a later
@@ -2751,6 +3935,7 @@ mod tests {
     /// storage, which re-segmented the two cells into one, so the row's
     /// `len()` exceeded its materialized cells. Minimized: the second scalar
     /// in a later call or after an SGR, then CUB and DCH inside the row.
+    /// Since ft-cklgg the two join into one cell, split or not.
     #[test]
     fn zwj_tail_gate_regression_clustering_neighbours_then_dch() {
         let cases: &[(&str, &str)] = &[("\u{1F1FA}", "\u{1F1F8}"), ("\u{1F600}", "\u{1F3FD}")];
@@ -2765,6 +3950,13 @@ mod tests {
                     let screen = term.screen();
                     let top = screen.physical_rows.min(screen.scrollback_rows());
                     let row = screen.scrollback_rows() - top;
+                    // Split or not, the two now form one cell (ft-cklgg).
+                    let mut whole = make_terminal();
+                    whole.advance_bytes(format!("{first}{gap}{second}\x1b[D\x1b[P").as_bytes());
+                    let expected = snapshot_terminal(&whole).all_lines[row]
+                        .cells
+                        .first()
+                        .map(|cell| cell.0.clone());
                     screen.with_phys_lines(row..row + 1, |lines| {
                         let line = lines[0];
                         let widths: usize = line.visible_cells().map(|cell| cell.width()).sum();
@@ -2777,7 +3969,7 @@ mod tests {
                             line.visible_cells()
                                 .next()
                                 .map(|cell| cell.str().to_string()),
-                            Some(first.to_string())
+                            expected
                         );
                     });
                 }
@@ -2882,6 +4074,7 @@ mod tests {
         actions: Vec<Action>,
         force_bulk: bool,
     ) -> TerminalSnapshot {
+        let _switches = test_switches();
         let _bulk_override = BulkAsciiRowWriteOverride::set(force_bulk);
         let _cluster_override = AsciiClusterRunAppendOverride::set(false);
         render_actions(actions)
@@ -2891,6 +4084,7 @@ mod tests {
         actions: Vec<Action>,
         force_bulk_append: bool,
     ) -> TerminalSnapshot {
+        let _switches = test_switches();
         let _bulk_override = BulkAsciiRowWriteOverride::set(true);
         let _cluster_override = AsciiClusterRunAppendOverride::set(force_bulk_append);
         render_actions(actions)
@@ -2990,10 +4184,16 @@ mod tests {
                 "ASCII cluster-run append diverged from per-cell materialization for {name}"
             );
         }
-        assert!(
-            total_cluster_hits > 0,
-            "ASCII cluster-run append was not exercised by the oracle corpus"
-        );
+        // Cluster-run append is the legacy `Line`'s: PageGrid rows store an
+        // ASCII run natively, so under FT_GRID_ENGINE=page the oracle corpus
+        // never reaches it. That lane only passed when another test's legacy
+        // append bumped the shared counter mid-render; alone it failed.
+        if make_terminal().screen().grid_engine() == crate::config::GridEngine::Legacy {
+            assert!(
+                total_cluster_hits > 0,
+                "ASCII cluster-run append was not exercised by the oracle corpus"
+            );
+        }
     }
 
     #[test]
@@ -3189,8 +4389,355 @@ mod tests {
         assert_eq!(print(false), print(true));
     }
 
+    /// A letter and its combining marks, which the segmentation's fast path
+    /// settles without `Graphemes` (4ece39911): every row, the cursor and
+    /// the pending wrap end as with the segmenter alone, mid-row, at the
+    /// right margin with autowrap on and off, with VS15 and VS16, around
+    /// ZWJ, in insert mode, between colors, and split into reads of a few
+    /// bytes.
+    #[test]
+    fn combining_mark_clusters_print_as_the_segmenter_prints_them() {
+        let mut stream = String::new();
+        for _ in 0..3 {
+            stream.push_str("a\u{301}b\u{308}\u{301}c \u{4e2d}\u{301}x");
+            stream.push_str("\u{5d0}\u{5b8}\u{645}\u{64b}");
+            stream.push_str("e\u{301}\u{fe0f}\u{2764}\u{fe0e}\u{301}q\u{200d}\u{301}r\u{200d} ");
+        }
+        stream.push_str(concat!(
+            // A wide base with a mark at the right margin, autowrap on, then off.
+            "\x1b[2;16H\u{4e2d}\u{301}z\u{4e2d}\u{301}",
+            "\x1b[?7l\x1b[3;16Hab\u{4e2d}\u{301}c\u{301}\x1b[?7h",
+            // After a ZWJ tail.
+            "\x1b[4;1Ha\u{200d}e\u{301}\u{4e2d}",
+            // Insert mode.
+            "\x1b[4h\x1b[5;2Hy\u{301}\u{4e2d}\u{301}\x1b[4l",
+            // Colors between clusters.
+            "\x1b[31me\u{301}\x1b[32mi\u{308}\x1b[m",
+        ));
+        let bytes = stream.as_bytes();
+        let print = |force_segmenter: bool, read: usize| {
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(GateTermConfig);
+            let size = TerminalSize {
+                rows: 6,
+                cols: 17,
+                pixel_width: 136,
+                pixel_height: 96,
+                dpi: 96,
+            };
+            let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            for chunk in bytes.chunks(read) {
+                terminal.advance_bytes(chunk);
+            }
+            terminal.advance_bytes(b"Z");
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+            snapshot_terminal(&terminal)
+        };
+        for read in [bytes.len(), 1, 2, 3, 5, 7] {
+            assert_eq!(
+                print(false, read),
+                print(true, read),
+                "reads of {read} bytes"
+            );
+        }
+    }
+
+    /// ft-yccm0.3.2.6: printed cells written in runs leave every row, the
+    /// cursor and each row's storage form as writing them one by one does,
+    /// on both grid engines, whole and split into reads of a few bytes.
+    #[test]
+    fn printed_cell_runs_match_cell_by_cell_printing() {
+        #[derive(Debug)]
+        struct EngineConfig(crate::config::GridEngine);
+        impl TerminalConfiguration for EngineConfig {
+            fn scrollback_size(&self) -> usize {
+                64
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig::default()
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> crate::config::GridEngine {
+                self.0
+            }
+        }
+        let mixed = "\u{4e2d}\u{6587} abc \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301}x \
+                     \u{5d0}\u{5d1} \u{645}\u{631} \u{1f1fa}\u{1f1f8}\u{2764}\u{fe0f}|";
+        let mut stream = String::new();
+        for _ in 0..4 {
+            stream.push_str(mixed);
+        }
+        stream.push_str(concat!(
+            // Over existing cells: wide over narrow, narrow over wide, and
+            // a run that ends past the row's end.
+            "\x1b[1;3H\u{4e2d}a\u{1f600}b\u{6587}\u{6587}\u{6587}\u{6587}\u{6587}\u{6587}",
+            // Past the end of an empty row.
+            "\x1b[5;15Hxy\u{4e2d}",
+            // Autowrap off: a wide cell on the last column, then VS16.
+            "\x1b[?7l\x1b[6;14H\u{4e2d}\u{4e2d}a\u{2764}\u{fe0f}\u{4e2d}\x1b[?7h",
+            // Insert mode.
+            "\x1b[4h\x1b[2;2H\u{4e2d}z\u{6587}\x1b[4l",
+            // DEC special graphics.
+            "\x1b(0lqqk\u{4e2d}x\x1b(B",
+            // A hyperlink, then protected cells.
+            "\x1b]8;;http://example.com\x1b\\link\u{4e2d}\u{1f600}\x1b]8;;\x1b\\",
+            "\x1b[1\"qprot\u{4e2d}\u{6587}\x1b[0\"q",
+            // A ZWJ tail, continued after a flush; a mark after a flush.
+            "a\u{200d}\x1b[m\u{1f600}\u{4e2d}b e\x1b[1m\u{301}\u{4e2d}\x1b[m",
+            // Left and right margins.
+            "\x1b[?69h\x1b[3;10s\x1b[7;3H\u{4e2d}\u{6587}\u{4e2d}\u{6587}abcdef\u{1f600}\x1b[?69l",
+            // A scroll region, scrolled.
+            "\x1b[2;5r\x1b[5;1H\n\n\u{4e2d}x\u{1f600}\n\u{6587}\x1b[r",
+            // Colors, a tab and a backspace.
+            "\x1b[38;5;100m\u{4e2d}abc\x1b[48;2;1;2;3m\u{1f600}\u{6587}\x1b[m",
+            "\x1b[8;1Ha\tb\x08\u{4e2d}\u{6587}z",
+            // Overwrites over wide cells.
+            "\x1b[1;1H\u{4e2d}\u{6587}\x1b[1;2Hab\u{1f600}",
+        ));
+        let bytes = stream.as_bytes();
+        let print = |engine: crate::config::GridEngine, cell_by_cell: bool, read: usize| {
+            FORCE_CELL_BY_CELL_PRINT.with(|force| force.set(cell_by_cell));
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                Arc::new(EngineConfig(engine));
+            let size = TerminalSize {
+                rows: 8,
+                cols: 17,
+                pixel_width: 136,
+                pixel_height: 128,
+                dpi: 96,
+            };
+            let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            for chunk in bytes.chunks(read) {
+                terminal.advance_bytes(chunk);
+            }
+            FORCE_CELL_BY_CELL_PRINT.with(|force| force.set(false));
+            let storage: Vec<bool> = terminal
+                .screen()
+                .all_lines()
+                .iter()
+                .map(Line::has_clustered_storage)
+                .collect();
+            (snapshot_terminal(&terminal), storage)
+        };
+        for engine in [
+            crate::config::GridEngine::Legacy,
+            crate::config::GridEngine::Page,
+        ] {
+            for read in [bytes.len(), 7, 3] {
+                assert_eq!(
+                    print(engine, false, read),
+                    print(engine, true, read),
+                    "{engine:?}, reads of {read} bytes"
+                );
+            }
+        }
+    }
+
+    /// Prints `pieces` in reads of `read` bytes, with the segmenter alone
+    /// or not, into a `cols`-wide screen on the chosen engine.
+    fn print_pieces(
+        pieces: &[&str],
+        cols: usize,
+        read: usize,
+        page: bool,
+        force_segmenter: bool,
+    ) -> String {
+        #[derive(Debug)]
+        struct EngineConfig(crate::config::GridEngine);
+        impl TerminalConfiguration for EngineConfig {
+            fn scrollback_size(&self) -> usize {
+                16
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig::default()
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> crate::config::GridEngine {
+                self.0
+            }
+        }
+        let engine = if page {
+            crate::config::GridEngine::Page
+        } else {
+            crate::config::GridEngine::Legacy
+        };
+        let stream = pieces.concat();
+        FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(EngineConfig(engine));
+        let size = TerminalSize {
+            rows: 4,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: 64,
+            dpi: 96,
+        };
+        let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+        for chunk in stream.as_bytes().chunks(read) {
+            terminal.advance_bytes(chunk);
+        }
+        terminal.advance_bytes(b"Z");
+        FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+        format!("{:?}", snapshot_terminal(&terminal))
+    }
+
+    /// The proptest's first failure, which was another test's global
+    /// switch flipping between its two prints (both now hold
+    /// `test_switches`), kept as a fixed case.
+    #[test]
+    fn plain_run_regression_insert_mode_after_a_zwj_tail() {
+        let _switches = test_switches();
+        let pieces = [
+            "\x1b[?7h",
+            "\x08",
+            "\x1b[?69l",
+            "\u{4e2d}",
+            "\u{1f600}",
+            "\t",
+            "\x1b[4l",
+            " ",
+            "\n",
+            "\n",
+            "a\u{200d}",
+            "\u{1f3fb}",
+            "\t",
+            "\u{903}",
+            "\x1b[m",
+            "\u{200b}",
+            "\x1b[31m",
+            "\n",
+            "\x1b[m",
+            "\x1b[4h",
+            "\u{645}\u{631}",
+            "\u{1f3fb}",
+            "\x1b[4l",
+        ];
+        assert_eq!(
+            print_pieces(&pieces, 9, 11, false, false),
+            print_pieces(&pieces, 9, 11, false, true)
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(160))]
+
+        /// The plain runs the fast path takes whole
+        /// (`PrintSegments::plain_run`) print what the segmenter alone
+        /// prints, one grapheme at a time: any mix of one- and multi-byte
+        /// lone characters, wide ones at the margin, clusters, ZWJ tails,
+        /// colors, line ends, cursor moves, margins, autowrap off and insert
+        /// mode, in narrow screens on both engines, split into any reads.
+        #[test]
+        fn plain_runs_print_as_the_segmenter_prints_them(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "abc", "x", " ", "\u{4e2d}", "\u{6587}\u{5b57}", "\u{5d0}\u{5d1}",
+                "\u{645}\u{631}", "\u{e9}", "e\u{301}", "\u{301}", "\u{1f600}",
+                "\u{1f468}\u{200d}\u{1f469}", "a\u{200d}", "\u{200d}", "\u{2764}\u{fe0f}",
+                "\u{1f1fa}\u{1f1f8}", "\u{1f3fb}", "\u{200b}", "\u{903}", "\x1b[31m",
+                "\x1b[m", "\r\n", "\n", "\r", "\x1b[2;3H", "\x1b[1;9H", "\x1b[?7l",
+                "\x1b[?7h", "\x1b[4h", "\x1b[4l", "\x1b[?69h\x1b[2;7s", "\x1b[?69l",
+                "\x08", "\t",
+            ]), 1..48),
+            cols in 3usize..14,
+            read in 1usize..24,
+            page in proptest::bool::ANY,
+        ) {
+            // Other tests flip process-wide print switches while holding it.
+            let _switches = test_switches();
+            proptest::prop_assert_eq!(
+                print_pieces(&pieces, cols, read, page, false),
+                print_pieces(&pieces, cols, read, page, true)
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(192))]
+
+        /// A printable ASCII character the parser hands over alone (between
+        /// two escape sequences, as a 256-color flood prints) is a run of one
+        /// that the fused path writes straight into the rows, where the
+        /// two-stage path buffers an `Action::Print` until the next flush.
+        /// Both leave the same terminal for any mix of such characters with
+        /// SGR, combining marks, ZWJ tails, emoji, pending wraps, autowrap
+        /// off, insert mode, DEC line drawing and titles, in narrow screens
+        /// on both engines, split into any reads.
+        #[test]
+        fn lone_ascii_characters_print_as_the_two_stage_path_prints_them(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "x", "y", " ", "~", "ab", "\x1b[31m", "\x1b[38;5;196m", "\x1b[m", "\u{301}",
+                "\u{200d}", "\u{1f600}", "\u{e9}", "\u{903}", "\x1b[?7l", "\x1b[?7h", "\x1b[4h",
+                "\x1b[4l", "\x1b(0", "\x1b(B", "\x1b]0;t\x07", "\x1b]0;", "\x07", "\r\n", "\x08",
+                "\t",
+            ]), 1..64),
+            cols in 2usize..9,
+            read in 1usize..16,
+            page in proptest::bool::ANY,
+        ) {
+            #[derive(Debug)]
+            struct EngineConfig(crate::config::GridEngine);
+            impl TerminalConfiguration for EngineConfig {
+                fn scrollback_size(&self) -> usize {
+                    16
+                }
+                fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                    ScrollbackTierConfig::default()
+                }
+                fn color_palette(&self) -> ColorPalette {
+                    ColorPalette::default()
+                }
+                fn grid_engine(&self) -> crate::config::GridEngine {
+                    self.0
+                }
+            }
+            let _switches = test_switches();
+            // The direct row write the fused path takes for a run of one.
+            let _bulk = BulkAsciiRowWriteOverride::set(true);
+            let engine = if page {
+                crate::config::GridEngine::Page
+            } else {
+                crate::config::GridEngine::Legacy
+            };
+            let stream = pieces.concat();
+            let size = TerminalSize {
+                rows: 4,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: 64,
+                dpi: 96,
+            };
+            let terminal = || {
+                let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                    Arc::new(EngineConfig(engine));
+                Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()))
+            };
+            let mut fused = terminal();
+            let mut two_stage = terminal();
+            let mut parser = Parser::new();
+            for chunk in stream.as_bytes().chunks(read).chain([b"Z".as_slice()]) {
+                fused.advance_bytes(chunk);
+                two_stage.perform_actions(parser.parse_as_vec(chunk));
+            }
+            // Every `advance_bytes` call moves the sequence number, and a
+            // read inside an escape sequence leaves the two-stage path no
+            // action to apply: rows' sequence numbers count calls here.
+            let snapshot = |terminal: &Terminal| {
+                let mut snapshot = snapshot_terminal(terminal);
+                for line in &mut snapshot.all_lines {
+                    line.seqno = 0;
+                }
+                snapshot
+            };
+            proptest::prop_assert_eq!(snapshot(&fused), snapshot(&two_stage), "{:?}", stream);
+        }
+    }
+
     #[test]
     fn a_direct_ascii_run_joins_the_next_grapheme_across_an_ignored_sequence() {
+        let _switches = test_switches();
         let _bulk = BulkAsciiRowWriteOverride::set(true);
         let cases: &[(&[u8], &str)] = &[
             (b"\x1b[?7lcY691164;\x1b[,1_\xe2\x80\x8d", ";\u{200d}"),
@@ -3237,6 +4784,278 @@ mod tests {
                 what,
                 cell,
                 cells
+            );
+        }
+    }
+
+    /// Pieces of a line-feed flood and of what interrupts or disables one
+    /// (ft-wd6cy): plain lines and line feeds most often, then what changes
+    /// a condition the flood checks once (margins, modes, charset, a pen
+    /// whose blank is colored), moves the cursor off the bottom row, or
+    /// ends a plain line early (UTF-8, a combining mark, a control).
+    fn line_flood_piece() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            8 => proptest::collection::vec(0x20u8..=0x7e, 0..30),
+            8 => Just(b"\n".to_vec()),
+            2 => Just(b"\r\n".to_vec()),
+            1 => Just(b"\r".to_vec()),
+            1 => Just(b"\t".to_vec()),
+            1 => Just(b"\x08".to_vec()),
+            1 => Just(b"\x1b[31m".to_vec()),
+            1 => Just(b"\x1b[41m".to_vec()),
+            1 => Just(b"\x1b[0m".to_vec()),
+            1 => Just(b"\x1b[3;2H".to_vec()),
+            1 => Just(b"\x1b[99;1H".to_vec()),
+            1 => Just(b"\x1b[2;3r".to_vec()),
+            1 => Just(b"\x1b[r".to_vec()),
+            1 => Just(b"\x1b[?6h".to_vec()),
+            1 => Just(b"\x1b[?6l".to_vec()),
+            1 => Just(b"\x1b[4h".to_vec()),
+            1 => Just(b"\x1b[4l".to_vec()),
+            1 => Just(b"\x1b[20h".to_vec()),
+            1 => Just(b"\x1b[20l".to_vec()),
+            1 => Just(b"\x1b[?7l".to_vec()),
+            1 => Just(b"\x1b[?7h".to_vec()),
+            1 => Just(b"\x1b(0".to_vec()),
+            1 => Just(b"\x1b(B".to_vec()),
+            1 => Just(b"\x1b[?69h\x1b[2;4s".to_vec()),
+            1 => Just(b"\x1b[?69l".to_vec()),
+            1 => Just("\u{e9}".as_bytes().to_vec()),
+            1 => Just("\u{301}".as_bytes().to_vec()),
+            1 => Just("\u{1f680}".as_bytes().to_vec()),
+            1 => Just(b"\x1b]0;title\x07".to_vec()),
+            // Semantic prompts: input until the end of the line (which a
+            // carriage return ends), input, output.
+            1 => Just(b"\x1b]133;I\x07".to_vec()),
+            1 => Just(b"\x1b]133;B\x07".to_vec()),
+            1 => Just(b"\x1b]133;C\x07".to_vec()),
+        ]
+    }
+
+    struct NoLineFeedDivert;
+
+    impl crate::terminal::FeedGate for NoLineFeedDivert {
+        fn diverts(&mut self, _action: &Action) -> bool {
+            false
+        }
+    }
+
+    fn line_flood_terminal(rows: usize, cols: usize, flood: bool) -> Terminal {
+        line_flood_terminal_with(rows, cols, flood, 64, None)
+    }
+
+    /// A flood test's scrollback size and, when given, grid engine (else
+    /// `FT_GRID_ENGINE`'s): line batches need the scrollback full.
+    #[derive(Debug)]
+    struct FloodTermConfig {
+        scrollback: usize,
+        engine: Option<crate::config::GridEngine>,
+    }
+
+    impl TerminalConfiguration for FloodTermConfig {
+        fn scrollback_size(&self) -> usize {
+            self.scrollback
+        }
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            ScrollbackTierConfig::default()
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn grid_engine(&self) -> crate::config::GridEngine {
+            self.engine
+                .unwrap_or_else(crate::config::GridEngine::from_env)
+        }
+    }
+
+    fn line_flood_terminal_with(
+        rows: usize,
+        cols: usize,
+        flood: bool,
+        scrollback: usize,
+        engine: Option<crate::config::GridEngine>,
+    ) -> Terminal {
+        let mut term = Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            },
+            Arc::new(FloodTermConfig { scrollback, engine }),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        term.line_flood = flood;
+        term
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(512))]
+
+        /// ft-wd6cy: with line-feed floods on, every chunking of any mix of
+        /// plain lines, line feeds and what interrupts them leaves the
+        /// terminal exactly as the per-line path does: every row's cells,
+        /// attributes, wrap flag and sequence number (scrollback included),
+        /// and the cursor. One more character then shows the pending wrap
+        /// agrees too. The fused mux path (`feed`) agrees as well.
+        #[test]
+        fn line_floods_leave_what_the_per_line_path_leaves(
+            pieces in proptest::collection::vec(line_flood_piece(), 1..60),
+            rows in 1usize..6,
+            cols in 1usize..14,
+            cuts in proptest::collection::vec(1usize..40, 1..8),
+            // Small enough for the scrollback to fill, which line batches need.
+            scrollback in proptest::prop_oneof![
+                proptest::strategy::Just(0usize),
+                proptest::strategy::Just(2usize),
+                proptest::strategy::Just(64usize),
+            ],
+        ) {
+            let bytes: Vec<u8> = pieces.concat();
+            let mut per_line = line_flood_terminal_with(rows, cols, false, scrollback, None);
+            let mut flood = line_flood_terminal_with(rows, cols, true, scrollback, None);
+            let mut fed = line_flood_terminal_with(rows, cols, true, scrollback, None);
+            let mut fed_parser = Parser::new();
+            let mut diverted = Vec::new();
+            let mut start = 0;
+            let mut cut = 0;
+            while start < bytes.len() {
+                let end = (start + cuts[cut % cuts.len()]).min(bytes.len());
+                cut += 1;
+                per_line.advance_bytes(&bytes[start..end]);
+                flood.advance_bytes(&bytes[start..end]);
+                fed.feed(&mut fed_parser, &bytes[start..end], &mut NoLineFeedDivert, &mut diverted);
+                start = end;
+            }
+            proptest::prop_assert!(diverted.is_empty());
+            let what = String::from_utf8_lossy(&bytes).to_string();
+            let expected = snapshot_terminal(&per_line);
+            proptest::prop_assert_eq!(&snapshot_terminal(&flood), &expected, "{:?}", what);
+            proptest::prop_assert_eq!(&snapshot_terminal(&fed), &expected, "{:?} fed", what);
+            for term in [&mut per_line, &mut flood, &mut fed] {
+                term.advance_bytes(b"Z");
+            }
+            let expected = snapshot_terminal(&per_line);
+            proptest::prop_assert_eq!(&snapshot_terminal(&flood), &expected, "{:?} + Z", what);
+            proptest::prop_assert_eq!(&snapshot_terminal(&fed), &expected, "{:?} fed + Z", what);
+        }
+    }
+
+    /// ft-wd6cy: a flood takes a run of plain lines in one call, stops
+    /// before a line it cannot take whole, and declines off the bottom row.
+    #[test]
+    fn a_line_feed_flood_takes_whole_plain_lines_on_the_bottom_row() {
+        use frankenterm_escape_parser::parser::AsciiScan;
+        let mut term = line_flood_terminal(3, 10, true);
+        let mut performer = Performer::new(&mut term);
+        // The cursor starts on the top row: declined.
+        assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
+        performer.cursor.y = 2;
+        // Two whole lines, then one that ends in UTF-8: up to its start.
+        let bytes = "\nab\n\ncd\u{e9}\n".as_bytes();
+        assert_eq!(performer.line_flood(bytes, AsciiScan::DEFAULT), 5);
+        // A line without its line feed stays for the parser.
+        assert_eq!(performer.line_flood(b"\nxyz", AsciiScan::DEFAULT), 1);
+        drop(performer);
+        term.line_flood = false;
+        let mut performer = Performer::new(&mut term);
+        assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
+    }
+
+    /// ft-wd6cy: with the scrollback full on the page engine, where each
+    /// flood line scrolls a row out through `PageList::scroll_line`'s trim,
+    /// a flood leaves what the per-line path leaves: `seq`'s staircase of
+    /// line feeds without carriage returns, which reaches the margin and
+    /// wraps now and then, CR LF lines, empty lines, lines too long for a
+    /// row, and staircases of spaces, which a blank pen leaves unwritten past
+    /// a row's end and a colored one writes, in reads that split lines
+    /// anywhere. (A batch that scrolled a screenful of such lines at once
+    /// and then wrote them cut seq's instructions 8% but cost 6.6% more
+    /// cycles: the bulk scroll still
+    /// trims, appends and rotates views row by row, every line was scanned
+    /// twice and every row touched twice.)
+    #[test]
+    fn floods_with_the_scrollback_full_leave_what_the_per_line_path_leaves() {
+        let mut bytes = Vec::new();
+        for n in 0..400 {
+            bytes.extend_from_slice(format!("{n}\n").as_bytes());
+        }
+        for n in 0..300 {
+            bytes.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\n\n\r\n\r\n");
+        for n in 0..60 {
+            bytes.extend_from_slice(format!("{}\r\n", "x".repeat(n % 23)).as_bytes());
+        }
+        for pen in ["", "\x1b[31m"] {
+            bytes.extend_from_slice(pen.as_bytes());
+            for n in 0..40 {
+                bytes.extend_from_slice(format!("{}\n", " ".repeat(n % 7)).as_bytes());
+            }
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"\x1b[0m");
+        let page = Some(crate::config::GridEngine::Page);
+        for (rows, cols, scrollback, read) in [
+            (5, 17, 0, 997),
+            (5, 17, 3, 61),
+            (8, 40, 7, 4096),
+            (3, 9, 0, 13),
+            (1, 9, 0, 997),
+        ] {
+            let mut per_line = line_flood_terminal_with(rows, cols, false, scrollback, page);
+            let mut flood = line_flood_terminal_with(rows, cols, true, scrollback, page);
+            for chunk in bytes.chunks(read) {
+                per_line.advance_bytes(chunk);
+                flood.advance_bytes(chunk);
+            }
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{rows}x{cols} scrollback {scrollback}, reads of {read}"
+            );
+            per_line.advance_bytes(b"Z");
+            flood.advance_bytes(b"Z");
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{rows}x{cols} scrollback {scrollback}, reads of {read} + Z"
+            );
+        }
+    }
+
+    /// A flood remembers where a line's first tabs and carriage returns
+    /// are and finds any later ones again: a line with more of them than it
+    /// remembers, one that starts with a tab, and one that ends in CR LF
+    /// all leave what the per-line path leaves.
+    #[test]
+    fn a_flood_line_with_many_tabs_and_carriage_returns_matches_the_per_line_path() {
+        let mut bytes = b"start\r\n".to_vec();
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"\ta\tbb\rc\t\td\re\tf\tgg\th\ri\tjjjjjjj\tk\tl\r\n");
+            bytes.extend_from_slice(b"\t\tlead\tthen text\r\n");
+            bytes.extend_from_slice(b"plain\n");
+        }
+        for cols in [7, 12, 40] {
+            let mut per_line = line_flood_terminal(3, cols, false);
+            let mut flood = line_flood_terminal(3, cols, true);
+            per_line.advance_bytes(&bytes);
+            flood.advance_bytes(&bytes);
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{cols} columns"
+            );
+            per_line.advance_bytes(b"Z");
+            flood.advance_bytes(b"Z");
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{cols} columns + Z"
             );
         }
     }

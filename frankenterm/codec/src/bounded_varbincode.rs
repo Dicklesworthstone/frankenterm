@@ -33,6 +33,8 @@ pub(crate) const TIERED_SCROLLBACK_BATCH_PANE_IDS_V1_NEWTYPE: &str =
     "frankenterm.codec.TieredScrollbackBatchPaneIdsV1";
 pub(crate) const TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE: &str =
     "frankenterm.codec.TieredScrollbackBatchEntriesV1";
+pub(crate) const PANE_USER_VARS_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVarsV1";
+pub(crate) const PANE_USER_VAR_TEXT_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVarTextV1";
 pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
@@ -160,6 +162,12 @@ impl ContainerAdmission {
         preallocation_maximum: TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS,
     };
 
+    const PANE_USER_VARS: Self = Self {
+        label: "pane user variables",
+        maximum: super::MAX_PANE_USER_VARS,
+        preallocation_maximum: super::MAX_PANE_USER_VARS,
+    };
+
     const fn restricted_by(self, requested: Self) -> Self {
         if requested.maximum <= self.maximum {
             requested
@@ -193,6 +201,11 @@ impl ByteBufferAdmission {
     const IMAGE_WIRE_BYTES: Self = Self {
         label: "image wire bytes",
         maximum: IMAGE_WIRE_BYTES_V1_MAX_BYTES,
+    };
+
+    const PANE_USER_VAR_TEXT: Self = Self {
+        label: "pane user variable text bytes",
+        maximum: super::MAX_PANE_USER_VAR_TEXT_BYTES,
     };
 
     const fn restricted_by(self, requested: Self) -> Self {
@@ -510,6 +523,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ByteBufferAdmission::ORDERED_WINDOW_SECTION)
         } else if name == IMAGE_WIRE_BYTES_V1_NEWTYPE {
             Some(ByteBufferAdmission::IMAGE_WIRE_BYTES)
+        } else if name == PANE_USER_VAR_TEXT_V1_NEWTYPE {
+            Some(ByteBufferAdmission::PANE_USER_VAR_TEXT)
         } else {
             None
         };
@@ -535,6 +550,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ContainerAdmission::TIERED_SCROLLBACK_BATCH_PANE_IDS)
         } else if name == TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE {
             Some(ContainerAdmission::TIERED_SCROLLBACK_BATCH_ENTRIES)
+        } else if name == PANE_USER_VARS_V1_NEWTYPE {
+            Some(ContainerAdmission::PANE_USER_VARS)
         } else {
             None
         };

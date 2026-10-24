@@ -1,0 +1,5 @@
+module CFrankenTermTerminal [system] {
+    header "../../../../../frankenterm/term/include/frankenterm_terminal.h"
+    link "frankenterm_term"
+    export *
+}

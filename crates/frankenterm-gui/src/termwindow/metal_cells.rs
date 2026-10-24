@@ -626,9 +626,11 @@ mod tests {
     #[test]
     fn the_blink_clocks_follow_the_configuration() {
         let config = ConfigHandle::default_config();
+        // Before the phase is computed: `due` is measured from that moment, so
+        // a later `start` made `due >= start` fail on a loaded machine.
+        let start = Instant::now();
         let mut clocks = MetalBlinkClocks::new(&config);
         let phase = clocks.text_phase(&config, None);
-        let start = Instant::now();
         for level in [phase.levels.slow, phase.levels.rapid] {
             let level = level.expect("the default rates blink");
             assert!((0.0..=1.0).contains(&level), "{level}");

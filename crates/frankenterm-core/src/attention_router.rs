@@ -52,6 +52,7 @@ pub enum AttentionRouterSourceKind {
     IncidentBundles,
     Manual,
     Fixture,
+    VerifiedSubmit,
 }
 
 impl AttentionRouterSourceKind {
@@ -73,6 +74,7 @@ impl AttentionRouterSourceKind {
             Self::IncidentBundles => "incident_bundles",
             Self::Manual => "manual",
             Self::Fixture => "fixture",
+            Self::VerifiedSubmit => "verified_submit",
         }
     }
 }
@@ -163,6 +165,7 @@ pub enum AttentionRouterSourceFactKind {
     SourceUnavailable,
     SourceNotConfigured,
     Manual,
+    SubmitProfileDrift,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +551,7 @@ pub enum AttentionRouterSafeAction {
     TriageUnhandledEventBeforeClaimingMoreWork,
     WaitForConnectorRecoveryOrUseReadOnlyFallback,
     InvestigateIncidentBundleBeforeContinuing,
+    RecheckSubmitProfileBeforeTrustingVerifiedSends,
 }
 
 impl AttentionRouterSafeAction {
@@ -624,6 +628,9 @@ impl AttentionRouterSafeAction {
             }
             Self::InvestigateIncidentBundleBeforeContinuing => {
                 "Investigate the incident bundle evidence before continuing mutable work."
+            }
+            Self::RecheckSubmitProfileBeforeTrustingVerifiedSends => {
+                "Recheck the agent type's submit profile against its current CLI before trusting verified sends to it."
             }
         }
     }
@@ -1032,6 +1039,13 @@ pub fn build_attention_router_surface_payload_from_snapshot(
         requested_item_id,
         selected_item.as_ref(),
     );
+    // `next` acts on the item it selected (which passes over source-health
+    // items when anything actionable exists); the other surfaces report the
+    // snapshot's top-ranked action.
+    let next_action = match (surface, selected_item.as_ref()) {
+        (AttentionRouterSurface::Next, Some(item)) => Some(item.recommended_action.clone()),
+        _ => snapshot.next_action.clone(),
+    };
     AttentionRouterSurfacePayload {
         schema: ATTENTION_ROUTER_SURFACE_SCHEMA.to_string(),
         contract_id: ATTENTION_ROUTER_CONTRACT_ID.to_string(),
@@ -1046,7 +1060,7 @@ pub fn build_attention_router_surface_payload_from_snapshot(
         side_effects_executed: false,
         degraded_mode: attention_router_degraded_mode(&snapshot),
         selected_item,
-        next_action: snapshot.next_action.clone(),
+        next_action,
         explanation,
         mcp_resources: attention_router_mcp_resources(),
         snapshot,
@@ -1218,11 +1232,33 @@ fn rule_from_fact(
     fact: &AttentionRouterSourceFact,
     reason_codes: &[String],
 ) -> Option<AttentionRouterRule> {
-    let text = format!(
-        "{} {} {}",
-        source.source_summary, fact.summary, source.command_or_api
-    )
-    .to_ascii_lowercase();
+    // Live typed facts embed user-chosen identifiers in their summaries
+    // (actors, rule ids, transaction ids, reservation owners, paths, bead
+    // ids), so only their kind and reason codes classify them, never the
+    // prose heuristics below.
+    let typed_live_fact = matches!(
+        fact.fact,
+        AttentionRouterSourceFactKind::PolicyDeniedAudit
+            | AttentionRouterSourceFactKind::PolicyRequireApproval
+            | AttentionRouterSourceFactKind::SubmitProfileDrift
+            | AttentionRouterSourceFactKind::EventUnhandled
+            | AttentionRouterSourceFactKind::EventCritical
+            | AttentionRouterSourceFactKind::IncidentBundleOpen
+            | AttentionRouterSourceFactKind::MissionTxState
+            | AttentionRouterSourceFactKind::PaneReservationActive
+    ) || matches!(
+        source.source_id.as_str(),
+        LIVE_GIT_SOURCE_ID | LIVE_BEADS_SOURCE_ID
+    );
+    let text = if typed_live_fact {
+        String::new()
+    } else {
+        format!(
+            "{} {} {}",
+            source.source_summary, fact.summary, source.command_or_api
+        )
+        .to_ascii_lowercase()
+    };
 
     if contains_text(
         &text,
@@ -1271,6 +1307,22 @@ fn rule_from_fact(
                 "replay_denied_action",
                 "bypass_policy_gate",
                 "forge_approval_token",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::SubmitProfileDrift
+        || contains_reason(reason_codes, &["verified_submit.profile_drift"])
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedInfra,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::RecheckSubmitProfileBeforeTrustingVerifiedSends,
+            AttentionRouterConfidence::Medium,
+            &[
+                "treat_unconfirmed_send_as_delivered",
+                "auto_resend_unconfirmed_prompt",
+                "disable_verified_submit_globally",
             ],
         ));
     }
@@ -1358,6 +1410,24 @@ fn rule_from_fact(
                 "choose_winner_from_conflicting_metadata",
                 "stage_unowned_tracker_changes",
                 "force_release_without_status_check",
+            ],
+        ));
+    }
+
+    // An operator's hold on a pane (ft intervene / ft reserve): leave the
+    // pane alone, rather than the file-path rules below.
+    if fact.fact == AttentionRouterSourceFactKind::PaneReservationActive
+        && contains_reason(reason_codes, &["reservation.active_manual"])
+    {
+        return Some(rule(
+            AttentionRouterClassification::DoNotTouch,
+            AttentionRouterItemKind::Ownership,
+            AttentionRouterSafeAction::WaitForReservationReleaseOrExpiryThenRecheck,
+            AttentionRouterConfidence::High,
+            &[
+                "send_input_to_held_pane",
+                "run_workflow_on_held_pane",
+                "release_operator_hold",
             ],
         ));
     }
@@ -2359,7 +2429,15 @@ fn selected_attention_router_item(
 ) -> Option<AttentionRouterItem> {
     match surface {
         AttentionRouterSurface::Status => None,
-        AttentionRouterSurface::Next => snapshot.items.first().cloned(),
+        // An unavailable source stays visible (status, degraded mode) but is
+        // never picked over actionable work: the contract continues from the
+        // remaining sources, so Agent Mail being down does not stall a swarm.
+        AttentionRouterSurface::Next => snapshot
+            .items
+            .iter()
+            .find(|item| item.kind != AttentionRouterItemKind::SourceHealth)
+            .or_else(|| snapshot.items.first())
+            .cloned(),
         AttentionRouterSurface::Explain => match requested_item_id {
             Some(item_id) => snapshot
                 .items
@@ -2597,6 +2675,1172 @@ pub fn operating_envelope_observation_from_health(
     observation
 }
 
+/// Audit history a live policy-gate source covers.
+pub const POLICY_GATE_AUDIT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest audit rows a live policy-gate source reads for each decision.
+pub const POLICY_GATE_AUDIT_MAX_ROWS: usize = 64;
+
+/// The audit-row fields a live policy-gate source uses. The action input, the
+/// policy's free-text reason, and the decision context are deliberately absent
+/// (they can echo command text), so no fact can carry them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyGateAuditRow {
+    pub ts: i64,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub pane_id: Option<u64>,
+    pub action_kind: String,
+    pub rule_id: Option<String>,
+}
+
+impl From<&crate::storage::AuditActionRecord> for PolicyGateAuditRow {
+    fn from(record: &crate::storage::AuditActionRecord) -> Self {
+        Self {
+            ts: record.ts,
+            actor_kind: record.actor_kind.clone(),
+            actor_id: record.actor_id.clone(),
+            pane_id: record.pane_id,
+            action_kind: record.action_kind.clone(),
+            rule_id: record.rule_id.clone(),
+        }
+    }
+}
+
+/// Live `policy_denied_audit` source from recent audit actions whose policy
+/// decision was `deny`, read by the caller within
+/// [`POLICY_GATE_AUDIT_WINDOW_MS`] and [`POLICY_GATE_AUDIT_MAX_ROWS`]. One
+/// fact per actor, action kind, and rule, counting its denials. `None` means
+/// the audit log could not be read.
+#[must_use]
+pub fn policy_denied_observation_from_audit(
+    denied: Option<&[PolicyGateAuditRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    policy_gate_observation(PolicyGate::Denied, denied, now_ms)
+}
+
+/// Live `approval_store` source from recent audit actions whose policy
+/// decision was `require_approval` and that are still unresolved: the caller
+/// drops any followed by an allowed action from the same actor, action kind,
+/// and pane, since that action was approved and ran. See
+/// [`policy_denied_observation_from_audit`] for the bounds and grouping.
+#[must_use]
+pub fn approval_required_observation_from_audit(
+    approval_required: Option<&[PolicyGateAuditRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    policy_gate_observation(PolicyGate::ApprovalRequired, approval_required, now_ms)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PolicyGate {
+    Denied,
+    ApprovalRequired,
+}
+
+impl PolicyGate {
+    const fn source_kind(self) -> AttentionRouterSourceKind {
+        match self {
+            Self::Denied => AttentionRouterSourceKind::PolicyDeniedAudit,
+            Self::ApprovalRequired => AttentionRouterSourceKind::ApprovalStore,
+        }
+    }
+
+    const fn fact_kind(self) -> AttentionRouterSourceFactKind {
+        match self {
+            Self::Denied => AttentionRouterSourceFactKind::PolicyDeniedAudit,
+            Self::ApprovalRequired => AttentionRouterSourceFactKind::PolicyRequireApproval,
+        }
+    }
+
+    const fn source_id(self) -> &'static str {
+        match self {
+            Self::Denied => "policy_denied_audit.recent",
+            Self::ApprovalRequired => "approval_store.recent_required",
+        }
+    }
+
+    const fn api(self) -> &'static str {
+        match self {
+            Self::Denied => "storage.audit_actions.policy_decision=deny",
+            Self::ApprovalRequired => "storage.audit_actions.policy_decision=require_approval",
+        }
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Denied => "policy.denied",
+            Self::ApprovalRequired => "approval.required",
+        }
+    }
+
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::ApprovalRequired => "required approval",
+        }
+    }
+}
+
+fn policy_gate_observation(
+    gate: PolicyGate,
+    actions: Option<&[PolicyGateAuditRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    let Some(actions) = actions else {
+        return AttentionRouterSourceObservation::new(
+            gate.source_id(),
+            gate.source_kind(),
+            AttentionRouterSourceHealth::Unavailable,
+            gate.api(),
+            "the local audit log could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local audit log is unavailable",
+            )
+            .with_reason_code(format!("{}.audit_unavailable", gate.source_kind().slug())),
+        );
+    };
+    // (actor, action kind, rule) -> (actions, panes)
+    let mut groups: std::collections::BTreeMap<
+        (String, String, String),
+        (u64, std::collections::BTreeSet<u64>),
+    > = std::collections::BTreeMap::new();
+    for action in actions {
+        let actor = action
+            .actor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|actor_id| !actor_id.is_empty())
+            .unwrap_or(action.actor_kind.as_str())
+            .to_string();
+        let rule = action
+            .rule_id
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_string());
+        let group = groups
+            .entry((actor, action.action_kind.clone(), rule))
+            .or_default();
+        group.0 = group.0.saturating_add(1);
+        if let Some(pane_id) = action.pane_id {
+            group.1.insert(pane_id);
+        }
+    }
+    let freshness_ms = actions
+        .iter()
+        .map(|action| action.ts)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let mut observation = AttentionRouterSourceObservation::new(
+        gate.source_id(),
+        gate.source_kind(),
+        AttentionRouterSourceHealth::Available,
+        gate.api(),
+        format!(
+            "{} audited actions {} in the last 24 hours",
+            actions.len(),
+            gate.verb()
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(actions.len()).unwrap_or(u64::MAX));
+    for ((actor, action_kind, rule), (count, panes)) in groups {
+        let panes = if panes.is_empty() {
+            "no pane".to_string()
+        } else {
+            let listed: Vec<String> = panes.iter().take(4).map(u64::to_string).collect();
+            let more = panes.len().saturating_sub(listed.len());
+            if more == 0 {
+                format!("pane {}", listed.join(", "))
+            } else {
+                format!("pane {} and {more} more", listed.join(", "))
+            }
+        };
+        // A stable key lets an operator `ft mute add` an expected pattern.
+        let mute_key = format!(
+            "attention.{}.{actor}.{action_kind}.{rule}",
+            gate.source_kind().slug()
+        );
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                gate.fact_kind(),
+                format!(
+                    "{action_kind} by {actor} {} {count} time(s), rule {rule}, {panes} [mute: ft mute add {mute_key}]",
+                    gate.verb()
+                ),
+            )
+            .count(count)
+            .with_agent_name(actor)
+            .with_reason_code(gate.reason_code())
+            .with_reason_code(format!("policy_rule.{rule}"))
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
+/// Newest verified-send receipts a live verified-submit source reads.
+pub const VERIFIED_SUBMIT_AUDIT_MAX_ROWS: usize = 1_000;
+
+/// Fewest UI-observable receipts for one agent type before its unconfirmed
+/// share can count as drift.
+pub const VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES: u64 = 8;
+/// Share of UI-observable receipts left unconfirmed (stuck in the composer or
+/// unverifiable) at or above which an agent type's submit profile is drifting.
+pub const VERIFIED_SUBMIT_DRIFT_PERCENT: u64 = 50;
+/// Rule id of the event the watcher records when an agent type starts
+/// drifting.
+pub const VERIFIED_SUBMIT_DRIFT_RULE_ID: &str = "core.verified_submit:profile_drift";
+
+/// One agent type's verified-send outcomes that its UI decides: submitted,
+/// queued behind an operation, stuck in the composer, unverifiable, or
+/// crashed to a shell. Policy outcomes and failed sends say nothing about the
+/// UI and are not counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifiedSubmitAgentTally {
+    pub agent_type: String,
+    pub observed: u64,
+    pub stuck_in_composer: u64,
+    pub verification_unavailable: u64,
+    /// Latest submit profile seen, as `id vVERSION`.
+    pub profile: Option<String>,
+}
+
+impl VerifiedSubmitAgentTally {
+    /// Receipts stuck in the composer or unverifiable.
+    #[must_use]
+    pub const fn unconfirmed(&self) -> u64 {
+        self.stuck_in_composer
+            .saturating_add(self.verification_unavailable)
+    }
+
+    /// At least [`VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES`] receipts, of which at
+    /// least [`VERIFIED_SUBMIT_DRIFT_PERCENT`] percent stayed unconfirmed: an
+    /// agent CLI update has probably broken composer detection.
+    #[must_use]
+    pub const fn is_drifting(&self) -> bool {
+        self.observed >= VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES
+            && self.unconfirmed().saturating_mul(100)
+                >= self.observed.saturating_mul(VERIFIED_SUBMIT_DRIFT_PERCENT)
+    }
+
+    /// The detection the watcher records and publishes when this agent type
+    /// starts drifting. It carries counts, the agent type and the latest
+    /// profile, never sent text or idempotency keys.
+    #[must_use]
+    pub fn drift_detection(&self) -> crate::patterns::Detection {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let agent_type = match self.agent_type.as_str() {
+            "codex" => AgentType::Codex,
+            "claude_code" => AgentType::ClaudeCode,
+            "gemini" => AgentType::Gemini,
+            _ => AgentType::Unknown,
+        };
+        Detection {
+            rule_id: VERIFIED_SUBMIT_DRIFT_RULE_ID.to_string(),
+            agent_type,
+            event_type: "submit_profile.drift".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: serde_json::json!({
+                "agent_type": self.agent_type,
+                "observed": self.observed,
+                "unconfirmed": self.unconfirmed(),
+                "stuck_in_composer": self.stuck_in_composer,
+                "verification_unavailable": self.verification_unavailable,
+                "profile": self.profile,
+            }),
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+}
+
+/// The agent type a receipt is tallied under: its trimmed agent type, or
+/// `unknown` when it has none.
+#[must_use]
+pub fn verified_submit_receipt_agent(receipt: &crate::robot_types::SubmitReceipt) -> &str {
+    receipt
+        .agent_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .unwrap_or("unknown")
+}
+
+/// Tally verified-send receipts, newest first, per agent type (ordered by
+/// agent type). A receipt without an agent type counts as `unknown`.
+#[must_use]
+pub fn verified_submit_agent_tallies<'a>(
+    receipts: impl IntoIterator<Item = &'a crate::robot_types::SubmitReceipt>,
+) -> Vec<VerifiedSubmitAgentTally> {
+    use crate::robot_types::SubmitReceiptState;
+
+    let mut tallies: std::collections::BTreeMap<String, VerifiedSubmitAgentTally> =
+        std::collections::BTreeMap::new();
+    for receipt in receipts {
+        let observable = matches!(
+            receipt.state,
+            SubmitReceiptState::Submitted
+                | SubmitReceiptState::QueuedBehindOperation
+                | SubmitReceiptState::StuckInComposer
+                | SubmitReceiptState::VerificationUnavailable
+                | SubmitReceiptState::PaneCrashedToShell
+        );
+        if !observable {
+            continue;
+        }
+        let agent = verified_submit_receipt_agent(receipt);
+        let tally = tallies
+            .entry(agent.to_string())
+            .or_insert_with(|| VerifiedSubmitAgentTally {
+                agent_type: agent.to_string(),
+                ..VerifiedSubmitAgentTally::default()
+            });
+        tally.observed = tally.observed.saturating_add(1);
+        match receipt.state {
+            SubmitReceiptState::StuckInComposer => {
+                tally.stuck_in_composer = tally.stuck_in_composer.saturating_add(1);
+            }
+            SubmitReceiptState::VerificationUnavailable => {
+                tally.verification_unavailable = tally.verification_unavailable.saturating_add(1);
+            }
+            _ => {}
+        }
+        // Newest first, so the first profile seen is the latest.
+        if tally.profile.is_none() {
+            tally.profile = receipt.profile_id.as_ref().map(|profile_id| {
+                match receipt.profile_version.as_deref() {
+                    Some(version) => format!("{profile_id} v{version}"),
+                    None => profile_id.clone(),
+                }
+            });
+        }
+    }
+    tallies.into_values().collect()
+}
+
+/// Live `verified_submit` source from recent verified-send receipts
+/// (W2.8, ft-7h5da.3.9), each paired with its audit timestamp in epoch ms.
+/// Receipts are grouped by agent type over the outcomes the agent's UI
+/// decides: submitted, queued behind an operation, stuck in the composer,
+/// unverifiable, or crashed to a shell. Policy outcomes and failed sends say
+/// nothing about the UI and are left out. An agent type with at least
+/// [`VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES`] such receipts, of which at least
+/// [`VERIFIED_SUBMIT_DRIFT_PERCENT`] percent stayed unconfirmed, raises a
+/// `submit_profile_drift` fact: an agent CLI update has probably broken
+/// composer detection, so verified sends to it can no longer be trusted.
+/// `None` means the receipts could not be read.
+#[must_use]
+pub fn verified_submit_observation_from_receipts(
+    receipts: Option<&[(i64, crate::robot_types::SubmitReceipt)]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "verified_submit.recent_receipts";
+    const API: &str = "storage.audit_actions.verification_summary";
+    let Some(receipts) = receipts else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::VerifiedSubmit,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "verified-send receipts could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local audit log is unavailable",
+            )
+            .with_reason_code("verified_submit.audit_unavailable"),
+        );
+    };
+    let tallies = verified_submit_agent_tallies(receipts.iter().map(|(_, receipt)| receipt));
+    let freshness_ms = receipts
+        .iter()
+        .map(|(ts, _)| *ts)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::VerifiedSubmit,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!(
+            "{} verified-send receipts from {} agent types in the last 24 hours",
+            receipts.len(),
+            tallies.len()
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(receipts.len()).unwrap_or(u64::MAX));
+    for tally in tallies {
+        if !tally.is_drifting() {
+            continue;
+        }
+        let agent = tally.agent_type.as_str();
+        let unconfirmed = tally.unconfirmed();
+        let profile = tally.profile.as_deref().unwrap_or("no submit profile");
+        let mute_key = format!("attention.verified_submit.drift.{agent}");
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SubmitProfileDrift,
+                format!(
+                    "{agent}: {unconfirmed} of {} verified sends unconfirmed ({} stuck in composer, {} unverifiable), {profile} [mute: ft mute add {mute_key}]",
+                    tally.observed, tally.stuck_in_composer, tally.verification_unavailable
+                ),
+            )
+            .count(unconfirmed)
+            .with_agent_name(agent)
+            .with_reason_code("verified_submit.profile_drift")
+            .with_reason_code(format!("agent_type.{agent}"))
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
+/// Detection history a live `events` source covers.
+pub const UNHANDLED_EVENTS_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest groups of identical unhandled detection events (same pane, rule,
+/// type and extracted values) a live `events` source reads. A source that
+/// fills it reports itself degraded rather than silently dropping older ones.
+pub const UNHANDLED_EVENTS_MAX_ROWS: usize = 256;
+
+/// One group of identical unhandled events, as a live `events` source uses
+/// it. Matched text and extracted values never leave the database;
+/// `identity_key` is the redacted hash `ft mute` keys events by
+/// (`crate::events::event_identity_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledEventRow {
+    pub pane_id: u64,
+    pub rule_id: String,
+    pub identity_key: String,
+    /// Events in the group.
+    pub occurrences: u64,
+    /// Detection time of the newest event in the group.
+    pub newest_at: i64,
+    /// Any event in the group is critical (the rest are warnings).
+    pub critical: bool,
+    /// Any event in the group was taken by a workflow that failed.
+    pub handling_failed: bool,
+}
+
+/// Live `events` source from unhandled warning and critical detection
+/// events, read by the caller within [`UNHANDLED_EVENTS_WINDOW_MS`] and
+/// [`UNHANDLED_EVENTS_MAX_ROWS`]. Events whose handling workflow failed count
+/// as unhandled; events an operator triaged as resolved or dismissed, and the
+/// watcher's own submit-profile drift events (already the `verified_submit`
+/// item), are left out. One fact per event identity, the key `ft mute` uses,
+/// so a muted event drops out and a repeating one is one item with a count.
+/// `None` means the events could not be read.
+#[must_use]
+pub fn unhandled_events_observation(
+    events: Option<&[UnhandledEventRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "events.unhandled";
+    const API: &str = "storage.events.read_unhandled";
+    let Some(events) = events else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::Events,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "detection events could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local events table is unavailable",
+            )
+            .with_reason_code("events.unavailable"),
+        );
+    };
+    // identity -> (newest group, occurrences, any critical, any failed handling)
+    let mut identities: std::collections::BTreeMap<&str, (&UnhandledEventRow, u64, bool, bool)> =
+        std::collections::BTreeMap::new();
+    for group in events {
+        let entry = identities
+            .entry(group.identity_key.as_str())
+            .or_insert((group, 0, false, false));
+        if group.newest_at > entry.0.newest_at {
+            entry.0 = group;
+        }
+        entry.1 = entry.1.saturating_add(group.occurrences);
+        entry.2 |= group.critical;
+        entry.3 |= group.handling_failed;
+    }
+    let total: u64 = events.iter().map(|group| group.occurrences).sum();
+    let freshness_ms = events
+        .iter()
+        .map(|group| group.newest_at)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let truncated = events.len() >= UNHANDLED_EVENTS_MAX_ROWS;
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::Events,
+        if truncated {
+            AttentionRouterSourceHealth::Degraded
+        } else {
+            AttentionRouterSourceHealth::Available
+        },
+        API,
+        format!(
+            "{total} unhandled warning or critical events ({} distinct) in the last 24 hours{}",
+            identities.len(),
+            if truncated {
+                "; older groups were not read"
+            } else {
+                ""
+            }
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(total);
+    if truncated {
+        observation = observation.with_reason_code("events.truncated");
+    }
+    for (identity_key, (newest, occurrences, critical, handling_failed)) in identities {
+        let age_s = now_ms.saturating_sub(u64::try_from(newest.newest_at).unwrap_or(0)) / 1000;
+        let fact_kind = if critical {
+            AttentionRouterSourceFactKind::EventCritical
+        } else {
+            AttentionRouterSourceFactKind::EventUnhandled
+        };
+        let mut fact = AttentionRouterSourceFact::new(
+            fact_kind,
+            format!(
+                "{occurrences} unhandled {} event(s) on pane {}{}{}, newest {age_s}s ago [mute: ft mute add {identity_key}]",
+                newest.rule_id,
+                newest.pane_id,
+                if critical { ", including critical" } else { "" },
+                if handling_failed {
+                    ", a handling workflow failed"
+                } else {
+                    ""
+                },
+            ),
+        )
+        .count(occurrences)
+        .with_affected_path(format!("pane:{}", newest.pane_id))
+        .with_reason_code("event.unhandled")
+        .with_notification_identity_key(identity_key);
+        if critical {
+            fact = fact.with_reason_code("event.critical");
+        }
+        if handling_failed {
+            fact = fact.with_reason_code("event.handling_failed");
+        }
+        observation = observation.with_fact(fact);
+    }
+    observation
+}
+
+/// Newest active manual pane reservations a live `pane_reservations` source
+/// reads.
+pub const MANUAL_RESERVATIONS_MAX_ROWS: usize = 64;
+
+/// The reservation fields a live `pane_reservations` source uses. The
+/// operator's free-text reason never leaves the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualReservationRow {
+    pub reservation_id: i64,
+    pub pane_id: u64,
+    pub owner_id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Live `pane_reservations` source from active, unexpired manual
+/// reservations: panes an operator paused or quarantined (`ft intervene`,
+/// `ft reserve`), which agents must leave alone until released or expired.
+/// One fact per reservation. `None` means the reservations could not be read.
+#[must_use]
+pub fn manual_reservations_observation(
+    reservations: Option<&[ManualReservationRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "pane_reservations.manual";
+    const API: &str = "storage.pane_reservations.active_manual";
+    let Some(reservations) = reservations else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::PaneReservations,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "pane reservations could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local pane reservation table is unavailable",
+            )
+            .with_reason_code("pane_reservations.unavailable"),
+        );
+    };
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::PaneReservations,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!("{} active manual pane reservations", reservations.len()),
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(reservations.len()).unwrap_or(u64::MAX));
+    for reservation in reservations {
+        let expires_in_s = u64::try_from(reservation.expires_at)
+            .unwrap_or(0)
+            .saturating_sub(now_ms)
+            / 1000;
+        let mute_key = format!("attention.pane_reservations.{}", reservation.reservation_id);
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::PaneReservationActive,
+                format!(
+                    "pane {} is held by {} (manual reservation {}), expires in {expires_in_s}s [mute: ft mute add {mute_key}]",
+                    reservation.pane_id, reservation.owner_id, reservation.reservation_id
+                ),
+            )
+            .with_agent_name(reservation.owner_id.as_str())
+            .with_affected_path(format!("pane:{}", reservation.pane_id))
+            .with_reason_code("reservation.active_manual")
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
+/// Crash history a live `incident_bundles` source covers.
+pub const RECENT_CRASH_BUNDLES_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest crash bundles a live `incident_bundles` source considers.
+pub const RECENT_CRASH_BUNDLES_MAX: usize = 8;
+
+/// A crash bundle a live `incident_bundles` source uses: its directory name
+/// and crash time only. The crash message and backtrace never reach a fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashBundleRow {
+    pub name: String,
+    pub crashed_at_ms: u64,
+}
+
+/// Live `incident_bundles` source from the watcher's crash bundles written in
+/// the last [`RECENT_CRASH_BUNDLES_WINDOW_MS`]: each is one fact asking for
+/// review (`ft reproduce export --kind crash`), muted per bundle once
+/// reviewed. `complete` is false when the bounded discovery could not prove
+/// its list (the source is then degraded, never "no crash"). `None` means
+/// the crash directory could not be read.
+#[must_use]
+pub fn crash_bundles_observation(
+    bundles: Option<&[CrashBundleRow]>,
+    complete: bool,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "incident_bundles.recent_crashes";
+    const API: &str = "crash_dir.read_only";
+    let Some(bundles) = bundles else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::IncidentBundles,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "the crash bundle directory could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local crash bundle directory is unavailable",
+            )
+            .with_reason_code("incident_bundles.unavailable"),
+        );
+    };
+    let freshness_ms = bundles
+        .iter()
+        .map(|bundle| bundle.crashed_at_ms)
+        .max()
+        .map_or(0, |newest| now_ms.saturating_sub(newest));
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::IncidentBundles,
+        if complete {
+            AttentionRouterSourceHealth::Available
+        } else {
+            AttentionRouterSourceHealth::Degraded
+        },
+        API,
+        format!(
+            "{} crash bundles in the last 24 hours{}",
+            bundles.len(),
+            if complete {
+                ""
+            } else {
+                "; the crash directory could not be fully listed"
+            }
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(bundles.len()).unwrap_or(u64::MAX));
+    if !complete {
+        observation = observation.with_reason_code("incident_bundles.incomplete");
+    }
+    for bundle in bundles {
+        let age_s = now_ms.saturating_sub(bundle.crashed_at_ms) / 1000;
+        let mute_key = format!("attention.incident_bundles.{}", bundle.name);
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::IncidentBundleOpen,
+                format!(
+                    "watcher crash bundle {} ({age_s}s old) needs review: ft reproduce export --kind crash [mute: ft mute add {mute_key}]",
+                    bundle.name
+                ),
+            )
+            .with_reason_code("incident.bundle_open")
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
+/// The workspace's active mission transaction contract
+/// (`.ft/mission/tx-active.json`): its id and lifecycle only. Intent text,
+/// steps and receipts stay in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTxRow {
+    pub tx_id: String,
+    pub state: crate::plan::MissionTxState,
+}
+
+/// Live `mission_tx_status` source from the active transaction contract: a
+/// failed or compensating transaction is a blocker until it is rolled back
+/// or settled. `Some(None)` means no active contract; `None` means it could
+/// not be read.
+#[must_use]
+pub fn active_tx_observation(
+    active: Option<Option<&ActiveTxRow>>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    use crate::plan::MissionTxState;
+
+    const SOURCE_ID: &str = "mission_tx_status.active";
+    const API: &str = "workspace.mission.tx_active_contract";
+    let Some(active) = active else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::MissionTxStatus,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "the active transaction contract could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the active transaction contract is unreadable",
+            )
+            .with_reason_code("mission_tx_status.unavailable"),
+        );
+    };
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::MissionTxStatus,
+        AttentionRouterSourceHealth::Available,
+        API,
+        match active {
+            Some(tx) => format!("active transaction {} is {:?}", tx.tx_id, tx.state),
+            None => "no active transaction contract".to_string(),
+        },
+    )
+    .live(now_ms, 0);
+    let Some(tx) = active else {
+        return observation;
+    };
+    let (state, next) = match tx.state {
+        MissionTxState::Failed => ("failed", "roll it back with ft tx rollback"),
+        MissionTxState::Compensating => (
+            "compensating",
+            "let compensation finish, then check ft tx show",
+        ),
+        _ => return observation,
+    };
+    let reason_code = format!("tx.{state}");
+    // The state is part of the key: muting a compensating transaction must
+    // not silence it if compensation fails and it returns to failed.
+    let mute_key = format!("attention.mission_tx_status.{}.{state}", tx.tx_id);
+    observation = observation.with_fact(
+        AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::MissionTxState,
+            format!(
+                "transaction {} is {:?}: {next} [mute: ft mute add {mute_key}]",
+                tx.tx_id, tx.state
+            ),
+        )
+        .with_reason_code(reason_code)
+        .with_notification_identity_key(mute_key),
+    );
+    observation
+}
+
+/// Source id of the live `git` source. Its facts name paths, which are
+/// user-chosen text, so they are classified by kind and reason codes only.
+pub const LIVE_GIT_SOURCE_ID: &str = "git.live_status";
+/// Source id of the live `beads` source (bead ids are user-chosen text too).
+pub const LIVE_BEADS_SOURCE_ID: &str = "beads.live_ready";
+/// Paths a live `git` fact lists; its count covers all of them.
+pub const LIVE_GIT_MAX_LISTED_PATHS: usize = 20;
+/// Ready bead ids a live `beads` fact lists, highest priority first.
+pub const LIVE_BEADS_MAX_LISTED: usize = 10;
+
+/// The workspace's `git status`, as the live `git` source uses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatusSummary {
+    /// Commits the branch is ahead of its upstream (0 without one).
+    pub ahead: u64,
+    /// Commits the branch is behind its upstream (0 without one).
+    pub behind: u64,
+    /// Every path with uncommitted changes (staged, unstaged, untracked or
+    /// unmerged), in git's order.
+    pub uncommitted_paths: Vec<String>,
+    /// The paths with staged changes.
+    pub staged_paths: Vec<String>,
+    pub untracked: u64,
+    pub unmerged: u64,
+}
+
+/// Parse `git status --porcelain=v2 --branch -z`. `None` when a record is
+/// not one the format defines, so a misread never looks like a clean tree.
+#[must_use]
+pub fn parse_git_status_porcelain_v2(raw: &[u8]) -> Option<GitStatusSummary> {
+    let mut summary = GitStatusSummary::default();
+    let mut records = raw
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let record = String::from_utf8_lossy(record);
+        let (tag, rest) = record.split_once(' ')?;
+        // Fields after the tag, the path last: ordinary changes carry XY and
+        // six more, renames and copies one more (score), unmerged entries
+        // XY and eight more.
+        let field_count = match tag {
+            "#" => {
+                if let Some(divergence) = rest.strip_prefix("branch.ab ") {
+                    let (ahead, behind) = divergence.split_once(' ')?;
+                    summary.ahead = ahead.strip_prefix('+')?.parse().ok()?;
+                    summary.behind = behind.strip_prefix('-')?.parse().ok()?;
+                }
+                continue;
+            }
+            "?" => {
+                summary.untracked += 1;
+                summary.uncommitted_paths.push(rest.to_string());
+                continue;
+            }
+            "!" => continue,
+            "1" => 8,
+            "2" => 9,
+            "u" => 10,
+            _ => return None,
+        };
+        let fields: Vec<&str> = rest.splitn(field_count, ' ').collect();
+        let (Some(xy), Some(path)) = (fields.first(), fields.get(field_count - 1)) else {
+            return None;
+        };
+        if tag == "u" {
+            summary.unmerged += 1;
+        } else if !xy.starts_with('.') {
+            summary.staged_paths.push((*path).to_string());
+        }
+        summary.uncommitted_paths.push((*path).to_string());
+        if tag == "2" {
+            // A rename or copy is followed by its original path.
+            records.next()?;
+        }
+    }
+    Some(summary)
+}
+
+/// What the live `git` source could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveGitStatus {
+    Read(GitStatusSummary),
+    /// The workspace is not inside a git work tree.
+    NotARepository,
+    /// git could not be run or its output not read; the reason code says why.
+    Unavailable(&'static str),
+}
+
+/// Live `git` source from the workspace's `git status`: uncommitted paths
+/// are a dirty-overlap item (edit and stage only disjoint paths), with staged
+/// paths and upstream divergence as context facts.
+#[must_use]
+pub fn git_status_observation(
+    status: &LiveGitStatus,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const API: &str = "git status --porcelain=v2 --branch -z";
+    let summary = match status {
+        LiveGitStatus::Read(summary) => summary,
+        LiveGitStatus::NotARepository => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_GIT_SOURCE_ID,
+                AttentionRouterSourceKind::Git,
+                AttentionRouterSourceHealth::NotConfigured,
+                API,
+                "the workspace is not a git work tree",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceNotConfigured,
+                    "no git work tree at the workspace root",
+                )
+                .with_reason_code("git.not_a_repository"),
+            );
+        }
+        LiveGitStatus::Unavailable(reason_code) => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_GIT_SOURCE_ID,
+                AttentionRouterSourceKind::Git,
+                AttentionRouterSourceHealth::Unavailable,
+                API,
+                "git status could not be read",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceUnavailable,
+                    "git status could not be read",
+                )
+                .with_reason_code(*reason_code),
+            );
+        }
+    };
+    let listed = |paths: &[String]| {
+        paths
+            .iter()
+            .take(LIVE_GIT_MAX_LISTED_PATHS)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let uncommitted = summary.uncommitted_paths.len();
+    let mut observation = AttentionRouterSourceObservation::new(
+        LIVE_GIT_SOURCE_ID,
+        AttentionRouterSourceKind::Git,
+        AttentionRouterSourceHealth::Available,
+        API,
+        if uncommitted == 0 {
+            "the working tree is clean".to_string()
+        } else {
+            format!("{uncommitted} paths have uncommitted changes")
+        },
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(uncommitted).unwrap_or(u64::MAX));
+    if uncommitted > 0 {
+        let paths = listed(&summary.uncommitted_paths);
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitDirtyPaths,
+            format!(
+                "{uncommitted} paths have uncommitted changes ({} untracked, {} unmerged): {}{}",
+                summary.untracked,
+                summary.unmerged,
+                paths.join(", "),
+                if uncommitted > paths.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ),
+        )
+        .count(u64::try_from(uncommitted).unwrap_or(u64::MAX))
+        .with_reason_code("git.dirty_paths");
+        if summary.unmerged > 0 {
+            fact = fact.with_reason_code("git.unmerged_paths");
+        }
+        for path in paths {
+            fact = fact.with_affected_path(path);
+        }
+        observation = observation.with_fact(fact);
+    }
+    if !summary.staged_paths.is_empty() {
+        let staged = summary.staged_paths.len();
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitStagedPaths,
+            format!("{staged} paths are staged but not committed"),
+        )
+        .count(u64::try_from(staged).unwrap_or(u64::MAX))
+        .with_reason_code("git.staged_paths");
+        for path in listed(&summary.staged_paths) {
+            fact = fact.with_affected_path(path);
+        }
+        observation = observation.with_fact(fact);
+    }
+    if summary.ahead > 0 || summary.behind > 0 {
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitBranchDivergence,
+            format!(
+                "the branch is {} commits ahead of and {} behind its upstream",
+                summary.ahead, summary.behind
+            ),
+        )
+        .count(summary.ahead.saturating_add(summary.behind));
+        if summary.ahead > 0 {
+            fact = fact.with_reason_code("git.branch_ahead");
+        }
+        if summary.behind > 0 {
+            fact = fact.with_reason_code("git.branch_behind");
+        }
+        observation = observation.with_fact(fact);
+    }
+    observation
+}
+
+/// A ready bead, as the live `beads` source uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyBeadRow {
+    pub id: String,
+    pub priority: u8,
+}
+
+/// Parse `br ready --json` (an array of issues, or an object holding them
+/// under `issues`): each issue's id and priority. Epics are left out: they
+/// are containers, not claimable work. `None` when the output is not that
+/// shape.
+#[must_use]
+pub fn parse_br_ready_json(raw: &[u8]) -> Option<Vec<ReadyBeadRow>> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let issues = match &value {
+        serde_json::Value::Array(issues) => issues,
+        serde_json::Value::Object(object) => object.get("issues")?.as_array()?,
+        _ => return None,
+    };
+    let mut rows = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let id = issue.get("id")?.as_str()?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        if issue.get("issue_type").and_then(serde_json::Value::as_str) == Some("epic") {
+            continue;
+        }
+        let priority = issue
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|priority| u8::try_from(priority).ok())
+            .unwrap_or(u8::MAX);
+        rows.push(ReadyBeadRow {
+            id: id.to_string(),
+            priority,
+        });
+    }
+    Some(rows)
+}
+
+/// What the live `beads` source could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveReadyBeads {
+    Read(Vec<ReadyBeadRow>),
+    /// The workspace has no `.beads` tracker.
+    NotConfigured,
+    /// `br` could not be run or its output not read; the reason code says why.
+    Unavailable(&'static str),
+}
+
+/// Live `beads` source from `br ready`: one ready-work item naming the
+/// highest-priority ready beads (most urgent first, `br`'s own order within
+/// a priority), with the total count.
+#[must_use]
+pub fn ready_beads_observation(
+    beads: &LiveReadyBeads,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const API: &str = "br ready --json";
+    let rows = match beads {
+        LiveReadyBeads::Read(rows) => rows,
+        LiveReadyBeads::NotConfigured => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_BEADS_SOURCE_ID,
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::NotConfigured,
+                API,
+                "the workspace has no beads tracker",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceNotConfigured,
+                    "no .beads directory at the workspace root",
+                )
+                .with_reason_code("beads.not_configured"),
+            );
+        }
+        LiveReadyBeads::Unavailable(reason_code) => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_BEADS_SOURCE_ID,
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::Unavailable,
+                API,
+                "ready beads could not be read",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceUnavailable,
+                    "br ready could not be read",
+                )
+                .with_reason_code(*reason_code),
+            );
+        }
+    };
+    let mut ordered: Vec<&ReadyBeadRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.priority);
+    let observation = AttentionRouterSourceObservation::new(
+        LIVE_BEADS_SOURCE_ID,
+        AttentionRouterSourceKind::Beads,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!("{} ready beads", rows.len()),
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+    let Some(top) = ordered.first() else {
+        return observation;
+    };
+    let listed: Vec<&str> = ordered
+        .iter()
+        .take(LIVE_BEADS_MAX_LISTED)
+        .map(|row| row.id.as_str())
+        .collect();
+    let mut fact = AttentionRouterSourceFact::new(
+        AttentionRouterSourceFactKind::BeadsReady,
+        format!(
+            "{} ready beads; highest priority first (P{}): {}",
+            rows.len(),
+            top.priority,
+            listed.join(", ")
+        ),
+    )
+    .count(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+    .with_reason_code("beads.ready_available");
+    for id in listed {
+        fact = fact.with_bead_id(id);
+    }
+    observation.with_fact(fact)
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -2686,7 +3930,7 @@ fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
     }
 }
 
-// ── W6.2 (ft-7h5da.7.2): deterministic ranked `ft robot next` advisory view ──
+// ── W6.2 (ft-7h5da.7.2): deterministic ranked `ft robot attention next` advisory view ──
 //
 // Layers a deterministic ranking (severity x age x pane-priority) with a
 // MANDATORY `reasons[]` rationale and a self-teaching `suggested_command` on top
@@ -2768,7 +4012,7 @@ pub struct AttentionRouterNextScore {
     pub composite: u64,
 }
 
-/// A single ranked entry in the `ft robot next` advisory view.
+/// A single ranked entry in the `ft robot attention next` advisory view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRouterNextEntry {
     /// 1-based position in the full ranked list (assigned before any budget
@@ -2906,16 +4150,16 @@ fn attention_router_next_suggested_command(item: &AttentionRouterItem) -> String
     if let Some(hint) = item.recommended_action.command_hint.as_ref() {
         let trimmed = hint.trim();
         if !trimmed.is_empty() {
-            return bounded_string(trimmed, "ft robot next --explain");
+            return bounded_string(trimmed, "ft robot attention explain");
         }
     }
     // Otherwise derive a safe, self-teaching default from the subject. `br show`
-    // and `ft robot next --explain` are read-only and always valid.
+    // and `ft robot attention explain` are read-only and always valid.
     let command = match item.subject.bead_id.as_deref() {
         Some(bead_id) if !bead_id.trim().is_empty() => format!("br show {}", bead_id.trim()),
-        _ => format!("ft robot next --explain {}", item.item_id),
+        _ => format!("ft robot attention explain {}", item.item_id),
     };
-    bounded_string(command, "ft robot next --explain")
+    bounded_string(command, "ft robot attention explain")
 }
 
 fn attention_router_next_estimated_tokens(
@@ -3141,6 +4385,921 @@ mod tests {
 
         let absent = operating_envelope_observation_from_health(None, now, 90_000);
         assert_eq!(absent.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    fn audit_row(
+        id: i64,
+        actor_id: Option<&str>,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        rule_id: Option<&str>,
+        policy_decision: &str,
+        ts: i64,
+    ) -> crate::storage::AuditActionRecord {
+        crate::storage::AuditActionRecord {
+            id,
+            ts,
+            actor_kind: "robot".to_string(),
+            actor_id: actor_id.map(str::to_string),
+            correlation_id: None,
+            pane_id,
+            domain: Some("local".to_string()),
+            action_kind: action_kind.to_string(),
+            policy_decision: policy_decision.to_string(),
+            decision_reason: Some("blocked rm -rf /secret-canary".to_string()),
+            rule_id: rule_id.map(str::to_string),
+            input_summary: Some("rm -rf /secret-canary".to_string()),
+            verification_summary: None,
+            decision_context: Some("{\"text\":\"secret-canary\"}".to_string()),
+            result: "denied".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_policy_gate_sources_group_audit_rows_without_their_input() {
+        let now: u64 = 1_800_000_000_000;
+        let at = |ago: i64| i64::try_from(now).expect("epoch ms") - ago;
+        let denied = [
+            audit_row(
+                3,
+                Some("BlueLake"),
+                "send_text",
+                Some(7),
+                Some("command_gate.destructive"),
+                "deny",
+                at(1_000),
+            ),
+            audit_row(
+                2,
+                Some("BlueLake"),
+                "send_text",
+                Some(9),
+                Some("command_gate.destructive"),
+                "deny",
+                at(5_000),
+            ),
+            audit_row(1, None, "spawn", None, None, "deny", at(9_000)),
+        ];
+        // Converting a full audit record drops its input, reason and context.
+        let denied: Vec<PolicyGateAuditRow> = denied.iter().map(PolicyGateAuditRow::from).collect();
+        let observation = policy_denied_observation_from_audit(Some(&denied), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::PolicyDeniedAudit
+        );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert!(observation.live);
+        assert_eq!(observation.items_seen, Some(3));
+        assert_eq!(observation.freshness_ms, Some(1_000));
+        assert_eq!(observation.facts.len(), 2, "grouped by actor, action, rule");
+        let blue = observation
+            .facts
+            .iter()
+            .find(|fact| fact.agent_names == ["BlueLake"])
+            .expect("BlueLake group");
+        assert_eq!(blue.count, Some(2));
+        assert!(blue.summary.contains("pane 7, 9"), "{}", blue.summary);
+        assert!(blue.reason_codes.contains(&"policy.denied".to_string()));
+        let anonymous = observation
+            .facts
+            .iter()
+            .find(|fact| fact.agent_names == ["robot"])
+            .expect("an actor without an id falls back to its kind");
+        assert!(
+            anonymous
+                .reason_codes
+                .contains(&"policy_rule.unspecified".to_string())
+        );
+        let mute_key = "attention.policy_denied_audit.BlueLake.send_text.command_gate.destructive";
+        assert_eq!(blue.notification_identity_key.as_deref(), Some(mute_key));
+        assert!(blue.summary.contains(mute_key), "{}", blue.summary);
+        let rendered = serde_json::to_string(&observation).expect("serialize");
+        assert!(
+            !rendered.contains("secret-canary"),
+            "no action input, free-text reason, or decision context: {rendered}"
+        );
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        let blockers = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.kind == AttentionRouterItemKind::Blocker)
+                .count()
+        };
+        assert_eq!(
+            blockers(&snapshot),
+            2,
+            "each live denial group is a blocker"
+        );
+        // An operator mute on the printed key suppresses exactly that group.
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::workspace_current(
+                    mute_key,
+                )),
+        );
+        assert_eq!(blockers(&muted), 1, "the muted group is suppressed");
+
+        let required = [PolicyGateAuditRow::from(&audit_row(
+            4,
+            Some("BlueLake"),
+            "send_text",
+            Some(7),
+            Some("approval.send"),
+            "require_approval",
+            at(2_000),
+        ))];
+        let approval = approval_required_observation_from_audit(Some(&required), now);
+        assert_eq!(
+            approval.source_kind,
+            AttentionRouterSourceKind::ApprovalStore
+        );
+        assert_eq!(
+            approval.facts[0].fact,
+            AttentionRouterSourceFactKind::PolicyRequireApproval
+        );
+        assert!(
+            approval.facts[0]
+                .reason_codes
+                .contains(&"approval.required".to_string())
+        );
+
+        let quiet = policy_denied_observation_from_audit(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = policy_denied_observation_from_audit(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+        assert_eq!(
+            unreadable.facts[0].fact,
+            AttentionRouterSourceFactKind::SourceUnavailable
+        );
+    }
+
+    fn submit_receipt(
+        agent: &str,
+        state: crate::robot_types::SubmitReceiptState,
+    ) -> crate::robot_types::SubmitReceipt {
+        crate::robot_types::SubmitReceipt {
+            state,
+            guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
+            guarantee_met: false,
+            agent_type: Some(agent.to_string()),
+            profile_id: Some(format!("{agent}.default")),
+            profile_version: Some("3".to_string()),
+            attempts: 1,
+            evidence_rule_ids: Vec::new(),
+            elapsed_ms: 10,
+            polls: 1,
+            cursor_before: None,
+            cursor_after: None,
+            idempotency_key: "secret-canary-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_verified_submit_source_flags_agent_types_whose_sends_stay_unconfirmed() {
+        use crate::robot_types::SubmitReceiptState as State;
+
+        let now: u64 = 1_800_000_000_000;
+        let ts = i64::try_from(now).expect("epoch ms") - 2_000;
+        let mut receipts = Vec::new();
+        // codex: 5 of 8 UI-observable sends unconfirmed.
+        for state in [
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::VerificationUnavailable,
+            State::VerificationUnavailable,
+            State::VerificationUnavailable,
+            State::Submitted,
+            State::Submitted,
+            State::QueuedBehindOperation,
+        ] {
+            receipts.push((ts, submit_receipt("codex", state)));
+        }
+        // Policy and transport outcomes are not evidence about the UI.
+        for state in [
+            State::PolicyDenied,
+            State::RequiresApproval,
+            State::SendFailed,
+        ] {
+            receipts.push((ts, submit_receipt("codex", state)));
+        }
+        // claude_code: 3 of 7 unconfirmed, below the sample floor anyway.
+        for state in [
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::Submitted,
+            State::Submitted,
+            State::Submitted,
+            State::Submitted,
+        ] {
+            receipts.push((ts, submit_receipt("claude_code", state)));
+        }
+        let observation = verified_submit_observation_from_receipts(Some(&receipts), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::VerifiedSubmit
+        );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(18));
+        assert_eq!(observation.freshness_ms, Some(2_000));
+        assert_eq!(observation.facts.len(), 1, "only codex drifts");
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::SubmitProfileDrift);
+        assert_eq!(fact.count, Some(5));
+        assert_eq!(fact.agent_names, ["codex"]);
+        assert!(fact.summary.contains("5 of 8"), "{}", fact.summary);
+        assert!(
+            fact.summary.contains("codex.default v3"),
+            "{}",
+            fact.summary
+        );
+        assert_eq!(
+            fact.notification_identity_key.as_deref(),
+            Some("attention.verified_submit.drift.codex")
+        );
+        let rendered = serde_json::to_string(&observation).expect("serialize");
+        assert!(!rendered.contains("secret-canary"), "{rendered}");
+        let drift_blocker = |snapshot: &AttentionRouterSnapshot| {
+            snapshot.items.iter().any(|item| {
+                item.kind == AttentionRouterItemKind::Blocker
+                    && item
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "verified_submit.profile_drift")
+            })
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert!(
+            drift_blocker(&snapshot),
+            "submit-profile drift is a blocker"
+        );
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.verified_submit.drift.codex",
+                )),
+        );
+        assert!(!drift_blocker(&muted), "a muted drift key is suppressed");
+
+        // Exactly half of eight samples drifts; seven samples never do.
+        let at_threshold: Vec<_> = (0..8)
+            .map(|index| {
+                let state = if index < 4 {
+                    State::VerificationUnavailable
+                } else {
+                    State::Submitted
+                };
+                (ts, submit_receipt("gemini", state))
+            })
+            .collect();
+        assert_eq!(
+            verified_submit_observation_from_receipts(Some(&at_threshold), now)
+                .facts
+                .len(),
+            1
+        );
+        let below_floor: Vec<_> = (0..7)
+            .map(|_| (ts, submit_receipt("gemini", State::VerificationUnavailable)))
+            .collect();
+        assert!(
+            verified_submit_observation_from_receipts(Some(&below_floor), now)
+                .facts
+                .is_empty()
+        );
+
+        let quiet = verified_submit_observation_from_receipts(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = verified_submit_observation_from_receipts(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn live_events_source_groups_unhandled_events_by_mute_identity() {
+        let now = 1_770_000_000_000_u64;
+        // Two groups (different raw extracted text) share one identity.
+        let group = |identity: &str,
+                     rule: &str,
+                     occurrences: u64,
+                     critical: bool,
+                     handling_failed: bool,
+                     pane: u64,
+                     ago_ms: i64| UnhandledEventRow {
+            pane_id: pane,
+            rule_id: rule.to_string(),
+            identity_key: identity.to_string(),
+            occurrences,
+            newest_at: i64::try_from(now).unwrap() - ago_ms,
+            critical,
+            handling_failed,
+        };
+        let events = [
+            group("evt:aa", "codex.usage.reached", 3, false, false, 3, 90_000),
+            group("evt:aa", "codex.usage.reached", 1, true, true, 3, 30_000),
+            group("evt:bb", "claude.compaction", 1, false, false, 5, 5_000),
+        ];
+        let observation = unhandled_events_observation(Some(&events), now);
+        assert_eq!(observation.source_kind, AttentionRouterSourceKind::Events);
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(5));
+        assert_eq!(observation.freshness_ms, Some(5_000));
+        assert_eq!(observation.facts.len(), 2, "one fact per event identity");
+        let repeated = &observation.facts[0];
+        assert_eq!(repeated.fact, AttentionRouterSourceFactKind::EventCritical);
+        assert_eq!(repeated.count, Some(4));
+        assert!(
+            repeated
+                .reason_codes
+                .iter()
+                .any(|code| code == "event.handling_failed")
+        );
+        assert_eq!(
+            repeated.notification_identity_key.as_deref(),
+            Some("evt:aa")
+        );
+        assert_eq!(repeated.affected_paths, ["pane:3"]);
+        assert!(
+            repeated
+                .reason_codes
+                .iter()
+                .any(|code| code == "event.critical")
+        );
+        assert!(
+            repeated
+                .summary
+                .contains("4 unhandled codex.usage.reached event(s) on pane 3, including critical")
+                && repeated.summary.contains("a handling workflow failed")
+                && repeated.summary.contains("newest 30s ago")
+                && repeated.summary.contains("ft mute add evt:aa"),
+            "{}",
+            repeated.summary
+        );
+        let single = &observation.facts[1];
+        assert_eq!(single.fact, AttentionRouterSourceFactKind::EventUnhandled);
+        assert_eq!(single.count, Some(1));
+
+        let event_items = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.kind == AttentionRouterItemKind::Blocker
+                        && item
+                            .reason_codes
+                            .iter()
+                            .any(|code| code == "event.unhandled")
+                })
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(
+            event_items(&snapshot),
+            2,
+            "each unhandled identity is a blocker"
+        );
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global("evt:aa")),
+        );
+        assert_eq!(
+            event_items(&muted),
+            1,
+            "ft mute add <identity> drops that event"
+        );
+
+        let quiet = unhandled_events_observation(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = unhandled_events_observation(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+
+        // A read that filled the group cap says so instead of looking complete.
+        let full: Vec<_> = (0..UNHANDLED_EVENTS_MAX_ROWS)
+            .map(|index| {
+                group(
+                    &format!("evt:{index}"),
+                    "codex.usage.reached",
+                    1,
+                    false,
+                    false,
+                    3,
+                    1_000,
+                )
+            })
+            .collect();
+        let truncated = unhandled_events_observation(Some(&full), now);
+        assert_eq!(truncated.health, AttentionRouterSourceHealth::Degraded);
+        assert!(
+            truncated
+                .reason_codes
+                .iter()
+                .any(|code| code == "events.truncated")
+        );
+    }
+
+    #[test]
+    fn live_active_tx_is_a_blocker_only_while_failed_or_compensating() {
+        use crate::plan::MissionTxState;
+
+        let now = 1_770_000_000_000_u64;
+        // The id carries words the prose heuristics react to ("enospc",
+        // "disk-pressure"); the typed fact must still be a tx blocker.
+        let tx = |state| ActiveTxRow {
+            tx_id: "tx:enospc-disk-pressure-fix".to_string(),
+            state,
+        };
+        let failed = tx(MissionTxState::Failed);
+        let observation = active_tx_observation(Some(Some(&failed)), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::MissionTxStatus
+        );
+        assert_eq!(observation.facts.len(), 1);
+        let fact = &observation.facts[0];
+        assert_eq!(fact.reason_codes, ["tx.failed"]);
+        assert!(fact.summary.contains("ft tx rollback"), "{}", fact.summary);
+        let blockers = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.classification == AttentionRouterClassification::BlockedDomain
+                        && item.reason_codes.iter().any(|code| code == "tx.failed")
+                })
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(blockers(&snapshot), 1, "classified by kind, not prose");
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone())
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.mission_tx_status.tx:enospc-disk-pressure-fix.failed",
+                )),
+        );
+        assert_eq!(blockers(&muted), 0);
+        // A mute taken while it was compensating does not hide the failure.
+        let muted_while_compensating = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.mission_tx_status.tx:enospc-disk-pressure-fix.compensating",
+                )),
+        );
+        assert_eq!(blockers(&muted_while_compensating), 1);
+
+        let compensating = tx(MissionTxState::Compensating);
+        assert_eq!(
+            active_tx_observation(Some(Some(&compensating)), now).facts[0].reason_codes,
+            ["tx.compensating"]
+        );
+        let committed = tx(MissionTxState::Committed);
+        assert!(
+            active_tx_observation(Some(Some(&committed)), now)
+                .facts
+                .is_empty()
+        );
+        assert!(active_tx_observation(Some(None), now).facts.is_empty());
+        assert_eq!(
+            active_tx_observation(None, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn live_crash_bundles_are_incident_blockers_until_muted() {
+        let now = 1_770_000_000_000_u64;
+        let bundle = CrashBundleRow {
+            name: "wa_crash_20260210_120000".to_string(),
+            crashed_at_ms: now - 120_000,
+        };
+        let observation = crash_bundles_observation(Some(std::slice::from_ref(&bundle)), true, now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::IncidentBundles
+        );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.freshness_ms, Some(120_000));
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::IncidentBundleOpen);
+        assert!(fact.summary.contains("(120s old)"), "{}", fact.summary);
+        let key = "attention.incident_bundles.wa_crash_20260210_120000";
+        assert_eq!(fact.notification_identity_key.as_deref(), Some(key));
+
+        let incidents = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.classification == AttentionRouterClassification::BlockedInfra
+                        && item
+                            .reason_codes
+                            .iter()
+                            .any(|code| code == "incident.bundle_open")
+                })
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(incidents(&snapshot), 1);
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(key)),
+        );
+        assert_eq!(incidents(&muted), 0, "a reviewed bundle is muted");
+        assert_eq!(
+            crash_bundles_observation(None, true, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
+        // A listing that could not be proven complete is degraded, not "no crash".
+        let partial = crash_bundles_observation(Some(&[]), false, now);
+        assert_eq!(partial.health, AttentionRouterSourceHealth::Degraded);
+        assert!(
+            partial
+                .reason_codes
+                .iter()
+                .any(|code| code == "incident_bundles.incomplete")
+        );
+    }
+
+    #[test]
+    fn live_manual_reservations_are_do_not_touch_items_per_hold() {
+        let now = 1_770_000_000_000_u64;
+        // The holder's name would trip the disk-pressure prose heuristic; a
+        // pane hold must still classify as do-not-touch.
+        let held = ManualReservationRow {
+            reservation_id: 41,
+            pane_id: 7,
+            owner_id: "disk-pressure-fix".to_string(),
+            created_at: 1_769_999_000_000,
+            expires_at: 1_770_000_600_000,
+        };
+        let observation = manual_reservations_observation(Some(std::slice::from_ref(&held)), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::PaneReservations
+        );
+        assert_eq!(observation.facts.len(), 1);
+        let fact = &observation.facts[0];
+        assert_eq!(
+            fact.fact,
+            AttentionRouterSourceFactKind::PaneReservationActive
+        );
+        assert_eq!(fact.affected_paths, ["pane:7"]);
+        assert_eq!(fact.agent_names, ["disk-pressure-fix"]);
+        assert_eq!(
+            fact.notification_identity_key.as_deref(),
+            Some("attention.pane_reservations.41")
+        );
+        assert!(fact.summary.contains("expires in 600s"), "{}", fact.summary);
+
+        let held_items = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.classification == AttentionRouterClassification::DoNotTouch)
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(held_items(&snapshot), 1, "an operator hold is do-not-touch");
+        let do_not_touch = snapshot
+            .items
+            .iter()
+            .find(|item| item.classification == AttentionRouterClassification::DoNotTouch)
+            .expect("hold item");
+        assert!(
+            do_not_touch
+                .forbidden_actions
+                .iter()
+                .any(|action| action == "send_input_to_held_pane"),
+            "{:?}",
+            do_not_touch.forbidden_actions
+        );
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.pane_reservations.41",
+                )),
+        );
+        assert_eq!(held_items(&muted), 0);
+        assert_eq!(
+            manual_reservations_observation(None, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn git_porcelain_v2_parser_reads_every_record_kind() {
+        let raw = [
+            "# branch.oid 0123456789abcdef0123456789abcdef01234567",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +3 -1",
+            "1 M. N... 100644 100644 100644 aaaa bbbb src/staged.rs",
+            "1 .M N... 100644 100644 100644 aaaa aaaa src/edited file.rs",
+            "1 MM N... 100644 100644 100644 aaaa bbbb src/both.rs",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 src/new_name.rs",
+            "src/old_name.rs",
+            "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc src/conflict.rs",
+            "? notes/untracked note.md",
+            "! target/ignored",
+        ]
+        .join("\0");
+        let summary = parse_git_status_porcelain_v2(raw.as_bytes()).expect("parses");
+        assert_eq!((summary.ahead, summary.behind), (3, 1));
+        assert_eq!(
+            summary.uncommitted_paths,
+            [
+                "src/staged.rs",
+                "src/edited file.rs",
+                "src/both.rs",
+                "src/new_name.rs",
+                "src/conflict.rs",
+                "notes/untracked note.md",
+            ]
+        );
+        assert_eq!(
+            summary.staged_paths,
+            ["src/staged.rs", "src/both.rs", "src/new_name.rs"]
+        );
+        assert_eq!((summary.untracked, summary.unmerged), (1, 1));
+
+        assert_eq!(
+            parse_git_status_porcelain_v2(b"# branch.head main\0"),
+            Some(GitStatusSummary::default()),
+            "a clean tree without an upstream"
+        );
+        for malformed in [
+            &b"X unknown record\0"[..],
+            b"1 M. too few fields\0",
+            b"# branch.ab 3 1\0",
+            b"2 R. N... 100644 100644 100644 aaaa aaaa R100 src/renamed.rs\0",
+        ] {
+            assert_eq!(
+                parse_git_status_porcelain_v2(malformed),
+                None,
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn live_git_source_makes_uncommitted_paths_a_dirty_overlap_item() {
+        let now = 1_770_000_000_000_u64;
+        let mut summary = GitStatusSummary {
+            ahead: 2,
+            behind: 0,
+            uncommitted_paths: (0..25)
+                .map(|index| format!("src/file_{index}.rs"))
+                .collect(),
+            staged_paths: vec!["src/file_0.rs".to_string()],
+            untracked: 4,
+            unmerged: 0,
+        };
+        // A path that reads like a disk-pressure blocker is still only a path.
+        summary.uncommitted_paths[0] = "docs/disk-pressure-cleanup approval.md".to_string();
+        let observation = git_status_observation(&LiveGitStatus::Read(summary), now);
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(25));
+        let dirty = observation
+            .facts
+            .iter()
+            .find(|fact| fact.fact == AttentionRouterSourceFactKind::GitDirtyPaths)
+            .expect("dirty fact");
+        assert_eq!(dirty.count, Some(25));
+        assert_eq!(dirty.affected_paths.len(), LIVE_GIT_MAX_LISTED_PATHS);
+        assert!(dirty.summary.contains("4 untracked") && dirty.summary.ends_with(", ..."));
+        assert!(observation.facts.iter().any(|fact| fact.fact
+            == AttentionRouterSourceFactKind::GitStagedPaths
+            && fact.count == Some(1)));
+        assert!(observation.facts.iter().any(|fact| {
+            fact.fact == AttentionRouterSourceFactKind::GitBranchDivergence
+                && fact.reason_codes == ["git.branch_ahead"]
+        }));
+
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        let items: Vec<_> = snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                item.reason_codes
+                    .iter()
+                    .any(|code| code == "git.dirty_paths")
+            })
+            .collect();
+        assert_eq!(items.len(), 1, "{:?}", snapshot.items);
+        assert_eq!(
+            items[0].classification,
+            AttentionRouterClassification::DirtyOverlap
+        );
+        assert_eq!(
+            items[0].recommended_action.action,
+            AttentionRouterSafeAction::AvoidOverlappingPathsAndClaimOnlyDisjointReadyWork
+        );
+
+        let clean = git_status_observation(&LiveGitStatus::Read(GitStatusSummary::default()), now);
+        assert_eq!(clean.health, AttentionRouterSourceHealth::Available);
+        assert!(clean.facts.is_empty());
+        let not_repo = git_status_observation(&LiveGitStatus::NotARepository, now);
+        assert_eq!(not_repo.health, AttentionRouterSourceHealth::NotConfigured);
+        let not_repo_items = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(not_repo),
+        )
+        .items;
+        assert!(
+            !not_repo_items.iter().any(|item| item
+                .reason_codes
+                .iter()
+                .any(|code| code.starts_with("git."))),
+            "no git work tree is not an attention item: {not_repo_items:?}"
+        );
+        let failed = git_status_observation(&LiveGitStatus::Unavailable("git.status_failed"), now);
+        assert_eq!(failed.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn br_ready_parser_and_live_beads_source_rank_by_priority() {
+        let raw = br#"[
+            {"id": "ft-low", "priority": 3, "issue_type": "task"},
+            {"id": "ft-epic", "priority": 0, "issue_type": "epic"},
+            {"id": "ft-disk-pressure-cleanup", "priority": 1, "issue_type": "bug"},
+            {"id": "ft-urgent", "priority": 0, "issue_type": "bug"},
+            {"id": "ft-unranked", "issue_type": "task"}
+        ]"#;
+        let rows = parse_br_ready_json(raw).expect("array form");
+        assert_eq!(rows.len(), 4, "the epic is left out");
+        assert_eq!(rows[3].priority, u8::MAX);
+        let wrapped = format!(
+            "{{\"issues\": {}}}",
+            std::str::from_utf8(raw).expect("utf8")
+        );
+        assert_eq!(parse_br_ready_json(wrapped.as_bytes()), Some(rows.clone()));
+        assert_eq!(parse_br_ready_json(b"not json"), None);
+        assert_eq!(parse_br_ready_json(br#"[{"priority": 1}]"#), None);
+
+        let now = 1_770_000_000_000_u64;
+        let observation = ready_beads_observation(&LiveReadyBeads::Read(rows), now);
+        assert_eq!(observation.items_seen, Some(4));
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::BeadsReady);
+        assert_eq!(fact.count, Some(4));
+        assert_eq!(
+            fact.bead_ids,
+            [
+                "ft-urgent",
+                "ft-disk-pressure-cleanup",
+                "ft-low",
+                "ft-unranked"
+            ]
+        );
+
+        // An unavailable source never outranks ready work for `next`, and a
+        // bead id that reads like a blocker is still ready work.
+        let input =
+            AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation);
+        let next = build_attention_router_surface_payload(
+            &input,
+            AttentionRouterSurface::Next,
+            "test.next",
+            None,
+        );
+        assert_eq!(
+            next.next_action.as_ref().map(|action| action.action),
+            Some(AttentionRouterSafeAction::ClaimReadyStaticSliceReservePathsAndRunStaticChecks),
+            "next_action follows the selected item"
+        );
+        assert_eq!(
+            next.snapshot
+                .next_action
+                .as_ref()
+                .map(|action| action.action),
+            Some(AttentionRouterSafeAction::RefreshUnavailableSourceOrUseRemainingReadOnlyContext),
+            "the snapshot still ranks the missing sources first"
+        );
+        let selected = next.selected_item.expect("ready work is selected");
+        assert_eq!(
+            selected.classification,
+            AttentionRouterClassification::ReadyNow
+        );
+        assert_eq!(
+            selected.recommended_action.action,
+            AttentionRouterSafeAction::ClaimReadyStaticSliceReservePathsAndRunStaticChecks
+        );
+        assert!(next.degraded_mode.active, "missing sources stay reported");
+        assert!(
+            next.snapshot
+                .items
+                .iter()
+                .any(|item| item.kind == AttentionRouterItemKind::SourceHealth)
+        );
+
+        let empty = ready_beads_observation(&LiveReadyBeads::Read(Vec::new()), now);
+        assert!(empty.facts.is_empty());
+        assert_eq!(
+            ready_beads_observation(&LiveReadyBeads::NotConfigured, now).health,
+            AttentionRouterSourceHealth::NotConfigured
+        );
+        // With nothing actionable, `next` still surfaces the source problem.
+        let blind = build_attention_router_surface_payload(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo"),
+            AttentionRouterSurface::Next,
+            "test.next",
+            None,
+        );
+        assert_eq!(
+            blind.selected_item.expect("source health item").kind,
+            AttentionRouterItemKind::SourceHealth
+        );
+    }
+
+    #[test]
+    fn verified_submit_tallies_mark_drift_at_the_threshold_and_build_a_content_free_event() {
+        use crate::robot_types::SubmitReceiptState as State;
+
+        // gemini: exactly 4 of 8 unconfirmed, the 50 % boundary.
+        let mut receipts = vec![
+            submit_receipt("gemini", State::StuckInComposer),
+            submit_receipt("gemini", State::VerificationUnavailable),
+            submit_receipt("gemini", State::VerificationUnavailable),
+            submit_receipt("gemini", State::StuckInComposer),
+        ];
+        for _ in 0..4 {
+            receipts.push(submit_receipt("gemini", State::Submitted));
+        }
+        // codex: 3 of 7 unconfirmed and below the sample floor.
+        for state in [State::StuckInComposer; 3] {
+            receipts.push(submit_receipt("codex", state));
+        }
+        for _ in 0..4 {
+            receipts.push(submit_receipt("codex", State::Submitted));
+        }
+        let mut anonymous = submit_receipt("ignored", State::PaneCrashedToShell);
+        anonymous.agent_type = None;
+        receipts.push(anonymous);
+        receipts.push(submit_receipt("gemini", State::SendFailed));
+
+        let tallies = verified_submit_agent_tallies(&receipts);
+        let agents: Vec<&str> = tallies.iter().map(|t| t.agent_type.as_str()).collect();
+        assert_eq!(agents, ["codex", "gemini", "unknown"]);
+        let gemini = &tallies[1];
+        assert_eq!(
+            (
+                gemini.observed,
+                gemini.stuck_in_composer,
+                gemini.verification_unavailable
+            ),
+            (8, 2, 2),
+            "the send failure is not UI evidence"
+        );
+        assert_eq!(gemini.unconfirmed(), 4);
+        assert!(gemini.is_drifting(), "half unconfirmed meets the threshold");
+        assert_eq!(gemini.profile.as_deref(), Some("gemini.default v3"));
+        assert!(
+            !tallies[0].is_drifting(),
+            "seven samples are below the floor"
+        );
+        assert_eq!(tallies[2].observed, 1);
+
+        let detection = gemini.drift_detection();
+        assert_eq!(detection.rule_id, VERIFIED_SUBMIT_DRIFT_RULE_ID);
+        assert_eq!(detection.agent_type, crate::patterns::AgentType::Gemini);
+        assert_eq!(detection.event_type, "submit_profile.drift");
+        assert_eq!(detection.severity, crate::patterns::Severity::Warning);
+        assert_eq!(detection.extracted["unconfirmed"], 4);
+        assert_eq!(detection.extracted["profile"], "gemini.default v3");
+        let serialized = serde_json::to_string(&detection).expect("detection serializes");
+        assert!(!serialized.contains("secret-canary-key"));
+        assert_eq!(
+            tallies[2].drift_detection().agent_type,
+            crate::patterns::AgentType::Unknown
+        );
     }
 
     fn source(

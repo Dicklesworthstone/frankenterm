@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Rebuild when this script or the vendored C sources change. The
+    // rerun-if-env-changed lines further down otherwise limit reruns to those
+    // variables, so an edit under vendored/ was never compiled into an
+    // existing target directory.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=vendored");
     if std::env::var_os("CARGO_FEATURE_VENDORED").is_none()
         && pkg_config::Config::new()
             // ssh_userauth_publickey_auto_get_current_identity

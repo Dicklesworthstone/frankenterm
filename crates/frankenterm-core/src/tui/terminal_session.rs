@@ -284,6 +284,32 @@ impl<S: TerminalSession> Drop for SessionGuard<S> {
     }
 }
 
+/// Output-gate ownership for a runtime that drives the terminal itself, such
+/// as the ftui `Program`, which enters and leaves the alternate screen on its
+/// own and so never goes through a [`SessionGuard`]. While it lives, direct
+/// stdout/stderr writes are gated as for a session in `mode` and the crash
+/// markers name an active session; dropping it, also on unwind, clears both.
+pub struct RuntimeOwnedSessionGuard {
+    _private: (),
+}
+
+impl RuntimeOwnedSessionGuard {
+    /// Gate output for a runtime-owned session in `mode`.
+    #[must_use]
+    pub fn enter(mode: ScreenMode) -> Self {
+        set_active_output_gate_for_mode(mode);
+        publish_crash_session_markers(SessionPhase::Active, Some(mode));
+        Self { _private: () }
+    }
+}
+
+impl Drop for RuntimeOwnedSessionGuard {
+    fn drop(&mut self) {
+        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
+        publish_crash_session_markers(SessionPhase::Idle, None);
+    }
+}
+
 impl<S: TerminalSession> std::ops::Deref for SessionGuard<S> {
     type Target = S;
     fn deref(&self) -> &S {
@@ -798,6 +824,31 @@ mod tests {
             assert!(output_gate::is_output_suppressed());
         }
         // Guard dropped → gate inactive
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert!(!output_gate::is_output_suppressed());
+    }
+
+    #[test]
+    fn runtime_owned_guard_suppresses_output_until_dropped_even_on_unwind() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        {
+            let _guard = RuntimeOwnedSessionGuard::enter(ScreenMode::AltScreen);
+            assert_eq!(output_gate::phase(), GatePhase::Active);
+            assert!(output_gate::is_output_suppressed());
+        }
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert!(!output_gate::is_output_suppressed());
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = RuntimeOwnedSessionGuard::enter(ScreenMode::AltScreen);
+            assert!(output_gate::is_output_suppressed());
+            panic!("runtime failed while it owned the terminal");
+        });
+        assert!(unwound.is_err());
         assert_eq!(output_gate::phase(), GatePhase::Inactive);
         assert!(!output_gate::is_output_suppressed());
     }

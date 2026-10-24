@@ -80,12 +80,6 @@
       "removal_bead": "ft-deexl",
       "allowed_tokens": ["tokio::"]
     },
-    "crates/frankenterm-core/src/mcp_proxy.rs": {
-      "owner": "ft-deexl",
-      "reason": "Narrative comment records a future timeout strategy using tokio::time::timeout syntax as an audited anti-pattern; no direct runtime usage is present.",
-      "removal_bead": "ft-deexl",
-      "allowed_tokens": ["tokio::"]
-    },
     "crates/frankenterm-core/src/web/sse.rs": {
       "owner": "ft-deexl",
       "reason": "Test helper documentation names the forbidden #[tokio::test] attribute to describe the supported-path migration invariant; no direct runtime usage is present.",

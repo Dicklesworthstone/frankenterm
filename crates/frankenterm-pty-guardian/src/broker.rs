@@ -60,7 +60,8 @@
 
 use crate::SealedAtomicBuildIdentity;
 use crate::output::{
-    GuardianOutputPipeline, GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1,
+    GuardianBrokerOutputChainV1, GuardianOutputPipeline, GuardianPaneOutputJournal,
+    GuardianPublishedGenesisAdmissionPermitV1,
 };
 use crate::transport::{
     GuardianServiceError, GuardianTokenEffectLease, GuardianTokenPathAuthority,
@@ -75,9 +76,9 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_checkpoint::{
     GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1,
 };
-use mux::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalTail,
-};
+use mux::guardian_output_journal::GuardianOutputAppendReceipt;
+#[cfg(test)]
+use mux::guardian_output_journal::{GuardianOutputJournal, GuardianOutputJournalTail};
 use mux::guardian_protocol::{
     GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
     GuardianBrokerControlAuthenticatorV1, GuardianBrokerLeaseWalAuthenticatorV1,
@@ -3804,24 +3805,102 @@ struct BrokerOutputDrainJobV1 {
     token_lease: GuardianTokenEffectLease,
 }
 
+/// What one drain job read from its pane's PTY.
+#[derive(Debug, Eq, PartialEq)]
+enum BrokerPtyDrainV1 {
+    Empty,
+    Bytes(usize),
+    Terminal(BrokerOutputTerminalReasonV1),
+}
+
+/// A first burst at least this large found the PTY full (a macOS PTY holds
+/// about 1 KiB), so its writer is likely blocked on this reader.
+const BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES: usize = 1024;
+/// How long one drain job waits for a blocked writer to refill the PTY.
+const BROKER_OUTPUT_DRAIN_FILL_WAIT: Duration = Duration::from_millis(2);
+
+/// Fill `buffer` from a nonblocking PTY reader for one journal record
+/// (ft-2pgul). Each record costs a synchronized journal append, and a writer
+/// blocked on a full PTY refills it only after this reader empties it, so a
+/// drain that stopped at the first empty read synced about 1 KiB at a time.
+/// When the bytes read before the first empty read show a full PTY, keep
+/// filling the record until it is full or [`BROKER_OUTPUT_DRAIN_FILL_WAIT`]
+/// has passed. That is decided once: a line-buffered writer refills a line
+/// at a time, so later bursts are small however fast the output. A smaller
+/// first burst (an echo, a prompt) ends the record at once. End of output or
+/// an error after some bytes ends the record with those bytes; the next
+/// drain reads it again.
+fn drain_pty_reader(
+    reader: &mut dyn PollablePtyReader,
+    buffer: &mut [u8],
+) -> Result<BrokerPtyDrainV1, ()> {
+    let mut filled = 0;
+    let mut fill_deadline = None;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) if filled == 0 => {
+                return Ok(BrokerPtyDrainV1::Terminal(
+                    BrokerOutputTerminalReasonV1::ZeroLengthRead,
+                ));
+            }
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if filled == 0 {
+                    return Ok(BrokerPtyDrainV1::Empty);
+                }
+                let deadline = match fill_deadline {
+                    Some(deadline) => deadline,
+                    None if filled >= BROKER_OUTPUT_DRAIN_FULL_BURST_BYTES => {
+                        *fill_deadline.insert(Instant::now() + BROKER_OUTPUT_DRAIN_FILL_WAIT)
+                    }
+                    None => break,
+                };
+                let Some(wait) = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|wait| !wait.is_zero())
+                else {
+                    break;
+                };
+                // Whole milliseconds, rounded up: poll(2) takes no finer.
+                let wait = u8::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u8::MAX);
+                let mut fds = [nix::poll::PollFd::new(
+                    reader.as_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                )];
+                match nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(wait)) {
+                    Ok(ready) if ready > 0 => {}
+                    Ok(_) => break,
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => break,
+                }
+            }
+            Err(error) if filled == 0 && is_pty_terminal_eio(&error) => {
+                return Ok(BrokerPtyDrainV1::Terminal(
+                    BrokerOutputTerminalReasonV1::PtyIoClosed,
+                ));
+            }
+            Err(_) if filled == 0 => return Err(()),
+            Err(_) => break,
+        }
+    }
+    Ok(BrokerPtyDrainV1::Bytes(filled))
+}
+
 impl BrokerOutputDrainJobV1 {
     fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, ()> {
         self.token_lease.validate().map_err(|_| ())?;
-        let read = match self.reader.read(&mut self.bytes) {
-            Ok(0) => {
-                self.bytes.clear();
-                return Ok(Some(BrokerOutputTerminalReasonV1::ZeroLengthRead));
-            }
-            Ok(read) => read,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+        let read = match drain_pty_reader(&mut *self.reader, &mut self.bytes)? {
+            BrokerPtyDrainV1::Empty => {
                 self.bytes.clear();
                 return Ok(None);
             }
-            Err(error) if is_pty_terminal_eio(&error) => {
+            BrokerPtyDrainV1::Terminal(reason) => {
                 self.bytes.clear();
-                return Ok(Some(BrokerOutputTerminalReasonV1::PtyIoClosed));
+                return Ok(Some(reason));
             }
-            Err(_) => return Err(()),
+            BrokerPtyDrainV1::Bytes(read) => read,
         };
         self.bytes.truncate(read);
         self.journal
@@ -4433,10 +4512,21 @@ pub struct BrokerControlServiceV1 {
     fenced_live_leases: u64,
     quarantined_live_leases: u64,
     lease_submission_cursor: Option<Uuid>,
+    pending_output_prefetch: Option<BrokerOutputPrefetchV1>,
     #[cfg(test)]
     lease_job_probe: Option<BrokerSpawnWorkerEffectLeaseProbeV1>,
     #[cfg(test)]
     rotation_lease_fault: Option<(Uuid, BrokerPaneLeaseWalPhaseV1)>,
+}
+
+/// A drain to start once the response to the data Read that queued it has
+/// been written ([`BrokerControlServiceV1::run_output_prefetch`]).
+#[derive(Clone, Copy)]
+struct BrokerOutputPrefetchV1 {
+    token: Token,
+    generation: u64,
+    pane_id: Uuid,
+    maximum: usize,
 }
 
 impl BrokerControlServiceV1 {
@@ -4713,6 +4803,7 @@ impl BrokerControlServiceV1 {
             fenced_live_leases: 0,
             quarantined_live_leases: 0,
             lease_submission_cursor: None,
+            pending_output_prefetch: None,
             #[cfg(test)]
             lease_job_probe: None,
             #[cfg(test)]
@@ -4864,6 +4955,7 @@ impl BrokerControlServiceV1 {
         self.expire_unauthenticated_connections();
         self.drain_spawn_completion();
         self.submit_pending_lease_transition();
+        self.run_output_prefetch();
         Ok(())
     }
 
@@ -5495,7 +5587,19 @@ impl BrokerControlServiceV1 {
                 return self.dispatch_successor_acknowledgement(owner, request);
             }
             BrokerControlOperationV1::ReadOutput => {
-                return self.dispatch_output_read(owner, request);
+                let response = self.dispatch_output_read(owner, request);
+                if let (Ok(served), Ok(maximum)) =
+                    (&response, <[u8; 4]>::try_from(request.payload()))
+                    && served.header.status == BrokerControlResponseStatusV1::Applied
+                {
+                    self.pending_output_prefetch = Some(BrokerOutputPrefetchV1 {
+                        token,
+                        generation,
+                        pane_id: request.header.durable_pane_id,
+                        maximum: usize::try_from(u32::from_be_bytes(maximum)).unwrap_or(0),
+                    });
+                }
+                return response;
             }
             BrokerControlOperationV1::AcknowledgeOutput => {
                 return self.dispatch_output_ack(owner, request);
@@ -5731,36 +5835,7 @@ impl BrokerControlServiceV1 {
                 .token_authority
                 .acquire_effect_lease()
                 .map_err(|_| ())?;
-            let bytes = Zeroizing::new(vec![0; count]);
-            // Allocate before transferring either irreplaceable facet.
-            let reader = pane.proxy_reader.take().ok_or(())?;
-            let Some(journal) = pane.output_journal.take() else {
-                pane.proxy_reader = Some(reader);
-                return Err(());
-            };
-            let job = BrokerOutputDrainJobV1 {
-                pane_id: request.header.durable_pane_id,
-                sequence: pane.next_output_sequence,
-                reader,
-                journal,
-                bytes,
-                result: Err(()),
-                token_lease,
-            };
-            let Some(sender) = self.output_worker.jobs.as_ref() else {
-                pane.proxy_reader = Some(job.reader);
-                pane.output_journal = Some(job.journal);
-                return Err(());
-            };
-            let submitted = (job.pane_id, job.sequence);
-            match sender.try_send(job) {
-                Ok(()) => self.output_worker.active = Some(submitted),
-                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
-                    pane.proxy_reader = Some(job.reader);
-                    pane.output_journal = Some(job.journal);
-                    return Err(());
-                }
-            }
+            self.submit_output_drain(request.header.durable_pane_id, count, token_lease)?;
             return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
         }
         let permit = live
@@ -5788,6 +5863,112 @@ impl BrokerControlServiceV1 {
             }
             Err(_) => Err(()),
         }
+    }
+
+    /// Hand a pane's PTY reader and output journal to the output worker for
+    /// one drain of at most `count` bytes; both return with its completion.
+    /// A refused submission restores them here.
+    fn submit_output_drain(
+        &mut self,
+        pane_id: Uuid,
+        count: usize,
+        token_lease: GuardianTokenEffectLease,
+    ) -> Result<(), ()> {
+        let pane = &mut self.live_spawns.get_mut(&pane_id).ok_or(())?.adoption.pane;
+        let bytes = Zeroizing::new(vec![0; count]);
+        // Allocate before transferring either irreplaceable facet.
+        let reader = pane.proxy_reader.take().ok_or(())?;
+        let Some(mut journal) = pane.output_journal.take() else {
+            pane.proxy_reader = Some(reader);
+            return Err(());
+        };
+        journal.release_through(pane.buffer_start_sequence);
+        let job = BrokerOutputDrainJobV1 {
+            pane_id,
+            sequence: pane.next_output_sequence,
+            reader,
+            journal,
+            bytes,
+            result: Err(()),
+            token_lease,
+        };
+        let Some(sender) = self.output_worker.jobs.as_ref() else {
+            pane.proxy_reader = Some(job.reader);
+            pane.output_journal = Some(job.journal);
+            return Err(());
+        };
+        let submitted = (job.pane_id, job.sequence);
+        match sender.try_send(job) {
+            Ok(()) => self.output_worker.active = Some(submitted),
+            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                pane.proxy_reader = Some(job.reader);
+                pane.output_journal = Some(job.journal);
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the drain a data Read queued, once that Read's response has
+    /// been written (ft-2pgul). Draining only when the guardian asked again
+    /// left the PTY full, and its writer blocked, while the guardian synced
+    /// and acknowledged each record; now the next record drains meanwhile.
+    /// Best effort: a busy worker, a full buffer or any refusal skips it,
+    /// and the guardian's next Read drains as before.
+    fn run_output_prefetch(&mut self) {
+        let Some(prefetch) = self.pending_output_prefetch else {
+            return;
+        };
+        if self
+            .connections
+            .get(&prefetch.token)
+            .is_some_and(|connection| {
+                connection.generation == prefetch.generation && connection.write_frame.is_some()
+            })
+        {
+            return;
+        }
+        self.pending_output_prefetch = None;
+        if self.output_worker.active.is_some() {
+            return;
+        }
+        let Some(live) = self.live_spawns.get_mut(&prefetch.pane_id) else {
+            return;
+        };
+        let pane = &mut live.adoption.pane;
+        if pane.output_terminal.is_some()
+            || pane.proxy_reader.is_none()
+            || pane
+                .output_journal
+                .as_ref()
+                .is_none_or(|journal| journal.failed)
+            || matches!(
+                pane.status().lifecycle,
+                BrokerPaneLifecycleV1::Quarantined(_)
+            )
+        {
+            return;
+        }
+        let Some(remaining) = pane
+            .limits
+            .max_buffered_output_bytes
+            .checked_sub(pane.output_buffer.len())
+        else {
+            return;
+        };
+        let count = prefetch.maximum.min(remaining);
+        if count == 0
+            || u64::try_from(count)
+                .ok()
+                .and_then(|count| pane.next_output_sequence.checked_add(count))
+                .is_none()
+        {
+            return;
+        }
+        let Ok(token_lease) = self.token_authority.acquire_effect_lease() else {
+            return;
+        };
+        let _ = self.submit_output_drain(prefetch.pane_id, count, token_lease);
     }
 
     fn dispatch_spawn(
@@ -10443,9 +10624,21 @@ impl BrokerVerifiedKernelChildV1 {
         if terminal_status.is_none() {
             let (rechecked_boot_id, rechecked_start_ticks, rechecked_state) =
                 linux_process_birth_identity(process_id)?;
-            if rechecked_boot_id != boot_id
-                || rechecked_start_ticks != start_ticks
-                || matches!(rechecked_state, b'Z' | b'X' | b'x')
+            if rechecked_boot_id != boot_id || rechecked_start_ticks != start_ticks {
+                return Err(BrokerChildIncarnationError::InvalidIdentity);
+            }
+            // A child that exited after try_wait looked is a zombie of this
+            // same incarnation (its pid cannot be reused before this owner
+            // reaps it): reap it as if try_wait had seen it exit. Refusing it
+            // failed the spawn of any command that exits at once.
+            if matches!(rechecked_state, b'Z' | b'X' | b'x')
+                && child
+                    .try_wait()
+                    .map_err(|source| BrokerChildIncarnationError::Io {
+                        site: "post-recheck-child-status",
+                        source,
+                    })?
+                    .is_none()
             {
                 return Err(BrokerChildIncarnationError::InvalidIdentity);
             }
@@ -10499,9 +10692,19 @@ impl BrokerVerifiedKernelChildV1 {
                     site: "post-start-token-child-status",
                     source,
                 })?;
+        // A child that exited after try_wait looked no longer reads as
+        // running, but its pid cannot be reused before this owner reaps it:
+        // reap it as if try_wait had seen it exit.
         if terminal_status.is_none()
             && LocalProcessInfo::observe_process_start_time(process_id)
                 != ProcessStartTimeObservation::Running(start_token)
+            && child
+                .try_wait()
+                .map_err(|source| BrokerChildIncarnationError::Io {
+                    site: "post-recheck-child-status",
+                    source,
+                })?
+                .is_none()
         {
             return Err(BrokerChildIncarnationError::InvalidIdentity);
         }
@@ -18211,17 +18414,43 @@ impl std::fmt::Debug for BrokerControlLeaseV1 {
     }
 }
 
-/// One fresh, activated encrypted output segment bound to a prepared pane.
+/// Where a broker-owned PTY durably appends each drained read.
+enum BrokerOutputJournalBackendV1 {
+    /// The broker output pipeline's published segment chain. A full segment
+    /// is sealed and its successor published, so the PTY outlives one
+    /// segment's record and byte caps.
+    Chain(GuardianBrokerOutputChainV1),
+    /// One raw segment that never rolls over. Unit tests bind these to drive
+    /// the pump and its failure paths under exact journal limits.
+    #[cfg(test)]
+    Segment(Box<GuardianOutputJournal>),
+}
+
+/// One fresh, activated encrypted output journal bound to a prepared pane.
 ///
 /// The broker may expose only the synchronized plaintext prefix. A failed
 /// append is sticky because the on-disk disposition can be ambiguous even
 /// though the bytes already drained from the PTY remain in memory.
 struct BrokerDurableOutputJournalV1 {
-    journal: GuardianOutputJournal,
+    backend: BrokerOutputJournalBackendV1,
     failed: bool,
 }
 
 impl BrokerDurableOutputJournalV1 {
+    fn bind_fresh_chain(
+        chain: GuardianBrokerOutputChainV1,
+        durable_pane_id: Uuid,
+    ) -> Result<Self, BrokerError> {
+        if chain.durable_pane_id() != durable_pane_id {
+            return Err(BrokerError::DurableOutputJournalBindingMismatch);
+        }
+        Ok(Self {
+            backend: BrokerOutputJournalBackendV1::Chain(chain),
+            failed: false,
+        })
+    }
+
+    #[cfg(test)]
     fn bind_fresh(
         journal: GuardianOutputJournal,
         durable_pane_id: Uuid,
@@ -18246,7 +18475,7 @@ impl BrokerDurableOutputJournalV1 {
             return Err(BrokerError::DurableOutputJournalUnavailable);
         }
         Ok(Self {
-            journal,
+            backend: BrokerOutputJournalBackendV1::Segment(Box::new(journal)),
             failed: false,
         })
     }
@@ -18259,46 +18488,81 @@ impl BrokerDurableOutputJournalV1 {
         if self.failed {
             return Err(BrokerError::DurableOutputJournalUnavailable);
         }
-        let Some(expected_record_sequence) = self.journal.next_sequence() else {
-            self.failed = true;
-            return Err(BrokerError::DurableOutputJournalUnavailable);
-        };
-        if self.journal.cumulative_plaintext_bytes() != output_sequence_start
-            || self.journal.tail() != GuardianOutputJournalTail::Clean
-            || self.journal.is_poisoned()
-            || self.journal.directory_entry_sync_required()
-        {
-            self.failed = true;
-            return Err(BrokerError::DurableOutputJournalUnavailable);
-        }
-        let payload_bytes = u32::try_from(payload.len())
-            .map_err(|_| BrokerError::DurableOutputJournalReceiptMismatch)?;
-        let expected_output_sequence_end = output_sequence_start
-            .checked_add(u64::from(payload_bytes))
-            .ok_or(BrokerError::DurableOutputJournalReceiptMismatch)?;
-        let receipt = match self.journal.append_and_sync(payload) {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                self.failed = true;
-                return Err(BrokerError::DurableOutputJournalUnavailable);
+        let result = match &mut self.backend {
+            BrokerOutputJournalBackendV1::Chain(chain) => chain
+                .append_read(output_sequence_start, payload)
+                .map_err(|_| BrokerError::DurableOutputJournalUnavailable),
+            #[cfg(test)]
+            BrokerOutputJournalBackendV1::Segment(journal) => {
+                append_to_raw_output_segment(journal, output_sequence_start, payload)
             }
         };
-        let receipt_matches = receipt.segment_id() == self.journal.identity().segment_id()
-            && receipt.sequence() == expected_record_sequence
-            && receipt.payload_bytes() == payload_bytes
-            && receipt.cumulative_plaintext_bytes() == expected_output_sequence_end
-            && self.journal.record_count() == expected_record_sequence
-            && self.journal.cumulative_plaintext_bytes() == expected_output_sequence_end
-            && self.journal.terminal_receipt() == Some(receipt)
-            && self.journal.tail() == GuardianOutputJournalTail::Clean
-            && !self.journal.is_poisoned()
-            && !self.journal.directory_entry_sync_required();
-        if !receipt_matches {
+        if result.is_err() {
             self.failed = true;
-            return Err(BrokerError::DurableOutputJournalReceiptMismatch);
         }
-        Ok(receipt)
+        result
     }
+
+    /// The guardian acknowledged output through `acknowledged_bytes` only
+    /// after committing it to its own journal, so a later rollover may
+    /// reclaim this pane's sealed broker segments at or below it.
+    fn release_through(&mut self, acknowledged_bytes: u64) {
+        match &mut self.backend {
+            BrokerOutputJournalBackendV1::Chain(chain) => chain.release_through(acknowledged_bytes),
+            #[cfg(test)]
+            BrokerOutputJournalBackendV1::Segment(_) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn raw_segment(&self) -> &GuardianOutputJournal {
+        match &self.backend {
+            BrokerOutputJournalBackendV1::Segment(journal) => journal,
+            BrokerOutputJournalBackendV1::Chain(_) => {
+                panic!("this test bound a published chain, not a raw segment")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn append_to_raw_output_segment(
+    journal: &mut GuardianOutputJournal,
+    output_sequence_start: u64,
+    payload: &[u8],
+) -> Result<GuardianOutputAppendReceipt, BrokerError> {
+    let expected_record_sequence = journal
+        .next_sequence()
+        .ok_or(BrokerError::DurableOutputJournalUnavailable)?;
+    if journal.cumulative_plaintext_bytes() != output_sequence_start
+        || journal.tail() != GuardianOutputJournalTail::Clean
+        || journal.is_poisoned()
+        || journal.directory_entry_sync_required()
+    {
+        return Err(BrokerError::DurableOutputJournalUnavailable);
+    }
+    let payload_bytes = u32::try_from(payload.len())
+        .map_err(|_| BrokerError::DurableOutputJournalReceiptMismatch)?;
+    let expected_output_sequence_end = output_sequence_start
+        .checked_add(u64::from(payload_bytes))
+        .ok_or(BrokerError::DurableOutputJournalReceiptMismatch)?;
+    let receipt = journal
+        .append_and_sync(payload)
+        .map_err(|_| BrokerError::DurableOutputJournalUnavailable)?;
+    let receipt_matches = receipt.segment_id() == journal.identity().segment_id()
+        && receipt.sequence() == expected_record_sequence
+        && receipt.payload_bytes() == payload_bytes
+        && receipt.cumulative_plaintext_bytes() == expected_output_sequence_end
+        && journal.record_count() == expected_record_sequence
+        && journal.cumulative_plaintext_bytes() == expected_output_sequence_end
+        && journal.terminal_receipt() == Some(receipt)
+        && journal.tail() == GuardianOutputJournalTail::Clean
+        && !journal.is_poisoned()
+        && !journal.directory_entry_sync_required();
+    if !receipt_matches {
+        return Err(BrokerError::DurableOutputJournalReceiptMismatch);
+    }
+    Ok(receipt)
 }
 
 /// Child-free broker typestate after PTY allocation and before durable
@@ -18433,6 +18697,7 @@ impl BrokerPreparedPaneV1 {
     /// Bind one empty, directory-synchronized encrypted output segment before
     /// the child can exist. Binding is one-way; a mismatched or previously
     /// used segment drops the child-free prepared reservation fail-closed.
+    #[cfg(test)]
     pub(crate) fn bind_fresh_output_journal(
         mut self,
         journal: GuardianOutputJournal,
@@ -18448,15 +18713,23 @@ impl BrokerPreparedPaneV1 {
     }
 
     /// Consume the output pipeline's exact fresh manifest-bound handle into
-    /// the broker-owned synchronous journal used by the persistent PTY pump.
+    /// the broker-owned synchronous chain used by the persistent PTY pump.
+    /// Binding is one-way and happens before the child can exist.
     pub(crate) fn bind_fresh_published_output_journal(
-        self,
+        mut self,
         journal: GuardianPaneOutputJournal,
     ) -> Result<Self, BrokerError> {
-        let journal = journal
-            .into_fresh_broker_journal()
+        if self.output_journal.is_some() {
+            return Err(BrokerError::DurableOutputJournalAlreadyBound);
+        }
+        let chain = journal
+            .into_fresh_broker_chain()
             .map_err(|_| BrokerError::DurableOutputJournalUnavailable)?;
-        self.bind_fresh_output_journal(journal)
+        self.output_journal = Some(BrokerDurableOutputJournalV1::bind_fresh_chain(
+            chain,
+            self.binding.durable_pane_id,
+        )?);
+        Ok(self)
     }
 
     #[must_use]
@@ -19609,6 +19882,7 @@ impl BrokerAdoptedPaneV1 {
             .ok_or(BrokerError::ProxyCapacityExhausted)?;
         self.output_buffer.extend(&chunk[..bytes_drained]);
         let durable_journal_sequence = if let Some(journal) = self.output_journal.as_mut() {
+            journal.release_through(self.buffer_start_sequence);
             Some(
                 journal
                     .append_and_sync(output_sequence_start, &chunk[..bytes_drained])?
@@ -28787,6 +29061,82 @@ mod tests {
         }
     }
 
+    fn nonblocking_test_pipe() -> (Box<dyn PollablePtyReader>, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("create drain test pipe");
+        let flags = nix::fcntl::fcntl(&reader, nix::fcntl::F_GETFL).expect("read pipe flags");
+        nix::fcntl::fcntl(
+            &reader,
+            nix::fcntl::F_SETFL(
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )
+        .expect("make drain test pipe nonblocking");
+        (Box::new(reader), writer)
+    }
+
+    #[test]
+    fn drain_fills_a_record_from_a_full_pty_and_ends_one_at_a_small_burst() {
+        let (mut reader, mut writer) = nonblocking_test_pipe();
+        let mut record = [0_u8; BROKER_OUTPUT_PUMP_CHUNK_BYTES];
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Empty)
+        );
+
+        writer.write_all(b"echo").expect("write a small burst");
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(4))
+        );
+        assert_eq!(&record[..4], b"echo");
+
+        // More than a record: the first drain fills its buffer, the second
+        // takes the rest after its full burst waits in vain for more.
+        let bulk: Vec<u8> = (0..BROKER_OUTPUT_PUMP_CHUNK_BYTES + 1500)
+            .map(|index| u8::try_from(index % 251).expect("byte"))
+            .collect();
+        writer.write_all(&bulk).expect("write more than a record");
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(BROKER_OUTPUT_PUMP_CHUNK_BYTES))
+        );
+        assert_eq!(record[..], bulk[..BROKER_OUTPUT_PUMP_CHUNK_BYTES]);
+        let started = Instant::now();
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(1500))
+        );
+        assert_eq!(record[..1500], bulk[BROKER_OUTPUT_PUMP_CHUNK_BYTES..]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // Output that ends after some bytes yields those bytes first; the next
+        // drain reports the end.
+        writer.write_all(b"last").expect("write the last burst");
+        drop(writer);
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(4))
+        );
+        assert_eq!(&record[..4], b"last");
+        // A child another test forks before its exec briefly holds a copy of
+        // the write end, so the end may show only after a few empty drains.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let end = loop {
+            match drain_pty_reader(&mut *reader, &mut record) {
+                Ok(BrokerPtyDrainV1::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(
+            end,
+            Ok(BrokerPtyDrainV1::Terminal(
+                BrokerOutputTerminalReasonV1::ZeroLengthRead
+            ))
+        );
+    }
+
     #[test]
     fn recovered_catalog_admission_accepts_valid_distinct_journals() {
         let directory = private_catalog_directory();
@@ -31171,12 +31521,12 @@ mod tests {
                 .as_ref()
                 .expect("adopted pane retained output journal");
             assert_eq!(
-                durable.journal.record_count(),
+                durable.raw_segment().record_count(),
                 u64::try_from(pumps.len()).expect("record count fits u64")
             );
-            assert_eq!(durable.journal.cumulative_plaintext_bytes(), 9);
+            assert_eq!(durable.raw_segment().cumulative_plaintext_bytes(), 9);
             let mut cursor = durable
-                .journal
+                .raw_segment()
                 .recovery_cursor(1, 32)
                 .expect("open authenticated output recovery cursor");
             let mut recovered = Vec::new();
@@ -31193,7 +31543,7 @@ mod tests {
                     .expect("deliver authenticated recovered output");
                 assert_eq!(recovered_receipt.sequence(), recovered_records);
             }
-            assert_eq!(recovered_records, durable.journal.record_count());
+            assert_eq!(recovered_records, durable.raw_segment().record_count());
             assert_eq!(recovered, b"journaled");
         }
 
@@ -31318,8 +31668,11 @@ mod tests {
             .as_ref()
             .expect("retained failed durable journal");
         assert!(durable.failed);
-        assert_eq!(durable.journal.record_count(), 1);
-        assert_eq!(durable.journal.cumulative_plaintext_bytes(), durable_end);
+        assert_eq!(durable.raw_segment().record_count(), 1);
+        assert_eq!(
+            durable.raw_segment().cumulative_plaintext_bytes(),
+            durable_end
+        );
         assert_eq!(
             pane.pump_ready_output_durably(),
             Err(BrokerError::DurableOutputJournalUnavailable),
@@ -32948,14 +33301,25 @@ mod tests {
             secret_lease_generation: 1,
         };
         let encoded = binding.encode();
+        // Each inspection takes the catalog lock. A child another test forks
+        // meanwhile can briefly hold the previous inspection's descriptor
+        // (see reopen_test_catalog_after_owner_drop): wait that out.
         let inspect = |bytes: &[u8], context: &GuardianSpawnCustodyContextV1| {
-            inspect_historical_genesis_binding(
-                &catalog,
-                &token,
-                identity.journal_id,
-                bytes,
-                context,
-            )
+            for attempt in 0..100 {
+                match inspect_historical_genesis_binding(
+                    &catalog,
+                    &token,
+                    identity.journal_id,
+                    bytes,
+                    context,
+                ) {
+                    Err(BrokerSpawnWalError::CatalogAlreadyOwned) if attempt < 99 => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("the bounded inspection loop always returns")
         };
         inspect(&encoded, &custody).unwrap();
         for offset in [16, 48, 72, 172, 176, 208, 240] {

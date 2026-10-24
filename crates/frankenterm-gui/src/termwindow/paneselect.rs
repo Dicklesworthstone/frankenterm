@@ -152,7 +152,7 @@ impl PaneSelector {
                 }));
 
             let dimensions = term_window.dimensions;
-            let pane_dims = pos.pane.get_dimensions();
+            let pane_dims = super::mouseevent::pane_dimensions(&*pos.pane);
 
             let computed = term_window.compute_element(
                 &LayoutContext {

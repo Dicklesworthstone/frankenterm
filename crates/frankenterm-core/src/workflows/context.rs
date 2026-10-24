@@ -329,6 +329,7 @@ impl WorkflowContext {
             verification_report.as_ref(),
             elapsed_ms(start),
         );
+        crate::verified_submit::record_submit_receipt(pane_id, &receipt);
         persist_verified_submit_receipt(cx, &storage, &injection, &receipt).await;
 
         Ok(WorkflowVerifiedSubmit {

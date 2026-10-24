@@ -1,0 +1,286 @@
+{
+  "bundle_id": "b.fixture",
+  "format": "ftworkspace",
+  "required_capabilities": [],
+  "source": {
+    "configuration_revision": "sha256:c26013973a731a236d13a9136e58481f64d854454273997fa8e73b63d193f5ee",
+    "exporter_id": "frankenterm.machines",
+    "kind": "machines_toml"
+  },
+  "version": 1,
+  "workspace": {
+    "credentials": [
+      {
+        "algorithm": "ssh-ed25519",
+        "id": "c.07899bb8cd6ceb021207a823",
+        "private_material": "not_included",
+        "public_fingerprint": "SHA256:0QMmKpubmKjdQYS8jbWmzKi7cvVkxacRPLyJX118Too",
+        "requirement": "matching_private_key"
+      }
+    ],
+    "groups": [
+      {
+        "auto_connect": false,
+        "id": "g.fleet",
+        "machine_order": [
+          "m.trj",
+          "m.css",
+          "m.dark"
+        ],
+        "name": "Fleet"
+      }
+    ],
+    "host_trust": [
+      {
+        "claimed_source": "known_hosts",
+        "host": "100.91.120.17",
+        "id": "h.727e8dda692b557fa6e50fe5",
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256:0QMmKpubmKjdQYS8jbWmzKi7cvVkxacRPLyJX118Too"
+          }
+        ],
+        "port": 22,
+        "revoked_keys": []
+      },
+      {
+        "claimed_source": "known_hosts",
+        "host": "css.example",
+        "id": "h.72a712ba587e91a0c8d6c2f5",
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256:0QMmKpubmKjdQYS8jbWmzKi7cvVkxacRPLyJX118Too"
+          }
+        ],
+        "port": 22,
+        "revoked_keys": []
+      },
+      {
+        "claimed_source": "known_hosts",
+        "host": "jumped",
+        "id": "h.d48b13425a68110a55a35d82",
+        "pins": [],
+        "port": 22,
+        "revoked_keys": []
+      }
+    ],
+    "id": "w.machines",
+    "machines": [
+      {
+        "auto_connect": false,
+        "id": "m.trj",
+        "name": "Threadripper",
+        "preferred_route_ref": "r.trj.mux",
+        "route_refs": [
+          "r.trj.mux",
+          "r.trj.tailscale"
+        ],
+        "tags": [],
+        "theme_ref": "t.trj"
+      },
+      {
+        "auto_connect": false,
+        "id": "m.css",
+        "name": "css",
+        "preferred_route_ref": "r.css.ssh",
+        "route_refs": [
+          "r.css.ssh"
+        ],
+        "tags": [],
+        "theme_ref": "t.css"
+      },
+      {
+        "auto_connect": false,
+        "id": "m.dark",
+        "name": "dark",
+        "preferred_route_ref": "r.dark.mux",
+        "route_refs": [
+          "r.dark.mux",
+          "r.dark.ssh"
+        ],
+        "tags": [],
+        "theme_ref": "t.dark"
+      }
+    ],
+    "name": "Fleet",
+    "preferences": {
+      "connect_on_open": false,
+      "initial_group_ref": "g.fleet",
+      "initial_machine_ref": "m.trj"
+    },
+    "routes": [
+      {
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [
+          "c.07899bb8cd6ceb021207a823"
+        ],
+        "host": "100.91.120.17",
+        "host_trust_ref": "h.727e8dda692b557fa6e50fe5",
+        "id": "r.trj.tailscale",
+        "jump_routes": [],
+        "mode": "direct_ssh",
+        "port": 22,
+        "session_creation": "on_select",
+        "user": "ubuntu"
+      },
+      {
+        "attach_policy": "existing_only",
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [
+          "c.07899bb8cd6ceb021207a823"
+        ],
+        "host": "100.91.120.17",
+        "host_trust_ref": "h.727e8dda692b557fa6e50fe5",
+        "id": "r.trj.mux",
+        "jump_routes": [],
+        "mode": "frankenterm_mux",
+        "port": 22,
+        "remote_command": "nc -N -U /run/user/1000/frankenterm/sock",
+        "user": "ubuntu"
+      },
+      {
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [
+          "c.07899bb8cd6ceb021207a823"
+        ],
+        "host": "css.example",
+        "host_trust_ref": "h.72a712ba587e91a0c8d6c2f5",
+        "id": "r.css.ssh",
+        "jump_routes": [],
+        "mode": "direct_ssh",
+        "port": 22,
+        "session_creation": "on_select",
+        "user": "ubuntu"
+      },
+      {
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [],
+        "host": "jumped",
+        "host_trust_ref": "h.d48b13425a68110a55a35d82",
+        "id": "r.dark.ssh",
+        "jump_routes": [],
+        "mode": "direct_ssh",
+        "port": 22,
+        "session_creation": "on_select",
+        "user": "unknown-user"
+      },
+      {
+        "attach_policy": "existing_only",
+        "authentication_methods": [
+          "publickey"
+        ],
+        "credential_refs": [],
+        "host": "jumped",
+        "host_trust_ref": "h.d48b13425a68110a55a35d82",
+        "id": "r.dark.mux",
+        "jump_routes": [],
+        "mode": "frankenterm_mux",
+        "port": 22,
+        "remote_command": "nc -N -U /s",
+        "user": "unknown-user"
+      }
+    ],
+    "themes": [
+      {
+        "accent": "#52AD70",
+        "ansi": [
+          "#000000",
+          "#CC5555",
+          "#55CC55",
+          "#CDCD55",
+          "#5455CB",
+          "#CC55CC",
+          "#7ACACA",
+          "#CCCCCC",
+          "#555555",
+          "#FF5555",
+          "#55FF55",
+          "#FFFF55",
+          "#5555FF",
+          "#FF55FF",
+          "#55FFFF",
+          "#FFFFFF"
+        ],
+        "background": "#0A0E14",
+        "cursor_background": "#52AD70",
+        "cursor_border": "#52AD70",
+        "cursor_foreground": "#0A0E14",
+        "foreground": "#B2B2B2",
+        "id": "t.trj",
+        "name": "trj",
+        "selection_background": "#234634",
+        "selection_foreground": "#B2B2B2"
+      },
+      {
+        "accent": "#4C9EF0",
+        "ansi": [
+          "#141C24",
+          "#FF5F6D",
+          "#4ADE80",
+          "#FACC15",
+          "#60A5FA",
+          "#E879F9",
+          "#22D3EE",
+          "#C4CCD4",
+          "#455768",
+          "#FF8A94",
+          "#86EFAC",
+          "#FDE047",
+          "#93C5FD",
+          "#F0ABFC",
+          "#67E8F9",
+          "#F2F5F8"
+        ],
+        "background": "#080F16",
+        "cursor_background": "#4C9EF0",
+        "cursor_border": "#4C9EF0",
+        "cursor_foreground": "#080F16",
+        "foreground": "#D4E0ED",
+        "id": "t.css",
+        "name": "FrankenTerm Azure",
+        "selection_background": "#204162",
+        "selection_foreground": "#D4E0ED"
+      },
+      {
+        "accent": "#F0B44C",
+        "ansi": [
+          "#241E14",
+          "#FF5F6D",
+          "#4ADE80",
+          "#FACC15",
+          "#60A5FA",
+          "#E879F9",
+          "#22D3EE",
+          "#D4CEC4",
+          "#685B45",
+          "#FF8A94",
+          "#86EFAC",
+          "#FDE047",
+          "#93C5FD",
+          "#F0ABFC",
+          "#67E8F9",
+          "#F8F6F2"
+        ],
+        "background": "#161108",
+        "cursor_background": "#F0B44C",
+        "cursor_border": "#F0B44C",
+        "cursor_foreground": "#161108",
+        "foreground": "#EDE4D4",
+        "id": "t.dark",
+        "name": "FrankenTerm Amber",
+        "selection_background": "#624A20",
+        "selection_foreground": "#EDE4D4"
+      }
+    ]
+  }
+}

@@ -955,14 +955,20 @@ fn open_authority_lock_file(
         Err(error) => return Err(error.into()),
     };
     let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(create)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = directory.open_with(AUTHORITY_LOCK_NAME, &options)?;
+    // Sibling processes (a GUI and a mux server, or several mux servers
+    // sharing a scrollback store) create this name at once (ft-nd1c0).
+    let file = if create {
+        frankenterm_core::lock::open_or_create_exclusively(
+            directory,
+            AUTHORITY_LOCK_NAME,
+            &options,
+        )?
+    } else {
+        directory.open_with(AUTHORITY_LOCK_NAME, &options)?
+    };
     let opened = validate_opened_metadata(directory, &file, 0)?;
     let named = validate_named_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), 0)?;
     if !same_file_identity(&opened, &named)

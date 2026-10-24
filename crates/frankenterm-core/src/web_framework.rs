@@ -13,18 +13,20 @@ use std::time::Duration;
 use tracing::warn;
 
 #[allow(unused_imports)]
-pub(crate) use fastapi::AppConfig;
-#[allow(unused_imports)]
 pub(crate) use fastapi::core::{
     BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome,
 };
 #[allow(unused_imports)]
-pub(crate) use fastapi::http::{ParseLimits, QueryString};
+pub(crate) use fastapi::http::{ParseLimits, PreBodyValidator, QueryString};
 #[allow(unused_imports)]
 pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
 #[allow(unused_imports)]
+pub(crate) use fastapi::{AppBuilder, AppConfig};
+#[allow(unused_imports)]
 pub(crate) use fastapi::{ResponseBody, ServerConfig, ServerError, TcpServer};
 
+#[doc(hidden)]
+pub use fastapi::AppConfig as FrameworkAppConfig;
 #[doc(hidden)]
 pub use fastapi::ResponseBody as FrameworkResponseBody;
 #[doc(hidden)]
@@ -539,6 +541,11 @@ impl FrameworkWebRuntime {
 
         let server_config = ServerConfig::new(resolved_bind_addr.to_string())
             .with_parse_limits(web_parse_limits(app.config().max_body_size))
+            // Despite the hook's name, the pinned App server calls it only
+            // after bounded parsing. It does run before 100/101, handler
+            // dispatch and keep-alive selection, so rejection closes the
+            // connection instead of dispatching a pipelined follow-up.
+            .with_pre_body_validator(crate::web::BodySizeGuard::new(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));

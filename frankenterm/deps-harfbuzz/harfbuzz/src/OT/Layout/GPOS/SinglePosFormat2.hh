@@ -7,20 +7,22 @@ namespace OT {
 namespace Layout {
 namespace GPOS_impl {
 
-struct SinglePosFormat2 : ValueBase
+template <typename Types>
+struct SinglePosFormat2_4 : ValueBase
 {
   protected:
   HBUINT16      format;                 /* Format identifier--format = 2 */
-  Offset16To<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 coverage;               /* Offset to Coverage table--from
                                          * beginning of subtable */
   ValueFormat   valueFormat;            /* Defines the types of data in the
                                          * ValueRecord */
-  HBUINT16      valueCount;             /* Number of ValueRecords */
+  typename Types::HBUINT
+                valueCount;             /* Number of ValueRecords */
   ValueRecord   values;                 /* Array of ValueRecords--positioning
                                          * values applied to glyphs */
   public:
-  DEFINE_SIZE_ARRAY (8, values);
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + ValueFormat::static_size + Types::HBUINT::static_size, values);
 
   bool sanitize (hb_sanitize_context_t *c) const
   {
@@ -104,7 +106,7 @@ struct SinglePosFormat2 : ValueBase
     if (unlikely (index >= valueCount)) return false;
 
     /* This is ugly... */
-    hb_buffer_t buffer;
+    hb_buffer_t buffer {};
     buffer.props.direction = direction;
     OT::hb_ot_apply_context_t c (1, font, &buffer, table_blob);
 
@@ -181,7 +183,7 @@ struct SinglePosFormat2 : ValueBase
     const hb_map_t &glyph_map = *c->plan->glyph_map;
 
     unsigned sub_length = valueFormat.get_len ();
-    auto values_array = values.as_array (valueCount * sub_length);
+    auto values_array = values.as_array ((unsigned) valueCount * sub_length);
 
     auto it =
     + hb_zip (this+coverage, hb_range ((unsigned) valueCount))

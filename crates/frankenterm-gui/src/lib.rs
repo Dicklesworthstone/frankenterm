@@ -5,6 +5,7 @@
 
 pub mod accessibility_preferences;
 pub mod adaptive_fps_loop;
+pub mod cli;
 pub mod domain_reconnect_manifest;
 pub mod floating_panes;
 pub mod gpu_regression;
@@ -1725,6 +1726,7 @@ pub mod selector_math {
 }
 pub mod smart_selection_a11y;
 pub mod status_bar;
+pub mod text_composition;
 pub mod triple_buffer_gui;
 
 pub mod gui_debug_log {

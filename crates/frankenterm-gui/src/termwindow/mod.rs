@@ -165,6 +165,9 @@ struct GuiPaneCleanupOwner {
     owner: Mutex<Weak<Mux>>,
     wake: Mutex<Option<flume::Sender<()>>>,
     admission_pending: AtomicBool,
+    /// Set when a returned credit woke the retained refresh to retry
+    /// admission; that refresh then repaints even if it carries other work.
+    credit_wake: AtomicBool,
     retry_pending: AtomicBool,
     allocation_pending: AtomicBool,
     retired: AtomicBool,
@@ -201,6 +204,7 @@ impl GuiPaneCleanupOwner {
             ),
             wake: Mutex::new(None),
             admission_pending: AtomicBool::new(false),
+            credit_wake: AtomicBool::new(false),
             retry_pending: AtomicBool::new(false),
             allocation_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
@@ -257,8 +261,14 @@ impl GuiPaneCleanupOwner {
 
     fn credit_returned(&self) {
         if self.admission_pending.swap(false, Ordering::AcqRel) {
+            self.credit_wake.store(true, Ordering::Release);
             self.wake();
         }
+    }
+
+    /// Whether a credit return woke the retained refresh since the last call.
+    fn take_credit_wake(&self) -> bool {
+        self.credit_wake.swap(false, Ordering::AcqRel)
     }
 
     fn update_capacity(&self, capacity: usize) {
@@ -2235,6 +2245,11 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
+    /// No part of the window is visible (macOS occlusion, ft-34at5).
+    occluded: bool,
+    /// Bumped on every occlusion change, so a delayed surface park only
+    /// applies to the occlusion that scheduled it.
+    occlusion_generation: u64,
     fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
@@ -2246,6 +2261,11 @@ pub struct TermWindow {
     /// When true, an `Apply` notification is already in flight that will run
     /// `update_title` on the next frame and clear this flag. See ft-9d60d.
     pending_update_title: bool,
+    /// Whether the coalesced refresh in flight also runs the status event
+    /// (`update_title`) rather than only the tab bar (`update_title_impl`).
+    pending_update_title_status: bool,
+    /// When the coalesced refresh in flight was scheduled.
+    pending_update_title_at: Option<Instant>,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
     terminal_size: TerminalSize,
@@ -3868,6 +3888,61 @@ impl TermWindow {
             .unwrap_or_else(TierSwapDoctorReport::no_atlases_in_process)
     }
 
+    /// A window hidden for [`SURFACE_PARK_DELAY`] parks its WebGPU surface,
+    /// releasing its window-size drawables; showing it again unparks the
+    /// surface and repaints (ft-34at5).
+    fn occlusion_changed(&mut self, occluded: bool, window: &Window) {
+        if self.occluded == occluded {
+            return;
+        }
+        self.occluded = occluded;
+        self.occlusion_generation = self.occlusion_generation.wrapping_add(1);
+        if !occluded {
+            if self
+                .webgpu
+                .as_ref()
+                .is_some_and(|webgpu| webgpu.unpark_surface())
+            {
+                metrics::counter!("gui.surface.park", "action" => "unparked").increment(1);
+                self.note_render_surface_recovery_signal();
+            }
+            window.invalidate();
+            return;
+        }
+        if self.webgpu.is_none() {
+            return;
+        }
+        let generation = self.occlusion_generation;
+        let window = window.clone();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(async move {
+                        sleep(SURFACE_PARK_DELAY).await;
+                        window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                            if tw.occluded
+                                && tw.occlusion_generation == generation
+                                && tw
+                                    .webgpu
+                                    .as_ref()
+                                    .is_some_and(|webgpu| webgpu.park_surface())
+                            {
+                                metrics::counter!("gui.surface.park", "action" => "parked")
+                                    .increment(1);
+                            }
+                        })));
+                    })
+                    .detach();
+            }
+            rejected => {
+                log::debug!("not parking the hidden window's surface: {rejected:?}");
+            }
+        }
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         self.record_idle_event(idle_detector::IdleEvent::FocusChange);
         log::trace!("Setting focus to {:?}", focused);
@@ -3977,6 +4052,22 @@ const MAX_STALE_SURFACE_RETRIES: u32 = 3;
 const MAX_PAINT_RETRIES: u32 = 2;
 const MAX_BACKEND_RETRIES: u32 = 3;
 const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
+/// How long `schedule_update_title` gathers title, cwd and progress alerts
+/// before one `update_title`. A changed tab bar repaints the whole window, and
+/// agents in background tabs animate their titles (spinners) constantly; at
+/// one 60 Hz frame (16 ms) those changes alone could hold a window at its
+/// `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
+const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
+
+/// How long a window stays hidden before its WebGPU surface is parked
+/// (ft-34at5). Long enough that switching between windows does not park
+/// the ones briefly covered.
+const SURFACE_PARK_DELAY: Duration = Duration::from_secs(5);
+
+/// A coalesced title refresh still pending after this long was dropped on
+/// the way back (the window's `notify` is refused under main-thread
+/// saturation); re-arm rather than coalesce every later change into it.
+const TITLE_UPDATE_LOST_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderWakeTicket(u64);
@@ -4690,6 +4781,8 @@ impl TermWindow {
             config_overrides: wezterm_dynamic::Value::Object(Default::default()),
             palette: None,
             focused: None,
+            occluded: false,
+            occlusion_generation: 0,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             pending_mux_geometry: Arc::new(Mutex::new(PendingMuxGeometry::default())),
@@ -4700,6 +4793,8 @@ impl TermWindow {
             resizes_pending: 0,
             is_repaint_pending: false,
             pending_update_title: false,
+            pending_update_title_status: false,
+            pending_update_title_at: None,
             pending_scale_changes: LinkedList::new(),
             terminal_size,
             render_state,
@@ -4960,6 +5055,15 @@ impl TermWindow {
                 myself.created(RenderContext::Glium(Rc::clone(&gl)))?;
             }
             if let Some(webgpu) = webgpu {
+                // The surface was configured with the size requested before
+                // the window existed. A resize that arrived while the renderer
+                // was initializing updated `dimensions` but found no surface,
+                // and the window can differ from the request (AppKit rounds to
+                // whole points: 471 px becomes 472). Later resizes to the same
+                // size are no-ops, so without this the surface stayed a pixel
+                // short and the layout was squeezed into it (ft-rsodi).
+                // `resize` does nothing when the sizes already match.
+                webgpu.resize(myself.dimensions);
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
@@ -5064,6 +5168,11 @@ impl TermWindow {
             }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
+                self.post_metal_surface();
+                Ok(true)
+            }
+            WindowEvent::OcclusionChanged(occluded) => {
+                self.occlusion_changed(occluded, window);
                 self.post_metal_surface();
                 Ok(true)
             }
@@ -5258,6 +5367,7 @@ impl TermWindow {
             return false;
         };
         self.begin_metal_font_read();
+        self.stage_metal_selection_frames();
         let captured_generation = self.damage_generation;
         let snapshot_path = self.claim_render_snapshot();
         let dimensions = self.dimensions;
@@ -5325,6 +5435,7 @@ impl TermWindow {
                 let frames = frankenterm_alloc::resource_ledger::FrameLedger::global();
                 frames.set_max_fps(self.config.max_fps);
                 frames.record_present();
+                self.settle_presented_selection_frames(captured_generation.value, 0);
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
                     self.damage_generation,
@@ -5673,6 +5784,9 @@ impl TermWindow {
         }
 
         let dimensions = self.dimensions;
+        // A reload can change the window's translucency; the surface follows
+        // it at the configure that precedes acquisition.
+        webgpu.set_opaque_content(self.config.window_content_is_opaque());
         let acquired = match Self::acquire_webgpu_frame_with_repair(&webgpu, dimensions) {
             Ok(acquired) => acquired,
             Err(failure) => {
@@ -5971,12 +6085,24 @@ impl TermWindow {
                         window,
                     )
                 });
+                let cleaned_up = matches!(cleanup_result, Ok(true));
                 if let Err(error) = cleanup_result {
                     log::error!("retained GUI pane cleanup failed; owner will retry: {error:#}");
                 }
                 // Empty retained wakes include credit returns: retry visible
                 // state admission through the ordinary paced native repaint.
-                actions.request_repaint();
+                // So do wakes that cleaned up a removed pane. A wake that
+                // carries only pane work repaints through that work instead:
+                // visible output below, the coalesced title refresh when the
+                // tab bar changed, and the invalidation branches. Agents in
+                // background tabs send such wakes all the time, and
+                // repainting on each one held their windows at max_fps for
+                // content nobody could see.
+                let carries_pane_work =
+                    title_refresh.is_some() || interest.iter().any(|word| *word != 0);
+                if pane_cleanup.take_credit_wake() || cleaned_up || !carries_pane_work {
+                    actions.request_repaint();
+                }
                 if reconcile
                     || attached_tabs
                         .as_ref()
@@ -6011,14 +6137,16 @@ impl TermWindow {
                     actions.request_repaint();
                 }
                 if let Some(title_refresh) = title_refresh {
-                    // Release the single-flight bit before reading live state;
-                    // output during this refresh can retain a successor ticket.
+                    // Release the single-flight bit; the coalesced refresh
+                    // reads live state when it runs, so alerts arriving
+                    // meanwhile are covered by it.
                     title_refresh.begin_refresh();
-                    self.update_title_impl(Some(&actions));
-                    // A title/progress-only refresh can change the tab bar
-                    // without any pane output. Retain its native repaint under
-                    // this admission before the visibility check returns.
-                    actions.request_repaint();
+                    // A changed tab bar repaints the whole window, and agents
+                    // animate their titles in background tabs all the time.
+                    // This refreshed at once with an unconditional repaint;
+                    // the coalesced refresh repaints only when the tab bar
+                    // changed, at most once per TITLE_UPDATE_COALESCE.
+                    self.schedule_title_refresh(false);
                 }
                 if interest.iter().any(|word| *word != 0) {
                     self.record_idle_event(idle_detector::IdleEvent::PtyData);
@@ -6112,7 +6240,7 @@ impl TermWindow {
                     } => {
                         // Coalesce: agents emitting OSC 7 / OSC 9;4 across multiple
                         // attached muxes can fire dozens of these per second.
-                        // Schedule one frame-bounded update_title instead. ft-9d60d.
+                        // Schedule one coalesced update_title instead. ft-9d60d.
                         self.schedule_update_title();
                     }
                     MuxNotification::Alert {
@@ -8180,29 +8308,27 @@ impl TermWindow {
         }
 
         let title = match config::run_immediate_with_lua_config(|lua| {
-            if let Some(lua) = lua {
-                let tabs = lua.create_sequence_from(tabs.clone().into_iter())?;
-                let panes = lua.create_sequence_from(panes.clone().into_iter())?;
-
-                let v = config::lua::emit_sync_callback(
-                    &*lua,
-                    (
-                        "format-window-title".to_string(),
-                        (
-                            active_tab.clone(),
-                            active_pane.clone(),
-                            tabs,
-                            panes,
-                            (*self.config).clone(),
-                        ),
-                    ),
-                )?;
-                match &v {
-                    mlua::Value::Nil => Ok(None),
-                    _ => Ok(Some(String::from_lua(v, &*lua)?)),
-                }
-            } else {
-                Ok(None)
+            let Some(lua) = lua else {
+                return Ok(None);
+            };
+            // Converting every tab, every pane and the whole configuration is
+            // the expensive part: skip it when nobody handles the event.
+            let Some(handler) = config::lua::registered_sync_callback(&lua, "format-window-title")?
+            else {
+                return Ok(None);
+            };
+            let tabs = lua.create_sequence_from(tabs.clone().into_iter())?;
+            let panes = lua.create_sequence_from(panes.clone().into_iter())?;
+            let v: mlua::Value = handler.call((
+                active_tab.clone(),
+                active_pane.clone(),
+                tabs,
+                panes,
+                (*self.config).clone(),
+            ))?;
+            match &v {
+                mlua::Value::Nil => Ok(None),
+                _ => Ok(Some(String::from_lua(v, &*lua)?)),
             }
         }) {
             Ok(s) => s,
@@ -8274,7 +8400,8 @@ impl TermWindow {
         }
     }
 
-    /// Schedule a coalesced `update_title()` at most once per ~16 ms frame.
+    /// Schedule a coalesced `update_title()` at most once per
+    /// [`TITLE_UPDATE_COALESCE`].
     ///
     /// Multiple mux subscribers (one per attached domain) re-emit Alerts like
     /// `Progress`, `CurrentWorkingDirectoryChanged`, and `OutputSinceFocusLost`
@@ -8282,14 +8409,29 @@ impl TermWindow {
     /// directly per Alert produces O(N_tabs × N_panes × Lua_roundtrip)
     /// allocation churn per call, dozens of times per second — the dominant
     /// driver of the wezterm-gui RSS leak observed in production. Coalescing
-    /// to one frame caps the call rate at ~60/sec independent of fanout.
-    /// See ft-9d60d.
+    /// caps the call rate (10/sec) independent of fanout, and with it the
+    /// whole-window repaints that tab-bar title changes cause. See ft-9d60d.
     fn schedule_update_title(&mut self) {
+        self.schedule_title_refresh(true);
+    }
+
+    /// The coalescing behind [`Self::schedule_update_title`]. `with_status`
+    /// also runs the status event; a tab-bar-only refresh (title alerts) does
+    /// not, so animated agent titles do not drive the Lua status handler.
+    fn schedule_title_refresh(&mut self, with_status: bool) {
+        self.pending_update_title_status |= with_status;
         if self.pending_update_title {
-            metrics::histogram!("update_title.coalesced").record(1.);
-            return;
+            let lost = self
+                .pending_update_title_at
+                .is_some_and(|at| at.elapsed() > TITLE_UPDATE_LOST_AFTER);
+            if !lost {
+                metrics::histogram!("update_title.coalesced").record(1.);
+                return;
+            }
+            log::warn!("coalesced title refresh never ran; scheduling a new one");
         }
         self.pending_update_title = true;
+        self.pending_update_title_at = Some(Instant::now());
         metrics::histogram!("update_title.scheduled").record(1.);
 
         if let Some(window) = self.window.as_ref() {
@@ -8301,11 +8443,14 @@ impl TermWindow {
                 promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                     reservation
                         .spawn_local(async move {
-                            // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
-                            sleep(Duration::from_millis(16)).await;
+                            sleep(TITLE_UPDATE_COALESCE).await;
                             window.notify(TermWindowNotif::Apply(Box::new(|tw| {
                                 tw.pending_update_title = false;
-                                tw.update_title();
+                                if std::mem::take(&mut tw.pending_update_title_status) {
+                                    tw.update_title();
+                                } else {
+                                    tw.update_title_impl(None);
+                                }
                             })));
                         })
                         .detach();
@@ -9084,7 +9229,7 @@ impl TermWindow {
     }
 
     fn scroll_to_prompt(&mut self, amount: isize, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top);
@@ -9107,7 +9252,9 @@ impl TermWindow {
     }
 
     fn scroll_by_page(&mut self, amount: f64, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        // Facts, not a terminal lock: scrolling a pane that floods must not
+        // wait for its parser (ft-yccm0.2.2.6).
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top) as f64
@@ -9131,7 +9278,8 @@ impl TermWindow {
     }
 
     fn scroll_by_line(&mut self, amount: isize, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        // The mouse wheel lands here; see scroll_by_page.
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top)
@@ -10906,7 +11054,7 @@ impl TermWindow {
     }
 
     fn scroll_to_top(&mut self, pane: &Arc<dyn Pane>) {
-        let dims = pane.get_dimensions();
+        let dims = mouseevent::pane_dimensions(&**pane);
         self.set_viewport(pane.pane_id(), Some(dims.scrollback_top), dims);
     }
 
@@ -10915,7 +11063,9 @@ impl TermWindow {
         if self.get_viewport(pane_id).is_none() {
             return;
         }
-        self.set_viewport(pane_id, None, pane.get_dimensions());
+        // Facts, not a terminal lock: the mouse path scrolls to the bottom
+        // before reporting (ft-yccm0.2.2.2).
+        self.set_viewport(pane_id, None, mouseevent::pane_dimensions(&**pane));
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {

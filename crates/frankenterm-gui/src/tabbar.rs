@@ -39,63 +39,136 @@ struct TitleText {
     len: usize,
 }
 
-fn call_format_tab_title(
-    tab: &TabInformation,
-    tab_info: &[TabInformation],
-    pane_info: &[PaneInformation],
-    config: &ConfigHandle,
-    hover: bool,
-    tab_max_width: usize,
-) -> Option<TitleText> {
-    match config::run_immediate_with_lua_config(|lua| {
-        if let Some(lua) = lua {
-            let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
-            let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
+/// Runs the `format-tab-title` handler for the tabs of one tab bar.
+///
+/// The tab list, the pane list and the configuration passed to the handler
+/// are the same for every tab of a tab bar, and converting them to Lua costs
+/// far more than the call itself (the configuration alone is hundreds of
+/// fields). They are converted at most once per tab bar, when the first title
+/// is formatted, and not at all when no Lua configuration is loaded or no
+/// `format-tab-title` handler is registered (GitHub #128). Every call of one
+/// tab bar receives the same `tabs`, `panes` and `config` tables.
+struct TabTitleFormatter<'a> {
+    tab_info: &'a [TabInformation],
+    pane_info: &'a [PaneInformation],
+    config: &'a ConfigHandle,
+    lua: TabTitleLua,
+    call: std::cell::OnceCell<Option<FormatTabTitleCall>>,
+}
 
-            let v = config::lua::emit_sync_callback(
-                &*lua,
-                (
-                    "format-tab-title".to_string(),
-                    (
-                        tab.clone(),
-                        tabs,
-                        panes,
-                        (**config).clone(),
-                        hover,
-                        tab_max_width,
-                    ),
-                ),
-            )?;
-            match &v {
-                mlua::Value::Nil => Ok(None),
-                mlua::Value::Table(_) => {
-                    let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
+/// Where a [`TabTitleFormatter`] gets its Lua state.
+enum TabTitleLua {
+    /// The current Lua configuration, looked up on first use.
+    Configured,
+    /// A given state, for tests.
+    #[cfg(test)]
+    Given(Option<std::rc::Rc<mlua::Lua>>),
+}
 
-                    let esc = format_as_escapes(items.clone())?;
-                    let line = parse_status_text(&esc, CellAttributes::default());
+/// The handler and the arguments shared by every tab of one tab bar.
+struct FormatTabTitleCall {
+    lua: std::rc::Rc<mlua::Lua>,
+    handler: mlua::Function,
+    tabs: mlua::Table,
+    panes: mlua::Table,
+    config: mlua::Value,
+}
 
-                    Ok(Some(TitleText {
-                        items,
-                        len: line.len(),
-                    }))
-                }
-                _ => {
-                    let s = String::from_lua(v, &*lua)?;
-                    let line = parse_status_text(&s, CellAttributes::default());
-                    Ok(Some(TitleText {
-                        len: line.len(),
-                        items: vec![FormatItem::Text(s)],
-                    }))
-                }
-            }
-        } else {
-            Ok(None)
+impl<'a> TabTitleFormatter<'a> {
+    fn new(
+        tab_info: &'a [TabInformation],
+        pane_info: &'a [PaneInformation],
+        config: &'a ConfigHandle,
+    ) -> Self {
+        Self {
+            tab_info,
+            pane_info,
+            config,
+            lua: TabTitleLua::Configured,
+            call: std::cell::OnceCell::new(),
         }
-    }) {
-        Ok(s) => s,
-        Err(err) => {
-            log::warn!("format-tab-title: {}", err);
-            None
+    }
+
+    /// The custom title of `tab`, or `None` when no handler is registered,
+    /// the handler returned nil, or it failed.
+    fn format(&self, tab: &TabInformation, hover: bool, tab_max_width: usize) -> Option<TitleText> {
+        let call = self.call.get_or_init(|| match self.prepare() {
+            Ok(call) => call,
+            Err(err) => {
+                log::warn!("format-tab-title: {err:#}");
+                None
+            }
+        });
+        match call.as_ref()?.format(tab, hover, tab_max_width) {
+            Ok(title) => title,
+            Err(err) => {
+                log::warn!("format-tab-title: {err:#}");
+                None
+            }
+        }
+    }
+
+    fn prepare(&self) -> anyhow::Result<Option<FormatTabTitleCall>> {
+        let lua = match &self.lua {
+            TabTitleLua::Configured => config::run_immediate_with_lua_config(Ok)?,
+            #[cfg(test)]
+            TabTitleLua::Given(lua) => lua.clone(),
+        };
+        let Some(lua) = lua else {
+            return Ok(None);
+        };
+        let Some(handler) = config::lua::registered_sync_callback(&lua, "format-tab-title")? else {
+            return Ok(None);
+        };
+        let tabs = lua.create_sequence_from(self.tab_info.iter().cloned())?;
+        let panes = lua.create_sequence_from(self.pane_info.iter().cloned())?;
+        let config = mlua::IntoLua::into_lua((**self.config).clone(), &lua)?;
+        Ok(Some(FormatTabTitleCall {
+            lua,
+            handler,
+            tabs,
+            panes,
+            config,
+        }))
+    }
+}
+
+impl FormatTabTitleCall {
+    fn format(
+        &self,
+        tab: &TabInformation,
+        hover: bool,
+        tab_max_width: usize,
+    ) -> anyhow::Result<Option<TitleText>> {
+        let v: mlua::Value = self.handler.call((
+            tab.clone(),
+            self.tabs.clone(),
+            self.panes.clone(),
+            self.config.clone(),
+            hover,
+            tab_max_width,
+        ))?;
+        match &v {
+            mlua::Value::Nil => Ok(None),
+            mlua::Value::Table(_) => {
+                let items = <Vec<FormatItem>>::from_lua(v, &self.lua)?;
+
+                let esc = format_as_escapes(items.clone())?;
+                let line = parse_status_text(&esc, CellAttributes::default());
+
+                Ok(Some(TitleText {
+                    items,
+                    len: line.len(),
+                }))
+            }
+            _ => {
+                let s = String::from_lua(v, &self.lua)?;
+                let line = parse_status_text(&s, CellAttributes::default());
+                Ok(Some(TitleText {
+                    len: line.len(),
+                    items: vec![FormatItem::Text(s)],
+                }))
+            }
         }
     }
 }
@@ -149,14 +222,13 @@ fn progress_indicator(progress: &Progress) -> Option<(FormatColor, String)> {
 
 fn compute_tab_title(
     tab: &TabInformation,
-    tab_info: &[TabInformation],
-    pane_info: &[PaneInformation],
-    config: &ConfigHandle,
+    formatter: &TabTitleFormatter<'_>,
     hover: bool,
     tab_max_width: usize,
 ) -> TitleText {
     metrics::histogram!("compute_tab_title.calls").record(1.);
-    let title = call_format_tab_title(tab, tab_info, pane_info, config, hover, tab_max_width);
+    let config = formatter.config;
+    let title = formatter.format(tab, hover, tab_max_width);
 
     match title {
         Some(title) => title,
@@ -382,6 +454,7 @@ impl TabBarState {
         // are symbols representing minimize, maximize and close.
 
         let mut active_tab_no = 0;
+        let title_formatter = TabTitleFormatter::new(tab_info, pane_info, config);
 
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
             tab_info
@@ -390,14 +463,7 @@ impl TabBarState {
                     if tab.is_active {
                         active_tab_no = tab.tab_index;
                     }
-                    compute_tab_title(
-                        tab,
-                        tab_info,
-                        pane_info,
-                        config,
-                        false,
-                        config.tab_max_width,
-                    )
+                    compute_tab_title(tab, &title_formatter, false, config.tab_max_width)
                 })
                 .collect()
         } else {
@@ -474,14 +540,8 @@ impl TabBarState {
             let recomputed_title;
             let tab_title: &TitleText = if hover || tab_title_len != config.tab_max_width {
                 metrics::histogram!("compute_tab_title.second_pass.recomputed").record(1.);
-                recomputed_title = compute_tab_title(
-                    &tab_info[tab_idx],
-                    tab_info,
-                    pane_info,
-                    config,
-                    hover,
-                    tab_title_len,
-                );
+                recomputed_title =
+                    compute_tab_title(&tab_info[tab_idx], &title_formatter, hover, tab_title_len);
                 &recomputed_title
             } else {
                 metrics::histogram!("compute_tab_title.second_pass.cached").record(1.);
@@ -651,6 +711,116 @@ impl TabBarState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    fn test_tabs(count: usize) -> Vec<TabInformation> {
+        (0..count)
+            .map(|index| TabInformation {
+                tab_id: index,
+                tab_index: index,
+                is_active: index == 0,
+                is_last_active: false,
+                active_pane: None,
+                window_id: 0,
+                tab_title: format!("tab {index}"),
+            })
+            .collect()
+    }
+
+    fn lua_with(script: &str) -> anyhow::Result<Rc<mlua::Lua>> {
+        let lua = config::lua::make_lua_context(std::path::Path::new("testing"))?;
+        lua.load(script).exec()?;
+        Ok(Rc::new(lua))
+    }
+
+    fn formatter_with<'a>(
+        lua: Option<Rc<mlua::Lua>>,
+        tab_info: &'a [TabInformation],
+        config: &'a ConfigHandle,
+    ) -> TabTitleFormatter<'a> {
+        TabTitleFormatter {
+            tab_info,
+            pane_info: &[],
+            config,
+            lua: TabTitleLua::Given(lua),
+            call: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn title_text(title: &TitleText) -> String {
+        title
+            .items
+            .iter()
+            .map(|item| match item {
+                FormatItem::Text(text) => text.as_str(),
+                _ => "",
+            })
+            .collect()
+    }
+
+    /// GitHub #128: the tab list, pane list and configuration were converted to
+    /// Lua again for every tab of every tab bar refresh.
+    #[test]
+    fn format_tab_title_arguments_are_built_once_per_tab_bar() -> anyhow::Result<()> {
+        let lua = lua_with(
+            r#"
+            calls = {}
+            require('wezterm').on('format-tab-title',
+                function(tab, tabs, panes, config, hover, max_width)
+                    table.insert(calls, { tabs = tabs, panes = panes, config = config })
+                    return 'T' .. tab.tab_index .. (hover and 'h' or '') .. max_width
+                end)
+            "#,
+        )?;
+        let tabs = test_tabs(3);
+        let config = ConfigHandle::default_config();
+        let formatter = formatter_with(Some(Rc::clone(&lua)), &tabs, &config);
+
+        for tab in &tabs {
+            let title = compute_tab_title(tab, &formatter, false, 16);
+            assert_eq!(title_text(&title), format!("T{}16", tab.tab_index));
+        }
+        let hovered = compute_tab_title(&tabs[1], &formatter, true, 7);
+        assert_eq!(title_text(&hovered), "T1h7");
+
+        let calls: mlua::Table = lua.globals().get("calls")?;
+        assert_eq!(calls.raw_len(), 4);
+        let first: mlua::Table = calls.get(1)?;
+        let first_tabs: mlua::Table = first.get("tabs")?;
+        assert_eq!(first_tabs.raw_len(), 3);
+        for index in 2..=4 {
+            let call: mlua::Table = calls.get(index)?;
+            for key in ["tabs", "panes", "config"] {
+                let shared: mlua::Table = first.get(key)?;
+                let this: mlua::Table = call.get(key)?;
+                assert_eq!(
+                    this.to_pointer(),
+                    shared.to_pointer(),
+                    "call {index} got a rebuilt `{key}` table"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn format_tab_title_arguments_are_not_built_without_a_handler() -> anyhow::Result<()> {
+        let tabs = test_tabs(2);
+        let config = ConfigHandle::default_config();
+
+        let unhandled = formatter_with(Some(lua_with("")?), &tabs, &config);
+        assert!(unhandled.prepare()?.is_none());
+        assert!(unhandled.format(&tabs[0], false, 16).is_none());
+        // The default title is used (these test tabs have no active pane).
+        assert_eq!(
+            title_text(&compute_tab_title(&tabs[1], &unhandled, false, 16)),
+            " no pane "
+        );
+
+        let without_lua = formatter_with(None, &tabs, &config);
+        assert!(without_lua.prepare()?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn indeterminate_progress_has_visible_indicator() {

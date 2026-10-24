@@ -1701,6 +1701,7 @@ fn arb_tx_compensation_outcome() -> impl Strategy<Value = TxCompensationOutcome>
         Just(TxCompensationOutcome::FullyRolledBack),
         Just(TxCompensationOutcome::CompensationFailed),
         Just(TxCompensationOutcome::NothingToCompensate),
+        Just(TxCompensationOutcome::ReconciliationRequired),
     ]
 }
 
@@ -1868,6 +1869,11 @@ proptest! {
             TxCompensationOutcome::NothingToCompensate => {
                 let check = matches!(target, MissionTxState::Compensated);
                 prop_assert!(check);
+            }
+            TxCompensationOutcome::ReconciliationRequired => {
+                let check = matches!(target, MissionTxState::Compensating);
+                prop_assert!(check);
+                prop_assert!(!target.is_terminal());
             }
         }
     }

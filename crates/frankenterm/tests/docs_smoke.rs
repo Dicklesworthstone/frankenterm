@@ -1072,10 +1072,14 @@ fn workspace_layout_contract_docs_truth_gate() {
             "ft-watch.log",
             "~/Library/Application Support/ft/ft.toml",
             "~/.config/ft/ft.toml",
-            "%APPDATA%\\ft\\ft.toml",
+            "%USERPROFILE%\\.config\\ft\\ft.toml",
         ],
     );
-    assert_excludes_all("workspace layout docs", &readme, &["watcher.lock"]);
+    assert_excludes_all(
+        "workspace layout docs",
+        &readme,
+        &["watcher.lock", "%APPDATA%\\ft\\ft.toml"],
+    );
 }
 
 #[test]

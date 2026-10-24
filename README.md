@@ -136,7 +136,7 @@ $ ft robot state
 }
 ```
 
-For AI-to-AI use, add `--format toon` to swap the JSON encoder for the lower-token [TOON](#deep-dive-toon-encoding) serialization. Exact byte savings depend on payload shape; the CLI prints JSON-vs-TOON byte counts to stderr if you pass `--stats`.
+For AI-to-AI use, add `--format toon` to swap the JSON encoder for the lower-token [TOON](#deep-dive-toon-encoding) serialization. Exact savings depend on payload shape; pass `--stats` and the CLI prints estimated JSON and TOON token counts and the savings percentage to stderr.
 
 ### 3 · Start observing (2 minutes)
 
@@ -283,7 +283,7 @@ For a free-text operator goal that respects the safety envelope:
 $ ft mission objective-plan --objective "spawn 5 codex panes for the pricing refactor"
 ```
 
-This invokes the capacity-aware objective planner, which asks the operating envelope whether 5 new panes are safe given current RCH pressure, fleet memory, etc. — and returns a plan only if it fits. See [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) for the JSON shapes.
+This invokes the read-only objective planner. It ranks the objective against the scope you pass and a capacity posture you supply (`--capacity-posture admit|defer|pause|unknown`, default `admit`); it does not read the live operating envelope itself, so check `ft swarm envelope` first and pass the posture it implies. See [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) for the JSON shapes.
 
 ### 7 · Verify the release attestation (1 minute)
 
@@ -364,18 +364,19 @@ Honest status of every shipped surface, without migration-era hand-waving.
 |---|---|---|
 | Watch / status / triage / doctor / reproduce | **Supported** | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints |
 | Search / events / audit / workflows / mission / tx | **Supported** | Backed by local storage, policy, and workflow subsystems |
-| Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflows`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approvals`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
+| Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflow`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approve`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
-| Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
+| Mission objective planner | **Supported** | Read-only objective planner; the capacity posture is caller-supplied (`--capacity-posture`), not read from the operating envelope (ft-auy2g) |
 | Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; audit tail included, process tree opt-in (`--process-sample`); GPU, render and BSU/ESU collectors are not on the production path |
 | Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
-| Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
-| Distributed mode | **Supported behind `--features distributed`** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
-| MCP server | **Supported behind `--features mcp`** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
+| Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
+| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). No authentication, Tailscale mode, terminal attach or DSR-packaged asset set yet; those are tracked under `ft-browser-frankenterm-7z4il` |
+| Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
+| MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
-| Browser auth tooling | **Feature-gated** | `ft auth` is real, but only in builds that include the browser feature and a usable browser stack |
+| Browser auth tooling | **Feature-gated (on by default)** | `ft auth` is real; it needs the `browser` feature (in default builds) and a usable browser stack on the host |
 | GUI (FrankenTerm.app) | **Supported on macOS** | Native macOS bundle; live render-state plumbing, BSU/ESU sync-output, classified drag handlers, command-palette domain labels |
 
 ---
@@ -642,9 +643,10 @@ ft robot get-text 7 --tail 5000
 **With `ft`:** The operating-envelope planner evaluates available pressure snapshots and configured bounds. Admission is a model decision, not a hardware safety guarantee. Target-class resource evidence remains unproven, and authenticated receipt consumption is tracked in `ft-7h5da.10.4.4`. Inspect the evidence state and limiting inputs before starting a large fleet.
 
 ```bash
-ft mission objective-plan --objective "spawn 100 codex panes" --strictness strict
-# returns a plan that's been validated against the envelope, OR
-# a deny verdict naming the limiting input
+ft swarm envelope                  # current admission verdict and the limiting inputs
+ft mission objective-plan --objective "spawn 100 codex panes" --strictness strict \
+                          --capacity-posture defer
+# objective-plan does not read the envelope; pass the posture the envelope implies
 ```
 
 ### Scenario 5 — Drive one AI by another, safely
@@ -954,6 +956,33 @@ ft search "<query>" --limit 50
 ```bash
 ft why --list                # list explanation templates
 ft why deny.alt_screen       # explain a common policy denial
+ft why FT-1001               # explain the error code an error message names
+```
+
+### Attention console
+
+`ft attention` ranks what needs an operator or agent next, without changing
+anything. Without `--input` it reads live sources:
+
+- the watcher's operating envelope;
+- policy denials and approval holds from the last 24 hours of the audit log;
+- verified-submit profile drift;
+- unhandled warning and critical detection events;
+- operator pane holds;
+- watcher crash bundles from the last day;
+- a failed or compensating mission transaction.
+
+Each item carries its reasons, a safe next action and a mute key. MCP
+`wa.attention` with `live: true` reads the same database sources, but not the
+watcher envelope, crash bundles or the transaction contract. The JSON contract is in
+`docs/robot-contracts/attention-router.md`.
+
+```bash
+ft attention status               # scored snapshot and source health
+ft attention next                 # the highest-priority safe next action
+ft attention explain              # why the next item ranks first
+ft robot attention next           # the same, as a robot envelope
+ft mute add <identity_key>        # stop one item resurfacing (the key is in its summary)
 ```
 
 ### Workflows
@@ -982,8 +1011,10 @@ ft mission plan                                # validate mission contract + com
 ft mission run                                 # advance lifecycle into execution
 ft mission status                              # lifecycle + assignment summary
 ft mission explain                             # legal lifecycle transitions
-ft mission pause / resume / abort              # canonical lifecycle transitions
-ft mission objective-plan --objective "<text>" # capacity-aware objective planner (ft-auy2g)
+ft mission pause                               # canonical lifecycle transitions
+ft mission resume
+ft mission abort
+ft mission objective-plan --objective "<text>" # read-only objective planner (ft-auy2g)
 ft tx plan                                     # validate tx contract + summarize lifecycle
 ft tx run                                      # prepare + commit, deterministically
 ft tx run --fail-step tx-step:commit
@@ -991,14 +1022,14 @@ ft tx rollback                                 # compensation for committed step
 ft tx show --include-contract                  # receipts and full tx payload
 ```
 
-The mission objective planner reads the requested objective, queries the operating-envelope planner for the current admission verdict, builds a plan that fits inside the envelope, and emits a deterministic plan artifact. Planning is side-effect-free; execution is a separate step that re-validates the plan against the live envelope. See [Operating Envelope](#operating-envelope) below.
+The mission objective planner reads the requested objective and a caller-supplied capacity posture (`--capacity-posture`, default `admit`), ranks the candidate work, and prints a deterministic plan artifact. It does not query the operating envelope (`ft swarm envelope` does), and planning is side-effect-free: nothing is spawned, sent, or stored. See [Operating Envelope](#operating-envelope) below.
 
 ### Rules
 
 ```bash
 ft rules list                            # list detection rules
 ft rules test "Usage limit reached"      # test text against rules
-ft rules show codex.usage_reached        # show rule details
+ft rules show codex.usage.reached        # show rule details
 ft robot rules lint --fixtures --strict  # validate the pack (naming + regex safety + fixture coverage)
 ```
 
@@ -1015,10 +1046,10 @@ ft audit --decision deny                 # only denied decisions
 ```bash
 ft triage                               # summarize issues (health/crashes/events)
 ft diag bundle --output /tmp/ft-diag    # collect diagnostic bundle
-ft reproduce --kind crash               # export latest crash bundle
+ft reproduce export --kind crash        # export latest crash bundle
 ft doctor                               # environment health check
 ft doctor --json                        # machine-readable diagnostics
-ft proof-doctor                         # validate evidence artifacts in docs/attestations/
+ft proof-doctor --bead <id> -- <cmd>    # check a proof command's RCH-required shape (does not run it)
 ```
 
 ### Attestation
@@ -1057,7 +1088,7 @@ Cargo, target-class capacity, live-pane mutation, or production-scale behavior.
 
 ### Web API (feature-gated)
 
-Build with `--features web`, then run `ft web` to expose a local HTTP surface on `127.0.0.1:8000` by default.
+Run `ft web` (the `web` feature is in default builds) to expose a local HTTP surface on `127.0.0.1:8000` by default.
 
 ```bash
 ft web
@@ -1070,6 +1101,19 @@ curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
 Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
 
 `/stream/events` has two event sources. Standalone `ft web` tails detections that a watcher persists to the same database (250 ms poll; `FT_WEB_STORAGE_TAIL=0` disables it). `ft watch --web [--web-port N]` runs the API inside the watcher and streams its live event bus directly, with no polling delay.
+
+#### Browser fleet viewer (preview)
+
+`ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `Tab`/`1`/`2` switch views, `j`/`k` move, `r` refetches. It never writes to a pane.
+
+```bash
+RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
+ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:8000/ui/
+```
+
+The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. WebGPU is required; browsers without it show an error instead of a blank page. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
+
+The server is still loopback-only and unauthenticated, so the viewer is for the local machine (or a tunnel you control). Authenticated tailnet access, terminal attach and DSR packaging are the open milestones of `ft-browser-frankenterm-7z4il`.
 
 `ft web` runs no capture pipeline of its own. `/stream/events` is fed by a storage tail: the server follows newly persisted `events` rows written by the watcher (another process) and republishes them on its in-process bus, so a detection reaches SSE clients within one poll interval (250 ms) after `ft watch` stores it. The tail starts after the newest existing row, so a restart never replays history. Embedders that publish to the same bus in-process can disable it with `WebServerConfig::with_storage_event_tail(false)`.
 
@@ -1331,9 +1375,8 @@ ft robot search "compilation failed" --mode hybrid
 ```bash
 ft robot events --limit 10
 ft robot events --pane 0
-ft robot events --rule-id "usage_limit"
+ft robot events --rule-id "codex.usage.reached"   # exact rule id match
 ft robot events --unhandled
-ft robot events --event-type gap            # capture-gap events only
 ```
 
 ### Agent Mail outage outbox
@@ -1437,7 +1480,7 @@ Configuration is discovered in canonical precedence order:
 1. Explicit `--config <path>` CLI option
 2. Workspace-local configuration via `FT_WORKSPACE` (`$FT_WORKSPACE/.ft/config.toml`, `$FT_WORKSPACE/.ft/ft.toml`, or `$FT_WORKSPACE/ft.toml`)
 3. Current working directory (`./.ft/config.toml`, `./.ft/ft.toml`, or `./ft.toml`)
-4. Platform default configuration (`~/.config/ft/ft.toml` on XDG, `~/Library/Application Support/ft/ft.toml` on macOS, or `%APPDATA%\ft\ft.toml` on Windows)
+4. Platform default configuration (`~/Library/Application Support/ft/ft.toml` on macOS; elsewhere, Windows included, `$XDG_CONFIG_HOME/ft/ft.toml` or else `~/.config/ft/ft.toml` under the home directory)
 
 ```toml
 [general]
@@ -1620,7 +1663,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   │   │   ├── search/                   # Lexical / semantic / hybrid + daemon
 │   │   │   ├── connector_*.rs            # Connector fabric (14 modules)
 │   │   │   ├── scrollback_tiers.rs       # Three-tier scrollback storage
-│   │   │   ├── scan_pipeline.rs          # SIMD scan + trigger + compression
+│   │   │   ├── simd_scan.rs              # Newline + ANSI density metrics (BOCPD features)
 │   │   │   ├── wire_protocol.rs          # Distributed messaging
 │   │   │   ├── operating_envelope.rs     # ft.operating_envelope.v1 planner
 │   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
@@ -1637,7 +1680,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   ├── frankenterm-core-mcp/             # MCP type boundary
 │   ├── frankenterm-core-test-macros/     # #[lab_runtime_test] proc macros
 │   │
-│   │   # ── 12 leaf type crates (zero first-party deps) ──
+│   │   # ── 12 leaf type crates (no first-party deps but one) ──
 │   ├── frankenterm-core-resource-types/
 │   ├── frankenterm-core-error-types/
 │   ├── frankenterm-core-config-types/
@@ -1674,7 +1717,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 
 ### Sub-crate extraction invariants
 
-- **Leaf type crates** (`*-types`) declare zero first-party dependencies.
+- **Leaf type crates** (`*-types`) declare no first-party dependencies, with one exception: `frankenterm-core-audit-types` depends on `frankenterm-core-replay-types`.
 - **Cluster sub-crates** (`*-ars`, `*-tantivy`, `*-replay`, `*-fleet`) depend on `frankenterm-core` and, where needed, shared leaf types.
 - **Core imports shared leaves**, including the feature-gated MCP type crate. The connector boundary imports connector types, not core.
 - **Normal/build dependency cycles are forbidden.** Dev-dependency cycles let core tests exercise the extracted clusters.
@@ -1686,7 +1729,6 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 |---|---|---|
 | Delta extraction | Bounded 1 MiB overlap matching with gap semantics | Efficient incremental capture without persisting full-buffer re-reads |
 | Pattern detection | Aho-Corasick multi-pattern + anchor filtering + Bloom prefilter | Fast multi-agent pattern matching with probabilistic pre-rejection |
-| Scan pipeline | SIMD newline/ANSI density scan + batch trigger + zstd | Three-stage pipeline for raw pane output |
 | Search | FTS5 lexical + hash-embedding semantic lane | Lexical, semantic, and hybrid modes via RRF fusion |
 | Change-point detection | BOCPD (Bayesian Online Change-Point Detection) | Catch novel failure modes regex patterns miss |
 | Backpressure | Four-tier model (Green/Yellow/Red/Black) with queue-depth gauges | Prevent OOM and cascading latency under load |
@@ -1707,13 +1749,12 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 1. **Discovery** — enumerate pane/session resources via active backend adapters
 2. **Capture** — stream output and state deltas from adapters / runtime hooks
 3. **Delta** — compare with the previous capture using the bounded 1 MiB overlap window
-4. **Scan** — run three-stage pipeline (SIMD metrics → pattern trigger → compression)
-5. **Store** — append new segments to SQLite with FTS5 indexing
-6. **Detect** — run pattern engine (anchored + Bloom-prefiltered + BOCPD) against new content
-7. **Event** — broadcast detections to event bus subscribers
-8. **Admit** — operating-envelope planner decides whether new pane/workflow work is safe
-9. **Workflow** — execute registered workflows on matching events (with trigger-policy allowlists)
-10. **Policy** — gate all actions through capability and rate-limit checks
+4. **Store** — append new segments to SQLite with FTS5 indexing
+5. **Detect** — run pattern engine (anchored + Bloom-prefiltered + BOCPD) against new content
+6. **Event** — broadcast detections to event bus subscribers
+7. **Admit** — operating-envelope planner decides whether new pane/workflow work is safe
+8. **Workflow** — execute registered workflows on matching events (with trigger-policy allowlists)
+9. **Policy** — gate all actions through capability and rate-limit checks
 11. **API** — expose everything via Robot Mode JSON, MCP, web/SSE, and distributed streamer
 
 ### System Components and Responsibilities
@@ -1723,7 +1764,6 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 | Component | Owns | Talks to | Doesn't do |
 |---|---|---|---|
 | **Ingest pipeline** (`ingest.rs`) | Pane discovery, delta extraction, gap detection, overlap matching | Storage (write), Event bus (deltas) | Pattern detection, policy decisions, sending input |
-| **Scan pipeline** (`scan_pipeline.rs`) | SIMD metrics, AC pattern trigger, zstd compression | Pattern engine (triggers), Storage (compressed bytes) | Persistence decisions, action execution |
 | **Pattern engine** (`patterns.rs`) | Rule packs, Bloom prefilter, anchor evaluation, regex execution, BOCPD | Event bus (detections), Storage (read-only) | Sending input, mutating panes |
 | **Event bus** (`events.rs`) | Bounded broadcast of typed events, fanout to subscribers, backpressure | All subscribers | Persistence (subscribers persist if needed) |
 | **Storage** (`storage/`) | SQLite schema + migrations, FTS5 indexing, single-writer lock, page-stat advisories + explicit VACUUM, backup/restore | All readers | Pattern matching, workflow execution |
@@ -1746,7 +1786,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 |---|---|---|
 | `frankenterm-core-ars` | Adaptive/Autonomous Reflex System (15 modules) — drift detection, evidence ledger, blast radius, regime analysis | Heavy ML/statistics surface that shouldn't be in everyone's compile graph |
 | `frankenterm-core-tantivy` | Full Tantivy lexical search stack (~16k LOC) | Tantivy is a heavy dep; sub-crating it lets `frankenterm-core` test paths skip it |
-| `frankenterm-core-replay` | Replay + replay-assessment harness (~25k LOC) | Determinism testing has its own dep set (proptest, criterion) |
+| `frankenterm-core-replay` | Replay + replay-assessment harness (~40k LOC) | Determinism testing has its own dep set (proptest, criterion) |
 | `frankenterm-core-fleet` | Fleet dashboard | Will host multi-host coordination; partial extraction in progress |
 | `frankenterm-core-connectors` | Connector type boundary | Reuses connector types without importing the core runtime |
 | `frankenterm-core-mcp` | MCP type boundary | MCP integration is feature-gated; types live in their own crate so consumers can depend on schemas without dragging in the server |
@@ -1756,7 +1796,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 ### Dependency rules (enforced by the build, not just by convention)
 
 1. **Core imports shared type crates.** The normal dependency direction for extracted implementation clusters is cluster → core; core's dev-dependencies can exercise those clusters in tests.
-2. **Leaf type crates declare zero first-party deps.** They depend only on external libs (serde, etc.).
+2. **Leaf type crates declare no first-party deps.** They depend only on external libs (serde, etc.), except that `frankenterm-core-audit-types` uses `frankenterm-core-replay-types`.
 3. **Implementation clusters depend on core and shared leaves.** MCP and connector type boundaries have narrower dependency graphs; the `frankenterm-core-*` prefix alone does not identify a cluster.
 4. **`tokio` ban** at the `cargo-deny` layer fails the build if any first-party `Cargo.toml` declares `tokio` directly.
 5. **Cycle detection** runs in the release gate (`scripts/release-gates.sh`, DSR quality) via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
@@ -1798,7 +1838,8 @@ This is the surface that protects swarms from accidentally being driven outside 
 
 ```bash
 ft mission objective-plan --objective "<operator goal as free text>" \
-                          --strictness {normal|strict|tolerant} \
+                          --strictness {advisory|normal|strict} \
+                          --capacity-posture {admit|defer|pause|unknown} \
                           --target-bead <ft-XXXXX>            # optional Beads candidate
                           --owned-path <path>[,<path>...]     # for dirty-overlap checks
                           --dirty-path <path>[,<path>...]     # caller-observed dirty state
@@ -1807,12 +1848,11 @@ ft mission objective-plan --objective "<operator goal as free text>" \
 `ft mission objective-plan` invokes the capacity-aware mission objective planner (ft-auy2g). Inputs and behavior:
 
 1. Takes a free-text `--objective` string (operator's stated goal). No JSON contract is required.
-2. Queries the operating-envelope planner for the current admission verdict against the supplied scope (owned paths, candidate bead, dirty paths).
-3. Builds a read-only plan that fits inside the envelope, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
-4. Emits a deterministic plan artifact (golden-fixture-comparable).
-5. Records the plan + decision rationale to the mission audit trail.
+2. Takes the capacity posture from the caller (`--capacity-posture`, default `admit`) together with the supplied scope (owned paths, candidate bead, dirty paths). It does not query the operating envelope; run `ft swarm envelope` for the live verdict and pass the posture it implies.
+3. Builds a read-only plan, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
+4. Prints a deterministic plan artifact (golden-fixture-comparable). Nothing is persisted; keep the output if you need a record.
 
-The planner is side-effect-free: objective-plan never spawns panes or sends input. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)); today it advances the mission lifecycle only and does not dispatch into panes (`ft-majms`, `ft-xxfwy.48`).
+The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)); today it advances the mission lifecycle only and does not dispatch into panes (`ft-majms`, `ft-xxfwy.48`).
 
 ---
 
@@ -1861,28 +1901,6 @@ The codebase is swept by family rather than by spot. Each family is a defect cla
 | **Docstring overpromise** | Docstring claims behavior the implementation doesn't honor | OSC 52 docstring honesty (ft-uea9o) |
 
 See [`docs/audit-checklist.md`](docs/audit-checklist.md) for the per-substrate audit checklist and the bead-keyed exemplars.
-
----
-
-## Deep Dive: How the Scan Pipeline Works
-
-This section documents the `scan_pipeline` component (`scan_pipeline.rs`). Note that the **live** capture-to-detection path does not run `ScanPipeline::process` per segment: production pattern matching is `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs`, and cross-segment continuity is handled by a bounded tail re-scan (see [Cross-chunk subtlety](#cross-chunk-subtlety)), not the whole-buffer `trigger_data_buffer` re-scan described below. The pipeline runs three stages in sequence on the same thread, avoiding cross-thread coordination overhead:
-
-```
-raw bytes ──► ScanPipeline::process()
-               ├── Stage 1: simd_scan (newline + ANSI density metrics)
-               ├── Stage 2: pattern_trigger (Aho-Corasick multi-pattern match)
-               └── Stage 3: byte_compression (zstd compress)
-                   └── ScanOutput { metrics, triggers, compressed, stats }
-```
-
-**Stage 1 (Metrics)** counts newlines and ANSI escape byte density using a linear scan. The ANSI density metric is useful for detecting panes running TUI applications (high escape-sequence volume) vs plain text output.
-
-**Stage 2 (Pattern Trigger)** runs an Aho-Corasick automaton that matches all registered trigger patterns in a single pass over the buffer. An important subtlety: Aho-Corasick's LeftmostFirst non-overlapping mode is not composable across chunk boundaries, because earlier bytes consume match positions and prevent later patterns from matching. This `scan_pipeline` component handles it by accumulating all data in a `trigger_data_buffer` and re-scanning the full buffer at flush time. The live production engine handles the same problem differently and more cheaply — see [Cross-chunk subtlety](#cross-chunk-subtlety).
-
-**Stage 3 (Compression)** applies zstd to the raw bytes. For typical terminal output, compression ratios of 5:1 to 10:1 are common. Compression is skipped for buffers below a configurable threshold (default: 256 bytes) where the overhead exceeds the savings.
-
-The pipeline supports two modes: **batch** (process a complete buffer at once) and **chunked** (process output incrementally with cross-boundary state carry, suitable for streaming ingestion from pane tailers).
 
 ---
 
@@ -2025,18 +2043,18 @@ text chunk
 
 ### Cross-chunk subtlety
 
-Aho-Corasick's LeftmostFirst non-overlapping mode is **not composable across chunk boundaries**. Earlier bytes consume match positions, preventing later patterns from matching. The **live production engine** — `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs` — solves this with a *bounded* tail re-scan: each new segment is prepended with `DetectionContext::tail_buffer` (capped at `PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES`, 2 KiB) and only that overlap is re-scanned, with the common no-match case rejected up front by the Bloom `quick_reject` before Aho-Corasick runs at all (segments are themselves capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES`, 64 KiB). The `scan_pipeline` component's whole-buffer `trigger_data_buffer` re-scan (described above) is a separate batch-mode path and is **not** on the live per-segment capture path; do not read it as the production cross-chunk engine.
+Aho-Corasick's LeftmostFirst non-overlapping mode is **not composable across chunk boundaries**. Earlier bytes consume match positions, preventing later patterns from matching. The **live production engine** — `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs` — solves this with a *bounded* tail re-scan: each new segment is prepended with `DetectionContext::tail_buffer` (capped at `PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES`, 2 KiB) and only that overlap is re-scanned, with the common no-match case rejected up front by the Bloom `quick_reject` before Aho-Corasick runs at all (segments are themselves capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES`, 64 KiB).
 
 ### Rule pack composition
 
-A "rule pack" is a versioned, named collection of detection rules. The default pack is `builtin:core` (Codex + Claude Code + Gemini + terminal runtime events). Custom packs live in `~/.config/ft/patterns.toml`. Each rule has:
+A "rule pack" is a versioned, named collection of detection rules. The default pack is `builtin:core` (Codex + Claude Code + Gemini + terminal runtime events). Custom packs are TOML files discovered in `<config_dir>/patterns/` (override with `[patterns] user_packs_dir`) and in the workspace's `.ft/patterns/`, or listed explicitly as `file:/path/to/pack.toml` in `[patterns] packs`. Each rule has:
 
 - `id` (stable, machine-readable, prefix-namespaced; e.g., `codex.usage.reached`)
-- `anchor_strings` (Bloom-prefilter + AC input; short literal strings the rule needs to see)
-- `pattern` (regex confirming the match; only run if anchors fire)
-- `severity` (info / warn / critical)
-- `agent_type` (codex / claude_code / gemini / wezterm / custom; must align with the `id` prefix)
-- `fixture_paths` (optional; corpus fixtures used by `ft robot rules lint --fixtures` to detect pack drift)
+- `agent_type` (codex / claude_code / gemini / wezterm / unknown; must align with the `id` prefix)
+- `event_type` and `description`
+- `anchors` (Bloom-prefilter + AC input; short literal strings the rule needs to see)
+- `regex` (optional; confirms the match, only run if anchors fire)
+- `severity` (info / warning / critical)
 
 ### Linter checks
 
@@ -2056,21 +2074,18 @@ A "rule pack" is a versioned, named collection of detection rules. The default p
 | Mode | Backend | Best for | Latency target |
 |---|---|---|---|
 | `lexical` (default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
-| `semantic` | fastembed embeddings via FrankenSearch | Conceptual queries ("connection issues"), paraphrased content | depends on embedding model |
+| `semantic` | FNV-1a hash embeddings (`fnv1a-hash-128`) | Token-overlap similarity on reworded queries; not true paraphrase understanding | vector scan over stored embeddings |
 | `hybrid` | RRF fusion of lexical + semantic | Best of both; recommended when in doubt | lexical + semantic + fusion overhead |
 
 ### Lexical (FTS5 + Tantivy)
 
 SQLite FTS5 indexes captured output at write time. A Tantivy secondary index exists as a separate crate but is not populated on the production path.
 
-### Semantic (fastembed)
+### Semantic (hash embeddings)
 
 Every appended segment also gets a 128-dimension FNV-1a hash embedding (`fnv1a-hash-128`) stored alongside it. Queries are embedded the same way and matched by vector similarity. This is a lexical-flavored semantic lane, not an ML model; fastembed and the embedder daemon are not on the production path.
 
-The semantic backend is feature-gated because:
-1. The embedder model is ~100 MB on disk
-2. Embedding generation has non-trivial CPU cost
-3. Many use cases (debugging known errors) don't need it
+It sits behind the `semantic-search` feature, which the `ft` binary enables by default; without it, semantic and hybrid modes return lexical-only results.
 
 ### Hybrid (RRF fusion)
 
@@ -2080,7 +2095,7 @@ Hybrid mode runs both backends in parallel and fuses results with Reciprocal Ran
 score(doc) = sum over backends of 1 / (k + rank_in_backend(doc))
 ```
 
-`k` defaults to 60 (the canonical RRF constant). Hybrid mode is the recommended default when you don't know in advance whether a query is best served by exact matching or paraphrase recall. The cost is roughly `lexical_latency + semantic_latency + small fusion overhead`.
+`k` defaults to 60 (the canonical RRF constant). Hybrid mode is the recommended default when you don't know in advance whether a query is best served by exact matching or by the looser token-overlap recall of the hash-embedding lane. The cost is roughly `lexical_latency + semantic_latency + small fusion overhead`.
 
 ### Future-query recall caveat
 
@@ -2090,7 +2105,7 @@ The current recall bound for semantic search on held-out data is a **vacuous PAC
 
 ## Deep Dive: Policy Engine
 
-The policy engine sits between every action and its target. Its job: turn a request like "send `<text>` to pane 7" into a decision: **Allow**, **Deny**, **RequireApproval**, or **Defer**.
+The policy engine sits between every action and its target. Its job: turn a request like "send `<text>` to pane 7" into a decision: **Allow**, **Deny**, or **RequireApproval**.
 
 ### Decision pipeline
 
@@ -2122,7 +2137,7 @@ ActionRequest
 │ Redactor (for read-path responses)         │  ← strip secrets before returning text
 └────────────────────────────────────────────┘
   │
-  ▼ Decision { Allow | Deny(reason) | RequireApproval(token) | Defer(reason) }
+  ▼ Decision { Allow | Deny(reason) | RequireApproval(token) }
 ```
 
 ### Audit writes
@@ -2145,7 +2160,7 @@ Every outbound pane-content read path (`ft get-text`, `ft search`, `ft robot get
 
 ### Policy surfaces and subsystem diagnostics
 
-The policy framework recognizes a small set of `PolicySurface` variants — `Mux`, `Swarm`, `Robot`, `Connector`, `Workflow`, `Mcp`, `Ipc`, `Unknown` — on every decision, so audit rows record *which subsystem* originated the request. Around those surfaces, the framework exposes a wider set of diagnostic subsystems (capability passport, command guard, approval flow, rate limiter, redactor, audit writer, etc.) — `ft doctor --json` reports per-subsystem health verdicts and `ft proof-doctor` validates the matching evidence artifacts. Those doctor rows describe a fresh engine, not the running watcher's counters. The operator kill-switch tier is persisted; quarantines, the in-memory audit chain, and pending approvals remain process-local. A trip receipt identifies the integrated owner and does not prove settlement of previously admitted remote work. See the [kill-switch contract](docs/robot-contracts/kill-switch.md) for per-effect refresh and fence semantics. Failures are typed and routed back through the same error-code taxonomy as the rest of robot mode.
+The policy framework recognizes a small set of `PolicySurface` variants — `Mux`, `Swarm`, `Robot`, `Connector`, `Workflow`, `Mcp`, `Ipc`, `Unknown` — on every decision, so audit rows record *which subsystem* originated the request. Around those surfaces, the framework exposes a wider set of diagnostic subsystems (capability passport, command guard, approval flow, rate limiter, redactor, audit writer, etc.) — `ft doctor --json` reports per-subsystem health verdicts, and `ft proof-doctor` checks whether an intended proof command has the RCH-required shape before it is run. Those doctor rows describe a fresh engine, not the running watcher's counters. The operator kill-switch tier is persisted; quarantines, the in-memory audit chain, and pending approvals remain process-local. A trip receipt identifies the integrated owner and does not prove settlement of previously admitted remote work. See the [kill-switch contract](docs/robot-contracts/kill-switch.md) for per-effect refresh and fence semantics. Failures are typed and routed back through the same error-code taxonomy as the rest of robot mode.
 
 ---
 
@@ -2159,7 +2174,7 @@ A workflow is a registered handler that triggers on detected patterns. The engin
 - **Runner** (`workflows/runner.rs`) — runs a single workflow execution. Persists state to `workflow_executions`. Enforces timeout + cancellation.
 - **Lock** (`workflows/lock.rs`) — per-pane workflow lock. Prevents two workflows from racing each other on the same pane. `LockManagerHealth` telemetry surface (ft-rai3h) tracks lock acquisition latency, hold time, and contention.
 - **Handlers** (`workflows/handlers.rs`) — built-in workflow implementations (`HandleCompaction`, `HandleUsageLimits`, `HandleAuthRequired`, `HandleOnErrorCassSearch`, others; see the [Built-in Workflow Handler Catalog](#deep-dive-built-in-workflow-handler-catalog) for the full list).
-- **Traits** (`workflows/traits.rs`) — the `Workflow` trait every handler implements. Required methods: `id()`, `triggers()`, `execute(ctx)`, `trigger_policy()` (defaults to `allow_all`).
+- **Traits** (`workflows/traits.rs`) — the `Workflow` trait every handler implements. Required methods: `name()`, `description()`, `handles(detection)`, `steps()`, `execute_step(ctx, step_idx)`; defaulted ones include `trigger_event_types()`, `supported_agent_types()` and `trigger_policy()` (defaults to `allow_all`).
 
 ### Trigger-policy allowlists (ft-j0ufc)
 
@@ -2483,9 +2498,9 @@ ft attestation verify docs/attestations/<version>.json
 ```
 
 This:
-1. Re-derives every `artifact_sha256` by reading the artifact from disk and hashing it
+1. Re-derives every `artifacts[].sha256` by reading the artifact from disk and hashing it
 2. Recomputes the canonical signing payload (deterministic serialization of the slots + metadata)
-3. Verifies that `canonical_payload_sha256` matches the recomputed hash
+3. Verifies that `signature.canonical_sha256` matches the recomputed hash
 4. Verifies that the `.sigstore` file's hash + size match the recorded values
 5. Verifies the Sigstore signature against the canonical payload using the Fulcio cert + Rekor entry
 
@@ -2500,8 +2515,9 @@ Sigstore keyless signing via Fulcio + Rekor. The signing identity, trust roots, 
 When a shipped slot turns out to be wrong, the bundle is not edited. Instead, a retraction is recorded:
 
 ```bash
-ft attestation retract docs/attestations/<version>.json --slot proofs/tx-killswitch --reason "..."
-ft attestation retractions docs/attestations/<version>.json --json
+ft attestation retract --bundle docs/attestations/<version>.json --slot proofs/tx-killswitch \
+                       --rationale-file why.txt --retracted-by-release <release>
+ft attestation retractions --bundle docs/attestations/<version>.json --json
 ```
 
 Retractions are append-only and visible to anyone who verifies the bundle; this is the bundle-retraction substrate (ft-tf6g3.41).
@@ -2674,7 +2690,7 @@ Beyond delta capture, `ft` has a separate **recorder** subsystem that produces h
 
 ### Replay
 
-The replay subsystem is its own crate (`frankenterm-core-replay`, ~25k LOC, 24 modules). It accepts a recorded session and produces:
+The replay subsystem is its own crate (`frankenterm-core-replay`, ~40k LOC, 31 source files). It accepts a recorded session and produces:
 - A normalized event DAG (decision graph with causal edges)
 - A virtual-clock harness so timing-dependent steps can be replayed deterministically
 - A diff engine that compares two replays, useful for catching nondeterminism in workflow handlers
@@ -2823,12 +2839,12 @@ Every `ft` error is a typed envelope with a stable code, a human-readable messag
 | `storage.*` | DB / FTS5 / migration errors |
 | `wezterm.*` | Mux backend errors (subset of `robot.wezterm_*`) |
 | `cass.*` | Cross-Agent Session Search errors |
-| `caut.*` | Caut (Cross-Agent Universal Tooling) errors |
+| `caut.*` | Errors from the `caut` account-usage CLI wrapper |
 | `connector.*` | Connector fabric errors |
 
 ### Categories (`ErrorCategory`)
 
-Each code is classified into a category for routing: `Wezterm`, `Internal`, `Policy`, `Storage`, `Network`, `Validation`, `RateLimit`, etc. Categories enable bulk policy decisions (e.g., "retry every `Network` error, alert on every `Internal`").
+Each code is classified into a category for routing, one per code range: `Wezterm` (1xxx), `Storage` (2xxx), `Pattern` (3xxx), `Policy` (4xxx), `Workflow` (5xxx), `Network` (6xxx), `Config` (7xxx), and `Internal` (9xxx). Categories enable bulk policy decisions (e.g., "retry every `Network` error, alert on every `Internal`").
 
 ### Retryability
 
@@ -2918,7 +2934,7 @@ The native event bridge subscribes to OS-level signals from the mux/GUI process:
 
 ### Implementation
 
-`native_events.rs` houses the bridge. It uses asupersync channels (broadcast for fanout, watch for single-value updates). The emitter side lives in the GUI / mux process and ships through the codec layer. The receiver side in `ft watch` subscribes per-pane.
+`native_events.rs` houses the bridge. It forwards native events to the runtime over an asupersync `mpsc` channel. The emitter side lives in the GUI / mux process and ships through the codec layer. The receiver side in `ft watch` subscribes per-pane.
 
 ### Fallback
 
@@ -2934,7 +2950,7 @@ When the native event bridge is unavailable (running against an older mux, or ag
 
 - Letting the contract shape stabilize while implementation evolves means external authors can start writing against it.
 - Replay determinism, fuel budgets, and policy-gating story can be designed before the runtime arrives.
-- `extensions.rs` lives in `frankenterm-core` and is feature-gated; building without the feature elides the surface entirely.
+- `extensions.rs` lives in `frankenterm-core` and is compiled into every build; it holds contract types only, with no runtime behind them.
 
 ### Intended capabilities (when wired)
 
@@ -2991,11 +3007,11 @@ Under `ft watch`, webhook delivery retries transport errors, 408, 429 and 5xx up
 
 ### Surface
 
-The IPC server (`ipc.rs`) listens on a Unix domain socket (or named pipe on Windows) configured via `[ipc]`. The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
+The IPC server (`ipc.rs`) listens on a Unix domain socket configured via `[ipc]` (Windows uses an AF_UNIX socket too, through the in-tree `frankenterm-uds` transport). The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
 
 ### Scope
 
-`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (Unix domain socket or named pipe).
+`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (a Unix domain socket on every platform).
 
 ### Why an IPC layer at all
 
@@ -3019,7 +3035,7 @@ destination = "~/.local/share/ft/backups"
 ```
 
 Each backup uses the SQLite online backup API for a consistent snapshot. The output archive contains:
-- The database binary (compressed via zstd in 2026-04+ — ft-akx00.3.3)
+- The database binary (zstd-compressed only when scheduled backups set `[backup.scheduled].compress = true`; the default is uncompressed)
 - A JSON manifest with SHA-256 checksums + bundle metadata
 - Optional SQL text dumps for human inspection
 
@@ -3035,11 +3051,11 @@ ft backup import /tmp/ft-snapshot --dry-run --yes         # show what would happ
 
 ### Retention
 
-Retention is governed by both `retention_days` and `max_backups`. Whichever bound is hit first triggers pruning. Pruning is per-cycle and emits an audit row.
+Retention is governed by both `retention_days` and `max_backups`. Whichever bound is hit first triggers pruning. Pruning runs after each scheduled backup; it deletes old archives on disk and writes no audit row.
 
 ### Disaster recovery drills
 
-`disaster_recovery_drills` (see deep dive above) exercises the backup/restore path on a schedule with operator-defined RTO/RPO targets. Reports include pass / fail / degraded verdicts. The `ContinuityReport` cold-start case was fixed in 2026-04 to report `Unknown` (not `Healthy`) when no drills have run yet; see CHANGELOG / br-ft-38rxl.
+`disaster_recovery_drills` (see deep dive above) models backup/restore drills against operator-defined RTO/RPO targets. Nothing schedules or invokes it today, so no drill runs on its own. Reports include pass / fail / degraded verdicts. The `ContinuityReport` cold-start case was fixed in 2026-04 to report `Unknown` (not `Healthy`) when no drills have run yet; see CHANGELOG / br-ft-38rxl.
 
 ---
 
@@ -3075,23 +3091,23 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 
 ## Compile-Time Feature Matrix
 
-`ft` is feature-gated extensively so a default build stays small and trimmed-down builds still work.
+The `ft` binary (`-p frankenterm`) turns nearly every surface on by default; the features exist so trimmed builds still compile. Defaults below come from `crates/frankenterm/Cargo.toml`.
 
 | Feature | What it enables | Default | Disable cost |
 |---|---|---|---|
 | `agent-detection` | `ft robot agents list / running / configure` family | **on** | Calls return `robot.feature_not_available`; no inventory |
-| `mcp` | MCP stdio server (`ft mcp serve`) | off | MCP integration unavailable |
-| `mcp-client` | MCP client transport (depends on fastmcp) | off | MCP-driven tool calls unavailable |
-| `web` | HTTP server + SSE streaming (`ft web`) | off | No web surface |
-| `distributed` | Distributed mode (`ft distributed agent`, aggregator) | off | Distributed unavailable |
-| `semantic-search` | fastembed embeddings + Tantivy semantic backend | off | Hybrid/semantic modes return lexical-only |
-| `ftui` | FrankenTUI dashboard backend | off | TUI dashboard unavailable |
+| `mcp` | MCP stdio server (`ft mcp serve`) | **on** | MCP integration unavailable |
+| `web` | HTTP server + SSE streaming (`ft web`) | **on** | No web surface |
+| `distributed` | Distributed mode (`ft distributed agent`, aggregator) | **on** | Distributed unavailable |
+| `semantic-search` | Hash-embedding semantic lane for semantic and hybrid search | **on** | Hybrid/semantic modes return lexical-only |
+| `ftui`, `tui-dashboard`, `tui-widgets` | FrankenTUI dashboard backend and widgets | **on** | TUI dashboard unavailable |
+| `vendored` | Vendored migration map for upgrades | **on** | Older DBs need manual upgrade path |
+| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | **on** | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
+| `subprocess-bridge` | Subprocess-bridge mission/tx surface | **on** | Subprocess-based mission steps unavailable |
+| `browser`, `native-wezterm`, `session-resume`, `redis-session`, `sync`, `jemalloc`, `asupersync-runtime` | Remaining default surfaces and the allocator/runtime choice | **on** | The matching surface is compiled out |
 | `tui-oracle` | Legacy ratatui parity oracle for regression checks | off | Dev-only |
-| `disk-pressure` | Disk-pressure telemetry source | off | Envelope uses fallback signals |
-| `vendored` | Vendored migration map for upgrades | off | Older DBs need manual upgrade path |
-| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | off | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
-| `subprocess-bridge` | Subprocess-bridge mission/tx surface | off | Subprocess-based mission steps unavailable |
-| `__journal_types_placeholder` | Test-only placeholder for unbuilt journal types | off | Test-internal |
+
+`mcp-client` (the MCP client transport) and `disk-pressure` (disk-pressure telemetry) are `frankenterm-core` features. The `ft` binary depends on the core crate without its defaults and does not enable them, so its operating envelope uses fallback disk signals.
 
 ### `--all-features` build
 
@@ -3099,7 +3115,7 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 
 ### Trimming for embedded / minimal builds
 
-`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. Agent-inventory robot calls become unavailable; everything else stays. Robust for headless / scripted use.
+`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. It drops every default surface in the table above (agent inventory, MCP server, web/SSE, distributed mode, semantic search, the TUI dashboard, the metrics endpoint and the rest), so add back with `--features` only what a headless or scripted deployment needs.
 
 ---
 
@@ -3171,7 +3187,7 @@ These four words refer to four distinct mechanisms. They are often conflated; th
 | **Snapshot** | Bounded mux topology + per-pane terminal metadata at a point in time | "What did the swarm look like?" | Inspect it or compare pane membership; `ft snapshot restore <id> --dry-run` emits a metadata-only, non-executable descriptor/status report | `session_checkpoints` + `mux_pane_state` tables |
 | **Session checkpoint** | Persistent session-progress markers | Diagnose and plan manual recovery after an unclean shutdown | Inspect with `ft session`; production does not execute a checkpoint restore | `session_checkpoints` table |
 | **Recording** | Time-ordered event log of *everything* that happened | "What did the swarm *do*?" | Deterministic replay via the replay subsystem | `.ft/recorder-log/events.log` (append-log backend) |
-| **Backup** | The whole `ft.db` + manifest as a portable archive | Disaster recovery, host migration | `ft backup import` | `[backup].destination` directory (default `~/.local/share/ft/backups`) |
+| **Backup** | The whole `ft.db` + manifest as a portable archive | Disaster recovery, host migration | `ft backup import` | `[backup.scheduled].destination` when set; otherwise `<workspace>/.ft/backups/` |
 
 ### When to use which
 
@@ -3188,7 +3204,7 @@ A recording, replayed on the same `ft` version with the same seed, produces byte
 
 ## Deep Dive: Pane Filter Rules
 
-`[ingest.panes]` lets you control which panes the watcher observes. Filter rules are deterministic; you can audit the include/exclude verdict for any pane via `ft show <pane_id>`.
+`[ingest.panes]` lets you control which panes the watcher observes. Filter rules are deterministic; `ft list --json` and `ft robot state` report each pane's `observed` flag and, for an excluded pane, its `ignore_reason`.
 
 ### Rule shape
 
@@ -3234,7 +3250,7 @@ Priority directly affects the watcher's round-robin scheduling; high-priority pa
 
 ### Bookmarks
 
-`ft panes bookmark add <pane_id> --alias build` stores a stable alias in the `pane_bookmarks` table; aliases persist across restarts and can be used in place of pane IDs in any command that accepts one.
+`ft panes bookmark add <pane_id> --alias build` stores a stable alias in the `pane_bookmarks` table; aliases persist across restarts. Pass one with `--bookmark <alias>` to `ft search` and `ft status`; other commands take numeric pane IDs.
 
 ---
 
@@ -3261,21 +3277,25 @@ and per-pane disk volume depends directly on output rate and retention.
 | 51–200 panes | 300–500 | synthetic benchmark budget: ~200 MB | **required** | optional |
 | 200+ panes | 500–1000 + per-pane priorities | target-class artifact required (see [target hardware](docs/perf/target-class-hardware.md)) | required | recommended (split across aggregators) |
 
-### When to enable each feature flag
+### What each default feature buys
 
-- **`--features semantic-search`**: when operators do conceptual queries ("connection issues") more than exact-string searches. Costs ~100 MB resident for the embedder model.
-- **`--features web`**: when wiring `ft` into a non-CLI tool (dashboard, webhook router, downstream service).
-- **`--features distributed`**: when the agent fleet spans multiple hosts.
-- **`--features mcp`**: when integrating with MCP-aware agent hosts.
-- **`--features ftui`**: when the operator wants an in-terminal dashboard.
+All of these are on in a default `ft` build ([feature matrix](#compile-time-feature-matrix)); keep them in a `--no-default-features` build only where they apply:
+
+- **`semantic-search`**: the hash-embedding lane behind semantic and hybrid search. It is model-free, so the cost is an embedding row per segment rather than a resident model.
+- **`web`**: wiring `ft` into a non-CLI tool (dashboard, webhook router, downstream service).
+- **`distributed`**: an agent fleet that spans multiple hosts.
+- **`mcp`**: integrating with MCP-aware agent hosts.
+- **`ftui`**: an in-terminal dashboard.
 
 ### Tuning knobs
 
 The full [`docs/tuning-reference.md`](docs/tuning-reference.md) catalogs every `[tuning.*]` key with default, unit, validation guard, and provisional starting ranges for 10/50/200+-pane workloads. The most commonly tuned:
 
-- `[tuning.runtime].max_concurrent_captures` — bounds per-tick capture parallelism
-- `[tuning.search].fts_query_timeout_ms` — caps FTS5 query time
-- `[tuning.patterns].bloom_filter_capacity` — sized for the active rule pack's anchor count
+- `[ingest].max_concurrent_captures` — bounds per-tick capture parallelism (default 10)
+- `[tuning.search].default_limit` / `max_limit` — default and maximum search result counts
+- `[tuning.patterns].bloom_false_positive_rate` — anchor prefilter false-positive rate (0.001–0.2, default 0.01)
+
+Unknown `[tuning.*]` keys are ignored rather than rejected, so check a key against the reference before relying on it.
 
 ---
 
@@ -3364,9 +3384,9 @@ must not rely on a bare long sleep/timeout for prompt shutdown.
 
 | Platform | Default Config File | Default Data Directory (`data_dir`) |
 |---|---|---|
-| **Linux / XDG** | `~/.config/ft/ft.toml` (or `$XDG_CONFIG_HOME/ft/ft.toml`) | `~/.local/share/ft/` (or `$XDG_DATA_HOME/ft/`) |
+| **Linux / XDG** | `~/.config/ft/ft.toml` (or `$XDG_CONFIG_HOME/ft/ft.toml`) | `~/.local/share/ft/` (`$XDG_DATA_HOME` is not consulted) |
 | **macOS** | `~/Library/Application Support/ft/ft.toml` | `~/Library/Application Support/ft/` |
-| **Windows** | `%APPDATA%\ft\ft.toml` | `%LOCALAPPDATA%\ft\` |
+| **Windows** | `%USERPROFILE%\.config\ft\ft.toml` (or `%XDG_CONFIG_HOME%\ft\ft.toml`) | `%APPDATA%\ft\` (Roaming) |
 
 ### Workspace vs Global State
 
@@ -3450,8 +3470,8 @@ The workflow engine ships with the following built-in handlers (`crates/frankent
 
 | Handler | Triggers on | Action |
 |---|---|---|
-| `HandleCompaction` | `claude_code.usage.reached`, related triggers | Sends `/compact` (or agent-equivalent) and verifies recovery |
-| `HandleUsageLimits` | `*.usage.reached`, `*.rate_limit.detected` | Generic usage-limit recovery dispatcher |
+| `HandleCompaction` | `session.compaction` detections (rule ids containing `compaction`) | Re-injects critical context (AGENTS.md) after the agent compacts its conversation |
+| `HandleUsageLimits` | Codex only: `codex.usage.reached`, `codex.usage_limit`, `codex.rate_limit.detected` | Codex usage-limit recovery |
 | `HandleClaudeCodeLimits` | Claude-Code-specific limit detections | Claude-specific recovery flows |
 | `HandleGeminiQuota` | `gemini.usage.reached` | Gemini quota recovery |
 | `HandleSessionEnd` | `*.session.end` patterns | Records session-end + writes a checkpoint |
@@ -3477,7 +3497,7 @@ Each handler can declare `trigger_policy()` returning `WorkflowTriggerPolicy::al
 
 ## Deep Dive: Saved Searches and Scheduled Queries
 
-`ft search saved` (or `ft robot search`'s saved-search routes) lets operators bookmark FTS queries and optionally schedule them to re-run periodically.
+`ft search saved` lets operators bookmark FTS queries and optionally schedule them to re-run periodically.
 
 ### Commands
 
@@ -3494,11 +3514,11 @@ ft search saved disable <name>                          # stop scheduled executi
 
 - **Polling-free alerting.** A scheduled saved search can route results into the notification pipeline (e.g., "every 5 min, check for `panic` across all panes; alert if any match").
 - **Auditable.** Scheduled-search results are persisted as events with the search name attached.
-- **Bounded cost.** The minimum interval is 1000 ms; the search executes against indexed FTS5 / Tantivy data so each run is bounded.
+- **Bounded cost.** The minimum interval is 1000 ms; the search executes against the indexed FTS5 data so each run is bounded.
 
 ### Saved-search storage
 
-The `saved_searches` table holds: name, query string, mode (lexical/semantic/hybrid), filters (pane, since, until), schedule interval, enabled flag.
+The `saved_searches` table holds: name, query string, optional pane filter, a since mode (`last_run` by default) with an optional `since_ms`, schedule interval, enabled flag, and the last run's time, result count and error. Saved searches run lexical queries; there is no per-search mode or `until` bound.
 
 ---
 
@@ -3523,7 +3543,7 @@ Identity keys are deterministic functions of:
 ### Finding identity keys
 
 ```bash
-ft events --format json | jq '.events[] | {id: .id, identity_key: .identity_key, rule_id: .rule_id}'
+ft events --format json | jq '.[] | {id, identity_key: .dedupe_key, rule_id, muted}'
 ```
 
 ### Mute semantics
@@ -3577,7 +3597,7 @@ When something does go wrong, the policy_denied_audit table (schema v24+), the a
 
 ## Deep Dive: Sample Mission and Tx Contracts
 
-For operators writing their first mission or tx contract, the authoritative shapes are the Rust types in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs) — `pub struct Mission` (`MISSION_SCHEMA_VERSION = 1`) and `pub struct MissionTxContract` (`MISSION_TX_SCHEMA_VERSION = 1`). The skeletons below are illustrative; check the structs for the complete field list, defaults, and required vs `#[serde(default)]` fields before authoring a contract.
+For operators writing their first mission or tx contract, the authoritative shapes are the Rust types in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs) — `pub struct Mission` (`MISSION_SCHEMA_VERSION = 2`) and `pub struct MissionTxContract` (`MISSION_TX_SCHEMA_VERSION = 1`). The skeletons below are illustrative; check the structs for the complete field list, defaults, and required vs `#[serde(default)]` fields before authoring a contract.
 
 ### Mission contract (`.ft/mission/active.json`)
 
@@ -3585,11 +3605,13 @@ Shape per `pub struct Mission` in `plan.rs`:
 
 ```json
 {
-  "mission_version": 1,
+  "mission_version": 2,
   "mission_id": "mission-refactor-pricing-2026-05-16",
+  "generation": "<storage incarnation, generated once at creation>",
+  "revision": 0,
   "title": "Refactor pricing module across services",
   "workspace_id": "frankenterm",
-  "lifecycle_state": "Planning",
+  "lifecycle_state": "planning",
   "ownership": { "...": "MissionOwnership shape" },
   "created_at_ms": 1747371600000,
   "candidates": [
@@ -3608,7 +3630,7 @@ Shape per `pub struct Mission` in `plan.rs`:
 }
 ```
 
-Required fields: `mission_version`, `mission_id`, `title`, `workspace_id`, `ownership`, `created_at_ms`. Defaulted: `lifecycle_state`, `candidates`, `assignments`, `pause_resume_state`. Optional: `provenance`, `updated_at_ms`.
+Required fields: `mission_version`, `mission_id`, `generation`, `revision`, `title`, `workspace_id`, `ownership`, `created_at_ms`. Enum values are snake_case (`planning`, `running`, ...). Defaulted: `lifecycle_state`, `candidates`, `assignments`, `pause_resume_state`. Optional: `provenance`, `updated_at_ms`.
 
 `ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state.
 
@@ -3657,8 +3679,8 @@ Shape per `pub struct MissionTxContract` in `plan.rs`. The tx steps live **insid
       }
     ]
   },
-  "lifecycle_state": "Pending",
-  "outcome": "Pending",
+  "lifecycle_state": "draft",
+  "outcome": "pending",
   "receipts": []
 }
 ```
@@ -3696,7 +3718,7 @@ bead.
 
 Don't. First classify residency:
 ```bash
-ft doctor --json | jq .resource_pressure_cockpit
+ft doctor --json | jq .swarm_capacity.resource_cockpit.residency_buckets
 ```
 The cockpit separates `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown`. Only after classification should you call something a leak. The `unknown` class being non-zero is the only one that's an immediate yellow flag.
 
@@ -3728,7 +3750,7 @@ Follow the rule-drift workflow:
 
 ```toml
 [patterns]
-packs = ["builtin:core", "custom:my_lab_pack"]
+packs = ["builtin:core", "file:/path/to/my_lab_pack.toml"]
 ```
 The daemon can hot-reload config on `SIGHUP`, but address only an exact,
 operator-owned watcher instance through its supervised lifecycle. Never use a
@@ -3738,9 +3760,10 @@ the active set.
 ### "I need to debug what the operating envelope is denying"
 
 ```bash
-ft doctor --json | jq .operating_envelope
+ft swarm envelope
+ft swarm envelope --surface explain --explain-reason <code>
 ```
-The cockpit shows reason codes (`telemetry.stale`, `capacity.red`, `capacity.black`, `capacity.target_class_unproven`, etc.) and per-input verdicts.
+The envelope shows reason codes (`telemetry.stale`, `capacity.red`, `capacity.black`, `capacity.target_class_unproven`, etc.) and per-input verdicts.
 
 ---
 
@@ -3768,7 +3791,7 @@ The renderer SLO catalog is consolidated at [`docs/perf/resize-quality-slo.md`](
 
 | Agent | Pattern examples |
 |---|---|
-| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected`, `codex.session.end` |
+| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected`, `codex.session.resume_hint` |
 | **Claude Code** | `claude_code.usage.reached`, `claude_code.approval_needed`, `claude_code.session.end` |
 | **Gemini** | `gemini.usage.reached`, `gemini.rate_limit.detected` |
 | **Terminal runtime** | `wezterm.mux.connection_lost`, `wezterm.pane.exited` |
@@ -3868,8 +3891,8 @@ This section catalogs every non-trivial algorithm or data structure the project 
 |---|---|---|
 | **Aho-Corasick (multi-pattern)** | `patterns.rs` scan trigger | O(n) in chunk length regardless of pattern count; the right tool for *exact-substring multi-pattern* matching. |
 | **Bloom filter** (FNV-1a seeded) | `patterns.rs` prefilter | Rejects 80–95% of chunks in O(k) per chunk where k is small. The false-positive rate is tunable; we tune for "reject when possible, but never miss." |
-| **SIMD newline / ANSI density scan** | `scan_pipeline.rs` Stage 1 | One linear pass per chunk gives us both newline count (for downstream segmentation) and ANSI escape density (for TUI-vs-text classification) at near-zero extra cost. |
-| **zstd compression** | `scan_pipeline.rs` Stage 3, warm scrollback | 5:1 to 10:1 ratios typical on terminal output; high compression ratio with low decompression cost. Skipped below a configurable threshold where overhead exceeds savings. |
+| **SIMD newline / ANSI density scan** | `simd_scan.rs`, feeding BOCPD features | One linear pass per chunk gives us both newline count and ANSI escape density (TUI-vs-text output) at near-zero extra cost. |
+| **zstd compression** | `byte_compression.rs`, warm scrollback tiers | 5:1 to 10:1 ratios typical on terminal output; high compression ratio with low decompression cost. |
 | **FNV-1a (64-bit non-crypto hash)** | Content fingerprinting | One byte per cycle; deterministic across platforms; ideal for real-time dedup decisions where SHA-256 is too expensive. |
 | **SHA-256** | Audit trail, attestation bundle, content addressing | Cryptographic strength is required where the hash is a security primitive (audit row signing, attestation verification, idempotency keys). |
 | **XOR filter** | Search dedup | Approximately 1.23 × n × fingerprint_bytes, which is more compact than Bloom at equivalent FP rates. Static (built once from a known set), which fits the dedup case where the known-hash set changes infrequently. |
@@ -3879,8 +3902,8 @@ This section catalogs every non-trivial algorithm or data structure the project 
 | Algorithm | Where | Why this one |
 |---|---|---|
 | **SQLite FTS5** | Storage (lexical index) | Bundled with rusqlite (no system dep); BM25-like ranking; reliable on commodity hardware. |
-| **Tantivy** | `frankenterm-core-tantivy` | Richer scoring + faster ranked queries; complements FTS5 when relevance matters more than raw matching. |
-| **fastembed embeddings** | `search/` semantic backend | Quantized models, ONNX runtime, low memory footprint. Feature-gated because not all users need semantic. |
+| **Tantivy** | `frankenterm-core-tantivy` | Richer scoring + faster ranked queries when relevance matters more than raw matching. The crate exists, but its index is not populated on the production path. |
+| **FNV-1a hash embeddings** | `search/` semantic lane | Deterministic, model-free and cheap enough to embed every segment at write time; fastembed/ONNX models are not on the production path. |
 | **Reciprocal Rank Fusion (RRF)** | `search/` hybrid mode | `score(doc) = sum 1/(k + rank)` with k=60 (canonical). Robust to rank-vs-score scale differences across backends. |
 
 ### Concurrency & cancellation
@@ -4091,15 +4114,13 @@ GET /stream/deltas       (pane_id, max_hz)
 
 ### 4. Prometheus metrics (when enabled)
 
-The watcher exposes Prometheus metrics for:
-- Capture throughput (bytes/sec, lines/sec)
-- Pattern detection latency (per rule pack)
-- Storage write queue depth + flush latency
-- FTS5 + Tantivy query latency
-- Workflow execution count + latency (per workflow id)
-- Tx phase latency (prepare / commit / compensate)
-- Fleet memory pressure tier
-- Policy denial counts by category
+`ft watch --metrics` (built with the `metrics` feature) serves `/metrics` on localhost, every name under the configured `[metrics] prefix`:
+- Uptime, observed panes, capture queue depth and capacity, storage write queue depth
+- Segments persisted, events recorded, ingest lag (average, maximum, sum and count), age of the last DB write
+- Native output coalescing (input events and bytes, emitted batches and bytes, largest batch, coalesce ratio)
+- Event bus publish, drop, subscriber, lag and per-channel queue figures
+- `verified_submit_receipts_total{agent_type,state}`: verified-submit receipts built in the watcher process (workflow `send_verified`); the MCP server logs its `wa.send` receipts as `frankenterm::verified_submit` tracing events instead
+- `verified_submit_idempotency_keys{state}` and `verified_submit_idempotency_oldest_unresolved_age_seconds`: the `wa.send` idempotency store's keys per state and the age of its oldest unresolved key, from a census the watcher takes every 5 minutes; an `in_doubt` key never clears without `wa.send` `reconcile`. `verified_submit_idempotency_census_age_seconds` says how old that census is
 
 ### 5. `ft doctor --json` + diagnostic bundles
 
@@ -4108,7 +4129,7 @@ For point-in-time debugging:
 - `ft status --health` — fleet snapshot
 - `ft triage` — issues summary
 - `ft diag bundle --output /tmp/ft-diag` — collect everything for handoff
-- `ft reproduce --kind crash` — incident bundle for forensics
+- `ft reproduce export --kind crash` — incident bundle for forensics
 
 For continuous monitoring, prefer Prometheus + SSE. For incident response, prefer the bundle + cockpit data.
 
@@ -4287,7 +4308,6 @@ instance.
 Classify the residency source first instead of assuming a heap leak. The [resource-pressure cockpit contract](docs/resource-pressure-cockpit-contract.md) separates `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown` resident bytes. See [`docs/operator-playbook.md`](docs/operator-playbook.md) for the collection flow.
 
 ```bash
-ft robot events --event-type gap          # check for gaps in capture
 ft doctor --json > /tmp/ft-doctor-memory.json
 ft status --health > /tmp/ft-status-health.txt
 ```
@@ -4325,15 +4345,15 @@ ft tx show --include-contract                     # inspect what happened
 
 ### Operating envelope denying admission
 
-The operating-envelope planner (`ft.operating_envelope.v1`) is library-resident; its state is surfaced through `ft mission objective-plan` (which embeds the envelope verdict), `ft doctor --json`, `ft status --health`, and the resource-pressure cockpit data. Use:
+The operating-envelope planner (`ft.operating_envelope.v1`) is library-resident; `ft swarm envelope` (and `ft robot swarm envelope` for agents) renders its current verdict and reason codes. The resource cockpit behind it appears in `ft doctor --json` under `swarm_capacity.resource_cockpit` once a watcher has published a health snapshot. Use:
 
 ```bash
-ft mission objective-plan --objective "smoke" --strictness strict
-ft doctor --json
-ft status --health
+ft swarm envelope                                            # verdict + limiting inputs
+ft swarm envelope --surface explain --explain-reason <code>  # drill into one reason code
+ft doctor --json | jq .swarm_capacity
 ```
 
-If admission is denied because telemetry is missing (rather than critical), the operator runbook ([`docs/operator-runbook.md`](docs/operator-runbook.md), ft-booek.6) walks through restoring the missing source. If it's denied because of critical pressure, the cockpit data tells you which input is responsible (RCH pressure, network pressure, process snapshots, fleet memory tier, or SQLite write-queue depth).
+If admission is denied because telemetry is missing (rather than critical), the operator runbook ([`docs/operator-runbook.md`](docs/operator-runbook.md), ft-booek.6) walks through restoring the missing source. If it's denied because of critical pressure, the envelope's reason codes name the input responsible (RCH pressure, network pressure, process snapshots, fleet memory tier, or SQLite write-queue depth).
 
 ---
 
@@ -4382,12 +4402,12 @@ Yes. The pattern detection and search work for any terminal output. Useful for d
 
 ### How do I add custom patterns?
 
-Custom rules live in a **pattern pack** file (a TOML doc with `name`, `version`, and a `[[rules]]` array). Put the file anywhere readable; reference it from your `ft.toml`:
+Custom rules live in a **pattern pack** file (a TOML doc with `name`, `version`, and a `[[rules]]` array). Drop it into `<config_dir>/patterns/` or the workspace's `.ft/patterns/`, where it is discovered automatically, or reference it from your `ft.toml` with a `file:` prefix (a bare path is rejected as an unknown pack):
 
 ```toml
 # ft.toml — load builtin pack + your custom file
 [patterns]
-packs = ["builtin:core", "/path/to/my_lab_pack.toml"]
+packs = ["builtin:core", "file:/path/to/my_lab_pack.toml"]
 ```
 
 A minimal `my_lab_pack.toml`:
@@ -4397,10 +4417,10 @@ name = "lab:my-pack"
 version = "0.1.0"
 
 [[rules]]
-id = "lab.fatal_error"
-agent_type = "claude_code"          # claude_code / codex / gemini / wezterm / custom
+id = "claude_code.lab.fatal_error" # a reserved prefix must match agent_type
+agent_type = "claude_code"          # claude_code / codex / gemini / wezterm / unknown
 event_type = "error"                # short, machine-readable event taxonomy key
-severity = "critical"               # info / warn / critical
+severity = "critical"               # info / warning / critical
 anchors = ["FATAL ERROR"]           # literal strings for Bloom + Aho-Corasick prefilter (required)
 regex = "FATAL ERROR:.*"            # optional confirming regex
 description = "Application-level fatal error in agent output."

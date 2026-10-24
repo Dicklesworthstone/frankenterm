@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+# Built locally by scripts/build-apple-ssh-xcframework.sh
+Artifacts/

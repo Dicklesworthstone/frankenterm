@@ -17,7 +17,7 @@ variables:
 .build windows common:
   # TODO: should probably get its own image at some point instead of reusing the GStreamer one
   # See https://gitlab.freedesktop.org/gstreamer/gstreamer/container_registry/18035 for latest
-  image: "registry.freedesktop.org/gstreamer/gstreamer/amd64/windows:2022-07-29.3-main"
+  image: "registry.freedesktop.org/gstreamer/gstreamer/amd64/windows:2026-02-01.0-main"
   stage: 'build'
   tags:
     - 'docker'
@@ -32,9 +32,12 @@ variables:
   stage: 'build'
 
 .build macos common:
+  # HVF is available since Sequoia 15.5, but 2024-10-28 seems to be Sequoia 15.0
+  # registry.freedesktop.org/gstreamer/gstreamer/macos-arm64/15-sequoia:2024-10-28.0
+  image: "registry.freedesktop.org/gstreamer/gstreamer/macos-arm64/26-tahoe:2025-09-30.0"
   stage: 'build'
   tags:
-    - 'gst-macos-11.1'
+    - gst-mac-arm
 
 .build windows meson:
   extends: '.build windows common'
@@ -94,22 +97,27 @@ variables:
 
 # Windows jobs.
 
-windows meson vs2019 amd64:
+windows meson vs2022 amd64:
   extends: '.build windows meson'
   variables:
     ARCH: 'amd64'
 
-windows meson vs2019 x86:
+windows meson vs2022 x86:
   extends: '.build windows meson'
   variables:
     ARCH: 'x86'
 
-windows msbuild vs2019 amd64:
+windows msbuild vs2022 amd64:
   extends: '.build windows msbuild'
   variables:
     ARCH: 'amd64'
     PLATFORM: 'x64'
 
+windows msbuild vs2022 arm64:
+  extends: '.build windows msbuild'
+  variables:
+    ARCH: 'arm64'
+    PLATFORM: 'arm64'
 
 # Linux Jobs.
 #
@@ -211,9 +219,10 @@ macos autotools:
   before_script:
     - '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"'
   script:
+    - export PATH=/opt/homebrew/bin:$PATH
     - brew install autoconf automake libtool
     - ./autogen.sh
-    - ./configure
+    - ./configure --prefix=/tmp/install-prefix
     - 'make -j$(sysctl -n hw.logicalcpu)'
     - make install
 
@@ -222,20 +231,21 @@ macos autotools clang:
   before_script:
     - '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"'
   script:
+    - export PATH=/opt/homebrew/bin:$PATH
     - brew install autoconf automake libtool
     - ./autogen.sh
-    - './configure CC=clang'
+    - ./configure --prefix=/tmp/install-prefix CC=clang
     - 'make -j$(sysctl -n hw.logicalcpu)'
     - make install
 
 macos meson:
   extends: '.build macos common'
-  script:
+  before_script:
     - pip3 install --upgrade pip
     - pip3 install -U meson
     - pip3 install --upgrade certifi
     - pip3 install -U ninja
-
-    - meson setup build ${MESON_ARGS}
+  script:
+    - meson setup . build --fatal-meson-warnings --default-library=both --prefix=/tmp/install-prefix
     - meson compile --verbose -C build
-    - sudo meson install -C build
+    - meson install -C build

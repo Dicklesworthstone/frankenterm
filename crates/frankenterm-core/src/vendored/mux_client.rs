@@ -23,12 +23,13 @@ use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, EvictPaneWarmScrollbackV1,
-    EvictPaneWarmScrollbackV1Response, GetCodecVersion, GetCodecVersionResponse, GetLines,
-    GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
-    GetSemanticZonesResponse, InputSerial, LineReadLayout, ListPanes, ListPanesResponse,
-    MoveFloatingPane, OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos,
-    PduWireRole, RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId,
+    EvictPaneWarmScrollbackV1Response, GetClientList, GetClientListResponse, GetCodecVersion,
+    GetCodecVersionResponse, GetLines, GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges,
+    GetPaneRenderChangesResponse, GetPaneTieredScrollbackStatusesV1,
+    GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones, GetSemanticZonesResponse,
+    InputSerial, LineReadLayout, ListPanes, ListPanesResponse, MoveFloatingPane,
+    OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos, PduWireRole,
+    RemoveFloatingPane, Resize, SelectStackPane, SendKeyDown, SendPaste, SetClientId,
     SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer,
     SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse, UpdatePaneConstraints,
     WriteToPane,
@@ -175,8 +176,29 @@ fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
     (text, start == 0)
 }
 
+/// Line reads and render-state reads the server refuses as `resource_busy`
+/// are re-sent this many times. Such a read was not applied and is safe to
+/// repeat. The server waits
+/// 1 ms for a pane's terminal per attempt, so on a contended host, where a
+/// preempted lock holder keeps it for many milliseconds, three retries over
+/// ~21 ms still lost reads that ended a swarm-echo run (ft-4p4uo: every
+/// server-side refusal was `stage=capture reason=metadata_busy`). Six over
+/// ~161 ms still lost one run in six on a saturated 6-core host (ab10,
+/// echo p99 0.25-0.47 s); eight cover ~641 ms.
+const MAX_RESOURCE_BUSY_RETRIES: usize = 8;
+
+/// The pause before retry `attempt` (from 0): 1, 10, 10, 20, 40, 80, 160,
+/// 320 ms.
 fn mux_read_retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(if attempt == 0 { 1 } else { 10 })
+    Duration::from_millis(match attempt {
+        0 => 1,
+        1 | 2 => 10,
+        3 => 20,
+        4 => 40,
+        5 => 80,
+        6 => 160,
+        _ => 320,
+    })
 }
 
 async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), DirectMuxError> {
@@ -188,7 +210,7 @@ async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), Dire
             .await
             .map_err(|error| cancelled_mux_error("text_snapshot_yield", error))
     } else {
-        // Repeated source churn still backs off within the same three-attempt
+        // Repeated source churn still backs off within the same attempt
         // budget. Quota refusals have their own unchanged backoff policy.
         crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
             .await
@@ -870,6 +892,15 @@ impl PendingRenderChanges {
         Ok(self.by_pane.contains_key(&pane_id))
     }
 
+    /// The pane with the most queued changes, if any pane has more than one.
+    fn deepest_queue(&self) -> Option<u64> {
+        self.by_pane
+            .iter()
+            .filter(|(_, queue)| queue.has_tail())
+            .max_by_key(|(_, queue)| queue.tail.len())
+            .map(|(pane_id, _)| *pane_id)
+    }
+
     fn validate(&self) -> Result<(), DirectMuxError> {
         self.totals.validate(Self::RESOURCE)?;
         if self.is_empty() == self.by_pane.is_empty() {
@@ -1536,9 +1567,9 @@ pub struct DirectMuxClient {
     #[cfg(test)]
     render_retention_codec_stats: RenderRetentionCodecStats,
     #[cfg(test)]
-    get_lines_retry_delays: [Option<Duration>; 3],
+    get_lines_retry_delays: [Option<Duration>; MAX_RESOURCE_BUSY_RETRIES],
     #[cfg(test)]
-    render_read_retry_delays: [Option<Duration>; 2],
+    render_read_retry_delays: [Option<Duration>; MAX_RESOURCE_BUSY_RETRIES],
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -2388,9 +2419,9 @@ impl DirectMuxClient {
             #[cfg(test)]
             render_retention_codec_stats: RenderRetentionCodecStats::default(),
             #[cfg(test)]
-            get_lines_retry_delays: [None; 3],
+            get_lines_retry_delays: [None; MAX_RESOURCE_BUSY_RETRIES],
             #[cfg(test)]
-            render_read_retry_delays: [None; 2],
+            render_read_retry_delays: [None; MAX_RESOURCE_BUSY_RETRIES],
             config,
         };
 
@@ -2695,7 +2726,7 @@ impl DirectMuxClient {
         // another read. All attempts share the original operation's budget.
         #[cfg(test)]
         {
-            self.render_read_retry_delays = [None; 2];
+            self.render_read_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let budget = self
             .config
@@ -2706,7 +2737,7 @@ impl DirectMuxClient {
         // caller's earlier capability deadline still bounds timeout_with_cx.
         let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
         let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
-            for attempt in 0..3 {
+            for attempt in 0..=MAX_RESOURCE_BUSY_RETRIES {
                 checkpoint_mux_cx(cx, self.connection_id, "render_read_retry")?;
                 if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
                     return Err(DirectMuxError::ReadTimeout);
@@ -2758,7 +2789,20 @@ impl DirectMuxClient {
                     }
                     response => self.settle_single_render_response(pane_id, response, true),
                 };
-                if attempt < 2 && settled.as_ref().is_err_and(is_retryable_render_rejection) {
+                // A busy refusal (the server's 1 ms terminal wait expired)
+                // gets a line read's retries: with only two, over ~11 ms, the
+                // text fence of `ft get-text` on a flooding pane ended every
+                // swarm-echo run that failed with resource_busy, while its
+                // line reads recovered (ft-4p4uo).
+                let retries = match &settled {
+                    Err(DirectMuxError::RemoteRejection(error))
+                        if error.code == codec::MuxErrorCode::RESOURCE_BUSY =>
+                    {
+                        MAX_RESOURCE_BUSY_RETRIES
+                    }
+                    _ => 2,
+                };
+                if attempt < retries && settled.as_ref().is_err_and(is_retryable_render_rejection) {
                     tracing::debug!(
                         pane_id,
                         attempt,
@@ -2815,7 +2859,6 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
-        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
         let budget = self
             .config
             .write_timeout
@@ -2823,7 +2866,7 @@ impl DirectMuxClient {
         let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
         #[cfg(test)]
         {
-            self.get_lines_retry_delays = [None; 3];
+            self.get_lines_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
             let mut busy_retries = 0usize;
@@ -2925,8 +2968,13 @@ impl DirectMuxClient {
         max_output_bytes: usize,
         tail: Option<usize>,
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
-        const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
-        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
+        // Three attempts failed robot reads of busy restored panes on loaded
+        // hosts (ft-ukqe3: hz3 at load 63, ovh-b): a full history read took
+        // ~450 ms, about half of them met a pane that had just spilled a row
+        // to cold storage (a new cold layout, or a moved canonical
+        // frontier), and 6 of 24 reads in one run lost all three. Each
+        // attempt is a fresh, whole read, so six only cost time on failure.
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 6;
         if self
             .peer_generation
             .as_ref()
@@ -2939,7 +2987,7 @@ impl DirectMuxClient {
         }
         #[cfg(test)]
         {
-            self.get_lines_retry_delays = [None; 3];
+            self.get_lines_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let mut chunk_rows = 512isize;
         let mut busy_retries = 0usize;
@@ -2990,10 +3038,70 @@ impl DirectMuxClient {
                 _ => (scrollback_top, None),
             };
             let read_from_top = start == scrollback_top;
+            // A tail inside one chunk is read as the pane's newest rows at
+            // capture time. An unfenced GetLines range that runs past the
+            // newest row is clamped by the server to the newest rows, which
+            // are hot, so the server captures and publishes them in one
+            // terminal hold. At full output rate, rows computed from this
+            // fence could scroll into cold history before the server captured
+            // them and then fail at the cold/hot seam (ft-pjjeg).
+            if content_tail.is_some() && !read_from_top && end - start <= chunk_rows {
+                let count = end - start;
+                let phase_started = diagnostics.start_phase();
+                let response = self
+                    .get_lines_with_cx(
+                        cx,
+                        pane_id,
+                        std::iter::once(isize::MAX - count..isize::MAX).collect(),
+                    )
+                    .await;
+                diagnostics.phase("newest_rows", phase_started);
+                let response = response?;
+                if response.pane_id as u64 != pane_id {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyPaneMismatch,
+                    ));
+                }
+                let (lines, _images) = response.lines.extract_data();
+                if lines.windows(2).any(|pair| pair[1].0 != pair[0].0 + 1) {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyRowOrderMismatch,
+                    ));
+                }
+                let mut out = String::new();
+                for (_, line) in lines {
+                    checkpoint_mux_cx(cx, self.connection_id, "text_read_append")?;
+                    if let Err(limit) =
+                        append_mux_text_line(&mut out, line.as_str().as_ref(), max_output_bytes)
+                    {
+                        return Ok(Ok(limit));
+                    }
+                }
+                return Ok(Ok(finish_mux_text_read(
+                    out,
+                    tail,
+                    content_tail,
+                    false,
+                    total_rows,
+                )));
+            }
             let mut out = String::new();
+            let mut replies = 0usize;
+            // Chunks reaching into the rows the fence saw as visible; the
+            // rest held only history (see the final fence below).
+            let visible_top = layout.dimensions.physical_top;
+            let mut visible_chunks = 0usize;
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
-                let chunk_end = start.saturating_add(chunk_rows).min(end);
+                let mut chunk_end = start.saturating_add(chunk_rows).min(end);
+                if start < visible_top
+                    && visible_top < chunk_end
+                    && chunk_end < end
+                    && end - visible_top <= chunk_rows
+                {
+                    // Leave the visible rows whole to the last chunk.
+                    chunk_end = visible_top;
+                }
                 let phase_started = diagnostics.start_phase();
                 let response = self
                     .send_request_with_cx(
@@ -3131,7 +3239,34 @@ impl DirectMuxClient {
                         return Ok(Ok(limit));
                     }
                 }
+                replies += 1;
+                if chunk_end > visible_top {
+                    visible_chunks += 1;
+                }
                 start = chunk_end;
+            }
+            // One reply is one capture under the pane's terminal lock, which
+            // the server published only after re-validating this fence's
+            // layout: it cannot tear, so it needs no final fence. A pane
+            // under continuous output never stands still for one, so a tail
+            // of it failed all three attempts even at 100 KB/s (ft-wpgjw).
+            // Stitched chunks of which only the last reached the rows the
+            // fence saw as visible need none either. The others held
+            // history, which cannot change while the pane's line layout
+            // holds, and the server publishes a chunk only while it still
+            // holds for this fence: every later reply proves no earlier
+            // chunk's rows were rewritten, and the stitched rows are the
+            // pane's rows as of the last reply (ft-ukqe3). Visible rows
+            // stitched from several chunks, and an empty read, must still
+            // prove the source stood still.
+            if replies != 0 && visible_chunks <= 1 {
+                return Ok(Ok(finish_mux_text_read(
+                    out,
+                    tail,
+                    content_tail,
+                    read_from_top,
+                    total_rows,
+                )));
             }
             let phase_started = diagnostics.start_phase();
             let final_state = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
@@ -3500,6 +3635,49 @@ impl DirectMuxClient {
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
             other => self.unexpected_response("UnitResponse", &other, true),
+        }
+    }
+
+    /// Send one key press using an explicit capability context.
+    ///
+    /// This is the GUI's input path: the server encodes the key for the
+    /// pane's own modes (application cursor keys, keypad mode, the kitty
+    /// keyboard protocol), so a remote client never needs to mirror them.
+    pub async fn send_key_down_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        event: termwiz::input::KeyEvent,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        let input_serial = InputSerial::try_now().ok_or(DirectMuxError::InputSerialExhausted)?;
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::SendKeyDown(SendKeyDown {
+                    pane_id: pane_id as usize,
+                    event,
+                    input_serial,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => self.unexpected_response("UnitResponse", &other, true),
+        }
+    }
+
+    /// List the mux's connected clients (focused pane, workspace, last input)
+    /// using an explicit capability context.
+    pub async fn get_client_list_with_cx(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<GetClientListResponse, DirectMuxError> {
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetClientList(GetClientList))
+            .await?;
+        match response {
+            Pdu::GetClientListResponse(payload) => Ok(payload),
+            other => self.unexpected_response("GetClientListResponse", &other, true),
         }
     }
 
@@ -5084,35 +5262,33 @@ impl DirectMuxClient {
         }
         let pane_id = payload.pane_id as u64;
         let snapshot = self.encode_render_change_snapshot(&payload)?;
-        let pending = self.encode_pending_render_change(payload)?;
+        let mut pending = self.encode_pending_render_change(payload)?;
 
         self.pending_render_changes.validate()?;
-        let aggregate_count = self
-            .pending_render_changes
-            .len()
-            .checked_add(reserved_local_count)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: PendingRenderChanges::RESOURCE,
-            })?;
-        let aggregate_bytes = self
-            .pending_render_changes
-            .retained_bytes()
-            .checked_add(reserved_local_bytes)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: PendingRenderChanges::RESOURCE,
-            })?;
         let pending_limit = RetentionLimit {
             max_count: self.config.max_pending_render_changes,
             max_bytes: self.config.max_pending_render_change_bytes,
         };
-        let _ = checked_retention_after_insert(
-            PendingRenderChanges::RESOURCE,
-            aggregate_count,
-            aggregate_bytes,
-            None,
-            pending.retained_bytes(),
+        if let Err(full) = self.check_pending_render_admission(
+            &pending,
+            reserved_local_count,
+            reserved_local_bytes,
             pending_limit,
-        )?;
+        ) {
+            if !matches!(full, DirectMuxError::RetentionLimitExceeded { .. }) {
+                return Err(full);
+            }
+            pending = match self.relieve_pending_render_pressure(pending, pending_limit)? {
+                Some(pending) => pending,
+                None => return Err(full),
+            };
+            self.check_pending_render_admission(
+                &pending,
+                reserved_local_count,
+                reserved_local_bytes,
+                pending_limit,
+            )?;
+        }
 
         let next_pending = self
             .pending_render_changes
@@ -5131,6 +5307,107 @@ impl DirectMuxClient {
         self.pending_render_changes
             .commit_insert(pending, next_pending);
         Ok(())
+    }
+
+    /// Whether `pending` fits the unilateral render queue beside the batch's
+    /// reserved local sidebands.
+    fn check_pending_render_admission(
+        &self,
+        pending: &RetainedRenderChange,
+        reserved_local_count: usize,
+        reserved_local_bytes: usize,
+        limit: RetentionLimit,
+    ) -> Result<(), DirectMuxError> {
+        let aggregate_count = self
+            .pending_render_changes
+            .len()
+            .checked_add(reserved_local_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: PendingRenderChanges::RESOURCE,
+            })?;
+        let aggregate_bytes = self
+            .pending_render_changes
+            .retained_bytes()
+            .checked_add(reserved_local_bytes)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: PendingRenderChanges::RESOURCE,
+            })?;
+        checked_retention_after_insert(
+            PendingRenderChanges::RESOURCE,
+            aggregate_count,
+            aggregate_bytes,
+            None,
+            pending.retained_bytes(),
+            limit,
+        )
+        .map(|_| ())
+    }
+
+    /// Makes room in a full unilateral render queue instead of failing the
+    /// client (ft-4p4uo: panes flooding faster than their polls consumed
+    /// filled the 512-entry queue, and the next push aborted a text read).
+    /// If `pending`'s pane already has queued changes, they and `pending`
+    /// become one change, which is returned in its place. Otherwise the
+    /// pane with the deepest queue is coalesced and `pending` is returned
+    /// unchanged. `None` when every queued pane holds a single change, so
+    /// the queue is genuinely at its limit.
+    ///
+    /// Only a push that would otherwise be refused is coalesced, so below
+    /// the limit every change is still delivered once, in order.
+    fn relieve_pending_render_pressure(
+        &mut self,
+        pending: RetainedRenderChange,
+        limit: RetentionLimit,
+    ) -> Result<Option<RetainedRenderChange>, DirectMuxError> {
+        let pane_id = pending.pane_id;
+        if self.pending_render_changes.contains_pane(pane_id)? {
+            let newer = pending.decode(self.connection_id)?;
+            let merged = self.take_coalesced_render_changes(pane_id, Some(newer))?;
+            tracing::debug!(
+                connection_id = self.connection_id,
+                pane_id,
+                phase = "render_queue_coalesce",
+                "coalesced a pane's queued render changes at the retention limit"
+            );
+            return merged
+                .map(|merged| self.encode_pending_render_change(merged))
+                .transpose();
+        }
+        let Some(deepest) = self.pending_render_changes.deepest_queue() else {
+            return Ok(None);
+        };
+        if let Some(merged) = self.take_coalesced_render_changes(deepest, None)? {
+            let merged = self.encode_pending_render_change(merged)?;
+            let next = self.pending_render_changes.admit_insert(&merged, limit)?;
+            self.pending_render_changes.commit_insert(merged, next);
+        }
+        tracing::debug!(
+            connection_id = self.connection_id,
+            pane_id = deepest,
+            phase = "render_queue_coalesce",
+            "coalesced the deepest pane render queue at the retention limit"
+        );
+        Ok(Some(pending))
+    }
+
+    /// Removes `pane_id`'s queued render changes and folds them, oldest
+    /// first, and then `newer`, into one change.
+    fn take_coalesced_render_changes(
+        &mut self,
+        pane_id: u64,
+        newer: Option<GetPaneRenderChangesResponse>,
+    ) -> Result<Option<GetPaneRenderChangesResponse>, DirectMuxError> {
+        let mut merged: Option<GetPaneRenderChangesResponse> = None;
+        while let Some(change) = self.take_pending_render_change(pane_id)? {
+            merged = Some(match merged {
+                Some(older) => coalesce_render_changes(older, change),
+                None => change,
+            });
+        }
+        Ok(match (merged, newer) {
+            (Some(older), Some(newer)) => Some(coalesce_render_changes(older, newer)),
+            (merged, newer) => merged.or(newer),
+        })
     }
 
     fn take_pending_render_change(
@@ -5562,6 +5839,49 @@ fn checked_retention_after_insert(
         });
     }
     Ok((requested_count, requested_bytes))
+}
+
+/// One render change equivalent to applying `older` and then `newer` to the
+/// same pane: `newer`'s state (cursor, dimensions, title, seqno, ...), every
+/// row either marked dirty, and `newer`'s bonus lines. `older`'s bonus lines
+/// may be stale after `newer`, so their rows are marked dirty instead and
+/// the consumer fetches them. The input acknowledgement stays at the latest
+/// one either reported.
+fn coalesce_render_changes(
+    older: GetPaneRenderChangesResponse,
+    newer: GetPaneRenderChangesResponse,
+) -> GetPaneRenderChangesResponse {
+    let mut rows = older.dirty_lines;
+    rows.extend(
+        older
+            .bonus_lines
+            .lines()
+            .map(|(row, _)| *row..row.saturating_add(1)),
+    );
+    rows.extend(newer.dirty_lines.iter().cloned());
+    GetPaneRenderChangesResponse {
+        dirty_lines: union_row_ranges(rows),
+        input_serial: newer.input_serial.or(older.input_serial),
+        ..newer
+    }
+}
+
+/// The non-empty ranges of `rows`, sorted, with overlapping and adjacent
+/// ranges joined.
+fn union_row_ranges(
+    mut rows: Vec<std::ops::Range<frankenterm_term::StableRowIndex>>,
+) -> Vec<std::ops::Range<frankenterm_term::StableRowIndex>> {
+    rows.retain(|range| range.start < range.end);
+    rows.sort_by_key(|range| range.start);
+    let mut joined: Vec<std::ops::Range<frankenterm_term::StableRowIndex>> =
+        Vec::with_capacity(rows.len());
+    for range in rows {
+        match joined.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => joined.push(range),
+        }
+    }
+    joined
 }
 
 fn duration_to_ms_u64(duration: Duration) -> u64 {
@@ -6317,6 +6637,83 @@ mod tests {
             input_serial: None,
             seqno,
         }
+    }
+
+    #[test]
+    fn coalesced_render_changes_union_dirty_rows_and_keep_the_newest_state() {
+        let mut older = test_render_change(7, 1, "old");
+        older.dirty_lines = vec![0..1, 3..5];
+        older.bonus_lines = test_bonus_lines(&["row 0", "row 1"]);
+        older.input_serial = Some(InputSerial::from_millis_since_epoch(5));
+        let mut newer = test_render_change(7, 2, "new");
+        newer.dirty_lines = vec![10..11, 4..6];
+        let merged = coalesce_render_changes(older, newer);
+        // Older bonus rows 0 and 1 are refetched rather than kept stale.
+        assert_eq!(merged.dirty_lines, vec![0..2, 3..6, 10..11]);
+        assert_eq!(merged.seqno, 2);
+        assert_eq!(merged.title, "new");
+        assert_eq!(merged.bonus_lines.lines().count(), 0);
+        assert_eq!(
+            merged.input_serial,
+            Some(InputSerial::from_millis_since_epoch(5))
+        );
+        assert_eq!(
+            union_row_ranges(vec![5..5, 2..4, 0..2]),
+            std::iter::once(0..4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_full_render_queue_coalesces_instead_of_failing_the_client() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (_dir, path, _server) =
+                render_read_server(1, |_, _| (Vec::new(), None, Vec::new())).await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .expect("connect");
+            client.config.max_pending_render_changes = 3;
+            let push = |client: &mut DirectMuxClient, pane_id, seqno, row: isize| {
+                let mut change = test_render_change(pane_id, seqno, &format!("{pane_id}-{seqno}"));
+                change.dirty_lines = std::iter::once(row..row + 1).collect();
+                client.stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(change))
+            };
+
+            // A pane pushed past the limit: its queue folds into one change.
+            for seqno in 1..=4 {
+                push(&mut client, 7, seqno, seqno as isize * 2).expect("push pane 7");
+            }
+            assert_eq!(client.pending_render_changes.len(), 1);
+            let merged = client
+                .take_pending_render_change(7)
+                .expect("take")
+                .expect("merged change");
+            assert_eq!(merged.dirty_lines, vec![2..3, 4..5, 6..7, 8..9]);
+            assert_eq!((merged.seqno, merged.title.as_str()), (4, "7-4"));
+
+            // A new pane at the limit: the deepest queue makes room.
+            push(&mut client, 8, 1, 0).expect("push pane 8");
+            push(&mut client, 8, 2, 1).expect("push pane 8");
+            push(&mut client, 9, 1, 0).expect("push pane 9");
+            push(&mut client, 10, 1, 0).expect("pane 8 coalesces to admit pane 10");
+            assert_eq!(client.pending_render_changes.len(), 3);
+            assert_eq!(
+                client
+                    .take_pending_render_change(8)
+                    .expect("take")
+                    .expect("pane 8")
+                    .dirty_lines,
+                std::iter::once(0..2).collect::<Vec<_>>()
+            );
+
+            // Every queued pane holds a single change: the limit stands.
+            push(&mut client, 11, 1, 0).expect("refill");
+            let full = push(&mut client, 12, 1, 0).expect_err("three panes, one change each");
+            assert!(matches!(
+                full,
+                DirectMuxError::RetentionLimitExceeded { .. }
+            ));
+        });
     }
 
     fn preload_compressed_render_sideband(
@@ -7335,6 +7732,18 @@ mod tests {
         Pdu::GetPaneRenderChangesResponse(state)
     }
 
+    /// A fixture pane all of whose rows are visible: every chunk of a read
+    /// reaches visible rows, so a stitched read of a changing source still
+    /// needs its final fence (ft-ukqe3).
+    fn text_read_visible_state(seqno: usize, top: isize, rows: usize) -> Pdu {
+        let mut response = text_read_state(seqno, top, rows);
+        if let Pdu::GetPaneRenderChangesResponse(ref mut state) = response {
+            state.dimensions.viewport_rows = rows;
+            state.dimensions.physical_top = top;
+        }
+        response
+    }
+
     fn text_read_row(row: isize, generation: &str) -> String {
         if row % 7 == 0 {
             String::new()
@@ -7363,6 +7772,32 @@ mod tests {
         Pdu::GetLinesAtLayoutResponse(codec::GetLinesAtLayoutResponse {
             pane_id: request.pane_id,
             layout: request.layout,
+            lines: lines.into(),
+        })
+    }
+
+    /// The server's clamp of an unfenced range that runs past the newest
+    /// row: the newest rows, as many as requested, ending at `newest_end`.
+    fn text_read_newest_reply(request: GetLines, newest_end: isize, generation: &str) -> Pdu {
+        let count = request
+            .lines
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<isize>();
+        let lines = (newest_end - count..newest_end)
+            .map(|row| {
+                let mut line = frankenterm_term::Line::from_text(
+                    &text_read_row(row, generation),
+                    &termwiz::cell::CellAttributes::default(),
+                    1,
+                    None,
+                );
+                line.set_last_cell_was_wrapped(row % 2 == 0, 1);
+                (row, line)
+            })
+            .collect::<Vec<_>>();
+        Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: request.pane_id,
             lines: lines.into(),
         })
     }
@@ -7821,7 +8256,9 @@ mod tests {
                             if !stale_first && render_count == 2 {
                                 generation = 8;
                             }
-                            let mut response = text_read_state(
+                            // Every row visible: a moved final fence still
+                            // restarts a stitched read (ft-ukqe3).
+                            let mut response = text_read_visible_state(
                                 generation,
                                 if generation == 7 { -7 } else { 3 },
                                 600,
@@ -8125,9 +8562,13 @@ mod tests {
                             count.0 += 1;
                             // The source advances again after each observation
                             // that rejected the previous attempt, then settles.
-                            // Reusing those pre-suspension observations spends
-                            // all three attempts before reaching source 5.
-                            text_read_state(count.0.min(5), 0, 3)
+                            // Reusing those pre-suspension observations reaches
+                            // source 5 only later, through fences the counts
+                            // below would show.
+                            // Two chunks of visible rows: a single reply, or a
+                            // last chunk holding the only visible rows, needs
+                            // no final fence (ft-wpgjw, ft-ukqe3).
+                            text_read_visible_state(count.0.min(5), 0, 600)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let seqno = request.layout.seqno;
@@ -8150,12 +8591,19 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
-                    MuxTextReadResult::Text(text_read_expected(0..3, "current")),
+                    MuxTextReadResult::Text(text_read_expected(0..600, "current")),
                     "yield and timed retry must each start from a fresh source fence"
                 );
                 assert_eq!(
                     *counts.lock().unwrap(),
-                    (6, vec![1, 3, 5]),
+                    (
+                        6,
+                        if rejected_chunk {
+                            vec![1, 3, 5, 5]
+                        } else {
+                            vec![1, 1, 3, 3, 5, 5]
+                        }
+                    ),
                     "refresh after each suspension and retain the final success fence"
                 );
                 drop(client);
@@ -8187,7 +8635,15 @@ mod tests {
                         Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
-                            text_read_state(if quota { 7 } else { count.0 }, 0, 3)
+                            // A changing snapshot needs two chunks of visible
+                            // rows: a single reply, or a last chunk holding the
+                            // only visible rows, needs no final fence
+                            // (ft-wpgjw, ft-ukqe3).
+                            if quota {
+                                text_read_state(7, 0, 3)
+                            } else {
+                                text_read_visible_state(count.0, 0, 600)
+                            }
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             seen.lock().unwrap().1 += 1;
@@ -8226,20 +8682,20 @@ mod tests {
                         "three rows shrink directly to one, then stop"
                     );
                 } else {
-                    assert_eq!(summaries[0]["attempts"], 3);
+                    assert_eq!(summaries[0]["attempts"], 6);
                     assert_eq!(summaries[0]["quota_reductions"], 0);
-                    assert_eq!(summaries[0]["final_source_retries"], 2);
+                    assert_eq!(summaries[0]["final_source_retries"], 5);
                     assert!(matches!(
                         error,
                         DirectMuxError::TextSnapshotChanged {
                             phase: "final_source",
-                            attempts: 3,
+                            attempts: 6,
                         }
                     ));
                     assert_eq!(
                         *counts.lock().unwrap(),
-                        (6, 3),
-                        "three attempts each have independent initial and final fences"
+                        (12, 12),
+                        "six attempts each have independent initial and final fences"
                     );
                 }
                 drop(client);
@@ -8513,14 +8969,17 @@ mod tests {
                         Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
-                            // Three changing attempts, then one stable source
-                            // for a separate caller-initiated transaction.
-                            text_read_state(count.0.min(7), 0, 3)
+                            // Six changing attempts, then one stable source
+                            // for a separate caller-initiated transaction. Two
+                            // chunks of visible rows: a single reply, or a last
+                            // chunk holding the only visible rows, needs no
+                            // final fence (ft-wpgjw, ft-ukqe3).
+                            text_read_visible_state(count.0.min(13), 0, 600)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let mut count = seen.lock().unwrap();
                             count.1 += 1;
-                            if rejected_chunk && count.0 < 7 {
+                            if rejected_chunk && count.0 < 13 {
                                 Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
                                     GetLinesAtLayout::IDENT,
                                 ))
@@ -8540,37 +8999,39 @@ mod tests {
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
                 assert!(summaries[0]["connection_id"].as_u64().unwrap() > 0);
-                assert_eq!(summaries[0]["attempts"], 3);
+                assert_eq!(summaries[0]["attempts"], 6);
                 assert_eq!(summaries[0]["quota_reductions"], 0);
                 assert_eq!(
                     summaries[0]["chunk_layout_retries"],
-                    if rejected_chunk { 2 } else { 0 }
+                    if rejected_chunk { 5 } else { 0 }
                 );
                 assert_eq!(
                     summaries[0]["final_source_retries"],
-                    if rejected_chunk { 0 } else { 2 }
+                    if rejected_chunk { 0 } else { 5 }
                 );
                 let expected_phase = if rejected_chunk {
                     "chunk_layout"
                 } else {
                     "final_source"
                 };
+                let mut expected_phases = vec![format!("{expected_phase}_yield")];
+                expected_phases.extend((0..4).map(|_| format!("{expected_phase}_wait")));
                 assert_eq!(
                     diagnostic_log.retry_phases(),
-                    vec![
-                        format!("{expected_phase}_yield"),
-                        format!("{expected_phase}_wait"),
-                    ],
-                    "repeated churn must retain its second-retry backoff"
+                    expected_phases,
+                    "repeated churn must retain its later-retry backoff"
                 );
                 assert!(matches!(
                     error,
                     MuxPoolError::Mux(DirectMuxError::TextSnapshotChanged {
                         phase,
-                        attempts: 3,
+                        attempts: 6,
                     }) if phase == expected_phase
                 ));
-                assert_eq!(*counts.lock().unwrap(), (6, 3));
+                assert_eq!(
+                    *counts.lock().unwrap(),
+                    (12, if rejected_chunk { 6 } else { 12 })
+                );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.recovery_attempts, 0, "no second retry budget");
                 assert_eq!(stats.connections_created, 1);
@@ -8578,9 +9039,12 @@ mod tests {
 
                 assert_eq!(
                     pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
-                    MuxTextReadResult::Text(text_read_expected(0..3, "settled"))
+                    MuxTextReadResult::Text(text_read_expected(0..600, "settled"))
                 );
-                assert_eq!(*counts.lock().unwrap(), (8, 4));
+                assert_eq!(
+                    *counts.lock().unwrap(),
+                    (14, if rejected_chunk { 8 } else { 14 })
+                );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.connections_created, 1, "aligned stream stays usable");
                 assert_eq!(stats.pool.total_acquired, 2);
@@ -8591,6 +9055,123 @@ mod tests {
                     .unwrap();
             };
             run_async_test(future.with_subscriber(subscriber));
+        }
+    }
+
+    /// ft-wpgjw: one reply is one capture under the pane's terminal lock,
+    /// published only after the server re-validated the fence's layout, so a
+    /// single-chunk read of a pane whose source moves on every observation
+    /// needs no final fence. It used to fail all three attempts, so `ft
+    /// get-text --tail` of any continuously printing pane failed.
+    #[test]
+    fn single_reply_text_read_of_a_changing_pane_needs_no_final_fence() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let counts = Arc::new(StdMutex::new((0usize, 0usize)));
+            let seen = Arc::clone(&counts);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        let mut count = seen.lock().unwrap();
+                        count.0 += 1;
+                        text_read_state(count.0, 0, 3)
+                    }
+                    Pdu::GetLinesAtLayout(request) => {
+                        seen.lock().unwrap().1 += 1;
+                        text_read_reply(request, "streaming")
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                MuxTextReadResult::Text(text_read_expected(0..3, "streaming"))
+            );
+            assert_eq!(
+                *counts.lock().unwrap(),
+                (1, 1),
+                "one fence and one reply; no final fence"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    /// ft-ukqe3: a multi-chunk read whose last chunk holds the only visible
+    /// rows is the pane's rows as of its last reply, though a pane printing
+    /// continuously never stands still for the final fence: the server served
+    /// each chunk only while the fence's layout held, and the history above
+    /// the visible rows cannot change while it does. A chunk that would end
+    /// inside the visible rows ends at them instead.
+    #[test]
+    fn stitched_text_read_of_a_changing_pane_with_visible_rows_last_succeeds() {
+        // 600 rows, the last 24 visible. A 500-row tail reads 524 rows from
+        // row 76, whose first 512-row chunk would end at visible row 588.
+        for (tail, chunks, expected) in [
+            (
+                None,
+                vec![0..512, 512..600],
+                MuxTextReadResult::Text(text_read_expected(0..600, "streaming")),
+            ),
+            (
+                Some(500),
+                vec![76..576, 576..600],
+                MuxTextReadResult::Bounded {
+                    text: text_read_expected(100..600, "streaming"),
+                    original_lines: 600,
+                    original_bytes: None,
+                    truncated: true,
+                },
+            ),
+        ] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let seen = Arc::new(StdMutex::new((0usize, Vec::new())));
+                let requests = Arc::clone(&seen);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            let mut seen = requests.lock().unwrap();
+                            seen.0 += 1;
+                            text_read_state(seen.0, 0, 600)
+                        }
+                        Pdu::GetLinesAtLayout(request) => {
+                            requests.lock().unwrap().1.push(request.lines[0].clone());
+                            text_read_reply(request, "streaming")
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    client
+                        .get_text_tail_with_cx(&cx, 9, 100_000, tail)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    (1, chunks),
+                    "one attempt: its fence and two chunks, no final fence"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
         }
     }
 
@@ -8743,12 +9324,13 @@ mod tests {
                     Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         text_read_state(7, -7, 600)
                     }
-                    Pdu::GetLinesAtLayout(request) => {
-                        assert_eq!(request.layout.seqno, 7);
+                    // A one-chunk tail is read as the pane's newest rows
+                    // (ft-pjjeg); a fenced read would panic here.
+                    Pdu::GetLines(request) => {
                         assert_eq!(request.pane_id, 9);
                         let range = request.lines[0].clone();
                         seen.lock().unwrap().push(range.clone());
-                        text_read_reply(request, "café 中文 e\u{301} 👩‍💻")
+                        text_read_newest_reply(request, 593, "café 中文 e\u{301} 👩‍💻")
                     }
                     other => panic!("unexpected text request {other:?}"),
                 })
@@ -8772,9 +9354,9 @@ mod tests {
             );
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![519..593],
-                "only the tail plus one viewport (24 rows) may be requested; \
-                 prefix rows -7..519 never cross the wire"
+                vec![isize::MAX - 74..isize::MAX],
+                "only the tail plus one viewport (74 rows) may be requested, as the \
+                 pane's newest rows; prefix rows -7..519 never cross the wire"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -8957,8 +9539,10 @@ mod tests {
             let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
                 .await
                 .unwrap();
+            // Over one chunk (550 + 24 rows > 512), so the tail is read fenced
+            // in chunks; a one-chunk tail reads the newest rows instead.
             let result = client
-                .get_text_tail_with_cx(&cx, 9, 100_000, Some(50))
+                .get_text_tail_with_cx(&cx, 9, 100_000, Some(550))
                 .await
                 .unwrap();
 
@@ -8966,7 +9550,7 @@ mod tests {
                 result,
                 MuxTextReadResult::Bounded {
                     // Row 602 is blank (602 % 7 == 0): the content tail ends at 601.
-                    text: text_read_expected(552..602, "new"),
+                    text: text_read_expected(52..602, "new"),
                     original_lines: 600,
                     original_bytes: None,
                     truncated: true,
@@ -8975,7 +9559,7 @@ mod tests {
 
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![519..593, 529..603],
+                vec![19..531, 29..541, 541..603],
                 "retry must recompute the suffix range against the updated layout"
             );
 
@@ -9028,7 +9612,16 @@ mod tests {
             );
             assert_eq!(
                 client.get_lines_retry_delays,
-                [Some(Duration::from_millis(1)), None, None],
+                [
+                    Some(Duration::from_millis(1)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                ],
                 "actual successful retry must schedule only the short initial delay"
             );
             drop(client);
@@ -9074,8 +9667,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                4,
-                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+                9,
+                "repeated busy must stop bounded at cap (1 initial + 8 retries = 9 requests)"
             );
             assert_eq!(
                 client.get_lines_retry_delays,
@@ -9083,6 +9676,11 @@ mod tests {
                     Some(Duration::from_millis(1)),
                     Some(Duration::from_millis(10)),
                     Some(Duration::from_millis(10)),
+                    Some(Duration::from_millis(20)),
+                    Some(Duration::from_millis(40)),
+                    Some(Duration::from_millis(80)),
+                    Some(Duration::from_millis(160)),
+                    Some(Duration::from_millis(320)),
                 ]
             );
             drop(client);
@@ -9187,18 +9785,18 @@ mod tests {
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Call 3: third busy refusal (busy_retries: 2 -> 3)
-                            3 => {
+                            // Calls 3-8: busy refusals (busy_retries: 2 -> 8)
+                            3..=8 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Call 4: fourth busy refusal; budget is exhausted (3 retries used).
-                            // If allowance had reset upon the snapshot change, this would retry (call 5).
+                            // Call 9: ninth busy refusal; budget is exhausted (8 retries used).
+                            // If allowance had reset upon the snapshot change, this would retry (call 10).
                             // Because allowance is shared across the whole transaction,
                             // the client must NOT retry here and must return the error.
-                            4 => {
+                            9 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
@@ -9227,8 +9825,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 chunk_calls.load(Ordering::SeqCst),
-                5,
-                "shared budget must cap total busy retries at 3 across changed snapshots (no reset)"
+                10,
+                "shared budget must cap total busy retries at 8 across changed snapshots (no reset)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -9391,8 +9989,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                4,
-                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+                9,
+                "repeated busy must stop bounded at cap (1 initial + 8 retries = 9 requests)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -9764,6 +10362,85 @@ mod tests {
             assert_eq!(saw_write.1, b"hello".to_vec());
             assert_eq!(saw_paste.0, 78);
             assert_eq!(saw_paste.1, "paste me");
+        });
+    }
+
+    /// Key presses travel as `SendKeyDown` (the GUI's input PDU) with a fresh,
+    /// strictly increasing input serial, and the client list decodes the
+    /// focused pane the mobile attach helper uses to pick its first pane.
+    #[test]
+    fn send_key_down_and_client_list_with_cx_roundtrip() {
+        use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let keys = Arc::new(StdMutex::new(Vec::new()));
+            let seen_keys = Arc::clone(&keys);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::SendKeyDown(request) => {
+                        seen_keys.lock().unwrap().push((
+                            request.pane_id,
+                            request.event,
+                            request.input_serial,
+                        ));
+                        Pdu::UnitResponse(UnitResponse {})
+                    }
+                    Pdu::GetClientList(_) => {
+                        let mut gui = mux::client::ClientInfo::new(Arc::new(ClientId::new()));
+                        gui.focused_pane_id = Some(4);
+                        gui.active_workspace = Some("default".to_string());
+                        Pdu::GetClientListResponse(GetClientListResponse { clients: vec![gui] })
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .expect("connect with cx");
+            let enter = KeyEvent {
+                key: KeyCode::Enter,
+                modifiers: Modifiers::NONE,
+            };
+            let ctrl_c = KeyEvent {
+                key: KeyCode::Char('c'),
+                modifiers: Modifiers::CTRL,
+            };
+            client
+                .send_key_down_with_cx(&cx, 9, enter.clone())
+                .await
+                .expect("send enter");
+            client
+                .send_key_down_with_cx(&cx, 9, ctrl_c.clone())
+                .await
+                .expect("send ctrl-c");
+            let listed = client
+                .get_client_list_with_cx(&cx)
+                .await
+                .expect("client list");
+            assert_eq!(listed.clients.len(), 1);
+            assert_eq!(listed.clients[0].focused_pane_id, Some(4));
+            assert_eq!(
+                listed.clients[0].active_workspace.as_deref(),
+                Some("default")
+            );
+
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let keys = keys.lock().unwrap();
+            assert_eq!(keys.len(), 2, "both key presses reach the server");
+            assert_eq!((keys[0].0, &keys[0].1), (9, &enter));
+            assert_eq!((keys[1].0, &keys[1].1), (9, &ctrl_c));
+            assert!(!keys[0].2.is_empty(), "a key press carries an input serial");
+            assert!(
+                keys[0].2 < keys[1].2,
+                "input serials order successive key presses"
+            );
         });
     }
 
@@ -12625,7 +13302,7 @@ mod tests {
             for (case, expected_requests) in [
                 ("recover", 2),
                 ("busy-recover", 2),
-                ("busy-persistent", 3),
+                ("busy-persistent", 9),
                 ("never", 1),
                 ("effect", 1),
                 ("wrong-request", 1),
@@ -12748,7 +13425,16 @@ mod tests {
                     );
                     assert_eq!(
                         client.render_read_retry_delays,
-                        [Some(Duration::from_millis(1)), None],
+                        [
+                            Some(Duration::from_millis(1)),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None
+                        ],
                         "a transient read race must not impose the sustained-contention delay"
                     );
                 } else if matches!(case, "cancel" | "extreme-cancel") {
@@ -12763,17 +13449,32 @@ mod tests {
                 } else {
                     assert!(result.is_err(), "rejection must not become a frame: {case}");
                 }
-                if matches!(case, "persistent" | "busy-persistent" | "extreme") {
+                if matches!(case, "persistent" | "extreme") {
                     assert_eq!(
                         client.render_read_retry_delays,
                         [
                             Some(Duration::from_millis(1)),
-                            Some(Duration::from_millis(10))
+                            Some(Duration::from_millis(10)),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None
                         ],
                         "persistent read contention keeps the bounded longer backoff"
                     );
+                } else if case == "busy-persistent" {
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [1, 10, 10, 20, 40, 80, 160, 320].map(|ms| Some(Duration::from_millis(ms))),
+                        "a busy terminal gets a line read's ~641 ms of retries"
+                    );
                 } else if matches!(case, "never" | "effect" | "wrong-request" | "eof") {
-                    assert_eq!(client.render_read_retry_delays, [None; 2]);
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [None; MAX_RESOURCE_BUSY_RETRIES]
+                    );
                 }
                 drop(client);
                 let requests = server.await.expect("server");

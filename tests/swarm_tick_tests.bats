@@ -388,6 +388,44 @@ EOF
     [[ "$(jq -r '.swarm.agents | length' "${TMP_DIR}/raw.json")" == "0" ]]
 }
 
+# ntm 1.36+ (GitHub #124): --robot-status is ntm.robot.status.v2, whose
+# sessions carry only headers; per-pane rows live in --robot-snapshot. Shapes
+# below mirror real ntm 1.37.0 output.
+write_ntm_v2_status() {
+    cat > "$1/ntm_robot_status.json" <<'JSON'
+{"schema_version":"ntm.robot.status.v2","sessions":[{"name":"frankenterm","agent_count":3,"health":{"status":"healthy"}},{"name":"other-swarm","agent_count":1,"health":{"status":"healthy"}}]}
+JSON
+}
+
+@test "ntm robot.status.v2: swarm panes come from --robot-snapshot" {
+    fixture="${TMP_DIR}/ntm-v2"
+    cp -R "${FIXTURES_ROOT}/healthy" "$fixture"
+    write_ntm_v2_status "$fixture"
+    cat > "${fixture}/ntm_robot_snapshot.json" <<'JSON'
+{"schema_version":"ntm.robot.snapshot.v1","sessions":[{"name":"frankenterm","attached":true,"agents":[{"pane":"0.0","type":"user","state":"idle"},{"pane":"0.1","type":"claude","state":"busy"},{"pane":"0.2","type":"codex","state":"idle"}]},{"name":"other-swarm","attached":false,"agents":[{"pane":"0.0","type":"codex","state":"idle"}]}]}
+JSON
+
+    PATH="${STUBS_DIR}:$PATH" \
+        FIXTURE_DIR="$fixture" \
+        REPO_ROOT="$REPO_ROOT" \
+        bash "$SCRIPT" frankenterm > "${TMP_DIR}/raw.json" 2>"${TMP_DIR}/stderr.log"
+    [[ "$(jq -c '.swarm' "${TMP_DIR}/raw.json")" == '{"panes_count":3,"agents":[{"idx":0,"type":"user","pane":"0.0"},{"idx":1,"type":"claude","pane":"0.1"},{"idx":2,"type":"codex","pane":"0.2"}]}' ]]
+    ! grep -q 'no readable per-pane rows' "${TMP_DIR}/stderr.log"
+}
+
+@test "ntm robot.status.v2 without readable snapshot: empty swarm and a stderr warning" {
+    fixture="${TMP_DIR}/ntm-v2-no-snapshot"
+    cp -R "${FIXTURES_ROOT}/healthy" "$fixture"
+    write_ntm_v2_status "$fixture"
+
+    PATH="${STUBS_DIR}:$PATH" \
+        FIXTURE_DIR="$fixture" \
+        REPO_ROOT="$REPO_ROOT" \
+        bash "$SCRIPT" frankenterm > "${TMP_DIR}/raw.json" 2>"${TMP_DIR}/stderr.log"
+    [[ "$(jq -c '.swarm' "${TMP_DIR}/raw.json")" == '{"panes_count":0,"agents":[]}' ]]
+    grep -q "ntm reports session 'frankenterm' but no readable per-pane rows" "${TMP_DIR}/stderr.log"
+}
+
 @test "robustness: ntm returning nothing (command absent) still yields valid JSON" {
     fixture="${TMP_DIR}/no-ntm"
     cp -R "${FIXTURES_ROOT}/healthy" "$fixture"

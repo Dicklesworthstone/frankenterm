@@ -85,13 +85,7 @@ legacy `wa://...` scheme for backward compatibility.
 | `wa.accounts_refresh` | Refresh account usage | `docs/json-schema/wa-robot-accounts-refresh.json` |
 | `wa.rules_list` | List detection rules | `docs/json-schema/wa-robot-rules-list.json` |
 | `wa.rules_test` | Test pattern matching | `docs/json-schema/wa-robot-rules-test.json` |
-| `wa.workflow_list` | List available workflows | `docs/json-schema/wa-robot-workflow-list.json` |
 | `wa.workflow_status` | Check workflow execution status | `docs/json-schema/wa-robot-workflow-status.json` |
-| `wa.workflow_abort` | Abort a running workflow | `docs/json-schema/wa-robot-workflow-abort.json` |
-| `wa.approve` | Submit approval code for pending action | `docs/json-schema/wa-robot-approve.json` |
-| `wa.why` | Explain an error code or policy denial | `docs/json-schema/wa-robot-why.json` |
-| `wa.rules_show` | Show details for a specific rule | `docs/json-schema/wa-robot-rules-show.json` |
-| `wa.rules_lint` | Lint rules: validate IDs, fixtures, regex | `docs/json-schema/wa-robot-rules-lint.json` |
 | `wa.reservations` | List active reservations | `docs/json-schema/wa-robot-reservations.json` |
 | `wa.reserve` | Create reservation | `docs/json-schema/wa-robot-reserve.json` |
 | `wa.release` | Release reservation | `docs/json-schema/wa-robot-release.json` |
@@ -109,8 +103,10 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
   - Response notes: text payloads are redacted before serialization; policy gates may return `FT-MCP-0006`.
 
 - `wa.send`
-  - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, wait_for?: string, timeout_secs?: u64=30, wait_for_regex?: bool=false }`
+  - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, verify_submit?: bool=false, submit_level?: "write" | "composer" | "submitted" | "working", idempotency_key?: string (1-256 bytes), wait_for?: string, timeout_secs?: u64=30 (1-600), wait_for_regex?: bool=false, reconcile?: "settle" | "abandon" }`
   - Response notes: non-dry-run send responses may include `data.submit`, a durable submit receipt keyed by `idempotency_key` and aligned with the audit `correlation_id`.
+  - Duplicate protection (with `idempotency_key`): replaying an identical send returns the original completed receipt for at least 24 hours; a proven pre-effect denial (policy denied, approval required) stays bound for at least 1 hour. Only when the store is at its ceiling (16384 records or 128 MiB) does a new send evict settled records older than those horizons, in bounded batches; a later identical send is then admitted as new. Pending and in-doubt records are never evicted, so a store full of unresolved authority keeps refusing new sends with `capacity_exceeded`.
+  - Reconciliation (`reconcile`, with the original request's exact params and `idempotency_key`, no `dry_run`): resolves a send that replay refused as in doubt (`submit_idempotency.in_doubt_noop`), receipt-pending (`submit_idempotency.effect_applied_receipt_pending_noop`), or whose owner's lease expired. Nothing is sent. `settle` stores an unverified receipt (`verification_unavailable`, guarantee not met, evidence `submit_idempotency.operator_reconciled`) that later replays return and that ages out like any completed receipt. `abandon` frees the key so the same request can be sent again; it is refused for a receipt-pending send, whose effect was applied. The current caller must pass the same policy authorization as a send, and every attempt writes a `submit_reconcile` audit row (mode and outcome, no text) under the key's `correlation_id`. A live owner, a completed or retryable record, or a missing one fails with the store's typed error.
 
 - `wa.wait_for`
   - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`
@@ -189,27 +185,9 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 - `wa.rules_test`
   - Params: `{ text: string, agent?: string }`
 
-- `wa.rules_show`
-  - Params: `{ rule_id: string }`
-
-- `wa.rules_lint`
-  - Params: `{ pack?: string, fixtures?: bool=false, strict?: bool=false }`
-
-- `wa.workflow_list`
-  - Params: `{}`
-
 - `wa.workflow_status`
   - Params: `{ execution_id?: string, pane_id?: u64, active?: bool=false, verbose?: bool=false }`
   - Note: At least one of `execution_id`, `pane_id`, or `active` must be provided.
-
-- `wa.workflow_abort`
-  - Params: `{ execution_id: string, reason?: string, force?: bool=false }`
-
-- `wa.approve`
-  - Params: `{ code: string, pane_id?: u64, fingerprint?: string, dry_run?: bool=false }`
-
-- `wa.why`
-  - Params: `{ code: string }`
 
 - `wa.reservations`
   - Params: `{ pane_id?: u64 }`
@@ -277,8 +255,7 @@ All MCP errors use stable codes prefixed with `FT-MCP-`:
 
 Any tool that causes side effects MUST pass the PolicyEngine, including: <!-- MCP-V1-003 -->
 - `wa.send`
-- `wa.workflow_run` / `wa.workflow_abort`
-- `wa.approve`
+- `wa.workflow_run`
 - `wa.reserve` / `wa.release`
 - `wa.accounts_refresh` (if it triggers external calls)
 

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FrankenTerm fleet viewer</title>
+<link rel="icon" href="data:,">
+<link rel="preload" href="./fonts/pragmasevka-nf-subset.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<main id="container">
+  <canvas id="terminal" tabindex="0" aria-label="FrankenTerm fleet viewer (read-only)"></canvas>
+</main>
+<!-- The rendered frame as text: for screen readers and browser tests. -->
+<pre id="screen-text" class="visually-hidden" aria-live="polite"></pre>
+<div id="error" role="alert" hidden></div>
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>

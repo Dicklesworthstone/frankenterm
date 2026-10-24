@@ -2350,6 +2350,40 @@ impl MissionMutationGuard {
 
 // ── Step Executor Trait ──────────────────────────────────────────────────────
 
+/// Whether a dispatched step has an authoritative outcome. An unsuccessful
+/// input alone cannot distinguish a pre-effect refusal from a lost reply after
+/// the effect was applied. Durable execution must retain its Pending record for
+/// the latter, including when the uncertain effect was a compensation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDispatchOutcome<T> {
+    /// The input is authoritative: success, or a proven unsuccessful attempt.
+    Settled(T),
+    /// The effect may have happened. Neither retry nor terminal certification
+    /// is authorized by this input.
+    Indeterminate(T),
+}
+
+impl<T> StepDispatchOutcome<T> {
+    fn input(&self) -> &T {
+        match self {
+            Self::Settled(input) | Self::Indeterminate(input) => input,
+        }
+    }
+
+    fn into_input(self) -> T {
+        match self {
+            Self::Settled(input) | Self::Indeterminate(input) => input,
+        }
+    }
+
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> StepDispatchOutcome<U> {
+        match self {
+            Self::Settled(input) => StepDispatchOutcome::Settled(map(input)),
+            Self::Indeterminate(input) => StepDispatchOutcome::Indeterminate(map(input)),
+        }
+    }
+}
+
 /// Trait for executing individual tx steps.
 ///
 /// The engine calls this to perform actual work (e.g., sending commands to panes,
@@ -2372,6 +2406,21 @@ pub trait StepExecutor {
         now_ms: i64,
     ) -> Vec<TxCommitStepInput>;
 
+    /// Execute with effect certainty preserved for the durable engine.
+    /// Executors whose failures can follow a possibly applied effect must
+    /// override this method instead of reporting those failures as settled.
+    fn execute_steps_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCommitStepInput>> {
+        self.execute_steps(contract, fail_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::Settled)
+            .collect()
+    }
+
     /// Execute compensation steps and return inputs.
     fn execute_compensations(
         &self,
@@ -2380,6 +2429,21 @@ pub trait StepExecutor {
         fail_for_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCompensationStepInput>;
+
+    /// Compensation has the same uncertainty boundary as commit: losing an
+    /// undo acknowledgement never grants permission to perform the undo again.
+    fn execute_compensations_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
+        self.execute_compensations(contract, commit_report, fail_for_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::Settled)
+            .collect()
+    }
 }
 
 mod effect_seal {
@@ -2577,7 +2641,10 @@ where
 /// Storage adapter trait for `StepAction::StoreData` execution and compensation (ft-2j3vo).
 ///
 /// Implementations provide observable, atomic, and idempotent key-value mutation
-/// for transaction steps.
+/// for transaction steps. A mutation error string does not prove that no effect
+/// occurred, so the durable engine retains Pending after an adapter error. This
+/// also applies to validation refusals reported only through these strings;
+/// error text is never retry authority.
 pub trait TxStorageAdapter: Send + Sync {
     /// Store a JSON value under `key`. Overwrites any existing value at `key`.
     fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String>;
@@ -2926,17 +2993,45 @@ fn action_has_pane(action: &crate::plan::StepAction) -> bool {
     )
 }
 
+/// Only explicit, correctly bound pre-effect refusals can retire a send's
+/// Pending record as Failed. Opaque transport errors, cancellation after
+/// admission, unknown future codes and malformed authority remain ambiguous.
+fn send_failure_proves_no_effect(error: &crate::Error, pane_id: u64) -> bool {
+    use crate::error::{MuxEffectCertainty, MuxObjectKind, MuxOperation, WeztermError};
+
+    match error {
+        crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) => {
+            rejection.has_consistent_authority()
+                && rejection.operation == MuxOperation::SendText
+                && rejection.effect == MuxEffectCertainty::NotApplied
+                && rejection
+                    .object
+                    .is_none_or(|object| object.kind == MuxObjectKind::Pane && object.id == pane_id)
+        }
+        crate::Error::Wezterm(WeztermError::PaneNotFound(missing)) => *missing == pane_id,
+        crate::Error::Wezterm(
+            WeztermError::CliNotFound
+            | WeztermError::NotRunning
+            | WeztermError::SocketNotFound(_)
+            | WeztermError::VersionSkew { .. }
+            | WeztermError::CircuitOpen { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Execute a single step action against the real backend (blocking).
 ///
-/// Spawns a one-shot runtime for async calls. If `timeout_ms` is provided, wraps
-/// the async operation in `runtime_async::timeout`. Returns `(success, reason_code, error_code)`.
+/// Spawns a one-shot runtime for sends; the backend owns its send deadline.
+/// External waits use their bounded poll loop. The input contains
+/// `(success, reason_code, error_code)`; its disposition preserves effect certainty.
 fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
     timeout_ms: Option<u64>,
     external_signals: Option<&crate::workflows::ExternalSignalRegistry>,
     storage_adapter: Option<&(dyn TxStorageAdapter + 'static)>,
-) -> (bool, String, Option<String>) {
+) -> StepDispatchOutcome<(bool, String, Option<String>)> {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
 
@@ -2951,7 +3046,7 @@ fn execute_step_action(
     // poll interval) instead of blocking on `join()` until `timeout_ms`.
     let parent_cx = crate::cx::Cx::current();
 
-    match action {
+    StepDispatchOutcome::Settled(match action {
         crate::plan::StepAction::SendText {
             pane_id,
             text,
@@ -2965,46 +3060,81 @@ fn execute_step_action(
             let result = match std::thread::Builder::new()
                 .name("ft-tx-send-step".to_string())
                 .spawn(move || {
-                    let rt = crate::runtime_async::RuntimeBuilder::current_thread()
-                        .build()
-                        .map_err(|e| format!("failed to build runtime for pane step: {e}"))?;
-                    rt.block_on(async {
-                        // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
-                        // ft-506i5: use the parent tx Cx captured on the driver
-                        // thread (thread::spawn does not propagate the task-local
-                        // Cx); fall back to a fresh request Cx only when there was
-                        // no ambient cx to begin with.
-                        let send_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
-                        let result = if no_paste {
-                            h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
-                        } else {
-                            h.send_text_with_cx(&send_cx, pane_id, &text).await
-                        };
-                        result.map_err(|e| e.to_string())
-                    })
+                    // Own the runtime, backend captures and future inside the
+                    // marked boundary, including their destruction. Recover
+                    // only finite panic evidence; the canonical helper owns
+                    // opaque payload disposal and its quarantine/poison policy.
+                    frankenterm_sigpipe::catch_recoverable(
+                        frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                        std::panic::AssertUnwindSafe(move || {
+                            let rt = match crate::runtime_async::RuntimeBuilder::current_thread()
+                                .build()
+                            {
+                                Ok(rt) => rt,
+                                Err(error) => {
+                                    return StepDispatchOutcome::Settled((
+                                        false,
+                                        "send_text_runtime_failed".to_string(),
+                                        Some(format!("FTX_RUNTIME: {error}")),
+                                    ));
+                                }
+                            };
+                            rt.block_on(async move {
+                                // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
+                                // ft-506i5: use the parent tx Cx captured on the driver
+                                // thread (thread::spawn does not propagate the task-local
+                                // Cx); fall back to a fresh request Cx only when there was
+                                // no ambient cx to begin with.
+                                let send_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
+                                let result = if no_paste {
+                                    h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
+                                } else {
+                                    h.send_text_with_cx(&send_cx, pane_id, &text).await
+                                };
+                                match result {
+                                    Ok(()) => StepDispatchOutcome::Settled((
+                                        true, "send_text_succeeded".to_string(), None,
+                                    )),
+                                    Err(error) if send_failure_proves_no_effect(&error, pane_id) => {
+                                        StepDispatchOutcome::Settled((
+                                            false,
+                                            "send_text_failed".to_string(),
+                                            Some(format!("FTX_SEND: {error}")),
+                                        ))
+                                    }
+                                    Err(error) => StepDispatchOutcome::Indeterminate((
+                                        false,
+                                        "send_text_indeterminate".to_string(),
+                                        Some(format!("FTX_SEND_INDETERMINATE: {error}")),
+                                    )),
+                                }
+                            })
+                        }),
+                    )
                 }) {
-                Ok(handle) => handle.join(),
+                Ok(handle) => match handle.join() {
+                    Ok(outcome) => outcome,
+                    // This is not a recovery boundary: a panic outside the
+                    // marked worker must retain its original fatal contract.
+                    // Never drop an opaque join payload as a failed action.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
                 Err(e) => {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "send_text_thread_spawn_failed".to_string(),
                         Some(format!("FTX_THREAD: {e}")),
-                    );
+                    ));
                 }
             };
-            match result {
-                Ok(Ok(())) => (true, "send_text_succeeded".to_string(), None),
-                Ok(Err(e)) => (
-                    false,
-                    "send_text_failed".to_string(),
-                    Some(format!("FTX_SEND: {e}")),
-                ),
-                Err(_) => (
+            return match result {
+                Ok(outcome) => outcome,
+                Err(_) => StepDispatchOutcome::Indeterminate((
                     false,
                     "send_text_thread_panic".to_string(),
                     Some("FTX_PANIC".to_string()),
-                ),
-            }
+                )),
+            };
         }
         crate::plan::StepAction::WaitFor {
             pane_id,
@@ -3018,30 +3148,30 @@ fn execute_step_action(
             // aliasing the signal key into the pane-text search pattern.
             if let crate::plan::WaitCondition::External { key } = condition {
                 let Some(registry) = external_signals else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "wait_for_external_unsupported".to_string(),
                         Some(format!(
                             "FTX_WAIT_EXTERNAL_UNSUPPORTED: signal '{key}' requires registry; \
                              wire one via PaneStepExecutor::with_external_signals(registry)"
                         )),
-                    );
+                    ));
                 };
                 let deadline = std::time::Instant::now();
                 let Some(deadline) = deadline.checked_add(timeout) else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "wait_for_timeout_overflow".to_string(),
                         Some(format!(
                             "FTX_WAIT: external timeout is too large: {timeout_val}ms"
                         )),
-                    );
+                    ));
                 };
                 let mut interval = std::time::Duration::from_millis(5);
                 let max_interval = std::time::Duration::from_millis(50);
                 loop {
                     if registry.is_signaled(key) {
-                        return (true, "wait_for_external_satisfied".to_string(), None);
+                        return StepDispatchOutcome::Settled((true, "wait_for_external_satisfied".to_string(), None));
                     }
                     // ft-506i5: this external wait runs on the driver thread, so
                     // the captured `parent_cx` is the live tx Cx. Honor
@@ -3052,23 +3182,23 @@ fn execute_step_action(
                         .as_ref()
                         .is_some_and(|cx| cx.checkpoint().is_err())
                     {
-                        return (
+                        return StepDispatchOutcome::Settled((
                             false,
                             "wait_for_cancelled".to_string(),
                             Some(format!(
                                 "FTX_WAIT_CANCELLED: external signal '{key}' wait interrupted by tx cancellation or deadline"
                             )),
-                        );
+                        ));
                     }
                     let now = std::time::Instant::now();
                     if now >= deadline {
-                        return (
+                        return StepDispatchOutcome::Settled((
                             false,
                             "wait_for_timeout".to_string(),
                             Some(format!(
                                 "FTX_WAIT: external signal '{key}' not fired within {timeout_val}ms"
                             )),
-                        );
+                        ));
                     }
                     let remaining = deadline.saturating_duration_since(now);
                     let chunk = interval.min(remaining);
@@ -3112,22 +3242,22 @@ fn execute_step_action(
         }
         crate::plan::StepAction::StoreData { key, value } => {
             let Some(storage) = storage_adapter else {
-                return (
+                return StepDispatchOutcome::Settled((
                     false,
                     "store_data_unwired".to_string(),
                     Some(
                         "FTX_STORE_DATA_UNWIRED: StoreData requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
                             .to_string(),
                     ),
-                );
+                ));
             };
             match storage.store_data(key, value) {
                 Ok(()) => (true, "store_data_succeeded".to_string(), None),
-                Err(e) => (
+                Err(e) => return StepDispatchOutcome::Indeterminate((
                     false,
-                    "store_data_failed".to_string(),
-                    Some(format!("FTX_STORE_DATA_FAILED: {e}")),
-                ),
+                    "store_data_indeterminate".to_string(),
+                    Some(format!("FTX_STORE_DATA_INDETERMINATE: {e}")),
+                )),
             }
         }
         crate::plan::StepAction::AcquireLock { .. } => (
@@ -3179,30 +3309,30 @@ fn execute_step_action(
         } => {
             if action_type == "delete_data" || action_type == "delete_store_data" {
                 let Some(storage) = storage_adapter else {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "delete_data_unwired".to_string(),
                         Some(
                             "FTX_DELETE_DATA_UNWIRED: delete_data requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
                                 .to_string(),
                         ),
-                    );
+                    ));
                 };
                 let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("");
                 if key.is_empty() {
-                    return (
+                    return StepDispatchOutcome::Settled((
                         false,
                         "delete_data_invalid_key".to_string(),
                         Some("FTX_DELETE_DATA_INVALID_KEY: missing or empty 'key' in payload".to_string()),
-                    );
+                    ));
                 }
                 match storage.delete_data(key) {
                     Ok(_) => (true, "delete_data_succeeded".to_string(), None),
-                    Err(e) => (
+                    Err(e) => return StepDispatchOutcome::Indeterminate((
                         false,
-                        "delete_data_failed".to_string(),
-                        Some(format!("FTX_DELETE_DATA_FAILED: {e}")),
-                    ),
+                        "delete_data_indeterminate".to_string(),
+                        Some(format!("FTX_DELETE_DATA_INDETERMINATE: {e}")),
+                    )),
                 }
             } else {
                 (
@@ -3212,7 +3342,7 @@ fn execute_step_action(
                 )
             }
         }
-    }
+    })
 }
 
 impl<P, A, T> StepExecutor for PaneStepExecutor<P, A, T>
@@ -3235,6 +3365,18 @@ where
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCommitStepInput> {
+        self.execute_steps_with_outcome(contract, fail_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::into_input)
+            .collect()
+    }
+
+    fn execute_steps_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCommitStepInput>> {
         let mut results = Vec::with_capacity(contract.plan.steps.len());
         let mut had_failure = false;
 
@@ -3251,26 +3393,26 @@ where
             // Deterministic failure injection
             if fail_step == Some(step.step_id.0.as_str()) {
                 tracing::warn!(step_id = %step.step_id.0, "injecting deterministic failure");
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "commit_step_failed_injected".to_string(),
                     error_code: Some("FTX3999".to_string()),
                     completed_at_ms: now_ms,
-                });
+                }));
                 had_failure = true;
                 continue;
             }
 
             // Stop executing after first failure (failure boundary)
             if had_failure {
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "skipped_after_failure".to_string(),
                     error_code: Some("FTX_SKIPPED".to_string()),
                     completed_at_ms: now_ms,
-                });
+                }));
                 continue;
             }
 
@@ -3283,7 +3425,7 @@ where
                     remaining_steps = remaining,
                     "phase timeout exceeded, skipping remaining steps"
                 );
-                results.push(TxCommitStepInput {
+                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                     step_id: step.step_id.clone(),
                     success: false,
                     reason_code: "phase_timeout".to_string(),
@@ -3293,7 +3435,7 @@ where
                         phase_budget.as_millis()
                     )),
                     completed_at_ms: now_ms,
-                });
+                }));
                 had_failure = true;
                 continue;
             }
@@ -3319,13 +3461,13 @@ where
                                     tier = ?tier,
                                     "critical backpressure — deferring non-pane step"
                                 );
-                                results.push(TxCommitStepInput {
+                                results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                                     step_id: step.step_id.clone(),
                                     success: false,
                                     reason_code: "backpressure_deferred".to_string(),
                                     error_code: Some("FTX_BACKPRESSURE_CRITICAL".to_string()),
                                     completed_at_ms: now_ms,
-                                });
+                                }));
                                 had_failure = true;
                                 continue;
                             }
@@ -3336,13 +3478,13 @@ where
                                 tier = ?tier,
                                 "emergency backpressure — deferring all steps"
                             );
-                            results.push(TxCommitStepInput {
+                            results.push(StepDispatchOutcome::Settled(TxCommitStepInput {
                                 step_id: step.step_id.clone(),
                                 success: false,
                                 reason_code: "backpressure_emergency".to_string(),
                                 error_code: Some("FTX_BACKPRESSURE_EMERGENCY".to_string()),
                                 completed_at_ms: now_ms,
-                            });
+                            }));
                             had_failure = true;
                             continue;
                         }
@@ -3359,7 +3501,7 @@ where
                 "executing pane step"
             );
 
-            let (success, reason_code, error_code) = execute_step_action(
+            let outcome = execute_step_action(
                 &self.handle,
                 &step.action,
                 step_timeout,
@@ -3369,21 +3511,23 @@ where
 
             tracing::info!(
                 step_id = %step.step_id.0,
-                success,
-                reason = %reason_code,
+                success = outcome.input().0,
+                reason = %outcome.input().1,
                 "pane step completed"
             );
 
-            if !success {
+            if !outcome.input().0 {
                 had_failure = true;
             }
-            results.push(TxCommitStepInput {
-                step_id: step.step_id.clone(),
-                success,
-                reason_code,
-                error_code,
-                completed_at_ms: now_ms,
-            });
+            results.push(
+                outcome.map(|(success, reason_code, error_code)| TxCommitStepInput {
+                    step_id: step.step_id.clone(),
+                    success,
+                    reason_code,
+                    error_code,
+                    completed_at_ms: now_ms,
+                }),
+            );
         }
 
         results
@@ -3396,6 +3540,19 @@ where
         fail_for_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCompensationStepInput> {
+        self.execute_compensations_with_outcome(contract, commit_report, fail_for_step, now_ms)
+            .into_iter()
+            .map(StepDispatchOutcome::into_input)
+            .collect()
+    }
+
+    fn execute_compensations_with_outcome(
+        &self,
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
         let contract_compensations = contract
             .plan
             .compensations
@@ -3415,44 +3572,45 @@ where
                     step_id = %result.step_id.0,
                     "injecting deterministic compensation failure"
                 );
-                TxCompensationStepInput {
+                StepDispatchOutcome::Settled(TxCompensationStepInput {
                     for_step_id: result.step_id.clone(),
                     success: false,
                     reason_code: "compensation_failed_injected".to_string(),
                     error_code: Some("FTX4999".to_string()),
                     completed_at_ms: now_ms,
-                }
+                })
             } else {
                 tracing::info!(step_id = %result.step_id.0, "executing pane compensation");
                 let Some(action) = contract_compensations.get(result.step_id.0.as_str()) else {
-                    inputs.push(TxCompensationStepInput {
+                    inputs.push(StepDispatchOutcome::Settled(TxCompensationStepInput {
                         for_step_id: result.step_id.clone(),
                         success: false,
                         reason_code: "compensation_action_missing".to_string(),
                         error_code: Some("FTX_COMPENSATION_MISSING".to_string()),
                         completed_at_ms: now_ms,
-                    });
+                    }));
                     break;
                 };
 
                 let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
-                let (success, reason_code, error_code) = execute_step_action(
+                execute_step_action(
                     &self.handle,
                     action,
                     step_timeout,
                     self.external_signals.as_deref(),
                     self.storage_adapter.as_deref(),
-                );
-
-                TxCompensationStepInput {
-                    for_step_id: result.step_id.clone(),
-                    success,
-                    reason_code,
-                    error_code,
-                    completed_at_ms: now_ms,
-                }
+                )
+                .map(|(success, reason_code, error_code)| {
+                    TxCompensationStepInput {
+                        for_step_id: result.step_id.clone(),
+                        success,
+                        reason_code,
+                        error_code,
+                        completed_at_ms: now_ms,
+                    }
+                })
             };
-            let success = input.success;
+            let success = input.input().success;
             inputs.push(input);
             if !success {
                 break;
@@ -3499,12 +3657,25 @@ pub struct TxRollbackExecutionResult {
     pub compensation_report: TxCompensationReport,
     /// Observability events emitted while gating and compensating.
     pub events: Vec<TxObservabilityEvent>,
-    /// Execution ledger, including its terminal phase and hash chain.
+    /// Execution ledger and hash chain. A proven-only partial rollback remains
+    /// in Compensating without a terminal disposition certificate.
     pub ledger: TxExecutionLedger,
     /// Decision-path trace for the rollback operation.
     pub decision_path: String,
     /// Globally unique, timestamp-sortable rollback execution identifier.
     pub execution_id: String,
+}
+
+/// Read-only explicit rollback preflight. The projected receipts remain local
+/// until proof, gates and durable ledger admission have all succeeded. Holding
+/// the lease set freezes every commit and declared compensation key throughout
+/// that handoff and the eventual compensation dispatch.
+struct DurableRollbackPreparation {
+    commit_report: TxCommitReport,
+    original_commit_outcomes: HashMap<String, StepOutcome>,
+    proof_leases: DurableKeyLeaseSet,
+    projected_contract: Option<MissionTxContract>,
+    unresolved_step_ids: Vec<String>,
 }
 
 /// Canonical overall outcome represented by a transaction lifecycle state.
@@ -4216,25 +4387,26 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             .validate()
             .map_err(TxExecutionError::InvalidContract)?;
         validate_tx_contract_state_outcome(contract).map_err(TxExecutionError::InvalidContract)?;
-        let logical_now_ms = checked_logical_now_ms(now_ms)?;
-        let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
-            .map_err(TxExecutionError::CompensationPhase)?;
         let mut rollback_proof_leases = None;
         let mut prevalidated_original_commit_outcomes = None;
-        if let Some(store) = store.as_deref_mut() {
-            let (outcomes, leases) = Self::acquire_atomic_compensation_proof(
-                contract,
-                &mut commit_report,
-                store,
-                logical_now_ms,
-            )?;
-            prevalidated_original_commit_outcomes = Some(outcomes);
-            rollback_proof_leases = Some(leases);
-        }
+        let mut projected_contract = None;
+        let mut unresolved_step_ids = Vec::new();
+        let commit_report = if let Some(store) = store.as_deref_mut() {
+            let prepared = Self::prepare_durable_explicit_rollback(contract, store, now_ms)?;
+            prevalidated_original_commit_outcomes = Some(prepared.original_commit_outcomes);
+            rollback_proof_leases = Some(prepared.proof_leases);
+            projected_contract = prepared.projected_contract;
+            unresolved_step_ids = prepared.unresolved_step_ids;
+            prepared.commit_report
+        } else {
+            mission_tx_rollback_commit_report(contract, now_ms)
+                .map_err(TxExecutionError::CompensationPhase)?
+        };
+        let preflight_contract = projected_contract.as_ref().unwrap_or(contract);
         validate_receipt_sequence_capacity(
-            contract,
+            preflight_contract,
             Self::compensation_receipt_headroom(
-                contract,
+                preflight_contract,
                 &commit_report,
                 rollback_proof_leases.as_ref(),
             )?,
@@ -4244,7 +4416,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let execution_id = unique_execution_id("rollback", now_ms);
         let mut events = Vec::new();
         let mut decision_path = "rollback".to_string();
-        let economic_hard_stop = contract
+        let economic_hard_stop = preflight_contract
             .economic_hard_stop_decision_current(now_ms)
             .map_err(TxExecutionError::InvalidContract)?;
         let effective_kill_switch = if economic_hard_stop.is_some() {
@@ -4258,29 +4430,44 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         // semantically wrong; dispatch uses this prepared decision just as the
         // normal prepare/commit path does.
         let gate_report = Self::compensation_gate_report(
-            contract,
+            preflight_contract,
             &commit_report,
             rollback_proof_leases.as_ref(),
         )?;
         let compensation_permit = self.validate_compensation_dispatch(
-            contract,
+            preflight_contract,
             &gate_report,
             &execution_id,
             effective_kill_switch,
             now_ms,
         )?;
-        let plan_id = contract.plan.plan_id.0.clone();
-        let compiled_plan = compiled_plan_from_contract(contract);
+        let plan_id = preflight_contract.plan.plan_id.0.clone();
+        let compiled_plan = compiled_plan_from_contract(preflight_contract);
         let mut ledger = TxExecutionLedger::new(&execution_id, &plan_id, compiled_plan.plan_hash);
         if let Some(store) = store.as_deref_mut() {
-            store
-                .abort_and_archive_matching_ledgers(&compiled_plan.plan_id, compiled_plan.plan_hash)
-                .map_err(|err| {
-                    TxExecutionError::LedgerWrite(format!(
-                        "failed to retire prior rollback ledgers for plan {}: {err}",
-                        compiled_plan.plan_id
-                    ))
+            let retirement = if unresolved_step_ids.is_empty() {
+                store.abort_and_archive_matching_ledgers(
+                    &compiled_plan.plan_id,
+                    compiled_plan.plan_hash,
+                )
+            } else {
+                let proof = rollback_proof_leases.as_ref().ok_or_else(|| {
+                    TxExecutionError::InvalidContract(
+                        "partial rollback requires continuously held durable proof".to_string(),
+                    )
                 })?;
+                store.retire_settled_ledgers_for_partial_rollback(
+                    &compiled_plan.plan_id,
+                    compiled_plan.plan_hash,
+                    proof,
+                )
+            };
+            retirement.map_err(|err| {
+                TxExecutionError::LedgerWrite(format!(
+                    "failed to retire prior rollback ledgers for plan {}: {err}",
+                    compiled_plan.plan_id
+                ))
+            })?;
             store
                 .create_ledger(&execution_id, &compiled_plan)
                 .map_err(|err| {
@@ -4302,6 +4489,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             )?;
         }
 
+        // The staged Success receipts become caller-visible only after every
+        // proof/gate/capacity check and durable ledger admission succeeds.
+        // Unknown effects have no new receipt or ledger record.
+        if let Some(projected) = projected_contract {
+            *contract = projected;
+        }
         contract.lifecycle_state = MissionTxState::Compensating;
         contract.outcome = TxOutcome::Pending;
         let (
@@ -4319,6 +4512,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             store.as_deref_mut(),
             prevalidated_original_commit_outcomes.as_ref(),
             rollback_proof_leases.as_mut(),
+            &unresolved_step_ids,
             now_ms,
         )?;
 
@@ -4341,14 +4535,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             },
         )?;
 
-        let terminal_phase = successful_terminal_ledger_phase(contract.lifecycle_state);
-        transition_execution_ledger_pair(
-            &mut ledger,
-            store.as_deref_mut(),
-            &execution_id,
-            terminal_phase,
-        )?;
-        archive_terminal_execution_ledger(&mut ledger, store, &execution_id)?;
+        if unresolved_step_ids.is_empty() {
+            let terminal_phase = successful_terminal_ledger_phase(contract.lifecycle_state);
+            transition_execution_ledger_pair(
+                &mut ledger,
+                store.as_deref_mut(),
+                &execution_id,
+                terminal_phase,
+            )?;
+            archive_terminal_execution_ledger(&mut ledger, store, &execution_id)?;
+        }
         Ok(TxRollbackExecutionResult {
             compensation_report: report,
             events,
@@ -4672,6 +4868,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     store.as_deref_mut(),
                     prevalidated_original_commit_outcomes.as_ref(),
                     compensation_proof_leases.as_mut(),
+                    &[],
                     now_ms,
                 )?;
 
@@ -5204,6 +5401,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         store: Option<&mut IdempotencyStore>,
         prevalidated_original_commit_outcomes: Option<&HashMap<String, StepOutcome>>,
         preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
+        unresolved_step_ids: &[String],
         now_ms: i64,
     ) -> Result<CompensationPhaseOutput, TxExecutionError> {
         if dispatch_permit.execution_id != execution_id
@@ -5300,6 +5498,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 .count();
         }
 
+        if !unresolved_step_ids.is_empty() {
+            report.outcome = crate::plan::TxCompensationOutcome::ReconciliationRequired;
+            report.unresolved_step_ids = unresolved_step_ids.to_vec();
+            report.reason_code = "rollback_reconciliation_required".to_string();
+            if report.error_code.is_none() {
+                report.error_code = Some("tx.compensation.reconciliation_required".to_string());
+            }
+            report.decision_path.push_str("->unresolved_commit_effects");
+        }
+
         let reason = match &report.outcome {
             crate::plan::TxCompensationOutcome::FullyRolledBack => {
                 "tx.compensation.fully_rolled_back"
@@ -5307,6 +5515,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             crate::plan::TxCompensationOutcome::CompensationFailed => "tx.compensation.failed",
             crate::plan::TxCompensationOutcome::NothingToCompensate => {
                 "tx.compensation.nothing_to_compensate"
+            }
+            crate::plan::TxCompensationOutcome::ReconciliationRequired => {
+                "tx.compensation.reconciliation_required"
             }
         };
 
@@ -5639,19 +5850,33 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 .plan
                 .compensations
                 .retain(|compensation| compensation.for_step_id == step.step_id);
-            let mut dispatched = self.executor.execute_steps(
+            let mut dispatched = self.executor.execute_steps_with_outcome(
                 &dispatch_contract,
                 self.config.fail_step.as_deref(),
                 now_ms,
             );
-            if dispatched.len() != 1 || dispatched[0].step_id != step.step_id {
+            if dispatched.len() != 1 || dispatched[0].input().step_id != step.step_id {
                 return Err(TxExecutionError::CommitPhase(format!(
                     "step executor returned {} results while dispatching commit step {}",
                     dispatched.len(),
                     step.step_id.0
                 )));
             }
-            let input = dispatched.remove(0);
+            let input = match dispatched.remove(0) {
+                StepDispatchOutcome::Settled(input) => input,
+                StepDispatchOutcome::Indeterminate(input) => {
+                    // The dispatch may have applied its effect. Leaving the
+                    // write-ahead record Pending blocks both terminal claims
+                    // and any redispatch after reopen, irrespective of TTL.
+                    return Err(TxExecutionError::DedupConflict {
+                        step_id: step.step_id.0.clone(),
+                        outcome: format!(
+                            "Pending: commit dispatch outcome is indeterminate ({})",
+                            input.reason_code
+                        ),
+                    });
+                }
+            };
             let succeeded = input.success;
             let outcome = if succeeded {
                 StepOutcome::Success {
@@ -5685,6 +5910,178 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         }
 
         Ok(commit_inputs)
+    }
+
+    fn prepare_durable_explicit_rollback(
+        contract: &MissionTxContract,
+        store: &mut IdempotencyStore,
+        now_ms: i64,
+    ) -> Result<DurableRollbackPreparation, TxExecutionError> {
+        let mut keys = contract
+            .plan
+            .steps
+            .iter()
+            .map(|step| commit_idempotency_key(contract, &step.step_id.0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for compensation in &contract.plan.compensations {
+            keys.push(compensation_idempotency_key(
+                contract,
+                &compensation.for_step_id.0,
+            )?);
+        }
+        let leases = store
+            .acquire_durable_key_leases(keys, checked_logical_now_ms(now_ms)?)
+            .map_err(classify_rollback_proof_lease_error)?;
+        let mut observed_commits = HashMap::new();
+        let mut first_pending = None;
+        for step in &contract.plan.steps {
+            let key = commit_idempotency_key(contract, &step.step_id.0)?;
+            let observed = leases
+                .get(&key)
+                .ok_or_else(|| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "explicit rollback proof omits commit key for {}",
+                        step.step_id.0
+                    ))
+                })?
+                .observed_outcome()
+                .cloned();
+            if matches!(observed, Some(StepOutcome::Pending)) && first_pending.is_none() {
+                first_pending = Some(step.step_id.0.clone());
+            }
+            observed_commits.insert(step.step_id.0.clone(), observed);
+        }
+
+        // This capability is specific to an orphaned Pending action. Ordinary
+        // rollback retains its strict complete-receipt and durable-proof rules.
+        let Some(first_pending) = first_pending else {
+            let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
+                .map_err(TxExecutionError::CompensationPhase)?;
+            let outcomes = Self::authoritative_commit_outcomes_with_leases(contract, &leases)?;
+            Self::restore_durable_already_compensated_candidates(&mut commit_report, &outcomes)?;
+            Self::validate_authoritative_compensation_outcomes_with_leases(
+                contract,
+                &commit_report,
+                &outcomes,
+                &leases,
+            )?;
+            return Ok(DurableRollbackPreparation {
+                commit_report,
+                original_commit_outcomes: outcomes,
+                proof_leases: leases,
+                projected_contract: None,
+                unresolved_step_ids: Vec::new(),
+            });
+        };
+
+        let mut outcomes = HashMap::new();
+        let mut unproven_step_ids = HashSet::new();
+        let mut unresolved_step_ids = Vec::new();
+        for step in &contract.plan.steps {
+            let observed = observed_commits
+                .get(&step.step_id.0)
+                .and_then(Option::as_ref);
+            match observed {
+                Some(outcome @ StepOutcome::Success { .. }) => {
+                    outcomes.insert(step.step_id.0.clone(), outcome.clone());
+                }
+                Some(StepOutcome::Pending | StepOutcome::Skipped { .. }) | None => {
+                    unproven_step_ids.insert(step.step_id.0.clone());
+                    unresolved_step_ids.push(step.step_id.0.clone());
+                }
+                Some(StepOutcome::Failed {
+                    compensated: false, ..
+                }) => {
+                    // Settled failures do not authorize an undo. They also do
+                    // not need invented receipts just to populate this report.
+                    unproven_step_ids.insert(step.step_id.0.clone());
+                }
+                Some(other) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step.step_id.0.clone(),
+                        detail: format!(
+                            "invalid durable action outcome during partial rollback: {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        for receipt in contract.receipts.iter().filter(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                && receipt.get("outcome").and_then(serde_json::Value::as_str) == Some("committed")
+        }) {
+            let step_id = receipt
+                .get("step_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    TxExecutionError::InvalidContract(
+                        "committed receipt lacks a step identifier".to_string(),
+                    )
+                })?;
+            if !outcomes.contains_key(step_id) {
+                return Err(TxExecutionError::RollbackProof {
+                    kind: RollbackProofKind::Conflict,
+                    step_id: step_id.to_string(),
+                    detail: format!(
+                        "rollback requires authoritative durable commit Success, got {:?}; partial rollback cannot promote an unknown effect",
+                        observed_commits.get(step_id).and_then(Option::as_ref)
+                    ),
+                });
+            }
+        }
+        // Inspect every declared undo, including those whose commit was not
+        // proven. A hidden Pending/Compensated undo is contradictory authority,
+        // never permission to skip its key and compensate something else.
+        for compensation in &contract.plan.compensations {
+            let step_id = &compensation.for_step_id.0;
+            let key = compensation_idempotency_key(contract, step_id)?;
+            let lease = leases.get(&key).ok_or_else(|| {
+                TxExecutionError::LedgerWrite(format!(
+                    "explicit rollback proof omits compensation key for {step_id}"
+                ))
+            })?;
+            if !outcomes.contains_key(step_id) && lease.observed_outcome().is_some() {
+                return Err(TxExecutionError::RollbackProof {
+                    kind: RollbackProofKind::Conflict,
+                    step_id: step_id.clone(),
+                    detail: "durable compensation exists without a proven successful commit"
+                        .to_string(),
+                });
+            }
+        }
+        if outcomes.is_empty() {
+            return Err(TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                step_id: first_pending,
+                detail: "Pending commit requires reconciliation and the receipt history does not identify a committed effect; no durable successful effect can be compensated".to_string(),
+            });
+        }
+
+        let successful_step_ids = outcomes.keys().cloned().collect::<HashSet<_>>();
+        let recovered = recovered_commit_success_report(contract, &successful_step_ids, now_ms)?;
+        let mut projected = contract.clone();
+        projected.receipts.extend(recovered.receipts);
+        let mut commit_report = crate::plan::mission_tx_proven_rollback_commit_report(
+            &projected,
+            now_ms,
+            &unproven_step_ids,
+        )
+        .map_err(TxExecutionError::CompensationPhase)?;
+        Self::restore_durable_already_compensated_candidates(&mut commit_report, &outcomes)?;
+        Self::validate_authoritative_compensation_outcomes_with_leases(
+            &projected,
+            &commit_report,
+            &outcomes,
+            &leases,
+        )?;
+        Ok(DurableRollbackPreparation {
+            commit_report,
+            original_commit_outcomes: outcomes,
+            proof_leases: leases,
+            projected_contract: Some(projected),
+            unresolved_step_ids,
+        })
     }
 
     fn acquire_atomic_compensation_proof(
@@ -6160,20 +6557,34 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 })?;
             compensation_keys.insert(step_result.step_id.0.clone(), idem_key.clone());
 
-            let mut dispatched = self.executor.execute_compensations(
+            let mut dispatched = self.executor.execute_compensations_with_outcome(
                 contract,
                 &dispatch_report,
                 self.config.fail_compensation_for_step.as_deref(),
                 now_ms,
             );
-            if dispatched.len() != 1 || dispatched[0].for_step_id != step_result.step_id {
+            if dispatched.len() != 1 || dispatched[0].input().for_step_id != step_result.step_id {
                 return Err(TxExecutionError::CompensationPhase(format!(
                     "step executor returned {} results while dispatching compensation for step {}",
                     dispatched.len(),
                     step_result.step_id.0
                 )));
             }
-            let input = dispatched.remove(0);
+            let input = match dispatched.remove(0) {
+                StepDispatchOutcome::Settled(input) => input,
+                StepDispatchOutcome::Indeterminate(input) => {
+                    // A failed acknowledgement is not a failed undo. Keep
+                    // the compensation key Pending so another rollback can
+                    // never repeat an undo that may already have happened.
+                    return Err(TxExecutionError::DedupConflict {
+                        step_id: step_result.step_id.0.clone(),
+                        outcome: format!(
+                            "Pending: compensation dispatch outcome is indeterminate ({})",
+                            input.reason_code
+                        ),
+                    });
+                }
+            };
             let succeeded = input.success;
             let outcome = if succeeded {
                 StepOutcome::Compensated {
@@ -6722,6 +7133,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         commit_report: &TxCommitReport,
         compensation_report: Option<&TxCompensationReport>,
     ) -> (MissionTxState, TxOutcome) {
+        if compensation_report.is_some_and(|report| {
+            report.outcome == crate::plan::TxCompensationOutcome::ReconciliationRequired
+                || !report.unresolved_step_ids.is_empty()
+        }) {
+            return (MissionTxState::Compensating, TxOutcome::Pending);
+        }
         if commit_report.is_fully_committed() {
             return (MissionTxState::Committed, TxOutcome::Committed);
         }
@@ -10621,6 +11038,7 @@ mod tests {
                 Some(&mut store),
                 Some(&duplicate_original_proof),
                 Some(&mut duplicate_proof_leases),
+                &[],
                 8_000,
             )
             .map_err(|err| err.to_string())?;
@@ -11602,6 +12020,7 @@ mod tests {
             failed_count: 0,
             no_compensation_count: 0,
             skipped_count: 0,
+            unresolved_step_ids: Vec::new(),
             step_results: Vec::new(),
             decision_path: "test".to_string(),
             reason_code: "rollback_complete".to_string(),
@@ -12350,7 +12769,10 @@ mod tests {
         TxPrepareTargetSnapshot, WaitCondition,
     };
     use crate::policy::{PolicyDecision, PolicyInput};
-    use crate::wezterm::{MockWezterm, WeztermHandle, mock_wezterm_handle};
+    use crate::wezterm::{
+        MockWezterm, MoveDirection, PaneInfo, SpawnTarget, SplitDirection, WeztermFuture,
+        WeztermHandle, WeztermInterface, mock_wezterm_handle,
+    };
     use std::sync::Arc;
 
     /// Allow-all policy authorizer for PaneStepExecutor tests.
@@ -13094,7 +13516,7 @@ mod tests {
         ];
 
         for (action, expected_reason, expected_error) in cases {
-            let result = execute_step_action(&mock, &action, None, None, None);
+            let result = execute_step_action(&mock, &action, None, None, None).into_input();
             assert!(!result.0, "{expected_reason} must fail closed");
             assert_eq!(result.1, expected_reason);
             assert!(
@@ -13473,6 +13895,1142 @@ mod tests {
     > {
         let executor = make_pane_executor(handle);
         TxExecutionEngine::new(executor, TxExecutionConfig::default())
+    }
+
+    #[test]
+    fn send_failure_certainty_requires_consistent_operation_and_target_authority() {
+        use crate::error::{
+            MuxEffectCertainty, MuxOperation, MuxRejection, MuxRejectionCode, MuxRetryAuthority,
+            WeztermError,
+        };
+
+        for refusal in [
+            WeztermError::MuxRejection(MuxRejection::backend_failure(MuxOperation::SendText)),
+            WeztermError::MuxRejection(MuxRejection::pane_not_found(MuxOperation::SendText, 7)),
+            WeztermError::PaneNotFound(7),
+            WeztermError::CliNotFound,
+            WeztermError::CircuitOpen {
+                retry_after_ms: 100,
+            },
+        ] {
+            assert!(send_failure_proves_no_effect(&refusal.into(), 7));
+        }
+
+        let mut inconsistent = MuxRejection::indeterminate(MuxOperation::SendText, None);
+        inconsistent.effect = MuxEffectCertainty::NotApplied;
+        for uncertain in [
+            WeztermError::IndeterminateMutation {
+                operation: "send-text",
+            },
+            WeztermError::MuxRejection(MuxRejection::indeterminate(MuxOperation::SendText, None)),
+            WeztermError::MuxRejection(inconsistent),
+            WeztermError::MuxRejection(MuxRejection::backend_failure(MuxOperation::KillPane)),
+            WeztermError::MuxRejection(MuxRejection::pane_not_found(MuxOperation::SendText, 8)),
+            WeztermError::PaneNotFound(8),
+            WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::UnknownFuture,
+                operation: MuxOperation::SendText,
+                object: None,
+                effect: MuxEffectCertainty::UnknownFuture,
+                retry: MuxRetryAuthority::UnknownFuture,
+            }),
+            WeztermError::Timeout(1),
+            WeztermError::ParseError("reply lost after dispatch".to_owned()),
+            WeztermError::CommandFailed("pane not found: 7".to_owned()),
+        ] {
+            assert!(!send_failure_proves_no_effect(&uncertain.into(), 7));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FileEffectFault {
+        None,
+        RefuseBeforeEffect,
+        LoseReplyAfterEffect,
+        PanicAfterEffect,
+    }
+
+    #[derive(Default)]
+    struct FileEffectPanicAudit {
+        dispatch_marked: std::sync::atomic::AtomicBool,
+        payload_dropped: std::sync::atomic::AtomicBool,
+        disposal_marked: std::sync::atomic::AtomicBool,
+    }
+
+    impl FileEffectPanicAudit {
+        fn assert_contained(&self) {
+            // Assert only on the driver thread: an assertion in the worker
+            // could itself be caught as the expected indeterminate outcome.
+            assert!(self.dispatch_marked.load(Ordering::SeqCst));
+            assert!(self.payload_dropped.load(Ordering::SeqCst));
+            assert!(self.disposal_marked.load(Ordering::SeqCst));
+        }
+    }
+
+    struct FileEffectPanicPayload(Arc<FileEffectPanicAudit>);
+
+    impl Drop for FileEffectPanicPayload {
+        fn drop(&mut self) {
+            self.0.disposal_marked.store(
+                frankenterm_sigpipe::is_recoverable_panic(),
+                Ordering::SeqCst,
+            );
+            self.0.payload_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The send path commits an observable file effect before injecting reply
+    /// loss. Other mux methods delegate to the existing mock. These tests use
+    /// the real pane executor and durable spool, not a synthetic step result.
+    struct FileEffectBackend {
+        fallback: WeztermHandle,
+        effect_path: PathBuf,
+        fault_text: &'static str,
+        fault: FileEffectFault,
+        panic_audit: Arc<FileEffectPanicAudit>,
+    }
+
+    impl FileEffectBackend {
+        fn handle(path: &Path, fault_text: &'static str, fault: FileEffectFault) -> WeztermHandle {
+            Self::handle_with_panic_audit(path, fault_text, fault, Arc::default())
+        }
+
+        fn handle_with_panic_audit(
+            path: &Path,
+            fault_text: &'static str,
+            fault: FileEffectFault,
+            panic_audit: Arc<FileEffectPanicAudit>,
+        ) -> WeztermHandle {
+            Arc::new(Self {
+                fallback: mock_wezterm_handle(),
+                effect_path: path.to_path_buf(),
+                fault_text,
+                fault,
+                panic_audit,
+            })
+        }
+
+        fn dispatch(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            let text = text.to_owned();
+            Box::pin(async move {
+                use crate::error::{MuxObjectIdentity, MuxObjectKind, MuxOperation, MuxRejection};
+                use std::io::Write;
+
+                let fault = if text == self.fault_text {
+                    self.fault
+                } else {
+                    FileEffectFault::None
+                };
+                if fault == FileEffectFault::RefuseBeforeEffect {
+                    return Err(crate::error::WeztermError::MuxRejection(
+                        MuxRejection::backend_failure(MuxOperation::SendText),
+                    )
+                    .into());
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.effect_path)
+                    .expect("open observable effect log");
+                writeln!(file, "{text}").expect("append observable effect");
+                file.sync_all().expect("persist observable effect");
+                match fault {
+                    FileEffectFault::LoseReplyAfterEffect => Err(
+                        crate::error::WeztermError::MuxRejection(MuxRejection::indeterminate(
+                            MuxOperation::SendText,
+                            Some(MuxObjectIdentity {
+                                kind: MuxObjectKind::Pane,
+                                id: pane_id,
+                            }),
+                        ))
+                        .into(),
+                    ),
+                    FileEffectFault::PanicAfterEffect => {
+                        self.panic_audit.dispatch_marked.store(
+                            frankenterm_sigpipe::is_recoverable_panic(),
+                            Ordering::SeqCst,
+                        );
+                        std::panic::panic_any(FileEffectPanicPayload(self.panic_audit.clone()));
+                    }
+                    FileEffectFault::None | FileEffectFault::RefuseBeforeEffect => Ok(()),
+                }
+            })
+        }
+    }
+
+    impl WeztermInterface for FileEffectBackend {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+            self.fallback.list_panes()
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+            self.fallback.get_pane(pane_id)
+        }
+
+        fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+            self.fallback.get_text(pane_id, escapes)
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            _no_paste: bool,
+            _no_newline: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.dispatch(pane_id, text)
+        }
+
+        fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+            self.fallback.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+            self.fallback.spawn(cwd, domain_name)
+        }
+
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            self.fallback.spawn_targeted(cwd, domain_name, target)
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            direction: SplitDirection,
+            cwd: Option<&str>,
+            percent: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            self.fallback.split_pane(pane_id, direction, cwd, percent)
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            self.fallback.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.fallback.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+            self.fallback.zoom_pane(pane_id, zoom)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.fallback.circuit_status()
+        }
+    }
+
+    fn file_effect_contract() -> MissionTxContract {
+        let send = |text: &str| StepAction::SendText {
+            pane_id: 0,
+            text: text.to_owned(),
+            paste_mode: None,
+        };
+        make_pane_contract_with_compensations(
+            vec![
+                ("s1".to_owned(), send("forward")),
+                ("s2".to_owned(), send("later")),
+            ],
+            vec![
+                ("s1".to_owned(), send("undo")),
+                ("s2".to_owned(), send("undo-later")),
+            ],
+        )
+    }
+
+    fn orphaned_file_effects(
+        directory: &Path,
+        policy: IdempotencyPolicy,
+    ) -> (MissionTxContract, IdempotencyStore) {
+        let effect_path = directory.join("effects.log");
+        let mut store = IdempotencyStore::open(directory, policy).unwrap();
+        let original = file_effect_contract();
+        let mut interrupted = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "later",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .execute_with_store(&mut interrupted, &mut store, 5_000)
+        .expect_err("second effect applies before its reply is lost");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        // Return the pre-dispatch contract to model a crash before even the
+        // confirmed first effect's receipt could reach the contract file.
+        (original, store)
+    }
+
+    #[test]
+    fn partial_rollback_compensates_only_proven_effect_once_across_restarts() {
+        use crate::plan::{TxCompensationOutcome, reconstruct_tx_resume_state};
+        use crate::tx_idempotency::TerminalDispositionKind;
+
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy {
+            max_active_ledgers: 2,
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let (original, store) = orphaned_file_effects(directory.path(), policy.clone());
+        let original_spool = durable_ledger_file_snapshot(directory.path());
+        drop(store);
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let mut contract = original.clone();
+
+        let mut contender = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let locked_keys = [
+            test_commit_key(&original, "s1"),
+            test_commit_key(&original, "s2"),
+            test_compensation_key(&original, "s1"),
+            test_compensation_key(&original, "s2"),
+        ];
+        set_rollback_post_proof_lease_test_hook(Some(Box::new(move || {
+            for key in locked_keys {
+                assert!(matches!(
+                    contender.acquire_durable_reservation(
+                        "contending-partial-rollback",
+                        &key,
+                        9_000
+                    ),
+                    Err(crate::tx_idempotency::IdempotencyError::ReservationInProgress { .. })
+                ));
+            }
+        })));
+
+        let first = engine
+            .rollback_with_store(&mut contract, &mut store, 9_000)
+            .unwrap();
+        assert_eq!(
+            first.compensation_report.outcome,
+            TxCompensationOutcome::ReconciliationRequired
+        );
+        assert_eq!(first.compensation_report.compensated_count, 1);
+        assert_eq!(first.compensation_report.unresolved_step_ids, ["s2"]);
+        assert!(first.compensation_report.has_residual_risk());
+        assert!(!first.compensation_report.is_fully_rolled_back());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert_eq!(first.ledger.phase(), TxPhase::Compensating);
+        assert!(first.ledger.terminal_certificate().is_none());
+        assert_eq!(first.ledger.record_count(), 1);
+        assert!(matches!(
+            first.ledger.records()[0].outcome,
+            StepOutcome::Compensated { .. }
+        ));
+        assert!(contract.receipts.iter().all(|receipt| {
+            receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("s1")
+        }));
+        assert!(
+            mission_tx_rollback_commit_report(&contract, 9_000).is_err(),
+            "receipt-only rollback must remain strict about the missing s2 proof"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+
+        let known_commit =
+            recovered_commit_success_report(&contract, &HashSet::from(["s1".to_owned()]), 9_000)
+                .unwrap();
+        let resume = reconstruct_tx_resume_state(
+            &contract,
+            Some(&known_commit),
+            Some(&first.compensation_report),
+            9_000,
+        );
+        assert_eq!(
+            TxExecutionEngine::<SyntheticStepExecutor>::determine_final_outcome(
+                contract.lifecycle_state,
+                &known_commit,
+                Some(&first.compensation_report),
+            ),
+            (MissionTxState::Compensating, TxOutcome::Pending)
+        );
+        assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+        assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+        assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+        assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+        assert!(resume.has_pending_work());
+        assert!(!resume.needs_compensation);
+
+        let mut previous_execution = first.execution_id;
+        // First discard the newly recovered receipts too, then repeat with
+        // them present. Both restart cases must consult durable undo proof.
+        for now_ms in [10_000, 11_000] {
+            drop(store);
+            store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+            if now_ms == 10_000 {
+                contract = original.clone();
+            }
+            let repeat = engine
+                .rollback_with_store(&mut contract, &mut store, now_ms)
+                .unwrap();
+            assert_eq!(
+                repeat.compensation_report.outcome,
+                TxCompensationOutcome::ReconciliationRequired
+            );
+            assert_eq!(repeat.compensation_report.unresolved_step_ids, ["s2"]);
+            assert!(repeat.compensation_report.step_results.is_empty());
+            assert_eq!(repeat.compensation_report.compensated_count, 0);
+            assert_eq!(
+                store.active_count(),
+                2,
+                "settled attempts must not exhaust the active budget"
+            );
+            assert_eq!(repeat.ledger.phase(), TxPhase::Compensating);
+            assert!(repeat.ledger.terminal_certificate().is_none());
+            let retired: TxExecutionLedger = serde_json::from_slice(
+                &std::fs::read(
+                    directory
+                        .path()
+                        .join("tx_ledgers")
+                        .join(format!("{previous_execution}.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(retired.phase(), TxPhase::Aborted);
+            assert_eq!(
+                retired.terminal_certificate().unwrap().disposition,
+                TerminalDispositionKind::Aborted
+            );
+            let snapshot = durable_ledger_file_snapshot(directory.path());
+            for (name, bytes) in &original_spool {
+                assert_eq!(
+                    snapshot.get(name),
+                    Some(bytes),
+                    "unknown predecessor must not be rewritten"
+                );
+            }
+            let resume = reconstruct_tx_resume_state(
+                &contract,
+                None,
+                Some(&repeat.compensation_report),
+                now_ms,
+            );
+            assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+            assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+            assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+            assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+            assert!(!resume.needs_compensation && resume.has_pending_work());
+            previous_execution = repeat.execution_id;
+        }
+        let error = engine
+            .execute_with_store(&mut original.clone(), &mut store, 12_000)
+            .expect_err("partial compensation never permits ordinary commit replay");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+            if outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&test_commit_key(&contract, "s2"), 12_000),
+            Some(StepOutcome::Pending)
+        ));
+    }
+
+    #[test]
+    fn partial_rollback_resume_remains_pending_with_complete_stale_receipts_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let contract_path = directory.path().join("contract.json");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let original = file_effect_contract();
+        let mut prior = original.clone();
+        let first = TxExecutionEngine::new(
+            make_pane_executor(FileEffectBackend::handle(
+                &effect_path,
+                "later",
+                FileEffectFault::RefuseBeforeEffect,
+            )),
+            TxExecutionConfig {
+                auto_compensate: false,
+                ..Default::default()
+            },
+        )
+        .execute_with_store(&mut prior, &mut store, 5_000)
+        .unwrap();
+        assert_eq!(first.commit_report.unwrap().failed_count, 1);
+        assert_eq!(std::fs::read_to_string(&effect_path).unwrap(), "forward\n");
+
+        // A real earlier refusal supplied a complete receipt history. Once
+        // that retryable failure expires, only s2 is retried; its lost reply
+        // must take precedence over the older failed receipt after restart.
+        let mut interrupted = original;
+        interrupted.receipts = prior.receipts;
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "later",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .execute_with_store(&mut interrupted, &mut store, 6_000)
+        .unwrap_err();
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Pending"))
+        );
+        let rollback = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut interrupted, &mut store, 7_000)
+        .unwrap();
+        assert_eq!(rollback.compensation_report.unresolved_step_ids, ["s2"]);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        std::fs::write(&contract_path, serde_json::to_vec(&interrupted).unwrap()).unwrap();
+        drop(store);
+
+        let store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let reopened: MissionTxContract =
+            serde_json::from_slice(&std::fs::read(contract_path).unwrap()).unwrap();
+        assert_eq!(reopened.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(reopened.outcome, TxOutcome::Pending);
+        assert!(matches!(
+            store.peek_cached_outcome(&test_commit_key(&reopened, "s2"), 9_000),
+            Some(StepOutcome::Pending)
+        ));
+        let stale_report = mission_tx_rollback_commit_report(&reopened, 9_000)
+            .expect("old complete receipts alone cannot reveal the new Pending effect");
+        for commit_report in [None, Some(&stale_report)] {
+            let resume =
+                crate::plan::reconstruct_tx_resume_state(&reopened, commit_report, None, 9_000);
+            assert_eq!(resume.pending_step_ids, [TxStepId("s2".to_owned())]);
+            assert_eq!(resume.committed_step_ids, [TxStepId("s1".to_owned())]);
+            assert_eq!(resume.compensated_step_ids, [TxStepId("s1".to_owned())]);
+            assert!(!resume.commit_phase_completed && !resume.compensation_phase_completed);
+            assert!(!resume.is_fully_resolved() && resume.has_pending_work());
+            assert!(!resume.needs_compensation);
+        }
+    }
+
+    #[test]
+    fn partial_rollback_never_retries_an_unacknowledged_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..Default::default()
+        };
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let mut contract = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo",
+            FileEffectFault::LoseReplyAfterEffect,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_000)
+        .expect_err("uncertain undo retains its write-ahead Pending record");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s1" && outcome.contains("Pending"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+        let snapshot = durable_ledger_file_snapshot(directory.path());
+        drop(store);
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let mut retry = original.clone();
+        let error = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut retry, &mut store, 9_000)
+        .expect_err("orphaned undo cannot be redispatched after restart or TTL");
+        assert!(
+            matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+            if step_id == "s1" && detail.contains("Pending"))
+        );
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(durable_ledger_file_snapshot(directory.path()), snapshot);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+    }
+
+    #[test]
+    fn partial_rollback_retries_proven_pre_effect_refusal_without_settling_unknown_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let (mut contract, mut store) =
+            orphaned_file_effects(directory.path(), IdempotencyPolicy::default());
+        let first = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo",
+            FileEffectFault::RefuseBeforeEffect,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_000)
+        .unwrap();
+        assert_eq!(first.compensation_report.failed_count, 1);
+        assert_eq!(first.compensation_report.unresolved_step_ids, ["s2"]);
+        assert!(
+            crate::plan::reconstruct_tx_resume_state(
+                &contract,
+                None,
+                Some(&first.compensation_report),
+                6_000,
+            )
+            .needs_compensation
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        drop(store);
+        let mut store =
+            IdempotencyStore::open(directory.path(), IdempotencyPolicy::default()).unwrap();
+        let retry = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ))
+        .rollback_with_store(&mut contract, &mut store, 6_050)
+        .unwrap();
+        assert_eq!(retry.compensation_report.compensated_count, 1);
+        assert!(retry.compensation_report.has_residual_risk());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Compensating);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo\n"
+        );
+    }
+
+    #[test]
+    fn partial_rollback_rejects_hidden_undo_for_unproven_commit_before_mutation() {
+        for pending in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let effect_path = directory.path().join("effects.log");
+            let (mut contract, mut store) =
+                orphaned_file_effects(directory.path(), IdempotencyPolicy::default());
+            let execution = "txe-contradictory-undo";
+            store
+                .create_ledger(execution, &compiled_plan_from_contract(&contract))
+                .unwrap();
+            store
+                .transition_phase(execution, TxPhase::Preparing)
+                .unwrap();
+            let key = test_compensation_key(&contract, "s2");
+            if pending {
+                let mut reservation = store
+                    .acquire_durable_reservation(execution, &key, 5_500)
+                    .unwrap();
+                store
+                    .record_execution_reserved(
+                        &mut reservation,
+                        execution,
+                        key,
+                        StepOutcome::Pending,
+                        StepRisk::High,
+                        "test-agent",
+                        5_500,
+                    )
+                    .unwrap();
+            } else {
+                record_durable_test_outcome(
+                    &mut store,
+                    execution,
+                    key,
+                    StepOutcome::Compensated {
+                        original_outcome: Box::new(StepOutcome::Success { result: None }),
+                        compensation_result: "unsupported original effect claim".to_owned(),
+                    },
+                    StepRisk::High,
+                    "test-agent",
+                    5_500,
+                )
+                .unwrap();
+            }
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(directory.path());
+            let error = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "",
+                FileEffectFault::None,
+            ))
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("even an omitted undo key must pass authority preflight");
+            assert!(
+                matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+                if step_id == "s2" && detail.contains("without a proven successful commit"))
+            );
+            assert_eq!(serde_json::to_value(&contract).unwrap(), original_contract);
+            assert_eq!(
+                durable_ledger_file_snapshot(directory.path()),
+                original_spool
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_rollback_rejected_preflight_preserves_contract_and_pending_spool() {
+        for rejection in ["gate", "capacity", "forged_receipt"] {
+            let directory = tempfile::tempdir().unwrap();
+            let effect_path = directory.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                max_active_ledgers: if rejection == "capacity" { 1 } else { 2 },
+                ..Default::default()
+            };
+            let (mut contract, mut store) = orphaned_file_effects(directory.path(), policy);
+            if rejection == "forged_receipt" {
+                let claimed = recovered_commit_success_report(
+                    &contract,
+                    &HashSet::from(["s2".to_owned()]),
+                    5_500,
+                )
+                .unwrap();
+                contract.receipts.extend(claimed.receipts);
+            }
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(directory.path());
+            let error = if rejection == "gate" {
+                let (executor, calls, dispatched) = CompensationGateAuditExecutor::new(true);
+                let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+                    .rollback_with_store(&mut contract, &mut store, 6_000)
+                    .unwrap_err();
+                assert_eq!(*calls.borrow(), 1);
+                assert!(dispatched.borrow().is_empty());
+                assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+                error
+            } else {
+                make_pane_engine(FileEffectBackend::handle(
+                    &effect_path,
+                    "",
+                    FileEffectFault::None,
+                ))
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .unwrap_err()
+            };
+            if rejection == "capacity" {
+                assert!(matches!(error, TxExecutionError::LedgerWrite(ref detail)
+                    if detail.contains("active ledger limit exceeded")));
+            } else if rejection == "forged_receipt" {
+                assert!(
+                    matches!(error, TxExecutionError::RollbackProof { ref step_id, ref detail, .. }
+                    if step_id == "s2" && detail.contains("Pending"))
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&contract).unwrap(),
+                original_contract,
+                "{rejection}: staged Success receipts must not escape a refused attempt"
+            );
+            assert_eq!(
+                durable_ledger_file_snapshot(directory.path()),
+                original_spool
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_commit_keeps_unacknowledged_effect_pending_across_reopen() {
+        for fault in [
+            FileEffectFault::LoseReplyAfterEffect,
+            FileEffectFault::PanicAfterEffect,
+        ] {
+            let dir = tempfile::tempdir().expect("effect and ledger directory");
+            let effect_path = dir.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                dedup_ttl_ms: 100,
+                ..Default::default()
+            };
+            let mut store = IdempotencyStore::open(dir.path(), policy.clone()).unwrap();
+            let panic_audit = Arc::new(FileEffectPanicAudit::default());
+            let engine = make_pane_engine(FileEffectBackend::handle_with_panic_audit(
+                &effect_path,
+                "later",
+                fault,
+                panic_audit.clone(),
+            ));
+            let mut original_contract = file_effect_contract();
+            original_contract.plan.steps.push(TxStep {
+                step_id: TxStepId("s3".to_owned()),
+                ordinal: 2,
+                action: StepAction::SendText {
+                    pane_id: 0,
+                    text: "last".to_owned(),
+                    paste_mode: None,
+                },
+                description: "must not dispatch after uncertainty".to_owned(),
+            });
+            let mut contract = original_contract.clone();
+            let key = test_commit_key(&contract, "s2");
+
+            let error = engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .expect_err("an applied effect with no reply must stay unresolved");
+            if fault == FileEffectFault::PanicAfterEffect {
+                panic_audit.assert_contained();
+            }
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+                if step_id == "s2" && outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&test_commit_key(&contract, "s1"), 5_000),
+                Some(StepOutcome::Success { .. })
+            ));
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 5_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert!(
+                store
+                    .peek_cached_outcome(&test_commit_key(&contract, "s3"), 5_000)
+                    .is_none()
+            );
+            assert!(
+                store
+                    .peek_cached_outcome(&test_compensation_key(&contract, "s1"), 5_000)
+                    .is_none()
+            );
+            assert_eq!(contract.lifecycle_state, MissionTxState::Committing);
+            assert!(contract.receipts.iter().all(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) != Some("commit")
+            }));
+            assert_eq!(store.active_count(), 1);
+            let ledger_bytes = durable_ledger_file_snapshot(dir.path());
+            drop(store);
+
+            // A healthy replacement would apply the command if allowed. The
+            // pre-execution contract plus reopened spool models restart before
+            // any receipt could be persisted, well beyond the dedup TTL.
+            let mut store = IdempotencyStore::open(dir.path(), policy).unwrap();
+            let retry_engine = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "later",
+                FileEffectFault::None,
+            ));
+            let mut retry_contract = original_contract;
+            let error = retry_engine
+                .execute_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart cannot retry an uncertain commit");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(durable_ledger_file_snapshot(dir.path()), ledger_bytes);
+        }
+    }
+
+    #[test]
+    fn durable_rollback_keeps_unacknowledged_undo_pending_across_reopen() {
+        for fault in [
+            FileEffectFault::LoseReplyAfterEffect,
+            FileEffectFault::PanicAfterEffect,
+        ] {
+            let dir = tempfile::tempdir().expect("effect and ledger directory");
+            let effect_path = dir.path().join("effects.log");
+            let policy = IdempotencyPolicy {
+                dedup_ttl_ms: 100,
+                ..Default::default()
+            };
+            let mut store = IdempotencyStore::open(dir.path(), policy.clone()).unwrap();
+            let panic_audit = Arc::new(FileEffectPanicAudit::default());
+            let engine = make_pane_engine(FileEffectBackend::handle_with_panic_audit(
+                &effect_path,
+                "undo-later",
+                fault,
+                panic_audit.clone(),
+            ));
+            let mut contract = file_effect_contract();
+            engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .unwrap();
+            let committed_contract = contract.clone();
+            let key = test_compensation_key(&contract, "s2");
+            let receipt_count = contract.receipts.len();
+
+            let error = engine
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .expect_err("an unacknowledged undo must remain unresolved");
+            if fault == FileEffectFault::PanicAfterEffect {
+                panic_audit.assert_contained();
+            }
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+                if step_id == "s2" && outcome.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\nundo-later\n"
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 6_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert!(
+                store
+                    .peek_cached_outcome(&test_compensation_key(&contract, "s1"), 6_000)
+                    .is_none()
+            );
+            assert_eq!(contract.receipts.len(), receipt_count);
+            assert_ne!(contract.lifecycle_state, MissionTxState::RolledBack);
+            let ledger_bytes = durable_ledger_file_snapshot(dir.path());
+            drop(store);
+
+            let mut store = IdempotencyStore::open(dir.path(), policy).unwrap();
+            let retry_engine = make_pane_engine(FileEffectBackend::handle(
+                &effect_path,
+                "undo-later",
+                FileEffectFault::None,
+            ));
+            let mut retry_contract = committed_contract.clone();
+            let error = retry_engine
+                .rollback_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart cannot repeat an uncertain undo");
+            assert!(
+                matches!(error, TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict, ref step_id, ref detail,
+            } if step_id == "s2" && detail.contains("Pending")),
+                "{fault:?}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&effect_path).unwrap(),
+                "forward\nlater\nundo-later\n"
+            );
+            assert_eq!(
+                serde_json::to_value(&retry_contract).unwrap(),
+                serde_json::to_value(&committed_contract).unwrap()
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&key, 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(durable_ledger_file_snapshot(dir.path()), ledger_bytes);
+        }
+    }
+
+    #[test]
+    fn durable_pre_effect_compensation_refusal_remains_retryable_after_reopen() {
+        let dir = tempfile::tempdir().expect("effect and ledger directory");
+        let effect_path = dir.path().join("effects.log");
+        let mut store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo-later",
+            FileEffectFault::RefuseBeforeEffect,
+        ));
+        let mut contract = file_effect_contract();
+        engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        let first = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .unwrap();
+        assert_eq!(first.compensation_report.failed_count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&contract, "s2"), 6_000),
+            Some(StepOutcome::Failed {
+                compensated: false,
+                ..
+            })
+        ));
+        drop(store);
+
+        let mut store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+        let retry_engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo-later",
+            FileEffectFault::None,
+        ));
+        let retry = retry_engine
+            .rollback_with_store(&mut contract, &mut store, 6_050)
+            .unwrap();
+        assert!(retry.compensation_report.is_fully_rolled_back());
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo-later\nundo\n"
+        );
+    }
+
+    #[test]
+    fn durable_storage_error_after_mutation_remains_pending_across_reopen() {
+        struct AppliedStorageError {
+            inner: FileTxStorageAdapter,
+            effects: PathBuf,
+        }
+
+        impl AppliedStorageError {
+            fn record_effect(&self) {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.effects)
+                    .unwrap();
+                writeln!(file, "mutation").unwrap();
+                file.sync_all().unwrap();
+            }
+        }
+
+        impl TxStorageAdapter for AppliedStorageError {
+            fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+                self.inner.store_data(key, value)?;
+                self.record_effect();
+                Err("storage reply lost after mutation".to_owned())
+            }
+
+            fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+                self.inner.get_data(key)
+            }
+
+            fn delete_data(&self, key: &str) -> Result<bool, String> {
+                self.inner.delete_data(key)?;
+                self.record_effect();
+                Err("storage reply lost after mutation".to_owned())
+            }
+        }
+
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let inner = FileTxStorageAdapter::new(dir.path().join("data")).unwrap();
+            inner
+                .store_data("record", &serde_json::json!("before"))
+                .unwrap();
+            let effects = dir.path().join("effects.log");
+            let storage = Arc::new(AppliedStorageError {
+                inner,
+                effects: effects.clone(),
+            });
+            let action = if delete {
+                StepAction::Custom {
+                    action_type: "delete_data".to_owned(),
+                    payload: serde_json::json!({"key": "record"}),
+                }
+            } else {
+                StepAction::StoreData {
+                    key: "record".to_owned(),
+                    value: serde_json::json!("after"),
+                }
+            };
+            let original = make_pane_contract(vec![("s1".to_owned(), action)]);
+            let mut contract = original.clone();
+            let mut store =
+                IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+            let engine = TxExecutionEngine::new(
+                make_pane_executor(mock_wezterm_handle()).with_storage_adapter(storage.clone()),
+                TxExecutionConfig::default(),
+            );
+            let error = engine
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .expect_err("opaque adapter failure cannot certify no mutation");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending"))
+            );
+            assert_eq!(
+                storage.get_data("record").unwrap(),
+                if delete {
+                    None
+                } else {
+                    Some(serde_json::json!("after"))
+                }
+            );
+            assert_eq!(std::fs::read_to_string(&effects).unwrap(), "mutation\n");
+            drop(store);
+
+            let mut store =
+                IdempotencyStore::open(dir.path(), IdempotencyPolicy::default()).unwrap();
+            let mut retry_contract = original;
+            let error = engine
+                .execute_with_store(&mut retry_contract, &mut store, 9_000)
+                .expect_err("restart must not repeat uncertain storage mutation");
+            assert!(
+                matches!(error, TxExecutionError::DedupConflict { ref outcome, .. }
+                if outcome.contains("Pending"))
+            );
+            assert!(matches!(
+                store.peek_cached_outcome(&test_commit_key(&contract, "s1"), 9_000),
+                Some(StepOutcome::Pending)
+            ));
+            assert_eq!(std::fs::read_to_string(&effects).unwrap(), "mutation\n");
+        }
     }
 
     /// Create a contract with compensations for rollback testing.
@@ -13932,6 +15490,7 @@ mod tests {
             None,
             None,
         );
+        let result = result.into_input();
         assert!(!result.0, "external wait must fail without a registry");
         assert_eq!(result.1, "wait_for_external_unsupported");
         let err = result.2.expect("error code present");
@@ -13961,6 +15520,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(result.0, "pre-fired signal must satisfy: {:?}", result);
         assert_eq!(result.1, "wait_for_external_satisfied");
         assert!(
@@ -13993,6 +15553,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(result.0, "late signal must satisfy: {:?}", result);
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -14023,6 +15584,7 @@ mod tests {
             None,
         );
         let elapsed = start.elapsed();
+        let result = result.into_input();
         assert!(!result.0, "no signal must time out");
         assert_eq!(result.1, "wait_for_timeout");
         let err = result.2.expect("error code present");
@@ -14062,6 +15624,7 @@ mod tests {
             Some(registry.as_ref()),
             None,
         );
+        let result = result.into_input();
         assert!(result.0, "external wait must succeed without a target pane");
         assert_ne!(
             result.1, "wait_for_no_pane",
@@ -14240,9 +15803,12 @@ mod tests {
                 },
             )]);
 
-            let results = executor.execute_steps(&contract, None, 1000);
-            assert!(!results[0].success, "Invalid key '{key}' must fail closed");
-            assert_eq!(results[0].reason_code, "store_data_failed");
+            let results = executor.execute_steps_with_outcome(&contract, None, 1000);
+            let StepDispatchOutcome::Indeterminate(input) = &results[0] else {
+                panic!("an opaque adapter error provides no effect certainty");
+            };
+            assert!(!input.success, "Invalid key '{key}' must fail closed");
+            assert_eq!(input.reason_code, "store_data_indeterminate");
         }
     }
 

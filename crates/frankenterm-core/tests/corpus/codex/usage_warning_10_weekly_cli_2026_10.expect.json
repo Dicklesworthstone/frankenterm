@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "codex.usage.warning_10",
+    "agent_type": "codex",
+    "event_type": "usage.warning",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "remaining": "10",
+      "limit_window": "weekly"
+    },
+    "matched_text": "10% of your weekly limit left"
+  }
+]

@@ -5694,7 +5694,7 @@ pub struct FallbackNextStepPlan {
     /// Explicit steps the operator must take to recover.
     ///
     /// Each entry is a human-readable instruction, e.g.:
-    /// - "Run `ft auth bootstrap --account openai-team` in a terminal"
+    /// - "Run `ft auth bootstrap openai --account openai-team` in a terminal"
     /// - "Wait for usage-limit reset (estimated 2024-03-15T12:00:00Z)"
     pub operator_steps: Vec<String>,
 
@@ -5714,7 +5714,7 @@ pub struct FallbackNextStepPlan {
 
     /// Suggested CLI commands the operator can run to resume or inspect.
     ///
-    /// e.g., `["ft auth bootstrap --account openai-team", "ft events --pane 42"]`
+    /// e.g., `["ft auth bootstrap openai --account openai-team", "ft events --pane-id 42"]`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggested_commands: Vec<String>,
 
@@ -5741,7 +5741,7 @@ pub fn build_needs_human_auth_plan(
     now_ms: i64,
 ) -> FallbackNextStepPlan {
     let mut operator_steps = vec![format!(
-        "Run `ft auth bootstrap --account {account}` to complete interactive login"
+        "Run `ft auth bootstrap openai --account {account}` to complete interactive login"
     )];
 
     if let Some(session_id) = resume_session_id {
@@ -5754,8 +5754,8 @@ pub fn build_needs_human_auth_plan(
         );
     }
 
-    let mut suggested_commands = vec![format!("ft auth bootstrap --account {account}")];
-    suggested_commands.push(format!("ft events --pane {pane_id}"));
+    let mut suggested_commands = vec![format!("ft auth bootstrap openai --account {account}")];
+    suggested_commands.push(format!("ft events --pane-id {pane_id}"));
 
     FallbackNextStepPlan {
         version: FallbackNextStepPlan::CURRENT_VERSION,
@@ -5794,7 +5794,7 @@ pub fn build_failover_disabled_plan(
             .push("Wait for the usage-limit reset time, then the session can retry.".to_string());
     }
 
-    let mut suggested_commands = vec![format!("ft events --pane {pane_id}")];
+    let mut suggested_commands = vec![format!("ft events --pane-id {pane_id}")];
     suggested_commands.push("ft config show".to_string());
 
     FallbackNextStepPlan {
@@ -5826,7 +5826,7 @@ pub fn build_tool_missing_plan(pane_id: u64, tool: &str, now_ms: i64) -> Fallbac
         retry_after_ms: None,
         resume_session_id: None,
         account_id: None,
-        suggested_commands: vec![format!("ft events --pane {pane_id}")],
+        suggested_commands: vec![format!("ft events --pane-id {pane_id}")],
         created_at_ms: now_ms,
     }
 }
@@ -5850,14 +5850,13 @@ pub fn build_all_accounts_exhausted_plan(
         );
     } else {
         operator_steps.push(
-            "Check account limits with `ft accounts status` and add or rotate accounts."
-                .to_string(),
+            "Check account limits with `ft accounts` and add or rotate accounts.".to_string(),
         );
     }
 
     let mut suggested_commands = vec![
-        "ft accounts status".to_string(),
-        format!("ft events --pane {pane_id}"),
+        "ft accounts".to_string(),
+        format!("ft events --pane-id {pane_id}"),
     ];
 
     if let Some(session_id) = resume_session_id {

@@ -406,6 +406,22 @@ pub trait Handler {
         self.action(Action::Control(code));
     }
 
+    /// A line-feed flood (ft-wd6cy): `bytes` starts with a ground-state line
+    /// feed. A handler may take it together with the complete lines after it,
+    /// each printable ASCII (`0x20..=0x7e`), horizontal tabs and carriage
+    /// returns (possibly none) ending in a line feed, exactly as
+    /// [`Handler::control`] for each control and [`Handler::print_ascii_run`] (or
+    /// [`Handler::print`] for one byte) for each run between them would apply
+    /// them. Returns how many bytes it took:
+    /// 0, the default, declines, and the parser goes on byte by byte;
+    /// otherwise a prefix of `bytes` ending in a line feed. A trailing line
+    /// without its line feed is never taken. `scan` is the parser's own
+    /// printable-ASCII scan, for finding where each line ends.
+    #[inline]
+    fn line_feed_flood(&mut self, _bytes: &[u8], _scan: AsciiScan) -> usize {
+        0
+    }
+
     /// [`Action::CSI`].
     #[inline]
     fn csi(&mut self, csi: CSI) {
@@ -848,8 +864,8 @@ impl Parser {
     /// On:
     /// - the run's extent (up to the first control, DEL or C1 control) is
     ///   found with the [`AsciiScan`] in use;
-    /// - its UTF-8 is validated once, by the same `core::str::from_utf8`
-    ///   that hands the handler its `&str`;
+    /// - its UTF-8 is validated once, by the same check that hands the
+    ///   handler its `&str` (`valid_utf8_prefix`, once per parse call);
     /// - a lone character with no printable byte after it is decoded and
     ///   checked in place.
     ///
@@ -964,11 +980,12 @@ impl Parser {
     /// across chunk boundaries (an incomplete trailing multibyte sequence is
     /// deferred to the scalar path, which correctly parks in `Utf8Sequence`).
     ///
-    /// With the CSI fast path on (ft-yccm0.3.2.4), two more ground-state
+    /// With the CSI fast path on (ft-yccm0.3.2.4), three more ground-state
     /// shapes skip the state machine, by the same invariant. A run of one
     /// codepoint prints as the `Action::Print` the machine would emit. A
     /// complete CSI sequence that [`Parser::ground_csi`] takes dispatches as
-    /// the machine would dispatch it, ending in Ground.
+    /// the machine would dispatch it, ending in Ground. A C0 control other
+    /// than ESC executes as the machine executes it, staying in Ground.
     fn parse_ground_batched<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
         let csi_fast_path = self.csi_fast_path;
         let ascii_scan = self.ascii_scan;
@@ -1006,6 +1023,23 @@ impl Parser {
                         i += consumed;
                         continue;
                     }
+                } else if csi_fast_path && byte < 0x20 {
+                    // A C0 control other than ESC (taken above), such as
+                    // the line feed ending every line, which a handler may
+                    // take with the plain lines after it.
+                    if byte == b'\n' {
+                        let taken = handler.line_feed_flood(&bytes[i..], ascii_scan);
+                        debug_assert!(
+                            taken == 0 || (taken <= n - i && bytes[i + taken - 1] == b'\n')
+                        );
+                        if taken > 0 {
+                            i += taken;
+                            continue;
+                        }
+                    }
+                    handler.control(crate::C0_CONTROL_CODES[usize::from(byte)]);
+                    i += 1;
+                    continue;
                 }
             }
 
@@ -1026,7 +1060,8 @@ impl Parser {
                 if self.state_machine.is_ground() {
                     let byte = bytes[i];
                     let boundary = if csi_fast_path {
-                        byte == 0x1b || can_start_printable_run(byte)
+                        // ESC and the other C0 controls included.
+                        byte < 0x20 || can_start_printable_run(byte)
                     } else {
                         can_start_printable_run(byte)
                             && matches!(
@@ -1379,13 +1414,36 @@ enum GroundRun<'a> {
 /// still holds for every later byte up to it. Without the cache, each run
 /// cut short by malformed UTF-8 would scan the rest of the input again,
 /// which is quadratic on long input with no controls in it.
+///
+/// It also holds the longest valid UTF-8 stretch of the input from the
+/// first run on, validated once on first use: a run inside it is a `&str`
+/// slice of it, with no `core::str::from_utf8` call per run. On a raw `seq`
+/// flood (an ASCII run of a few digits per line) that call was 8% of the
+/// parse (ft-yccm0.3.2.6). It starts at the first run, not the input's
+/// start: a read that splits a character leaves the next read beginning
+/// with its continuation bytes, which no valid prefix of the input covers,
+/// and every run of that read was then validated on its own.
 #[derive(Default)]
-struct RunExtents {
+struct RunExtents<'a> {
     control: Option<usize>,
     c1: Option<usize>,
+    /// Where the validated stretch starts, and the stretch.
+    valid: Option<(usize, &'a str)>,
 }
 
-impl RunExtents {
+impl<'a> RunExtents<'a> {
+    /// `bytes[start..end]` as a `&str`, when it lies in the validated
+    /// stretch on character boundaries; `None` otherwise. `bytes` is the
+    /// whole input of this parse call, as for the other positions, and runs
+    /// come in order, so `start` is never before the first run's.
+    #[inline]
+    fn text(&mut self, bytes: &'a [u8], start: usize, end: usize) -> Option<&'a str> {
+        let (base, valid) = *self
+            .valid
+            .get_or_insert_with(|| (start, valid_utf8_prefix(&bytes[start..])));
+        valid.get(start.checked_sub(base)?..end.checked_sub(base)?)
+    }
+
     /// The first control or DEL at or after `from`, or the input's length.
     #[inline]
     fn control_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
@@ -1428,7 +1486,7 @@ fn ground_run<'a>(
     start: usize,
     scan: AsciiScan,
     simd_utf8: bool,
-    extents: &mut RunExtents,
+    extents: &mut RunExtents<'a>,
 ) -> GroundRun<'a> {
     if simd_utf8 {
         ground_run_bulk(bytes, start, scan, extents)
@@ -1464,27 +1522,23 @@ fn ground_run_scalar(bytes: &[u8], start: usize, scan: AsciiScan) -> GroundRun<'
 /// 3. Otherwise the run can reach as far as the first control, DEL or
 ///    `0xc2 0x00..=0x9f` pair (a C1 control in UTF-8, which the state
 ///    machine executes), found with the `std::simd` scans in
-///    [`RunExtents`]. That stretch is validated once by
-///    `core::str::from_utf8`, which also yields the `&str` handed over. The
-///    run ends where the valid UTF-8 ends, at an invalid or incomplete
-///    sequence, which the state machine then decodes, replacement
-///    characters and all.
+///    [`RunExtents`]. That stretch lies in the input's valid UTF-8 prefix,
+///    which [`valid_utf8_prefix`] validates once per parse call and which
+///    yields the `&str` handed over. The run ends where the valid UTF-8
+///    ends, at an invalid or incomplete sequence, which the state machine
+///    then decodes, replacement characters and all.
 ///
-/// Only a run cut short by such a sequence is validated a second time, to
-/// obtain its shorter `&str`.
-///
-/// A separate `std::simd` UTF-8 validator would not save that pass: safe
-/// Rust only makes a `&str` from bytes by `core::str::from_utf8`, so it
-/// would be a second validation, not a replacement.
+/// Only a run outside that prefix is validated on its own, by
+/// `core::str::from_utf8`.
 fn ground_run_bulk<'a>(
     bytes: &'a [u8],
     start: usize,
     scan: AsciiScan,
-    extents: &mut RunExtents,
+    extents: &mut RunExtents<'a>,
 ) -> GroundRun<'a> {
     let ascii_end = start + ascii_stretch(bytes, start, scan);
     if bytes.get(ascii_end).is_none_or(|&next| next < 0x80) {
-        return ascii_run(&bytes[start..ascii_end]);
+        return ascii_run(bytes, start, ascii_end, extents);
     }
     if ascii_end == start {
         let Some((c, len)) = decode_utf8_char(&bytes[start..]) else {
@@ -1502,9 +1556,12 @@ fn ground_run_bulk<'a>(
         .control_from(bytes, ascii_end, scan)
         .min(extents.c1_from(bytes, ascii_end, scan));
     let candidate = &bytes[start..limit];
-    let text = match core::str::from_utf8(candidate) {
-        Ok(text) => Some(text),
-        Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+    let text = match extents.text(bytes, start, limit) {
+        Some(text) => Some(text),
+        None => match core::str::from_utf8(candidate) {
+            Ok(text) => Some(text),
+            Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+        },
     };
     let Some(text) = text else {
         return GroundRun::None;
@@ -1520,16 +1577,62 @@ fn ground_run_bulk<'a>(
     }
 }
 
-/// A run of printable ASCII.
+/// The longest valid UTF-8 prefix of `bytes`, as `core::str::from_utf8`
+/// and `Utf8Error::valid_up_to` give it, but checked with SIMD by
+/// `simdutf8` (NEON on aarch64; on x86 AVX2 or SSE4.2, detected at run time
+/// with `std`). On mixed-script text, where few blocks are all ASCII,
+/// `core::str::from_utf8` was 8% of the ingest (ft-yccm0.3.2.6).
+///
+/// A read often ends inside a character the next read completes; that
+/// incomplete tail is left out first, so such input takes one pass.
+fn valid_utf8_prefix(bytes: &[u8]) -> &str {
+    let complete = bytes.len() - incomplete_utf8_tail_len(bytes);
+    if let Ok(text) = simdutf8::basic::from_utf8(&bytes[..complete]) {
+        return text;
+    }
+    let valid =
+        simdutf8::compat::from_utf8(bytes).map_or_else(|error| error.valid_up_to(), str::len);
+    simdutf8::basic::from_utf8(&bytes[..valid]).unwrap_or_default()
+}
+
+/// The length of the lead byte and continuation bytes at the end of
+/// `bytes` that start a character without completing it: 0 when the last
+/// character is complete, or when the tail is not such a start at all.
+/// Such a tail is never part of a valid prefix, so leaving it out keeps
+/// the longest valid prefix whenever the rest is valid.
+fn incomplete_utf8_tail_len(bytes: &[u8]) -> usize {
+    let tail = &bytes[bytes.len().saturating_sub(3)..];
+    let Some(lead) = tail.iter().rposition(|&byte| !matches!(byte, 0x80..=0xbf)) else {
+        return 0;
+    };
+    let needed = match tail[lead] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return 0,
+    };
+    let present = tail.len() - lead;
+    if present < needed { present } else { 0 }
+}
+
+/// The run of printable ASCII `bytes[start..end]`.
 #[inline]
-fn ascii_run(run: &[u8]) -> GroundRun<'_> {
-    match run {
+fn ascii_run<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    end: usize,
+    extents: &mut RunExtents<'a>,
+) -> GroundRun<'a> {
+    match &bytes[start..end] {
         [] => GroundRun::None,
         [byte] => GroundRun::One(char::from(*byte), 1),
-        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
-            text,
-            ascii: true,
-        }),
+        run => extents
+            .text(bytes, start, end)
+            .or_else(|| core::str::from_utf8(run).ok())
+            .map_or(GroundRun::None, |text| GroundRun::Text {
+                text,
+                ascii: true,
+            }),
     }
 }
 
@@ -1686,30 +1789,32 @@ fn scan_csi(bytes: &[u8], esc: usize, params: &mut [CsiParam]) -> Option<(usize,
 /// other bytes, which take the scan and decode as before.
 #[inline]
 fn palette_sgr(body: &[u8]) -> Option<(Sgr, usize)> {
-    let foreground = match body.get(..5)? {
-        b"38;5;" => true,
-        b"48;5;" => false,
+    // Fixed-length patterns, each one length check and byte compares: the
+    // prefix as a slice compare and the digits as an iterator chain were a
+    // tenth of a 256-color flood.
+    let &[kind, b'8', b';', b'5', b';', first, ref rest @ ..] = body else {
+        return None;
+    };
+    let foreground = match kind {
+        b'3' => true,
+        b'4' => false,
         _ => return None,
     };
-    let digits = body.get(5..)?;
-    let count = digits
-        .iter()
-        .take(4)
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if !(1..=3).contains(&count) || digits.get(count) != Some(&b'm') {
-        return None;
-    }
-    let value = digits[..count]
-        .iter()
-        .fold(0_u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+    let digit = |byte: u8| Some(u16::from(byte.wrapping_sub(b'0'))).filter(|&value| value <= 9);
+    let first = digit(first)?;
+    let (value, len) = match *rest {
+        [b'm', ..] => (first, 7),
+        [second, b'm', ..] => (first * 10 + digit(second)?, 8),
+        [second, third, b'm', ..] => (first * 100 + digit(second)? * 10 + digit(third)?, 9),
+        _ => return None,
+    };
     let color = crate::color::ColorSpec::PaletteIndex(u8::try_from(value).ok()?);
     let sgr = if foreground {
         Sgr::Foreground(color)
     } else {
         Sgr::Background(color)
     };
-    Some((sgr, 5 + count + 1))
+    Some((sgr, len))
 }
 
 /// Hands `handler` the items of a dispatched CSI sequence: the D2 table
@@ -1748,6 +1853,9 @@ impl<'a, H: Handler + ?Sized> VTActor for Performer<'a, H> {
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
+        if let Some(&code) = crate::C0_CONTROL_CODES.get(usize::from(byte)) {
+            return self.handler.control(code);
+        }
         match FromPrimitive::from_u8(byte) {
             Some(code) => self.handler.control(code),
             None => error!(
@@ -1984,8 +2092,9 @@ mod test {
     use super::*;
     use crate::color::ColorSpec;
     use crate::csi::{
-        CharacterPath, DecPrivateMode, DecPrivateModeCode, Device, Intensity, Mode, Sgr, Underline,
-        Window, XtSmGraphics, XtSmGraphicsItem, XtermKeyModifierResource,
+        CharacterPath, Cursor, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
+        EraseInLine, Intensity, Mode, Sgr, Underline, Window, XtSmGraphics, XtSmGraphicsItem,
+        XtermKeyModifierResource,
     };
     use crate::{EscCode, OneBased};
     use k9::assert_equal as assert_eq;
@@ -3116,6 +3225,9 @@ mod test {
             "\x1b[38;5;12;1m",
             "\x1b[48;5;12H",
             "\x1b[38;5;1x",
+            "\x1b[38;5;1;m",
+            "\x1b[48;5;12;m",
+            "\x1b[38;5;1x3m",
             "\x1b[038;5;9m",
             "\x1b[58;5;9m",
             "\x1b[38;2;1;2;3m",
@@ -3134,6 +3246,47 @@ mod test {
             actions
         };
         for cut in (0..=stream.len()).step_by(7) {
+            assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
+        }
+    }
+
+    /// ft-yccm0.3.2.6: the ground-state C0 shortcut leaves the action stream
+    /// the state machine gives, for every C0 byte between characters, after
+    /// a CSI, inside OSC, ESC and CSI sequences (which CAN and SUB abort),
+    /// after a cut-off UTF-8 lead, and twice in a row, at every cut of the
+    /// stream in two. The table it reads names each byte's own code.
+    #[test]
+    fn ground_c0_shortcut_leaves_the_action_stream_unchanged() {
+        for (byte, code) in crate::C0_CONTROL_CODES.iter().enumerate() {
+            assert_eq!(*code as usize, byte);
+            assert_eq!(ControlCode::from_u8(byte as u8), Some(*code));
+        }
+        // 0 in a shape stands for the C0 byte under test.
+        let shapes: [&[u8]; 7] = [
+            b"a\x00b",
+            b"\x1b[1m\x00",
+            b"\x1b]0;t\x00\x07",
+            b"\x1b\x00[m",
+            b"\x1b[3\x00m",
+            b"\xc3\x00",
+            b"\x00\x00",
+        ];
+        let mut stream = Vec::new();
+        for byte in 0..0x20u8 {
+            for shape in shapes {
+                stream.extend(shape.iter().map(|&b| if b == 0 { byte } else { b }));
+                stream.push(b'Z');
+            }
+        }
+        let parse = |shortcut: bool, cut: usize| {
+            let mut parser = Parser::new();
+            parser.set_print_batching(true);
+            parser.set_csi_fast_path(shortcut);
+            let mut actions = parser.parse_as_vec(&stream[..cut]);
+            actions.extend(parser.parse_as_vec(&stream[cut..]));
+            actions
+        };
+        for cut in (0..=stream.len()).step_by(5) {
             assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
         }
     }
@@ -3800,6 +3953,84 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1bP1;2zABC\x1b\\");
+    }
+
+    #[test]
+    fn scroll_left_and_right() {
+        assert_eq!(
+            round_trip_parse("\x1b[ @"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollLeft(1)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[3 @"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollLeft(3)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[ A"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollRight(1)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[12 A"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollRight(12)))]
+        );
+        // 0 counts as 1 (xterm's one_if_default), as vttest sends it.
+        parse_as("\x1b[0 @", "\x1b[ @");
+        parse_as("\x1b[0 A", "\x1b[ A");
+        // ICH and CUU keep their own finals.
+        assert_eq!(
+            round_trip_parse("\x1b[2@\x1b[2A"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::InsertCharacter(2))),
+                Action::CSI(CSI::Cursor(Cursor::Up(2))),
+            ]
+        );
+    }
+
+    #[test]
+    fn selective_erase_and_character_protection() {
+        assert_eq!(
+            round_trip_parse("\x1b[?J\x1b[?1J\x1b[?2J"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseToEndOfDisplay
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseToStartOfDisplay
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseDisplay
+                ))),
+            ]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[?K\x1b[?1K\x1b[?2K"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseToEndOfLine
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseToStartOfLine
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseLine
+                ))),
+            ]
+        );
+        parse_as("\x1b[?0K", "\x1b[?K");
+        assert_eq!(
+            round_trip_parse("\x1b[1\"q\x1b[0\"q"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectCharacterProtection(true))),
+                Action::CSI(CSI::Edit(Edit::SelectCharacterProtection(false))),
+            ]
+        );
+        // The default and 2 do not protect, as xterm's CASE_DECSCA reads them.
+        parse_as("\x1b[\"q\x1b[2\"q", "\x1b[0\"q\x1b[0\"q");
+        // Other values are not DECSCA's.
+        assert!(matches!(
+            Parser::new().parse_as_vec(b"\x1b[3\"q").as_slice(),
+            [Action::CSI(CSI::Unspecified(_))]
+        ));
     }
 
     #[test]

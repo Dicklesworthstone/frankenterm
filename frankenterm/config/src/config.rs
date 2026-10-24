@@ -10,7 +10,8 @@ use crate::default_config_with_overrides_applied;
 use crate::exec_domain::ExecDomain;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
-    FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
+    FontShaperSelection, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule,
+    TextStyle,
 };
 use crate::frontend::FrontEndSelection;
 use crate::keyassignment::{
@@ -493,6 +494,19 @@ pub struct Config {
     #[dynamic(default)]
     pub freetype_load_flags: Option<FreeTypeLoadFlags>,
 
+    /// The LCD filter FreeType applies to subpixel text (a
+    /// `freetype_render_target` of `HorizontalLcd` or `VerticalLcd`):
+    /// `Default`, `Light` or `None`. Read when fonts load.
+    #[dynamic(default)]
+    pub freetype_lcd_filter: FreeTypeLcdFilter,
+
+    /// Five LCD filter taps in 1/256 units that replace the ones of
+    /// `freetype_lcd_filter`, for example `[8, 77, 86, 77, 8]`. Taps that
+    /// add up to 256 keep the brightness; a zero center tap turns filtering
+    /// off. Read when fonts load.
+    #[dynamic(default, validate = "validate_freetype_lcd_filter_weights")]
+    pub freetype_lcd_filter_weights: Option<Vec<u8>>,
+
     /// Selects the freetype interpret version to use.
     /// Likely values are 35, 38 and 40 which have different
     /// characteristics with respective to subpixel hinting.
@@ -927,6 +941,16 @@ pub struct Config {
     #[dynamic(default)]
     pub enable_zwlr_output_manager: bool,
 
+    /// When the Wayland compositor offers `wp_fractional_scale_v1` and
+    /// `wp_viewporter`, render each window at the output's fractional scale
+    /// (for example 1.25) instead of rounding up to the next integer scale
+    /// and letting the compositor shrink the result. Set this to false to
+    /// keep the integer buffer-scale path. Read when the Wayland connection
+    /// starts. Only builds with Wayland support use it.
+    /// The default is true.
+    #[dynamic(default = "default_true")]
+    pub enable_wayland_fractional_scale: bool,
+
     /// Whether to prefer EGL over other GL implementations.
     /// EGL on Windows has jankier resize behavior than WGL (which
     /// is used if EGL is unavailable), but EGL survives graphics
@@ -1046,6 +1070,21 @@ pub struct Config {
 
     #[dynamic(default)]
     pub text_min_contrast_ratio: Option<f32>,
+
+    /// Glyph coverage gamma, after kitty's `text_composition_strategy`:
+    /// 0.01 or more. Higher values make text heavier, fully for dark text
+    /// on a light background and hardly at all for light text on a dark
+    /// one. Setting this or `text_contrast` also blends text in linear
+    /// light. Applies to the OpenGL and WebGpu front ends.
+    #[dynamic(default, validate = "validate_text_gamma")]
+    pub text_gamma: Option<f32>,
+
+    /// Extra glyph coverage contrast, a percentage from 0 to 100, after
+    /// kitty's `text_composition_strategy`. Setting this or `text_gamma`
+    /// also blends text in linear light. Applies to the OpenGL and WebGpu
+    /// front ends.
+    #[dynamic(default, validate = "validate_text_contrast")]
+    pub text_contrast: Option<f32>,
 
     #[dynamic(default)]
     pub force_reverse_video_cursor: bool,
@@ -1236,6 +1275,15 @@ pub struct Config {
     #[dynamic(default = "default_max_fps", validate = "validate_max_fps")]
     pub max_fps: u64,
 
+    /// Repaint-rate limit for a window without keyboard focus; unset uses
+    /// `max_fps`, and a value above `max_fps` is capped at it. Honored on
+    /// macOS. Unfocused windows keep updating, just less often. Translucent
+    /// windows stacked on one another all count as visible to the OS, so
+    /// without this each one repaints at `max_fps` while the pane it shows
+    /// animates, even when no one can see it.
+    #[dynamic(default, validate = "validate_unfocused_max_fps")]
+    pub unfocused_max_fps: Option<u64>,
+
     #[dynamic(default = "default_shape_cache_size")]
     pub shape_cache_size: usize,
     #[dynamic(default = "default_line_state_cache_size")]
@@ -1339,6 +1387,29 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether the window draws only opaque pixels: it is not translucent,
+    /// and it has no background layers or its bottom layer fills the window
+    /// with opaque color, which everything else is drawn over. Decided from
+    /// the configuration, not the loaded layers, which arrive after the first
+    /// frames; until a layer loads the window paints its opaque terminal
+    /// background. The legacy `window_background_image` and
+    /// `window_background_gradient` options are `background` layers by now.
+    pub fn window_content_is_opaque(&self) -> bool {
+        self.window_background_opacity >= 1.0
+            && self
+                .background
+                .first()
+                .is_none_or(BackgroundLayer::fills_window_opaquely)
+    }
+
+    /// The repaint-rate limit for a window, by whether it has keyboard focus.
+    pub fn max_fps_for_focus(&self, focused: bool) -> u64 {
+        match self.unfocused_max_fps {
+            Some(unfocused) if !focused => unfocused.min(self.max_fps),
+            _ => self.max_fps,
+        }
+    }
+
     pub fn load() -> LoadedConfig {
         Self::load_with_overrides(&frankenterm_dynamic::Value::default())
     }
@@ -2712,6 +2783,46 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
     }
 }
 
+/// The smallest `text_gamma`; kitty uses the same floor.
+pub const MIN_TEXT_GAMMA: f32 = 0.01;
+
+fn validate_text_gamma(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(gamma) if !(gamma.is_finite() && *gamma >= MIN_TEXT_GAMMA) => Err(format!(
+            "text_gamma must be a number of at least {MIN_TEXT_GAMMA}, got {gamma}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_contrast(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(contrast) if !(0.0..=100.0).contains(contrast) => Err(format!(
+            "text_contrast must be a percentage from 0 to 100, got {contrast}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_freetype_lcd_filter_weights(value: &Option<Vec<u8>>) -> Result<(), String> {
+    match value {
+        Some(weights) if weights.len() != 5 => Err(format!(
+            "freetype_lcd_filter_weights must list exactly 5 weights, got {}",
+            weights.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_unfocused_max_fps(value: &Option<u64>) -> Result<(), String> {
+    match value {
+        Some(fps) if !(MIN_MAX_FPS..=MAX_MAX_FPS).contains(fps) => Err(format!(
+            "unfocused_max_fps must be in {MIN_MAX_FPS}..={MAX_MAX_FPS}, got {fps}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Convert a configured repaint-rate limit into a nonzero repaint interval.
 ///
 /// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
@@ -2913,9 +3024,10 @@ fn default_gui_startup_args() -> Vec<String> {
     vec!["start".to_string()]
 }
 
-// Coupled with term/src/config.rs:TerminalConfiguration::unicode_version
+// Coupled with term/src/config.rs:TerminalConfiguration::unicode_version,
+// which says why the default is 14 rather than 9.
 fn default_unicode_version() -> u8 {
-    9
+    14
 }
 
 fn default_mux_env_remove() -> Vec<String> {
@@ -3531,6 +3643,123 @@ mod tests {
         assert_eq!(cfg.scrollback_lines, defaults.scrollback_lines);
     }
 
+    /// Build a `Config` from `key = value` pairs the way the TOML and Lua
+    /// loaders do, through `FromDynamic`.
+    fn config_from_pairs(pairs: Vec<(&str, Value)>) -> Result<Config, frankenterm_dynamic::Error> {
+        let mut object = frankenterm_dynamic::Object::default();
+        for (key, value) in pairs {
+            object.insert(Value::String(key.to_string()), value);
+        }
+        Config::from_dynamic(&Value::Object(object), FromDynamicOptions::default())
+    }
+
+    #[test]
+    fn wayland_fractional_scale_is_on_by_default_and_can_be_turned_off() {
+        assert!(Config::default_config().enable_wayland_fractional_scale);
+        let config = config_from_pairs(vec![(
+            "enable_wayland_fractional_scale",
+            Value::Bool(false),
+        )])
+        .expect("a boolean is a valid enable_wayland_fractional_scale");
+        assert!(!config.enable_wayland_fractional_scale);
+    }
+
+    fn float(value: f64) -> Value {
+        Value::F64(ordered_float::OrderedFloat(value))
+    }
+
+    fn weights(taps: &[u64]) -> Value {
+        Value::Array(
+            taps.iter()
+                .copied()
+                .map(Value::U64)
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    #[test]
+    fn text_rendering_options_default_to_the_existing_rendering() {
+        let config = Config::default_config();
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Default);
+        assert_eq!(config.freetype_lcd_filter_weights, None);
+        assert_eq!(config.text_gamma, None);
+        assert_eq!(config.text_contrast, None);
+    }
+
+    #[test]
+    fn text_rendering_options_parse() {
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("Light".to_string())),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77, 8])),
+            ("text_gamma", float(1.7)),
+            // Lua and TOML integers are accepted for the float options.
+            ("text_contrast", Value::U64(30)),
+        ])
+        .expect("valid text rendering options");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Light);
+        assert_eq!(
+            config.freetype_lcd_filter_weights,
+            Some(vec![8, 77, 86, 77, 8])
+        );
+        assert_eq!(config.text_gamma, Some(1.7));
+        assert_eq!(config.text_contrast, Some(30.0));
+
+        // The range ends are valid.
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("None".to_string())),
+            ("text_gamma", float(f64::from(MIN_TEXT_GAMMA))),
+            ("text_contrast", Value::U64(100)),
+        ])
+        .expect("range ends are valid");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::None);
+        assert_eq!(config.text_gamma, Some(MIN_TEXT_GAMMA));
+        assert_eq!(config.text_contrast, Some(100.0));
+        let config = config_from_pairs(vec![("text_contrast", Value::U64(0))])
+            .expect("a contrast of 0 is valid");
+        assert_eq!(config.text_contrast, Some(0.0));
+    }
+
+    #[test]
+    fn text_rendering_options_reject_bad_values() {
+        let cases = [
+            ("text_gamma", float(0.0)),
+            ("text_gamma", float(0.009)),
+            ("text_gamma", Value::I64(-2)),
+            ("text_gamma", float(f64::NAN)),
+            ("text_gamma", float(f64::INFINITY)),
+            // Finite as an f64, infinite as the f32 the option holds.
+            ("text_gamma", float(1.0e39)),
+            ("text_contrast", Value::I64(-1)),
+            ("text_contrast", float(100.5)),
+            ("text_contrast", float(f64::NAN)),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77])),
+            (
+                "freetype_lcd_filter_weights",
+                weights(&[8, 77, 86, 77, 8, 0]),
+            ),
+            ("freetype_lcd_filter_weights", weights(&[])),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 256, 77, 8])),
+            // FreeType no longer has its pre-2.3 Legacy filter.
+            ("freetype_lcd_filter", Value::String("Legacy".to_string())),
+        ];
+        for (key, value) in cases {
+            // This crate is edition 2018: a lone panic! literal is not a
+            // format string, so the arguments are passed explicitly.
+            let shown = format!("{} = {:?}", key, value);
+            let err = match config_from_pairs(vec![(key, value)]) {
+                Ok(_) => panic!("{} was accepted", shown),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(key),
+                "{}: error does not name the key: {}",
+                shown,
+                err
+            );
+        }
+    }
+
     #[test]
     fn dropped_file_quoting_windows_quotes_tab() {
         let result = DroppedFileQuoting::Windows.escape("has\ttab");
@@ -3805,6 +4034,27 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_windows_repaint_at_their_own_cap() {
+        let mut config = Config::default_config();
+        config.max_fps = 30;
+        assert_eq!(config.unfocused_max_fps, None, "off by default");
+        assert_eq!(config.max_fps_for_focus(false), 30);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(10);
+        assert_eq!(config.max_fps_for_focus(false), 10);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(120);
+        assert_eq!(config.max_fps_for_focus(false), 30, "never above max_fps");
+
+        assert!(validate_unfocused_max_fps(&None).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(MIN_MAX_FPS)).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(0)).is_err());
+        assert!(validate_unfocused_max_fps(&Some(MAX_MAX_FPS + 1)).is_err());
+    }
+
+    #[test]
     fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
         assert_eq!(frame_interval_for_max_fps(0), Duration::from_secs(1));
         assert_eq!(
@@ -3946,8 +4196,8 @@ mod tests {
     }
 
     #[test]
-    fn default_unicode_version_is_nine() {
-        assert_eq!(default_unicode_version(), 9);
+    fn default_unicode_version_widens_vs16_emoji() {
+        assert_eq!(default_unicode_version(), 14);
     }
 
     #[test]
@@ -4252,6 +4502,24 @@ mod tests {
         assert!(message.contains("max_fps"), "unexpected error: {}", message);
         assert!(
             message.contains("1..=1000"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(message.contains("got 0"), "unexpected error: {}", message);
+    }
+
+    #[test]
+    fn config_from_dynamic_reads_and_validates_unfocused_max_fps() {
+        let load = |fps: u64| {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(Value::String("unfocused_max_fps".into()), Value::U64(fps));
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+        };
+        let config = load(10).expect("a valid unfocused_max_fps loads");
+        assert_eq!(config.unfocused_max_fps, Some(10));
+        let message = load(0).expect_err("zero must be rejected").to_string();
+        assert!(
+            message.contains("unfocused_max_fps"),
             "unexpected error: {}",
             message
         );

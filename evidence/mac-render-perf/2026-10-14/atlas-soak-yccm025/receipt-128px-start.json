@@ -1,0 +1,186 @@
+{
+  "bundles_captured": 14,
+  "elapsed_s": 4200,
+  "extra_env": [
+    "FRANKENTERM_NATIVE_E2E_NONACTIVATING=1",
+    "FRANKENTERM_CONFIG_FILE=/Users/jemanuel/.cache/ftsoak/c-grow.lua",
+    "FRANKENTERM_LUA_CONFIG=1"
+  ],
+  "gpu_budget_mib": 1024,
+  "growth_verdict": {
+    "bundles": 14,
+    "failures": [],
+    "metrics": {
+      "allocator/active": {
+        "grows": false,
+        "projected_24h_bytes": 212343614,
+        "r2": 0.012,
+        "slope_bytes_per_hour": 8847651,
+        "tolerance_bytes": 67108864
+      },
+      "allocator/allocated": {
+        "grows": false,
+        "projected_24h_bytes": 601428878,
+        "r2": 0.069,
+        "slope_bytes_per_hour": 25059537,
+        "tolerance_bytes": 67108864
+      },
+      "allocator/mapped": {
+        "grows": false,
+        "projected_24h_bytes": -333635593,
+        "r2": 0.01,
+        "slope_bytes_per_hour": -13901483,
+        "tolerance_bytes": 67108864
+      },
+      "allocator/resident": {
+        "grows": false,
+        "projected_24h_bytes": -394313662,
+        "r2": 0.014,
+        "slope_bytes_per_hour": -16429736,
+        "tolerance_bytes": 67108864
+      },
+      "allocator/retained": {
+        "grows": false,
+        "projected_24h_bytes": 463081555,
+        "r2": 0.019,
+        "slope_bytes_per_hour": 19295065,
+        "tolerance_bytes": 67108864
+      },
+      "cache/image_cache_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "cache/line_quad_cache_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 191177267,
+        "r2": 0.031,
+        "slope_bytes_per_hour": 7965719,
+        "tolerance_bytes": 67108864
+      },
+      "cache/line_shape_cache_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 103739365,
+        "r2": 0.029,
+        "slope_bytes_per_hour": 4322474,
+        "tolerance_bytes": 67108864
+      },
+      "cache/shape_cache_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 35630111,
+        "r2": 0.117,
+        "slope_bytes_per_hour": 1484588,
+        "tolerance_bytes": 67108864
+      },
+      "gpu_owned_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/buffer/index": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/buffer/other": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/buffer/readback": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/buffer/uniform": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/buffer/vertex": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/texture/atlas": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/texture/drawable": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/texture/image": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "ledger/texture/other": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "panes/warm_resident_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 0,
+        "r2": 0.0,
+        "slope_bytes_per_hour": 0,
+        "tolerance_bytes": 67108864
+      },
+      "phys_footprint": {
+        "grows": false,
+        "projected_24h_bytes": 117707705,
+        "r2": 0.001,
+        "slope_bytes_per_hour": 4904488,
+        "tolerance_bytes": 67108864
+      },
+      "rss_bytes": {
+        "grows": false,
+        "projected_24h_bytes": 231447905,
+        "r2": 0.005,
+        "slope_bytes_per_hour": 9643663,
+        "tolerance_bytes": 67108864
+      }
+    },
+    "pass": true,
+    "span_hours": 1.0833,
+    "tail_bundles": 7
+  },
+  "growth_verdict_advisory": false,
+  "gui_bin": "/Users/jemanuel/.cache/ftpush/bundle-421fe20/FrankenTerm.app/Contents/MacOS/frankenterm-gui",
+  "gui_exited_early": false,
+  "host_load_average_end": "{ 2.58 2.40 2.36 }",
+  "host_load_average_start": "{ 2.17 2.48 2.49 }",
+  "isolation_probe": "skipped:no-ft",
+  "pass": true,
+  "requested_duration_s": 4200,
+  "resize_unavailable": "36:117: execution error: System Events got an error: osascript is not allowed assistive access. (-1719)",
+  "resizes_ok": 0,
+  "run_dir": "/Users/jemanuel/.cache/ftsoak/run-70m-grow",
+  "sample_interval_s": 300,
+  "schema": "frankenterm.gui_soak_receipt.v1"
+}

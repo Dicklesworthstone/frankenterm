@@ -270,6 +270,19 @@ pub async fn build_server_with_db(
 /// reachable via the explicit `build_server_degraded` entry —
 /// this private helper does NOT enforce that invariant
 /// (callers above are responsible for gating).
+/// The workspace whose git status and ready beads `wa.attention` reads on a
+/// live run: the one this server resolves, and only when that workspace's
+/// database is the one the server serves. A caller never chooses it.
+fn mcp_attention_workspace_root(
+    config: &Config,
+    db_path: Option<&std::path::Path>,
+) -> Option<Arc<PathBuf>> {
+    let served = std::fs::canonicalize(db_path?).ok()?;
+    let layout = config.workspace_layout(None).ok()?;
+    let resolved = std::fs::canonicalize(&layout.db_path).ok()?;
+    (resolved == served).then(|| Arc::new(layout.root))
+}
+
 async fn build_server_inner(
     cx: &crate::cx::Cx,
     config: &Config,
@@ -348,7 +361,14 @@ async fn build_server_inner(
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
         .tool(FormatAwareToolHandler::new(WaOperatingEnvelopeTool))
-        .tool(FormatAwareToolHandler::new(WaAttentionTool))
+        .tool(FormatAwareToolHandler::new(
+            WaAttentionTool::new(db_path.clone()).with_workspace_root(
+                mcp_attention_workspace_root(
+                    config.as_ref(),
+                    db_path.as_deref().map(PathBuf::as_path),
+                ),
+            ),
+        ))
         .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
             Arc::clone(&config),
         )))
@@ -749,6 +769,28 @@ mod tests {
 
     fn build_server(config: &Config) -> Result<Server> {
         build_server_degraded(config)
+    }
+
+    /// The API schema registry (and the docs generated from it) may only name
+    /// MCP tools this server registers; it once advertised wa.rules_show and
+    /// wa.approve, which never existed.
+    #[test]
+    fn api_schema_mcp_tools_are_registered_tools() {
+        let registered: std::collections::BTreeSet<&str> = DEGRADED_MODE_BASE_TOOL_NAMES
+            .iter()
+            .chain(DB_GATED_AUDITED_TOOL_NAMES)
+            .copied()
+            .collect();
+        let unregistered: Vec<String> = crate::api_schema::SchemaRegistry::canonical()
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.mcp_tool.clone())
+            .filter(|tool| !registered.contains(tool.as_str()))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "API schema names MCP tools the server does not register: {unregistered:?}"
+        );
     }
 
     #[test]

@@ -104,6 +104,7 @@ fn validate_resize_increments(incr: ResizeIncrement) -> anyhow::Result<()> {
 }
 
 use super::copy_and_paste::{set_pipe_nonblocking, CopyAndPaste};
+use super::fractional_scale::{self, FractionalScaleSurface};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
@@ -434,6 +435,12 @@ impl WaylandWindow {
             let compositor = &conn.wayland_state.borrow().compositor;
             compositor.create_surface_with_data(&qh, surface_data)
         };
+        let fractional_scale = conn
+            .wayland_state
+            .borrow()
+            .fractional_scale
+            .as_ref()
+            .map(|globals| globals.attach(&surface, &qh, window_id));
 
         let ResolvedGeometry {
             x: _,
@@ -510,6 +517,7 @@ impl WaylandWindow {
         let inner = Rc::new(RefCell::new(WaylandWindowInner {
             events: WindowEventSender::new(event_handler),
             surface_factor: 1.0,
+            fractional_scale,
             copy_and_paste,
             invalidated: false,
             window: Some(window),
@@ -997,6 +1005,10 @@ pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<Strin
 pub struct WaylandWindowInner {
     pub(crate) events: WindowEventSender,
     surface_factor: f64,
+    /// `wp_fractional_scale_v1` and `wp_viewport` for this surface, when the
+    /// compositor supports fractional scaling. Declared before `window` so it
+    /// is destroyed before the surface it refers to.
+    fractional_scale: Option<FractionalScaleSurface>,
     copy_and_paste: Arc<Mutex<CopyAndPaste>>,
     window: Option<XdgWindow>,
     pub(super) window_frame: FallbackFrame<WaylandState>,
@@ -1115,6 +1127,7 @@ impl WaylandWindowInner {
     fn close(&mut self) {
         self.cancel_key_repeat();
         self.events.dispatch(WindowEvent::Destroyed);
+        self.fractional_scale.take();
         self.window.take();
     }
 
@@ -1208,16 +1221,84 @@ impl WaylandWindowInner {
         Ok(gl_state)
     }
 
+    /// The compositor's preferred fractional scale, once it has sent one.
+    /// While this is `Some`, the buffer is drawn at this scale with a
+    /// `buffer_scale` of 1 and the viewport maps it onto the surface size.
+    fn fractional_scale(&self) -> Option<f64> {
+        self.fractional_scale
+            .as_ref()
+            .and_then(FractionalScaleSurface::preferred)
+    }
+
     fn get_dpi_factor(&self) -> f64 {
-        self.dimensions.dpi_factor()
+        match self.fractional_scale() {
+            Some(scale) => scale,
+            None => self.dimensions.dpi_factor(),
+        }
     }
 
     fn surface_to_pixels(&self, surface: i32) -> i32 {
-        self.dimensions.surface_to_pixels(surface)
+        match self.fractional_scale() {
+            Some(scale) => fractional_scale::surface_to_buffer(surface, scale),
+            None => self.dimensions.surface_to_pixels(surface),
+        }
     }
 
     fn pixels_to_surface(&self, pixels: i32) -> i32 {
-        self.dimensions.pixels_to_surface(pixels)
+        match self.fractional_scale() {
+            Some(scale) => fractional_scale::buffer_to_surface(pixels, scale),
+            None => self.dimensions.pixels_to_surface(pixels),
+        }
+    }
+
+    /// The buffer pixel under a surface-local pointer coordinate.
+    fn surface_point_to_pixels(&self, coord: f64) -> isize {
+        match self.fractional_scale() {
+            Some(scale) => fractional_scale::surface_point_to_buffer(coord, scale),
+            None => self.surface_to_pixels(coord as i32) as isize,
+        }
+    }
+
+    /// Apply a `preferred_scale` from the compositor. The window keeps its
+    /// surface (logical) size, so once the window is configured this queues
+    /// a configure at that size; it then recomputes the buffer size and DPI
+    /// with the new scale. Before the first configure there is nothing to
+    /// redo: that configure picks the scale up.
+    pub(super) fn set_preferred_fractional_scale(&mut self, scale: f64) {
+        // The surface size, measured with the scale in effect until now.
+        let surface_size =
+            checked_pixel_dimensions(self.dimensions.pixel_width, self.dimensions.pixel_height)
+                .and_then(|(width, height)| {
+                    Some((
+                        u32::try_from(self.pixels_to_surface(width)).ok()?,
+                        u32::try_from(self.pixels_to_surface(height)).ok()?,
+                    ))
+                });
+        let Some(fractional) = self.fractional_scale.as_mut() else {
+            return;
+        };
+        if !fractional.set_preferred(scale) {
+            return;
+        }
+        log::debug!("Wayland preferred fractional scale is now {scale}");
+        if self.window.is_none() || self.pending_first_configure.is_some() {
+            return;
+        }
+        let Some(surface_size) = surface_size else {
+            log::error!(
+                "Cannot apply Wayland fractional scale {scale} to invalid dimensions {:?}",
+                self.dimensions
+            );
+            return;
+        };
+        {
+            let mut pending_event =
+                lock_or_recover(&self.pending_event, "queueing fractional scale configure");
+            if pending_event.configure.is_none() {
+                pending_event.configure.replace(surface_size);
+            }
+        }
+        self.dispatch_pending_event();
     }
 
     pub(super) fn dispatch_dropped_files(&mut self, paths: Vec<PathBuf>) {
@@ -1229,8 +1310,8 @@ impl WaylandWindowInner {
 
         if let Some((x, y)) = PendingMouse::coords(&pending_mouse) {
             let coords = Point::new(
-                self.surface_to_pixels(x as i32) as isize,
-                self.surface_to_pixels(y as i32) as isize,
+                self.surface_point_to_pixels(x),
+                self.surface_point_to_pixels(y),
             );
             self.last_mouse_coords = coords;
             let event = MouseEvent {
@@ -1389,8 +1470,12 @@ impl WaylandWindowInner {
                     );
                     break 'valid_configure;
                 };
-                let surface_udata = SurfaceUserData::from_wl(self.surface());
-                let factor = surface_udata.surface_data.scale_factor() as f64;
+                let fractional = self.fractional_scale();
+                let factor = fractional.unwrap_or_else(|| {
+                    SurfaceUserData::from_wl(self.surface())
+                        .surface_data
+                        .scale_factor() as f64
+                });
                 let old_dimensions = self.dimensions;
 
                 let dpi = self
@@ -1405,8 +1490,14 @@ impl WaylandWindowInner {
                             &self.config.dpi_by_screen,
                         )
                     })
-                    .unwrap_or_else(|| self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI))
-                    as usize;
+                    .unwrap_or_else(|| self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI));
+                // A fractional scale gives a fractional DPI (1.1 is 105.6);
+                // round it rather than size fonts for the step below.
+                let dpi = if fractional.is_some() {
+                    dpi.round()
+                } else {
+                    dpi
+                } as usize;
 
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
@@ -1458,6 +1549,19 @@ impl WaylandWindowInner {
                 window
                     .xdg_surface()
                     .set_window_geometry(x, y, surface_width, surface_height);
+                if fractional.is_some() {
+                    if let Some(fractional_surface) = self.fractional_scale.as_ref() {
+                        // The buffer is drawn at the fractional scale; the
+                        // viewport maps it back onto the surface size.
+                        fractional_surface.set_destination(surface_width, surface_height);
+                    }
+                    if self.surface_factor != 1.0 {
+                        // Undo an integer buffer scale applied before the
+                        // first preferred_scale event arrived.
+                        self.surface().set_buffer_scale(1);
+                        self.surface_factor = 1.0;
+                    }
+                }
                 // Compute the new pixel dimensions
                 let (Ok(pixel_width_usize), Ok(pixel_height_usize)) =
                     (usize::try_from(pixel_width), usize::try_from(pixel_height))
@@ -1500,7 +1604,7 @@ impl WaylandWindowInner {
                     if let Some(wegl_surface) = self.wegl_surface.as_mut() {
                         wegl_surface.resize(pixel_width, pixel_height, 0, 0);
                     }
-                    if self.surface_factor != factor {
+                    if fractional.is_none() && self.surface_factor != factor {
                         if let Some(connection) = Connection::get() {
                             let wayland_conn = connection.wayland();
                             let wayland_state = wayland_conn.wayland_state.borrow();
@@ -1602,17 +1706,25 @@ impl WaylandWindowInner {
         {
             self.text_cursor.replace(rect);
 
-            let surface_udata = SurfaceUserData::from_wl(&surface);
-            let factor = surface_udata.surface_data().scale_factor();
-
-            if let Some(text_input) = &state.text_input {
-                if let Some(input) = text_input.get_text_input_for_surface(&surface) {
-                    input.set_cursor_rectangle(
+            // The cursor rectangle is in surface-local coordinates.
+            let (x, y, width, height) = match self.fractional_scale() {
+                Some(scale) => fractional_scale::buffer_rect_to_surface(rect, scale),
+                None => {
+                    let factor = SurfaceUserData::from_wl(&surface)
+                        .surface_data()
+                        .scale_factor();
+                    (
                         rect.min_x() as i32 / factor,
                         rect.min_y() as i32 / factor,
                         rect.width() as i32 / factor,
                         rect.height() as i32 / factor,
-                    );
+                    )
+                }
+            };
+
+            if let Some(text_input) = &state.text_input {
+                if let Some(input) = text_input.get_text_input_for_surface(&surface) {
+                    input.set_cursor_rectangle(x, y, width, height);
                     input.commit();
                 }
             }

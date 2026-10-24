@@ -1279,7 +1279,7 @@ impl WaModel {
         } else {
             self.triage_queued_action = None;
             self.view_state.error_message =
-                Some("Saved search has no schedule; set one via `ft search saved schedule`".into());
+                Some("Saved search has no schedule; set one via `ft search saved schedule <name> <interval-ms>`".into());
         }
     }
 
@@ -3245,7 +3245,7 @@ fn render_panes_view(
         let next_action = if selected_profile != active_profile {
             format!("Apply selected profile: ft rules profile apply {selected_profile}")
         } else if !pane.unhandled_badge.is_empty() {
-            format!("Run: ft workflow list --pane {}", pane.pane_id)
+            format!("Run: ft events --pane-id {} --unhandled", pane.pane_id)
         } else {
             format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
         };
@@ -5111,9 +5111,15 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
     let query: Arc<dyn QueryClient + Send + Sync> = Arc::new(query);
     let model = WaModel::new(query, config);
 
-    ftui::App::fullscreen(model)
-        .run()
-        .map_err(|e| crate::Error::runtime_backend("ftui_tui_run", e.to_string()))?;
+    // The ftui runtime owns the terminal; hold the output gate while it
+    // draws, and release it before the caller logs any error.
+    let result = {
+        let _session = super::terminal_session::RuntimeOwnedSessionGuard::enter(
+            super::ftui_compat::ScreenMode::AltScreen,
+        );
+        ftui::App::fullscreen(model).run()
+    };
+    result.map_err(|e| crate::Error::runtime_backend("ftui_tui_run", e.to_string()))?;
 
     Ok(())
 }

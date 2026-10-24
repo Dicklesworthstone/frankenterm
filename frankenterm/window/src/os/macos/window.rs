@@ -161,6 +161,52 @@ fn backing_dimensions_from_rect(backing_frame: NSRect) -> (u32, u32) {
     )
 }
 
+/// One of the app's windows, as [`covered_windows`] sees it.
+#[derive(Clone, Copy)]
+struct CoverFacts {
+    /// Position in the app's front-to-back window order; `None` when the
+    /// window is not in that order.
+    rank: Option<usize>,
+    frame: NSRect,
+    /// Visible, not minimized and on the active Space.
+    shown: bool,
+    /// Draws only opaque pixels at full window alpha.
+    opaque: bool,
+    /// Titled, so its corners are rounded.
+    titled: bool,
+}
+
+/// Which windows another of the app's windows hides: one in front of it,
+/// shown and opaque, whose frame contains its frame. A titled cover's rounded
+/// corners would show the square corners of an untitled window behind it,
+/// so a titled cover hides only titled windows.
+fn covered_windows(windows: &[CoverFacts]) -> Vec<bool> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let Some(rank) = window.rank.filter(|_| window.shown) else {
+                return false;
+            };
+            windows.iter().enumerate().any(|(other, cover)| {
+                other != index
+                    && cover.shown
+                    && cover.opaque
+                    && cover.rank.is_some_and(|cover_rank| cover_rank < rank)
+                    && rect_contains(cover.frame, window.frame)
+                    && (!cover.titled || window.titled)
+            })
+        })
+        .collect()
+}
+
+fn rect_contains(outer: NSRect, inner: NSRect) -> bool {
+    outer.origin.x <= inner.origin.x
+        && outer.origin.y <= inner.origin.y
+        && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
+        && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
+}
+
 impl BackendImpl {
     /// The native window has already processed the resize. Refresh any
     /// backend-specific drawable bookkeeping before the logical resize event
@@ -175,8 +221,94 @@ impl BackendImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::{backing_dimensions_from_rect, normalize_backing_dimension};
+    use super::{
+        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension, CoverFacts,
+    };
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
+
+    fn facts(rank: usize, x: f64, width: f64, opaque: bool) -> CoverFacts {
+        CoverFacts {
+            rank: Some(rank),
+            frame: NSRect::new(NSPoint::new(x, 30.0), NSSize::new(width, 1600.0)),
+            shown: true,
+            opaque,
+            titled: true,
+        }
+    }
+
+    #[test]
+    fn stacked_windows_behind_an_opaque_window_are_covered() {
+        // The operator's smart glass: the front window is glass, the second
+        // opaque, and eight more are stacked behind them at the same frame.
+        let mut stack = vec![facts(0, 0.0, 3072.0, false), facts(1, 0.0, 3072.0, true)];
+        stack.extend((2..10).map(|rank| facts(rank, 0.0, 3072.0, true)));
+        let covered = covered_windows(&stack);
+        assert!(!covered[0], "front window");
+        assert!(!covered[1], "shows through the glass front window");
+        assert!(covered[2..].iter().all(|covered| *covered));
+    }
+
+    #[test]
+    fn glass_partial_or_hidden_covers_hide_nothing() {
+        let behind = facts(1, 100.0, 800.0, true);
+        let cases = [
+            ("glass cover", facts(0, 0.0, 3072.0, false)),
+            ("partial cover", facts(0, 200.0, 800.0, true)),
+            (
+                "minimized cover",
+                CoverFacts {
+                    shown: false,
+                    ..facts(0, 0.0, 3072.0, true)
+                },
+            ),
+            (
+                "cover not in the window order",
+                CoverFacts {
+                    rank: None,
+                    ..facts(0, 0.0, 3072.0, true)
+                },
+            ),
+            ("cover behind it", facts(2, 0.0, 3072.0, true)),
+        ];
+        for (name, cover) in cases {
+            assert_eq!(
+                covered_windows(&[cover, behind]),
+                [false, false],
+                "{}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn titled_cover_hides_only_titled_windows() {
+        let cover = facts(0, 0.0, 1000.0, true);
+        let untitled = CoverFacts {
+            titled: false,
+            ..facts(1, 0.0, 1000.0, true)
+        };
+        assert_eq!(covered_windows(&[cover, untitled]), [false, false]);
+        let square_cover = CoverFacts {
+            titled: false,
+            ..cover
+        };
+        assert_eq!(
+            covered_windows(&[square_cover, facts(1, 0.0, 1000.0, true)]),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn a_window_that_is_not_shown_is_not_reported_covered() {
+        let hidden = CoverFacts {
+            shown: false,
+            ..facts(1, 0.0, 1000.0, true)
+        };
+        assert_eq!(
+            covered_windows(&[facts(0, 0.0, 1000.0, true), hidden]),
+            [false, false]
+        );
+    }
 
     #[test]
     fn backing_dimensions_from_rect_preserve_positive_sizes() {
@@ -586,6 +718,9 @@ impl Window {
                 window: None,
                 screen_changed: false,
                 paint_throttled: false,
+                focused: false,
+                occluded: false,
+                covered: false,
                 repaint_slot: None,
                 invalidated: true,
                 gl_context_pair: None,
@@ -1356,6 +1491,7 @@ impl WindowInner {
                 self.window.makeKeyAndOrderFront_(nil);
             }
         }
+        schedule_window_cover_refresh();
     }
 
     fn close(&mut self) {
@@ -1368,6 +1504,8 @@ impl WindowInner {
         unsafe {
             self.window.makeKeyAndOrderFront_(nil);
         }
+        // An inactive app's window comes to the front without becoming key.
+        schedule_window_cover_refresh();
     }
 
     fn hide(&mut self) {
@@ -1524,6 +1662,114 @@ impl WindowInner {
         self.update_window_background_blur();
         self.update_titlebar_background();
         self.apply_decorations();
+        // Its opacity decides whether it covers the windows behind it.
+        schedule_window_cover_refresh();
+    }
+}
+
+thread_local! {
+    static WINDOW_COVER_REFRESH_PENDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Runs [`refresh_window_cover`] once the current AppKit event has been
+/// handled, when the windows' order, frames and visibility have settled.
+/// Requests made before it runs share it.
+fn schedule_window_cover_refresh() {
+    if WINDOW_COVER_REFRESH_PENDING.with(|pending| pending.replace(true)) {
+        return;
+    }
+    match crate::reserve_window_main_thread(
+        promise::spawn::MainThreadServiceClass::Interactive,
+        4 * 1024,
+        "macOS window cover refresh",
+    ) {
+        Ok(reservation) => reservation
+            .spawn_local(async {
+                WINDOW_COVER_REFRESH_PENDING.with(|pending| pending.set(false));
+                refresh_window_cover();
+            })
+            .detach(),
+        Err(_) => WINDOW_COVER_REFRESH_PENDING.with(|pending| pending.set(false)),
+    }
+}
+
+/// AppKit reports a window visible while any part of it may show, and on
+/// macOS 26 neither a titled window nor one whose layer is not opaque hides
+/// the window behind it (ft-yccm0.7 probe: a stock titled window 20 pt larger
+/// on every side left the window behind it visible; an untitled window with
+/// an opaque layer hid it). So FrankenTerm windows stacked behind another
+/// never report occlusion and never park their surfaces (ft-34at5). This
+/// also reports a window occluded while another of the app's windows covers
+/// it ([`covered_windows`]).
+fn refresh_window_cover() {
+    let Some(conn) = Connection::get() else {
+        return;
+    };
+    let registered: Vec<_> = conn.windows.borrow().values().map(Rc::clone).collect();
+    let ordered: Vec<id> = unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        let ordered: id = msg_send![app, orderedWindows];
+        (0..ordered.count())
+            .map(|index| ordered.objectAtIndex(index))
+            .collect()
+    };
+    let mut views = Vec::with_capacity(registered.len());
+    let mut facts = Vec::with_capacity(registered.len());
+    for handle in registered {
+        let Ok(handle) = handle.try_borrow() else {
+            // A window operation holds it; look again after that.
+            schedule_window_cover_refresh();
+            return;
+        };
+        let Some(view) = WindowView::get_this(unsafe { &**handle.view }) else {
+            continue;
+        };
+        let Ok(inner) = view.inner.try_borrow() else {
+            schedule_window_cover_refresh();
+            return;
+        };
+        let window = *handle.window;
+        let (shown, alpha, frame, titled) = unsafe {
+            let visible: BOOL = msg_send![window, isVisible];
+            let miniaturized: BOOL = msg_send![window, isMiniaturized];
+            let on_active_space: BOOL = msg_send![window, isOnActiveSpace];
+            let alpha: CGFloat = msg_send![window, alphaValue];
+            (
+                visible == YES && miniaturized == NO && on_active_space == YES,
+                alpha,
+                NSWindow::frame(window),
+                NSWindow::styleMask(window).contains(NSWindowStyleMask::NSTitledWindowMask),
+            )
+        };
+        facts.push(CoverFacts {
+            rank: ordered.iter().position(|ordered| *ordered == window),
+            frame,
+            shown,
+            opaque: alpha >= 1.0 && inner.config.window_content_is_opaque(),
+            titled,
+        });
+        views.push(Rc::clone(&view.inner));
+    }
+    for (inner, covered) in views.iter().zip(covered_windows(&facts)) {
+        let Ok(mut inner) = inner.try_borrow_mut() else {
+            schedule_window_cover_refresh();
+            continue;
+        };
+        if inner.covered != covered {
+            log::debug!(
+                "window {} covered by another window: {}",
+                inner.window_id,
+                covered
+            );
+            let hidden = inner.occluded || inner.covered;
+            inner.covered = covered;
+            if hidden != (inner.occluded || covered) {
+                inner
+                    .events
+                    .dispatch(WindowEvent::OcclusionChanged(!hidden));
+            }
+        }
     }
 }
 
@@ -1713,6 +1959,14 @@ struct Inner {
     window: Option<WeakPtr>,
     screen_changed: bool,
     paint_throttled: bool,
+    /// Whether this is the key window; paces repaints by
+    /// `Config::max_fps_for_focus`.
+    focused: bool,
+    /// No part of the window is visible (`NSWindowOcclusionState`).
+    occluded: bool,
+    /// Another of the app's windows hides it (`refresh_window_cover`). The
+    /// window is reported occluded while either holds.
+    covered: bool,
     /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
     repaint_slot: Option<Instant>,
     window_id: usize,
@@ -2427,22 +2681,57 @@ impl WindowView {
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(true));
+            let mut inner = this.inner.borrow_mut();
+            inner.focused = true;
+            // A throttle taken at a lower unfocused rate would hold the
+            // focus repaint back for up to that longer interval. Let the
+            // paint that the focus change requests start now; the stale
+            // completion then leaves the new throttle alone (slot check).
+            if inner.paint_throttled
+                && inner.config.max_fps_for_focus(false) < inner.config.max_fps_for_focus(true)
+            {
+                inner.paint_throttled = false;
+            }
+            inner.events.dispatch(WindowEvent::FocusChanged(true));
+            drop(inner);
             this.update_application_presentation(true);
         }
+        // Becoming key usually brings the window to the front.
+        schedule_window_cover_refresh();
+    }
+
+    extern "C" fn did_change_occlusion_state(this: &mut Object, _sel: Sel, notification: id) {
+        // NSWindowOcclusionStateVisible: some part of the window is visible.
+        const VISIBLE: NSUInteger = 1 << 1;
+        let window: id = unsafe { msg_send![notification, object] };
+        if window.is_null() {
+            return;
+        }
+        let state: NSUInteger = unsafe { msg_send![window, occlusionState] };
+        let occluded = state & VISIBLE == 0;
+        if let Some(this) = Self::get_this(this) {
+            let mut inner = this.inner.borrow_mut();
+            let hidden = inner.occluded || inner.covered;
+            inner.occluded = occluded;
+            if hidden != (occluded || inner.covered) {
+                inner
+                    .events
+                    .dispatch(WindowEvent::OcclusionChanged(!hidden));
+            }
+        }
+        // A window AppKit hides or shows may cover others.
+        schedule_window_cover_refresh();
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(false));
+            let mut inner = this.inner.borrow_mut();
+            inner.focused = false;
+            inner.events.dispatch(WindowEvent::FocusChanged(false));
+            drop(inner);
             this.update_application_presentation(true);
         }
+        schedule_window_cover_refresh();
     }
 
     // Switch the coordinate system to have 0,0 in the top left
@@ -2512,6 +2801,8 @@ impl WindowView {
                 drop(retired);
             }
         }
+        // The windows it covered show once it is gone.
+        schedule_window_cover_refresh();
     }
 
     fn mouse_common(this: &mut Object, nsevent: id, kind: MouseEventKind) {
@@ -3156,6 +3447,7 @@ impl WindowView {
             // the wrong place.
             this.inner.borrow_mut().screen_changed = true;
         }
+        schedule_window_cover_refresh();
     }
 
     extern "C" fn will_start_live_resize(this: &mut Object, _sel: Sel, _notification: id) {
@@ -3255,6 +3547,12 @@ impl WindowView {
                 live_resizing,
             });
         }
+        schedule_window_cover_refresh();
+    }
+
+    /// Moving a window can cover or uncover others.
+    extern "C" fn did_move(_this: &mut Object, _sel: Sel, _notification: id) {
+        schedule_window_cover_refresh();
     }
 
     extern "C" fn update_layer(_view: &mut Object, _sel: Sel) {
@@ -3335,7 +3633,9 @@ impl WindowView {
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let interval = config::frame_interval_for_max_fps(inner.config.max_fps);
+                let interval = config::frame_interval_for_max_fps(
+                    inner.config.max_fps_for_focus(inner.focused),
+                );
                 let slot = crate::repaint_slot(inner.repaint_slot, paint_started, interval);
                 inner.repaint_slot = Some(slot);
                 let connection = Connection::get().map(|connection| Rc::downgrade(&connection));
@@ -3378,6 +3678,11 @@ impl WindowView {
                                 }
                                 let invalidated = {
                                     let mut state = original_state.borrow_mut();
+                                    if state.repaint_slot != Some(slot) {
+                                        // A newer paint owns the throttle:
+                                        // focus released this one early.
+                                        return;
+                                    }
                                     state.paint_throttled = false;
                                     state.invalidated
                                 };
@@ -3582,6 +3887,10 @@ impl WindowView {
                 sel!(windowDidChangeScreen:),
                 Self::did_change_screen as extern "C" fn(&mut Object, Sel, id),
             );
+            cls.add_method(
+                sel!(windowDidMove:),
+                Self::did_move as extern "C" fn(&mut Object, Sel, id),
+            );
 
             cls.add_method(
                 sel!(windowDidBecomeKey:),
@@ -3590,6 +3899,10 @@ impl WindowView {
             cls.add_method(
                 sel!(windowDidResignKey:),
                 Self::did_resign_key as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(windowDidChangeOcclusionState:),
+                Self::did_change_occlusion_state as extern "C" fn(&mut Object, Sel, id),
             );
 
             cls.add_method(

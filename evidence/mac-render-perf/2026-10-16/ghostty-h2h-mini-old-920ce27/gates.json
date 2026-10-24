@@ -1,0 +1,10 @@
+{
+  "max_cv_pct": 5.0,
+  "max_load_1m": 4.0,
+  "min_runs": 10,
+  "rounds": 10,
+  "warmup": 3,
+  "order": "ABBA",
+  "contract_max_cv_pct": 5.0,
+  "contract_max_load_1m": 4.0
+}

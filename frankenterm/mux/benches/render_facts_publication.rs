@@ -56,9 +56,10 @@ use std::hint::black_box;
 use std::io::{Cursor, Read, Result as IoResult, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use termwiz::cell::CellAttributes;
 use termwiz::escape::parser::Parser;
 use termwiz::escape::Action;
-use termwiz::surface::{Line, SequenceNo};
+use termwiz::surface::Line;
 
 const BATCH_SIZES: [usize; 2] = [4 * 1024, 128 * 1024];
 const BENCH_CORPUS_BYTES: usize = 4 * 1024 * 1024;
@@ -274,13 +275,17 @@ impl<'a> Workload<'a> {
     }
 }
 
+/// What both arms must agree on. Sequence numbers are left out: since
+/// ft-yccm0.2.3 the parser hands the lock over on a 2 ms clock, so how many
+/// a run takes depends on timing (a 32 MiB run differed by 7), not on
+/// publication. Rows are compared by their cells and wrap, not by `Line`
+/// equality, which includes each row's seqno.
 #[derive(Debug, PartialEq)]
 struct PaneState {
-    seqno: SequenceNo,
     cursor: StableCursorPosition,
     dimensions: RenderableDimensions,
     title: String,
-    lines: Vec<Line>,
+    rows: Vec<(Vec<(String, CellAttributes)>, bool)>,
 }
 
 fn capture_state(pane: &LocalPane) -> PaneState {
@@ -288,12 +293,19 @@ fn capture_state(pane: &LocalPane) -> PaneState {
     let end = dimensions.physical_top + dimensions.viewport_rows as isize;
     let (_, lines) = pane.get_lines(dimensions.scrollback_top..end);
     PaneState {
-        seqno: pane.get_current_seqno(),
         cursor: pane.get_cursor_position(),
         dimensions,
         title: pane.get_title(),
-        lines,
+        rows: lines.iter().map(row_content).collect(),
     }
+}
+
+fn row_content(line: &Line) -> (Vec<(String, CellAttributes)>, bool) {
+    let cells = line
+        .visible_cells()
+        .map(|cell| (cell.str().to_string(), cell.attrs().clone()))
+        .collect();
+    (cells, line.last_cell_was_wrapped())
 }
 
 /// Both arms must leave the same terminal behind: publication only reads.
@@ -305,7 +317,7 @@ fn assert_arms_leave_identical_state(workload: &Workload<'_>) {
     let published = capture_state(&publish);
     let skipped = capture_state(&skip);
     assert!(
-        !published.lines.is_empty(),
+        !published.rows.is_empty(),
         "the corpus must leave rows behind"
     );
     assert!(
@@ -314,8 +326,8 @@ fn assert_arms_leave_identical_state(workload: &Workload<'_>) {
         workload.label()
     );
     // The publish arm really published; the skip arm kept its initial facts.
-    assert_eq!(publish.render_facts().seqno, published.seqno);
-    assert!(skip.render_facts().seqno < skipped.seqno);
+    assert_eq!(publish.render_facts().seqno, publish.get_current_seqno());
+    assert!(skip.render_facts().seqno < skip.get_current_seqno());
 }
 
 fn timed_run(workload: &Workload<'_>, publish: bool) -> Duration {

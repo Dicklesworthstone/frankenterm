@@ -5,7 +5,7 @@ use crate::parser::ParsedFont;
 #[cfg(not(windows))]
 use crate::rasterizer::colr::DrawOp;
 use anyhow::{anyhow, Context};
-use config::{configuration, FreeTypeLoadFlags, FreeTypeLoadTarget};
+use config::{configuration, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget};
 pub use freetype::*;
 use memmap2::{Mmap, MmapOptions};
 use rangeset::RangeSet;
@@ -1203,14 +1203,36 @@ impl Library {
             }
         }
 
-        // Due to patent concerns, the freetype library disables the LCD
-        // filtering feature by default, and since we always build our
-        // own copy of freetype, it is likewise disabled by default for
-        // us too.  As a result, this call will generally fail.
-        // Freetype is still able to render a decent result without it!
-        lib.set_lcd_filter(FT_LcdFilter::FT_LCD_FILTER_DEFAULT).ok();
+        lib.apply_lcd_filter_config(&config);
 
         Ok(lib)
+    }
+
+    /// Apply `freetype_lcd_filter` and then, when set,
+    /// `freetype_lcd_filter_weights`, which replace the filter's weights.
+    /// They only affect subpixel (`HorizontalLcd` / `VerticalLcd`) renders.
+    /// The vendored FreeType is built with
+    /// `FT_CONFIG_OPTION_SUBPIXEL_RENDERING`, so both calls succeed; a
+    /// FreeType built without it rejects them and renders LCD glyphs with
+    /// its unfiltered "Harmony" method, which is why a failure only logs.
+    fn apply_lcd_filter_config(&mut self, config: &config::Config) {
+        if let Err(err) = self.set_lcd_filter(lcd_filter_to_ft(config.freetype_lcd_filter)) {
+            log::debug!("freetype_lcd_filter: {err:#}");
+        }
+        if let Some(weights) = config.freetype_lcd_filter_weights.as_deref() {
+            match <[u8; 5]>::try_from(weights) {
+                Ok(weights) => {
+                    if let Err(err) = self.set_lcd_filter_weights(weights) {
+                        log::debug!("freetype_lcd_filter_weights: {err:#}");
+                    }
+                }
+                // Config validation rejects any other length.
+                Err(_) => log::error!(
+                    "ignoring freetype_lcd_filter_weights: expected 5 weights, got {}",
+                    weights.len()
+                ),
+            }
+        }
     }
 
     /// Returns the number of faces in a given font.
@@ -1278,6 +1300,26 @@ impl Library {
             ft_result(FT_Library_SetLcdFilter(self.lib, filter), ())
                 .context("FT_Library_SetLcdFilter")
         }
+    }
+
+    /// Replace the LCD filter with five FIR taps in 1/256 units. FreeType
+    /// copies the array; a zero center tap turns filtering off.
+    pub fn set_lcd_filter_weights(&mut self, mut weights: [u8; 5]) -> anyhow::Result<()> {
+        unsafe {
+            ft_result(
+                FT_Library_SetLcdFilterWeights(self.lib, weights.as_mut_ptr()),
+                (),
+            )
+            .context("FT_Library_SetLcdFilterWeights")
+        }
+    }
+}
+
+fn lcd_filter_to_ft(filter: FreeTypeLcdFilter) -> FT_LcdFilter {
+    match filter {
+        FreeTypeLcdFilter::Default => FT_LcdFilter::FT_LCD_FILTER_DEFAULT,
+        FreeTypeLcdFilter::Light => FT_LcdFilter::FT_LCD_FILTER_LIGHT,
+        FreeTypeLcdFilter::None => FT_LcdFilter::FT_LCD_FILTER_NONE,
     }
 }
 
@@ -1554,4 +1596,112 @@ pub fn composite_mode_to_operator(mode: FT_Composite_Mode) -> cairo::Operator {
 
 fn ft_make_tag(a: u8, b: u8, c: u8, d: u8) -> FT_ULong {
     (a as FT_ULong) << 24 | (b as FT_ULong) << 16 | (c as FT_ULong) << 8 | (d as FT_ULong)
+}
+
+#[cfg(test)]
+mod lcd_filter_tests {
+    use super::*;
+    use crate::locator::FontOrigin;
+
+    const DEFAULT_WEIGHTS: [u8; 5] = [0x08, 0x4d, 0x56, 0x4d, 0x08];
+
+    /// The subpixel (HorizontalLcd) bitmap of a few glyphs, rendered with
+    /// whatever LCD filter `lib` has.
+    fn lcd_pixels(lib: &Library) -> Vec<u8> {
+        let handle = FontDataHandle {
+            source: FontDataSource::BuiltIn {
+                name: "JetBrainsMono-Regular.ttf",
+                data: include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"),
+            },
+            index: 0,
+            variation: 0,
+            origin: FontOrigin::BuiltIn,
+            coverage: None,
+        };
+        let mut face = lib.face_from_locator(&handle).unwrap();
+        face.set_font_size(12.0, 96).unwrap();
+        let (load_flags, render_mode) = compute_load_flags_from_config(
+            Some(FreeTypeLoadFlags::default()),
+            Some(FreeTypeLoadTarget::HorizontalLcd),
+            Some(FreeTypeLoadTarget::HorizontalLcd),
+            Some(96),
+        );
+        assert_eq!(render_mode, FT_Render_Mode::FT_RENDER_MODE_LCD);
+        let mut pixels = vec![];
+        for c in ['m', 'w', 'i', 'A'] {
+            let glyph = unsafe { FT_Get_Char_Index(face.face, c as _) };
+            assert_ne!(glyph, 0, "no glyph for {c:?}");
+            let slot = face
+                .load_and_render_glyph(glyph, load_flags, render_mode, false)
+                .unwrap();
+            let bitmap = &slot.bitmap;
+            let len = bitmap.rows as usize * bitmap.pitch.unsigned_abs() as usize;
+            pixels.extend_from_slice(unsafe { from_raw_parts(bitmap.buffer, len) });
+        }
+        assert!(pixels.iter().any(|&p| p != 0), "glyphs rendered blank");
+        pixels
+    }
+
+    fn lib_with_filter(filter: FreeTypeLcdFilter) -> Library {
+        let mut lib = Library::new().unwrap();
+        lib.set_lcd_filter(lcd_filter_to_ft(filter))
+            .unwrap_or_else(|err| panic!("{filter:?} rejected: {err:#}"));
+        lib
+    }
+
+    /// Without FT_CONFIG_OPTION_SUBPIXEL_RENDERING these calls fail and the
+    /// filter options would silently do nothing.
+    #[test]
+    fn every_filter_and_custom_weights_are_accepted() {
+        config::use_test_configuration();
+        for filter in [
+            FreeTypeLcdFilter::Default,
+            FreeTypeLcdFilter::Light,
+            FreeTypeLcdFilter::None,
+        ] {
+            lib_with_filter(filter);
+        }
+        Library::new()
+            .unwrap()
+            .set_lcd_filter_weights([0x00, 0x40, 0x80, 0x40, 0x00])
+            .unwrap();
+    }
+
+    #[test]
+    fn each_filter_renders_subpixel_text_differently() {
+        config::use_test_configuration();
+        let default = lcd_pixels(&lib_with_filter(FreeTypeLcdFilter::Default));
+        let light = lcd_pixels(&lib_with_filter(FreeTypeLcdFilter::Light));
+        let none = lcd_pixels(&lib_with_filter(FreeTypeLcdFilter::None));
+        assert_ne!(default, light);
+        assert_ne!(default, none);
+        assert_ne!(light, none);
+
+        // The Default filter is exactly its documented weights.
+        let mut lib = Library::new().unwrap();
+        lib.set_lcd_filter_weights(DEFAULT_WEIGHTS).unwrap();
+        assert_eq!(lcd_pixels(&lib), default);
+    }
+
+    #[test]
+    fn library_applies_the_configured_filter_and_weights() {
+        config::use_test_configuration();
+        let default = lcd_pixels(&lib_with_filter(FreeTypeLcdFilter::Default));
+        let none = lcd_pixels(&lib_with_filter(FreeTypeLcdFilter::None));
+
+        // Start from the other filter each time, so a no-op would show.
+        let mut config = config::Config::default();
+        let mut lib = lib_with_filter(FreeTypeLcdFilter::None);
+        lib.apply_lcd_filter_config(&config);
+        assert_eq!(lcd_pixels(&lib), default);
+
+        config.freetype_lcd_filter = FreeTypeLcdFilter::None;
+        lib.apply_lcd_filter_config(&config);
+        assert_eq!(lcd_pixels(&lib), none);
+
+        // Custom weights replace the named filter's.
+        config.freetype_lcd_filter_weights = Some(DEFAULT_WEIGHTS.to_vec());
+        lib.apply_lcd_filter_config(&config);
+        assert_eq!(lcd_pixels(&lib), default);
+    }
 }

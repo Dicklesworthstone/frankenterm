@@ -1,0 +1,77 @@
+# ft-yccm0.2.1.7 AC4 native macOS subset: crash and recovery suite
+# host: mac-studio 27.0.1 arm64; toolchain: rustc 1.100.0-nightly (908501772 2026-08-30)
+# source: 15a2b1c46 + da2c97e4b (git diff sha f20faf27eb3d) = the code of 0460bffe4
+# filesystem: /dev/disk3s5   3.6Ti   2.2Ti   1.5Ti      Type (Bundle): apfs
+# TMPDIR: /var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/
+# started 2026-10-12T20:36:17Z load 154.56 174.85 173.90
+running 68 tests
+test guardian_proxy::tests::guardian_domain_successor_image_recovery_and_reopen ... ignored, requires actual sealed candidate identity; run explicitly in strict RCH/DSR
+test guardian_proxy::tests::guardian_recovery_durable_claim_survives_process_death_without_mux_aliasing ... ignored, requires actual sealed candidate identity; run explicitly in strict RCH/DSR
+test guardian_proxy::tests::guardian_recovery_claim_process ... ok
+test delivery_ledger::tests::telemetry_and_external_commands_have_non_item_count_recovery ... ok
+test sessionhandler::tests::notification_recovery_mismatch_retires_under_the_recovery_guard ... ok
+test sessionhandler::ordered_window_adapter::tests::mux_reorder_results_map_to_the_closed_wire_vocabulary ... ok
+test dispatch::tests::same_class_retained_frames_stay_segmented_below_the_write_quantum ... ok
+test guardian_proxy::tests::terminal_observation_preserves_pending_input_recovery_until_exact_disposition_is_known ... ok
+test guardian_proxy::tests::terminal_observation_rejects_retire_and_close_on_partial_input_recovery ... ok
+test sessionhandler::ordered_window_adapter::tests::reorder_request_conversion_validates_digest_before_narrowing ... ok
+test guardian_proxy::tests::terminal_observation_permits_retire_and_close_after_full_input_recovery ... ok
+test guardian_proxy::tests::terminal_observation_rejects_retire_and_close_on_unknown_input_recovery ... ok
+test sessionhandler::tests::notification_settlement_retires_poison_under_the_recovered_guard ... ok
+test sessionhandler::tests::notification_ack_retires_poison_under_the_recovered_guard ... ok
+test dispatch::tests::ordered_reorder_authority_exists_only_after_successful_pdu87 ... ok
+test guardian_proxy::tests::guardian_recovered_domain_rejects_invalid_identity_policy_and_endpoints ... ok
+test dispatch::tests::topology_fence_queues_snapshot_before_reordered_contiguous_events ... ok
+test sessionhandler::tests::legacy_enqueue_recovery_mismatch_retires_under_the_recovery_guard ... ok
+test sessionhandler::tests::legacy_enqueue_rollback_retires_poison_under_the_recovered_guard ... ok
+test sessionhandler::tests::legacy_enqueue_ack_retires_poison_under_the_recovered_guard ... ok
+test sessionhandler::tests::no_change_settlement_retires_poison_under_the_recovered_guard ... ok
+test dispatch::tests::proptest_write_pending_pdus_classifies_network_write_failures_without_reordering ... ok
+test sessionhandler::tests::panicked_abandoned_legacy_enqueue_recovery_cannot_linger_in_flight ... ok
+test sessionhandler::tests::ordered_snapshot_accepts_reorder_completed_before_initial_authority_cut ... ok
+test guardian_proxy::tests::guardian_recovered_domain_preserves_command_policy_identity_and_owner ... ok
+test tests::global_test_state_lock_recovers_without_cascading_failures ... ok
+test dispatch::tests::proptest_write_pending_pdus_retries_transient_network_errors_without_reordering ... ok
+test guardian_output_keys::tests::initial_pending_intent_is_unavailable_read_only_and_recovered_writable ... ok
+test recovery_runtime::tests::periodic_recovery_missing_or_corrupt_authority_never_publishes ... ok
+test tests::a_batch_cut_back_in_process_is_retried_under_a_fresh_nonce_segment ... ok
+test tests::cold_reads_keep_the_last_segment_open_until_it_changes ... ok
+test recovery_runtime::tests::periodic_recovery_busy_domain_retries_then_publishes_without_restart ... ok
+test tests::authenticated_incremental_chain_rejects_reorder_duplication_and_omission ... ok
+test tests::digest_only_wal_names_a_batch_without_copying_it_and_rows_are_written_once ... ok
+test tests::digest_only_wal_publication_refused_before_its_stage_cuts_the_unnamed_rows ... ok
+test tests::live_scrollback_export_ignores_uncommitted_torn_tail ... ok
+test guardian_output_keys::tests::retained_intent_recovers_every_publication_crash_cut_without_replacement ... ok
+test tests::authenticated_append_wal_recovers_with_its_historical_guardian_key ... ok
+test deferred_scrollback::overload_gap_is_one_durable_marker_that_snapshots_and_recovery_see ... ok
+test recovery_runtime::tests::periodic_recovery_real_pty_publishes_consecutive_authenticated_roots ... ok
+test guardian_proxy::tests::selected_recovery_checkpoint_binds_exact_replay_before_acknowledgement ... ok
+test tests::digest_only_wal_publication_cut_short_after_a_complete_stage_rolls_forward_on_reopen ... ok
+test recovery_runtime::tests::periodic_recovery_unsupported_domain_is_terminal_without_publication ... ok
+test sessionhandler::tests::future_enabled_reorder_maps_apply_and_replay_then_rejects_foreign_authority ... ok
+test tests::batches_store_compact_rows_under_one_manifest_named_nonce_segment ... ok
+test tests::row_segment_tables_refuse_reused_bases_and_noncanonical_forms ... ok
+test tests::a_torn_segment_is_cut_from_its_first_row ... ok
+test tests::a_reopen_after_a_crash_reseals_lost_sequences_under_a_fresh_nonce_segment ... ok
+test tests::segments_keep_exact_retention_and_the_oldest_rows_segment_readable ... ok
+test tests::digest_only_wal_recovery_refuses_a_torn_or_missing_batch_without_writing ... ok
+test tests::authenticated_append_wal_supersession_recovers_ack_crash_and_advances_generations ... ok
+test tests::a_reordered_or_torn_tail_is_adopted_only_up_to_its_first_bad_segment ... ok
+test tests::cold_read_bench_hooks_read_back_exact_rows_from_the_stores_segments ... ok
+test recovery_runtime::tests::periodic_recovery_atomic_restore_advances_only_exact_predecessor ... ok
+test tests::native_scrollback_batch_recovery_refuses_mutated_wal_without_writing_content ... ok
+test recovery_runtime::tests::periodic_recovery_shutdown_waits_for_actual_blocking_capture ... ok
+test sessionhandler::tests::ordered_snapshot_retries_reorder_after_all_window_orders_are_frozen ... ok
+test sessionhandler::tests::prepared_install_retires_poison_under_the_recovered_guard ... ok
+test sessionhandler::tests::terminal_sequence_settlement_retires_poison_under_the_recovered_guard ... ok
+test tests::server_unix_listener_does_not_create_unrecoverable_client_domain ... ok
+test tests::legacy_v1_append_wal_recovers_to_v4_across_crash_cuts_and_cold_reopens ... ok
+test tests::authenticated_append_wal_recovers_every_durable_later_row_crash_cut ... ok
+test tests::scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix ... ok
+test tests::a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count ... ok
+test tests::a_tail_killed_between_window_sync_and_publication_recovers_every_window_row ... ok
+test tests::a_full_row_segment_table_falls_back_to_v3_rows_until_retention_frees_a_slot ... ok
+test tests::digest_only_recovery_refuses_or_exactly_restores_after_any_single_bit_flip ... ok
+test tests::every_crash_state_inside_a_transaction_recovers_an_exact_committed_prefix ... ok
+test result: ok. 66 passed; 0 failed; 2 ignored; 0 measured; 742 filtered out; finished in 34.22s
+# finished 2026-10-12T20:36:54Z load 118.29 163.00 169.60

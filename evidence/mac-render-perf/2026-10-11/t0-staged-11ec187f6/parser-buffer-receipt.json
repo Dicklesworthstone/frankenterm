@@ -1,0 +1,6605 @@
+{
+  "aggregate": {
+    "ft": {
+      "beach_balls": 0,
+      "drain_mb_s": {
+        "cv_pct": 10.021171638174527,
+        "max": 92.15758589841859,
+        "mean": 80.2353405505703,
+        "median": 76.77200189122195,
+        "min": 75.23977252141874,
+        "n": 4,
+        "values": [
+          77.96884767580705,
+          75.23977252141874,
+          75.57515610663684,
+          92.15758589841859
+        ]
+      },
+      "drain_s": {
+        "cv_pct": 9.17377949523251,
+        "max": 9.965487333,
+        "mean": 9.40987478125,
+        "median": 9.7689685625,
+        "min": 8.136074667,
+        "n": 4,
+        "values": [
+          9.616674125,
+          9.965487333,
+          9.921263,
+          8.136074667
+        ]
+      },
+      "footprint_after": [
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/00-ft/footprint/ft-52074-20261011T230603Z",
+          "gpu_owned_bytes": 14516224,
+          "phys_footprint": 987252368,
+          "rss_bytes": 407879680
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/03-ft/footprint/ft-57667-20261011T230651Z",
+          "gpu_owned_bytes": 16859136,
+          "phys_footprint": 998573712,
+          "rss_bytes": 411041792
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/04-ft/footprint/ft-59070-20261011T230707Z",
+          "gpu_owned_bytes": 16629760,
+          "phys_footprint": 992315048,
+          "rss_bytes": 404258816
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/07-ft/footprint/ft-62644-20261011T230752Z",
+          "gpu_owned_bytes": 16859136,
+          "phys_footprint": 1082394352,
+          "rss_bytes": 494764032
+        }
+      ],
+      "internal_present_fps": {
+        "cv_pct": 0.2960195258206036,
+        "max": 58.49959606864206,
+        "mean": 58.29841390254764,
+        "median": 58.301361769405034,
+        "min": 58.09133600273841,
+        "n": 4,
+        "values": [
+          58.49959606864206,
+          58.356011421015516,
+          58.24671211779456,
+          58.09133600273841
+        ]
+      },
+      "mean_fps": null,
+      "stall_max_s": 0.0,
+      "time_total_s": {
+        "cv_pct": 9.164234825825055,
+        "max": 9.972,
+        "mean": 9.4165,
+        "median": 9.775500000000001,
+        "min": 8.143,
+        "n": 4,
+        "values": [
+          9.624,
+          9.972,
+          9.927,
+          8.143
+        ]
+      }
+    },
+    "ft_baseline": {
+      "beach_balls": 0,
+      "drain_mb_s": {
+        "cv_pct": 6.301456206324099,
+        "max": 87.64535523266886,
+        "mean": 80.14848634749627,
+        "median": 78.05734704939925,
+        "min": 76.83389605851772,
+        "n": 4,
+        "values": [
+          78.59957918147526,
+          76.83389605851772,
+          77.51511491732323,
+          87.64535523266886
+        ]
+      },
+      "drain_s": {
+        "cv_pct": 5.95206168442574,
+        "max": 9.758726792,
+        "mean": 9.38153466675,
+        "median": 9.606234541500001,
+        "min": 8.554942792,
+        "n": 4,
+        "values": [
+          9.539504,
+          9.758726792,
+          9.672965083,
+          8.554942792
+        ]
+      },
+      "footprint_after": [
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/01-ft_baseline/footprint/ft_baseline-53268-20261011T230619Z",
+          "gpu_owned_bytes": 14319616,
+          "phys_footprint": 972277416,
+          "rss_bytes": 392708096
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/02-ft_baseline/footprint/ft_baseline-54566-20261011T230635Z",
+          "gpu_owned_bytes": 16859136,
+          "phys_footprint": 946996880,
+          "rss_bytes": 359415808
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/05-ft_baseline/footprint/ft_baseline-60257-20261011T230723Z",
+          "gpu_owned_bytes": 16662528,
+          "phys_footprint": 1003325120,
+          "rss_bytes": 415432704
+        },
+        {
+          "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/06-ft_baseline/footprint/ft_baseline-61656-20261011T230738Z",
+          "gpu_owned_bytes": 16859136,
+          "phys_footprint": 1041696448,
+          "rss_bytes": 454082560
+        }
+      ],
+      "internal_present_fps": {
+        "cv_pct": 0.4826913803479396,
+        "max": 58.82435878170601,
+        "mean": 58.55596610363195,
+        "median": 58.61039306603565,
+        "min": 58.1787195007505,
+        "n": 4,
+        "values": [
+          58.82435878170601,
+          58.1787195007505,
+          58.511930651821835,
+          58.70885548024946
+        ]
+      },
+      "mean_fps": null,
+      "stall_max_s": 0.0,
+      "time_total_s": {
+        "cv_pct": 5.9487467061772,
+        "max": 9.766,
+        "mean": 9.3875,
+        "median": 9.6115,
+        "min": 8.561,
+        "n": 4,
+        "values": [
+          9.545,
+          9.766,
+          9.678,
+          8.561
+        ]
+      }
+    }
+  },
+  "arms": {
+    "ft": {
+      "env": {},
+      "gui_bin": "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/frankenterm-gui",
+      "kind": "ft",
+      "lua": [],
+      "name": "ft"
+    },
+    "ft_baseline": {
+      "env": {},
+      "gui_bin": "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/frankenterm-gui",
+      "kind": "ft",
+      "lua": [
+        "config.mux_output_parser_buffer_size = 512 * 1024"
+      ],
+      "name": "ft_baseline"
+    }
+  },
+  "contention": null,
+  "corpus": {
+    "bytes": 749801000,
+    "label": "T0",
+    "name": "color_emoji_random",
+    "path": "/Users/jemanuel/color-emoji-random.bin",
+    "sha256": "a442d89593da3bbfd1d059e186b999387098c2aa7d8d4a8df88f47b811c43767",
+    "source": "file"
+  },
+  "cpu_hog": {
+    "aggregate_level": 0,
+    "levels": [
+      0
+    ],
+    "order": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "source": "import ctypes;ctypes.CDLL(None).pthread_set_qos_class_self_np(0x15,0);print('ready',flush=True);any(iter(int,1))"
+  },
+  "display": {
+    "refresh_hz": 60,
+    "scale": [
+      1
+    ]
+  },
+  "fingerprint": {
+    "cpu": "Apple M5 Ultra",
+    "displays": [
+      {
+        "display_id": 6,
+        "frame_points": [
+          0,
+          0,
+          1920,
+          1200
+        ],
+        "main": true,
+        "max_fps": 60,
+        "mode_pixels": [
+          1920,
+          1200
+        ],
+        "mode_points": [
+          1920,
+          1200
+        ],
+        "mode_refresh_hz": 60,
+        "name": "DELL 3008WFP",
+        "scale": 1
+      }
+    ],
+    "efficiency_cores": "24",
+    "harness_repo_head": "11ec187f6859ca03dcb22e09e926cd36dcf2ae30",
+    "hw_model": "Mac17,15",
+    "memsize": "274877906944",
+    "ncpu": "36",
+    "os": "macOS 27.0.1 26A434",
+    "perf_cores": "12",
+    "power_source": "Now drawing from 'AC Power'",
+    "python": "3.14.6"
+  },
+  "finished_utc": "2026-10-11T23:07:54.730819+00:00",
+  "flood_corpus": null,
+  "fps_measured": false,
+  "ft": {
+    "baseline_gui_bin_sha256": "c9aa43b89720ce69085f7251d8fd0826617cb6434b987d156e021f5075d6cd1e",
+    "env": [],
+    "front_end": "WebGpu",
+    "gui_bin": "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/frankenterm-gui",
+    "gui_bin_sha256": "c9aa43b89720ce69085f7251d8fd0826617cb6434b987d156e021f5075d6cd1e",
+    "lua": [],
+    "max_fps": 120,
+    "scrollback_lines": 100000,
+    "snapshot_interval_ms": 500,
+    "throttle_interval_ms": 8.333334
+  },
+  "geometry": {
+    "cols": 120,
+    "font_family": "Pragmasevka Nerd Font",
+    "font_size": 16.0,
+    "rows": 40,
+    "sibling_flood": false
+  },
+  "harness": {
+    "argv": [
+      "--gui-bin",
+      "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/frankenterm-gui",
+      "--ft-bin",
+      "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/ft",
+      "--corpus-file",
+      "/Users/jemanuel/color-emoji-random.bin",
+      "--baseline",
+      "ft",
+      "--baseline-ft-lua",
+      "config.mux_output_parser_buffer_size = 512 * 1024",
+      "--reps",
+      "4",
+      "--no-fps",
+      "--no-beachball-probe",
+      "--out",
+      "/Users/jemanuel/ft-staging/5351b/t0/parser-buf"
+    ],
+    "meter_sha256": "66cb433c7c660a051b6d8067b79a13615378d40e3599562bd57ce140940be520",
+    "script_sha256": "15a3d0521475f03b7681851db4c7d515ea927ef83186076e430e78ab2d9ceb2d",
+    "token": "ftgt-parser-buf"
+  },
+  "incumbent": null,
+  "isolation": {
+    "env": {
+      "HOME": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home",
+      "LANG": "en_US.UTF-8",
+      "LOGNAME": "jemanuel",
+      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+      "TMPDIR": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/tmp/",
+      "USER": "jemanuel",
+      "XDG_CACHE_HOME": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.cache",
+      "XDG_CONFIG_HOME": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.config",
+      "XDG_DATA_HOME": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share",
+      "XDG_RUNTIME_DIR": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/xdg-runtime"
+    },
+    "probe": {
+      "exit": 1,
+      "ft_bin": "/Users/jemanuel/ft-staging/5351b/app/FrankenTerm.app/Contents/MacOS/ft",
+      "status": "ok"
+    }
+  },
+  "order": [
+    "ft",
+    "ft_baseline",
+    "ft_baseline",
+    "ft",
+    "ft",
+    "ft_baseline",
+    "ft_baseline",
+    "ft"
+  ],
+  "runs": [
+    {
+      "arm": "ft",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/00-ft/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.616674125,
+        "interval_mb_s": {
+          "p5": 64.99319985689837,
+          "p50": 76.76630311330578,
+          "p95": 94.45023107544273
+        },
+        "mb_s": 77.96884767580705,
+        "mib_s": 74.35688750820832,
+        "samples": 39,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96667421688541,
+        96677038362666
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/00-ft/footprint/ft-52074-20261011T230603Z",
+        "gpu_owned_bytes": 14516224,
+        "phys_footprint": 987252368,
+        "rss_bytes": 407879680
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 169017344,
+            "allocated": 139769136,
+            "mapped": 402440192,
+            "resident": 284983296,
+            "retained": 292765696
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 590,
+          "painted_frames_total": 586,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 585,
+            "max_ns": 1680974375,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12733763750
+          },
+          "presented_total": 586,
+          "retried_paint_frames_total": 3,
+          "stale_presented_total": 3
+        },
+        "points": 28,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3389,
+                "max_ns": 53500,
+                "p50_ns": 47,
+                "p95_ns": 2559,
+                "p99_ns": 3071,
+                "total_ns": 1526372
+              },
+              "wait": {
+                "count": 3389,
+                "max_ns": 271708,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 670126
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 590,
+                "max_ns": 649958,
+                "p50_ns": 393215,
+                "p95_ns": 524287,
+                "p99_ns": 649958,
+                "total_ns": 203301261
+              },
+              "wait": {
+                "count": 590,
+                "max_ns": 240167,
+                "p50_ns": 0,
+                "p95_ns": 28671,
+                "p99_ns": 49151,
+                "total_ns": 3061871
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4797,
+                "max_ns": 2041375,
+                "p50_ns": 163839,
+                "p95_ns": 2041375,
+                "p99_ns": 2041375,
+                "total_ns": 3223523101
+              },
+              "wait": {
+                "count": 4797,
+                "max_ns": 616000,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 67090838
+              }
+            }
+          },
+          "main_thread_blocked_ns": 3061871,
+          "main_thread_blocked_waits": 187,
+          "main_thread_max_wait_ns": 240167
+        }
+      },
+      "index": 0,
+      "internal_present": {
+        "fps": 58.49959606864206,
+        "presented": 562.5715518362618
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-52074.json",
+      "kind": "ft",
+      "load_end": [
+        21.81,
+        22.15,
+        19.57
+      ],
+      "load_go": [
+        22.61,
+        22.31,
+        19.58
+      ],
+      "load_start": [
+        22.61,
+        22.31,
+        19.58
+      ],
+      "offset_cross_check": {
+        "lsof": 3014727,
+        "proc_pidfdinfo": 131143
+      },
+      "pids": {
+        "ancestry": [
+          52110,
+          52074,
+          51984
+        ],
+        "cat": 52237,
+        "shell": 52110,
+        "terminal": 52074
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/00-ft",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 11
+            },
+            "cpu_s": 6.662,
+            "current_priorities": {
+              "20": 11
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.452,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.9,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.715,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.106,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.099,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.09,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 4,
+              "user-initiated": 7
+            },
+            "cpu_s": 0.089,
+            "current_priorities": {
+              "31": 4,
+              "37": 7
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.089,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 1
+            },
+            "cpu_s": 0.032,
+            "current_priorities": {
+              "31": 2,
+              "37": 1
+            },
+            "name": "(unnamed)",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.024,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 3
+            },
+            "cpu_s": 0.017,
+            "current_priorities": {
+              "37": 3
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.011,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "terminal-threaded-writer",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.782,
+          "user-initiated": 12.843,
+          "utility": 6.662
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 52,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 5.06s system 52% cpu 9.624 total",
+        "system_s": 5.06,
+        "total_s": 9.624,
+        "user_s": 0.01
+      },
+      "widths": {
+        "failed": [],
+        "histogram": {
+          "1": 282,
+          "2": 1094
+        },
+        "seconds": 0.201,
+        "widths": {
+          "1F300": 2,
+          "1F301": 2,
+          "1F302": 2,
+          "1F303": 2,
+          "1F304": 2,
+          "1F305": 2,
+          "1F306": 2,
+          "1F307": 2,
+          "1F308": 2,
+          "1F309": 2,
+          "1F30A": 2,
+          "1F30B": 2,
+          "1F30C": 2,
+          "1F30D": 2,
+          "1F30E": 2,
+          "1F30F": 2,
+          "1F310": 2,
+          "1F311": 2,
+          "1F312": 2,
+          "1F313": 2,
+          "1F314": 2,
+          "1F315": 2,
+          "1F316": 2,
+          "1F317": 2,
+          "1F318": 2,
+          "1F319": 2,
+          "1F31A": 2,
+          "1F31B": 2,
+          "1F31C": 2,
+          "1F31D": 2,
+          "1F31E": 2,
+          "1F31F": 2,
+          "1F320": 2,
+          "1F321": 1,
+          "1F322": 1,
+          "1F323": 1,
+          "1F324": 1,
+          "1F325": 1,
+          "1F326": 1,
+          "1F327": 1,
+          "1F328": 1,
+          "1F329": 1,
+          "1F32A": 1,
+          "1F32B": 1,
+          "1F32C": 1,
+          "1F32D": 2,
+          "1F32E": 2,
+          "1F32F": 2,
+          "1F330": 2,
+          "1F331": 2,
+          "1F332": 2,
+          "1F333": 2,
+          "1F334": 2,
+          "1F335": 2,
+          "1F336": 1,
+          "1F337": 2,
+          "1F338": 2,
+          "1F339": 2,
+          "1F33A": 2,
+          "1F33B": 2,
+          "1F33C": 2,
+          "1F33D": 2,
+          "1F33E": 2,
+          "1F33F": 2,
+          "1F340": 2,
+          "1F341": 2,
+          "1F342": 2,
+          "1F343": 2,
+          "1F344": 2,
+          "1F345": 2,
+          "1F346": 2,
+          "1F347": 2,
+          "1F348": 2,
+          "1F349": 2,
+          "1F34A": 2,
+          "1F34B": 2,
+          "1F34C": 2,
+          "1F34D": 2,
+          "1F34E": 2,
+          "1F34F": 2,
+          "1F350": 2,
+          "1F351": 2,
+          "1F352": 2,
+          "1F353": 2,
+          "1F354": 2,
+          "1F355": 2,
+          "1F356": 2,
+          "1F357": 2,
+          "1F358": 2,
+          "1F359": 2,
+          "1F35A": 2,
+          "1F35B": 2,
+          "1F35C": 2,
+          "1F35D": 2,
+          "1F35E": 2,
+          "1F35F": 2,
+          "1F360": 2,
+          "1F361": 2,
+          "1F362": 2,
+          "1F363": 2,
+          "1F364": 2,
+          "1F365": 2,
+          "1F366": 2,
+          "1F367": 2,
+          "1F368": 2,
+          "1F369": 2,
+          "1F36A": 2,
+          "1F36B": 2,
+          "1F36C": 2,
+          "1F36D": 2,
+          "1F36E": 2,
+          "1F36F": 2,
+          "1F370": 2,
+          "1F371": 2,
+          "1F372": 2,
+          "1F373": 2,
+          "1F374": 2,
+          "1F375": 2,
+          "1F376": 2,
+          "1F377": 2,
+          "1F378": 2,
+          "1F379": 2,
+          "1F37A": 2,
+          "1F37B": 2,
+          "1F37C": 2,
+          "1F37D": 1,
+          "1F37E": 2,
+          "1F37F": 2,
+          "1F380": 2,
+          "1F381": 2,
+          "1F382": 2,
+          "1F383": 2,
+          "1F384": 2,
+          "1F385": 2,
+          "1F386": 2,
+          "1F387": 2,
+          "1F388": 2,
+          "1F389": 2,
+          "1F38A": 2,
+          "1F38B": 2,
+          "1F38C": 2,
+          "1F38D": 2,
+          "1F38E": 2,
+          "1F38F": 2,
+          "1F390": 2,
+          "1F391": 2,
+          "1F392": 2,
+          "1F393": 2,
+          "1F394": 1,
+          "1F395": 1,
+          "1F396": 1,
+          "1F397": 1,
+          "1F398": 1,
+          "1F399": 1,
+          "1F39A": 1,
+          "1F39B": 1,
+          "1F39C": 1,
+          "1F39D": 1,
+          "1F39E": 1,
+          "1F39F": 1,
+          "1F3A0": 2,
+          "1F3A1": 2,
+          "1F3A2": 2,
+          "1F3A3": 2,
+          "1F3A4": 2,
+          "1F3A5": 2,
+          "1F3A6": 2,
+          "1F3A7": 2,
+          "1F3A8": 2,
+          "1F3A9": 2,
+          "1F3AA": 2,
+          "1F3AB": 2,
+          "1F3AC": 2,
+          "1F3AD": 2,
+          "1F3AE": 2,
+          "1F3AF": 2,
+          "1F3B0": 2,
+          "1F3B1": 2,
+          "1F3B2": 2,
+          "1F3B3": 2,
+          "1F3B4": 2,
+          "1F3B5": 2,
+          "1F3B6": 2,
+          "1F3B7": 2,
+          "1F3B8": 2,
+          "1F3B9": 2,
+          "1F3BA": 2,
+          "1F3BB": 2,
+          "1F3BC": 2,
+          "1F3BD": 2,
+          "1F3BE": 2,
+          "1F3BF": 2,
+          "1F3C0": 2,
+          "1F3C1": 2,
+          "1F3C2": 2,
+          "1F3C3": 2,
+          "1F3C4": 2,
+          "1F3C5": 2,
+          "1F3C6": 2,
+          "1F3C7": 2,
+          "1F3C8": 2,
+          "1F3C9": 2,
+          "1F3CA": 2,
+          "1F3CB": 1,
+          "1F3CC": 1,
+          "1F3CD": 1,
+          "1F3CE": 1,
+          "1F3CF": 2,
+          "1F3D0": 2,
+          "1F3D1": 2,
+          "1F3D2": 2,
+          "1F3D3": 2,
+          "1F3D4": 1,
+          "1F3D5": 1,
+          "1F3D6": 1,
+          "1F3D7": 1,
+          "1F3D8": 1,
+          "1F3D9": 1,
+          "1F3DA": 1,
+          "1F3DB": 1,
+          "1F3DC": 1,
+          "1F3DD": 1,
+          "1F3DE": 1,
+          "1F3DF": 1,
+          "1F3E0": 2,
+          "1F3E1": 2,
+          "1F3E2": 2,
+          "1F3E3": 2,
+          "1F3E4": 2,
+          "1F3E5": 2,
+          "1F3E6": 2,
+          "1F3E7": 2,
+          "1F3E8": 2,
+          "1F3E9": 2,
+          "1F3EA": 2,
+          "1F3EB": 2,
+          "1F3EC": 2,
+          "1F3ED": 2,
+          "1F3EE": 2,
+          "1F3EF": 2,
+          "1F3F0": 2,
+          "1F3F1": 1,
+          "1F3F2": 1,
+          "1F3F3": 1,
+          "1F3F4": 2,
+          "1F3F5": 1,
+          "1F3F6": 1,
+          "1F3F7": 1,
+          "1F3F8": 2,
+          "1F3F9": 2,
+          "1F3FA": 2,
+          "1F3FB": 2,
+          "1F3FC": 2,
+          "1F3FD": 2,
+          "1F3FE": 2,
+          "1F3FF": 2,
+          "1F400": 2,
+          "1F401": 2,
+          "1F402": 2,
+          "1F403": 2,
+          "1F404": 2,
+          "1F405": 2,
+          "1F406": 2,
+          "1F407": 2,
+          "1F408": 2,
+          "1F409": 2,
+          "1F40A": 2,
+          "1F40B": 2,
+          "1F40C": 2,
+          "1F40D": 2,
+          "1F40E": 2,
+          "1F40F": 2,
+          "1F410": 2,
+          "1F411": 2,
+          "1F412": 2,
+          "1F413": 2,
+          "1F414": 2,
+          "1F415": 2,
+          "1F416": 2,
+          "1F417": 2,
+          "1F418": 2,
+          "1F419": 2,
+          "1F41A": 2,
+          "1F41B": 2,
+          "1F41C": 2,
+          "1F41D": 2,
+          "1F41E": 2,
+          "1F41F": 2,
+          "1F420": 2,
+          "1F421": 2,
+          "1F422": 2,
+          "1F423": 2,
+          "1F424": 2,
+          "1F425": 2,
+          "1F426": 2,
+          "1F427": 2,
+          "1F428": 2,
+          "1F429": 2,
+          "1F42A": 2,
+          "1F42B": 2,
+          "1F42C": 2,
+          "1F42D": 2,
+          "1F42E": 2,
+          "1F42F": 2,
+          "1F430": 2,
+          "1F431": 2,
+          "1F432": 2,
+          "1F433": 2,
+          "1F434": 2,
+          "1F435": 2,
+          "1F436": 2,
+          "1F437": 2,
+          "1F438": 2,
+          "1F439": 2,
+          "1F43A": 2,
+          "1F43B": 2,
+          "1F43C": 2,
+          "1F43D": 2,
+          "1F43E": 2,
+          "1F43F": 1,
+          "1F440": 2,
+          "1F441": 1,
+          "1F442": 2,
+          "1F443": 2,
+          "1F444": 2,
+          "1F445": 2,
+          "1F446": 2,
+          "1F447": 2,
+          "1F448": 2,
+          "1F449": 2,
+          "1F44A": 2,
+          "1F44B": 2,
+          "1F44C": 2,
+          "1F44D": 2,
+          "1F44E": 2,
+          "1F44F": 2,
+          "1F450": 2,
+          "1F451": 2,
+          "1F452": 2,
+          "1F453": 2,
+          "1F454": 2,
+          "1F455": 2,
+          "1F456": 2,
+          "1F457": 2,
+          "1F458": 2,
+          "1F459": 2,
+          "1F45A": 2,
+          "1F45B": 2,
+          "1F45C": 2,
+          "1F45D": 2,
+          "1F45E": 2,
+          "1F45F": 2,
+          "1F460": 2,
+          "1F461": 2,
+          "1F462": 2,
+          "1F463": 2,
+          "1F464": 2,
+          "1F465": 2,
+          "1F466": 2,
+          "1F467": 2,
+          "1F468": 2,
+          "1F469": 2,
+          "1F46A": 2,
+          "1F46B": 2,
+          "1F46C": 2,
+          "1F46D": 2,
+          "1F46E": 2,
+          "1F46F": 2,
+          "1F470": 2,
+          "1F471": 2,
+          "1F472": 2,
+          "1F473": 2,
+          "1F474": 2,
+          "1F475": 2,
+          "1F476": 2,
+          "1F477": 2,
+          "1F478": 2,
+          "1F479": 2,
+          "1F47A": 2,
+          "1F47B": 2,
+          "1F47C": 2,
+          "1F47D": 2,
+          "1F47E": 2,
+          "1F47F": 2,
+          "1F480": 2,
+          "1F481": 2,
+          "1F482": 2,
+          "1F483": 2,
+          "1F484": 2,
+          "1F485": 2,
+          "1F486": 2,
+          "1F487": 2,
+          "1F488": 2,
+          "1F489": 2,
+          "1F48A": 2,
+          "1F48B": 2,
+          "1F48C": 2,
+          "1F48D": 2,
+          "1F48E": 2,
+          "1F48F": 2,
+          "1F490": 2,
+          "1F491": 2,
+          "1F492": 2,
+          "1F493": 2,
+          "1F494": 2,
+          "1F495": 2,
+          "1F496": 2,
+          "1F497": 2,
+          "1F498": 2,
+          "1F499": 2,
+          "1F49A": 2,
+          "1F49B": 2,
+          "1F49C": 2,
+          "1F49D": 2,
+          "1F49E": 2,
+          "1F49F": 2,
+          "1F4A0": 2,
+          "1F4A1": 2,
+          "1F4A2": 2,
+          "1F4A3": 2,
+          "1F4A4": 2,
+          "1F4A5": 2,
+          "1F4A6": 2,
+          "1F4A7": 2,
+          "1F4A8": 2,
+          "1F4A9": 2,
+          "1F4AA": 2,
+          "1F4AB": 2,
+          "1F4AC": 2,
+          "1F4AD": 2,
+          "1F4AE": 2,
+          "1F4AF": 2,
+          "1F4B0": 2,
+          "1F4B1": 2,
+          "1F4B2": 2,
+          "1F4B3": 2,
+          "1F4B4": 2,
+          "1F4B5": 2,
+          "1F4B6": 2,
+          "1F4B7": 2,
+          "1F4B8": 2,
+          "1F4B9": 2,
+          "1F4BA": 2,
+          "1F4BB": 2,
+          "1F4BC": 2,
+          "1F4BD": 2,
+          "1F4BE": 2,
+          "1F4BF": 2,
+          "1F4C0": 2,
+          "1F4C1": 2,
+          "1F4C2": 2,
+          "1F4C3": 2,
+          "1F4C4": 2,
+          "1F4C5": 2,
+          "1F4C6": 2,
+          "1F4C7": 2,
+          "1F4C8": 2,
+          "1F4C9": 2,
+          "1F4CA": 2,
+          "1F4CB": 2,
+          "1F4CC": 2,
+          "1F4CD": 2,
+          "1F4CE": 2,
+          "1F4CF": 2,
+          "1F4D0": 2,
+          "1F4D1": 2,
+          "1F4D2": 2,
+          "1F4D3": 2,
+          "1F4D4": 2,
+          "1F4D5": 2,
+          "1F4D6": 2,
+          "1F4D7": 2,
+          "1F4D8": 2,
+          "1F4D9": 2,
+          "1F4DA": 2,
+          "1F4DB": 2,
+          "1F4DC": 2,
+          "1F4DD": 2,
+          "1F4DE": 2,
+          "1F4DF": 2,
+          "1F4E0": 2,
+          "1F4E1": 2,
+          "1F4E2": 2,
+          "1F4E3": 2,
+          "1F4E4": 2,
+          "1F4E5": 2,
+          "1F4E6": 2,
+          "1F4E7": 2,
+          "1F4E8": 2,
+          "1F4E9": 2,
+          "1F4EA": 2,
+          "1F4EB": 2,
+          "1F4EC": 2,
+          "1F4ED": 2,
+          "1F4EE": 2,
+          "1F4EF": 2,
+          "1F4F0": 2,
+          "1F4F1": 2,
+          "1F4F2": 2,
+          "1F4F3": 2,
+          "1F4F4": 2,
+          "1F4F5": 2,
+          "1F4F6": 2,
+          "1F4F7": 2,
+          "1F4F8": 2,
+          "1F4F9": 2,
+          "1F4FA": 2,
+          "1F4FB": 2,
+          "1F4FC": 2,
+          "1F4FD": 1,
+          "1F4FE": 1,
+          "1F4FF": 2,
+          "1F500": 2,
+          "1F501": 2,
+          "1F502": 2,
+          "1F503": 2,
+          "1F504": 2,
+          "1F505": 2,
+          "1F506": 2,
+          "1F507": 2,
+          "1F508": 2,
+          "1F509": 2,
+          "1F50A": 2,
+          "1F50B": 2,
+          "1F50C": 2,
+          "1F50D": 2,
+          "1F50E": 2,
+          "1F50F": 2,
+          "1F510": 2,
+          "1F511": 2,
+          "1F512": 2,
+          "1F513": 2,
+          "1F514": 2,
+          "1F515": 2,
+          "1F516": 2,
+          "1F517": 2,
+          "1F518": 2,
+          "1F519": 2,
+          "1F51A": 2,
+          "1F51B": 2,
+          "1F51C": 2,
+          "1F51D": 2,
+          "1F51E": 2,
+          "1F51F": 2,
+          "1F520": 2,
+          "1F521": 2,
+          "1F522": 2,
+          "1F523": 2,
+          "1F524": 2,
+          "1F525": 2,
+          "1F526": 2,
+          "1F527": 2,
+          "1F528": 2,
+          "1F529": 2,
+          "1F52A": 2,
+          "1F52B": 2,
+          "1F52C": 2,
+          "1F52D": 2,
+          "1F52E": 2,
+          "1F52F": 2,
+          "1F530": 2,
+          "1F531": 2,
+          "1F532": 2,
+          "1F533": 2,
+          "1F534": 2,
+          "1F535": 2,
+          "1F536": 2,
+          "1F537": 2,
+          "1F538": 2,
+          "1F539": 2,
+          "1F53A": 2,
+          "1F53B": 2,
+          "1F53C": 2,
+          "1F53D": 2,
+          "1F53E": 1,
+          "1F53F": 1,
+          "1F540": 1,
+          "1F541": 1,
+          "1F542": 1,
+          "1F543": 1,
+          "1F544": 1,
+          "1F545": 1,
+          "1F546": 1,
+          "1F547": 1,
+          "1F548": 1,
+          "1F549": 1,
+          "1F54A": 1,
+          "1F54B": 2,
+          "1F54C": 2,
+          "1F54D": 2,
+          "1F54E": 2,
+          "1F54F": 1,
+          "1F550": 2,
+          "1F551": 2,
+          "1F552": 2,
+          "1F553": 2,
+          "1F554": 2,
+          "1F555": 2,
+          "1F556": 2,
+          "1F557": 2,
+          "1F558": 2,
+          "1F559": 2,
+          "1F55A": 2,
+          "1F55B": 2,
+          "1F55C": 2,
+          "1F55D": 2,
+          "1F55E": 2,
+          "1F55F": 2,
+          "1F560": 2,
+          "1F561": 2,
+          "1F562": 2,
+          "1F563": 2,
+          "1F564": 2,
+          "1F565": 2,
+          "1F566": 2,
+          "1F567": 2,
+          "1F568": 1,
+          "1F569": 1,
+          "1F56A": 1,
+          "1F56B": 1,
+          "1F56C": 1,
+          "1F56D": 1,
+          "1F56E": 1,
+          "1F56F": 1,
+          "1F570": 1,
+          "1F571": 1,
+          "1F572": 1,
+          "1F573": 1,
+          "1F574": 1,
+          "1F575": 1,
+          "1F576": 1,
+          "1F577": 1,
+          "1F578": 1,
+          "1F579": 1,
+          "1F57A": 2,
+          "1F57B": 1,
+          "1F57C": 1,
+          "1F57D": 1,
+          "1F57E": 1,
+          "1F57F": 1,
+          "1F580": 1,
+          "1F581": 1,
+          "1F582": 1,
+          "1F583": 1,
+          "1F584": 1,
+          "1F585": 1,
+          "1F586": 1,
+          "1F587": 1,
+          "1F588": 1,
+          "1F589": 1,
+          "1F58A": 1,
+          "1F58B": 1,
+          "1F58C": 1,
+          "1F58D": 1,
+          "1F58E": 1,
+          "1F58F": 1,
+          "1F590": 1,
+          "1F591": 1,
+          "1F592": 1,
+          "1F593": 1,
+          "1F594": 1,
+          "1F595": 2,
+          "1F596": 2,
+          "1F597": 1,
+          "1F598": 1,
+          "1F599": 1,
+          "1F59A": 1,
+          "1F59B": 1,
+          "1F59C": 1,
+          "1F59D": 1,
+          "1F59E": 1,
+          "1F59F": 1,
+          "1F5A0": 1,
+          "1F5A1": 1,
+          "1F5A2": 1,
+          "1F5A3": 1,
+          "1F5A4": 2,
+          "1F5A5": 1,
+          "1F5A6": 1,
+          "1F5A7": 1,
+          "1F5A8": 1,
+          "1F5A9": 1,
+          "1F5AA": 1,
+          "1F5AB": 1,
+          "1F5AC": 1,
+          "1F5AD": 1,
+          "1F5AE": 1,
+          "1F5AF": 1,
+          "1F5B0": 1,
+          "1F5B1": 1,
+          "1F5B2": 1,
+          "1F5B3": 1,
+          "1F5B4": 1,
+          "1F5B5": 1,
+          "1F5B6": 1,
+          "1F5B7": 1,
+          "1F5B8": 1,
+          "1F5B9": 1,
+          "1F5BA": 1,
+          "1F5BB": 1,
+          "1F5BC": 1,
+          "1F5BD": 1,
+          "1F5BE": 1,
+          "1F5BF": 1,
+          "1F5C0": 1,
+          "1F5C1": 1,
+          "1F5C2": 1,
+          "1F5C3": 1,
+          "1F5C4": 1,
+          "1F5C5": 1,
+          "1F5C6": 1,
+          "1F5C7": 1,
+          "1F5C8": 1,
+          "1F5C9": 1,
+          "1F5CA": 1,
+          "1F5CB": 1,
+          "1F5CC": 1,
+          "1F5CD": 1,
+          "1F5CE": 1,
+          "1F5CF": 1,
+          "1F5D0": 1,
+          "1F5D1": 1,
+          "1F5D2": 1,
+          "1F5D3": 1,
+          "1F5D4": 1,
+          "1F5D5": 1,
+          "1F5D6": 1,
+          "1F5D7": 1,
+          "1F5D8": 1,
+          "1F5D9": 1,
+          "1F5DA": 1,
+          "1F5DB": 1,
+          "1F5DC": 1,
+          "1F5DD": 1,
+          "1F5DE": 1,
+          "1F5DF": 1,
+          "1F5E0": 1,
+          "1F5E1": 1,
+          "1F5E2": 1,
+          "1F5E3": 1,
+          "1F5E4": 1,
+          "1F5E5": 1,
+          "1F5E6": 1,
+          "1F5E7": 1,
+          "1F5E8": 1,
+          "1F5E9": 1,
+          "1F5EA": 1,
+          "1F5EB": 1,
+          "1F5EC": 1,
+          "1F5ED": 1,
+          "1F5EE": 1,
+          "1F5EF": 1,
+          "1F5F0": 1,
+          "1F5F1": 1,
+          "1F5F2": 1,
+          "1F5F3": 1,
+          "1F5F4": 1,
+          "1F5F5": 1,
+          "1F5F6": 1,
+          "1F5F7": 1,
+          "1F5F8": 1,
+          "1F5F9": 1,
+          "1F5FA": 1,
+          "1F5FB": 2,
+          "1F5FC": 2,
+          "1F5FD": 2,
+          "1F5FE": 2,
+          "1F5FF": 2,
+          "1F600": 2,
+          "1F601": 2,
+          "1F602": 2,
+          "1F603": 2,
+          "1F604": 2,
+          "1F605": 2,
+          "1F606": 2,
+          "1F607": 2,
+          "1F608": 2,
+          "1F609": 2,
+          "1F60A": 2,
+          "1F60B": 2,
+          "1F60C": 2,
+          "1F60D": 2,
+          "1F60E": 2,
+          "1F60F": 2,
+          "1F610": 2,
+          "1F611": 2,
+          "1F612": 2,
+          "1F613": 2,
+          "1F614": 2,
+          "1F615": 2,
+          "1F616": 2,
+          "1F617": 2,
+          "1F618": 2,
+          "1F619": 2,
+          "1F61A": 2,
+          "1F61B": 2,
+          "1F61C": 2,
+          "1F61D": 2,
+          "1F61E": 2,
+          "1F61F": 2,
+          "1F620": 2,
+          "1F621": 2,
+          "1F622": 2,
+          "1F623": 2,
+          "1F624": 2,
+          "1F625": 2,
+          "1F626": 2,
+          "1F627": 2,
+          "1F628": 2,
+          "1F629": 2,
+          "1F62A": 2,
+          "1F62B": 2,
+          "1F62C": 2,
+          "1F62D": 2,
+          "1F62E": 2,
+          "1F62F": 2,
+          "1F630": 2,
+          "1F631": 2,
+          "1F632": 2,
+          "1F633": 2,
+          "1F634": 2,
+          "1F635": 2,
+          "1F636": 2,
+          "1F637": 2,
+          "1F638": 2,
+          "1F639": 2,
+          "1F63A": 2,
+          "1F63B": 2,
+          "1F63C": 2,
+          "1F63D": 2,
+          "1F63E": 2,
+          "1F63F": 2,
+          "1F640": 2,
+          "1F641": 2,
+          "1F642": 2,
+          "1F643": 2,
+          "1F644": 2,
+          "1F645": 2,
+          "1F646": 2,
+          "1F647": 2,
+          "1F648": 2,
+          "1F649": 2,
+          "1F64A": 2,
+          "1F64B": 2,
+          "1F64C": 2,
+          "1F64D": 2,
+          "1F64E": 2,
+          "1F64F": 2,
+          "1F680": 2,
+          "1F681": 2,
+          "1F682": 2,
+          "1F683": 2,
+          "1F684": 2,
+          "1F685": 2,
+          "1F686": 2,
+          "1F687": 2,
+          "1F688": 2,
+          "1F689": 2,
+          "1F68A": 2,
+          "1F68B": 2,
+          "1F68C": 2,
+          "1F68D": 2,
+          "1F68E": 2,
+          "1F68F": 2,
+          "1F690": 2,
+          "1F691": 2,
+          "1F692": 2,
+          "1F693": 2,
+          "1F694": 2,
+          "1F695": 2,
+          "1F696": 2,
+          "1F697": 2,
+          "1F698": 2,
+          "1F699": 2,
+          "1F69A": 2,
+          "1F69B": 2,
+          "1F69C": 2,
+          "1F69D": 2,
+          "1F69E": 2,
+          "1F69F": 2,
+          "1F6A0": 2,
+          "1F6A1": 2,
+          "1F6A2": 2,
+          "1F6A3": 2,
+          "1F6A4": 2,
+          "1F6A5": 2,
+          "1F6A6": 2,
+          "1F6A7": 2,
+          "1F6A8": 2,
+          "1F6A9": 2,
+          "1F6AA": 2,
+          "1F6AB": 2,
+          "1F6AC": 2,
+          "1F6AD": 2,
+          "1F6AE": 2,
+          "1F6AF": 2,
+          "1F6B0": 2,
+          "1F6B1": 2,
+          "1F6B2": 2,
+          "1F6B3": 2,
+          "1F6B4": 2,
+          "1F6B5": 2,
+          "1F6B6": 2,
+          "1F6B7": 2,
+          "1F6B8": 2,
+          "1F6B9": 2,
+          "1F6BA": 2,
+          "1F6BB": 2,
+          "1F6BC": 2,
+          "1F6BD": 2,
+          "1F6BE": 2,
+          "1F6BF": 2,
+          "1F6C0": 2,
+          "1F6C1": 2,
+          "1F6C2": 2,
+          "1F6C3": 2,
+          "1F6C4": 2,
+          "1F6C5": 2,
+          "1F6C6": 1,
+          "1F6C7": 1,
+          "1F6C8": 1,
+          "1F6C9": 1,
+          "1F6CA": 1,
+          "1F6CB": 1,
+          "1F6CC": 2,
+          "1F6CD": 1,
+          "1F6CE": 1,
+          "1F6CF": 1,
+          "1F6D0": 2,
+          "1F6D1": 2,
+          "1F6D2": 2,
+          "1F6D3": 1,
+          "1F6D4": 1,
+          "1F6D5": 2,
+          "1F6D6": 2,
+          "1F6D7": 2,
+          "1F6D8": 2,
+          "1F6D9": 1,
+          "1F6DA": 1,
+          "1F6DB": 1,
+          "1F6DC": 2,
+          "1F6DD": 2,
+          "1F6DE": 2,
+          "1F6DF": 2,
+          "1F6E0": 1,
+          "1F6E1": 1,
+          "1F6E2": 1,
+          "1F6E3": 1,
+          "1F6E4": 1,
+          "1F6E5": 1,
+          "1F6E6": 1,
+          "1F6E7": 1,
+          "1F6E8": 1,
+          "1F6E9": 1,
+          "1F6EA": 1,
+          "1F6EB": 2,
+          "1F6EC": 2,
+          "1F6ED": 1,
+          "1F6EE": 1,
+          "1F6EF": 1,
+          "1F6F0": 1,
+          "1F6F1": 1,
+          "1F6F2": 1,
+          "1F6F3": 1,
+          "1F6F4": 2,
+          "1F6F5": 2,
+          "1F6F6": 2,
+          "1F6F7": 2,
+          "1F6F8": 2,
+          "1F6F9": 2,
+          "1F6FA": 2,
+          "1F6FB": 2,
+          "1F6FC": 2,
+          "1F6FD": 1,
+          "1F6FE": 1,
+          "1F6FF": 1,
+          "1F900": 1,
+          "1F901": 1,
+          "1F902": 1,
+          "1F903": 1,
+          "1F904": 1,
+          "1F905": 1,
+          "1F906": 1,
+          "1F907": 1,
+          "1F908": 1,
+          "1F909": 1,
+          "1F90A": 1,
+          "1F90B": 1,
+          "1F90C": 2,
+          "1F90D": 2,
+          "1F90E": 2,
+          "1F90F": 2,
+          "1F910": 2,
+          "1F911": 2,
+          "1F912": 2,
+          "1F913": 2,
+          "1F914": 2,
+          "1F915": 2,
+          "1F916": 2,
+          "1F917": 2,
+          "1F918": 2,
+          "1F919": 2,
+          "1F91A": 2,
+          "1F91B": 2,
+          "1F91C": 2,
+          "1F91D": 2,
+          "1F91E": 2,
+          "1F91F": 2,
+          "1F920": 2,
+          "1F921": 2,
+          "1F922": 2,
+          "1F923": 2,
+          "1F924": 2,
+          "1F925": 2,
+          "1F926": 2,
+          "1F927": 2,
+          "1F928": 2,
+          "1F929": 2,
+          "1F92A": 2,
+          "1F92B": 2,
+          "1F92C": 2,
+          "1F92D": 2,
+          "1F92E": 2,
+          "1F92F": 2,
+          "1F930": 2,
+          "1F931": 2,
+          "1F932": 2,
+          "1F933": 2,
+          "1F934": 2,
+          "1F935": 2,
+          "1F936": 2,
+          "1F937": 2,
+          "1F938": 2,
+          "1F939": 2,
+          "1F93A": 2,
+          "1F93B": 1,
+          "1F93C": 2,
+          "1F93D": 2,
+          "1F93E": 2,
+          "1F93F": 2,
+          "1F940": 2,
+          "1F941": 2,
+          "1F942": 2,
+          "1F943": 2,
+          "1F944": 2,
+          "1F945": 2,
+          "1F946": 1,
+          "1F947": 2,
+          "1F948": 2,
+          "1F949": 2,
+          "1F94A": 2,
+          "1F94B": 2,
+          "1F94C": 2,
+          "1F94D": 2,
+          "1F94E": 2,
+          "1F94F": 2,
+          "1F950": 2,
+          "1F951": 2,
+          "1F952": 2,
+          "1F953": 2,
+          "1F954": 2,
+          "1F955": 2,
+          "1F956": 2,
+          "1F957": 2,
+          "1F958": 2,
+          "1F959": 2,
+          "1F95A": 2,
+          "1F95B": 2,
+          "1F95C": 2,
+          "1F95D": 2,
+          "1F95E": 2,
+          "1F95F": 2,
+          "1F960": 2,
+          "1F961": 2,
+          "1F962": 2,
+          "1F963": 2,
+          "1F964": 2,
+          "1F965": 2,
+          "1F966": 2,
+          "1F967": 2,
+          "1F968": 2,
+          "1F969": 2,
+          "1F96A": 2,
+          "1F96B": 2,
+          "1F96C": 2,
+          "1F96D": 2,
+          "1F96E": 2,
+          "1F96F": 2,
+          "1F970": 2,
+          "1F971": 2,
+          "1F972": 2,
+          "1F973": 2,
+          "1F974": 2,
+          "1F975": 2,
+          "1F976": 2,
+          "1F977": 2,
+          "1F978": 2,
+          "1F979": 2,
+          "1F97A": 2,
+          "1F97B": 2,
+          "1F97C": 2,
+          "1F97D": 2,
+          "1F97E": 2,
+          "1F97F": 2,
+          "1F980": 2,
+          "1F981": 2,
+          "1F982": 2,
+          "1F983": 2,
+          "1F984": 2,
+          "1F985": 2,
+          "1F986": 2,
+          "1F987": 2,
+          "1F988": 2,
+          "1F989": 2,
+          "1F98A": 2,
+          "1F98B": 2,
+          "1F98C": 2,
+          "1F98D": 2,
+          "1F98E": 2,
+          "1F98F": 2,
+          "1F990": 2,
+          "1F991": 2,
+          "1F992": 2,
+          "1F993": 2,
+          "1F994": 2,
+          "1F995": 2,
+          "1F996": 2,
+          "1F997": 2,
+          "1F998": 2,
+          "1F999": 2,
+          "1F99A": 2,
+          "1F99B": 2,
+          "1F99C": 2,
+          "1F99D": 2,
+          "1F99E": 2,
+          "1F99F": 2,
+          "1F9A0": 2,
+          "1F9A1": 2,
+          "1F9A2": 2,
+          "1F9A3": 2,
+          "1F9A4": 2,
+          "1F9A5": 2,
+          "1F9A6": 2,
+          "1F9A7": 2,
+          "1F9A8": 2,
+          "1F9A9": 2,
+          "1F9AA": 2,
+          "1F9AB": 2,
+          "1F9AC": 2,
+          "1F9AD": 2,
+          "1F9AE": 2,
+          "1F9AF": 2,
+          "1F9B0": 2,
+          "1F9B1": 2,
+          "1F9B2": 2,
+          "1F9B3": 2,
+          "1F9B4": 2,
+          "1F9B5": 2,
+          "1F9B6": 2,
+          "1F9B7": 2,
+          "1F9B8": 2,
+          "1F9B9": 2,
+          "1F9BA": 2,
+          "1F9BB": 2,
+          "1F9BC": 2,
+          "1F9BD": 2,
+          "1F9BE": 2,
+          "1F9BF": 2,
+          "1F9C0": 2,
+          "1F9C1": 2,
+          "1F9C2": 2,
+          "1F9C3": 2,
+          "1F9C4": 2,
+          "1F9C5": 2,
+          "1F9C6": 2,
+          "1F9C7": 2,
+          "1F9C8": 2,
+          "1F9C9": 2,
+          "1F9CA": 2,
+          "1F9CB": 2,
+          "1F9CC": 2,
+          "1F9CD": 2,
+          "1F9CE": 2,
+          "1F9CF": 2,
+          "1F9D0": 2,
+          "1F9D1": 2,
+          "1F9D2": 2,
+          "1F9D3": 2,
+          "1F9D4": 2,
+          "1F9D5": 2,
+          "1F9D6": 2,
+          "1F9D7": 2,
+          "1F9D8": 2,
+          "1F9D9": 2,
+          "1F9DA": 2,
+          "1F9DB": 2,
+          "1F9DC": 2,
+          "1F9DD": 2,
+          "1F9DE": 2,
+          "1F9DF": 2,
+          "1F9E0": 2,
+          "1F9E1": 2,
+          "1F9E2": 2,
+          "1F9E3": 2,
+          "1F9E4": 2,
+          "1F9E5": 2,
+          "1F9E6": 2,
+          "1F9E7": 2,
+          "1F9E8": 2,
+          "1F9E9": 2,
+          "1F9EA": 2,
+          "1F9EB": 2,
+          "1F9EC": 2,
+          "1F9ED": 2,
+          "1F9EE": 2,
+          "1F9EF": 2,
+          "1F9F0": 2,
+          "1F9F1": 2,
+          "1F9F2": 2,
+          "1F9F3": 2,
+          "1F9F4": 2,
+          "1F9F5": 2,
+          "1F9F6": 2,
+          "1F9F7": 2,
+          "1F9F8": 2,
+          "1F9F9": 2,
+          "1F9FA": 2,
+          "1F9FB": 2,
+          "1F9FC": 2,
+          "1F9FD": 2,
+          "1F9FE": 2,
+          "1F9FF": 2,
+          "1FA70": 2,
+          "1FA71": 2,
+          "1FA72": 2,
+          "1FA73": 2,
+          "1FA74": 2,
+          "1FA75": 2,
+          "1FA76": 2,
+          "1FA77": 2,
+          "1FA78": 2,
+          "1FA79": 2,
+          "1FA7A": 2,
+          "1FA7B": 2,
+          "1FA7C": 2,
+          "1FA7D": 1,
+          "1FA7E": 1,
+          "1FA7F": 1,
+          "1FA80": 2,
+          "1FA81": 2,
+          "1FA82": 2,
+          "1FA83": 2,
+          "1FA84": 2,
+          "1FA85": 2,
+          "1FA86": 2,
+          "1FA87": 2,
+          "1FA88": 2,
+          "1FA89": 2,
+          "1FA8A": 2,
+          "1FA8B": 1,
+          "1FA8C": 1,
+          "1FA8D": 1,
+          "1FA8E": 2,
+          "1FA8F": 2,
+          "1FA90": 2,
+          "1FA91": 2,
+          "1FA92": 2,
+          "1FA93": 2,
+          "1FA94": 2,
+          "1FA95": 2,
+          "1FA96": 2,
+          "1FA97": 2,
+          "1FA98": 2,
+          "1FA99": 2,
+          "1FA9A": 2,
+          "1FA9B": 2,
+          "1FA9C": 2,
+          "1FA9D": 2,
+          "1FA9E": 2,
+          "1FA9F": 2,
+          "1FAA0": 2,
+          "1FAA1": 2,
+          "1FAA2": 2,
+          "1FAA3": 2,
+          "1FAA4": 2,
+          "1FAA5": 2,
+          "1FAA6": 2,
+          "1FAA7": 2,
+          "1FAA8": 2,
+          "1FAA9": 2,
+          "1FAAA": 2,
+          "1FAAB": 2,
+          "1FAAC": 2,
+          "1FAAD": 2,
+          "1FAAE": 2,
+          "1FAAF": 2,
+          "1FAB0": 2,
+          "1FAB1": 2,
+          "1FAB2": 2,
+          "1FAB3": 2,
+          "1FAB4": 2,
+          "1FAB5": 2,
+          "1FAB6": 2,
+          "1FAB7": 2,
+          "1FAB8": 2,
+          "1FAB9": 2,
+          "1FABA": 2,
+          "1FABB": 2,
+          "1FABC": 2,
+          "1FABD": 2,
+          "1FABE": 2,
+          "1FABF": 2,
+          "1FAC0": 2,
+          "1FAC1": 2,
+          "1FAC2": 2,
+          "1FAC3": 2,
+          "1FAC4": 2,
+          "1FAC5": 2,
+          "1FAC6": 2,
+          "1FAC7": 1,
+          "1FAC8": 2,
+          "1FAC9": 1,
+          "1FACA": 1,
+          "1FACB": 1,
+          "1FACC": 1,
+          "1FACD": 2,
+          "1FACE": 2,
+          "1FACF": 2,
+          "1FAD0": 2,
+          "1FAD1": 2,
+          "1FAD2": 2,
+          "1FAD3": 2,
+          "1FAD4": 2,
+          "1FAD5": 2,
+          "1FAD6": 2,
+          "1FAD7": 2,
+          "1FAD8": 2,
+          "1FAD9": 2,
+          "1FADA": 2,
+          "1FADB": 2,
+          "1FADC": 2,
+          "1FADD": 1,
+          "1FADE": 1,
+          "1FADF": 2,
+          "1FAE0": 2,
+          "1FAE1": 2,
+          "1FAE2": 2,
+          "1FAE3": 2,
+          "1FAE4": 2,
+          "1FAE5": 2,
+          "1FAE6": 2,
+          "1FAE7": 2,
+          "1FAE8": 2,
+          "1FAE9": 2,
+          "1FAEA": 2,
+          "1FAEB": 1,
+          "1FAEC": 1,
+          "1FAED": 1,
+          "1FAEE": 1,
+          "1FAEF": 2,
+          "1FAF0": 2,
+          "1FAF1": 2,
+          "1FAF2": 2,
+          "1FAF3": 2,
+          "1FAF4": 2,
+          "1FAF5": 2,
+          "1FAF6": 2,
+          "1FAF7": 2,
+          "1FAF8": 2,
+          "1FAF9": 1,
+          "1FAFA": 1,
+          "1FAFB": 1,
+          "1FAFC": 1,
+          "1FAFD": 1,
+          "1FAFE": 1,
+          "1FAFF": 1
+        }
+      },
+      "window_title": "ftgt-parser-buf-00-ft"
+    },
+    {
+      "arm": "ft_baseline",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/01-ft_baseline/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.539504,
+        "interval_mb_s": {
+          "p5": 65.00056440320485,
+          "p50": 77.79416375918123,
+          "p95": 93.40296084918893
+        },
+        "mb_s": 78.59957918147526,
+        "mib_s": 74.95839994571233,
+        "samples": 39,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96683822601625,
+        96693362105625
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/01-ft_baseline/footprint/ft_baseline-53268-20261011T230619Z",
+        "gpu_owned_bytes": 14319616,
+        "phys_footprint": 972277416,
+        "rss_bytes": 392708096
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 168067072,
+            "allocated": 144901264,
+            "mapped": 387039232,
+            "resident": 271466496,
+            "retained": 293486592
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 585,
+          "painted_frames_total": 582,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 581,
+            "max_ns": 1067028125,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12366873957
+          },
+          "presented_total": 582,
+          "retried_paint_frames_total": 2,
+          "stale_presented_total": 1
+        },
+        "points": 27,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3617,
+                "max_ns": 32375,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3583,
+                "total_ns": 1431840
+              },
+              "wait": {
+                "count": 3617,
+                "max_ns": 32917,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 124626
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 585,
+                "max_ns": 5855416,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 655359,
+                "total_ns": 199440384
+              },
+              "wait": {
+                "count": 585,
+                "max_ns": 1923209,
+                "p50_ns": 0,
+                "p95_ns": 24575,
+                "p99_ns": 49151,
+                "total_ns": 5988002
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 5165,
+                "max_ns": 2069458,
+                "p50_ns": 57343,
+                "p95_ns": 2069458,
+                "p99_ns": 2069458,
+                "total_ns": 3128300001
+              },
+              "wait": {
+                "count": 5165,
+                "max_ns": 3551458,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 67889787
+              }
+            }
+          },
+          "main_thread_blocked_ns": 5988002,
+          "main_thread_blocked_waits": 182,
+          "main_thread_max_wait_ns": 1923209
+        }
+      },
+      "index": 1,
+      "internal_present": {
+        "fps": 58.82435878170601,
+        "presented": 561.1552058955197
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-53268.json",
+      "kind": "ft",
+      "load_end": [
+        20.63,
+        21.86,
+        19.51
+      ],
+      "load_go": [
+        20.94,
+        21.96,
+        19.52
+      ],
+      "load_start": [
+        21.81,
+        22.15,
+        19.57
+      ],
+      "offset_cross_check": {
+        "lsof": 2359376,
+        "proc_pidfdinfo": 80
+      },
+      "pids": {
+        "ancestry": [
+          53269,
+          53268,
+          51984
+        ],
+        "cat": 53424,
+        "shell": 53269,
+        "terminal": 53268
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/01-ft_baseline",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 11
+            },
+            "cpu_s": 5.959,
+            "current_priorities": {
+              "20": 11
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.91,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.485,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.263,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10,
+              "utility": 1
+            },
+            "cpu_s": 0.096,
+            "current_priorities": {
+              "20": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.09,
+            "current_priorities": {
+              "31": 2,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.086,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.074,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.073,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.021,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 2
+            },
+            "cpu_s": 0.016,
+            "current_priorities": {
+              "31": 1,
+              "37": 2
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 3
+            },
+            "cpu_s": 0.015,
+            "current_priorities": {
+              "37": 3
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.009,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "update_checker",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.294,
+          "user-initiated": 11.846,
+          "utility": 5.959
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 47,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 4.56s system 47% cpu 9.545 total",
+        "system_s": 4.56,
+        "total_s": 9.545,
+        "user_s": 0.01
+      },
+      "widths": {
+        "failed": [],
+        "histogram": {
+          "1": 282,
+          "2": 1094
+        },
+        "seconds": 0.196,
+        "widths": {
+          "1F300": 2,
+          "1F301": 2,
+          "1F302": 2,
+          "1F303": 2,
+          "1F304": 2,
+          "1F305": 2,
+          "1F306": 2,
+          "1F307": 2,
+          "1F308": 2,
+          "1F309": 2,
+          "1F30A": 2,
+          "1F30B": 2,
+          "1F30C": 2,
+          "1F30D": 2,
+          "1F30E": 2,
+          "1F30F": 2,
+          "1F310": 2,
+          "1F311": 2,
+          "1F312": 2,
+          "1F313": 2,
+          "1F314": 2,
+          "1F315": 2,
+          "1F316": 2,
+          "1F317": 2,
+          "1F318": 2,
+          "1F319": 2,
+          "1F31A": 2,
+          "1F31B": 2,
+          "1F31C": 2,
+          "1F31D": 2,
+          "1F31E": 2,
+          "1F31F": 2,
+          "1F320": 2,
+          "1F321": 1,
+          "1F322": 1,
+          "1F323": 1,
+          "1F324": 1,
+          "1F325": 1,
+          "1F326": 1,
+          "1F327": 1,
+          "1F328": 1,
+          "1F329": 1,
+          "1F32A": 1,
+          "1F32B": 1,
+          "1F32C": 1,
+          "1F32D": 2,
+          "1F32E": 2,
+          "1F32F": 2,
+          "1F330": 2,
+          "1F331": 2,
+          "1F332": 2,
+          "1F333": 2,
+          "1F334": 2,
+          "1F335": 2,
+          "1F336": 1,
+          "1F337": 2,
+          "1F338": 2,
+          "1F339": 2,
+          "1F33A": 2,
+          "1F33B": 2,
+          "1F33C": 2,
+          "1F33D": 2,
+          "1F33E": 2,
+          "1F33F": 2,
+          "1F340": 2,
+          "1F341": 2,
+          "1F342": 2,
+          "1F343": 2,
+          "1F344": 2,
+          "1F345": 2,
+          "1F346": 2,
+          "1F347": 2,
+          "1F348": 2,
+          "1F349": 2,
+          "1F34A": 2,
+          "1F34B": 2,
+          "1F34C": 2,
+          "1F34D": 2,
+          "1F34E": 2,
+          "1F34F": 2,
+          "1F350": 2,
+          "1F351": 2,
+          "1F352": 2,
+          "1F353": 2,
+          "1F354": 2,
+          "1F355": 2,
+          "1F356": 2,
+          "1F357": 2,
+          "1F358": 2,
+          "1F359": 2,
+          "1F35A": 2,
+          "1F35B": 2,
+          "1F35C": 2,
+          "1F35D": 2,
+          "1F35E": 2,
+          "1F35F": 2,
+          "1F360": 2,
+          "1F361": 2,
+          "1F362": 2,
+          "1F363": 2,
+          "1F364": 2,
+          "1F365": 2,
+          "1F366": 2,
+          "1F367": 2,
+          "1F368": 2,
+          "1F369": 2,
+          "1F36A": 2,
+          "1F36B": 2,
+          "1F36C": 2,
+          "1F36D": 2,
+          "1F36E": 2,
+          "1F36F": 2,
+          "1F370": 2,
+          "1F371": 2,
+          "1F372": 2,
+          "1F373": 2,
+          "1F374": 2,
+          "1F375": 2,
+          "1F376": 2,
+          "1F377": 2,
+          "1F378": 2,
+          "1F379": 2,
+          "1F37A": 2,
+          "1F37B": 2,
+          "1F37C": 2,
+          "1F37D": 1,
+          "1F37E": 2,
+          "1F37F": 2,
+          "1F380": 2,
+          "1F381": 2,
+          "1F382": 2,
+          "1F383": 2,
+          "1F384": 2,
+          "1F385": 2,
+          "1F386": 2,
+          "1F387": 2,
+          "1F388": 2,
+          "1F389": 2,
+          "1F38A": 2,
+          "1F38B": 2,
+          "1F38C": 2,
+          "1F38D": 2,
+          "1F38E": 2,
+          "1F38F": 2,
+          "1F390": 2,
+          "1F391": 2,
+          "1F392": 2,
+          "1F393": 2,
+          "1F394": 1,
+          "1F395": 1,
+          "1F396": 1,
+          "1F397": 1,
+          "1F398": 1,
+          "1F399": 1,
+          "1F39A": 1,
+          "1F39B": 1,
+          "1F39C": 1,
+          "1F39D": 1,
+          "1F39E": 1,
+          "1F39F": 1,
+          "1F3A0": 2,
+          "1F3A1": 2,
+          "1F3A2": 2,
+          "1F3A3": 2,
+          "1F3A4": 2,
+          "1F3A5": 2,
+          "1F3A6": 2,
+          "1F3A7": 2,
+          "1F3A8": 2,
+          "1F3A9": 2,
+          "1F3AA": 2,
+          "1F3AB": 2,
+          "1F3AC": 2,
+          "1F3AD": 2,
+          "1F3AE": 2,
+          "1F3AF": 2,
+          "1F3B0": 2,
+          "1F3B1": 2,
+          "1F3B2": 2,
+          "1F3B3": 2,
+          "1F3B4": 2,
+          "1F3B5": 2,
+          "1F3B6": 2,
+          "1F3B7": 2,
+          "1F3B8": 2,
+          "1F3B9": 2,
+          "1F3BA": 2,
+          "1F3BB": 2,
+          "1F3BC": 2,
+          "1F3BD": 2,
+          "1F3BE": 2,
+          "1F3BF": 2,
+          "1F3C0": 2,
+          "1F3C1": 2,
+          "1F3C2": 2,
+          "1F3C3": 2,
+          "1F3C4": 2,
+          "1F3C5": 2,
+          "1F3C6": 2,
+          "1F3C7": 2,
+          "1F3C8": 2,
+          "1F3C9": 2,
+          "1F3CA": 2,
+          "1F3CB": 1,
+          "1F3CC": 1,
+          "1F3CD": 1,
+          "1F3CE": 1,
+          "1F3CF": 2,
+          "1F3D0": 2,
+          "1F3D1": 2,
+          "1F3D2": 2,
+          "1F3D3": 2,
+          "1F3D4": 1,
+          "1F3D5": 1,
+          "1F3D6": 1,
+          "1F3D7": 1,
+          "1F3D8": 1,
+          "1F3D9": 1,
+          "1F3DA": 1,
+          "1F3DB": 1,
+          "1F3DC": 1,
+          "1F3DD": 1,
+          "1F3DE": 1,
+          "1F3DF": 1,
+          "1F3E0": 2,
+          "1F3E1": 2,
+          "1F3E2": 2,
+          "1F3E3": 2,
+          "1F3E4": 2,
+          "1F3E5": 2,
+          "1F3E6": 2,
+          "1F3E7": 2,
+          "1F3E8": 2,
+          "1F3E9": 2,
+          "1F3EA": 2,
+          "1F3EB": 2,
+          "1F3EC": 2,
+          "1F3ED": 2,
+          "1F3EE": 2,
+          "1F3EF": 2,
+          "1F3F0": 2,
+          "1F3F1": 1,
+          "1F3F2": 1,
+          "1F3F3": 1,
+          "1F3F4": 2,
+          "1F3F5": 1,
+          "1F3F6": 1,
+          "1F3F7": 1,
+          "1F3F8": 2,
+          "1F3F9": 2,
+          "1F3FA": 2,
+          "1F3FB": 2,
+          "1F3FC": 2,
+          "1F3FD": 2,
+          "1F3FE": 2,
+          "1F3FF": 2,
+          "1F400": 2,
+          "1F401": 2,
+          "1F402": 2,
+          "1F403": 2,
+          "1F404": 2,
+          "1F405": 2,
+          "1F406": 2,
+          "1F407": 2,
+          "1F408": 2,
+          "1F409": 2,
+          "1F40A": 2,
+          "1F40B": 2,
+          "1F40C": 2,
+          "1F40D": 2,
+          "1F40E": 2,
+          "1F40F": 2,
+          "1F410": 2,
+          "1F411": 2,
+          "1F412": 2,
+          "1F413": 2,
+          "1F414": 2,
+          "1F415": 2,
+          "1F416": 2,
+          "1F417": 2,
+          "1F418": 2,
+          "1F419": 2,
+          "1F41A": 2,
+          "1F41B": 2,
+          "1F41C": 2,
+          "1F41D": 2,
+          "1F41E": 2,
+          "1F41F": 2,
+          "1F420": 2,
+          "1F421": 2,
+          "1F422": 2,
+          "1F423": 2,
+          "1F424": 2,
+          "1F425": 2,
+          "1F426": 2,
+          "1F427": 2,
+          "1F428": 2,
+          "1F429": 2,
+          "1F42A": 2,
+          "1F42B": 2,
+          "1F42C": 2,
+          "1F42D": 2,
+          "1F42E": 2,
+          "1F42F": 2,
+          "1F430": 2,
+          "1F431": 2,
+          "1F432": 2,
+          "1F433": 2,
+          "1F434": 2,
+          "1F435": 2,
+          "1F436": 2,
+          "1F437": 2,
+          "1F438": 2,
+          "1F439": 2,
+          "1F43A": 2,
+          "1F43B": 2,
+          "1F43C": 2,
+          "1F43D": 2,
+          "1F43E": 2,
+          "1F43F": 1,
+          "1F440": 2,
+          "1F441": 1,
+          "1F442": 2,
+          "1F443": 2,
+          "1F444": 2,
+          "1F445": 2,
+          "1F446": 2,
+          "1F447": 2,
+          "1F448": 2,
+          "1F449": 2,
+          "1F44A": 2,
+          "1F44B": 2,
+          "1F44C": 2,
+          "1F44D": 2,
+          "1F44E": 2,
+          "1F44F": 2,
+          "1F450": 2,
+          "1F451": 2,
+          "1F452": 2,
+          "1F453": 2,
+          "1F454": 2,
+          "1F455": 2,
+          "1F456": 2,
+          "1F457": 2,
+          "1F458": 2,
+          "1F459": 2,
+          "1F45A": 2,
+          "1F45B": 2,
+          "1F45C": 2,
+          "1F45D": 2,
+          "1F45E": 2,
+          "1F45F": 2,
+          "1F460": 2,
+          "1F461": 2,
+          "1F462": 2,
+          "1F463": 2,
+          "1F464": 2,
+          "1F465": 2,
+          "1F466": 2,
+          "1F467": 2,
+          "1F468": 2,
+          "1F469": 2,
+          "1F46A": 2,
+          "1F46B": 2,
+          "1F46C": 2,
+          "1F46D": 2,
+          "1F46E": 2,
+          "1F46F": 2,
+          "1F470": 2,
+          "1F471": 2,
+          "1F472": 2,
+          "1F473": 2,
+          "1F474": 2,
+          "1F475": 2,
+          "1F476": 2,
+          "1F477": 2,
+          "1F478": 2,
+          "1F479": 2,
+          "1F47A": 2,
+          "1F47B": 2,
+          "1F47C": 2,
+          "1F47D": 2,
+          "1F47E": 2,
+          "1F47F": 2,
+          "1F480": 2,
+          "1F481": 2,
+          "1F482": 2,
+          "1F483": 2,
+          "1F484": 2,
+          "1F485": 2,
+          "1F486": 2,
+          "1F487": 2,
+          "1F488": 2,
+          "1F489": 2,
+          "1F48A": 2,
+          "1F48B": 2,
+          "1F48C": 2,
+          "1F48D": 2,
+          "1F48E": 2,
+          "1F48F": 2,
+          "1F490": 2,
+          "1F491": 2,
+          "1F492": 2,
+          "1F493": 2,
+          "1F494": 2,
+          "1F495": 2,
+          "1F496": 2,
+          "1F497": 2,
+          "1F498": 2,
+          "1F499": 2,
+          "1F49A": 2,
+          "1F49B": 2,
+          "1F49C": 2,
+          "1F49D": 2,
+          "1F49E": 2,
+          "1F49F": 2,
+          "1F4A0": 2,
+          "1F4A1": 2,
+          "1F4A2": 2,
+          "1F4A3": 2,
+          "1F4A4": 2,
+          "1F4A5": 2,
+          "1F4A6": 2,
+          "1F4A7": 2,
+          "1F4A8": 2,
+          "1F4A9": 2,
+          "1F4AA": 2,
+          "1F4AB": 2,
+          "1F4AC": 2,
+          "1F4AD": 2,
+          "1F4AE": 2,
+          "1F4AF": 2,
+          "1F4B0": 2,
+          "1F4B1": 2,
+          "1F4B2": 2,
+          "1F4B3": 2,
+          "1F4B4": 2,
+          "1F4B5": 2,
+          "1F4B6": 2,
+          "1F4B7": 2,
+          "1F4B8": 2,
+          "1F4B9": 2,
+          "1F4BA": 2,
+          "1F4BB": 2,
+          "1F4BC": 2,
+          "1F4BD": 2,
+          "1F4BE": 2,
+          "1F4BF": 2,
+          "1F4C0": 2,
+          "1F4C1": 2,
+          "1F4C2": 2,
+          "1F4C3": 2,
+          "1F4C4": 2,
+          "1F4C5": 2,
+          "1F4C6": 2,
+          "1F4C7": 2,
+          "1F4C8": 2,
+          "1F4C9": 2,
+          "1F4CA": 2,
+          "1F4CB": 2,
+          "1F4CC": 2,
+          "1F4CD": 2,
+          "1F4CE": 2,
+          "1F4CF": 2,
+          "1F4D0": 2,
+          "1F4D1": 2,
+          "1F4D2": 2,
+          "1F4D3": 2,
+          "1F4D4": 2,
+          "1F4D5": 2,
+          "1F4D6": 2,
+          "1F4D7": 2,
+          "1F4D8": 2,
+          "1F4D9": 2,
+          "1F4DA": 2,
+          "1F4DB": 2,
+          "1F4DC": 2,
+          "1F4DD": 2,
+          "1F4DE": 2,
+          "1F4DF": 2,
+          "1F4E0": 2,
+          "1F4E1": 2,
+          "1F4E2": 2,
+          "1F4E3": 2,
+          "1F4E4": 2,
+          "1F4E5": 2,
+          "1F4E6": 2,
+          "1F4E7": 2,
+          "1F4E8": 2,
+          "1F4E9": 2,
+          "1F4EA": 2,
+          "1F4EB": 2,
+          "1F4EC": 2,
+          "1F4ED": 2,
+          "1F4EE": 2,
+          "1F4EF": 2,
+          "1F4F0": 2,
+          "1F4F1": 2,
+          "1F4F2": 2,
+          "1F4F3": 2,
+          "1F4F4": 2,
+          "1F4F5": 2,
+          "1F4F6": 2,
+          "1F4F7": 2,
+          "1F4F8": 2,
+          "1F4F9": 2,
+          "1F4FA": 2,
+          "1F4FB": 2,
+          "1F4FC": 2,
+          "1F4FD": 1,
+          "1F4FE": 1,
+          "1F4FF": 2,
+          "1F500": 2,
+          "1F501": 2,
+          "1F502": 2,
+          "1F503": 2,
+          "1F504": 2,
+          "1F505": 2,
+          "1F506": 2,
+          "1F507": 2,
+          "1F508": 2,
+          "1F509": 2,
+          "1F50A": 2,
+          "1F50B": 2,
+          "1F50C": 2,
+          "1F50D": 2,
+          "1F50E": 2,
+          "1F50F": 2,
+          "1F510": 2,
+          "1F511": 2,
+          "1F512": 2,
+          "1F513": 2,
+          "1F514": 2,
+          "1F515": 2,
+          "1F516": 2,
+          "1F517": 2,
+          "1F518": 2,
+          "1F519": 2,
+          "1F51A": 2,
+          "1F51B": 2,
+          "1F51C": 2,
+          "1F51D": 2,
+          "1F51E": 2,
+          "1F51F": 2,
+          "1F520": 2,
+          "1F521": 2,
+          "1F522": 2,
+          "1F523": 2,
+          "1F524": 2,
+          "1F525": 2,
+          "1F526": 2,
+          "1F527": 2,
+          "1F528": 2,
+          "1F529": 2,
+          "1F52A": 2,
+          "1F52B": 2,
+          "1F52C": 2,
+          "1F52D": 2,
+          "1F52E": 2,
+          "1F52F": 2,
+          "1F530": 2,
+          "1F531": 2,
+          "1F532": 2,
+          "1F533": 2,
+          "1F534": 2,
+          "1F535": 2,
+          "1F536": 2,
+          "1F537": 2,
+          "1F538": 2,
+          "1F539": 2,
+          "1F53A": 2,
+          "1F53B": 2,
+          "1F53C": 2,
+          "1F53D": 2,
+          "1F53E": 1,
+          "1F53F": 1,
+          "1F540": 1,
+          "1F541": 1,
+          "1F542": 1,
+          "1F543": 1,
+          "1F544": 1,
+          "1F545": 1,
+          "1F546": 1,
+          "1F547": 1,
+          "1F548": 1,
+          "1F549": 1,
+          "1F54A": 1,
+          "1F54B": 2,
+          "1F54C": 2,
+          "1F54D": 2,
+          "1F54E": 2,
+          "1F54F": 1,
+          "1F550": 2,
+          "1F551": 2,
+          "1F552": 2,
+          "1F553": 2,
+          "1F554": 2,
+          "1F555": 2,
+          "1F556": 2,
+          "1F557": 2,
+          "1F558": 2,
+          "1F559": 2,
+          "1F55A": 2,
+          "1F55B": 2,
+          "1F55C": 2,
+          "1F55D": 2,
+          "1F55E": 2,
+          "1F55F": 2,
+          "1F560": 2,
+          "1F561": 2,
+          "1F562": 2,
+          "1F563": 2,
+          "1F564": 2,
+          "1F565": 2,
+          "1F566": 2,
+          "1F567": 2,
+          "1F568": 1,
+          "1F569": 1,
+          "1F56A": 1,
+          "1F56B": 1,
+          "1F56C": 1,
+          "1F56D": 1,
+          "1F56E": 1,
+          "1F56F": 1,
+          "1F570": 1,
+          "1F571": 1,
+          "1F572": 1,
+          "1F573": 1,
+          "1F574": 1,
+          "1F575": 1,
+          "1F576": 1,
+          "1F577": 1,
+          "1F578": 1,
+          "1F579": 1,
+          "1F57A": 2,
+          "1F57B": 1,
+          "1F57C": 1,
+          "1F57D": 1,
+          "1F57E": 1,
+          "1F57F": 1,
+          "1F580": 1,
+          "1F581": 1,
+          "1F582": 1,
+          "1F583": 1,
+          "1F584": 1,
+          "1F585": 1,
+          "1F586": 1,
+          "1F587": 1,
+          "1F588": 1,
+          "1F589": 1,
+          "1F58A": 1,
+          "1F58B": 1,
+          "1F58C": 1,
+          "1F58D": 1,
+          "1F58E": 1,
+          "1F58F": 1,
+          "1F590": 1,
+          "1F591": 1,
+          "1F592": 1,
+          "1F593": 1,
+          "1F594": 1,
+          "1F595": 2,
+          "1F596": 2,
+          "1F597": 1,
+          "1F598": 1,
+          "1F599": 1,
+          "1F59A": 1,
+          "1F59B": 1,
+          "1F59C": 1,
+          "1F59D": 1,
+          "1F59E": 1,
+          "1F59F": 1,
+          "1F5A0": 1,
+          "1F5A1": 1,
+          "1F5A2": 1,
+          "1F5A3": 1,
+          "1F5A4": 2,
+          "1F5A5": 1,
+          "1F5A6": 1,
+          "1F5A7": 1,
+          "1F5A8": 1,
+          "1F5A9": 1,
+          "1F5AA": 1,
+          "1F5AB": 1,
+          "1F5AC": 1,
+          "1F5AD": 1,
+          "1F5AE": 1,
+          "1F5AF": 1,
+          "1F5B0": 1,
+          "1F5B1": 1,
+          "1F5B2": 1,
+          "1F5B3": 1,
+          "1F5B4": 1,
+          "1F5B5": 1,
+          "1F5B6": 1,
+          "1F5B7": 1,
+          "1F5B8": 1,
+          "1F5B9": 1,
+          "1F5BA": 1,
+          "1F5BB": 1,
+          "1F5BC": 1,
+          "1F5BD": 1,
+          "1F5BE": 1,
+          "1F5BF": 1,
+          "1F5C0": 1,
+          "1F5C1": 1,
+          "1F5C2": 1,
+          "1F5C3": 1,
+          "1F5C4": 1,
+          "1F5C5": 1,
+          "1F5C6": 1,
+          "1F5C7": 1,
+          "1F5C8": 1,
+          "1F5C9": 1,
+          "1F5CA": 1,
+          "1F5CB": 1,
+          "1F5CC": 1,
+          "1F5CD": 1,
+          "1F5CE": 1,
+          "1F5CF": 1,
+          "1F5D0": 1,
+          "1F5D1": 1,
+          "1F5D2": 1,
+          "1F5D3": 1,
+          "1F5D4": 1,
+          "1F5D5": 1,
+          "1F5D6": 1,
+          "1F5D7": 1,
+          "1F5D8": 1,
+          "1F5D9": 1,
+          "1F5DA": 1,
+          "1F5DB": 1,
+          "1F5DC": 1,
+          "1F5DD": 1,
+          "1F5DE": 1,
+          "1F5DF": 1,
+          "1F5E0": 1,
+          "1F5E1": 1,
+          "1F5E2": 1,
+          "1F5E3": 1,
+          "1F5E4": 1,
+          "1F5E5": 1,
+          "1F5E6": 1,
+          "1F5E7": 1,
+          "1F5E8": 1,
+          "1F5E9": 1,
+          "1F5EA": 1,
+          "1F5EB": 1,
+          "1F5EC": 1,
+          "1F5ED": 1,
+          "1F5EE": 1,
+          "1F5EF": 1,
+          "1F5F0": 1,
+          "1F5F1": 1,
+          "1F5F2": 1,
+          "1F5F3": 1,
+          "1F5F4": 1,
+          "1F5F5": 1,
+          "1F5F6": 1,
+          "1F5F7": 1,
+          "1F5F8": 1,
+          "1F5F9": 1,
+          "1F5FA": 1,
+          "1F5FB": 2,
+          "1F5FC": 2,
+          "1F5FD": 2,
+          "1F5FE": 2,
+          "1F5FF": 2,
+          "1F600": 2,
+          "1F601": 2,
+          "1F602": 2,
+          "1F603": 2,
+          "1F604": 2,
+          "1F605": 2,
+          "1F606": 2,
+          "1F607": 2,
+          "1F608": 2,
+          "1F609": 2,
+          "1F60A": 2,
+          "1F60B": 2,
+          "1F60C": 2,
+          "1F60D": 2,
+          "1F60E": 2,
+          "1F60F": 2,
+          "1F610": 2,
+          "1F611": 2,
+          "1F612": 2,
+          "1F613": 2,
+          "1F614": 2,
+          "1F615": 2,
+          "1F616": 2,
+          "1F617": 2,
+          "1F618": 2,
+          "1F619": 2,
+          "1F61A": 2,
+          "1F61B": 2,
+          "1F61C": 2,
+          "1F61D": 2,
+          "1F61E": 2,
+          "1F61F": 2,
+          "1F620": 2,
+          "1F621": 2,
+          "1F622": 2,
+          "1F623": 2,
+          "1F624": 2,
+          "1F625": 2,
+          "1F626": 2,
+          "1F627": 2,
+          "1F628": 2,
+          "1F629": 2,
+          "1F62A": 2,
+          "1F62B": 2,
+          "1F62C": 2,
+          "1F62D": 2,
+          "1F62E": 2,
+          "1F62F": 2,
+          "1F630": 2,
+          "1F631": 2,
+          "1F632": 2,
+          "1F633": 2,
+          "1F634": 2,
+          "1F635": 2,
+          "1F636": 2,
+          "1F637": 2,
+          "1F638": 2,
+          "1F639": 2,
+          "1F63A": 2,
+          "1F63B": 2,
+          "1F63C": 2,
+          "1F63D": 2,
+          "1F63E": 2,
+          "1F63F": 2,
+          "1F640": 2,
+          "1F641": 2,
+          "1F642": 2,
+          "1F643": 2,
+          "1F644": 2,
+          "1F645": 2,
+          "1F646": 2,
+          "1F647": 2,
+          "1F648": 2,
+          "1F649": 2,
+          "1F64A": 2,
+          "1F64B": 2,
+          "1F64C": 2,
+          "1F64D": 2,
+          "1F64E": 2,
+          "1F64F": 2,
+          "1F680": 2,
+          "1F681": 2,
+          "1F682": 2,
+          "1F683": 2,
+          "1F684": 2,
+          "1F685": 2,
+          "1F686": 2,
+          "1F687": 2,
+          "1F688": 2,
+          "1F689": 2,
+          "1F68A": 2,
+          "1F68B": 2,
+          "1F68C": 2,
+          "1F68D": 2,
+          "1F68E": 2,
+          "1F68F": 2,
+          "1F690": 2,
+          "1F691": 2,
+          "1F692": 2,
+          "1F693": 2,
+          "1F694": 2,
+          "1F695": 2,
+          "1F696": 2,
+          "1F697": 2,
+          "1F698": 2,
+          "1F699": 2,
+          "1F69A": 2,
+          "1F69B": 2,
+          "1F69C": 2,
+          "1F69D": 2,
+          "1F69E": 2,
+          "1F69F": 2,
+          "1F6A0": 2,
+          "1F6A1": 2,
+          "1F6A2": 2,
+          "1F6A3": 2,
+          "1F6A4": 2,
+          "1F6A5": 2,
+          "1F6A6": 2,
+          "1F6A7": 2,
+          "1F6A8": 2,
+          "1F6A9": 2,
+          "1F6AA": 2,
+          "1F6AB": 2,
+          "1F6AC": 2,
+          "1F6AD": 2,
+          "1F6AE": 2,
+          "1F6AF": 2,
+          "1F6B0": 2,
+          "1F6B1": 2,
+          "1F6B2": 2,
+          "1F6B3": 2,
+          "1F6B4": 2,
+          "1F6B5": 2,
+          "1F6B6": 2,
+          "1F6B7": 2,
+          "1F6B8": 2,
+          "1F6B9": 2,
+          "1F6BA": 2,
+          "1F6BB": 2,
+          "1F6BC": 2,
+          "1F6BD": 2,
+          "1F6BE": 2,
+          "1F6BF": 2,
+          "1F6C0": 2,
+          "1F6C1": 2,
+          "1F6C2": 2,
+          "1F6C3": 2,
+          "1F6C4": 2,
+          "1F6C5": 2,
+          "1F6C6": 1,
+          "1F6C7": 1,
+          "1F6C8": 1,
+          "1F6C9": 1,
+          "1F6CA": 1,
+          "1F6CB": 1,
+          "1F6CC": 2,
+          "1F6CD": 1,
+          "1F6CE": 1,
+          "1F6CF": 1,
+          "1F6D0": 2,
+          "1F6D1": 2,
+          "1F6D2": 2,
+          "1F6D3": 1,
+          "1F6D4": 1,
+          "1F6D5": 2,
+          "1F6D6": 2,
+          "1F6D7": 2,
+          "1F6D8": 2,
+          "1F6D9": 1,
+          "1F6DA": 1,
+          "1F6DB": 1,
+          "1F6DC": 2,
+          "1F6DD": 2,
+          "1F6DE": 2,
+          "1F6DF": 2,
+          "1F6E0": 1,
+          "1F6E1": 1,
+          "1F6E2": 1,
+          "1F6E3": 1,
+          "1F6E4": 1,
+          "1F6E5": 1,
+          "1F6E6": 1,
+          "1F6E7": 1,
+          "1F6E8": 1,
+          "1F6E9": 1,
+          "1F6EA": 1,
+          "1F6EB": 2,
+          "1F6EC": 2,
+          "1F6ED": 1,
+          "1F6EE": 1,
+          "1F6EF": 1,
+          "1F6F0": 1,
+          "1F6F1": 1,
+          "1F6F2": 1,
+          "1F6F3": 1,
+          "1F6F4": 2,
+          "1F6F5": 2,
+          "1F6F6": 2,
+          "1F6F7": 2,
+          "1F6F8": 2,
+          "1F6F9": 2,
+          "1F6FA": 2,
+          "1F6FB": 2,
+          "1F6FC": 2,
+          "1F6FD": 1,
+          "1F6FE": 1,
+          "1F6FF": 1,
+          "1F900": 1,
+          "1F901": 1,
+          "1F902": 1,
+          "1F903": 1,
+          "1F904": 1,
+          "1F905": 1,
+          "1F906": 1,
+          "1F907": 1,
+          "1F908": 1,
+          "1F909": 1,
+          "1F90A": 1,
+          "1F90B": 1,
+          "1F90C": 2,
+          "1F90D": 2,
+          "1F90E": 2,
+          "1F90F": 2,
+          "1F910": 2,
+          "1F911": 2,
+          "1F912": 2,
+          "1F913": 2,
+          "1F914": 2,
+          "1F915": 2,
+          "1F916": 2,
+          "1F917": 2,
+          "1F918": 2,
+          "1F919": 2,
+          "1F91A": 2,
+          "1F91B": 2,
+          "1F91C": 2,
+          "1F91D": 2,
+          "1F91E": 2,
+          "1F91F": 2,
+          "1F920": 2,
+          "1F921": 2,
+          "1F922": 2,
+          "1F923": 2,
+          "1F924": 2,
+          "1F925": 2,
+          "1F926": 2,
+          "1F927": 2,
+          "1F928": 2,
+          "1F929": 2,
+          "1F92A": 2,
+          "1F92B": 2,
+          "1F92C": 2,
+          "1F92D": 2,
+          "1F92E": 2,
+          "1F92F": 2,
+          "1F930": 2,
+          "1F931": 2,
+          "1F932": 2,
+          "1F933": 2,
+          "1F934": 2,
+          "1F935": 2,
+          "1F936": 2,
+          "1F937": 2,
+          "1F938": 2,
+          "1F939": 2,
+          "1F93A": 2,
+          "1F93B": 1,
+          "1F93C": 2,
+          "1F93D": 2,
+          "1F93E": 2,
+          "1F93F": 2,
+          "1F940": 2,
+          "1F941": 2,
+          "1F942": 2,
+          "1F943": 2,
+          "1F944": 2,
+          "1F945": 2,
+          "1F946": 1,
+          "1F947": 2,
+          "1F948": 2,
+          "1F949": 2,
+          "1F94A": 2,
+          "1F94B": 2,
+          "1F94C": 2,
+          "1F94D": 2,
+          "1F94E": 2,
+          "1F94F": 2,
+          "1F950": 2,
+          "1F951": 2,
+          "1F952": 2,
+          "1F953": 2,
+          "1F954": 2,
+          "1F955": 2,
+          "1F956": 2,
+          "1F957": 2,
+          "1F958": 2,
+          "1F959": 2,
+          "1F95A": 2,
+          "1F95B": 2,
+          "1F95C": 2,
+          "1F95D": 2,
+          "1F95E": 2,
+          "1F95F": 2,
+          "1F960": 2,
+          "1F961": 2,
+          "1F962": 2,
+          "1F963": 2,
+          "1F964": 2,
+          "1F965": 2,
+          "1F966": 2,
+          "1F967": 2,
+          "1F968": 2,
+          "1F969": 2,
+          "1F96A": 2,
+          "1F96B": 2,
+          "1F96C": 2,
+          "1F96D": 2,
+          "1F96E": 2,
+          "1F96F": 2,
+          "1F970": 2,
+          "1F971": 2,
+          "1F972": 2,
+          "1F973": 2,
+          "1F974": 2,
+          "1F975": 2,
+          "1F976": 2,
+          "1F977": 2,
+          "1F978": 2,
+          "1F979": 2,
+          "1F97A": 2,
+          "1F97B": 2,
+          "1F97C": 2,
+          "1F97D": 2,
+          "1F97E": 2,
+          "1F97F": 2,
+          "1F980": 2,
+          "1F981": 2,
+          "1F982": 2,
+          "1F983": 2,
+          "1F984": 2,
+          "1F985": 2,
+          "1F986": 2,
+          "1F987": 2,
+          "1F988": 2,
+          "1F989": 2,
+          "1F98A": 2,
+          "1F98B": 2,
+          "1F98C": 2,
+          "1F98D": 2,
+          "1F98E": 2,
+          "1F98F": 2,
+          "1F990": 2,
+          "1F991": 2,
+          "1F992": 2,
+          "1F993": 2,
+          "1F994": 2,
+          "1F995": 2,
+          "1F996": 2,
+          "1F997": 2,
+          "1F998": 2,
+          "1F999": 2,
+          "1F99A": 2,
+          "1F99B": 2,
+          "1F99C": 2,
+          "1F99D": 2,
+          "1F99E": 2,
+          "1F99F": 2,
+          "1F9A0": 2,
+          "1F9A1": 2,
+          "1F9A2": 2,
+          "1F9A3": 2,
+          "1F9A4": 2,
+          "1F9A5": 2,
+          "1F9A6": 2,
+          "1F9A7": 2,
+          "1F9A8": 2,
+          "1F9A9": 2,
+          "1F9AA": 2,
+          "1F9AB": 2,
+          "1F9AC": 2,
+          "1F9AD": 2,
+          "1F9AE": 2,
+          "1F9AF": 2,
+          "1F9B0": 2,
+          "1F9B1": 2,
+          "1F9B2": 2,
+          "1F9B3": 2,
+          "1F9B4": 2,
+          "1F9B5": 2,
+          "1F9B6": 2,
+          "1F9B7": 2,
+          "1F9B8": 2,
+          "1F9B9": 2,
+          "1F9BA": 2,
+          "1F9BB": 2,
+          "1F9BC": 2,
+          "1F9BD": 2,
+          "1F9BE": 2,
+          "1F9BF": 2,
+          "1F9C0": 2,
+          "1F9C1": 2,
+          "1F9C2": 2,
+          "1F9C3": 2,
+          "1F9C4": 2,
+          "1F9C5": 2,
+          "1F9C6": 2,
+          "1F9C7": 2,
+          "1F9C8": 2,
+          "1F9C9": 2,
+          "1F9CA": 2,
+          "1F9CB": 2,
+          "1F9CC": 2,
+          "1F9CD": 2,
+          "1F9CE": 2,
+          "1F9CF": 2,
+          "1F9D0": 2,
+          "1F9D1": 2,
+          "1F9D2": 2,
+          "1F9D3": 2,
+          "1F9D4": 2,
+          "1F9D5": 2,
+          "1F9D6": 2,
+          "1F9D7": 2,
+          "1F9D8": 2,
+          "1F9D9": 2,
+          "1F9DA": 2,
+          "1F9DB": 2,
+          "1F9DC": 2,
+          "1F9DD": 2,
+          "1F9DE": 2,
+          "1F9DF": 2,
+          "1F9E0": 2,
+          "1F9E1": 2,
+          "1F9E2": 2,
+          "1F9E3": 2,
+          "1F9E4": 2,
+          "1F9E5": 2,
+          "1F9E6": 2,
+          "1F9E7": 2,
+          "1F9E8": 2,
+          "1F9E9": 2,
+          "1F9EA": 2,
+          "1F9EB": 2,
+          "1F9EC": 2,
+          "1F9ED": 2,
+          "1F9EE": 2,
+          "1F9EF": 2,
+          "1F9F0": 2,
+          "1F9F1": 2,
+          "1F9F2": 2,
+          "1F9F3": 2,
+          "1F9F4": 2,
+          "1F9F5": 2,
+          "1F9F6": 2,
+          "1F9F7": 2,
+          "1F9F8": 2,
+          "1F9F9": 2,
+          "1F9FA": 2,
+          "1F9FB": 2,
+          "1F9FC": 2,
+          "1F9FD": 2,
+          "1F9FE": 2,
+          "1F9FF": 2,
+          "1FA70": 2,
+          "1FA71": 2,
+          "1FA72": 2,
+          "1FA73": 2,
+          "1FA74": 2,
+          "1FA75": 2,
+          "1FA76": 2,
+          "1FA77": 2,
+          "1FA78": 2,
+          "1FA79": 2,
+          "1FA7A": 2,
+          "1FA7B": 2,
+          "1FA7C": 2,
+          "1FA7D": 1,
+          "1FA7E": 1,
+          "1FA7F": 1,
+          "1FA80": 2,
+          "1FA81": 2,
+          "1FA82": 2,
+          "1FA83": 2,
+          "1FA84": 2,
+          "1FA85": 2,
+          "1FA86": 2,
+          "1FA87": 2,
+          "1FA88": 2,
+          "1FA89": 2,
+          "1FA8A": 2,
+          "1FA8B": 1,
+          "1FA8C": 1,
+          "1FA8D": 1,
+          "1FA8E": 2,
+          "1FA8F": 2,
+          "1FA90": 2,
+          "1FA91": 2,
+          "1FA92": 2,
+          "1FA93": 2,
+          "1FA94": 2,
+          "1FA95": 2,
+          "1FA96": 2,
+          "1FA97": 2,
+          "1FA98": 2,
+          "1FA99": 2,
+          "1FA9A": 2,
+          "1FA9B": 2,
+          "1FA9C": 2,
+          "1FA9D": 2,
+          "1FA9E": 2,
+          "1FA9F": 2,
+          "1FAA0": 2,
+          "1FAA1": 2,
+          "1FAA2": 2,
+          "1FAA3": 2,
+          "1FAA4": 2,
+          "1FAA5": 2,
+          "1FAA6": 2,
+          "1FAA7": 2,
+          "1FAA8": 2,
+          "1FAA9": 2,
+          "1FAAA": 2,
+          "1FAAB": 2,
+          "1FAAC": 2,
+          "1FAAD": 2,
+          "1FAAE": 2,
+          "1FAAF": 2,
+          "1FAB0": 2,
+          "1FAB1": 2,
+          "1FAB2": 2,
+          "1FAB3": 2,
+          "1FAB4": 2,
+          "1FAB5": 2,
+          "1FAB6": 2,
+          "1FAB7": 2,
+          "1FAB8": 2,
+          "1FAB9": 2,
+          "1FABA": 2,
+          "1FABB": 2,
+          "1FABC": 2,
+          "1FABD": 2,
+          "1FABE": 2,
+          "1FABF": 2,
+          "1FAC0": 2,
+          "1FAC1": 2,
+          "1FAC2": 2,
+          "1FAC3": 2,
+          "1FAC4": 2,
+          "1FAC5": 2,
+          "1FAC6": 2,
+          "1FAC7": 1,
+          "1FAC8": 2,
+          "1FAC9": 1,
+          "1FACA": 1,
+          "1FACB": 1,
+          "1FACC": 1,
+          "1FACD": 2,
+          "1FACE": 2,
+          "1FACF": 2,
+          "1FAD0": 2,
+          "1FAD1": 2,
+          "1FAD2": 2,
+          "1FAD3": 2,
+          "1FAD4": 2,
+          "1FAD5": 2,
+          "1FAD6": 2,
+          "1FAD7": 2,
+          "1FAD8": 2,
+          "1FAD9": 2,
+          "1FADA": 2,
+          "1FADB": 2,
+          "1FADC": 2,
+          "1FADD": 1,
+          "1FADE": 1,
+          "1FADF": 2,
+          "1FAE0": 2,
+          "1FAE1": 2,
+          "1FAE2": 2,
+          "1FAE3": 2,
+          "1FAE4": 2,
+          "1FAE5": 2,
+          "1FAE6": 2,
+          "1FAE7": 2,
+          "1FAE8": 2,
+          "1FAE9": 2,
+          "1FAEA": 2,
+          "1FAEB": 1,
+          "1FAEC": 1,
+          "1FAED": 1,
+          "1FAEE": 1,
+          "1FAEF": 2,
+          "1FAF0": 2,
+          "1FAF1": 2,
+          "1FAF2": 2,
+          "1FAF3": 2,
+          "1FAF4": 2,
+          "1FAF5": 2,
+          "1FAF6": 2,
+          "1FAF7": 2,
+          "1FAF8": 2,
+          "1FAF9": 1,
+          "1FAFA": 1,
+          "1FAFB": 1,
+          "1FAFC": 1,
+          "1FAFD": 1,
+          "1FAFE": 1,
+          "1FAFF": 1
+        }
+      },
+      "window_title": "ftgt-parser-buf-01-ft_baseline"
+    },
+    {
+      "arm": "ft_baseline",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/02-ft_baseline/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.758726792,
+        "interval_mb_s": {
+          "p5": 56.62049945702498,
+          "p50": 81.5299907375957,
+          "p95": 93.51619546547833
+        },
+        "mb_s": 76.83389605851772,
+        "mib_s": 73.27451330043576,
+        "samples": 39,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96699753586666,
+        96709512313458
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/02-ft_baseline/footprint/ft_baseline-54566-20261011T230635Z",
+        "gpu_owned_bytes": 16859136,
+        "phys_footprint": 946996880,
+        "rss_bytes": 359415808
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 167755776,
+            "allocated": 144005920,
+            "mapped": 351846400,
+            "resident": 236339200,
+            "retained": 328679424
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 588,
+          "painted_frames_total": 584,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 583,
+            "max_ns": 1700981708,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12832482125
+          },
+          "presented_total": 584,
+          "retried_paint_frames_total": 2,
+          "stale_presented_total": 7
+        },
+        "points": 28,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3512,
+                "max_ns": 17750,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3071,
+                "total_ns": 1340221
+              },
+              "wait": {
+                "count": 3512,
+                "max_ns": 451459,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 956833
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 588,
+                "max_ns": 1853084,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 655359,
+                "total_ns": 194159934
+              },
+              "wait": {
+                "count": 588,
+                "max_ns": 217209,
+                "p50_ns": 0,
+                "p95_ns": 24575,
+                "p99_ns": 49151,
+                "total_ns": 2649747
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4973,
+                "max_ns": 2059500,
+                "p50_ns": 98303,
+                "p95_ns": 2059500,
+                "p99_ns": 2059500,
+                "total_ns": 3173571787
+              },
+              "wait": {
+                "count": 4973,
+                "max_ns": 9610250,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 69959531
+              }
+            }
+          },
+          "main_thread_blocked_ns": 2649747,
+          "main_thread_blocked_waits": 172,
+          "main_thread_max_wait_ns": 217209
+        }
+      },
+      "index": 2,
+      "internal_present": {
+        "fps": 58.1787195007505,
+        "presented": 567.7502287162267
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-54566.json",
+      "kind": "ft",
+      "load_end": [
+        19.9,
+        21.64,
+        19.47
+      ],
+      "load_go": [
+        20.42,
+        21.8,
+        19.5
+      ],
+      "load_start": [
+        20.63,
+        21.86,
+        19.51
+      ],
+      "offset_cross_check": {
+        "lsof": 3145808,
+        "proc_pidfdinfo": 80
+      },
+      "pids": {
+        "ancestry": [
+          54567,
+          54566,
+          51984
+        ],
+        "cat": 54823,
+        "shell": 54567,
+        "terminal": 54566
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/02-ft_baseline",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 11
+            },
+            "cpu_s": 6.403,
+            "current_priorities": {
+              "20": 10,
+              "46": 1
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.36,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.769,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.321,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.111,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.098,
+            "current_priorities": {
+              "31": 2,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.095,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.091,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.064,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.023,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 3
+            },
+            "cpu_s": 0.023,
+            "current_priorities": {
+              "37": 3
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 2
+            },
+            "cpu_s": 0.013,
+            "current_priorities": {
+              "31": 1,
+              "37": 2
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.011,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "update_checker",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.356,
+          "user-initiated": 12.625,
+          "utility": 6.403
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 51,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 4.99s system 51% cpu 9.766 total",
+        "system_s": 4.99,
+        "total_s": 9.766,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-02-ft_baseline"
+    },
+    {
+      "arm": "ft",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/03-ft/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.965487333,
+        "interval_mb_s": {
+          "p5": 57.80324646623278,
+          "p50": 72.87216977500191,
+          "p95": 94.06163628418278
+        },
+        "mb_s": 75.23977252141874,
+        "mib_s": 71.75423862592578,
+        "samples": 40,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96715748463250,
+        96725713950583
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/03-ft/footprint/ft-57667-20261011T230651Z",
+        "gpu_owned_bytes": 16859136,
+        "phys_footprint": 998573712,
+        "rss_bytes": 411041792
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 170295296,
+            "allocated": 144068448,
+            "mapped": 403357696,
+            "resident": 285884416,
+            "retained": 310722560
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 599,
+          "painted_frames_total": 595,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 594,
+            "max_ns": 1090080584,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12808019333
+          },
+          "presented_total": 595,
+          "retried_paint_frames_total": 3,
+          "stale_presented_total": 8
+        },
+        "points": 28,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3659,
+                "max_ns": 24833,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3071,
+                "total_ns": 1369281
+              },
+              "wait": {
+                "count": 3659,
+                "max_ns": 157500,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 211042
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 599,
+                "max_ns": 639833,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 639833,
+                "total_ns": 193133141
+              },
+              "wait": {
+                "count": 599,
+                "max_ns": 91709,
+                "p50_ns": 0,
+                "p95_ns": 24575,
+                "p99_ns": 49151,
+                "total_ns": 2388960
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 5076,
+                "max_ns": 2085834,
+                "p50_ns": 196607,
+                "p95_ns": 2085834,
+                "p99_ns": 2085834,
+                "total_ns": 3207604361
+              },
+              "wait": {
+                "count": 5076,
+                "max_ns": 480000,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 62089083
+              }
+            }
+          },
+          "main_thread_blocked_ns": 2388960,
+          "main_thread_blocked_waits": 175,
+          "main_thread_max_wait_ns": 91709
+        }
+      },
+      "index": 3,
+      "internal_present": {
+        "fps": 58.356011421015516,
+        "presented": 581.5460926205335
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-57667.json",
+      "kind": "ft",
+      "load_end": [
+        18.18,
+        21.17,
+        19.34
+      ],
+      "load_go": [
+        19.11,
+        21.45,
+        19.42
+      ],
+      "load_start": [
+        19.11,
+        21.45,
+        19.42
+      ],
+      "offset_cross_check": {
+        "lsof": 2687047,
+        "proc_pidfdinfo": 71
+      },
+      "pids": {
+        "ancestry": [
+          57737,
+          57667,
+          51984
+        ],
+        "cat": 58144,
+        "shell": 57737,
+        "terminal": 57667
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/03-ft",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 11
+            },
+            "cpu_s": 6.627,
+            "current_priorities": {
+              "20": 10,
+              "46": 1
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.528,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.958,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.398,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.116,
+            "current_priorities": {
+              "31": 2,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.113,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.106,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 9,
+              "utility": 1
+            },
+            "cpu_s": 0.101,
+            "current_priorities": {
+              "20": 1,
+              "31": 1,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.086,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.022,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 3
+            },
+            "cpu_s": 0.019,
+            "current_priorities": {
+              "37": 3
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.012,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "update_checker",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 3
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 3
+            },
+            "name": "(unnamed)",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "(unnamed)",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.433,
+          "user-initiated": 13.028,
+          "utility": 6.627
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 52,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 5.25s system 52% cpu 9.972 total",
+        "system_s": 5.25,
+        "total_s": 9.972,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-03-ft"
+    },
+    {
+      "arm": "ft",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/04-ft/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.921263,
+        "interval_mb_s": {
+          "p5": 62.91699262260276,
+          "p50": 74.18185599750417,
+          "p95": 89.00587982119511
+        },
+        "mb_s": 75.57515610663684,
+        "mib_s": 72.0740853372925,
+        "samples": 40,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96731891731208,
+        96741812994208
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/04-ft/footprint/ft-59070-20261011T230707Z",
+        "gpu_owned_bytes": 16629760,
+        "phys_footprint": 992315048,
+        "rss_bytes": 404258816
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 169476096,
+            "allocated": 142591648,
+            "mapped": 396214272,
+            "resident": 280707072,
+            "retained": 259145728
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 595,
+          "painted_frames_total": 591,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 590,
+            "max_ns": 1684538125,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12792799291
+          },
+          "presented_total": 591,
+          "retried_paint_frames_total": 3,
+          "stale_presented_total": 7
+        },
+        "points": 28,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3559,
+                "max_ns": 87375,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3071,
+                "total_ns": 1508945
+              },
+              "wait": {
+                "count": 3559,
+                "max_ns": 35292,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 132334
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 595,
+                "max_ns": 616042,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 616042,
+                "total_ns": 199141120
+              },
+              "wait": {
+                "count": 595,
+                "max_ns": 527083,
+                "p50_ns": 0,
+                "p95_ns": 28671,
+                "p99_ns": 65535,
+                "total_ns": 3148376
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4904,
+                "max_ns": 2348417,
+                "p50_ns": 163839,
+                "p95_ns": 2097151,
+                "p99_ns": 2097151,
+                "total_ns": 3206531893
+              },
+              "wait": {
+                "count": 4904,
+                "max_ns": 524458,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 59194080
+              }
+            }
+          },
+          "main_thread_blocked_ns": 3148376,
+          "main_thread_blocked_waits": 168,
+          "main_thread_max_wait_ns": 527083
+        }
+      },
+      "index": 4,
+      "internal_present": {
+        "fps": 58.24671211779456,
+        "presented": 577.8809498059268
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-59070.json",
+      "kind": "ft",
+      "load_end": [
+        18.37,
+        20.97,
+        19.31
+      ],
+      "load_go": [
+        17.6,
+        21.0,
+        19.29
+      ],
+      "load_start": [
+        17.6,
+        21.0,
+        19.29
+      ],
+      "offset_cross_check": {
+        "lsof": 2228295,
+        "proc_pidfdinfo": 71
+      },
+      "pids": {
+        "ancestry": [
+          59094,
+          59070,
+          51984
+        ],
+        "cat": 59279,
+        "shell": 59094,
+        "terminal": 59070
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/04-ft",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.567,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "utility": 11
+            },
+            "cpu_s": 6.399,
+            "current_priorities": {
+              "20": 11
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.019,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.345,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.137,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.111,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.102,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.087,
+            "current_priorities": {
+              "31": 2,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.068,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 3
+            },
+            "cpu_s": 0.024,
+            "current_priorities": {
+              "37": 3
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.021,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.012,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "update_checker",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "(unnamed)",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.379,
+          "user-initiated": 13.116,
+          "utility": 6.399
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 53,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 5.30s system 53% cpu 9.927 total",
+        "system_s": 5.3,
+        "total_s": 9.927,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-04-ft"
+    },
+    {
+      "arm": "ft_baseline",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/05-ft_baseline/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 9.672965083,
+        "interval_mb_s": {
+          "p5": 58.84325278732339,
+          "p50": 80.00261271125063,
+          "p95": 90.43729860505313
+        },
+        "mb_s": 77.51511491732323,
+        "mib_s": 73.92417422993014,
+        "samples": 39,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96747988728125,
+        96757661693208
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/05-ft_baseline/footprint/ft_baseline-60257-20261011T230723Z",
+        "gpu_owned_bytes": 16662528,
+        "phys_footprint": 1003325120,
+        "rss_bytes": 415432704
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 169574400,
+            "allocated": 144636736,
+            "mapped": 405979136,
+            "resident": 290455552,
+            "retained": 274546688
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 581,
+          "painted_frames_total": 577,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 576,
+            "max_ns": 1688575625,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 12306548584
+          },
+          "presented_total": 577,
+          "retried_paint_frames_total": 3,
+          "stale_presented_total": 5
+        },
+        "points": 27,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3512,
+                "max_ns": 19459,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3071,
+                "total_ns": 1314280
+              },
+              "wait": {
+                "count": 3512,
+                "max_ns": 193375,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 472833
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 581,
+                "max_ns": 2330041,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 655359,
+                "total_ns": 194423750
+              },
+              "wait": {
+                "count": 581,
+                "max_ns": 147333,
+                "p50_ns": 0,
+                "p95_ns": 28671,
+                "p99_ns": 40959,
+                "total_ns": 2590998
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4938,
+                "max_ns": 2092334,
+                "p50_ns": 131071,
+                "p95_ns": 2092334,
+                "p99_ns": 2092334,
+                "total_ns": 3167616679
+              },
+              "wait": {
+                "count": 4938,
+                "max_ns": 1218042,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 393215,
+                "total_ns": 61613535
+              }
+            }
+          },
+          "main_thread_blocked_ns": 2590998,
+          "main_thread_blocked_waits": 173,
+          "main_thread_max_wait_ns": 147333
+        }
+      },
+      "index": 5,
+      "internal_present": {
+        "fps": 58.511930651821835,
+        "presented": 565.98386213399
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-60257.json",
+      "kind": "ft",
+      "load_end": [
+        21.63,
+        21.6,
+        19.57
+      ],
+      "load_go": [
+        20.34,
+        21.34,
+        19.45
+      ],
+      "load_start": [
+        18.37,
+        20.97,
+        19.31
+      ],
+      "offset_cross_check": {
+        "lsof": 2359376,
+        "proc_pidfdinfo": 80
+      },
+      "pids": {
+        "ancestry": [
+          60276,
+          60257,
+          51984
+        ],
+        "cat": 60390,
+        "shell": 60276,
+        "terminal": 60257
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/05-ft_baseline",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 6.419,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 1,
+              "utility": 10
+            },
+            "cpu_s": 6.253,
+            "current_priorities": {
+              "20": 9,
+              "37": 1,
+              "46": 1
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 5.782,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 3.3,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.116,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 10
+            },
+            "cpu_s": 0.099,
+            "current_priorities": {
+              "31": 1,
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.097,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.097,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.064,
+            "current_priorities": {
+              "31": 3,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 2
+            },
+            "cpu_s": 0.029,
+            "current_priorities": {
+              "31": 1,
+              "37": 2
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.021,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.01,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "update_checker",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "(unnamed)",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 11
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 11
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 11
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 3.332,
+          "user-initiated": 12.704,
+          "utility": 6.253
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 11
+      },
+      "time": {
+        "cpu_pct": 52,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 5.05s system 52% cpu 9.678 total",
+        "system_s": 5.05,
+        "total_s": 9.678,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-05-ft_baseline"
+    },
+    {
+      "arm": "ft_baseline",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/06-ft_baseline/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 8.554942792,
+        "interval_mb_s": {
+          "p5": 74.30321432523594,
+          "p50": 88.0350122257691,
+          "p95": 99.41446871313626
+        },
+        "mb_s": 87.64535523266886,
+        "mib_s": 83.58512423769842,
+        "samples": 35,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96763844235458,
+        96772399178250
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/06-ft_baseline/footprint/ft_baseline-61656-20261011T230738Z",
+        "gpu_owned_bytes": 16859136,
+        "phys_footprint": 1041696448,
+        "rss_bytes": 454082560
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 173244416,
+            "allocated": 146254936,
+            "mapped": 444448768,
+            "resident": 329072640,
+            "retained": 309477376
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 513,
+          "painted_frames_total": 509,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 508,
+            "max_ns": 1688332708,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 20971519,
+            "total_ns": 11201713917
+          },
+          "presented_total": 509,
+          "retried_paint_frames_total": 2,
+          "stale_presented_total": 2
+        },
+        "points": 25,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3104,
+                "max_ns": 24916,
+                "p50_ns": 47,
+                "p95_ns": 2047,
+                "p99_ns": 3071,
+                "total_ns": 1159800
+              },
+              "wait": {
+                "count": 3104,
+                "max_ns": 37458,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 122667
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 513,
+                "max_ns": 5055750,
+                "p50_ns": 327679,
+                "p95_ns": 524287,
+                "p99_ns": 524287,
+                "total_ns": 159956293
+              },
+              "wait": {
+                "count": 513,
+                "max_ns": 2404833,
+                "p50_ns": 0,
+                "p95_ns": 24575,
+                "p99_ns": 40959,
+                "total_ns": 4584460
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4668,
+                "max_ns": 2280291,
+                "p50_ns": 114687,
+                "p95_ns": 2097151,
+                "p99_ns": 2097151,
+                "total_ns": 3115952225
+              },
+              "wait": {
+                "count": 4668,
+                "max_ns": 2393125,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 327679,
+                "total_ns": 56848793
+              }
+            }
+          },
+          "main_thread_blocked_ns": 4584460,
+          "main_thread_blocked_waits": 190,
+          "main_thread_max_wait_ns": 2404833
+        }
+      },
+      "index": 6,
+      "internal_present": {
+        "fps": 58.70885548024946,
+        "presented": 502.25090001732985
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-61656.json",
+      "kind": "ft",
+      "load_end": [
+        18.4,
+        20.89,
+        19.35
+      ],
+      "load_go": [
+        20.3,
+        21.33,
+        19.48
+      ],
+      "load_start": [
+        21.63,
+        21.6,
+        19.57
+      ],
+      "offset_cross_check": {
+        "lsof": 4063312,
+        "proc_pidfdinfo": 80
+      },
+      "pids": {
+        "ancestry": [
+          61657,
+          61656,
+          51984
+        ],
+        "cat": 61822,
+        "shell": 61657,
+        "terminal": 61656
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/06-ft_baseline",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 10
+            },
+            "cpu_s": 6.022,
+            "current_priorities": {
+              "20": 9,
+              "46": 1
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 5.972,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 5.387,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 2.809,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.09,
+            "current_priorities": {
+              "31": 1,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.086,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.081,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.08,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 7
+            },
+            "cpu_s": 0.066,
+            "current_priorities": {
+              "31": 3,
+              "37": 7
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 2
+            },
+            "cpu_s": 0.024,
+            "current_priorities": {
+              "31": 1,
+              "37": 2
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.017,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.009,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "terminal-threaded-writer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "pane-child-waiter-61657",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 2.835,
+          "user-initiated": 11.787,
+          "utility": 6.022
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 10
+      },
+      "time": {
+        "cpu_pct": 53,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 4.61s system 53% cpu 8.561 total",
+        "system_s": 4.61,
+        "total_s": 8.561,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-06-ft_baseline"
+    },
+    {
+      "arm": "ft",
+      "beachball": null,
+      "cat_exit_status": 0,
+      "config_file": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/07-ft/frankenterm.lua",
+      "cpu_hog_threads": 0,
+      "drain": {
+        "bytes": 749801000,
+        "drain_s": 8.136074667,
+        "interval_mb_s": {
+          "p5": 78.36834716187747,
+          "p50": 91.40399687075664,
+          "p95": 110.91931423896158
+        },
+        "mb_s": 92.15758589841859,
+        "mib_s": 87.88832273332461,
+        "samples": 33,
+        "stalls": {
+          "episodes": 0,
+          "episodes_ge_1s": 0,
+          "max_s": 0.0,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0
+        }
+      },
+      "drain_window_ns": [
+        96778600947541,
+        96786737022208
+      ],
+      "errors": [],
+      "footprint_after": {
+        "bundle": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/07-ft/footprint/ft-62644-20261011T230752Z",
+        "gpu_owned_bytes": 16859136,
+        "phys_footprint": 1082394352,
+        "rss_bytes": 494764032
+      },
+      "fps": null,
+      "fps_unavailable": null,
+      "ft_snapshot": {
+        "allocator": {
+          "backend": "jemalloc",
+          "options": {
+            "background_thread": null,
+            "dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0,
+            "narenas": 144
+          },
+          "stats": {
+            "active": 169869312,
+            "allocated": 149108480,
+            "mapped": 486014976,
+            "resident": 370753536,
+            "retained": 280494080
+          },
+          "unavailable": null
+        },
+        "frames": {
+          "max_fps": 120,
+          "paint_passes_total": 489,
+          "painted_frames_total": 486,
+          "present_failures_total": 0,
+          "present_interval": {
+            "count": 485,
+            "max_ns": 1091943333,
+            "p50_ns": 16777215,
+            "p95_ns": 20971519,
+            "p99_ns": 25165823,
+            "total_ns": 10816358832
+          },
+          "presented_total": 486,
+          "retried_paint_frames_total": 2,
+          "stale_presented_total": 2
+        },
+        "points": 24,
+        "terminal_locks": {
+          "holders": {
+            "other": {
+              "hold": {
+                "count": 3015,
+                "max_ns": 25750,
+                "p50_ns": 47,
+                "p95_ns": 1791,
+                "p99_ns": 3071,
+                "total_ns": 982577
+              },
+              "wait": {
+                "count": 3015,
+                "max_ns": 43416,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 0,
+                "total_ns": 130457
+              }
+            },
+            "paint": {
+              "hold": {
+                "count": 489,
+                "max_ns": 695209,
+                "p50_ns": 327679,
+                "p95_ns": 458751,
+                "p99_ns": 655359,
+                "total_ns": 145409462
+              },
+              "wait": {
+                "count": 489,
+                "max_ns": 172417,
+                "p50_ns": 0,
+                "p95_ns": 28671,
+                "p99_ns": 57343,
+                "total_ns": 2726707
+              }
+            },
+            "parser": {
+              "hold": {
+                "count": 4812,
+                "max_ns": 2231334,
+                "p50_ns": 131071,
+                "p95_ns": 2097151,
+                "p99_ns": 2097151,
+                "total_ns": 3136644018
+              },
+              "wait": {
+                "count": 4812,
+                "max_ns": 701375,
+                "p50_ns": 0,
+                "p95_ns": 0,
+                "p99_ns": 327679,
+                "total_ns": 58566211
+              }
+            }
+          },
+          "main_thread_blocked_ns": 2726707,
+          "main_thread_blocked_waits": 192,
+          "main_thread_max_wait_ns": 172417
+        }
+      },
+      "index": 7,
+      "internal_present": {
+        "fps": 58.09133600273841,
+        "presented": 472.63544722406505
+      },
+      "isolated_snapshot": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/home/.local/share/frankenterm/frankenterm-resources-62644.json",
+      "kind": "ft",
+      "load_end": [
+        15.73,
+        20.17,
+        19.12
+      ],
+      "load_go": [
+        17.33,
+        20.62,
+        19.26
+      ],
+      "load_start": [
+        18.4,
+        20.89,
+        19.35
+      ],
+      "offset_cross_check": {
+        "lsof": 2162759,
+        "proc_pidfdinfo": 71
+      },
+      "pids": {
+        "ancestry": [
+          62646,
+          62644,
+          51984
+        ],
+        "cat": 62781,
+        "shell": 62646,
+        "terminal": 62644
+      },
+      "run_dir": "/Users/jemanuel/ft-staging/5351b/t0/parser-buf/runs/07-ft",
+      "threads": {
+        "busiest": [
+          {
+            "classes": {
+              "utility": 10
+            },
+            "cpu_s": 5.97,
+            "current_priorities": {
+              "20": 7,
+              "46": 3
+            },
+            "name": "scrollback-durability",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 5.891,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "mux-read-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 5.283,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "mux-parse-pane-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 2.547,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "main",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.082,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "promise-background-io",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 2,
+              "user-initiated": 8
+            },
+            "cpu_s": 0.081,
+            "current_priorities": {
+              "31": 2,
+              "37": 8
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 9
+            },
+            "cpu_s": 0.079,
+            "current_priorities": {
+              "31": 1,
+              "37": 9
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 4,
+              "user-initiated": 6
+            },
+            "cpu_s": 0.066,
+            "current_priorities": {
+              "31": 4,
+              "37": 6
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 3,
+              "user-initiated": 7
+            },
+            "cpu_s": 0.05,
+            "current_priorities": {
+              "31": 3,
+              "37": 7
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 1,
+              "utility": 1
+            },
+            "cpu_s": 0.03,
+            "current_priorities": {
+              "20": 1,
+              "31": 1,
+              "37": 1
+            },
+            "name": "(unnamed)",
+            "qos": "utility"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.017,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "resource-snapshot",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 1,
+              "user-initiated": 2
+            },
+            "cpu_s": 0.013,
+            "current_priorities": {
+              "31": 1,
+              "37": 2
+            },
+            "name": "(unnamed)",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.008,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "asupersync-fallback-timer",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.001,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "promise-background-0",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "gui-stats-recorder",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ssh-agent-proxy-updater",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ft-layout-persistence",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "user-initiated": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "37": 10
+            },
+            "name": "com.apple.NSEventThread",
+            "qos": "user-initiated"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "ft-gui-mux-server",
+            "qos": "default"
+          },
+          {
+            "classes": {
+              "default": 10
+            },
+            "cpu_s": 0.0,
+            "current_priorities": {
+              "31": 10
+            },
+            "name": "terminal-threaded-writer",
+            "qos": "default"
+          }
+        ],
+        "cpu_s_by_qos": {
+          "default": 2.572,
+          "user-initiated": 11.546,
+          "utility": 6.0
+        },
+        "error": null,
+        "interval_s": 1.0,
+        "samples": 10
+      },
+      "time": {
+        "cpu_pct": 55,
+        "raw": "( print -r -- $sysparams[pid] > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat -- \"$2)  0.01s user 4.53s system 55% cpu 8.143 total",
+        "system_s": 4.53,
+        "total_s": 8.143,
+        "user_s": 0.01
+      },
+      "window_title": "ftgt-parser-buf-07-ft"
+    }
+  ],
+  "schema": "frankenterm.gui_throughput_receipt.v1",
+  "schema_problems": [],
+  "started_utc": "2026-10-11T23:05:48.626371+00:00",
+  "tcc": {
+    "accessibility": false,
+    "screen_capture": false
+  },
+  "verdicts": {
+    "drain_offset_s": {
+      "arms": {
+        "ft": {
+          "cv_pct": 9.17377949523251,
+          "max": 9.965487333,
+          "mean": 9.40987478125,
+          "median": 9.7689685625,
+          "min": 8.136074667,
+          "n": 4,
+          "values": [
+            9.616674125,
+            9.965487333,
+            9.921263,
+            8.136074667
+          ]
+        },
+        "ft_baseline": {
+          "cv_pct": 5.95206168442574,
+          "max": 9.758726792,
+          "mean": 9.38153466675,
+          "median": 9.606234541500001,
+          "min": 8.554942792,
+          "n": 4,
+          "values": [
+            9.539504,
+            9.758726792,
+            9.672965083,
+            8.554942792
+          ]
+        }
+      },
+      "metric": "drain_s",
+      "verdict": "NO_ADMISSIBLE_RATIO (ft drain_s CV 9.2% > 5.0%; ft_baseline drain_s CV 6.0% > 5.0%)"
+    },
+    "drain_total_s": {
+      "arms": {
+        "ft": {
+          "cv_pct": 9.164234825825055,
+          "max": 9.972,
+          "mean": 9.4165,
+          "median": 9.775500000000001,
+          "min": 8.143,
+          "n": 4,
+          "values": [
+            9.624,
+            9.972,
+            9.927,
+            8.143
+          ]
+        },
+        "ft_baseline": {
+          "cv_pct": 5.9487467061772,
+          "max": 9.766,
+          "mean": 9.3875,
+          "median": 9.6115,
+          "min": 8.561,
+          "n": 4,
+          "values": [
+            9.545,
+            9.766,
+            9.678,
+            8.561
+          ]
+        }
+      },
+      "metric": "total_s",
+      "verdict": "NO_ADMISSIBLE_RATIO (ft total_s CV 9.2% > 5.0%; ft_baseline total_s CV 5.9% > 5.0%)"
+    },
+    "fps": {
+      "arms": {
+        "ft": null,
+        "ft_baseline": null
+      },
+      "metric": "mean_fps",
+      "verdict": "NO_ADMISSIBLE_RATIO (FPS not measured (--no-fps); ft has no mean_fps values; ft_baseline has no mean_fps values)"
+    },
+    "meter_validation": []
+  },
+  "width_parity": {
+    "codepoints": 1376,
+    "compared": [
+      "ft",
+      "ft_baseline"
+    ],
+    "differences": [],
+    "disagreements": 0
+  }
+}

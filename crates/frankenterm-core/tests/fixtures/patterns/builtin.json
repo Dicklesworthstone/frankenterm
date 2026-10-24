@@ -42,8 +42,13 @@
     "expected_extracted": { "reset_time": "2:30 PM" }
   },
   {
-    "name": "codex_usage_reached_negative",
+    "name": "codex_usage_reached_without_reset_time",
     "text": "You've hit your usage limit. Please try again later.",
+    "expected_rule_ids": ["codex.usage.reached"]
+  },
+  {
+    "name": "codex_usage_reached_negative",
+    "text": "You've hit your usage limit, please wait",
     "expected_rule_ids": [],
     "negative_for": "codex.usage.reached"
   },

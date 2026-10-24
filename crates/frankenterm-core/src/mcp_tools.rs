@@ -1605,14 +1605,37 @@ fn load_mcp_rehearsal_manifest(
 }
 
 // wa.attention tool
-pub(super) struct WaAttentionTool;
+pub(super) struct WaAttentionTool {
+    /// Workspace database for `live` runs; `None` in degraded mode.
+    db_path: Option<Arc<PathBuf>>,
+    /// The server's own workspace, whose git status and ready beads `live`
+    /// runs read. Never the caller's `workspace` argument, which would let a
+    /// caller list arbitrary directories.
+    workspace_root: Option<Arc<PathBuf>>,
+}
+
+impl WaAttentionTool {
+    #[must_use]
+    pub(super) fn new(db_path: Option<Arc<PathBuf>>) -> Self {
+        Self {
+            db_path,
+            workspace_root: None,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn with_workspace_root(mut self, workspace_root: Option<Arc<PathBuf>>) -> Self {
+        self.workspace_root = workspace_root;
+        self
+    }
+}
 
 impl ToolHandler for WaAttentionTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "wa.attention".to_string(),
             description: Some(
-                "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)"
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds, plus the server workspace's git status and ready beads (ft robot attention also reads the watcher envelope, crash bundles and the active transaction)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -1622,7 +1645,8 @@ impl ToolHandler for WaAttentionTool {
                     "item_id": { "type": "string", "description": "Attention item id to explain when surface=explain" },
                     "input": { "type": "object", "description": "AttentionRouterSourceAdapterInput object; omitted input yields an explicit degraded no-input snapshot" },
                     "generated_at_ms": { "type": "integer", "minimum": 0 },
-                    "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" }
+                    "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" },
+                    "live": { "type": "boolean", "default": false, "description": "When input is omitted, add the live read-only sources from the workspace database (policy denials, unresolved approval holds, verified-submit drift, unhandled warning and critical events, operator pane holds) and honor active ft mutes; reported unavailable when the server has no workspace database" }
                 },
                 "additionalProperties": false
             }),
@@ -1660,6 +1684,7 @@ impl ToolHandler for WaAttentionTool {
             return envelope_to_content(envelope);
         };
 
+        let live = params.live && params.input.is_none();
         let mut input = params.input.unwrap_or_else(|| {
             AttentionRouterSourceAdapterInput::new(
                 params.generated_at_ms.unwrap_or_else(now_ms),
@@ -1674,6 +1699,32 @@ impl ToolHandler for WaAttentionTool {
             .filter(|workspace| !workspace.trim().is_empty())
         {
             input.workspace = workspace;
+        }
+        // A caller-supplied input is scored exactly; a live run adds the
+        // audit-backed sources, the same ones `ft attention` reads, and the
+        // server workspace's git status and ready beads when it has one.
+        if live {
+            let audit = match self.db_path.as_deref() {
+                Some(db_path) => {
+                    crate::attention_live::read_live_attention_audit(db_path, input.generated_at_ms)
+                }
+                None => crate::attention_live::LiveAttentionAudit::unreadable(),
+            };
+            crate::attention_live::apply_live_attention_audit(&mut input, &audit);
+            if let Some(root) = self.workspace_root.as_deref() {
+                input
+                    .observations
+                    .push(crate::attention_router::git_status_observation(
+                        &crate::attention_live::read_git_status(root),
+                        input.generated_at_ms,
+                    ));
+                input
+                    .observations
+                    .push(crate::attention_router::ready_beads_observation(
+                        &crate::attention_live::read_ready_beads(root),
+                        input.generated_at_ms,
+                    ));
+            }
         }
 
         let payload = build_attention_router_surface_payload(
@@ -9237,6 +9288,100 @@ async fn mcp_submit_idempotency_complete(
     .await
 }
 
+async fn mcp_submit_idempotency_reconcile(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    resolution: crate::submit_idempotency_store::SubmitReconciliation,
+) -> Result<
+    crate::submit_idempotency_store::ReconcileOutcome,
+    crate::submit_idempotency_store::SubmitIdempotencyError,
+> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
+        move || crate::submit_idempotency_store::reconcile(&ft_dir, &binding, resolution),
+    )
+    .await
+}
+
+/// Audit one reconciliation attempt: pane, mode and outcome class, with the
+/// caller key as the correlation id (as verified sends record it). The request
+/// text never enters the row.
+async fn record_mcp_submit_reconcile_audit(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    reconciliation: mcp_types::McpSubmitReconciliation,
+    outcome: &Result<
+        crate::submit_idempotency_store::ReconcileOutcome,
+        crate::submit_idempotency_store::SubmitIdempotencyError,
+    >,
+) {
+    use crate::submit_idempotency_store::ReconcileOutcome;
+
+    let mode = match reconciliation {
+        mcp_types::McpSubmitReconciliation::Settle => "settle",
+        mcp_types::McpSubmitReconciliation::Abandon => "abandon",
+    };
+    let (result, detail) = match outcome {
+        Ok(ReconcileOutcome::Settled(_)) => ("success", "settled".to_string()),
+        Ok(ReconcileOutcome::Abandoned) => ("success", "abandoned".to_string()),
+        Err(error) => ("failed", format!("refused:{}", error.error_class())),
+    };
+    let record = crate::storage::AuditActionRecord {
+        id: 0,
+        ts: i64::try_from(mcp_types::now_ms()).unwrap_or(i64::MAX),
+        actor_kind: "mcp".to_string(),
+        actor_id: None,
+        correlation_id: Some(binding.caller_key().to_string()),
+        pane_id: Some(pane_id),
+        domain: None,
+        action_kind: "submit_reconcile".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: Some(detail),
+        rule_id: Some(crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID.to_string()),
+        input_summary: Some(format!("reconcile={mode}")),
+        verification_summary: None,
+        decision_context: None,
+        result: result.to_string(),
+    };
+    if let Err(error) = storage.record_audit_action_with_cx(cx, record).await {
+        tracing::warn!(%error, "wa.send could not audit a submit reconciliation");
+    }
+}
+
+fn mcp_reconciled_submit(pane_id: u64, receipt: &crate::robot_types::SubmitReceipt) -> McpSendData {
+    McpSendData {
+        pane_id,
+        injection: InjectionResult::Allowed {
+            decision: PolicyDecision::allow_with_rule(
+                crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID,
+            ),
+            summary: "unresolved submit settled by reconciliation; nothing was sent".to_string(),
+            pane_id,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        },
+        wait_for: None,
+        verification_error: crate::verified_submit::submit_guarantee_failure_message(receipt),
+        submit: Some(receipt.clone()),
+        output_omissions: None,
+        dry_run: false,
+    }
+}
+
+fn mcp_abandoned_submit(pane_id: u64) -> McpSendData {
+    mcp_blocked_submit_replay(
+        pane_id,
+        "The unresolved send for this idempotency key was abandoned; send the same request again to retry it",
+        "submit_idempotency.abandoned",
+        "unresolved submit abandoned by reconciliation",
+        "Prior send abandoned; nothing was sent",
+    )
+}
+
 fn mcp_completed_submit_replay(
     pane_id: u64,
     receipt: &crate::robot_types::SubmitReceipt,
@@ -9276,7 +9421,7 @@ fn mcp_effect_pending_submit_replay(pane_id: u64) -> McpSendData {
         "A prior send applied its pane effect but receipt finalization is pending; automatic replay is disabled",
         "submit_idempotency.effect_applied_receipt_pending_noop",
         "effect-applied duplicate submit replay suppressed",
-        "Prior send effect was applied but its receipt is pending; automatic resend refused",
+        "Prior send effect was applied but its receipt is pending; automatic resend refused (settle it with reconcile)",
     )
 }
 
@@ -9286,7 +9431,7 @@ fn mcp_indeterminate_submit_replay(pane_id: u64) -> McpSendData {
         "A prior send with this idempotency key has an indeterminate outcome; automatic replay is disabled",
         "submit_idempotency.in_doubt_noop",
         "indeterminate duplicate submit replay suppressed",
-        "Prior send outcome is indeterminate; automatic resend refused",
+        "Prior send outcome is indeterminate; automatic resend refused (settle or abandon it with reconcile)",
     )
 }
 
@@ -9520,7 +9665,8 @@ impl ToolHandler for WaSendTool {
                     "idempotency_key": { "type": "string", "minLength": 1, "maxLength": MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES, "description": "Caller replay key; a completed identical non-dry-run send returns its stored receipt without re-sending, while an interrupted/indeterminate prior send refuses automatic replay" },
                     "wait_for": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Wait for a pattern after sending" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
-                    "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
+                    "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" },
+                    "reconcile": { "type": "string", "enum": ["settle", "abandon"], "description": "Resolve the unresolved prior send for this exact request and idempotency_key instead of sending: settle closes it with an unverified receipt that later replays return; abandon frees the key for a resend and is refused once the prior send's effect was applied" }
                 },
                 "required": ["pane_id", "text"],
                 "additionalProperties": false
@@ -9564,6 +9710,19 @@ impl ToolHandler for WaSendTool {
             {
                 return error;
             }
+        }
+        if params.reconcile.is_some() && (params.idempotency_key.is_none() || params.dry_run) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "reconcile needs the original request's idempotency_key and no dry_run",
+                Some(
+                    "Repeat the exact request that was refused as in doubt, with the same \
+                     idempotency_key, and add reconcile."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
         }
 
         // [ft-05hfm] Bound the text payload before any downstream
@@ -9732,6 +9891,35 @@ impl ToolHandler for WaSendTool {
                         dry_run: false,
                     });
                 }
+            }
+
+            // Operator reconciliation (ft-7h5da.3.5.1), gated by the same
+            // authorization: settle or abandon the unresolved claim for this
+            // exact request. Nothing is sent, and the outcome is audited
+            // without the request text.
+            if let (Some(reconciliation), Some(binding)) =
+                (params.reconcile, submit_idempotency_binding.as_ref())
+            {
+                let outcome =
+                    mcp_submit_idempotency_reconcile(ft_dir, binding, reconciliation.into()).await;
+                record_mcp_submit_reconcile_audit(
+                    &storage,
+                    &wezterm_cx,
+                    params.pane_id,
+                    binding,
+                    reconciliation,
+                    &outcome,
+                )
+                .await;
+                return match outcome {
+                    Ok(crate::submit_idempotency_store::ReconcileOutcome::Settled(receipt)) => {
+                        Ok(mcp_reconciled_submit(params.pane_id, &receipt))
+                    }
+                    Ok(crate::submit_idempotency_store::ReconcileOutcome::Abandoned) => {
+                        Ok(mcp_abandoned_submit(params.pane_id))
+                    }
+                    Err(error) => Err(mcp_submit_idempotency_storage_error(error)),
+                };
             }
 
             // Complete every read-only preparation step before claiming. The
@@ -9962,6 +10150,7 @@ impl ToolHandler for WaSendTool {
                     // claim key and request fingerprint remain store-private.
                     receipt.idempotency_key = binding.caller_key().to_string();
                 }
+                crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
                 // The exact receipt is now fully constructed. Persist it
                 // before best-effort audit attachment or any unrelated await.
                 // Always attempt completion for Allowed, even when the prior
@@ -15580,7 +15769,7 @@ mod tests {
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaMissionObjectivePlanTool.definition(),
             WaOperatingEnvelopeTool.definition(),
-            WaAttentionTool.definition(),
+            WaAttentionTool::new(None).definition(),
             WaRehearsalScoreTool::new(Arc::clone(&cfg)).definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
             WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
@@ -20101,7 +20290,7 @@ mod tests {
 
     #[test]
     fn wa_attention_tool_is_read_only_and_explains_inline_input() {
-        let tool = WaAttentionTool;
+        let tool = WaAttentionTool::new(None);
         let status = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -20166,6 +20355,142 @@ mod tests {
         assert_eq!(
             explain["data"]["selected_item"]["recommended_action"]["mutates"],
             false
+        );
+    }
+
+    #[test]
+    fn wa_attention_live_reads_the_workspace_audit_log_only_when_asked() {
+        let (_dir, db) = temp_db_path();
+        let now = super::now_ms();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("storage");
+            storage
+                .record_audit_action(crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts: i64::try_from(now).expect("epoch ms") - 1_000,
+                    actor_kind: "robot".to_string(),
+                    actor_id: Some("BlueLake".to_string()),
+                    correlation_id: None,
+                    pane_id: Some(7),
+                    domain: None,
+                    action_kind: "send_text".to_string(),
+                    policy_decision: "deny".to_string(),
+                    decision_reason: Some("blocked".to_string()),
+                    rule_id: Some("command_gate.destructive".to_string()),
+                    input_summary: Some("rm -rf /secret-canary".to_string()),
+                    verification_summary: None,
+                    decision_context: None,
+                    result: "denied".to_string(),
+                })
+                .await
+                .expect("record denial");
+            storage.shutdown().await.expect("storage shutdown");
+        });
+        let denial_items = |envelope: &serde_json::Value| {
+            envelope["data"]["snapshot"]["items"]
+                .as_array()
+                .map_or(0, |items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["reason_codes"].as_array().is_some_and(|codes| {
+                                codes.iter().any(|code| code == "policy.denied")
+                            })
+                        })
+                        .count()
+                })
+        };
+        let status = |tool: &WaAttentionTool, live: bool| {
+            parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "surface": "status",
+                        "generated_at_ms": now,
+                        "live": live
+                    }),
+                )
+                .expect("wa.attention status should respond"),
+            )
+        };
+
+        let tool = WaAttentionTool::new(Some(Arc::clone(&db)));
+        let live = status(&tool, true);
+        assert_eq!(live["ok"], true, "envelope: {live}");
+        assert_eq!(denial_items(&live), 1, "the live run reads the audit log");
+        assert!(
+            !live.to_string().contains("secret-canary"),
+            "the action input never leaves the database"
+        );
+        assert_eq!(
+            denial_items(&status(&tool, false)),
+            0,
+            "without live, only caller input is scored"
+        );
+        assert_eq!(
+            denial_items(&status(&WaAttentionTool::new(None), true)),
+            0,
+            "a degraded server reports the audit sources unavailable"
+        );
+    }
+
+    #[test]
+    fn wa_attention_live_reads_the_server_workspace_git_status_never_the_callers() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let Ok(init) = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+        else {
+            eprintln!("git is not installed; skipping");
+            return;
+        };
+        assert!(init.success());
+        std::fs::write(workspace.path().join("dirty.txt"), "x").expect("write");
+        let git_source = |tool: &WaAttentionTool, caller_workspace: &str| {
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "surface": "status",
+                        "live": true,
+                        "workspace": caller_workspace
+                    }),
+                )
+                .expect("wa.attention status should respond"),
+            );
+            envelope["data"]["snapshot"]["sources"]
+                .as_array()
+                .and_then(|sources| {
+                    sources
+                        .iter()
+                        .find(|source| source["source_kind"] == "git")
+                        .cloned()
+                })
+                .expect("a git source is always reported")
+        };
+
+        let tool = WaAttentionTool::new(None)
+            .with_workspace_root(Some(Arc::new(workspace.path().to_path_buf())));
+        let read = git_source(&tool, "/");
+        assert_eq!(
+            read["source_id"],
+            crate::attention_router::LIVE_GIT_SOURCE_ID
+        );
+        assert_eq!(read["health"], "available");
+        assert_eq!(read["items_seen"], 1, "the server workspace's dirty file");
+
+        // Without a server workspace the caller's path is never read.
+        let unread = git_source(
+            &WaAttentionTool::new(None),
+            &workspace.path().to_string_lossy(),
+        );
+        assert_ne!(
+            unread["source_id"],
+            crate::attention_router::LIVE_GIT_SOURCE_ID
         );
     }
 
@@ -21552,7 +21877,9 @@ mod tests {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (_dir, db) = temp_db_path();
-            let pane_id = 4_207;
+            // Its own pane: the contract-doctor denial test uses 4_207, and
+            // pane-state fixtures are process-global (ft-zrwue).
+            let pane_id = 4_208;
             let text = "echo indeterminate";
             let caller_key = "crash-before-receipt";
             let binding = test_submit_idempotency_binding(pane_id, text, caller_key);
@@ -21612,6 +21939,152 @@ mod tests {
                     .expect("lookup in-doubt claim"),
                 Some(crate::submit_idempotency_store::StoredSubmitState::InDoubt)
             );
+        });
+    }
+
+    #[test]
+    fn wa_send_reconcile_settles_or_abandons_an_unresolved_claim_without_sending() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_209;
+            let text = "echo reconcile";
+            let ft_dir = db.parent().expect("test database parent");
+            let seed_in_doubt = |caller_key: &str| {
+                let binding = test_submit_idempotency_binding(pane_id, text, caller_key);
+                let token = match crate::submit_idempotency_store::claim(ft_dir, &binding)
+                    .expect("seed active claim")
+                {
+                    crate::submit_idempotency_store::ClaimOutcome::Claimed(token) => token,
+                    other => panic!("expected fresh claim, got {other:?}"),
+                };
+                crate::submit_idempotency_store::mark_in_doubt(ft_dir, &binding, token)
+                    .expect("seed in-doubt state");
+                binding
+            };
+            seed_in_doubt("reconcile-settle");
+            let abandoned = seed_in_doubt("reconcile-abandon");
+
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+            );
+            let call = |arguments: serde_json::Value| {
+                parse_json_content(
+                    tool.call(&test_mcp_context(), arguments)
+                        .expect("wa.send returns an envelope"),
+                )
+            };
+
+            let keyless = call(serde_json::json!({
+                "pane_id": pane_id, "text": text, "reconcile": "settle"
+            }));
+            assert_eq!(keyless["ok"], false);
+            assert_eq!(keyless["error_code"], MCP_ERR_INVALID_ARGS);
+
+            let settled = call(serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "idempotency_key": "reconcile-settle",
+                "reconcile": "settle"
+            }));
+            assert_eq!(settled["ok"], true, "envelope: {settled:?}");
+            assert_eq!(settled["data"]["injection"]["status"], "allowed");
+            assert_eq!(
+                settled["data"]["injection"]["decision"]["rule_id"],
+                crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID
+            );
+            assert_eq!(
+                settled["data"]["submit"]["state"],
+                "verification_unavailable"
+            );
+            assert_eq!(settled["data"]["submit"]["guarantee_met"], false);
+            let replay = call(serde_json::json!({
+                "pane_id": pane_id, "text": text, "idempotency_key": "reconcile-settle"
+            }));
+            assert_eq!(
+                replay["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.duplicate_noop",
+                "later replays return the settled receipt"
+            );
+            assert_eq!(replay["data"]["submit"], settled["data"]["submit"]);
+
+            let freed = call(serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "idempotency_key": "reconcile-abandon",
+                "reconcile": "abandon"
+            }));
+            assert_eq!(freed["ok"], true, "envelope: {freed:?}");
+            assert_eq!(freed["data"]["injection"]["status"], "denied");
+            assert_eq!(
+                freed["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.abandoned"
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(ft_dir, &abandoned)
+                    .expect("lookup abandoned claim"),
+                None,
+                "the key is free for a resend"
+            );
+
+            let content = mock
+                .pane_state(pane_id)
+                .await
+                .expect("mock pane should exist")
+                .content;
+            assert!(!content.contains(text), "reconciliation never sends");
+
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("open audit storage");
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    action_kind: Some("submit_reconcile".to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .expect("read audit");
+            let mut rows: Vec<(String, Option<String>, Option<String>)> = audit
+                .iter()
+                .map(|row| {
+                    (
+                        row.result.clone(),
+                        row.decision_reason.clone(),
+                        row.input_summary.clone(),
+                    )
+                })
+                .collect();
+            rows.sort();
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "success".to_string(),
+                        Some("abandoned".to_string()),
+                        Some("reconcile=abandon".to_string())
+                    ),
+                    (
+                        "success".to_string(),
+                        Some("settled".to_string()),
+                        Some("reconcile=settle".to_string())
+                    ),
+                ]
+            );
+            assert!(audit.iter().all(|row| {
+                row.input_summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.contains(text))
+            }));
         });
     }
 

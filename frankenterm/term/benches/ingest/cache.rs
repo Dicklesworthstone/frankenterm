@@ -9,10 +9,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use super::corpus::{Corpus, GENERATOR_VERSION};
+use super::deferred::Deferred;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -42,8 +44,10 @@ impl CacheOutcome {
 }
 
 pub struct LoadedCorpus {
-    pub bytes: Vec<u8>,
-    pub sha256: String,
+    pub bytes: Arc<Vec<u8>>,
+    /// The SHA-256 (hex); a `--from-file` corpus is hashed on its own
+    /// thread while the lanes run.
+    pub sha256: Deferred<String>,
     pub path: PathBuf,
     pub outcome: CacheOutcome,
 }
@@ -91,8 +95,8 @@ pub fn load_or_generate(
     let path = corpus_path(dir, corpus, size, seed);
     if let Some((bytes, sha256)) = read_verified(&path, size)? {
         return Ok(LoadedCorpus {
-            bytes,
-            sha256,
+            bytes: Arc::new(bytes),
+            sha256: Deferred::ready(sha256),
             path,
             outcome: CacheOutcome::Reused,
         });
@@ -103,19 +107,54 @@ pub fn load_or_generate(
     write_atomically(&path, &bytes)?;
     write_atomically(&sidecar_path(&path), sidecar_contents(&sha256).as_bytes())?;
     Ok(LoadedCorpus {
-        bytes,
-        sha256,
+        bytes: Arc::new(bytes),
+        sha256: Deferred::ready(sha256),
         path,
         outcome: CacheOutcome::Generated,
     })
 }
 
-pub fn load_file(path: &Path) -> io::Result<LoadedCorpus> {
-    let bytes = fs::read(path)?;
-    let sha256 = sha256_hex(&bytes);
+/// The file at `path`, for `--stream`: its bytes stay on disk for the lane
+/// to read as it goes, and its SHA-256 is read and hashed on its own thread.
+pub fn stream_file(path: &Path) -> io::Result<LoadedCorpus> {
+    fs::metadata(path)?;
+    let hashed = path.to_path_buf();
     Ok(LoadedCorpus {
+        sha256: Deferred::spawn(move || {
+            sha256_hex_of_file(&hashed).unwrap_or_else(|error| format!("unreadable: {error}"))
+        }),
+        bytes: Arc::new(Vec::new()),
+        path: path.to_path_buf(),
+        outcome: CacheOutcome::External,
+    })
+}
+
+fn sha256_hex_of_file(path: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize().iter() {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(hex)
+}
+
+pub fn load_file(path: &Path) -> io::Result<LoadedCorpus> {
+    let bytes = Arc::new(fs::read(path)?);
+    let hashed = Arc::clone(&bytes);
+    Ok(LoadedCorpus {
+        sha256: Deferred::spawn(move || sha256_hex(&hashed)),
         bytes,
-        sha256,
         path: path.to_path_buf(),
         outcome: CacheOutcome::External,
     })

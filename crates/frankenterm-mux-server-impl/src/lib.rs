@@ -69,6 +69,27 @@ const EXACT_SCROLLBACK_COMPACT_MIN_CELLS: usize = 3;
 /// storage, serialized as its attribute runs (1 is the cell vector, 2 the
 /// compact printable-ASCII form).
 const EXACT_SCROLLBACK_SCHEMA_CLUSTERED: u32 = 3;
+/// An exact row's plaintext schema for a row showing images: schema 1's cell
+/// vector and width sidecar with the images detached, then each image object
+/// the row shows once and every cell's image layers naming them
+/// (`ExactScrollbackRowImagesV1`). The other schemas carry an attribute
+/// run's whole image in every run, so a screenshot's row came to tens of
+/// megabytes, more than any row may hold, and the pane's durability stalled
+/// on it.
+const EXACT_SCROLLBACK_SCHEMA_IMAGES: u32 = 4;
+
+/// Whether rows showing images seal as schema 4 (`set_image_scrollback_rows`).
+static IMAGE_SCROLLBACK_ROWS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Seal rows showing images as schema 4 from now on. The caller learned that
+/// this mux's guardian admits it (`GuardianClient::admits_image_scrollback_rows`):
+/// every mux that will read this store then decodes it, as for compact
+/// checkpoints, since the guardian stays on the family it was installed
+/// with. A reader older than schema 4 cannot read such a row.
+pub fn set_image_scrollback_rows(enabled: bool) {
+    IMAGE_SCROLLBACK_ROWS.store(enabled, std::sync::atomic::Ordering::Release);
+}
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -168,6 +189,10 @@ std::thread_local! {
     static LIVE_SCROLLBACK_RECORD_BYTES_APPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Exercise the real publication trigger with a small bounded fixture.
+    static LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2)
+    };
 }
 
 /// Add `bytes` to one of this thread's byte counters (ft-y0gy9).
@@ -464,11 +489,11 @@ mod deferred_scrollback {
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
     use std::time::{Duration, Instant};
     use wezterm_term::config::{
-        ScrollbackCapacityWait, ScrollbackClearCommit, ScrollbackIntervalCapture,
-        ScrollbackIntervalIdentity, ScrollbackLineAdmission, ScrollbackPrefix,
-        ScrollbackReplaceCommit, ScrollbackSnapshot, ScrollbackSnapshotGeneration,
-        ScrollbackSnapshotLimits, ScrollbackSpillError, ScrollbackSpillSink, ScrollbackUsage,
-        ScrollbackUsageCapture,
+        ScrollbackAncestry, ScrollbackCapacityWait, ScrollbackClearCommit,
+        ScrollbackIntervalCapture, ScrollbackIntervalIdentity, ScrollbackLineAdmission,
+        ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
+        ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
+        ScrollbackSpillSink, ScrollbackUsage, ScrollbackUsageCapture,
     };
     use wezterm_term::{Line, StableRowIndex};
 
@@ -487,6 +512,61 @@ mod deferred_scrollback {
     const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
     const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
     pub const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
+    pub const SHED_RELEASE_THREAD_NAME: &str = "scrollback-shed-release";
+
+    /// Frees `garbage` on the shed-release thread instead of the caller's, or
+    /// here if that thread cannot run. Rows shed into an overload gap are
+    /// released this way: the admitting parser holds its pane's terminal
+    /// lock, and freeing one shed (~75k rows) there held it 53 ms in a debug
+    /// build. On a loaded host every read of that pane, through 6 retries
+    /// over ~161 ms, got resource_busy (ft-4p4uo). The thread runs at utility
+    /// priority, so freeing does not compete with input and parsing.
+    fn release_off_thread(garbage: Box<dyn Send>) {
+        static RELEASE: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+        let sender = RELEASE.get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn Send>>();
+            std::thread::Builder::new()
+                .name(SHED_RELEASE_THREAD_NAME.to_string())
+                .spawn(move || {
+                    let _ = procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility);
+                    for garbage in receiver {
+                        procinfo::reassert_current_thread_qos_for_life(
+                            procinfo::ThreadQos::Utility,
+                        );
+                        drop(garbage);
+                        RELEASE_BACKLOG.fetch_sub(1, Ordering::AcqRel);
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        });
+        if let Some(sender) = sender {
+            RELEASE_BACKLOG.fetch_add(1, Ordering::AcqRel);
+            if let Err(unsent) = sender.send(garbage) {
+                // The thread is gone; the garbage is freed here.
+                RELEASE_BACKLOG.fetch_sub(1, Ordering::AcqRel);
+                drop(unsent);
+            }
+        }
+    }
+
+    /// Boxes sent to the release thread and not yet freed there.
+    static RELEASE_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+
+    /// More than this many unfreed boxes and the durability writer frees its
+    /// own garbage: the channel is unbounded, and a starved release thread
+    /// must not let committed rows pile up in memory.
+    const WRITER_RELEASE_BACKLOG_MAX: usize = 16;
+
+    /// The writer's committed rows: freed on the release thread unless its
+    /// backlog is long, then here, with no lock held (ft-yccm0.2.1.8).
+    fn release_writer_garbage(garbage: Box<dyn Send>) {
+        if RELEASE_BACKLOG.load(Ordering::Acquire) >= WRITER_RELEASE_BACKLOG_MAX {
+            drop(garbage);
+        } else {
+            release_off_thread(garbage);
+        }
+    }
 
     /// The single thread that performs durable scrollback IO for every pane.
     ///
@@ -601,9 +681,10 @@ mod deferred_scrollback {
                 .name(DURABILITY_THREAD_NAME.to_string())
                 .spawn(move || {
                     // Durability need not finish promptly; keep it off the
-                    // performance cores that parse output (ft-yccm0.3.1.3).
+                    // performance cores that parse output (ft-yccm0.3.1.3),
+                    // and on Linux below the input and parse threads.
                     if let Err(error) =
-                        procinfo::set_current_thread_qos(procinfo::ThreadQos::Utility)
+                        procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility)
                     {
                         log::warn!(
                             "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
@@ -700,6 +781,16 @@ mod deferred_scrollback {
         }
     }
 
+    /// Whether the writer hands the backing store its shared rows instead of
+    /// a clone of each (ft-y0gy9): on unless FT_SCROLLBACK_SHARED_ROWS=0,
+    /// read once per process. The same rows are stored either way.
+    fn shared_rows_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            super::durability_switch_on(std::env::var_os("FT_SCROLLBACK_SHARED_ROWS").as_deref())
+        })
+    }
+
     fn duration_ms(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
@@ -720,6 +811,9 @@ mod deferred_scrollback {
 
         fn run(&self) {
             while let Some(sink) = self.next_sink() {
+                // ananicy-cpp re-nices every thread of the server to the
+                // input thread's level every 15 s on ACFS hosts (ft-4p4uo).
+                procinfo::reassert_current_thread_qos_for_life(procinfo::ThreadQos::Utility);
                 self.service(sink);
             }
         }
@@ -768,6 +862,7 @@ mod deferred_scrollback {
         }
 
         fn service(&self, sink: Arc<DeferredScrollbackSpillSink>) {
+            sink.publish_metrics();
             if let Some(retry_at) = sink.retry_not_before() {
                 if retry_at > Instant::now() {
                     // Still backing off; `scheduled` stays set.
@@ -777,22 +872,43 @@ mod deferred_scrollback {
             }
             // An open commit window keeps gathering rows; `scheduled` stays
             // set, so further requests do not queue the sink again.
-            let window = sink.commit_window(Instant::now());
-            match window {
-                CommitWindow::Open { closes_at } => {
-                    self.lock_queue().windows.push((closes_at, sink));
-                    return;
+            loop {
+                match sink.commit_window(Instant::now()) {
+                    CommitWindow::Open { .. } => {
+                        let mut queue = self.lock_queue();
+                        // Pair the final decision with parking. A concurrent
+                        // commit either closes this check or finds the parked
+                        // sink when it expedites. Contention retries outside
+                        // the queue lock without closing a fresh window.
+                        match sink.try_commit_window(Instant::now()) {
+                            Some(CommitWindow::Open { closes_at }) => {
+                                queue.windows.push((closes_at, sink));
+                                return;
+                            }
+                            Some(CommitWindow::Closed(_)) => break,
+                            None => {}
+                        }
+                    }
+                    CommitWindow::Closed(reason) => {
+                        log::debug!(
+                            target: "mux::scrollback_durability",
+                            "pane={} commit window closed: {reason}",
+                            sink.pane_label
+                        );
+                        break;
+                    }
                 }
-                CommitWindow::Closed(reason) => log::debug!(
-                    target: "mux::scrollback_durability",
-                    "pane={} commit window closed: {reason}",
-                    sink.pane_label
-                ),
             }
             // Clear before draining: a row admitted during this drain
             // schedules another pass instead of waiting for the next batch.
             sink.scheduled.store(false, Ordering::Release);
-            if sink.drain_scheduled().is_ok() {
+            if sink.drain_scheduled(DrainMode::Scheduled).is_ok() {
+                // A turn never chases arrivals behind its captured batch.
+                // Re-enter the policy and the shared FIFO for the remainder,
+                // including a commit request whose rows are already durable.
+                if sink.needs_service() {
+                    sink.schedule();
+                }
                 return;
             }
             let retry_at = sink.retry_not_before().unwrap_or_else(Instant::now);
@@ -821,6 +937,7 @@ mod deferred_scrollback {
         line: Arc<Line>,
         retention: usize,
         charged_bytes: usize,
+        admitted_at: Instant,
     }
 
     /// How every durability-gap marker row begins. Output can print it too,
@@ -885,6 +1002,19 @@ mod deferred_scrollback {
         Closed(&'static str),
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DrainMode {
+        Scheduled,
+        Flush,
+    }
+
+    /// Publish after all rows admitted through this frontier are durable.
+    /// `None` is a request to publish an empty queue, not no request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct CommitRequest {
+        through: Option<StableRowIndex>,
+    }
+
     impl Pending {
         fn start(&self) -> StableRowIndex {
             match self {
@@ -931,8 +1061,24 @@ mod deferred_scrollback {
         /// When the first row still queued was admitted: the open commit
         /// window's start (ft-yccm0.2.1.2).
         window_opened: Option<Instant>,
-        /// When the newest row was admitted, for the idle close.
+        /// When the newest row was admitted, for the idle close: exact for
+        /// a row that opened a window, otherwise the time a commit-window
+        /// check first saw `admitted_since_check`.
         last_admitted: Option<Instant>,
+        /// Rows were admitted behind the window's first one since the last
+        /// commit-window check, which reads no clock per row.
+        admitted_since_check: bool,
+        /// When the first row admitted since the drain last captured
+        /// arrived: every later row before the next capture is committed in
+        /// that row's window and carries its time.
+        uncaptured_since: Option<Instant>,
+        /// An explicit commit survives partial acknowledgements and failed
+        /// publication. New arrivals and later requests cannot move the
+        /// earliest outstanding frontier.
+        commit_requested: Option<CommitRequest>,
+        /// Later requests coalesce here while the earliest frontier finishes,
+        /// so repeated close/flush requests cannot keep moving its goal.
+        commit_followup: Option<CommitRequest>,
         // An acknowledged suffix, transferred from pending without cloning or
         // serializing cells. First reflow can read its cold/hot boundary here.
         // Uses the same cell/text charge as pending, not a total heap estimate.
@@ -941,6 +1087,9 @@ mod deferred_scrollback {
         durable_bytes: usize,
         oldest: Option<StableRowIndex>,
         newest_exclusive: Option<StableRowIndex>,
+        /// The receipt of the clear that produced this state; dropped with
+        /// the state by anything that replaces it.
+        last_clear: Option<ScrollbackClearCommit>,
     }
 
     pub struct DeferredScrollbackSpillSink {
@@ -967,8 +1116,13 @@ mod deferred_scrollback {
         progress_signal: Condvar,
         health: Mutex<WriterHealth>,
         committed_batches: AtomicU64,
-        /// A close (or explicit commit request) ends the open commit window.
-        commit_now: AtomicBool,
+        /// Admitted rows and overload-gap rows and bytes not yet added to the
+        /// `metrics` counters. The parser only bumps these; the writer
+        /// publishes them once per turn, since every metrics call goes
+        /// through the GUI's recorder (ft-yccm0.2.1.8).
+        unreported_admitted: AtomicU64,
+        unreported_gap_rows: AtomicU64,
+        unreported_gap_bytes: AtomicU64,
     }
 
     impl State {
@@ -988,12 +1142,36 @@ mod deferred_scrollback {
                 shedding: false,
                 window_opened: None,
                 last_admitted: None,
+                admitted_since_check: false,
+                uncaptured_since: None,
+                commit_requested: None,
+                commit_followup: None,
                 cached: VecDeque::new(),
                 cached_bytes: 0,
                 durable_bytes,
                 oldest,
                 newest_exclusive,
+                last_clear: None,
             }
+        }
+
+        /// The last clear's receipt while nothing has reached the sink since:
+        /// no row or gap queued, captured, written or cached, no frontier, no
+        /// commit outstanding and no uncertain publication. Clearing again
+        /// would change nothing durable.
+        fn unchanged_since_clear(&self) -> Option<ScrollbackClearCommit> {
+            let receipt = self.last_clear?;
+            (!self.publication_uncertain
+                && self.pending.is_empty()
+                && self.in_flight == 0
+                && self.written_gaps.is_empty()
+                && self.cached.is_empty()
+                && self.durable_bytes == 0
+                && self.oldest.is_none()
+                && self.newest_exclusive.is_none()
+                && self.commit_requested.is_none()
+                && self.commit_followup.is_none())
+            .then_some(receipt)
         }
 
         /// How far below `stable_row` its store row is: one less than each
@@ -1049,7 +1227,15 @@ mod deferred_scrollback {
         /// first, until `need` bytes are freed or none are left. Adjacent
         /// gaps coalesce into one. Returns the bytes freed, the dropped rows
         /// (to be released outside the state lock) and the new gap spans.
-        fn shed(&mut self, need: usize, at_unix_ms: u64) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+        /// `clock` gives the wall time a new gap records; it is read only if
+        /// a row is shed (overload calls this for every row another pane's
+        /// queue keeps over budget).
+        fn shed(
+            &mut self,
+            need: usize,
+            clock: impl Fn() -> u64,
+        ) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+            let mut read = None;
             let mut freed = 0;
             let mut dropped = Vec::new();
             let mut spans = Vec::new();
@@ -1076,6 +1262,7 @@ mod deferred_scrollback {
                     Pending::Gap(gap) => gap.retention,
                 };
                 dropped.extend(self.pending.drain(index..end));
+                let at_unix_ms = *read.get_or_insert_with(&clock);
                 let mut span = GapSpan {
                     start: first,
                     end: last,
@@ -1118,7 +1305,8 @@ mod deferred_scrollback {
             (freed, dropped, spans)
         }
 
-        fn prune_cached(&mut self) {
+        /// Pruned rows move to `evicted`; see [`Self::cache_acknowledged`].
+        fn prune_cached(&mut self, evicted: &mut Vec<Pending>) {
             while self.cached.front().is_some_and(|row| {
                 self.oldest.is_none_or(|oldest| row.stable_row < oldest)
                     || self.cached.len() > MAX_CACHED_ROWS
@@ -1126,15 +1314,21 @@ mod deferred_scrollback {
             }) {
                 if let Some(row) = self.cached.pop_front() {
                     self.cached_bytes -= row.charged_bytes;
+                    evicted.push(Pending::Row(row));
                 }
             }
         }
 
-        fn cache_acknowledged(&mut self, row: PendingRow) {
+        /// Rows this lets go of (the row itself, when it is not cached) move
+        /// to `evicted`, for the caller to free after it releases the state
+        /// lock: freeing a row zeroizes its text, and admission waits on
+        /// this lock under the terminal lock (ft-yccm0.2.1.8).
+        fn cache_acknowledged(&mut self, row: PendingRow, evicted: &mut Vec<Pending>) {
             // A skipped row breaks the contiguous suffix. Mutable image
             // handles cannot stand in for the serialized backing-store image.
             if row.charged_bytes > MAX_CACHED_BYTES || row.line.has_image_attachments() {
-                self.cached.clear();
+                evicted.extend(self.cached.drain(..).map(Pending::Row));
+                evicted.push(Pending::Row(row));
                 self.cached_bytes = 0;
                 return;
             }
@@ -1143,16 +1337,18 @@ mod deferred_scrollback {
             {
                 if let Some(oldest) = self.cached.pop_front() {
                     self.cached_bytes -= oldest.charged_bytes;
+                    evicted.push(Pending::Row(oldest));
                 }
             }
             if self.cached.try_reserve(1).is_err() {
-                self.cached.clear();
+                evicted.extend(self.cached.drain(..).map(Pending::Row));
+                evicted.push(Pending::Row(row));
                 self.cached_bytes = 0;
                 return;
             }
             self.cached_bytes += row.charged_bytes;
             self.cached.push_back(row);
-            self.prune_cached();
+            self.prune_cached(evicted);
         }
     }
 
@@ -1194,7 +1390,9 @@ mod deferred_scrollback {
                 progress_signal: Condvar::new(),
                 health: Mutex::new(WriterHealth::default()),
                 committed_batches: AtomicU64::new(0),
-                commit_now: AtomicBool::new(false),
+                unreported_admitted: AtomicU64::new(0),
+                unreported_gap_rows: AtomicU64::new(0),
+                unreported_gap_bytes: AtomicU64::new(0),
             }))
         }
 
@@ -1330,8 +1528,29 @@ mod deferred_scrollback {
         /// Whether the writer should commit this sink's queued rows now
         /// (ft-yccm0.2.1.2), or when its open commit window closes.
         fn commit_window(&self, now: Instant) -> CommitWindow {
-            if self.commit_now.load(Ordering::Acquire) {
-                return CommitWindow::Closed("commit requested");
+            let Ok(mut state) = self.state.lock() else {
+                return CommitWindow::Closed("state unavailable");
+            };
+            self.commit_window_for_state(now, &mut state)
+        }
+
+        /// The final parking check owns the global writer queue. A clear or
+        /// replacement can hold state across storage IO, so contention must
+        /// retry outside that queue instead of waiting or forcing a commit.
+        fn try_commit_window(&self, now: Instant) -> Option<CommitWindow> {
+            match self.state.try_lock() {
+                Ok(mut state) => Some(self.commit_window_for_state(now, &mut state)),
+                Err(TryLockError::WouldBlock) => None,
+                Err(TryLockError::Poisoned(_)) => Some(CommitWindow::Closed("state unavailable")),
+            }
+        }
+
+        fn commit_window_for_state(&self, now: Instant, state: &mut State) -> CommitWindow {
+            // Rows admitted since the last check arrived by `now`. Counting
+            // them as arriving now can hold the idle close back by at most
+            // one idle interval, never past the window's age.
+            if std::mem::take(&mut state.admitted_since_check) {
+                state.last_admitted = Some(now);
             }
             if self.self_ref.strong_count() <= 1 {
                 return CommitWindow::Closed("pane closed");
@@ -1343,9 +1562,9 @@ mod deferred_scrollback {
             if self.writer.queued_bytes() >= self.writer.queue_budget() / 2 {
                 return CommitWindow::Closed("queue pressure");
             }
-            let Ok(state) = self.state.lock() else {
-                return CommitWindow::Closed("state unavailable");
-            };
+            if state.commit_requested.is_some() {
+                return CommitWindow::Closed("commit requested");
+            }
             if state.pending.is_empty() {
                 return CommitWindow::Closed("nothing queued");
             }
@@ -1373,10 +1592,97 @@ mod deferred_scrollback {
             }
         }
 
-        /// One drain by the writer or an explicit flush. The outcome is
-        /// recorded under the gate, so a stale failure can never overwrite a
-        /// later drain's recovery. Panics are contained here.
-        fn drain_scheduled(&self) -> Result<(), ScrollbackSpillError> {
+        fn needs_service(&self) -> bool {
+            self.pending_rows.load(Ordering::Acquire) != 0
+                || self
+                    .state
+                    .try_lock()
+                    // A destructive operation may own state during IO. A
+                    // conservative extra turn is preferable to blocking the
+                    // parser or missing an outstanding publication request.
+                    .map_or(true, |state| state.commit_requested.is_some())
+        }
+
+        /// Called under drain_gate for a synchronous flush or a closed pane,
+        /// and directly for an asynchronous commit request. Admission and
+        /// destructive replacement share state, so the frontier belongs to
+        /// exactly the currently retained lineage.
+        fn request_commit(&self) -> Result<CommitRequest, ScrollbackSpillError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let request = CommitRequest {
+                through: state.newest_exclusive,
+            };
+            match state.commit_requested {
+                Some(pending) if request.through > pending.through => {
+                    state.commit_followup = Some(request);
+                }
+                Some(_) => {}
+                None => state.commit_requested = Some(request),
+            }
+            Ok(request)
+        }
+
+        /// The caller holds drain_gate. Publish a satisfied request without
+        /// holding state across storage IO; a later, larger request remains
+        /// pending, and a failed publication never consumes the request.
+        fn publish_requested_commit(
+            &self,
+            captured: Option<CommitRequest>,
+        ) -> Result<(), ScrollbackSpillError> {
+            let publish = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                if state.publication_uncertain {
+                    return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+                }
+                let satisfied = |request: &CommitRequest| {
+                    request.through.is_none_or(|through| {
+                        state
+                            .pending
+                            .front()
+                            .is_none_or(|front| front.start() >= through)
+                    })
+                };
+                captured.as_ref().is_some_and(satisfied)
+                    || state.commit_requested.as_ref().is_some_and(satisfied)
+            };
+            if publish {
+                self.backing.flush_scrollback()?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                if state.commit_requested.is_some_and(|request| {
+                    request.through.is_none_or(|through| {
+                        state
+                            .pending
+                            .front()
+                            .is_none_or(|front| front.start() >= through)
+                    })
+                }) {
+                    let followup = state.commit_followup.take();
+                    state.commit_requested = followup.filter(|request| {
+                        request.through.is_some_and(|through| {
+                            state
+                                .pending
+                                .front()
+                                .is_some_and(|front| front.start() < through)
+                        })
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        /// One bounded writer turn, or an explicit flush through a captured
+        /// frontier. The outcome is recorded under the gate, so a stale
+        /// failure cannot overwrite a later recovery. Panics are contained.
+        fn drain_scheduled(&self, mode: DrainMode) -> Result<(), ScrollbackSpillError> {
             // The gate guards no data: pending-row invariants live in state,
             // which is never held across backing IO by a drain. A drain that
             // panicked left every unacknowledged row pending, and the backing
@@ -1385,19 +1691,38 @@ mod deferred_scrollback {
                 .drain_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            // This drain empties the queue, which closes the window. A commit
-            // request or a closed pane also publishes the backing's manifest
-            // (ft-yccm0.2.1.2).
-            let publish =
-                self.commit_now.swap(false, Ordering::AcqRel) || self.self_ref.strong_count() <= 1;
             let outcome = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
                 std::panic::AssertUnwindSafe(|| -> Result<(), ScrollbackSpillError> {
-                    self.drain()?;
-                    if publish {
-                        self.backing.flush_scrollback()?;
+                    let flush_request = if mode == DrainMode::Flush {
+                        Some(self.request_commit()?)
+                    } else {
+                        None
+                    };
+                    if self.self_ref.strong_count() <= 1 {
+                        self.request_commit()?;
                     }
-                    Ok(())
+                    let (through, request) = {
+                        let state = self
+                            .state
+                            .lock()
+                            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                        // A synchronous flush owns its captured newest
+                        // frontier even when an older asynchronous request
+                        // is still pending.
+                        let request = flush_request.or(state.commit_requested);
+                        let through =
+                            request.map_or(state.newest_exclusive, |request| request.through);
+                        (through, request)
+                    };
+                    self.drain_through(through, mode == DrainMode::Scheduled)?;
+                    // The pane may close while the captured write is in
+                    // flight. Keep its remaining rows and publication alive
+                    // across subsequent finite writer turns.
+                    if self.self_ref.strong_count() <= 1 {
+                        self.request_commit()?;
+                    }
+                    self.publish_requested_commit(request)
                 }),
             );
             let (error, panicked) = match outcome {
@@ -1433,18 +1758,31 @@ mod deferred_scrollback {
         // Charges cell storage and grapheme bytes without allocating a second
         // text serialization under the terminal lock. Shared attribute/image
         // payloads are not a claim about total process memory usage.
+        /// Queue memory a row holds: its retained bytes, so a clustered row
+        /// (the usual form by the time it spills) is charged its text and
+        /// attribute runs rather than a Cell per column (ft-yccm0.2.1.6).
         pub(super) fn row_charge(line: &Line) -> Option<usize> {
-            let cells = line
-                .len()
-                .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
-            cells
-                .checked_add(std::mem::size_of::<Line>())?
-                .checked_add(line.visible_text_bytes()?)
+            line.retained_bytes()
         }
 
-        /// The caller holds operation. Never hold state across backing IO.
+        /// The caller holds drain_gate. Snapshot callers also hold operation,
+        /// so their captured frontier is the entire admitted queue. Never hold
+        /// state across backing IO.
         fn drain(&self) -> Result<(), ScrollbackSpillError> {
-            let result = self.drain_entries();
+            let through = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                .newest_exclusive;
+            self.drain_through(through, false)
+        }
+
+        fn drain_through(
+            &self,
+            through: Option<StableRowIndex>,
+            one_batch: bool,
+        ) -> Result<(), ScrollbackSpillError> {
+            let result = self.drain_entries(through, one_batch);
             if let Ok(mut state) = self.state.lock() {
                 // Nothing is in flight between drains, whatever the outcome.
                 state.in_flight = 0;
@@ -1452,7 +1790,11 @@ mod deferred_scrollback {
             result
         }
 
-        fn drain_entries(&self) -> Result<(), ScrollbackSpillError> {
+        fn drain_entries(
+            &self,
+            through: Option<StableRowIndex>,
+            one_batch: bool,
+        ) -> Result<(), ScrollbackSpillError> {
             enum Next {
                 Rows {
                     stable_row: StableRowIndex,
@@ -1466,6 +1808,11 @@ mod deferred_scrollback {
                     store_row: StableRowIndex,
                 },
             }
+            // An empty captured frontier never includes a later arrival.
+            let Some(through) = through else {
+                return Ok(());
+            };
+            let window_bytes = self.writer.commit_policy().window_bytes;
             loop {
                 let next = {
                     let mut state = self
@@ -1479,17 +1826,29 @@ mod deferred_scrollback {
                     let skip = state.store_skip();
                     let next = match state.pending.front() {
                         None => None,
+                        Some(front) if front.start() >= through => None,
                         Some(Pending::Gap(gap)) => Some(Next::Gap {
                             gap: *gap,
                             store_row: gap.start - skip,
                         }),
                         Some(Pending::Row(first)) => {
+                            let mut bytes = 0usize;
                             let lines: Vec<_> = state
                                 .pending
                                 .iter()
                                 .take(MAX_BATCH_ROWS)
                                 .map_while(|entry| match entry {
-                                    Pending::Row(row) if row.retention == first.retention => {
+                                    Pending::Row(row)
+                                        if row.retention == first.retention
+                                            && row.stable_row < through
+                                            // A single row is indivisible;
+                                            // otherwise a turn respects the
+                                            // configured window byte target.
+                                            && (bytes == 0
+                                                || row.charged_bytes
+                                                    <= window_bytes.saturating_sub(bytes)) =>
+                                    {
+                                        bytes = bytes.saturating_add(row.charged_bytes);
                                         Some(Arc::clone(&row.line))
                                     }
                                     _ => None,
@@ -1517,6 +1876,8 @@ mod deferred_scrollback {
                         Some(Next::Gap { .. }) => 1,
                         Some(Next::Rows { lines, .. }) => lines.len(),
                     };
+                    // Arrivals from here on open the next window.
+                    state.uncaptured_since = None;
                     next
                 };
                 match next {
@@ -1529,6 +1890,9 @@ mod deferred_scrollback {
                         cached,
                         retention,
                     }) => self.write_rows(stable_row, store_row, lines, cached, retention)?,
+                }
+                if one_batch {
+                    return Ok(());
                 }
             }
         }
@@ -1566,9 +1930,10 @@ mod deferred_scrollback {
                 _ => return Err(ScrollbackSpillError::SnapshotRowMissing),
             }
             state.in_flight = 0;
-            if state.pending.is_empty() {
-                state.window_opened = None;
-            }
+            state.window_opened = state.pending.front().and_then(|entry| match entry {
+                Pending::Row(row) => Some(row.admitted_at),
+                Pending::Gap(_) => None,
+            });
             state.written_gaps.push_back(gap);
             state.prune_written_gaps(store_oldest);
             // The cached suffix serves contiguous acknowledged rows only.
@@ -1605,16 +1970,22 @@ mod deferred_scrollback {
             retention: usize,
         ) -> Result<(), ScrollbackSpillError> {
             let started = Instant::now();
-            // Only bounded Arc handles were captured under state. Materialize
-            // the backing-store batch outside the metadata critical section.
-            let lines: Vec<_> = pending_lines
-                .iter()
-                .map(|line| line.as_ref().clone())
-                .collect();
-            let acknowledged = self
-                .backing
-                .store_scrollback_lines(store_row, &lines, retention);
-            if acknowledged == 0 || acknowledged > lines.len() {
+            // Only bounded Arc handles were captured under state. The backing
+            // store encodes those shared rows where they are, outside the
+            // metadata critical section (ft-y0gy9). FT_SCROLLBACK_SHARED_ROWS=0
+            // hands it clones instead, as before.
+            let acknowledged = if shared_rows_enabled() {
+                self.backing
+                    .store_scrollback_shared_lines(store_row, &pending_lines, retention)
+            } else {
+                let lines: Vec<_> = pending_lines
+                    .iter()
+                    .map(|line| line.as_ref().clone())
+                    .collect();
+                self.backing
+                    .store_scrollback_lines(store_row, &lines, retention)
+            };
+            if acknowledged == 0 || acknowledged > pending_lines.len() {
                 return Err(ScrollbackSpillError::StorageUnavailable);
             }
             let durable_bytes = self.backing.retained_scrollback_bytes();
@@ -1629,18 +2000,20 @@ mod deferred_scrollback {
             // captured rows, so they are still the front. Keep the owned
             // plaintext until the backing sink acknowledges durability.
             let mut acknowledged_bytes = 0usize;
+            let mut evicted = Vec::new();
             for _ in 0..acknowledged {
                 let Some(Pending::Row(row)) = state.pending.pop_front() else {
                     return Err(ScrollbackSpillError::SnapshotRowMissing);
                 };
                 state.pending_bytes -= row.charged_bytes;
                 acknowledged_bytes += row.charged_bytes;
-                state.cache_acknowledged(row);
+                state.cache_acknowledged(row, &mut evicted);
             }
             state.in_flight = 0;
-            if state.pending.is_empty() {
-                state.window_opened = None;
-            }
+            state.window_opened = state.pending.front().and_then(|entry| match entry {
+                Pending::Row(row) => Some(row.admitted_at),
+                Pending::Gap(_) => None,
+            });
             state.durable_bytes = durable_bytes;
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
@@ -1657,8 +2030,10 @@ mod deferred_scrollback {
             self.writer.release(acknowledged_bytes);
             self.committed_batches.fetch_add(1, Ordering::AcqRel);
             self.publish_progress();
-            drop(cached_lines);
-            drop(pending_lines);
+            // The writer bounds how much scrollback becomes durable in a
+            // flood; freeing a batch's rows (zeroizing the last owner's
+            // text) was ~15% of its time. The release thread does it.
+            release_writer_garbage(Box::new((evicted, cached_lines, pending_lines)));
             metrics::counter!("mux.scrollback.deferred_rows_durable")
                 .increment(acknowledged as u64);
             metrics::histogram!("mux.scrollback.durability_commit_latency_us")
@@ -1720,12 +2095,33 @@ mod deferred_scrollback {
             if close_window {
                 self.writer.expedite(self);
             }
-            // Last-reference Line destruction happens outside the state lock.
-            drop(dropped);
+            // Shed rows are the last references to their Lines: free them
+            // outside the state lock and off this (terminal-holding) thread.
+            if !dropped.is_empty() {
+                release_off_thread(Box::new(dropped));
+            }
             if !gaps.is_empty() {
                 self.report_gaps(&gaps, entered_overload);
             }
             admission
+        }
+
+        /// Adds the rows admitted and the gap rows and bytes counted since
+        /// the last call to their `metrics` counters. Called by the writer
+        /// each time it services this sink, and when the sink drops.
+        fn publish_metrics(&self) {
+            let admitted = self.unreported_admitted.swap(0, Ordering::Relaxed);
+            if admitted != 0 {
+                metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(admitted);
+            }
+            let gap_rows = self.unreported_gap_rows.swap(0, Ordering::Relaxed);
+            if gap_rows != 0 {
+                metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(gap_rows);
+            }
+            let gap_bytes = self.unreported_gap_bytes.swap(0, Ordering::Relaxed);
+            if gap_bytes != 0 {
+                metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(gap_bytes);
+            }
         }
 
         /// Logs and counts rows dropped from durability. Entering overload is
@@ -1733,8 +2129,10 @@ mod deferred_scrollback {
         fn report_gaps(&self, gaps: &[GapSpan], entered: bool) {
             let rows: StableRowIndex = gaps.iter().map(GapSpan::rows).sum();
             let bytes: usize = gaps.iter().map(|gap| gap.bytes).sum();
-            metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(rows as u64);
-            metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(bytes as u64);
+            self.unreported_gap_rows
+                .fetch_add(rows as u64, Ordering::Relaxed);
+            self.unreported_gap_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
             if self.writer.publishes() {
                 // Gap records are counted when their markers are written.
                 DurabilityLedger::global().record_gaps(0, rows as u64, bytes as u64);
@@ -1826,7 +2224,7 @@ mod deferred_scrollback {
             let queued = self.writer.queued_bytes();
             let as_gap = if queued.saturating_add(charge) > budget {
                 let need = queued.saturating_add(charge).saturating_sub(budget / 2);
-                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms());
+                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms);
                 self.writer.release(freed);
                 dropped.append(&mut gone);
                 gaps.append(&mut spans);
@@ -1844,14 +2242,26 @@ mod deferred_scrollback {
             };
             let was_empty = state.pending.is_empty();
             let was_full = window_full(state);
+            // One clock read per commit window, not per row (ft-yccm0.2.1.8):
+            // on macOS it was ~80 ns of a short row's ~285 under the terminal
+            // lock. A row behind the first one the drain has not captured yet
+            // is committed in that row's window, so it carries that row's
+            // admission time: when its window opened.
+            let (now, read_clock) = match state.uncaptured_since {
+                Some(opened) if !was_empty => (opened, false),
+                _ => {
+                    let now = Instant::now();
+                    state.uncaptured_since = Some(now);
+                    (now, true)
+                }
+            };
             if as_gap {
-                let at_unix_ms = unix_now_ms();
-                let span = GapSpan {
+                let mut span = GapSpan {
                     start: stable_row,
                     end: next,
                     retention,
                     bytes: charge,
-                    at_unix_ms,
+                    at_unix_ms: 0,
                 };
                 let tail = state.pending.len().checked_sub(1);
                 match (tail, state.pending.back_mut()) {
@@ -1860,34 +2270,49 @@ mod deferred_scrollback {
                     {
                         last.end = next;
                         last.bytes += charge;
+                        // The row joins that gap and its time.
+                        span.at_unix_ms = last.at_unix_ms;
                     }
-                    _ => state.pending.push_back(Pending::Gap(span)),
+                    _ => {
+                        span.at_unix_ms = unix_now_ms();
+                        state.pending.push_back(Pending::Gap(span));
+                    }
                 }
                 gaps.push(span);
             } else {
                 state.pending.push_back(Pending::Row(PendingRow {
                     stable_row,
-                    line: Arc::new(line.clone()),
+                    line: Arc::new(line.clone_content()),
                     retention,
                     charged_bytes: charge,
+                    admitted_at: now,
                 }));
                 state.pending_bytes += charge;
                 self.writer.charge(charge);
             }
             // The commit window opens with the first queued row; reaching a
             // size threshold closes it early (ft-yccm0.2.1.2).
-            let now = Instant::now();
             if was_empty {
                 state.window_opened = Some(now);
             }
-            state.last_admitted = Some(now);
+            if read_clock {
+                state.last_admitted = Some(now);
+                state.admitted_since_check = false;
+            } else {
+                state.admitted_since_check = true;
+            }
             *close_window = !was_full && window_full(state);
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
-            state.prune_cached();
-            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
+            // A row pruned here usually shares its text with the row Screen
+            // still holds, so freeing it is cheap; a send per row to the
+            // release thread would cost more.
+            let mut pruned = Vec::new();
+            state.prune_cached(&mut pruned);
+            drop(pruned);
+            self.unreported_admitted.fetch_add(1, Ordering::Relaxed);
             let interval = match state.interval_identity.capture(Some(oldest..next)) {
                 ScrollbackIntervalCapture::Ready(interval) => Some(interval),
                 _ => None,
@@ -1898,6 +2323,7 @@ mod deferred_scrollback {
 
     impl Drop for DeferredScrollbackSpillSink {
         fn drop(&mut self) {
+            self.publish_metrics();
             // Never silent: rows dropped here were admitted but never became
             // durable (pane closed while its store was failing, or without a
             // durability handoff). No IO here; the dropping thread may be a UI
@@ -2004,16 +2430,15 @@ mod deferred_scrollback {
             true
         }
 
-        /// Explicit sync point: drains on the calling thread, serialized with
-        /// the writer, and returns once every admitted row is durable and the
-        /// backing's manifest describes it.
+        /// Explicit sync point: serialized with the writer, capture the
+        /// admitted frontier and return once it is durable and published.
+        /// Concurrent later arrivals belong to a subsequent commit window.
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
-            self.commit_now.store(true, Ordering::Release);
-            self.drain_scheduled()
+            self.drain_scheduled(DrainMode::Flush)
         }
 
         fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
-            if self.pending_rows.load(Ordering::Acquire) != 0 {
+            if self.needs_service() {
                 self.schedule();
             }
             self.durability_failure().map_or(Ok(()), Err)
@@ -2021,10 +2446,12 @@ mod deferred_scrollback {
 
         /// Pane close: commit now rather than at the window's end.
         fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
-            self.commit_now.store(true, Ordering::Release);
-            let result = self.request_scrollback_flush();
+            self.request_commit()?;
+            // A queue can be empty while its durable tail still needs a
+            // manifest publication. Such a request also owns a writer turn.
+            self.schedule();
             self.writer.expedite(self);
-            result
+            self.durability_failure().map_or(Ok(()), Err)
         }
 
         fn await_scrollback_capacity(&self, timeout: Duration) -> ScrollbackCapacityWait {
@@ -2346,71 +2773,16 @@ mod deferred_scrollback {
             prefix: ScrollbackPrefix<'_>,
             retention: usize,
         ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-            let _operation = self
-                .operation
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            // An in-flight writer batch must finish before the generation
-            // changes under it.
-            let _drain = self
-                .drain_gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            if state.publication_uncertain {
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            if !state.pending.is_empty() {
-                return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
-            }
-            // Allocate before the durable commit; capture remains Busy until
-            // bounds and identity are installed together under this guard.
-            let interval_identity = ScrollbackIntervalIdentity::default();
-            let oldest = prefix.oldest_stable_row();
-            let newest = prefix.newest_stable_row_exclusive();
-            let receipt = match self
-                .backing
-                .replace_scrollback_prefix(expected, prefix, retention)
-            {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    state.publication_uncertain =
-                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
-                    return Err(error);
-                }
-            };
-            let generation = receipt.generation();
-            let valid_generation = match expected {
-                Some(expected) => {
-                    generation.content_epoch() == expected.content_epoch()
-                        && expected.revision().checked_add(1) == Some(generation.revision())
-                }
-                None => generation.revision() == 1,
-            };
-            if receipt.oldest_stable_row() != oldest
-                || receipt.newest_stable_row_exclusive() != newest
-                || !valid_generation
-            {
-                state.publication_uncertain = true;
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            // The replaced prefix is written row for row, so its store rows
-            // equal its stable rows again: no gap offset survives.
-            *state = State {
-                interval_identity,
-                ..State::empty(
-                    self.backing.retained_scrollback_bytes(),
-                    receipt.oldest_stable_row(),
-                    Some(receipt.newest_stable_row_exclusive()),
-                )
-            };
-            self.pending_rows.store(0, Ordering::Release);
-            drop(state);
-            self.publish_progress();
-            Ok(receipt)
+            self.replace_prefix_with(expected, None, prefix, retention)
+        }
+
+        fn replace_scrollback_prefix_superseding(
+            &self,
+            ancestry: ScrollbackAncestry,
+            prefix: ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            self.replace_prefix_with(Some(ancestry.ancestor), Some(ancestry), prefix, retention)
         }
 
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
@@ -2418,6 +2790,21 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An Ink TUI taller than its terminal redraws with ESC[2J ESC[3J
+            // ESC[H, many times a second, and its frames scroll only into the
+            // in-memory hot tier. When nothing has reached this sink since its
+            // last clear, that clear still stands; publishing it again (a
+            // manifest and a truncation, 2-9 ms under the pane's terminal
+            // lock) would change nothing durable.
+            if let Some(receipt) = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                .unchanged_since_clear()
+                .filter(|_| self.backing.retained_scrollback_rows() == 0)
+            {
+                return Ok(receipt);
+            }
             // Wait out an in-flight writer batch: an append landing after the
             // clear would resurrect rows from before it. A successful explicit
             // clear discards both the durable generation and its queued
@@ -2449,6 +2836,7 @@ mod deferred_scrollback {
                 &mut *state,
                 State {
                     interval_identity,
+                    last_clear: Some(receipt),
                     ..State::empty(0, None, None)
                 },
             );
@@ -2459,6 +2847,136 @@ mod deferred_scrollback {
             Ok(receipt)
         }
     }
+
+    impl DeferredScrollbackSpillSink {
+        /// Both replacement entry points; `supersede` passes an expected
+        /// generation to the backing sink as an ancestor.
+        fn replace_prefix_with(
+            &self,
+            expected: Option<ScrollbackSnapshotGeneration>,
+            supersede: Option<ScrollbackAncestry>,
+            prefix: ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An in-flight writer batch must finish before the generation
+            // changes under it.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            if state.publication_uncertain {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            if !state.pending.is_empty() {
+                return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
+            }
+            // Allocate before the durable commit; capture remains Busy until
+            // bounds and identity are installed together under this guard.
+            let interval_identity = ScrollbackIntervalIdentity::default();
+            let oldest = prefix.oldest_stable_row();
+            let newest = prefix.newest_stable_row_exclusive();
+            // The backing sink checks a superseding ancestor under its own
+            // mutation boundary, while these locks keep this sink's writer
+            // from admitting a row in between.
+            let replaced = match supersede {
+                Some(ancestry) => self
+                    .backing
+                    .replace_scrollback_prefix_superseding(ancestry, prefix, retention),
+                None => self
+                    .backing
+                    .replace_scrollback_prefix(expected, prefix, retention),
+            };
+            let receipt = match replaced {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    state.publication_uncertain =
+                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                    return Err(error);
+                }
+            };
+            let generation = receipt.generation();
+            let valid_generation = match (supersede, expected) {
+                (Some(ancestry), _) => ancestry.admits_receipt(generation),
+                (None, Some(expected)) => {
+                    generation.content_epoch() == expected.content_epoch()
+                        && expected
+                            .revision()
+                            .checked_add(1)
+                            .is_some_and(|revision| generation.revision() == revision)
+                }
+                (None, None) => generation.revision() == 1,
+            };
+            if receipt.oldest_stable_row() != oldest
+                || receipt.newest_stable_row_exclusive() != newest
+                || !valid_generation
+            {
+                state.publication_uncertain = true;
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            // The replaced prefix is written row for row, so its store rows
+            // equal its stable rows again: no gap offset survives.
+            *state = State {
+                interval_identity,
+                ..State::empty(
+                    self.backing.retained_scrollback_bytes(),
+                    receipt.oldest_stable_row(),
+                    Some(receipt.newest_stable_row_exclusive()),
+                )
+            };
+            self.pending_rows.store(0, Ordering::Release);
+            drop(state);
+            self.publish_progress();
+            Ok(receipt)
+        }
+    }
+    /// ESC[3J repeated with nothing reaching the sink in between (an Ink
+    /// redraw whose frames stay in the hot tier) reuses the last clear
+    /// instead of publishing another one; any row in between makes the next
+    /// clear a real, durable one again.
+    #[test]
+    fn repeated_clear_with_nothing_spilled_reuses_the_last_durable_clear() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let first = deferred.clear_scrollback().unwrap();
+        assert_eq!(
+            deferred.clear_scrollback().unwrap(),
+            first,
+            "nothing to clear"
+        );
+        assert_eq!(deferred.clear_scrollback().unwrap(), first);
+
+        let line = Line::from_text("row", &CellAttributes::blank(), 1, None);
+        assert!(
+            deferred
+                .store_scrollback_line_with_receipt(5, &line, 4)
+                .accepted()
+        );
+        let queued = deferred.clear_scrollback().unwrap();
+        assert_ne!(queued, first, "a queued row needs a real clear");
+        assert_eq!(deferred.clear_scrollback().unwrap(), queued);
+
+        assert!(
+            deferred
+                .store_scrollback_line_with_receipt(6, &line, 4)
+                .accepted()
+        );
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+        let durable = deferred.clear_scrollback().unwrap();
+        assert_ne!(durable, queued, "a durable row needs a real clear");
+        assert_eq!(backing.retained_scrollback_rows(), 0);
+        assert_eq!(deferred.clear_scrollback().unwrap(), durable);
+    }
+
     #[test]
     fn deferred_admission_receipt_binds_exact_pending_row_and_rejects_busy_or_reused_source() {
         use wezterm_term::CellAttributes;
@@ -2810,6 +3328,11 @@ mod deferred_scrollback {
     struct GateState {
         closed: bool,
         inside: usize,
+        entered_calls: usize,
+        allowed_calls: Option<usize>,
+        acknowledge_rows: Option<usize>,
+        published_frontiers: Vec<usize>,
+        fail_next_flush: bool,
         panic_on_store: bool,
         writer_thread: Option<String>,
         writer_qos: Option<procinfo::ThreadQos>,
@@ -2837,6 +3360,46 @@ mod deferred_scrollback {
 
         fn set_panic(&self, panic_on_store: bool) {
             self.gate.lock().unwrap().panic_on_store = panic_on_store;
+        }
+
+        fn allow_calls(&self, calls: usize) {
+            self.gate.lock().unwrap().allowed_calls = Some(calls);
+            self.gate_signal.notify_all();
+        }
+
+        fn wait_for_calls(&self, calls: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.entered_calls < calls {
+                let now = Instant::now();
+                assert!(now < deadline, "the writer never entered call {calls}");
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn wait_for_publications(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.published_frontiers.len() < count {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "the writer never published frontier {count}"
+                );
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn published_frontiers(&self) -> Vec<usize> {
+            self.gate.lock().unwrap().published_frontiers.clone()
         }
 
         fn inside(&self) -> usize {
@@ -2887,7 +3450,7 @@ mod deferred_scrollback {
             lines: &[Line],
             _retention: usize,
         ) -> usize {
-            {
+            let acknowledged = {
                 let mut gate = self.gate.lock().unwrap();
                 gate.writer_thread = std::thread::current().name().map(str::to_owned);
                 gate.writer_qos = procinfo::current_thread_qos();
@@ -2896,23 +3459,39 @@ mod deferred_scrollback {
                     panic!("injected scrollback store panic");
                 }
                 gate.inside += 1;
+                gate.entered_calls += 1;
+                let call = gate.entered_calls;
                 self.gate_signal.notify_all();
-                while gate.closed {
+                while gate.closed || gate.allowed_calls.is_some_and(|allowed| call > allowed) {
                     gate = self.gate_signal.wait(gate).unwrap();
                 }
                 gate.inside -= 1;
-            }
+                gate.acknowledge_rows
+                    .unwrap_or(lines.len())
+                    .min(lines.len())
+            };
             let mut rows = self.rows.lock().unwrap();
             if rows.last().is_some_and(|(last, _)| last + 1 != first) {
                 return 0;
             }
-            for (offset, line) in lines.iter().enumerate() {
+            for (offset, line) in lines.iter().take(acknowledged).enumerate() {
                 rows.push((
                     first + offset as StableRowIndex,
                     line.as_str().trim_end().to_string(),
                 ));
             }
-            lines.len()
+            acknowledged
+        }
+
+        fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
+            let frontier = self.rows.lock().unwrap().len();
+            let mut gate = self.gate.lock().unwrap();
+            if std::mem::take(&mut gate.fail_next_flush) {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            gate.published_frontiers.push(frontier);
+            self.gate_signal.notify_all();
+            Ok(())
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
@@ -3096,6 +3675,68 @@ mod deferred_scrollback {
             "caught up below half the budget"
         );
         assert_eq!(sink.durability_failure(), None);
+    }
+
+    #[test]
+    fn shed_rows_are_freed_off_the_admitting_thread() {
+        use wezterm_term::CellAttributes;
+
+        /// Parks the release thread until the test opens it, so rows an
+        /// admission handed over are observably still alive.
+        struct Gate(std::sync::mpsc::Receiver<()>);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                let _ = self.0.recv_timeout(Duration::from_secs(10));
+            }
+        }
+
+        let (_dir, _backing, deferred) = super::tests::deferred_test_sink();
+        // Every live copy of a row holds this link, so its count tracks them.
+        let hyperlink = Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://shed.example/",
+            "shed",
+        ));
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::clone(&hyperlink)));
+        let line = |row: StableRowIndex| Line::from_text(&format!("shed {row}"), &attrs, 0, None);
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(99)).unwrap();
+        deferred.writer.set_queue_budget(charge * 1_000);
+        for row in 0..100 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 10_000));
+        }
+        let queued = Arc::strong_count(&hyperlink);
+        let (open, gate) = std::sync::mpsc::channel();
+        release_off_thread(Box::new(Gate(gate)));
+
+        // Over budget, the oldest queued rows become a gap.
+        deferred.writer.set_queue_budget(charge * 50);
+        assert!(deferred.store_scrollback_line(100, &line(100), 10_000));
+        let shed = deferred
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter_map(|entry| match entry {
+                Pending::Gap(gap) => Some(gap.rows()),
+                Pending::Row(_) => None,
+            })
+            .sum::<StableRowIndex>();
+        assert!(shed >= 50, "the admission shed {shed} rows");
+        assert!(
+            Arc::strong_count(&hyperlink) > queued,
+            "the admitting thread freed the shed rows itself"
+        );
+
+        open.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&hyperlink) > queued / 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            Arc::strong_count(&hyperlink) <= queued / 2,
+            "the release thread frees the shed rows"
+        );
     }
 
     #[test]
@@ -3357,6 +3998,22 @@ mod deferred_scrollback {
         started.elapsed()
     }
 
+    /// The writer counts a batch after the store acknowledges it, a moment
+    /// after its rows become visible there. Returns the settled count.
+    #[cfg(test)]
+    fn wait_for_batches(sink: &DeferredScrollbackSpillSink, batches: u64) -> u64 {
+        let started = Instant::now();
+        while sink.committed_batches() < batches {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer acknowledged {} of {batches} batches",
+                sink.committed_batches()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        sink.committed_batches()
+    }
+
     #[test]
     fn commit_windows_gather_parse_batches_into_one_transaction() {
         let (store, sink) = windowed_sink(
@@ -3378,7 +4035,7 @@ mod deferred_scrollback {
         assert!(store.rows().is_empty(), "the window is still open");
         // The burst ends: the idle close commits it as one transaction.
         wait_for_rows(&store, 80);
-        assert_eq!(sink.committed_batches(), 1);
+        assert_eq!(wait_for_batches(&sink, 1), 1);
         let expected: Vec<_> = (0..80).map(|row| (row, GatedStore::text(row))).collect();
         assert_eq!(store.rows(), expected);
     }
@@ -3409,7 +4066,7 @@ mod deferred_scrollback {
         // The 16th row reaches the window bytes and closes the window.
         assert!(sink.store_scrollback_line(15, &GatedStore::line(15), 1 << 20));
         assert!(wait_for_rows(&store, 16) < Duration::from_secs(4));
-        assert_eq!(sink.committed_batches(), 1);
+        assert_eq!(wait_for_batches(&sink, 1), 1);
 
         // A pane close commits the open window at once.
         for row in 16..19 {
@@ -3420,7 +4077,7 @@ mod deferred_scrollback {
         assert_eq!(store.rows().len(), 16, "the new window is open");
         sink.request_scrollback_commit().unwrap();
         assert!(wait_for_rows(&store, 19) < Duration::from_secs(4));
-        assert_eq!(sink.committed_batches(), 2);
+        assert_eq!(wait_for_batches(&sink, 2), 2);
     }
 
     #[test]
@@ -3462,7 +4119,495 @@ mod deferred_scrollback {
             sink.request_scrollback_flush().unwrap();
             wait_for_rows(&store, row as usize + 1);
         }
-        assert_eq!(sink.committed_batches(), 3);
+        assert_eq!(wait_for_batches(&sink, 3), 3);
+    }
+
+    /// A failed assertion must also release a writer blocked in a test store.
+    #[cfg(test)]
+    struct ReleaseGatedStores(Vec<Arc<GatedStore>>);
+
+    #[cfg(test)]
+    impl Drop for ReleaseGatedStores {
+        fn drop(&mut self) {
+            for store in &self.0 {
+                store.set_closed(false);
+                store.allow_calls(usize::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn window_eligibility_does_not_wait_on_state_held_by_a_destructive_operation() {
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x79,
+        );
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        // The parser's handoff: the writer now holds its own reference, as
+        // whenever it checks a window. Without one the pane reads as closed.
+        sink.request_scrollback_flush().unwrap();
+        let state = sink.state.lock().unwrap();
+        let checking = sink.clone();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let checker = std::thread::spawn(move || {
+            let _queue = checking.writer.shared.lock_queue();
+            sent.send(checking.try_commit_window(Instant::now()))
+                .unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_millis(500));
+        drop(state);
+        checker.join().unwrap();
+        assert_eq!(result, Ok(None));
+        assert!(matches!(
+            sink.commit_window(Instant::now()),
+            CommitWindow::Open { .. }
+        ));
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn admission_counts_rows_for_the_writer_to_publish_to_metrics() {
+        use metrics::{
+            Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        struct Add(Arc<AtomicU64>);
+        impl CounterFn for Add {
+            fn increment(&self, value: u64) {
+                self.0.fetch_add(value, Ordering::SeqCst);
+            }
+            fn absolute(&self, value: u64) {
+                self.0.store(value, Ordering::SeqCst);
+            }
+        }
+        #[derive(Default)]
+        struct Admitted {
+            rows: Arc<AtomicU64>,
+            registrations: AtomicUsize,
+        }
+        impl metrics::Recorder for Admitted {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                if key.name() == "mux.scrollback.deferred_rows_admitted" {
+                    Counter::from_arc(Arc::new(Add(Arc::clone(&self.rows))))
+                } else {
+                    Counter::noop()
+                }
+            }
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x7b,
+        );
+        let recorder = Admitted::default();
+        // Admission (the parser, under the terminal lock) touches no metric.
+        metrics::with_local_recorder(&recorder, || {
+            for row in 0..3 {
+                assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+            }
+        });
+        assert_eq!(recorder.registrations.load(Ordering::SeqCst), 0);
+        // The writer's turn publishes the count once.
+        metrics::with_local_recorder(&recorder, || sink.publish_metrics());
+        assert_eq!(recorder.rows.load(Ordering::SeqCst), 3);
+        metrics::with_local_recorder(&recorder, || sink.publish_metrics());
+        assert_eq!(recorder.rows.load(Ordering::SeqCst), 3, "published once");
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn rows_behind_a_window_start_read_no_clock_and_hold_the_idle_close_one_check() {
+        let idle = Duration::from_secs(120);
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(1000),
+                idle,
+                ..CommitPolicy::default()
+            },
+            0x7a,
+        );
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_flush().unwrap();
+        // Let the writer make its first check and park the sink, so no
+        // check of its own runs during this test.
+        let started = Instant::now();
+        while sink.writer.shared.lock_queue().windows.is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer never parked the sink"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (opened, first_admitted) = {
+            let state = sink.state.lock().unwrap();
+            (state.window_opened.unwrap(), state.last_admitted.unwrap())
+        };
+        assert_eq!(
+            opened, first_admitted,
+            "the row that opens a window reads the clock"
+        );
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        assert!(sink.store_scrollback_line(2, &GatedStore::line(2), 64));
+        {
+            let state = sink.state.lock().unwrap();
+            for entry in &state.pending {
+                let Pending::Row(row) = entry else {
+                    panic!("only rows are queued");
+                };
+                assert_eq!(row.admitted_at, opened, "row {}", row.stable_row);
+            }
+            assert_eq!(state.last_admitted, Some(first_admitted));
+            assert!(state.admitted_since_check);
+        }
+        // A check after the first row's idle close sees the later arrivals
+        // and counts them from itself: still open, one idle interval on.
+        let check = first_admitted + idle + Duration::from_secs(1);
+        assert_eq!(
+            sink.commit_window(check),
+            CommitWindow::Open {
+                closes_at: check + idle
+            }
+        );
+        // Nothing new by the next check: the idle close.
+        assert_eq!(
+            sink.commit_window(check + idle),
+            CommitWindow::Closed("idle")
+        );
+        // After a drain captures the queue, the next arrival opens the next
+        // window: it reads the clock, so that window starts at its admission.
+        // (The capture as the drain makes it, without writing anything.)
+        std::thread::sleep(Duration::from_millis(2));
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.in_flight = state.pending.len();
+            state.uncaptured_since = None;
+        }
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        {
+            let mut state = sink.state.lock().unwrap();
+            let Some(Pending::Row(next)) = state.pending.back() else {
+                panic!("row 3 is queued");
+            };
+            assert!(next.admitted_at > opened);
+            assert_eq!(state.last_admitted, Some(next.admitted_at));
+            assert!(!state.admitted_since_check);
+            state.in_flight = 0;
+        }
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn scheduled_turns_yield_to_quiet_pane_while_hot_pane_replenishes() {
+        let writer = DurabilityWriter::spawn();
+        writer.set_commit_policy(CommitPolicy {
+            window: Duration::ZERO,
+            ..CommitPolicy::default()
+        });
+        let hot_store = Arc::new(GatedStore::default());
+        let quiet_store = Arc::new(GatedStore::default());
+        let _release = ReleaseGatedStores(vec![hot_store.clone(), quiet_store.clone()]);
+        hot_store.allow_calls(0);
+        quiet_store.allow_calls(0);
+        let hot =
+            DeferredScrollbackSpillSink::with_writer(hot_store.clone(), [0x71; 16], writer.clone())
+                .unwrap();
+        let quiet =
+            DeferredScrollbackSpillSink::with_writer(quiet_store.clone(), [0x72; 16], writer)
+                .unwrap();
+        assert!(hot.store_scrollback_line(0, &GatedStore::line(0), 64));
+        hot.request_scrollback_flush().unwrap();
+        hot_store.wait_for_calls(1);
+
+        // The hot pane already owns the next queue entry when the quiet pane
+        // arrives. Keep replenishing it before every captured write returns.
+        assert!(hot.store_scrollback_line(1, &GatedStore::line(1), 64));
+        hot.request_scrollback_flush().unwrap();
+        assert!(quiet.store_scrollback_line(0, &GatedStore::line(0), 64));
+        quiet.request_scrollback_flush().unwrap();
+        hot_store.allow_calls(1);
+        hot_store.wait_for_calls(2);
+        assert!(hot.store_scrollback_line(2, &GatedStore::line(2), 64));
+        hot.request_scrollback_flush().unwrap();
+        hot_store.allow_calls(2);
+
+        // A drain-until-empty loop instead enters hot call 3 and strands the
+        // quiet pane behind it. Finite turns reach the quiet pane first.
+        quiet_store.wait_for_calls(1);
+        assert_eq!(hot_store.gate.lock().unwrap().entered_calls, 2);
+        assert_eq!(hot_store.rows().len(), 2);
+        assert_eq!(hot.pending_rows.load(Ordering::Acquire), 1);
+        quiet_store.allow_calls(1);
+        hot_store.allow_calls(3);
+        wait_for_rows(&hot_store, 3);
+        wait_for_rows(&quiet_store, 1);
+        hot.flush_scrollback().unwrap();
+        quiet.flush_scrollback().unwrap();
+        assert_eq!(hot.durability_failure(), None);
+        assert_eq!(quiet.durability_failure(), None);
+    }
+
+    #[test]
+    fn scheduled_turn_opens_a_new_window_for_arrivals_behind_its_capture() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                window_bytes: 1 << 30,
+                idle: Duration::from_secs(120),
+            },
+            0x73,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        sink.request_scrollback_flush().unwrap();
+        store.allow_calls(1);
+        store.wait_for_publications(1);
+        {
+            let _drain = sink.drain_gate.lock().unwrap();
+            let state = sink.state.lock().unwrap();
+            let Some(Pending::Row(first)) = state.pending.front() else {
+                panic!("the fresh arrival must remain in the next window");
+            };
+            assert_eq!(first.stable_row, 1);
+            assert_eq!(state.window_opened, Some(first.admitted_at));
+            assert!(state.commit_requested.is_none());
+        }
+        assert_eq!(store.rows().len(), 1);
+        assert!(matches!(
+            sink.commit_window(Instant::now()),
+            CommitWindow::Open { .. }
+        ));
+        // A no-op handoff also cannot replay the already acknowledged row.
+        for _ in 0..32 {
+            sink.request_scrollback_flush().unwrap();
+        }
+        store.allow_calls(2);
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_publications(2);
+        assert_eq!(
+            store.rows(),
+            vec![(0, GatedStore::text(0)), (1, GatedStore::text(1))]
+        );
+        assert_eq!(store.published_frontiers(), vec![1, 2]);
+    }
+
+    #[test]
+    fn partial_turn_acknowledgements_preserve_each_requested_publication_frontier() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x74,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        assert!(store.published_frontiers().is_empty());
+        assert!(sink.store_scrollback_line(4, &GatedStore::line(4), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(2);
+        store.wait_for_calls(3);
+        assert!(store.published_frontiers().is_empty());
+        // Repeated requests during early partial ACKs must not keep moving
+        // the original frontier. It publishes when call 3 acknowledges it;
+        // the bounded follow-up represents the latest later request.
+        store.allow_calls(3);
+        store.wait_for_calls(4);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        assert_eq!(
+            sink.state.lock().unwrap().commit_requested,
+            Some(CommitRequest { through: Some(5) })
+        );
+        store.allow_calls(4);
+        store.wait_for_calls(5);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        store.allow_calls(5);
+        store.wait_for_publications(2);
+        assert_eq!(store.published_frontiers(), vec![3, 5]);
+        assert_eq!(
+            store.rows(),
+            (0..5)
+                .map(|row| (row, GatedStore::text(row)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_flush_publishes_its_frontier_without_chasing_later_arrivals() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x75);
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        // Retain an older asynchronous intent without handing it to the
+        // worker yet. The synchronous flush must still capture all 3 rows.
+        sink.request_commit().unwrap();
+        for row in 1..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        let flushing = sink.clone();
+        let (done, completion) = std::sync::mpsc::sync_channel(1);
+        let flusher = std::thread::spawn(move || {
+            done.send(flushing.flush_scrollback()).unwrap();
+        });
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(3);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+        flusher.join().unwrap();
+        // The later asynchronous request is still pending, with its write
+        // blocked. The synchronous caller's three rows are already published.
+        store.wait_for_calls(4);
+        assert_eq!(store.rows().len(), 3);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        store.allow_calls(4);
+        store.wait_for_publications(2);
+        assert_eq!(store.published_frontiers(), vec![3, 4]);
+    }
+
+    #[test]
+    fn an_empty_queue_retries_a_failed_commit_publication() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x76);
+        store.gate.lock().unwrap().fail_next_flush = true;
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        assert_eq!(
+            sink.flush_scrollback(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(sink.pending_rows.load(Ordering::Acquire), 0);
+        assert_eq!(store.rows().len(), 1);
+        assert!(store.published_frontiers().is_empty());
+        assert_eq!(
+            sink.durability_failure(),
+            Some(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert!(matches!(
+            sink.request_scrollback_flush(),
+            Ok(()) | Err(ScrollbackSpillError::StorageUnavailable)
+        ));
+        store.wait_for_publications(1);
+        let _drain = sink.drain_gate.lock().unwrap();
+        assert!(sink.state.lock().unwrap().commit_requested.is_none());
+        assert_eq!(sink.durability_failure(), None);
+        assert_eq!(store.published_frontiers(), vec![1]);
+        assert_eq!(store.rows().len(), 1, "publication must not replay rows");
+    }
+
+    #[test]
+    fn a_closed_pane_finishes_partial_turns_and_publishes_before_release() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x77);
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        let closed = Arc::downgrade(&sink);
+        drop(sink);
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        store.allow_calls(2);
+        store.wait_for_calls(3);
+        assert!(store.published_frontiers().is_empty());
+        store.allow_calls(3);
+        store.wait_for_publications(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while closed.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer retained a completed closed pane"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(store.rows().len(), 3);
+        assert_eq!(store.published_frontiers(), vec![3]);
+    }
+
+    #[test]
+    fn a_coalesced_gap_can_cover_a_commit_frontier_in_one_scheduled_turn() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::ZERO,
+                ..CommitPolicy::default()
+            },
+            0x78,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_flush().unwrap();
+        store.wait_for_calls(1);
+        let charge = DeferredScrollbackSpillSink::row_charge(&GatedStore::line(1)).unwrap();
+        sink.set_writer_budget(2 * charge);
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        sink.request_scrollback_commit().unwrap();
+        for row in 2..5 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        let gap = {
+            let state = sink.state.lock().unwrap();
+            let Pending::Gap(gap) = state.pending[1] else {
+                panic!("overload must coalesce behind the in-flight row");
+            };
+            assert_eq!(gap.start, 1);
+            assert!(
+                gap.end > 2,
+                "the coalesced gap crosses the requested frontier"
+            );
+            gap
+        };
+        sink.set_writer_budget(DEFAULT_QUEUE_BUDGET_BYTES);
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        assert!(store.published_frontiers().is_empty());
+        store.allow_calls(2);
+        store.wait_for_publications(1);
+        assert_eq!(store.published_frontiers(), vec![2]);
+        assert_eq!(store.rows()[1], (1, gap.marker_text()));
+        assert_eq!(sink.load_scrollback_line(2).map(|line| line.len()), Some(0));
+        store.allow_calls(usize::MAX);
+        sink.flush_scrollback().unwrap();
+        assert_eq!(sink.durability_failure(), None);
+        assert!(sink.queued_gaps().is_empty());
     }
 
     #[test]
@@ -3614,8 +4759,18 @@ mod deferred_scrollback {
             assert!(failing.store_scrollback_line(row, &GatedStore::line(row), 64));
         }
         failing.request_scrollback_flush().unwrap();
+        // The degraded pane is exported through the resource snapshot that
+        // `ft doctor --json` reads (this pane id is unique to this test).
+        // The writer updates it just after the pane's own health.
+        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
+        let exported_degraded = || {
+            DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&failing_label)
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while failing.durability_failure().is_none() {
+        while failing.durability_failure().is_none() || !exported_degraded() {
             assert!(
                 Instant::now() < deadline,
                 "the writer panic was not surfaced"
@@ -3623,12 +4778,7 @@ mod deferred_scrollback {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(failing.writer_panicked());
-        // The degraded pane is exported through the resource snapshot that
-        // `ft doctor --json` reads (this pane id is unique to this test).
-        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
-        let exported = DurabilityLedger::global().snapshot();
-        assert!(exported.degraded_panes.contains_key(&failing_label));
-        assert!(exported.writer_panics_total >= 1);
+        assert!(DurabilityLedger::global().snapshot().writer_panics_total >= 1);
         // The parser sees a degraded pane, never a panic, and keeps its rows.
         assert_eq!(
             failing.request_scrollback_flush(),
@@ -3670,13 +4820,13 @@ mod deferred_scrollback {
         }
         let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
         assert_eq!(failing_store.rows(), expected);
-        assert!(
-            !DurabilityLedger::global()
-                .snapshot()
-                .degraded_panes
-                .contains_key(&failing_label),
-            "a recovered pane leaves the exported degraded set"
-        );
+        while exported_degraded() {
+            assert!(
+                Instant::now() < deadline,
+                "a recovered pane leaves the exported degraded set"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -5798,6 +6948,31 @@ pub const LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024
 pub const LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES: u64 = 1024 * 1024 * 1024;
 const LIVE_SCROLLBACK_DISCOVERY_EXTRA_ENTRIES: usize = 4096;
 
+/// Discovery attempts after the first when a pane's store refused it.
+const LIVE_SCROLLBACK_DISCOVERY_RETRIES: usize = 3;
+const LIVE_SCROLLBACK_DISCOVERY_RETRY_PAUSE: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+/// A live pane's store changed while discovery read it: a race with the
+/// writer, which republishes a busy pane's manifest about once a second (and
+/// with every overload gap marker), not evidence of corruption.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct LiveScrollbackChangedDuringDiscovery(&'static str);
+
+/// Whether discovery lost a race with the pane's writer: the manifest or
+/// directory changed, or the ledger snapshot saw its files change.
+fn live_scrollback_discovery_raced_writer(error: &anyhow::Error) -> bool {
+    error.is::<LiveScrollbackChangedDuringDiscovery>()
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<frankenterm_core::storage::mmap_store::MmapStoreError>()
+                .is_some_and(
+                    frankenterm_core::storage::mmap_store::MmapStoreError::is_concurrent_change,
+                )
+        })
+}
+
 /// Read a pane ledger as its manifest publishes it (ft-yccm0.2.1.2). A
 /// complete authenticated v4 manifest names a prefix that the ledger may
 /// extend with a durable, not yet published tail; that tail reads as an
@@ -7534,13 +8709,24 @@ impl LiveScrollbackSpillSink {
             observed_oldest <= wal.target_oldest_sequence,
             "append WAL recovery ledger pruned beyond its authenticated target"
         );
+        let keep_from =
+            store_segment_keep_from(store, wal.ledger_pane_id, wal.target_oldest_sequence)?;
         if observed_oldest < wal.target_oldest_sequence {
-            let keep_from =
-                store_segment_keep_from(store, wal.ledger_pane_id, wal.target_oldest_sequence)?;
             store
-                .prune_before_keeping(wal.ledger_pane_id, wal.target_oldest_sequence, keep_from)
+                .prune_before(wal.ledger_pane_id, wal.target_oldest_sequence)
                 .context("recover append WAL retention cut")?;
         }
+        // A crash may already have published the retention cut while leaving
+        // physical compaction unfinished. Complete bounded maintenance even
+        // when the logical oldest row is already the authenticated target.
+        store
+            .compact_pane_if_stale_keeping(
+                wal.ledger_pane_id,
+                LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
+                keep_from,
+                Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
+            )
+            .context("compact recovered append WAL target within manifest bound")?;
         Self::verify_append_wal_target_store(wal, store)?;
         let verified_ledger = if wal.is_incremental() {
             Some(Self::verify_incremental_append_wal_target_chain_cold(
@@ -11067,10 +12253,16 @@ mod scrollback_crash_points {
         });
         if ARMED.lock().is_ok_and(|armed| *armed == Some(step)) {
             #[cfg(unix)]
-            let _ = rustix::process::kill_process(
-                rustix::process::getpid(),
-                rustix::process::Signal::KILL,
-            );
+            {
+                let _ = rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::KILL,
+                );
+                // A SIGKILL sent to this process can take effect after kill
+                // returns (macOS under load). An immediate abort() then won
+                // the race and the child died of SIGABRT, so wait for it.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
             std::process::abort();
         }
     }
@@ -11472,6 +12664,21 @@ pub mod scrollback_record_bench {
                 .sum();
             super::SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(None));
             bytes
+        }
+
+        /// The decode-charge check the writer runs on every clustered row
+        /// before sealing it as schema 3 (it walks the row's cells), over
+        /// the rows in clustered storage. Returns the sum of the charges.
+        #[must_use]
+        pub fn charge_clustered(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .filter(|line| line.has_clustered_storage())
+                .map(|line| {
+                    super::clustered_scrollback_decoded_charge(line, 0)
+                        .expect("bench clustered row charges")
+                })
+                .sum()
         }
 
         /// Each row's exact plaintext, as the writer compresses it.
@@ -11923,6 +13130,84 @@ pub mod scrollback_record_bench {
         }
     }
 
+    /// A live durable scrollback store written as the durability writer
+    /// writes it (ft-y0gy9): commit windows of a pane's rows under a
+    /// retention, so every window past the retention evicts, with the tail
+    /// published every few windows. For the writer's whole CPU per row:
+    /// encoding, sealing, the chain, eviction reads, appends, publications.
+    pub struct WriterStore {
+        sink: super::LiveScrollbackSpillSink,
+        retention: usize,
+        publish_every: usize,
+        next_row: usize,
+        windows: usize,
+    }
+
+    impl WriterStore {
+        /// The store, in `dir`, which must outlive it, holding row 0 under a
+        /// retention of `retention` rows, publishing every `publish_every`
+        /// windows (the production cadence is 1 s; this is deterministic).
+        #[must_use]
+        pub fn open(
+            dir: &std::path::Path,
+            rows: &Rows,
+            retention: usize,
+            publish_every: usize,
+        ) -> Self {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let sink = super::LiveScrollbackSpillSink::open(
+                dir.to_path_buf(),
+                &config::ScrollbackSpillSinkContext {
+                    pane_id: 1,
+                    domain_id: 1,
+                    durable_pane_id: [0x5b; 16],
+                    command_description: "scrollback-writer-bench".to_string(),
+                },
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("bench durable scrollback store");
+            assert!(
+                sink.store_scrollback_line(0, &rows.0[0], retention),
+                "bench first row"
+            );
+            Self {
+                sink,
+                retention,
+                publish_every: publish_every.max(1),
+                next_row: 1,
+                windows: 0,
+            }
+        }
+
+        /// Store `rows` as the next window, at the next stable rows, and
+        /// publish the tail when the cadence is due. Returns the rows stored.
+        pub fn store_window(&mut self, rows: &Rows) -> usize {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let mut stored = 0;
+            while stored < rows.0.len() {
+                let committed = self.sink.store_scrollback_lines(
+                    (self.next_row + stored) as isize,
+                    &rows.0[stored..],
+                    self.retention,
+                );
+                assert!(
+                    committed > 0,
+                    "bench window at row {}",
+                    self.next_row + stored
+                );
+                stored += committed;
+            }
+            self.next_row += stored;
+            self.windows += 1;
+            if self.windows % self.publish_every == 0 {
+                self.sink.flush_scrollback().expect("bench tail publishes");
+            }
+            stored
+        }
+    }
+
     /// A live durable scrollback store holding `rows` from stable row 0, as
     /// a pane's scrollback reaches it: row 0 alone, then commit windows
     /// from `FIRST_SEGMENT_ROW`, then published. For cold reads through the
@@ -12301,8 +13586,12 @@ pub mod scrollback_record_bench {
 }
 
 /// The zstd level each exact row's frame is written at when no override
-/// names one (ft-y0gy9).
-const EXACT_SCROLLBACK_ROW_ZSTD_LEVEL: i32 = 1;
+/// names one (ft-y0gy9). Level -1 leaves literals raw. On T0 rows (bench
+/// scrollback_writer, 4096 rows) it compressed in 7.5 ms where level 1
+/// took 24.0 ms, and its payloads were 0.933 of the plaintext where level
+/// 1's were 0.777. Rows under 256 bytes are never compressed.
+/// FT_SCROLLBACK_ROW_ZSTD_LEVEL=1 restores level 1.
+const EXACT_SCROLLBACK_ROW_ZSTD_LEVEL: i32 = -1;
 
 /// The zstd level of each exact row's own frame: FT_SCROLLBACK_ROW_ZSTD_LEVEL
 /// when it names one in -7..=3, otherwise `EXACT_SCROLLBACK_ROW_ZSTD_LEVEL`,
@@ -12452,7 +13741,24 @@ fn serialize_exact_semantic_scrollback_line_into(
     line: &wezterm_term::Line,
     out: &mut Vec<u8>,
 ) -> bool {
+    serialize_exact_semantic_scrollback_line_into_with(
+        line,
+        out,
+        IMAGE_SCROLLBACK_ROWS.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// `serialize_exact_semantic_scrollback_line_into`, sealing a row showing
+/// images as schema 4 exactly when `image_rows`.
+fn serialize_exact_semantic_scrollback_line_into_with(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+    image_rows: bool,
+) -> bool {
     wipe_scrollback_plaintext(out);
+    if image_rows && line.has_image_attachments() {
+        return serialize_image_semantic_scrollback_line_into(line, out);
+    }
     #[cfg(test)]
     let clustered = line.has_clustered_storage() && !FORCE_CELL_SCHEMAS.with(std::cell::Cell::get);
     #[cfg(not(test))]
@@ -12612,6 +13918,33 @@ fn clustered_scrollback_decoded_charge(
     if !line.has_clustered_storage() || line.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
         return None;
     }
+    // A row of single-width printable ASCII passes every check below by
+    // construction, and the cells of one attribute run share their
+    // attributes, so each run is charged at once. The per-cell walk was 16%
+    // of the durability writer's time in a flood (ft-yccm0.2.1.8). Same
+    // result as the walk (clustered_decoded_charge_shortcut_matches_the_cell_walk).
+    if let Some(runs) = line.single_width_ascii_runs() {
+        let mut charge = plaintext_bytes;
+        for (cells, attrs) in runs {
+            // The walk never visits a run with no cells, so neither do we.
+            if cells == 0 {
+                continue;
+            }
+            let materialized = std::mem::size_of::<termwiz::cell::Cell>()
+                .checked_add(attrs.snapshot_clone_heap_bytes()?)?;
+            charge = charge.checked_add(materialized.checked_mul(cells)?)?;
+        }
+        return Some(charge);
+    }
+    clustered_scrollback_decoded_charge_by_cell(line, plaintext_bytes)
+}
+
+/// [`clustered_scrollback_decoded_charge`] cell by cell, for any clustered
+/// row within the length limit.
+fn clustered_scrollback_decoded_charge_by_cell(
+    line: &wezterm_term::Line,
+    plaintext_bytes: usize,
+) -> Option<usize> {
     let mut charge = plaintext_bytes;
     let mut columns = 0usize;
     let mut text_bytes = 0usize;
@@ -12671,6 +14004,207 @@ struct ExactSemanticScrollbackLineV1 {
     schema: u32,
     line: wezterm_term::Line,
     cell_widths: Vec<u8>,
+}
+
+/// Schema 4's sidecar, after its `ExactSemanticScrollbackLineV1`: the image
+/// objects the row shows, each once, and its cells' image layers, cell by
+/// cell, each cell's in its z-index order.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactScrollbackRowImagesV1 {
+    images: Vec<termwiz::image::ImageData>,
+    layers: Vec<ExactScrollbackImageLayerV1>,
+}
+
+/// `ExactScrollbackRowImagesV1` over borrowed images: the same bytes.
+#[derive(Serialize)]
+struct ExactScrollbackRowImagesRef<'a> {
+    images: Vec<&'a termwiz::image::ImageData>,
+    layers: &'a [ExactScrollbackImageLayerV1],
+}
+
+/// One image a cell shows: a region of the row's `image`th object, as
+/// `ImageCell` holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactScrollbackImageLayerV1 {
+    cell: u32,
+    image: u32,
+    top_left: termwiz::image::TextureCoordinate,
+    bottom_right: termwiz::image::TextureCoordinate,
+    z_index: i32,
+    padding: (u16, u16, u16, u16),
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+}
+
+/// Schema 4 for a row showing images, written into `out`; false, with `out`
+/// wiped, for a row it cannot seal.
+fn serialize_image_semantic_scrollback_line_into(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+) -> bool {
+    let mut stripped = line.clone();
+    let cells = stripped.cells_mut();
+    if cells.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+        return false;
+    }
+    let mut cell_widths = Vec::new();
+    if cell_widths.try_reserve_exact(cells.len()).is_err() {
+        return false;
+    }
+    let mut images: Vec<Arc<termwiz::image::ImageData>> = Vec::new();
+    let mut entries = std::collections::HashMap::new();
+    let mut layers = Vec::new();
+    for (index, cell) in cells.iter_mut().enumerate() {
+        let Ok(width) = u8::try_from(cell.width()) else {
+            return false;
+        };
+        if !matches!(width, 1 | 2) {
+            return false;
+        }
+        cell_widths.push(width);
+        let Some(shown) = cell.attrs().images() else {
+            continue;
+        };
+        let Ok(cell_index) = u32::try_from(index) else {
+            return false;
+        };
+        for image in shown {
+            let data = image.image_data();
+            let key = Arc::as_ptr(data) as usize;
+            let entry = match entries.get(&key) {
+                Some(entry) => *entry,
+                None => {
+                    let Ok(entry) = u32::try_from(images.len()) else {
+                        return false;
+                    };
+                    images.push(Arc::clone(data));
+                    entries.insert(key, entry);
+                    entry
+                }
+            };
+            layers.push(ExactScrollbackImageLayerV1 {
+                cell: cell_index,
+                image: entry,
+                top_left: image.top_left(),
+                bottom_right: image.bottom_right(),
+                z_index: image.z_index(),
+                padding: image.padding(),
+                image_id: image.image_id(),
+                placement_id: image.placement_id(),
+            });
+        }
+        cell.attrs_mut().clear_images();
+    }
+    let semantic = ExactSemanticScrollbackLineV1 {
+        schema: EXACT_SCROLLBACK_SCHEMA_IMAGES,
+        line: stripped,
+        cell_widths,
+    };
+    let sidecar = ExactScrollbackRowImagesRef {
+        images: images.iter().map(AsRef::as_ref).collect(),
+        layers: &layers,
+    };
+    serialize_semantic_scrollback_payload_into(&semantic, out)
+        && serialize_semantic_scrollback_payload_into(&sidecar, out)
+}
+
+/// Live images decoded rows may share, by content hash: at most this many.
+const ROW_IMAGE_INTERN_ENTRIES: usize = 64;
+
+std::thread_local! {
+    static ROW_IMAGE_INTERN: std::cell::RefCell<Vec<([u8; 32], std::sync::Weak<termwiz::image::ImageData>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Each durable row of a picture holds its own copy (ft-nyofz), so a picture
+/// across 16 rows decoded into 16 allocations, held as long as the rows were.
+/// Rows decoded on one thread share one object per content hash while any of
+/// them holds it, as a live picture's cells share one.
+fn intern_row_image(image: termwiz::image::ImageData) -> Arc<termwiz::image::ImageData> {
+    let hash = image.hash();
+    ROW_IMAGE_INTERN.with(|table| {
+        let mut table = table.borrow_mut();
+        table.retain(|(_, live)| live.strong_count() > 0);
+        if let Some(shared) = table
+            .iter()
+            .find(|(known, _)| *known == hash)
+            .and_then(|(_, live)| live.upgrade())
+        {
+            return shared;
+        }
+        let shared = Arc::new(image);
+        if table.len() >= ROW_IMAGE_INTERN_ENTRIES {
+            table.remove(0);
+        }
+        table.push((hash, Arc::downgrade(&shared)));
+        shared
+    })
+}
+
+/// Attach schema 4's images to the cells of its decoded row.
+fn attach_exact_scrollback_row_images(
+    line: &mut wezterm_term::Line,
+    sidecar: ExactScrollbackRowImagesV1,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !line.has_image_attachments() && !sidecar.layers.is_empty(),
+        "an image scrollback row shows its images only through its layers"
+    );
+    let images: Vec<Arc<termwiz::image::ImageData>> =
+        sidecar.images.into_iter().map(intern_row_image).collect();
+    let mut named = vec![false; images.len()];
+    let cells = line.cells_mut();
+    let mut layers = sidecar.layers.into_iter().peekable();
+    let mut previous_cell = None;
+    while let Some(first) = layers.next() {
+        anyhow::ensure!(
+            previous_cell.is_none_or(|previous| previous < first.cell),
+            "image scrollback row layers are grouped cell by cell, in cell order"
+        );
+        previous_cell = Some(first.cell);
+        let cell = first.cell;
+        let mut shown = vec![first];
+        while let Some(next) = layers.next_if(|layer| layer.cell == cell) {
+            shown.push(next);
+        }
+        anyhow::ensure!(
+            shown
+                .windows(2)
+                .all(|pair| pair[0].z_index <= pair[1].z_index),
+            "a cell's image layers are in z-index order"
+        );
+        let mut attached = Vec::with_capacity(shown.len());
+        for layer in shown {
+            let data = images
+                .get(layer.image as usize)
+                .ok_or_else(|| anyhow::anyhow!("an image layer names no image of its row"))?;
+            named[layer.image as usize] = true;
+            let (left, top, right, bottom) = layer.padding;
+            attached.push(Box::new(termwiz::image::ImageCell::with_z_index(
+                layer.top_left,
+                layer.bottom_right,
+                Arc::clone(data),
+                layer.z_index,
+                left,
+                top,
+                right,
+                bottom,
+                layer.image_id,
+                layer.placement_id,
+            )));
+        }
+        let target = cells
+            .get_mut(cell as usize)
+            .ok_or_else(|| anyhow::anyhow!("an image layer names no cell of its row"))?;
+        target.attrs_mut().set_images(attached);
+    }
+    anyhow::ensure!(
+        named.iter().all(|named| *named),
+        "every image of an image scrollback row is shown"
+    );
+    Ok(())
 }
 
 /// `ExactSemanticScrollbackLineV1` over a borrowed row and sidecar: the same
@@ -13348,12 +14882,22 @@ fn decode_exact_semantic_scrollback_plaintext(
     let mut semantic: ExactSemanticScrollbackLineV1 =
         codec::bounded_varbincode_deserialize(&mut reader)
             .context("bounded decode of semantic scrollback row")?;
+    let images = if semantic.schema == EXACT_SCROLLBACK_SCHEMA_IMAGES {
+        let images: ExactScrollbackRowImagesV1 = codec::bounded_varbincode_deserialize(&mut reader)
+            .context("bounded decode of semantic scrollback row images")?;
+        Some(images)
+    } else {
+        None
+    };
     anyhow::ensure!(
         reader.is_empty(),
         "semantic scrollback row contains trailing plaintext"
     );
     anyhow::ensure!(
-        matches!(semantic.schema, 1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED),
+        matches!(
+            semantic.schema,
+            1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED | EXACT_SCROLLBACK_SCHEMA_IMAGES
+        ),
         "unsupported semantic scrollback row schema"
     );
     if semantic.schema == EXACT_SCROLLBACK_SCHEMA_CLUSTERED {
@@ -13403,6 +14947,9 @@ fn decode_exact_semantic_scrollback_plaintext(
             cell.attrs().clone(),
         );
         *cell = restored;
+    }
+    if let Some(images) = images {
+        attach_exact_scrollback_row_images(&mut semantic.line, images)?;
     }
     Ok((
         semantic.line,
@@ -14050,8 +15597,12 @@ impl LiveScrollbackSpillSink {
     /// the tail is near the bounds one cumulative WAL may name.
     fn publication_due(&self, published: &LiveScrollbackPublishedPrefix, live_next: u64) -> bool {
         let tail_rows = live_next.saturating_sub(published.authority.next_sequence);
+        #[cfg(not(test))]
+        let byte_threshold = LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2;
+        #[cfg(test)]
+        let byte_threshold = LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD.with(std::cell::Cell::get);
         tail_rows >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS / 2
-            || published.tail_record_bytes >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2
+            || published.tail_record_bytes >= byte_threshold
             || self
                 .last_publication
                 .lock()
@@ -14228,10 +15779,11 @@ impl LiveScrollbackSpillSink {
                 live.content_epoch,
                 published.revision,
             ));
-        live.published = Some(LiveScrollbackPublishedPrefix {
+        let published = LiveScrollbackPublishedPrefix {
             tail_record_bytes,
             ..published
-        });
+        };
+        live.published = Some(published);
         *state = live;
         drop(state);
         log::debug!(
@@ -14341,13 +15893,14 @@ impl LiveScrollbackSpillSink {
             if let Some(oldest) = target.oldest_sequence {
                 // The segment holding the oldest row stays readable whole.
                 let keep_from = store_segment_keep_from(&store, ledger_pane_id, oldest)?;
-                store.prune_before_keeping(ledger_pane_id, oldest, keep_from)?;
+                store.prune_before(ledger_pane_id, oldest)?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("retention_pruned");
                 store.compact_pane_if_stale_keeping(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
                     keep_from,
+                    Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
                 )?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("compacted");
@@ -14400,10 +15953,10 @@ impl LiveScrollbackSpillSink {
 
     /// Store `lines` and count the durability syncs that took. `gap` is the
     /// (rows, bytes) a single gap-marker row stands for (ft-yccm0.2.1.6).
-    fn store_scrollback_rows(
+    fn store_scrollback_rows<L: std::borrow::Borrow<wezterm_term::Line>>(
         &self,
         stable_row: wezterm_term::StableRowIndex,
-        lines: &[wezterm_term::Line],
+        lines: &[L],
         max_retained_rows: usize,
         gap: Option<(u64, u64)>,
     ) -> usize {
@@ -14423,15 +15976,18 @@ impl LiveScrollbackSpillSink {
         if committed { committed_rows } else { 0 }
     }
 
-    fn store_scrollback_lines_transaction(
+    fn store_scrollback_lines_transaction<L: std::borrow::Borrow<wezterm_term::Line>>(
         &self,
         stable_row: wezterm_term::StableRowIndex,
-        lines: &[wezterm_term::Line],
+        lines: &[L],
         max_retained_rows: usize,
         gap: Option<(u64, u64)>,
         committed_rows: &mut usize,
     ) -> bool {
-        let Some(line) = lines.first() else {
+        let Some(line) = lines
+            .first()
+            .map(std::borrow::Borrow::<wezterm_term::Line>::borrow)
+        else {
             return false;
         };
         if lines.len() > LIVE_SCROLLBACK_WINDOW_MAX_ROWS || (gap.is_some() && lines.len() != 1) {
@@ -14766,7 +16322,12 @@ impl LiveScrollbackSpillSink {
             // ft-yccm0.2.1.4 option A: compact rows go into the open segment,
             // sealed by one AEAD operation when full and at the batch's end.
             let mut segment_first = None;
-            for (offset, line) in lines.iter().take(batch_rows).enumerate() {
+            for (offset, line) in lines
+                .iter()
+                .map(std::borrow::Borrow::<wezterm_term::Line>::borrow)
+                .take(batch_rows)
+                .enumerate()
+            {
                 let Some(row) = wezterm_term::StableRowIndex::try_from(offset)
                     .ok()
                     .and_then(|offset| stable_row.checked_add(offset))
@@ -15081,13 +16642,14 @@ impl LiveScrollbackSpillSink {
                     .ok_or_else(|| anyhow::anyhow!("scrollback retention cut overflows"))?;
                 // The segment holding the oldest row stays readable whole.
                 let keep_from = store_segment_keep_from(&store, ledger_pane_id, prune_before_seq)?;
-                store.prune_before_keeping(ledger_pane_id, prune_before_seq, keep_from)?;
+                store.prune_before(ledger_pane_id, prune_before_seq)?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("retention_pruned");
                 store.compact_pane_if_stale_keeping(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
                     keep_from,
+                    Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
                 )?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("compacted");
@@ -15168,6 +16730,17 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         &self,
         stable_row: wezterm_term::StableRowIndex,
         lines: &[wezterm_term::Line],
+        max_retained_rows: usize,
+    ) -> usize {
+        self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
+    }
+
+    /// The same transaction over the caller's shared rows, encoded where they
+    /// are, without cloning each row first (ft-y0gy9).
+    fn store_scrollback_shared_lines(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        lines: &[Arc<wezterm_term::Line>],
         max_retained_rows: usize,
     ) -> usize {
         self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
@@ -15644,6 +17217,110 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         wezterm_term::config::ScrollbackReplaceCommit,
         wezterm_term::config::ScrollbackSpillError,
     > {
+        self.replace_scrollback_prefix_with(expected_generation, None, prefix, max_retained_rows)
+    }
+
+    fn replace_scrollback_prefix_superseding(
+        &self,
+        ancestry: wezterm_term::config::ScrollbackAncestry,
+        prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<
+        wezterm_term::config::ScrollbackReplaceCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        self.replace_scrollback_prefix_with(
+            Some(ancestry.ancestor),
+            Some(ancestry),
+            prefix,
+            max_retained_rows,
+        )
+    }
+
+    fn clear_scrollback(
+        &self,
+    ) -> Result<
+        wezterm_term::config::ScrollbackClearCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
+
+        let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
+        let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
+        self.forget_cold_segment();
+        let ledger_pane_id = self.active_ledger_pane_id();
+        let current_state = *self.lock_state("clear_scrollback current state")?;
+        if current_state.transaction_quarantined {
+            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+        }
+        self.verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)?;
+        self.advance_authenticated_append_wal_supersession()
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        // Prove the physical store is available before publishing a logical
+        // clear. Holding this guard through publication also prevents a clear
+        // manifest from becoming durable after store-lock poisoning has made
+        // reclamation impossible to even attempt.
+        let mut store = self.lock_store("clear_scrollback store availability")?;
+        let (previous, clear_generation) = {
+            let mut state = self.lock_state("clear_scrollback state reset")?;
+            let previous = *state;
+            *state = self.clear_successor_state(&previous, ledger_pane_id);
+            (previous, state.snapshot_generation())
+        };
+        // Publish the clear intent before truncating the content log. If the
+        // process dies between these operations, constructor recovery observes
+        // `cleared` and completes the idempotent clear before accepting data.
+        if let Err(error) = self.persist_manifest("cleared") {
+            if error.outcome_indeterminate() {
+                if let Ok(mut state) = self.lock_state("clear_scrollback quarantine publication") {
+                    state.transaction_quarantined = true;
+                }
+                log::error!("scrollback clear publication outcome is indeterminate");
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            *self.lock_state("clear_scrollback manifest rollback")? = previous;
+            log::error!("failed to publish scrollback clear intent");
+            return Err(ScrollbackSpillError::StorageUnavailable);
+        }
+        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred append WAL supersession acknowledgement after committed scrollback clear: {error:#}"
+            );
+        }
+        let physical_reclaimed = store.clear_pane(ledger_pane_id).is_ok();
+        drop(store);
+        if physical_reclaimed {
+            if let Ok(mut state) = self.lock_state("clear_scrollback physical completion") {
+                state.clear_pending_physical_reclamation = false;
+            } else {
+                log::error!("scrollback state unavailable after committed physical clear");
+            }
+        } else {
+            // The `cleared` manifest is already durable, so the logical clear
+            // is committed. Keep the old bytes unreachable and retry their
+            // physical reclamation before accepting a later row.
+            log::error!("deferred physical reclamation after committed scrollback clear");
+        }
+        Ok(ScrollbackClearCommit::new(clear_generation))
+    }
+}
+
+impl LiveScrollbackSpillSink {
+    /// The compare-and-swap behind both replacement entry points. With
+    /// `supersede`, the published generation is accepted when the ancestry
+    /// admits it (the ancestor's epoch at a revision no older than its, or a
+    /// later epoch after a clear the caller replayed), and it becomes the
+    /// predecessor the successor manifest names.
+    fn replace_scrollback_prefix_with(
+        &self,
+        expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+        supersede: Option<wezterm_term::config::ScrollbackAncestry>,
+        prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<
+        wezterm_term::config::ScrollbackReplaceCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
         use wezterm_term::config::{
             ScrollbackReplaceCommit, ScrollbackSnapshotGeneration, ScrollbackSpillError,
         };
@@ -15680,6 +17357,20 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         } else {
             self.lock_store("replace_scrollback_prefix CAS rows")?
                 .line_count(previous_ledger_pane_id)
+        };
+        // Superseding: rows this lineage gained after the ancestor (tail
+        // windows a dead writer committed, adopted on reopen, or a clear it
+        // published) are replaced under this same mutation boundary, never
+        // merged.
+        let expected_generation = match supersede {
+            Some(ancestry) => {
+                let published = previous_state.snapshot_generation();
+                if !ancestry.admits(published) {
+                    return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
+                }
+                Some(published)
+            }
+            None => expected_generation,
         };
         let successor_generation = match expected_generation {
             Some(expected) => {
@@ -15794,7 +17485,19 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                 max_retained_rows,
                 LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES,
             )
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            .map_err(|error| {
+                log::error!(
+                    "staging the replacement scrollback ledger beside {} failed: {error}",
+                    self.manifest_path.display()
+                );
+                ScrollbackSpillError::StorageUnavailable
+            })?;
+        if staged.set_aside_interrupted() {
+            log::warn!(
+                "set aside an interrupted attempt at this scrollback replacement beside {} and staged it again",
+                self.manifest_path.display()
+            );
+        }
         if staged.record_count() != row_count || staged.committed_bytes() != committed_record_bytes
         {
             return Err(ScrollbackSpillError::StorageUnavailable);
@@ -15995,73 +17698,6 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             prefix.oldest_stable_row(),
             prefix.newest_stable_row_exclusive(),
         ))
-    }
-
-    fn clear_scrollback(
-        &self,
-    ) -> Result<
-        wezterm_term::config::ScrollbackClearCommit,
-        wezterm_term::config::ScrollbackSpillError,
-    > {
-        use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
-
-        let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
-        let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
-        self.forget_cold_segment();
-        let ledger_pane_id = self.active_ledger_pane_id();
-        let current_state = *self.lock_state("clear_scrollback current state")?;
-        if current_state.transaction_quarantined {
-            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-        }
-        self.verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)?;
-        self.advance_authenticated_append_wal_supersession()
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        // Prove the physical store is available before publishing a logical
-        // clear. Holding this guard through publication also prevents a clear
-        // manifest from becoming durable after store-lock poisoning has made
-        // reclamation impossible to even attempt.
-        let mut store = self.lock_store("clear_scrollback store availability")?;
-        let (previous, clear_generation) = {
-            let mut state = self.lock_state("clear_scrollback state reset")?;
-            let previous = *state;
-            *state = self.clear_successor_state(&previous, ledger_pane_id);
-            (previous, state.snapshot_generation())
-        };
-        // Publish the clear intent before truncating the content log. If the
-        // process dies between these operations, constructor recovery observes
-        // `cleared` and completes the idempotent clear before accepting data.
-        if let Err(error) = self.persist_manifest("cleared") {
-            if error.outcome_indeterminate() {
-                if let Ok(mut state) = self.lock_state("clear_scrollback quarantine publication") {
-                    state.transaction_quarantined = true;
-                }
-                log::error!("scrollback clear publication outcome is indeterminate");
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            *self.lock_state("clear_scrollback manifest rollback")? = previous;
-            log::error!("failed to publish scrollback clear intent");
-            return Err(ScrollbackSpillError::StorageUnavailable);
-        }
-        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
-            log::warn!(
-                "deferred append WAL supersession acknowledgement after committed scrollback clear: {error:#}"
-            );
-        }
-        let physical_reclaimed = store.clear_pane(ledger_pane_id).is_ok();
-        drop(store);
-        if physical_reclaimed {
-            if let Ok(mut state) = self.lock_state("clear_scrollback physical completion") {
-                state.clear_pending_physical_reclamation = false;
-            } else {
-                log::error!("scrollback state unavailable after committed physical clear");
-            }
-        } else {
-            // The `cleared` manifest is already durable, so the logical clear
-            // is committed. Keep the old bytes unreachable and retry their
-            // physical reclamation before accepting a later row.
-            log::error!("deferred physical reclamation after committed scrollback clear");
-        }
-        Ok(ScrollbackClearCommit::new(clear_generation))
     }
 }
 
@@ -16399,7 +18035,7 @@ pub fn list_live_scrollback_panes(
     let mut panes = Vec::with_capacity(pane_paths.len());
     for (durable_pane_id, pane_path) in pane_paths {
         let manifest_path = pane_path.join("manifest.json");
-        let result = (|| -> anyhow::Result<LiveScrollbackManifestV1> {
+        let discover = || -> anyhow::Result<LiveScrollbackManifestV1> {
             let metadata_before = validate_live_scrollback_directory(&pane_path, true)?;
             let manifest_before = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
                 .ok_or_else(|| anyhow::anyhow!("live scrollback manifest is missing"))?;
@@ -16446,13 +18082,16 @@ pub fn list_live_scrollback_panes(
                 } else {
                     None
                 };
-            let manifest_after = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("live scrollback manifest disappeared during discovery")
-                })?;
+            let manifest_after = LiveScrollbackSpillSink::read_manifest(&manifest_path)?.ok_or(
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback manifest disappeared during discovery",
+                ),
+            )?;
             anyhow::ensure!(
                 manifest_before == manifest_after,
-                "live scrollback manifest changed during discovery"
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback manifest changed during discovery"
+                )
             );
             validate_live_scrollback_manifest_identity(
                 &manifest_after,
@@ -16496,10 +18135,34 @@ pub fn list_live_scrollback_panes(
             let metadata_after = std::fs::symlink_metadata(&pane_path)?;
             anyhow::ensure!(
                 !filesystem_metadata_changed(&metadata_before, &metadata_after)?,
-                "live scrollback pane directory changed during discovery"
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback pane directory changed during discovery"
+                )
             );
             Ok(manifest_after)
-        })();
+        };
+        // A busy pane's writer republishes while discovery reads, and a
+        // publication prunes the ledger before it writes the new manifest, so
+        // a refusal can be a race rather than damage. Retry a few times; a
+        // refusal that persists while the manifest kept changing between
+        // attempts is a live writer (changing), and one that persists over
+        // an unchanged manifest is damage (corrupt).
+        let probe = || {
+            LiveScrollbackSpillSink::read_manifest(&manifest_path)
+                .ok()
+                .flatten()
+        };
+        let first_probe = probe();
+        let mut writer_active = false;
+        let mut result = discover();
+        for _ in 0..LIVE_SCROLLBACK_DISCOVERY_RETRIES {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(LIVE_SCROLLBACK_DISCOVERY_RETRY_PAUSE);
+            writer_active |= first_probe.is_none() || probe() != first_probe;
+            result = discover();
+        }
         match result {
             Ok(manifest) => panes.push(LiveScrollbackDurablePane {
                 durable_pane_id,
@@ -16515,7 +18178,12 @@ pub fn list_live_scrollback_panes(
             }),
             Err(error) => panes.push(LiveScrollbackDurablePane {
                 durable_pane_id,
-                state: "corrupt".to_string(),
+                state: if writer_active || live_scrollback_discovery_raced_writer(&error) {
+                    "changing"
+                } else {
+                    "corrupt"
+                }
+                .to_string(),
                 source_pane_id: None,
                 source_domain_id: None,
                 command_description: None,
@@ -17717,6 +19385,52 @@ mod tests {
         }
     }
 
+    /// ft-y0gy9: a live sink stores shared rows as it stores the same rows
+    /// owned: the same acknowledgements window by window, the same retained
+    /// rows and record bytes, and the same rows read back.
+    #[test]
+    fn shared_rows_store_and_read_back_as_owned_rows_do() {
+        let rows = scrollback_record_bench::Rows::t0_corpus(600, 3);
+        let lines = rows.lines();
+        let shared: Vec<Arc<Line>> = lines.iter().cloned().map(Arc::new).collect();
+        let owned_dir = tempfile::tempdir().unwrap();
+        let shared_dir = tempfile::tempdir().unwrap();
+        let owned_sink = windowed_test_sink(owned_dir.path());
+        let shared_sink = windowed_test_sink(shared_dir.path());
+        assert!(owned_sink.store_scrollback_line(0, &lines[0], 4096));
+        assert_eq!(
+            shared_sink.store_scrollback_shared_lines(0, &shared[..1], 4096),
+            1
+        );
+        let mut row = 1;
+        while row < lines.len() {
+            let end = (row + 256).min(lines.len());
+            let owned = owned_sink.store_scrollback_lines(row as isize, &lines[row..end], 4096);
+            let via_shared =
+                shared_sink.store_scrollback_shared_lines(row as isize, &shared[row..end], 4096);
+            assert_eq!(owned, via_shared, "window at row {row}");
+            assert!(owned > 0, "window at row {row}");
+            row += owned;
+        }
+        owned_sink.flush_scrollback().unwrap();
+        shared_sink.flush_scrollback().unwrap();
+        assert_eq!(
+            owned_sink.retained_scrollback_rows(),
+            shared_sink.retained_scrollback_rows()
+        );
+        assert_eq!(
+            owned_sink.retained_scrollback_bytes(),
+            shared_sink.retained_scrollback_bytes()
+        );
+        for probe in [0_usize, 1, 299, 599] {
+            let mut expected = lines[probe].clone();
+            let mut from_owned = owned_sink.load_scrollback_line(probe as isize).unwrap();
+            let mut from_shared = shared_sink.load_scrollback_line(probe as isize).unwrap();
+            assert_eq!(from_owned.cells_mut(), expected.cells_mut(), "row {probe}");
+            assert_eq!(from_shared.cells_mut(), expected.cells_mut(), "row {probe}");
+        }
+    }
+
     #[test]
     fn durability_switches_are_on_unless_set_to_zero() {
         use std::ffi::OsStr;
@@ -17826,6 +19540,171 @@ mod tests {
             deferred.clear_scrollback().is_err(),
             "uncertainty requires reopen"
         );
+    }
+
+    /// Guardian restore: the checkpoint pinned the store's generation, then
+    /// the writer kept spilling (every spilled row advances the revision).
+    /// The restored model replayed those rows from the guardian journal, so
+    /// a superseding replacement publishes exactly its prefix over them,
+    /// while the strict compare-and-swap keeps refusing.
+    #[test]
+    fn deferred_scrollback_superseding_replacement_replaces_rows_spilled_after_the_ancestor() {
+        use wezterm_term::config::{
+            ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotGeneration,
+            ScrollbackSnapshotLimits, ScrollbackSpillError,
+        };
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |text: &str| Line::from_text(text, &attrs, 5, None);
+        let strict = |ancestor| ScrollbackAncestry {
+            ancestor,
+            cleared_since: false,
+        };
+        assert!(deferred.store_scrollback_line(10, &row("checkpointed"), 8));
+        let ancestor = deferred
+            .snapshot_scrollback(
+                11,
+                ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap()
+            .generation();
+        assert!(deferred.store_scrollback_line(11, &row("spilled after"), 8));
+        assert!(deferred.store_scrollback_line(12, &row("spilled after too"), 8));
+        deferred.flush_scrollback().unwrap();
+
+        let model = [row("checkpointed"), row("replayed")];
+        let prefix = || ScrollbackPrefix::from_slices(Some(10), 12, &model, &[]).unwrap();
+        assert_eq!(
+            deferred
+                .replace_scrollback_prefix(Some(ancestor), prefix(), 8)
+                .map(|_| ()),
+            Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+            "the strict compare-and-swap refuses an advanced store"
+        );
+        let foreign = ScrollbackSnapshotGeneration::new([0xa5; 16], ancestor.revision());
+        let ahead = ScrollbackSnapshotGeneration::new(ancestor.content_epoch(), u64::MAX - 1);
+        for refused in [foreign, ahead] {
+            assert_eq!(
+                deferred
+                    .replace_scrollback_prefix_superseding(strict(refused), prefix(), 8)
+                    .map(|_| ()),
+                Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+                "only a same-epoch ancestor at or behind the store may be superseded"
+            );
+        }
+        let published = backing
+            .lock_state("superseding regression")
+            .unwrap()
+            .snapshot_generation();
+        assert!(published.revision() > ancestor.revision());
+
+        let receipt = deferred
+            .replace_scrollback_prefix_superseding(strict(ancestor), prefix(), 8)
+            .unwrap();
+        assert_eq!(
+            receipt.generation(),
+            ScrollbackSnapshotGeneration::new(ancestor.content_epoch(), published.revision() + 1),
+            "the successor advances the published generation, not the ancestor"
+        );
+        assert_eq!(
+            (
+                receipt.oldest_stable_row(),
+                receipt.newest_stable_row_exclusive()
+            ),
+            (Some(10), 12)
+        );
+        assert_eq!(deferred.load_scrollback_line(10), Some(row("checkpointed")));
+        assert_eq!(deferred.load_scrollback_line(11), Some(row("replayed")));
+        assert_eq!(
+            deferred.load_scrollback_line(12),
+            None,
+            "no stale tail row survives"
+        );
+        assert_eq!(deferred.retained_scrollback_rows(), 2);
+        assert!(deferred.store_scrollback_line(12, &row("live again"), 8));
+        assert_eq!(deferred.load_scrollback_line(12), Some(row("live again")));
+    }
+
+    /// A restored model that replayed a clear after its checkpoint supersedes
+    /// the store that writer cleared, in whatever epoch it reached since;
+    /// one that replayed none still may not.
+    #[test]
+    fn deferred_scrollback_superseding_replacement_follows_a_replayed_clear() {
+        use wezterm_term::config::{
+            ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotLimits, ScrollbackSpillError,
+        };
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |text: &str| Line::from_text(text, &attrs, 5, None);
+        assert!(deferred.store_scrollback_line(10, &row("checkpointed"), 8));
+        let ancestor = deferred
+            .snapshot_scrollback(
+                11,
+                ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap()
+            .generation();
+        // The writer cleared twice after the checkpoint, with rows reaching
+        // the store in between, so the store sits two epochs past it.
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(20, &row("between clears"), 8));
+        deferred.flush_scrollback().unwrap();
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(30, &row("after the clears"), 8));
+        deferred.flush_scrollback().unwrap();
+        let published = backing
+            .lock_state("superseding across clears")
+            .unwrap()
+            .snapshot_generation();
+        assert_ne!(published.content_epoch(), ancestor.content_epoch());
+
+        let model = [row("replayed after the clears")];
+        let prefix = || ScrollbackPrefix::from_slices(Some(30), 31, &model, &[]).unwrap();
+        assert_eq!(
+            deferred
+                .replace_scrollback_prefix_superseding(
+                    ScrollbackAncestry {
+                        ancestor,
+                        cleared_since: false,
+                    },
+                    prefix(),
+                    8,
+                )
+                .map(|_| ()),
+            Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+            "a model that replayed no clear cannot vouch for another epoch"
+        );
+        let receipt = deferred
+            .replace_scrollback_prefix_superseding(
+                ScrollbackAncestry {
+                    ancestor,
+                    cleared_since: true,
+                },
+                prefix(),
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.generation().content_epoch(),
+            published.content_epoch()
+        );
+        assert_eq!(receipt.generation().revision(), published.revision() + 1);
+        assert_eq!(
+            deferred.load_scrollback_line(30),
+            Some(row("replayed after the clears"))
+        );
+        assert_eq!(deferred.load_scrollback_line(20), None);
+        assert_eq!(deferred.retained_scrollback_rows(), 1);
     }
 
     #[test]
@@ -18184,10 +20063,12 @@ mod tests {
         // queue held, and overflow sheds the oldest queued rows into an
         // explicit gap. The parser never waits, and no row disappears.
         let (_dir, backing, deferred) = deferred_test_sink();
-        let row_bytes = deferred_scrollback::DeferredScrollbackSpillSink::row_charge(
-            &Line::from_text("retained", &CellAttributes::blank(), 0, None),
-        )
-        .unwrap();
+        // Rows spill in the clustered form the screen compresses them to, and
+        // are charged at that size (ft-yccm0.2.1.6).
+        let mut spilled = Line::from_text("retained", &CellAttributes::blank(), 0, None);
+        spilled.compress_for_scrollback();
+        let row_bytes =
+            deferred_scrollback::DeferredScrollbackSpillSink::row_charge(&spilled).unwrap();
         let budget = LIVE_SCROLLBACK_APPEND_MAX_ROWS * row_bytes;
         deferred.set_writer_budget(budget);
         let pane = deferred_test_pane(deferred.clone(), 8192);
@@ -19841,6 +21722,51 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn a_commit_window_crossing_the_byte_threshold_publishes_immediately() {
+        struct RestoreThreshold(u64);
+        impl Drop for RestoreThreshold {
+            fn drop(&mut self) {
+                LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD.with(|limit| limit.set(self.0));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let rows = digest_only_test_lines("publication-byte-frontier", 6);
+        assert!(sink.store_scrollback_line(0, &rows[0], 16));
+        assert_eq!(sink.store_scrollback_lines(1, &rows[1..3], 16), 2);
+        assert_eq!(sink.store_scrollback_lines(3, &rows[3..5], 16), 2);
+        let before = published_manifest(&sink);
+        assert_eq!(before.next_seq, 3);
+        let previous_bytes = sink
+            .lock_state("test byte frontier before final window")
+            .unwrap()
+            .published
+            .unwrap()
+            .tail_record_bytes;
+        let _restore = RestoreThreshold(
+            LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD
+                .with(|limit| limit.replace(previous_bytes + 1)),
+        );
+        // The previous prefix is below the trigger; the next record crosses
+        // it. Passing the old prefix to publication_due strands this window.
+        assert_eq!(sink.store_scrollback_lines(5, &rows[5..], 16), 1);
+        let published = published_manifest(&sink);
+        assert_eq!(published.next_seq, 6);
+        assert!(
+            sink.lock_state("test byte frontier published")
+                .unwrap()
+                .published
+                .is_none()
+        );
+        drop(sink);
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert_rows_read_back_from(&reopened, 0, &rows.iter().collect::<Vec<_>>());
+    }
+
     /// ft-yccm0.2.1.2 AC1/AC2: with a publication cadence, a process's first
     /// batch (which starts its nonce segment) is a single-batch transaction
     /// that publishes; every later commit window appends its rows under
@@ -19961,8 +21887,8 @@ mod tests {
     /// as segments, one AEAD operation each, and retention stays exact. The
     /// oldest retained row here sits inside a segment whose first rows
     /// retention evicted: the store keeps those rows only as the slack that
-    /// authenticates the segment (tests compact on every prune, so the slack
-    /// survives compaction), and they never read back. Every retained row
+    /// authenticates the segment through amortized compaction, and they never
+    /// read back as retained rows. Every retained row
     /// reads back exactly through a cold read, a ranged read, a snapshot and
     /// export, before and after reopen.
     #[test]
@@ -20004,10 +21930,11 @@ mod tests {
             let ledger_pane_id = sink.active_ledger_pane_id();
             let store = sink.lock_store("test segment slack").unwrap();
             assert_eq!(store.oldest_seq(ledger_pane_id), Some(14), "{case}");
-            assert_eq!(
-                store.pruned_tail_start(ledger_pane_id),
-                Some(11),
-                "{case}: the slack is exactly the segment's evicted rows"
+            assert!(
+                store
+                    .pruned_tail_start(ledger_pane_id)
+                    .is_some_and(|first| first <= 11),
+                "{case}: amortized slack still includes every authentication support row"
             );
             let slack = store
                 .lines_range_reaching_pruned(ledger_pane_id, 11..21, 16, 1 << 20)
@@ -20985,6 +22912,72 @@ mod tests {
         }
     }
 
+    /// A busy pane's writer republishes its manifest while `ft session
+    /// list-durable` reads the store. Losing that race is not corruption:
+    /// discovery retries, and a store that keeps changing lists as
+    /// "changing", never "corrupt". The ft-yccm0.2.1.6 native stress receipt
+    /// listed a flooding pane as corrupt on every attempt.
+    #[test]
+    fn listing_a_store_its_writer_keeps_republishing_never_reports_corrupt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const RETENTION: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap(),
+        );
+        let first = Line::from_text("busy", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &first, RETENTION));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (sink, stop) = (Arc::clone(&sink), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                // Each gap marker is its own transaction and publication.
+                let mut row: wezterm_term::StableRowIndex = 1;
+                while !stop.load(Ordering::Acquire) {
+                    let marker = Line::from_text(
+                        &format!(
+                            "[durability gap: 1 rows ({row}..{}), 10 bytes, reason=overload, at_unix_ms=1]",
+                            row + 1
+                        ),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    );
+                    assert!(sink.store_scrollback_gap_marker(row, &marker, RETENTION, 1, 10));
+                    row += 1;
+                }
+                row
+            })
+        };
+        let mut changing = 0;
+        for _ in 0..100 {
+            let panes = list_live_scrollback_panes(dir.path(), 16).unwrap();
+            assert_eq!(panes.len(), 1);
+            match panes[0].state.as_str() {
+                "changing" => changing += 1,
+                "corrupt" => panic!(
+                    "a republished store listed as corrupt: {:?}",
+                    panes[0].error
+                ),
+                _ => {}
+            }
+        }
+        stop.store(true, Ordering::Release);
+        let rows = writer.join().unwrap();
+        assert!(rows > 2, "the writer republished during the listings");
+        eprintln!(
+            "listings that saw a changing store: {changing}/100, markers written: {}",
+            rows - 1
+        );
+        let settled = list_live_scrollback_panes(dir.path(), 16).unwrap();
+        assert!(
+            settled[0].state != "changing" && settled[0].state != "corrupt",
+            "a quiet store lists as written: {:?}",
+            settled[0]
+        );
+    }
+
     #[test]
     fn deferred_scrollback_admission_retains_exact_rows_until_durable_flush() {
         let (_dir, backing, deferred) = deferred_test_sink();
@@ -21560,6 +23553,196 @@ mod tests {
         rows
     }
 
+    /// A row of 80 cells showing slices of one 512x256 RGBA image (512 KiB),
+    /// as Screen hands it over.
+    fn image_row(width: u32, height: u32) -> Line {
+        use termwiz::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let pixels: Vec<u8> = (0..width * height * 4).map(|byte| byte as u8).collect();
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            width, height, pixels,
+        )));
+        let mut line = Line::with_width(80, 1);
+        for column in 0..80 {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_image(Box::new(ImageCell::new(
+                TextureCoordinate::new_f32(column as f32 / 80.0, 0.0),
+                TextureCoordinate::new_f32((column + 1) as f32 / 80.0, 1.0 / 16.0),
+                Arc::clone(&image),
+            )));
+            line.set_cell(column, termwiz::cell::Cell::blank_with_attrs(attrs), 1);
+        }
+        line.compress_for_scrollback();
+        line
+    }
+
+    /// The images each cell of `decoded` shows are `original`'s, field by
+    /// field and byte by byte; returns the distinct objects `decoded` holds.
+    fn assert_same_row_images(original: &Line, decoded: &Line) -> usize {
+        let mut objects = std::collections::HashSet::new();
+        assert_eq!(original.len(), decoded.len());
+        for (left, right) in original.visible_cells().zip(decoded.visible_cells()) {
+            assert_eq!(left.str(), right.str());
+            assert_eq!(left.width(), right.width());
+            assert_eq!(left.attrs(), right.attrs());
+            let (left, right) = (left.attrs().images(), right.attrs().images());
+            assert_eq!(left.is_some(), right.is_some());
+            for (left, right) in left.iter().flatten().zip(right.iter().flatten()) {
+                assert_eq!(left.z_index(), right.z_index());
+                assert_eq!(left.top_left(), right.top_left());
+                assert_eq!(*left.image_data().data(), *right.image_data().data());
+                assert_eq!(
+                    left.image_data().current_content_hash(),
+                    right.image_data().current_content_hash()
+                );
+                objects.insert(Arc::as_ptr(right.image_data()) as usize);
+            }
+        }
+        objects.len()
+    }
+
+    /// A row showing a screenshot seals each image object once as schema 4;
+    /// sealed as the other schemas, every cell repeats the whole image, and
+    /// the row exceeds what any row may hold, so the pane's durability used
+    /// to stall on it. It decodes to the same cells, sharing one object.
+    #[test]
+    fn image_rows_seal_each_image_once_and_decode_exactly() {
+        let line = image_row(512, 256);
+        let mut plaintext = Vec::new();
+        assert!(
+            !serialize_exact_semantic_scrollback_line_into_with(&line, &mut plaintext, false),
+            "without schema 4 the row cannot be sealed"
+        );
+        assert!(serialize_exact_semantic_scrollback_line_into_with(
+            &line,
+            &mut plaintext,
+            true
+        ));
+        assert!(
+            plaintext.len() < 512 * 256 * 4 + 64 * 1024,
+            "{} bytes",
+            plaintext.len()
+        );
+        let (decoded, _, fidelity) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext.clone()),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+        assert_eq!(assert_same_row_images(&line, &decoded), 1);
+        // Another row of the same picture, decoded while this one lives,
+        // shares its image object rather than holding a second copy.
+        let (again, _, _) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext.clone()),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        let first_image = |line: &Line| {
+            line.visible_cells()
+                .find_map(|cell| cell.attrs().images())
+                .and_then(|images| images.first().map(|image| Arc::clone(image.image_data())))
+                .expect("an image cell")
+        };
+        assert!(Arc::ptr_eq(&first_image(&decoded), &first_image(&again)));
+
+        // A row without images seals as before, whatever the switch says.
+        for line in clustered_test_rows() {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            assert!(serialize_exact_semantic_scrollback_line_into_with(
+                &line,
+                &mut before,
+                false
+            ));
+            assert!(serialize_exact_semantic_scrollback_line_into_with(
+                &line, &mut after, true
+            ));
+            assert_eq!(before, after);
+        }
+    }
+
+    /// Two images, overlapping layers in z-index order, and plain text
+    /// round-trip; a layer naming no image of its row fails decoding.
+    #[test]
+    fn image_rows_keep_layers_and_refuse_dangling_ones() {
+        use termwiz::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let image = |seed: u8| {
+            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                4,
+                4,
+                vec![seed; 64],
+            )))
+        };
+        let (under, over) = (image(1), image(2));
+        let mut line = Line::from_text("text then images", &CellAttributes::blank(), 1, None);
+        for column in 10..14 {
+            let mut attrs = CellAttributes::blank();
+            for (z_index, data) in [(-1, &under), (0, &over), (0, &under)] {
+                attrs.attach_image(Box::new(ImageCell::with_z_index(
+                    TextureCoordinate::new_f32(0.0, 0.0),
+                    TextureCoordinate::new_f32(1.0, 1.0),
+                    Arc::clone(data),
+                    z_index,
+                    1,
+                    2,
+                    3,
+                    4,
+                    Some(7),
+                    Some(column as u32),
+                )));
+            }
+            line.set_cell(column, termwiz::cell::Cell::blank_with_attrs(attrs), 1);
+        }
+        line.compress_for_scrollback();
+        let mut plaintext = Vec::new();
+        assert!(serialize_exact_semantic_scrollback_line_into_with(
+            &line,
+            &mut plaintext,
+            true
+        ));
+        let (decoded, _, _) = decode_exact_semantic_scrollback_plaintext(
+            Zeroizing::new(plaintext),
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .unwrap();
+        assert_eq!(assert_same_row_images(&line, &decoded), 2);
+
+        let mut stripped = Line::from_text("x", &CellAttributes::blank(), 1, None);
+        let semantic = ExactSemanticScrollbackLineV1 {
+            schema: EXACT_SCROLLBACK_SCHEMA_IMAGES,
+            cell_widths: vec![1; stripped.cells_mut().len()],
+            line: stripped,
+        };
+        let dangling = [ExactScrollbackImageLayerV1 {
+            cell: 0,
+            image: 0,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            z_index: 0,
+            padding: (0, 0, 0, 0),
+            image_id: None,
+            placement_id: None,
+        }];
+        let mut plaintext = Vec::new();
+        assert!(serialize_semantic_scrollback_payload_into(
+            &semantic,
+            &mut plaintext
+        ));
+        assert!(serialize_semantic_scrollback_payload_into(
+            &ExactScrollbackRowImagesRef {
+                images: Vec::new(),
+                layers: &dangling,
+            },
+            &mut plaintext
+        ));
+        assert!(
+            decode_exact_semantic_scrollback_plaintext(
+                Zeroizing::new(plaintext),
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .is_err()
+        );
+    }
+
     /// ft-yccm0.2.1.4: durable bytes written and syncs per MiB of T0 input,
     /// the cell-vector schemas every row sealed before against schema 3, in
     /// one run. Realistic T0 rows (the M.1 generator through an 80-column
@@ -22055,6 +24238,53 @@ mod tests {
                 > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
         );
         assert_eq!(serialize_exact_semantic_scrollback_line(&line), expected);
+    }
+
+    /// A clustered row with one attribute run per entry of `runs`: its text,
+    /// a palette color (0 = default) and whether it carries a hyperlink.
+    fn clustered_row_with_runs(runs: &[(String, u8, bool)]) -> wezterm_term::Line {
+        let mut cells = Vec::new();
+        for (text, color, link) in runs {
+            let mut attrs = termwiz::cell::CellAttributes::default();
+            if *color > 0 {
+                attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(*color));
+            }
+            if *link {
+                attrs.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(
+                    "https://example.com/run",
+                ))));
+            }
+            cells.extend(
+                text.chars()
+                    .map(|ch| termwiz::cell::Cell::new(ch, attrs.clone())),
+            );
+        }
+        let mut line = wezterm_term::Line::from_cells(cells, 1);
+        line.compress_for_scrollback();
+        line
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.2.1.8: charging a single-width ASCII row per attribute
+        /// run gives what the per-cell walk gives, overflow included.
+        #[test]
+        fn clustered_decoded_charge_shortcut_matches_the_cell_walk(
+            runs in proptest::collection::vec(
+                ("[ -~]{1,30}", 0u8..4, proptest::bool::ANY),
+                1..6,
+            ),
+            plaintext in proptest::prop_oneof![
+                0usize..10_000,
+                proptest::strategy::Just(usize::MAX - 64),
+            ],
+        ) {
+            let line = clustered_row_with_runs(&runs);
+            proptest::prop_assert!(line.single_width_ascii_runs().is_some());
+            proptest::prop_assert_eq!(
+                clustered_scrollback_decoded_charge(&line, plaintext),
+                clustered_scrollback_decoded_charge_by_cell(&line, plaintext)
+            );
+        }
     }
 
     #[test]
@@ -24546,10 +26776,9 @@ mod tests {
         }
 
         assert_eq!(sink.retained_scrollback_rows(), 2);
-        assert_eq!(
-            sink.physical_scrollback_bytes(),
-            sink.retained_scrollback_bytes() as u64,
-            "test-threshold compaction should rewrite the stale prefix away"
+        assert!(
+            sink.physical_scrollback_bytes() <= 2 * sink.retained_scrollback_bytes() as u64 + 64,
+            "amortized compaction bounds stale slack by the retained payload plus bounded headers"
         );
         assert_eq!(sink.oldest_scrollback_row(), Some(2));
         assert!(sink.load_scrollback_line(1).is_none());
@@ -26948,10 +29177,9 @@ mod tests {
         assert_eq!(sink.retained_scrollback_rows(), max_retained_rows);
         let oldest_retained_row = (1024 - max_retained_rows) as wezterm_term::StableRowIndex;
         assert_eq!(sink.oldest_scrollback_row(), Some(oldest_retained_row));
-        assert_eq!(
-            sink.physical_scrollback_bytes(),
-            sink.retained_scrollback_bytes() as u64,
-            "test-threshold compaction should keep physical bytes to retained records"
+        assert!(
+            sink.physical_scrollback_bytes() <= 2 * sink.retained_scrollback_bytes() as u64 + 64,
+            "single-row segments keep at most one retained payload of stale slack plus headers"
         );
         assert!(
             sink.physical_scrollback_bytes() < 256 * 1024,
@@ -28338,16 +30566,22 @@ mod tests {
         ));
 
         // The same Unix entry is still a real connectable client in GUI mode.
-        // Its unsupported recovery policy must continue to refuse capture.
+        // It has no durable recovery policy, so while it hosts no pane the
+        // image leaves it out (a pane in it would refuse the capture).
         update_mux_domains(&handle)?;
         assert!(
             mux.get_domain_by_name("owned-listener")
                 .is_some_and(|domain| domain.is::<ClientDomain>())
         );
-        assert!(matches!(
-            mux.capture_topology_coherent(Default::default()),
-            Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
-        ));
+        let captured = mux.capture_topology_coherent(Default::default())?;
+        assert_eq!(
+            captured
+                .domains
+                .iter()
+                .map(|domain| domain.name.as_str())
+                .collect::<Vec<_>>(),
+            ["guardian"]
+        );
         Ok(())
     }
 

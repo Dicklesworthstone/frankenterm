@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -o errexit -o pipefail -o posix
 
-# Copyright (c) 2019-2024 Cosmin Truta.
-#
-# Use, modification and distribution are subject to the MIT License.
-# Please see the accompanying file LICENSE_MIT.txt
-#
+# Copyright (C) 2019 Cosmin Truta
 # SPDX-License-Identifier: MIT
 
 # shellcheck source=ci/lib/ci.lib.sh
@@ -51,6 +47,7 @@ function ci_trace_build {
     ci_info "environment option: \$CI_LIBS: '$CI_LIBS'"
     ci_info "environment option: \$CI_SANITIZERS: '$CI_SANITIZERS'"
     ci_info "environment option: \$CI_FORCE: '$CI_FORCE'"
+    ci_info "environment option: \$CI_NO_BUILD: '$CI_NO_BUILD'"
     ci_info "environment option: \$CI_NO_TEST: '$CI_NO_TEST'"
     ci_info "environment option: \$CI_NO_CLEAN: '$CI_NO_CLEAN'"
     ci_info "executable: \$CI_MAKE: $(command -V "$CI_MAKE")"
@@ -145,10 +142,12 @@ function ci_build {
     for my_makefile in $CI_MAKEFILES
     do
         ci_info "using makefile: $my_makefile"
-        # Spawn "make".
-        ci_spawn "$CI_MAKE" -f "$my_makefile" \
-                            "${all_make_flags[@]}" \
-                            "${all_make_vars[@]}"
+        ci_expr $((CI_NO_BUILD)) || {
+            # Spawn "make".
+            ci_spawn "$CI_MAKE" -f "$my_makefile" \
+                                "${all_make_flags[@]}" \
+                                "${all_make_vars[@]}"
+        }
         ci_expr $((CI_NO_TEST)) || {
             # Spawn "make test" if testing is not disabled.
             ci_spawn "$CI_MAKE" -f "$my_makefile" \

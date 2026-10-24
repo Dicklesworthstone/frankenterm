@@ -1275,7 +1275,10 @@ impl SuggestionRule for AccountLowRule {
                 self.id(),
             )
             .with_priority(Priority::High)
-            .with_action(SuggestedAction::new("Switch account", "ft accounts switch")),
+            .with_action(SuggestedAction::new(
+                "Preview next account",
+                format!("ft accounts --service {} --pick", account.service),
+            )),
         )
     }
 
@@ -1372,7 +1375,7 @@ impl SuggestionRule for FirstWorkflowRule {
             .with_priority(Priority::Low)
             .with_action(SuggestedAction::new(
                 "Preview workflow",
-                format!("ft workflow run \"{workflow}\" --dry-run"),
+                format!("ft workflow run \"{workflow}\" --pane <pane-id> --dry-run"),
             ))
             .with_dismissable(true),
         )
@@ -1402,15 +1405,24 @@ impl SuggestionRule for ErrorRecoveryRule {
             .filter(|e| is_error_event(e))
             .max_by_key(|e| e.detected_at)?;
         let code = error_code_from_event(event);
+        // ft why explains FT-xxxx codes; a detection rule explains itself;
+        // anything else is best read from the pane's events.
+        let command = if code.starts_with("FT-") {
+            format!("ft why {code}")
+        } else if !event.rule_id.is_empty() {
+            format!("ft rules show {}", event.rule_id)
+        } else {
+            format!("ft events --pane-id {}", event.pane_id)
+        };
         Some(
             Suggestion::new(
                 format!("error_recovery:{code}"),
                 SuggestionType::Recovery,
-                format!("Error {code} occurred. Run `ft why {code}` to understand what happened and how to fix it."),
+                format!("Error {code} occurred. Run `{command}` to understand what happened and how to fix it."),
                 self.id(),
             )
             .with_priority(Priority::High)
-            .with_action(SuggestedAction::new("Explain error", format!("ft why {code}"))),
+            .with_action(SuggestedAction::new("Explain error", command)),
         )
     }
 
@@ -1589,8 +1601,8 @@ impl SuggestionRule for AltScreenWarningRule {
             )
             .with_priority(Priority::High)
             .with_action(SuggestedAction::new(
-                "Check pane state",
-                format!("ft robot state --pane {}", pane_ids[0]),
+                "See what the pane is showing",
+                format!("ft get-text {} --tail 20", pane_ids[0]),
             )),
         )
     }
@@ -2269,13 +2281,20 @@ mod tests {
     fn test_account_low_rule_triggers() {
         let rule = AccountLowRule::default();
         let mut ctx = SuggestionContext::new();
-        ctx.add_account(make_account("acct-1", 10.0));
+        let mut account = make_account("acct-1", 10.0);
+        account.service = "anthropic".to_string();
+        ctx.add_account(account);
 
         assert!(rule.applies(&ctx));
         let suggestion = rule.generate(&ctx).expect("expected suggestion");
         assert_eq!(suggestion.suggestion_type, SuggestionType::Warning);
         assert!(suggestion.message.contains("10"));
-        assert!(suggestion.action.is_some());
+        // The CLI defaults --service to openai, so the preview must name the
+        // low account's own service.
+        assert_eq!(
+            suggestion.action.expect("action").command,
+            "ft accounts --service anthropic --pick"
+        );
     }
 
     #[test]
@@ -2325,6 +2344,30 @@ mod tests {
         let suggestion = rule.generate(&ctx).expect("expected suggestion");
         assert_eq!(suggestion.suggestion_type, SuggestionType::Recovery);
         assert!(suggestion.message.contains("FT-4001"));
+        assert_eq!(
+            suggestion
+                .action
+                .as_ref()
+                .map(|action| action.command.as_str()),
+            Some("ft why FT-4001")
+        );
+
+        // Without an FT code, the detection rule explains itself.
+        let mut ctx = SuggestionContext::new();
+        ctx.add_recent_event(make_event(
+            "error.timeout",
+            "core.codex:error_timeout",
+            now_ms,
+            None,
+        ));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(
+            suggestion
+                .action
+                .as_ref()
+                .map(|action| action.command.as_str()),
+            Some("ft rules show core.codex:error_timeout")
+        );
     }
 
     #[test]

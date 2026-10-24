@@ -611,6 +611,10 @@ pub struct RenderableInner {
     implicit_hyperlink_rules: Vec<Rule>,
 
     fetch_limiter: RateLimiter,
+    /// The latest render delta scrolled the screen (`physical_top` moved).
+    /// Read-ahead waits for a settled screen: rows above a streaming
+    /// viewport scroll away before a fetch returns (ft-2760r).
+    screen_scrolling: bool,
     fetch_retry_wake: async_channel::Sender<()>,
     deferred_fetches: Vec<DeferredLineFetch>,
     failed_fetch_authority: Option<(PaneRegistrationHandle, RpcGenerationScope, LineReadLayout)>,
@@ -709,6 +713,7 @@ impl RenderableInner {
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
+            screen_scrolling: false,
             fetch_retry_wake,
             deferred_fetches: Vec::new(),
             failed_fetch_authority: None,
@@ -1416,6 +1421,8 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
+        self.screen_scrolling =
+            !reset_layout && delta.dimensions.physical_top != self.dimensions.physical_top;
         self.dimensions = delta.dimensions;
         self.tiered_scrollback_status = delta.tiered_scrollback_status;
         self.title = delta.title;
@@ -2331,8 +2338,14 @@ impl RenderableInner {
         let receipt = reservation.admission_receipt();
         let scheduler = (receipt.queue_id, receipt.scheduler_generation);
 
+        // `spawn`, not `spawn_local`: renderer queries reach this from any
+        // thread (the Metal front end captures a client pane's rows on its
+        // render thread), and a local task is bound to the thread that creates
+        // it. Polling it on the main thread would trip async-task's
+        // "local task polled by a thread that didn't spawn it" assertion and
+        // abort the GUI.
         reservation
-            .spawn_local(async move {
+            .spawn(async move {
                 if registration.try_with_current(|_| ()).is_none() {
                     return Self::apply_lines(
                         registration,
@@ -2530,15 +2543,6 @@ impl RenderableInner {
             return Ok(());
         }
 
-        // Liveness backstop only: jump straight to the max interval after the
-        // bootstrap poll instead of ramping 20ms -> ... -> max. Real updates arrive
-        // via the server's unilateral push, and a dead connection is detected at
-        // ~RTT by the transport reader thread + the PaneRemoved push, so the poll is
-        // just a slow backstop. The first poll still fires immediately (the pane is
-        // constructed with last_poll = initial_last_poll(now)) to register the
-        // server-side push tracking that all subsequent pushes depend on. [zero-poll]
-        self.poll_interval = max_poll_interval();
-
         let Some(registration) = self.mux_registration.load() else {
             return Ok(());
         };
@@ -2558,6 +2562,19 @@ impl RenderableInner {
             }
         };
 
+        // Liveness backstop only: jump straight to the max interval after the
+        // bootstrap poll instead of ramping 20ms -> ... -> max. Real updates arrive
+        // via the server's unilateral push, and a dead connection is detected at
+        // ~RTT by the transport reader thread + the PaneRemoved push, so the poll is
+        // just a slow backstop. The first poll still fires immediately (the pane is
+        // constructed with last_poll = initial_last_poll(now)) to register the
+        // server-side push tracking that all subsequent pushes depend on. [zero-poll]
+        //
+        // Set only once this poll is really issued: an attempt that could not
+        // start (no registration yet, or the scheduler refused it) must leave
+        // the bootstrap poll eligible on the next call, not a backstop interval
+        // away.
+        self.poll_interval = max_poll_interval();
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
         let remote_pane_id = self.remote_pane_id;
@@ -2567,8 +2584,11 @@ impl RenderableInner {
         let request = rpc.get_pane_render_changes(GetPaneRenderChanges {
             pane_id: remote_pane_id,
         });
+        // `spawn`, not `spawn_local`: renderer queries call `poll` from any
+        // thread, including the Metal render thread (see
+        // `schedule_fetch_lines_reserved`).
         reservation
-            .spawn_local(async move {
+            .spawn(async move {
                 let response = with_rpc_deadline(
                     LIVENESS_POLL_RPC_DEADLINE,
                     "pane liveness poll",
@@ -4538,7 +4558,15 @@ impl RenderableState {
         // been changed optimistically by a local resize. Out-of-bounds GetLines
         // requests are shifted back into the server's retained rows, so probing
         // below the screen can retransmit the entire visible viewport.
-        let [before, after] = prefetch_ranges(&lines, &inner.dimensions);
+        // While output scrolls the screen, the rows above it are cold history
+        // by the time a fetch arrives: the server refused each one and the
+        // fetch budget for on-screen rows went to them (ft-2760r: ~50 refused
+        // reads a second from a GUI attached to a flooding pane).
+        let [before, after] = if inner.screen_scrolling {
+            [0..0, 0..0]
+        } else {
+            prefetch_ranges(&lines, &inner.dimensions)
+        };
         let needs_prefetch =
             before
                 .clone()
@@ -5915,6 +5943,64 @@ mod tests {
         }
     }
 
+    /// ft-2760r: read-ahead waits for a settled screen. While output scrolls
+    /// the screen, the rows above the viewport are cold history before a
+    /// fetch of them returns, and the fetch budget belongs to on-screen rows.
+    #[test]
+    fn read_ahead_waits_for_a_settled_screen() {
+        for (physical_top, read_ahead) in [(8, true), (10, false)] {
+            let renderable = test_renderable_state();
+            let state = renderable.lock();
+            let delta = {
+                let mut inner = state.inner.borrow_mut();
+                inner.dimensions.viewport_rows = 4;
+                inner.dimensions.scrollback_rows = 14;
+                inner.dimensions.scrollback_top = 0;
+                inner.dimensions.physical_top = 8;
+                inner.seqno = 7;
+                inner.fetch_limiter = super::RateLimiter::new(|_| 1);
+                for row in 8..14 {
+                    let line =
+                        Line::from_text(&format!("row {row}"), &CellAttributes::default(), 7, None);
+                    inner.lines.put(row, LineEntry::Line(line));
+                }
+                let mut dimensions = inner.dimensions;
+                dimensions.physical_top = physical_top;
+                codec::GetPaneRenderChangesResponse {
+                    pane_id: 743,
+                    mouse_grabbed: false,
+                    alt_screen_active: false,
+                    cursor_position: inner.cursor_position,
+                    dimensions,
+                    tiered_scrollback_status: None,
+                    dirty_lines: Vec::new(),
+                    title: "read-ahead".to_string(),
+                    working_dir: None,
+                    bonus_lines: codec::SerializedLines::from(Vec::new()),
+                    input_serial: None,
+                    seqno: 8,
+                }
+            };
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_changes_to_surface(delta, Vec::new()));
+            let (first, visible) = state.get_lines(physical_top..physical_top + 4);
+            assert_eq!(first, physical_top);
+            assert_eq!(visible.len(), 4);
+            assert_eq!(
+                state
+                    .inner
+                    .borrow_mut()
+                    .fetch_limiter
+                    .non_blocking_admittance_check(1),
+                !read_ahead,
+                "read-ahead after a delta moving physical_top 8 -> {}",
+                physical_top
+            );
+        }
+    }
+
     fn test_image(width: u32, height: u32, fill: u8) -> Arc<ImageData> {
         Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             width,
@@ -6940,11 +7026,14 @@ mod tests {
         );
         let registered: Arc<dyn mux::pane::Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(!peer.is_empty(), "binding must produce its palette RPC");
-        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(peer.is_empty());
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))),
+            "binding must produce its palette RPC: {:?}",
+            requests
+        );
         let repaint_requests = Arc::new(AtomicUsize::new(0));
         let observed_repaints = Arc::clone(&repaint_requests);
         let weak_renderable = Arc::downgrade(&pane.renderable);
@@ -7186,6 +7275,170 @@ mod tests {
         exercise_render_fetch_retry(FetchRetryChange::None);
     }
 
+    /// A registered client pane whose main-thread queue is the test thread,
+    /// for renderer queries made from another thread. The Metal front end
+    /// captures a client pane's rows on its render thread
+    /// (`capture_pane_rows`); the line fetch and the liveness poll that this
+    /// starts must be tasks the main-thread queue can run. A local task is
+    /// bound to its creating thread, and async-task aborts the GUI when the
+    /// main thread polls or drops it.
+    fn with_pane_queried_off_the_main_thread(
+        name: &str,
+        body: impl FnOnce(
+            &promise::spawn::SimpleExecutor,
+            &crate::client::TestRpcPeer,
+            &Arc<ClientPane>,
+            &Arc<dyn mux::pane::Pane>,
+        ),
+    ) {
+        let scope = crate::MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(mux::Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(751),
+            ClientDomainConfig::Unix(UnixDomain {
+                name: name.into(),
+                ..UnixDomain::default()
+            }),
+        );
+        let client = Arc::new(ClientInner::new(751, client, None, None, false));
+        let pane = Arc::new(
+            ClientPane::new(
+                &client,
+                753,
+                757,
+                761,
+                wezterm_term::TerminalSize::default(),
+                name,
+                false,
+            )
+            .unwrap(),
+        );
+        let registered: Arc<dyn mux::pane::Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        body(&executor, &peer, &pane, &registered);
+    }
+
+    #[test]
+    fn row_capture_on_a_render_thread_spawns_a_fetch_the_main_thread_can_run() {
+        use mux::render_mirror::{capture_pane_rows, CaptureRequest, RenderMirror};
+        use std::convert::TryFrom;
+
+        with_pane_queried_off_the_main_thread(
+            "render-thread-fetch",
+            |executor, peer, pane, registered| {
+                let dimensions = registered.get_dimensions();
+                let first = dimensions.physical_top;
+                let visible = first
+                    ..first
+                        + wezterm_term::StableRowIndex::try_from(dimensions.viewport_rows).unwrap();
+
+                // A first capture is full: every uncached visible row is fetched,
+                // reserved and spawned on the capturing thread.
+                let render_pane = Arc::clone(registered);
+                std::thread::spawn(move || {
+                    let request = CaptureRequest {
+                        viewport_top: None,
+                        rules: &[],
+                        rules_generation: 0,
+                    };
+                    capture_pane_rows(&*render_pane, &mut RenderMirror::new(), &request);
+                })
+                .join()
+                .expect("render-thread capture panicked");
+                assert!(
+                    matches!(
+                        pane.renderable.lock().inner.borrow().lines.peek(&first),
+                        Some(LineEntry::Fetching(_))
+                    ),
+                    "the render-thread capture must start the line fetch"
+                );
+
+                let all_cached = || {
+                    let state = pane.renderable.lock();
+                    let inner = state.inner.borrow();
+                    visible
+                        .clone()
+                        .all(|row| matches!(inner.lines.peek(&row), Some(LineEntry::Line(_))))
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !all_cached() {
+                    while executor.try_tick().unwrap() {}
+                    while !peer.is_empty() {
+                        let rows = visible
+                            .clone()
+                            .map(|row| (row, Line::with_width(17, 0)))
+                            .collect();
+                        promise::spawn::block_on(peer.respond_next_lines(rows)).unwrap();
+                        while executor.try_tick().unwrap() {}
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the fetch spawned on the render thread never completed on the main thread"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn change_query_on_a_render_thread_spawns_a_liveness_poll_the_main_thread_can_run() {
+        with_pane_queried_off_the_main_thread(
+            "render-thread-poll",
+            |executor, peer, pane, registered| {
+                // Registration already polled once; make the next poll due.
+                {
+                    let state = pane.renderable.lock();
+                    let mut inner = state.inner.borrow_mut();
+                    assert!(!inner.poll_in_progress.load(Ordering::SeqCst));
+                    let overdue = inner.poll_interval + Duration::from_millis(1);
+                    inner.last_poll = Instant::now()
+                        .checked_sub(overdue)
+                        .expect("monotonic clock is past one poll interval");
+                }
+                // `capture_pane_rows` asks what changed on every incremental
+                // capture, and that query issues the due liveness poll.
+                let render_pane = Arc::clone(registered);
+                std::thread::spawn(move || {
+                    render_pane.get_changed_since(0..1, SEQ_ZERO);
+                })
+                .join()
+                .expect("render-thread change query panicked");
+                assert!(
+                    pane.renderable
+                        .lock()
+                        .inner
+                        .borrow()
+                        .poll_in_progress
+                        .load(Ordering::SeqCst),
+                    "the render-thread change query must issue the liveness poll"
+                );
+                let requests =
+                    peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| matches!(request, codec::Pdu::GetPaneRenderChanges(_))),
+                    "the liveness poll must reach the wire: {:?}",
+                    requests
+                );
+                assert!(
+                    !pane
+                        .renderable
+                        .lock()
+                        .inner
+                        .borrow()
+                        .poll_in_progress
+                        .load(Ordering::SeqCst),
+                    "the liveness poll task must complete on the main thread"
+                );
+            },
+        );
+    }
+
     fn exercise_backend_fetch_failure(rejection: MuxErrorRetry, exhaust: bool) {
         let terminal = rejection != MuxErrorRetry::SAFE_AFTER_BACKOFF;
         let scope = crate::MuxTestScope::enter();
@@ -7214,11 +7467,14 @@ mod tests {
         );
         let registered: Arc<dyn mux::pane::Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(!peer.is_empty());
-        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(peer.is_empty());
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))),
+            "binding must produce its palette RPC: {:?}",
+            requests
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         {
             let state = pane.renderable.lock();

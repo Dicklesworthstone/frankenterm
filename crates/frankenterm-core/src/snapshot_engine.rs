@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -151,12 +151,22 @@ pub enum WholeMuxCaptureError {
     InvalidTimeout,
     #[error("publication authority path is not representable")]
     InvalidAuthorityPath,
-    #[error("model capture exhausted its total time budget")]
-    CaptureDeadline,
+    /// With how far the capture got: its panes are captured one after
+    /// another under the one budget.
+    #[error(
+        "model capture exhausted its total time budget after {elapsed_ms} ms with {taken} of {panes} pane checkpoints taken (slowest: pane {slowest_pane:?} in {slowest_ms} ms)"
+    )]
+    CaptureDeadline {
+        elapsed_ms: u128,
+        taken: usize,
+        panes: usize,
+        slowest_pane: Option<usize>,
+        slowest_ms: u128,
+    },
     #[error("model capture exceeds the retained checkpoint byte limit")]
     CaptureByteLimit,
-    #[error("mux topology, pane registration, or terminal model changed during capture")]
-    StaleCapture,
+    #[error("mux topology, pane registration, or terminal model changed during capture: {0}")]
+    StaleCapture(&'static str),
     #[error("capture capability context stopped")]
     Context(#[from] SnapshotError),
     #[error("coherent mux topology capture failed")]
@@ -182,6 +192,143 @@ pub enum WholeMuxCaptureError {
 enum CapturedPaneCheckpoint {
     Model(mux::ModelParserCheckpointAck),
     Guardian(Box<mux::guardian_checkpoint::PublishedGuardianCheckpoint>),
+}
+
+/// The first part of a topology recheck that differs from the capture, if any.
+#[cfg(feature = "frankenterm-deps")]
+fn topology_change(
+    captured: &mux::MuxCapturedTopology,
+    rechecked: &mux::MuxCapturedTopology,
+) -> Option<&'static str> {
+    if captured.session_incarnation != rechecked.session_incarnation {
+        Some("mux incarnation changed during capture")
+    } else if captured.topology_revision != rechecked.topology_revision {
+        Some("topology revision changed during capture")
+    } else if captured.domains != rechecked.domains
+        || captured.default_domain_id != rechecked.default_domain_id
+    {
+        Some("domains changed during capture")
+    } else if captured.windows != rechecked.windows {
+        Some("windows changed during capture")
+    } else if !tabs_agree(captured, rechecked) {
+        Some("tabs changed during capture")
+    } else if !pane_bindings_agree(&captured.pane_bindings, &rechecked.pane_bindings) {
+        Some("pane bindings changed during capture")
+    } else if captured.workspaces != rechecked.workspaces
+        || captured.client_workspace != rechecked.client_workspace
+        || captured.default_workspace != rechecked.default_workspace
+    {
+        Some("workspaces changed during capture")
+    } else {
+        None
+    }
+}
+
+/// Whether a topology recheck still has the same tabs. A guardian pane's leaf
+/// in a split tree is compared without what its output changes (title,
+/// directory, screen, cursor and scroll position): the recovery image takes
+/// only a leaf's identity from the tree, and that pane's journal replays the
+/// rest.
+#[cfg(feature = "frankenterm-deps")]
+fn tabs_agree(captured: &mux::MuxCapturedTopology, rechecked: &mux::MuxCapturedTopology) -> bool {
+    let guardian: HashSet<usize> = captured
+        .pane_bindings
+        .iter()
+        .filter(|pane| pane.spawn_custody.is_some())
+        .map(|pane| pane.pane_id)
+        .collect();
+    captured.tabs.len() == rechecked.tabs.len()
+        && captured
+            .tabs
+            .iter()
+            .zip(&rechecked.tabs)
+            .all(|(before, after)| {
+                if guardian.is_empty() {
+                    return before == after;
+                }
+                let (mut before, mut after) = (before.clone(), after.clone());
+                strip_guardian_leaf_volatility(&mut before.split_tree, &guardian);
+                strip_guardian_leaf_volatility(&mut after.split_tree, &guardian);
+                before == after
+            })
+}
+
+#[cfg(feature = "frankenterm-deps")]
+fn strip_guardian_leaf_volatility(node: &mut mux::tab::PaneNode, guardian: &HashSet<usize>) {
+    match node {
+        mux::tab::PaneNode::Empty => {}
+        mux::tab::PaneNode::Leaf(entry) => {
+            if guardian.contains(&entry.pane_id) {
+                entry.title.clear();
+                entry.working_dir = None;
+                entry.alt_screen_active = false;
+                entry.cursor_pos = Default::default();
+                entry.physical_top = 0;
+                entry.top_row = 0;
+                entry.left_col = 0;
+            }
+        }
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            strip_guardian_leaf_volatility(left, guardian);
+            strip_guardian_leaf_volatility(right, guardian);
+        }
+    }
+}
+
+/// Whether a topology recheck still names the same panes in the same places.
+/// A guardian pane's title, directory, cursor and screen are left out: they
+/// change with every byte it prints, the recovery image takes them from that
+/// pane's own checkpoint, and its journal replays everything after it.
+#[cfg(feature = "frankenterm-deps")]
+fn pane_bindings_agree(
+    captured: &[mux::MuxCapturedPaneBinding],
+    rechecked: &[mux::MuxCapturedPaneBinding],
+) -> bool {
+    captured.len() == rechecked.len()
+        && captured.iter().zip(rechecked).all(|(before, after)| {
+            if before.spawn_custody.is_none() {
+                return before == after;
+            }
+            let mut after = after.clone();
+            after.title.clone_from(&before.title);
+            after.cwd.clone_from(&before.cwd);
+            after.cursor_pos = before.cursor_pos;
+            after.alt_screen_active = before.alt_screen_active;
+            *before == after
+        })
+}
+
+/// The pane checkpoints of one whole-mux capture, timed so that a capture
+/// out of budget names how far it got and which pane spent the most: the
+/// panes are captured one after another under one total budget.
+#[cfg(feature = "frankenterm-deps")]
+struct CaptureTiming {
+    started: Instant,
+    panes: usize,
+    taken: usize,
+    slowest: Option<(usize, Duration)>,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl CaptureTiming {
+    fn pane_taken(&mut self, pane_id: usize, took: Duration) {
+        self.taken += 1;
+        if self.slowest.is_none_or(|(_, slowest)| took > slowest) {
+            self.slowest = Some((pane_id, took));
+        }
+    }
+
+    /// [`WholeMuxCaptureError::CaptureDeadline`] with the timing, which the
+    /// mux logs as the capture's failure.
+    fn deadline(&self) -> WholeMuxCaptureError {
+        WholeMuxCaptureError::CaptureDeadline {
+            elapsed_ms: self.started.elapsed().as_millis(),
+            taken: self.taken,
+            panes: self.panes,
+            slowest_pane: self.slowest.map(|(pane, _)| pane),
+            slowest_ms: self.slowest.map_or(0, |(_, took)| took.as_millis()),
+        }
+    }
 }
 
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
@@ -257,7 +404,8 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     if attempt.authority.reconciliation_is_required() {
         return Err(WholeMuxCaptureError::ReconciliationRequired);
     }
-    let deadline = Instant::now()
+    let started = Instant::now();
+    let deadline = started
         .checked_add(capture_timeout)
         .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
     let config = mux::MuxTopologyCaptureConfig {
@@ -267,17 +415,37 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     };
     let captured = mux.capture_topology_coherent(config)?;
     if hex::encode(captured.session_incarnation.as_bytes()) != expected.mux_incarnation_id {
-        return Err(WholeMuxCaptureError::StaleCapture);
+        return Err(WholeMuxCaptureError::StaleCapture(
+            "mux incarnation differs from the publication identity",
+        ));
     }
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
-    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default();
+    // Version 4 lines, graphics and protection when the mux's guardian admits
+    // them. A pane's checkpoint must also fit the recovery image's per-pane
+    // ceiling: capture trims the oldest history to it, as it does to its own
+    // encoding ceiling, instead of publication refusing the whole image (a
+    // pane showing tens of megabytes of images exceeds it).
+    let guardian_limits = mux.guardian_checkpoint_limits();
+    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+        max_encoded_bytes: guardian_limits.max_encoded_bytes.min(
+            crate::session_restore::WholeMuxRecoveryLimits::default().max_per_pane_checkpoint_bytes,
+        ),
+        ..guardian_limits
+    };
+    let mut timing = CaptureTiming {
+        started,
+        panes: captured.pane_bindings.len(),
+        taken: 0,
+        slowest: None,
+    };
     for pane in &captured.pane_bindings {
         snapshot_cx_checkpoint(cx)?;
+        let pane_started = Instant::now();
         let remaining = deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(pane_started)
             .filter(|duration| !duration.is_zero())
-            .ok_or(WholeMuxCaptureError::CaptureDeadline)?;
+            .ok_or_else(|| timing.deadline())?;
         let mut cancellation = None;
         let mut capture_deadline_reached = false;
         let checkpoint = if pane.spawn_custody.is_some() {
@@ -298,14 +466,16 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 return Err(WholeMuxCaptureError::Context(error));
             }
             if capture_deadline_reached {
-                return Err(WholeMuxCaptureError::CaptureDeadline);
+                return Err(timing.deadline());
             }
             snapshot_cx_checkpoint(cx)?;
             let published = result.map_err(|source| {
                 if let Some(live_err) = source.downcast_ref::<mux::LiveParserCheckpointError>() {
                     match live_err {
                         mux::LiveParserCheckpointError::StaleRegistration => {
-                            WholeMuxCaptureError::StaleCapture
+                            WholeMuxCaptureError::StaleCapture(
+                                "guardian pane registration changed during its checkpoint",
+                            )
                         }
                         mux::LiveParserCheckpointError::CheckpointBusy
                         | mux::LiveParserCheckpointError::GuardianDeliveryBusy => {
@@ -327,7 +497,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             if capture.registration_wire_identity() != pane.registration_wire_identity
                 || capture.durable_pane_id().to_string() != pane.pane_uuid
             {
-                return Err(WholeMuxCaptureError::StaleCapture);
+                return Err(WholeMuxCaptureError::StaleCapture(
+                    "guardian checkpoint names another registration",
+                ));
             }
             total_bytes = total_bytes
                 .checked_add(capture.terminal_checkpoint().canonical_payload().len())
@@ -351,12 +523,14 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 return Err(WholeMuxCaptureError::Context(error));
             }
             if capture_deadline_reached {
-                return Err(WholeMuxCaptureError::CaptureDeadline);
+                return Err(timing.deadline());
             }
             snapshot_cx_checkpoint(cx)?;
             let ack = result.map_err(|source| match source {
                 mux::LiveParserCheckpointError::StaleRegistration => {
-                    WholeMuxCaptureError::StaleCapture
+                    WholeMuxCaptureError::StaleCapture(
+                        "pane registration changed during its checkpoint",
+                    )
                 }
                 mux::LiveParserCheckpointError::CheckpointBusy => WholeMuxCaptureError::Busy,
                 source => WholeMuxCaptureError::Pane {
@@ -367,7 +541,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             if ack.registration_wire_identity != pane.registration_wire_identity
                 || ack.durable_pane_id.to_string() != pane.pane_uuid
             {
-                return Err(WholeMuxCaptureError::StaleCapture);
+                return Err(WholeMuxCaptureError::StaleCapture(
+                    "model checkpoint names another registration",
+                ));
             }
             total_bytes = total_bytes
                 .checked_add(ack.terminal_checkpoint.canonical_payload().len())
@@ -376,15 +552,20 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             CapturedPaneCheckpoint::Model(ack)
         };
         checkpoints.push(checkpoint);
+        timing.pane_taken(pane.pane_id, pane_started.elapsed());
     }
     after_capture();
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
-        return Err(WholeMuxCaptureError::CaptureDeadline);
+        return Err(timing.deadline());
     }
     // Every checkpoint precedes every validation read. Unchanged monotonic
     // witnesses establish a common cut between those two passes; equal visible
-    // state alone would incorrectly admit an A -> B -> A change.
+    // state alone would incorrectly admit an A -> B -> A change. A guardian
+    // pane needs no common cut: its journal holds every byte after its
+    // checkpoint and a restore replays them, so it must only still be the same
+    // registration under the same lease. Otherwise a pane that keeps printing
+    // could never be part of a published image.
     for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
         snapshot_cx_checkpoint(cx)?;
         let is_current = match checkpoint {
@@ -392,30 +573,25 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 mux.model_checkpoint_is_current(pane.pane_id, ack)
             }
             CapturedPaneCheckpoint::Guardian(published) => {
-                mux.guardian_checkpoint_is_current(pane.pane_id, published)
+                mux.guardian_checkpoint_is_restorable(pane.pane_id, published)
             }
         };
         if !is_current {
-            return Err(WholeMuxCaptureError::StaleCapture);
+            return Err(WholeMuxCaptureError::StaleCapture(match checkpoint {
+                CapturedPaneCheckpoint::Model(_) => "a model pane changed after its checkpoint",
+                CapturedPaneCheckpoint::Guardian(_) => {
+                    "a guardian pane's registration or lease changed after its checkpoint"
+                }
+            }));
         }
     }
     let rechecked = mux.capture_topology_coherent(config)?;
-    if captured.session_incarnation != rechecked.session_incarnation
-        || captured.topology_revision != rechecked.topology_revision
-        || captured.domains != rechecked.domains
-        || captured.default_domain_id != rechecked.default_domain_id
-        || captured.windows != rechecked.windows
-        || captured.tabs != rechecked.tabs
-        || captured.pane_bindings != rechecked.pane_bindings
-        || captured.workspaces != rechecked.workspaces
-        || captured.client_workspace != rechecked.client_workspace
-        || captured.default_workspace != rechecked.default_workspace
-    {
-        return Err(WholeMuxCaptureError::StaleCapture);
+    if let Some(changed) = topology_change(&captured, &rechecked) {
+        return Err(WholeMuxCaptureError::StaleCapture(changed));
     }
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
-        return Err(WholeMuxCaptureError::CaptureDeadline);
+        return Err(timing.deadline());
     }
     // Capture identity is caller-owned; storage names additionally include the
     // observed cut time so a failed encryption attempt is not blindly replayed.
@@ -455,6 +631,12 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     match result {
         Ok(receipt) => {
             attempt.settle();
+            // Live checkpoints now count from the members this root names.
+            for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
+                if let CapturedPaneCheckpoint::Guardian(published) = checkpoint {
+                    mux.note_guardian_root_committed(pane.pane_id, published);
+                }
+            }
             Ok(receipt)
         }
         Err(error) => {
@@ -506,7 +688,7 @@ pub fn publish_whole_mux_recovery(
         representation_id_from_envelope_bytes,
     };
     use frankenterm_term::terminalstate::checkpoint::{
-        TERMINAL_CHECKPOINT_VERSION, TerminalCheckpointLimits, TerminalCheckpointV3,
+        TerminalCheckpointLimits, TerminalCheckpointV3,
     };
 
     snapshot_cx_checkpoint(cx)?;
@@ -688,13 +870,20 @@ pub fn publish_whole_mux_recovery(
                 && encrypted_bytes <= current_verifier.limits().max_total_checkpoint_bytes,
             "whole-mux encrypted byte limit exceeded",
         )?;
+        // Version 3 or 4, as the mux's guardian admits (decoded above).
+        let schema_version = TerminalCheckpointV3::canonical_payload_version(
+            input.checkpoint.terminal_checkpoint().canonical_payload(),
+        )
+        .ok_or(WholeMuxPublicationError::Validation(
+            "whole-mux checkpoint declares no schema version",
+        ))?;
         refs.insert(
             input.pane_id,
             RecoveryObjectRef {
                 object_id: input.object_id.to_owned(),
                 byte_length: envelope.len() as u64,
                 payload_digest,
-                schema_version: TERMINAL_CHECKPOINT_VERSION,
+                schema_version,
             },
         );
         prepared_objects.push(RecoveryObjectPayload {
@@ -745,48 +934,11 @@ pub fn publish_whole_mux_recovery(
         )?;
     }
     snapshot_cx_checkpoint(cx)?;
-    // RootVerifier's closure adapter retains the caller's actual Cx throughout
-    // graph validation; no fresh root context or permissive verifier is involved.
-    #[derive(Debug, thiserror::Error)]
-    enum VerifyPublicationError {
-        #[error("publication context stopped")]
-        Context(#[from] SnapshotError),
-        #[error("whole-mux graph verification failed")]
-        Graph(#[from] crate::session_restore::WholeMuxRecoveryError),
-        #[error("predecessor identity or semantic image digest mismatch")]
-        Predecessor,
-        #[error("unexpected candidate generation {0}")]
-        UnexpectedRole(u64),
-    }
-    let verify = |candidate: &crate::snapshot_publication::RootSlotCandidate,
-                  store: &crate::snapshot_publication::SnapshotPublicationStore|
-     -> Result<_, VerifyPublicationError> {
-        snapshot_cx_checkpoint(cx)?;
-        let checked_root = if candidate.generation == expected.generation {
-            current_verifier.verify_root_with_cx(cx, candidate, store)?
-        } else if let Some(predecessor) = expected.predecessor.as_ref() {
-            if candidate.generation <= predecessor.expected_generation {
-                let checked = predecessor_verifier.verify_root_with_cx(cx, candidate, store)?;
-                // Both alternating slots retain authenticated discovery roots.
-                // Verify the older slot too: rejecting it makes generation 3
-                // fail reconciliation before it can replace generation 1.
-                // The publication store still requires the selected active
-                // root to match the exact predecessor generation and hash.
-                if candidate.generation == predecessor.expected_generation
-                    && (hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
-                        || Some(checked.image().image_digest) != expected.predecessor_image_digest)
-                {
-                    return Err(VerifyPublicationError::Predecessor);
-                }
-                checked
-            } else {
-                return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
-            }
-        } else {
-            return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
-        };
-        snapshot_cx_checkpoint(cx)?;
-        Ok(checked_root)
+    let verify = WholeMuxPublicationVerifier {
+        cx,
+        expected,
+        current: &current_verifier,
+        predecessor: &predecessor_verifier,
     };
     Ok(store.publish_repair_protected_generation_root(
         cx,
@@ -802,6 +954,170 @@ pub fn publish_whole_mux_recovery(
         repair_key.as_ref(),
         &verify,
     )?)
+}
+
+/// Reclaim the objects neither retained whole-mux root reads from a store
+/// that filled before publication reclaimed them (ft-6nfed): a full store
+/// refuses a new generation's objects before its root could reclaim any.
+/// Both roots verify under `expected`'s key, root identity, session and
+/// guardian custody, as publication verifies its predecessor.
+#[cfg(feature = "frankenterm-deps")]
+pub fn reclaim_whole_mux_recovery_objects(
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    key: Arc<crate::snapshot_representation::RecoveryKey>,
+    expected: &WholeMuxPublicationIdentity,
+) -> Result<crate::snapshot_publication::ObjectReclamation, WholeMuxPublicationError> {
+    use crate::session_restore::{WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig};
+
+    let repair_key = key.derive_repair_authentication_key()?;
+    let trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
+        .with_session_id(expected.session_id.clone());
+    let verifier = WholeMuxRecoveryVerifier::new_production(key, trusted);
+    #[cfg(unix)]
+    let verifier = match expected.existing_guardian_custody.as_ref() {
+        Some(token_path) => verifier.with_existing_guardian_custody(token_path.clone()),
+        None => verifier,
+    };
+    Ok(store.reclaim_unreachable_objects(
+        &verifier,
+        &format!("whole-mux-{}", hex::encode(expected.root_object_id)),
+        &expected.root_object_id,
+        repair_key.as_ref(),
+    )?)
+}
+
+/// Lift a whole-mux store's latched publication authority once its durable
+/// outcome is known again. A publication that fails after it began writing
+/// latches the authority, since its root may or may not have committed, and
+/// every later capture in this process is refused. Holding the authority in
+/// this process and the store's publication lock across processes, the
+/// committed roots must select under `verifier` with no unresolved
+/// authority; the caller then rebinds its predecessor from that selection.
+/// Returns whether a latch was lifted. A store that still does not read
+/// cleanly keeps its latch.
+#[cfg(feature = "frankenterm-deps")]
+pub fn reconcile_whole_mux_publication_authority(
+    cx: &crate::cx::Cx,
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    verifier: &crate::session_restore::WholeMuxRecoveryVerifier,
+) -> Result<bool, WholeMuxCaptureError> {
+    snapshot_cx_checkpoint(cx)?;
+    let path = store
+        .root_path()
+        .to_str()
+        .ok_or(WholeMuxCaptureError::InvalidAuthorityPath)?;
+    let authority = shared_snapshot_authority_state(path);
+    if !authority.reconciliation_is_required() {
+        return Ok(false);
+    }
+    if authority
+        .in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(WholeMuxCaptureError::Busy);
+    }
+    let _held = SnapshotAuthorityReadGuard {
+        authority: Arc::clone(&authority),
+    };
+    let _lock = store
+        .acquire_publication_lock()
+        .map_err(|error| WholeMuxCaptureError::Publication(error.into()))?;
+    let selected =
+        crate::session_restore::select_verified_recovery_roots_with_cx(cx, store, verifier)
+            .map_err(|error| WholeMuxCaptureError::Publication(error.into()))?;
+    if selected.has_unresolved_authority() {
+        return Err(WholeMuxCaptureError::ReconciliationRequired);
+    }
+    authority.clear_reconciliation();
+    Ok(true)
+}
+
+#[cfg(feature = "frankenterm-deps")]
+#[derive(Debug, thiserror::Error)]
+enum WholeMuxPublicationVerifyError {
+    #[error("publication context stopped")]
+    Context(#[from] SnapshotError),
+    #[error("whole-mux graph verification failed: {0}")]
+    Graph(#[from] crate::session_restore::WholeMuxRecoveryError),
+    #[error("predecessor identity or semantic image digest mismatch")]
+    Predecessor,
+    #[error("unexpected candidate generation {0}")]
+    UnexpectedRole(u64),
+}
+
+/// Verifies the candidate and the committed roots a whole-mux publication
+/// meets. Retains the caller's actual Cx throughout graph validation; no fresh
+/// root context or permissive verifier is involved. Unlike a closure
+/// (`RootVerifier` for `Fn`), it tells the store which rejections only say
+/// newer captures superseded a root's guardian evidence.
+#[cfg(feature = "frankenterm-deps")]
+struct WholeMuxPublicationVerifier<'a> {
+    cx: &'a crate::cx::Cx,
+    expected: &'a WholeMuxPublicationIdentity,
+    current: &'a crate::session_restore::WholeMuxRecoveryVerifier,
+    predecessor: &'a crate::session_restore::WholeMuxRecoveryVerifier,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl crate::snapshot_publication::RootVerifier for WholeMuxPublicationVerifier<'_> {
+    type Error = WholeMuxPublicationVerifyError;
+    type Verified = crate::session_restore::ValidatedWholeMuxRecovery;
+
+    fn verify_root(
+        &self,
+        candidate: &crate::snapshot_publication::RootSlotCandidate,
+        store: &crate::snapshot_publication::SnapshotPublicationStore,
+    ) -> Result<Self::Verified, Self::Error> {
+        let (cx, expected) = (self.cx, self.expected);
+        snapshot_cx_checkpoint(cx)?;
+        let checked_root = if candidate.generation == expected.generation {
+            self.current.verify_root_with_cx(cx, candidate, store)?
+        } else if let Some(predecessor) = expected.predecessor.as_ref() {
+            if candidate.generation <= predecessor.expected_generation {
+                let checked = self.predecessor.verify_root_with_cx(cx, candidate, store)?;
+                // Both alternating slots retain authenticated discovery roots.
+                // Verify the older slot too: rejecting it makes generation 3
+                // fail reconciliation before it can replace generation 1.
+                // The publication store still requires the selected active
+                // root to match the exact predecessor generation and hash.
+                if candidate.generation == predecessor.expected_generation
+                    && (hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
+                        || Some(checked.image().image_digest) != expected.predecessor_image_digest)
+                {
+                    return Err(WholeMuxPublicationVerifyError::Predecessor);
+                }
+                checked
+            } else {
+                return Err(WholeMuxPublicationVerifyError::UnexpectedRole(
+                    candidate.generation,
+                ));
+            }
+        } else {
+            return Err(WholeMuxPublicationVerifyError::UnexpectedRole(
+                candidate.generation,
+            ));
+        };
+        snapshot_cx_checkpoint(cx)?;
+        Ok(checked_root)
+    }
+
+    fn superseded_by_newer(&self, error: &Self::Error) -> bool {
+        matches!(error, WholeMuxPublicationVerifyError::Graph(graph)
+            if self.predecessor.superseded_by_newer(graph))
+    }
+
+    fn root_objects(
+        &self,
+        candidate: &crate::snapshot_publication::RootSlotCandidate,
+        store: &crate::snapshot_publication::SnapshotPublicationStore,
+    ) -> Option<Vec<String>> {
+        // Either verifier authenticates the manifest under the same key and
+        // root identity; the roles differ only in what verification pins.
+        self.predecessor
+            .root_objects_with_cx(self.cx, candidate, store)
+            .ok()
+    }
 }
 
 // =============================================================================
@@ -3301,6 +3617,20 @@ struct SessionCleanupSchedule {
     retry_deferred_at: Option<Instant>,
 }
 
+/// Outcome of one in-process attempt to lift a latch left by an interrupted
+/// session cleanup (ft-28hba).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCleanupReconciliation {
+    /// Snapshot authority was not latched.
+    NotLatched,
+    /// The latch stays: another cause latched it, a latched cleanup may still
+    /// be running, admission is busy, or the durable re-read failed.
+    Retained,
+    /// The latch was lifted. `retention_fenced` reports a durable cleanup
+    /// receipt that still pauses retention until an operator acknowledges it.
+    Lifted { retention_fenced: bool },
+}
+
 impl SessionCleanupSchedule {
     fn defer_retry(&mut self, now: Instant) {
         self.retry_deferred_at = Some(now);
@@ -3463,6 +3793,13 @@ struct SnapshotAuthorityState {
     reconciliation_required: AtomicBool,
     session_cleanup_reconciliation_required: AtomicBool,
     first_latched_operation: AtomicU8,
+    /// Every cause latched since the last reconciliation: one bit per
+    /// operation code, plus [`LATCHED_UNPROVEN_IDENTITY`]. Guarded by
+    /// `latched_handoffs` so a lift cannot interleave with a new latch.
+    latched_causes: AtomicU32,
+    /// Handoffs of latched attempts whose closures may still be running. A
+    /// latch is never lifted while one of them has started but not returned.
+    latched_handoffs: StdMutex<Vec<Arc<AtomicU8>>>,
     /// Whether the latched pause of session retention has been reported.
     cleanup_pause_reported: AtomicBool,
     /// Shared monotonic checkpoint-retention schedule. This prevents multiple
@@ -3493,6 +3830,8 @@ impl SnapshotAuthorityState {
             reconciliation_required: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             first_latched_operation: AtomicU8::new(0),
+            latched_causes: AtomicU32::new(0),
+            latched_handoffs: StdMutex::new(Vec::new()),
             cleanup_pause_reported: AtomicBool::new(false),
             checkpoint_cleanup_cadence: StdMutex::new(CheckpointCleanupCadence::new()),
         }
@@ -3505,23 +3844,129 @@ impl SnapshotAuthorityState {
                 .load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn latch_reconciliation(self: &Arc<Self>, operation: SnapshotAuthorityOperation) {
-        let _ = self.first_latched_operation.compare_exchange(
-            0,
-            operation.code(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.reconciliation_required.store(true, Ordering::Release);
-        self.session_cleanup_reconciliation_required
-            .store(true, Ordering::Release);
+        self.latch_causes(1 << operation.code(), operation, None);
+    }
+
+    /// Latch after a mutation attempt lost its outcome. Its handoff is kept so
+    /// a later reconciliation can tell whether the closure is still running.
+    fn latch_attempt(
+        self: &Arc<Self>,
+        operation: SnapshotAuthorityOperation,
+        handoff_state: &Arc<AtomicU8>,
+    ) {
+        self.latch_causes(1 << operation.code(), operation, Some(handoff_state));
+    }
+
+    /// Latch because the database's filesystem identity could not be proven.
+    /// No in-process reconciliation lifts this cause.
+    fn latch_unproven_identity(self: &Arc<Self>, operation: SnapshotAuthorityOperation) {
+        self.latch_causes(LATCHED_UNPROVEN_IDENTITY, operation, None);
+    }
+
+    fn latch_causes(
+        self: &Arc<Self>,
+        causes: u32,
+        operation: SnapshotAuthorityOperation,
+        handoff_state: Option<&Arc<AtomicU8>>,
+    ) {
+        {
+            let mut handoffs = self
+                .latched_handoffs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handoff_state) = handoff_state {
+                handoffs.push(Arc::clone(handoff_state));
+            }
+            self.latched_causes.fetch_or(causes, Ordering::AcqRel);
+            let _ = self.first_latched_operation.compare_exchange(
+                0,
+                operation.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.reconciliation_required.store(true, Ordering::Release);
+            self.session_cleanup_reconciliation_required
+                .store(true, Ordering::Release);
+        }
         retain_latched_snapshot_authority(self);
     }
 
     fn first_latched_operation(&self) -> Option<SnapshotAuthorityOperation> {
         SnapshotAuthorityOperation::from_code(self.first_latched_operation.load(Ordering::Acquire))
     }
+
+    /// Whether every latched cause is a session-retention cleanup whose
+    /// closure has returned or never started (ft-28hba).
+    fn latch_is_settled_session_cleanup(&self) -> bool {
+        let handoffs = self
+            .latched_handoffs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::settled_session_cleanup(&handoffs, self.latched_causes.load(Ordering::Acquire))
+    }
+
+    fn settled_session_cleanup(handoffs: &[Arc<AtomicU8>], causes: u32) -> bool {
+        causes == 1 << SnapshotAuthorityOperation::SessionRetentionCleanup.code()
+            && handoffs
+                .iter()
+                .all(|handoff| handoff.load(Ordering::Acquire) != AUTHORITY_HANDOFF_STARTED)
+    }
+
+    /// Lift the latch once the caller, holding this authority exclusively,
+    /// has proved the durable outcome the latch stood for.
+    #[cfg(feature = "frankenterm-deps")]
+    fn clear_reconciliation(self: &Arc<Self>) {
+        self.clear_reconciliation_if(|_, _| true);
+    }
+
+    /// Lift the latch if `proven` still holds for the latched causes and
+    /// handoffs, checked under the same lock every latch takes, so a cause
+    /// latched after the caller's proof keeps the latch. Returns whether the
+    /// latch was lifted.
+    fn clear_reconciliation_if(
+        self: &Arc<Self>,
+        proven: impl FnOnce(&[Arc<AtomicU8>], u32) -> bool,
+    ) -> bool {
+        {
+            let mut handoffs = self
+                .latched_handoffs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !proven(&handoffs, self.latched_causes.load(Ordering::Acquire)) {
+                return false;
+            }
+            handoffs.clear();
+            self.latched_causes.store(0, Ordering::Release);
+            self.reconciliation_required.store(false, Ordering::Release);
+            self.session_cleanup_reconciliation_required
+                .store(false, Ordering::Release);
+            self.first_latched_operation.store(0, Ordering::Release);
+            self.cleanup_pause_reported.store(false, Ordering::Release);
+        }
+        let mut entries = snapshot_authority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A latch published after the lift above inserts its own entries
+        // under this lock; leave those latched.
+        if self.reconciliation_is_required() {
+            return false;
+        }
+        for entry in entries.values_mut() {
+            if matches!(entry, SnapshotAuthorityRegistryEntry::Latched(latched)
+                if Arc::ptr_eq(latched, self))
+            {
+                *entry = SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(self));
+            }
+        }
+        true
+    }
 }
+
+/// Latched-cause bit for an unproven filesystem identity; operation codes use
+/// the low bits.
+const LATCHED_UNPROVEN_IDENTITY: u32 = 1 << 31;
 
 enum SnapshotAuthorityRegistryEntry {
     Live(Weak<SnapshotAuthorityState>),
@@ -3683,9 +4128,9 @@ fn refresh_snapshot_authority_file_identities(
         conflict_count = conflicts.len(),
         "snapshot filesystem authority identity could not be proven"
     );
-    state.latch_reconciliation(operation);
+    state.latch_unproven_identity(operation);
     for conflict in conflicts {
-        conflict.latch_reconciliation(operation);
+        conflict.latch_unproven_identity(operation);
     }
     Err(error)
 }
@@ -4282,7 +4727,8 @@ impl SnapshotAuthorityAttemptGuard {
     }
 
     fn latch_and_settle(mut self) {
-        self.authority.latch_reconciliation(self.operation);
+        self.authority
+            .latch_attempt(self.operation, &self.handoff_state);
         self.settled = true;
     }
 }
@@ -4295,7 +4741,8 @@ impl Drop for SnapshotAuthorityAttemptGuard {
                 state,
                 AUTHORITY_HANDOFF_STARTED | AUTHORITY_HANDOFF_COMPLETED
             ) {
-                self.authority.latch_reconciliation(self.operation);
+                self.authority
+                    .latch_attempt(self.operation, &self.handoff_state);
             }
         }
         self.authority.in_progress.store(false, Ordering::Release);
@@ -5393,7 +5840,10 @@ impl SnapshotEngine {
         &self,
         cx: &crate::cx::Cx,
     ) -> std::result::Result<(), SnapshotError> {
-        if self.authority_reconciliation_is_required() {
+        if self.authority_reconciliation_is_required()
+            && self.reconcile_session_cleanup_latch(cx).await
+                == SessionCleanupReconciliation::Retained
+        {
             return Err(
                 self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCleanup)
             );
@@ -6265,14 +6715,18 @@ impl SnapshotEngine {
     /// completion is lost, the
     /// engine latches both `session_cleanup_reconciliation_required` and the
     /// shared snapshot-authority reconciliation state. This suppresses every
-    /// later mutation of the same authority tables for this engine instance,
-    /// including after a same-engine scheduler restart.
+    /// later mutation of the same authority tables, including after a
+    /// same-engine scheduler restart, until the cleanup has returned and
+    /// [`Self::reconcile_session_cleanup_latch`] lifts the latch.
     async fn maybe_run_session_cleanup(
         &self,
         cx: &crate::cx::Cx,
         schedule: &mut SessionCleanupSchedule,
     ) {
-        if self.authority_reconciliation_is_required() {
+        if self.authority_reconciliation_is_required()
+            && self.reconcile_session_cleanup_latch(cx).await
+                == SessionCleanupReconciliation::Retained
+        {
             self.report_latched_cleanup_pause();
             return;
         }
@@ -6364,6 +6818,15 @@ impl SnapshotEngine {
                         automatic_retry_suppressed = true,
                         "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
                     );
+                    // The scheduler captures right after this, and a capture
+                    // refused by the latch ends the scheduler. A cleanup that
+                    // returned its error can be reconciled now.
+                    if matches!(
+                        self.reconcile_session_cleanup_latch(cx).await,
+                        SessionCleanupReconciliation::Lifted { .. }
+                    ) {
+                        schedule.defer_retry(Instant::now());
+                    }
                 } else {
                     schedule.defer_retry(Instant::now());
                     tracing::warn!(
@@ -6390,9 +6853,120 @@ impl SnapshotEngine {
         }
         tracing::warn!(
             first_indeterminate_operation = ?self.snapshot_authority.first_latched_operation(),
-            remediation = "restart the watcher (ft stop && ft watch) to rebuild snapshot authority from durable state",
+            remediation = "restart the watcher (ft stop && ft watch) to rebuild snapshot authority from durable state; a latch left only by session cleanup lifts on its own once that cleanup has returned",
             "Session retention cleanup is paused: snapshot authority needs reconciliation"
         );
+    }
+
+    /// Lift a latch that only an interrupted session-retention cleanup set
+    /// (ft-28hba), so one lost cleanup outcome no longer stops every snapshot
+    /// until the watcher restarts.
+    ///
+    /// Cleanup deletes only sessions that shut down cleanly or whose owner is
+    /// proven dead, and rows whose session is gone. Whether it finished, partly
+    /// finished or never started, it leaves this process's own sessions alone,
+    /// and the engine re-reads the database before trusting its caches. What
+    /// the latch guards against is a cleanup closure that may still commit. So
+    /// it lifts only when every latched cause is session cleanup, every latched
+    /// closure has returned, this engine holds the authority exclusively, the
+    /// database is still the same file, and a fresh read finds this engine's
+    /// own session still owned by this process. The durable cleanup receipt is
+    /// left alone: an open one keeps retention fenced until an operator
+    /// acknowledges it, which no longer needs a watcher restart.
+    async fn reconcile_session_cleanup_latch(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> SessionCleanupReconciliation {
+        if !self.authority_reconciliation_is_required() {
+            return SessionCleanupReconciliation::NotLatched;
+        }
+        if !self.snapshot_authority.latch_is_settled_session_cleanup() {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let Ok(session_id) = self
+            .session_id
+            .read_with_cx(cx)
+            .await
+            .map(|session_id| (*session_id).clone())
+        else {
+            return SessionCleanupReconciliation::Retained;
+        };
+        if self
+            .snapshot_authority
+            .in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let _held = SnapshotAuthorityReadGuard {
+            authority: Arc::clone(&self.snapshot_authority),
+        };
+        if refresh_snapshot_authority_file_identities(
+            self.db_path.as_str(),
+            &self.snapshot_authority,
+            SnapshotAuthorityOperation::SessionRetentionCleanup,
+        )
+        .is_err()
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let db_path = Arc::clone(&self.db_path);
+        let owner = self.owner_identity.clone();
+        let observed = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            observe_session_cleanup_reconciliation(
+                db_path.as_str(),
+                session_id.as_deref(),
+                owner.as_ref(),
+            )
+        })
+        .await;
+        let status = match observed {
+            Ok(Ok(Some(status))) => status,
+            Ok(Ok(None)) => {
+                tracing::error!(
+                    "Snapshot authority stays latched: this engine's session is no longer owned by this process"
+                );
+                return SessionCleanupReconciliation::Retained;
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    error_class =
+                        crate::session_retention::session_cleanup_database_error_class(&error),
+                    "Snapshot authority reconciliation could not re-read the database; retrying later"
+                );
+                return SessionCleanupReconciliation::Retained;
+            }
+            Err(_) => return SessionCleanupReconciliation::Retained,
+        };
+        if !self
+            .snapshot_authority
+            .clear_reconciliation_if(SnapshotAuthorityState::settled_session_cleanup)
+        {
+            return SessionCleanupReconciliation::Retained;
+        }
+        let retention_fenced = status.blocks_cleanup();
+        match status {
+            crate::session_retention::SessionCleanupAttemptStatus::Open { attempt_id, .. } => {
+                tracing::warn!(
+                    attempt_id = %attempt_id,
+                    remediation = "the attempt is no longer running; acknowledge it with `ft session acknowledge-cleanup <attempt> --force` to resume retention",
+                    "Snapshots resume after an interrupted session cleanup; retention stays paused until its attempt is acknowledged"
+                );
+            }
+            crate::session_retention::SessionCleanupAttemptStatus::Malformed => {
+                tracing::warn!(
+                    remediation = "inspect `ft session doctor` and acknowledge the malformed receipt to resume retention",
+                    "Snapshots resume after an interrupted session cleanup; retention stays paused behind a malformed cleanup receipt"
+                );
+            }
+            _ => {
+                tracing::info!(
+                    "Snapshots and retention resume after an interrupted session cleanup"
+                );
+            }
+        }
+        SessionCleanupReconciliation::Lifted { retention_fenced }
     }
 
     /// Acquire exclusive authority for an automatic cleanup attempt. A second
@@ -8124,6 +8698,50 @@ fn open_snapshot_query_conn(db_path: &str) -> std::result::Result<Connection, ru
     let conn = Connection::open_with_flags(db_path, flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// Durable re-read behind lifting a session-cleanup latch. The engine's own
+/// session, when it has one, must still be owned by this process, under the
+/// same predicate a checkpoint commit updates it with. `Ok(None)` means it is
+/// not, and the latch stays. Otherwise the cleanup receipt says whether
+/// retention stays fenced.
+fn observe_session_cleanup_reconciliation(
+    db_path: &str,
+    session_id: Option<&str>,
+    owner: Option<&crate::session_retention::SessionOwnerIdentity>,
+) -> std::result::Result<
+    Option<crate::session_retention::SessionCleanupAttemptStatus>,
+    rusqlite::Error,
+> {
+    let conn = open_snapshot_query_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    if let Some(session_id) = session_id {
+        let ours: bool = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM mux_sessions
+                 WHERE session_id = ?1
+                   AND (
+                       (?2 IS NULL AND owner_pid IS NULL
+                           AND owner_process_start IS NULL
+                           AND owner_heartbeat_at IS NULL)
+                       OR (host_id = ?2
+                           AND owner_pid = ?3
+                           AND owner_process_start = ?4)
+                   )
+             )",
+            rusqlite::params![
+                session_id,
+                owner.map(|identity| identity.host_id.as_str()),
+                owner.map(|identity| identity.pid),
+                owner.map(|identity| identity.process_start),
+            ],
+            |row| row.get(0),
+        )?;
+        if !ours {
+            return Ok(None);
+        }
+    }
+    crate::session_retention::session_cleanup_attempt_status(&tx).map(Some)
 }
 
 /// Re-read and recompute the complete persisted v2 snapshot witness. The
@@ -11851,7 +12469,6 @@ fn acquire_checkpoint_artifact_publication_lock(
     options
         .read(true)
         .write(true)
-        .create(true)
         .truncate(false)
         .follow(FollowSymlinks::No);
     #[cfg(unix)]
@@ -11860,7 +12477,8 @@ fn acquire_checkpoint_artifact_publication_lock(
 
         options.mode(0o600);
     }
-    let cap_file = parent.open_with(lock_leaf, &options)?;
+    // Concurrent `ft` processes create this lock together (ft-nd1c0).
+    let cap_file = crate::lock::open_or_create_exclusively(parent, lock_leaf, &options)?;
     let handle_metadata = cap_file.metadata()?;
     let path_metadata = parent.symlink_metadata(lock_leaf)?;
     let opened_snapshot =
@@ -13448,6 +14066,67 @@ mod tests {
 
     #[test]
     #[cfg(feature = "frankenterm-deps")]
+    fn publication_verifier_tells_the_store_which_rejections_are_superseded() {
+        use crate::session_restore::{
+            WholeMuxRecoveryError, WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+        };
+        use crate::snapshot_publication::RootVerifier;
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([24; 32]).unwrap());
+        let graph_verifier = || {
+            WholeMuxRecoveryVerifier::new_production(
+                Arc::clone(&key),
+                WholeMuxTrustedIdentityConfig::new([25; 32]),
+            )
+        };
+        let (current, predecessor) = (graph_verifier(), graph_verifier());
+        let expected = WholeMuxPublicationIdentity {
+            generation: 2,
+            session_id: "superseded-test".into(),
+            mux_incarnation_id: "00".repeat(16),
+            root_object_id: [25; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let cx = crate::cx::Cx::for_testing();
+        let verifier = WholeMuxPublicationVerifier {
+            cx: &cx,
+            expected: &expected,
+            current: &current,
+            predecessor: &predecessor,
+        };
+        // A committed root whose guardian member newer captures superseded
+        // must reach the store as such; the closure this replaced never did.
+        assert!(
+            verifier.superseded_by_newer(&WholeMuxPublicationVerifyError::Graph(
+                WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 1 }
+            ))
+        );
+        for error in [
+            WholeMuxPublicationVerifyError::Graph(
+                WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: 1,
+                    reason: "no authenticated guardian witness is installed".into(),
+                },
+            ),
+            WholeMuxPublicationVerifyError::Predecessor,
+            WholeMuxPublicationVerifyError::UnexpectedRole(3),
+        ] {
+            assert!(!verifier.superseded_by_newer(&error), "{error}");
+        }
+        // The store's rejection reason carries the graph error.
+        let shown = WholeMuxPublicationVerifyError::Graph(
+            WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 1 },
+        )
+        .to_string();
+        assert!(shown.contains("superseded for pane 1"), "{shown}");
+    }
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
     fn model_mux_capture_serializes_and_releases_prepublication_authority() {
         let mux = mux::Mux::new(None);
         let topology = mux.capture_topology_coherent(Default::default()).unwrap();
@@ -13511,7 +14190,9 @@ mod tests {
                 &expected,
                 Duration::from_secs(1),
             ),
-            Err(WholeMuxCaptureError::StaleCapture)
+            Err(WholeMuxCaptureError::StaleCapture(
+                "mux incarnation differs from the publication identity"
+            ))
         ));
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
@@ -13529,6 +14210,97 @@ mod tests {
         assert_eq!(receipt.generation, 1);
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    fn whole_mux_reconciliation_lifts_a_latch_only_over_cleanly_read_roots() {
+        use crate::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+            select_verified_recovery_roots_with_cx,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let mux = mux::Mux::new(None);
+        let topology = mux.capture_topology_coherent(Default::default()).unwrap();
+        let directory = checkpoint_artifact_test_directory();
+        let store = crate::snapshot_publication::SnapshotPublicationStore::open(
+            directory.path(),
+            Default::default(),
+        )
+        .unwrap();
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([31; 32]).unwrap());
+        let mut expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "reconciliation-test".into(),
+            mux_incarnation_id: hex::encode(topology.session_incarnation.as_bytes()),
+            root_object_id: [32; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let cx = crate::cx::Cx::for_testing();
+        let publish = |expected: &WholeMuxPublicationIdentity| {
+            capture_and_publish_whole_mux_recovery(
+                &cx,
+                &mux,
+                &store,
+                Arc::clone(&key),
+                expected,
+                Duration::from_secs(1),
+            )
+        };
+        let first = publish(&expected).unwrap();
+        let verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([32; 32]).with_session_id("reconciliation-test"),
+        );
+        assert!(!reconcile_whole_mux_publication_authority(&cx, &store, &verifier).unwrap());
+
+        // A publication whose outcome is unknown latches the authority.
+        let current = select_verified_recovery_roots_with_cx(&cx, &store, &verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        expected.generation = 2;
+        expected.predecessor = Some(crate::snapshot_publication::PredecessorBinding {
+            expected_generation: 1,
+            expected_hash: hex::encode(current.root_envelope_sha256()),
+        });
+        expected.predecessor_image_digest = Some(current.image().image_digest);
+        let authority = shared_snapshot_authority_state(store.root_path().to_str().unwrap());
+        authority.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+        assert!(matches!(
+            publish(&expected),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+
+        // A root that does not read cleanly keeps the latch.
+        let private = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&first.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            reconcile_whole_mux_publication_authority(&cx, &store, &verifier),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+        assert!(authority.reconciliation_is_required());
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        assert!(matches!(
+            publish(&expected),
+            Err(WholeMuxCaptureError::ReconciliationRequired)
+        ));
+
+        std::fs::set_permissions(&first.path, private).unwrap();
+        assert!(reconcile_whole_mux_publication_authority(&cx, &store, &verifier).unwrap());
+        assert!(!authority.reconciliation_is_required());
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        // A fresh lookup of the same store is no longer latched either.
+        assert!(
+            !shared_snapshot_authority_state(store.root_path().to_str().unwrap())
+                .reconciliation_is_required()
+        );
+        assert_eq!(publish(&expected).unwrap().generation, 2);
     }
 
     #[test]
@@ -13635,7 +14407,12 @@ mod tests {
         );
         assert!(reached_boundary.get());
         assert!(
-            matches!(result, Err(WholeMuxCaptureError::StaleCapture)),
+            matches!(
+                result,
+                Err(WholeMuxCaptureError::StaleCapture(
+                    "domains changed during capture"
+                ))
+            ),
             "{result:?}"
         );
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
@@ -13753,7 +14530,12 @@ mod tests {
             "capture must reach the actual ACK boundary"
         );
         assert!(
-            matches!(changed, Err(WholeMuxCaptureError::StaleCapture)),
+            matches!(
+                changed,
+                Err(WholeMuxCaptureError::StaleCapture(
+                    "a model pane changed after its checkpoint"
+                ))
+            ),
             "{changed:?}"
         );
         assert_eq!(owned.pane.get_title(), "A");
@@ -16772,17 +17554,18 @@ mod tests {
     }
 
     #[test]
-    fn session_cleanup_reconciliation_latch_survives_same_engine_scheduler_restart() {
+    fn session_cleanup_latch_survives_scheduler_restart_until_its_cleanup_returns() {
         run_async_test(async {
-            use crate::session_retention::{SessionCleanupError, SessionCleanupIndeterminatePhase};
-
-            let engine =
-                SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
-            assert!(engine.latch_session_cleanup_reconciliation(
-                SessionCleanupError::IndeterminateCleanup {
-                    phase: SessionCleanupIndeterminatePhase::CleanupExecution,
-                }
-            ));
+            let (_tmp, db_path) = setup_test_db();
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(db_path, config);
+            // A cleanup whose result was lost while its closure still runs.
+            let running_cleanup = Arc::new(AtomicU8::new(AUTHORITY_HANDOFF_STARTED));
+            engine.snapshot_authority.latch_attempt(
+                SnapshotAuthorityOperation::SessionRetentionCleanup,
+                &running_cleanup,
+            );
 
             // A restarted scheduler begins with fresh cadence state. The
             // engine-owned latch must still stop cleanup before touching that
@@ -16804,13 +17587,211 @@ mod tests {
                     .cleanup_pause_reported
                     .load(Ordering::Acquire)
             );
+            assert!(
+                engine
+                    .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                    .await
+                    .is_err(),
+                "a cleanup that may still commit keeps every mutation refused"
+            );
+
+            // Once the closure has returned, the next pass lifts the latch
+            // and cleanup runs again.
+            running_cleanup.store(AUTHORITY_HANDOFF_COMPLETED, Ordering::Release);
             engine
                 .maybe_run_session_cleanup(&cx, &mut restarted_scheduler_schedule)
                 .await;
-            assert_eq!(
-                restarted_scheduler_schedule,
-                SessionCleanupSchedule::default()
+            assert!(!engine.authority_reconciliation_is_required());
+            assert!(
+                restarted_scheduler_schedule
+                    .last_authoritative_success
+                    .is_some(),
+                "cleanup must run once the latch lifts"
             );
+        });
+    }
+
+    /// Simulate a cleanup that returned an indeterminate outcome after
+    /// admitting its durable receipt, as a busy database mid-pipeline does.
+    async fn interrupt_session_cleanup(engine: &SnapshotEngine, cx: &crate::cx::Cx) {
+        use crate::session_retention::{
+            SESSION_CLEANUP_ATTEMPT_KEY, SessionCleanupError, SessionCleanupIndeterminatePhase,
+        };
+
+        let db_path = Arc::clone(&engine.db_path);
+        let result = engine
+            .spawn_blocking_authority_with_cx(
+                cx,
+                SnapshotAuthorityOperation::SessionRetentionCleanup,
+                move || -> std::result::Result<(), SessionCleanupError> {
+                    let conn = Connection::open(db_path.as_str()).unwrap();
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS config (
+                             key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+                         )",
+                    )
+                    .unwrap();
+                    let open_receipt = serde_json::json!({
+                        "schema": "ft.session_cleanup_attempt.v1",
+                        "attempt_id": "interrupted-1",
+                        "state": "open",
+                        "owner_pid": std::process::id(),
+                        "started_at_ms": 1,
+                        "max_age_days": 30,
+                        "max_closed_sessions": 0,
+                        "max_total_size_mb": 0,
+                        "finished_at_ms": null,
+                        "sessions_deleted": null,
+                        "orphan_rows_deleted": null,
+                    });
+                    conn.execute(
+                        "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                        rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, open_receipt.to_string()],
+                    )
+                    .unwrap();
+                    Err(SessionCleanupError::IndeterminateCleanup {
+                        phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+                    })
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SnapshotError::IndeterminateAuthorityMutation {
+                operation: SnapshotAuthorityOperation::SessionRetentionCleanup,
+            })
+        ));
+        assert!(engine.authority_reconciliation_is_required());
+    }
+
+    #[test]
+    fn an_interrupted_session_cleanup_no_longer_stops_snapshots() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            let panes = vec![make_test_pane(1, 24, 80)];
+            let first = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect("first capture creates the session");
+
+            interrupt_session_cleanup(&engine, &cx).await;
+            assert!(matches!(
+                engine.capture(&panes, SnapshotTrigger::Manual).await,
+                Err(SnapshotError::AuthorityReconciliationRequired { .. })
+            ));
+
+            // The scheduler's next pass reconciles before it touches the
+            // database, so it keeps running instead of failing.
+            engine
+                .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                .await
+                .expect("a returned cleanup's latch lifts on the next pass");
+            assert!(!engine.authority_reconciliation_is_required());
+            let next = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect("snapshots resume in the same session");
+            assert_eq!(next.session_id, first.session_id);
+            assert!(next.checkpoint_id > first.checkpoint_id);
+
+            // The open receipt still fences retention for the operator.
+            let mut schedule = SessionCleanupSchedule::default();
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
+            assert!(schedule.last_authoritative_success.is_none());
+            assert!(!engine.authority_reconciliation_is_required());
+        });
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_reports_a_still_fenced_retention() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            interrupt_session_cleanup(&engine, &cx).await;
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Lifted {
+                    retention_fenced: true
+                }
+            );
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::NotLatched
+            );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_keeps_latches_it_cannot_prove() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+
+            // Another operation also lost its outcome.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            interrupt_session_cleanup(&engine, &cx).await;
+            engine
+                .snapshot_authority
+                .latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            assert!(engine.authority_reconciliation_is_required());
+
+            // The database's identity could not be proven.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            engine
+                .snapshot_authority
+                .latch_unproven_identity(SnapshotAuthorityOperation::SessionRetentionCleanup);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+
+            // Exclusive admission is held elsewhere.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            interrupt_session_cleanup(&engine, &cx).await;
+            engine
+                .snapshot_authority
+                .in_progress
+                .store(true, Ordering::Release);
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            engine
+                .snapshot_authority
+                .in_progress
+                .store(false, Ordering::Release);
+
+            // The engine's own session no longer belongs to this process.
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(Arc::clone(&db_path), SnapshotConfig::default());
+            let captured = engine
+                .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+                .await
+                .expect("capture creates the session");
+            interrupt_session_cleanup(&engine, &cx).await;
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .execute(
+                    "UPDATE mux_sessions
+                     SET host_id = 'elsewhere', owner_pid = 4242424, owner_process_start = 1
+                     WHERE session_id = ?1",
+                    [&captured.session_id],
+                )
+                .unwrap();
+            assert_eq!(
+                engine.reconcile_session_cleanup_latch(&cx).await,
+                SessionCleanupReconciliation::Retained
+            );
+            assert!(engine.authority_reconciliation_is_required());
         });
     }
 
@@ -17501,11 +18482,14 @@ mod tests {
             .unwrap();
             assert_eq!(automatic_receipt.complete_pane_count, 1);
 
+            // The bound only stops a hung test; this one checks prefix links,
+            // not the shutdown budget, and a saturated worker took 3.4 s to
+            // commit the checkpoint alone.
             let shutdown = engine
                 .shutdown_checkpoint_with_cx(
                     &cx,
                     &[make_test_pane(1, 30, 100)],
-                    Duration::from_secs(5),
+                    Duration::from_secs(60),
                 )
                 .await
                 .expect("shutdown capture must settle");
@@ -22189,7 +23173,9 @@ mod tests {
     /// message shape as the assertion it replaces, so a genuine "capture did not
     /// happen" bug still reports clearly rather than timing out silently.
     async fn await_checkpoint_count(db_path: &str, expected: i64, label: &str) {
-        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        // Only a failing test waits this long; a saturated full-suite worker
+        // has needed more than 10 s for a startup capture plus one more.
+        const WAIT_BUDGET: Duration = Duration::from_secs(60);
         const POLL_STEP: Duration = Duration::from_millis(20);
 
         let deadline = Instant::now() + WAIT_BUDGET;
@@ -22210,7 +23196,7 @@ mod tests {
     /// scheduler has received the blocking result and released mutation
     /// authority, so database visibility alone is not a settlement signal.
     async fn await_capture_successes(engine: &SnapshotEngine, expected: u64, label: &str) {
-        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        const WAIT_BUDGET: Duration = Duration::from_secs(60);
         const POLL_STEP: Duration = Duration::from_millis(20);
 
         let deadline = Instant::now() + WAIT_BUDGET;
@@ -22287,7 +23273,7 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // 3 x WorkCompleted = 6.0 >= 5.0
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
@@ -22926,7 +23912,7 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // Fire 5 WorkCompleted triggers (5 x 2.0 = 10.0) as fast as possible
             for _ in 0..5 {
@@ -24215,5 +25201,203 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         saturating_telemetry_add(&counter, 1);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    #[test]
+    fn a_printing_guardian_pane_keeps_its_topology_cut_but_a_model_pane_does_not() {
+        let size = frankenterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let binding = |spawn_custody| mux::MuxCapturedPaneBinding {
+            pane_id: 1,
+            pane_uuid: uuid::Uuid::from_u128(1).to_string(),
+            spawn_custody,
+            registration_wire_identity: [7; 16],
+            domain_id: 0,
+            domain_name: "local".into(),
+            window_id: 0,
+            tab_id: 0,
+            lane: mux::MuxCapturedPaneLane::Tiled,
+            title: "before".into(),
+            cwd: Some("/before".into()),
+            size,
+            alt_screen_active: false,
+            cursor_pos: (0, 1),
+            is_active_in_tab: true,
+            is_zoomed_in_tab: false,
+        };
+        let provenance = mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+            original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+                broker_lineage: uuid::Uuid::from_u128(11),
+                guardian_incarnation: uuid::Uuid::from_u128(12),
+                mux_incarnation: uuid::Uuid::from_u128(13),
+                broker_build: [0; 32],
+                guardian_build: [0; 32],
+                mux_build: [0; 32],
+                pane_id: uuid::Uuid::from_u128(1),
+                effect_id: uuid::Uuid::from_u128(14),
+            },
+            current_mux_incarnation: uuid::Uuid::from_u128(13),
+            current_lease_generation: 1,
+            acknowledged_successor: None,
+        };
+        // What printing changes: title, directory, cursor and screen.
+        let printed = |mut pane: mux::MuxCapturedPaneBinding| {
+            pane.title = "after".into();
+            pane.cwd = Some("/after".into());
+            pane.cursor_pos = (5, 9);
+            pane.alt_screen_active = true;
+            pane
+        };
+
+        let guardian = binding(Some(provenance));
+        assert!(pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[printed(guardian.clone())]
+        ));
+        let model = binding(None);
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&model),
+            &[printed(model.clone())]
+        ));
+
+        // A resize or a move is structural for every pane.
+        let mut resized = guardian.clone();
+        resized.size.cols = 120;
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[resized]
+        ));
+        let mut moved = guardian.clone();
+        moved.tab_id = 3;
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[moved]
+        ));
+        assert!(!pane_bindings_agree(std::slice::from_ref(&guardian), &[]));
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    #[test]
+    fn a_printing_guardian_pane_keeps_its_tab_cut_but_a_model_pane_does_not() {
+        let size = frankenterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let provenance = mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+            original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+                broker_lineage: uuid::Uuid::from_u128(21),
+                guardian_incarnation: uuid::Uuid::from_u128(22),
+                mux_incarnation: uuid::Uuid::from_u128(23),
+                broker_build: [0; 32],
+                guardian_build: [0; 32],
+                mux_build: [0; 32],
+                pane_id: uuid::Uuid::from_u128(0),
+                effect_id: uuid::Uuid::from_u128(24),
+            },
+            current_mux_incarnation: uuid::Uuid::from_u128(23),
+            current_lease_generation: 1,
+            acknowledged_successor: None,
+        };
+        // Pane 0 is guardian-owned, pane 1 model-only; one tab each.
+        let pane_bindings = (0..2_usize)
+            .map(|index| mux::MuxCapturedPaneBinding {
+                pane_id: index,
+                pane_uuid: uuid::Uuid::from_u128(index as u128).to_string(),
+                spawn_custody: (index == 0).then_some(provenance),
+                registration_wire_identity: [index as u8; 16],
+                domain_id: 0,
+                domain_name: "local".into(),
+                window_id: 0,
+                tab_id: index,
+                lane: mux::MuxCapturedPaneLane::Tiled,
+                title: String::new(),
+                cwd: None,
+                size,
+                alt_screen_active: false,
+                cursor_pos: (0, 0),
+                is_active_in_tab: true,
+                is_zoomed_in_tab: false,
+            })
+            .collect();
+        let tabs = (0..2_usize)
+            .map(|index| mux::MuxCapturedTab {
+                tab_id: index,
+                durable_tab_id: uuid::Uuid::from_u128(100 + index as u128),
+                window_id: 0,
+                title: String::new(),
+                size,
+                size_before_zoom: size,
+                active_pane_id: Some(index),
+                zoomed_pane_id: None,
+                split_tree: mux::tab::PaneNode::Leaf(mux::tab::PaneEntry {
+                    window_id: 0,
+                    tab_id: index,
+                    pane_id: index,
+                    title: String::new(),
+                    size,
+                    working_dir: None,
+                    alt_screen_active: false,
+                    is_active_pane: true,
+                    is_zoomed_pane: false,
+                    workspace: "default".into(),
+                    cursor_pos: Default::default(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: None,
+                }),
+                floating_panes: vec![],
+                floating_focus: None,
+                pane_stacks: vec![],
+                underlying_tiled_active_pane_id: Some(index),
+                runtime_state: Default::default(),
+            })
+            .collect();
+        let captured = mux::MuxCapturedTopology {
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([3; 16]),
+            default_domain_id: Some(0),
+            domains: vec![],
+            topology_revision: mux::TopologyRevision::new(1),
+            captured_at_epoch_ms: 1,
+            client_workspace: None,
+            default_workspace: "default".into(),
+            workspaces: vec![],
+            windows: vec![],
+            tabs,
+            pane_bindings,
+        };
+        // What printing changes in a pane's split-tree leaf.
+        let printed = |pane_id: usize| {
+            let mut topology = captured.clone();
+            let mux::tab::PaneNode::Leaf(entry) = &mut topology.tabs[pane_id].split_tree else {
+                unreachable!("fixture tabs are single leaves");
+            };
+            entry.title = "printed".into();
+            entry.alt_screen_active = true;
+            entry.physical_top = 40;
+            entry.top_row = 40;
+            topology
+        };
+        assert_eq!(topology_change(&captured, &printed(0)), None);
+        assert_eq!(
+            topology_change(&captured, &printed(1)),
+            Some("tabs changed during capture")
+        );
+        // A resize stays structural for the guardian pane too.
+        let mut resized = captured.clone();
+        resized.tabs[0].size.cols = 120;
+        assert_eq!(
+            topology_change(&captured, &resized),
+            Some("tabs changed during capture")
+        );
     }
 }

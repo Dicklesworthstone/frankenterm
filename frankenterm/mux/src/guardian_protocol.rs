@@ -104,6 +104,18 @@ const REPLAY_ACK_REPLY_MAGIC: [u8; 4] = *b"GAR1";
 const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
 const HELLO_BUILD_IDENTITY_PAYLOAD_BYTES: usize = 40;
+// Bits of a build-bearing Hello's byte 5, each a capability the mux requires.
+// A guardian refuses a bit it does not know; the first decoder refused all.
+const HELLO_REQUIRES_SUCCESSOR_ROTATION: u8 = 1;
+const HELLO_REQUIRES_COMPACT_CHECKPOINTS: u8 = 2;
+const HELLO_REQUIRES_GRAPHICS_CHECKPOINTS: u8 = 4;
+const HELLO_REQUIRES_PROTECTION_CHECKPOINTS: u8 = 8;
+const HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS: u8 = 16;
+const HELLO_KNOWN_REQUIREMENTS: u8 = HELLO_REQUIRES_SUCCESSOR_ROTATION
+    | HELLO_REQUIRES_COMPACT_CHECKPOINTS
+    | HELLO_REQUIRES_GRAPHICS_CHECKPOINTS
+    | HELLO_REQUIRES_PROTECTION_CHECKPOINTS
+    | HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
 const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;
@@ -1189,14 +1201,59 @@ impl GuardianHelloBuildIdentityV1 {
     #[must_use]
     pub fn encode_requiring_successor_rotation(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
         let mut payload = self.encode();
-        payload[5] = 1;
+        payload[5] |= HELLO_REQUIRES_SUCCESSOR_ROTATION;
+        payload
+    }
+
+    /// Require that the guardian validate version 4 (compact) terminal
+    /// checkpoints. A guardian predating them rejects this reserved bit, so
+    /// an accepted Hello is the mux's only evidence that it may publish them.
+    #[must_use]
+    pub fn encode_requiring_compact_checkpoints(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_COMPACT_CHECKPOINTS;
+        payload
+    }
+
+    /// Require that the guardian validate terminal checkpoints holding
+    /// graphics state (images in cells, Kitty state). A guardian predating
+    /// them rejects this reserved bit, so an accepted Hello is the mux's
+    /// only evidence that it may publish them.
+    #[must_use]
+    pub fn encode_requiring_graphics_checkpoints(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_GRAPHICS_CHECKPOINTS;
+        payload
+    }
+
+    /// Require that the guardian validate terminal checkpoints holding
+    /// character protection (DECSCA, SPA), as for graphics checkpoints.
+    #[must_use]
+    pub fn encode_requiring_protection_checkpoints(
+        self,
+    ) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_PROTECTION_CHECKPOINTS;
+        payload
+    }
+
+    /// Require a build that reads durable scrollback rows showing images in
+    /// their own schema (each image once per row), as for graphics
+    /// checkpoints: a mux writes them only for such a guardian, so every mux
+    /// that reads its store, the guardian's family or later, decodes them.
+    #[must_use]
+    pub fn encode_requiring_image_scrollback_rows(
+        self,
+    ) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS;
         payload
     }
 
     fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
         if payload.len() != HELLO_BUILD_IDENTITY_PAYLOAD_BYTES
             || payload.get(..4) != Some(HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC.as_slice())
-            || payload[5] > 1
+            || payload[5] & !HELLO_KNOWN_REQUIREMENTS != 0
             || payload[6..8].iter().any(|byte| *byte != 0)
         {
             return Err(GuardianProtocolError::InvalidOperationPayload);
@@ -1787,6 +1844,18 @@ impl GuardianCheckpointEffectIdentity {
     const fn intent(self) -> GuardianCheckpointIntent {
         self.intent
     }
+}
+
+/// How a catalog adoption under
+/// [`GuardianProtocolState::apply_checkpoint_transactionally_or_refuse`]
+/// failed.
+#[derive(Debug)]
+pub enum GuardianCheckpointPublicationFailure<E> {
+    /// Refused before anything durable was written: the request fails with
+    /// no effect recorded, and its exact retry is a fresh attempt.
+    Refused(E),
+    /// The durable outcome is unknown: the effect is recorded indeterminate.
+    Indeterminate(E),
 }
 
 /// Nonconstructible catalog-publication authority issued only after the
@@ -9852,6 +9921,28 @@ impl GuardianProtocolState {
         request: &AuthenticatedGuardianRequest,
         publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
     ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        self.apply_checkpoint_transactionally_or_refuse(request, |permit| {
+            publish(permit).map_err(GuardianCheckpointPublicationFailure::Indeterminate)
+        })
+    }
+
+    /// [`Self::apply_checkpoint_transactionally`] whose callback may also
+    /// refuse: [`GuardianCheckpointPublicationFailure::Refused`] says the
+    /// publication made nothing durable (the guardian's catalog had no room),
+    /// so no effect, receipt or sequence is installed and the request fails
+    /// with [`GuardianProtocolError::CapacityExhausted`]. Its exact retry is
+    /// then a fresh attempt. An indeterminate outcome quarantines the mux's
+    /// lease; a full catalog after a restore is neither indeterminate nor
+    /// lasting, since reclamation resumes once the restore's replay settles.
+    /// An exact replay of an indeterminate publication treats a refusal as
+    /// one more failed reconciliation.
+    pub fn apply_checkpoint_transactionally_or_refuse<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        publish: impl FnOnce(
+            GuardianCheckpointCatalogAdoptionPermitV1,
+        ) -> Result<(), GuardianCheckpointPublicationFailure<E>>,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
         validate_request_envelope(request)?;
         if request.header.guardian_incarnation != self.incarnation {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch);
@@ -10011,7 +10102,15 @@ impl GuardianProtocolState {
         );
         let disposition = match publication {
             Ok(Ok(())) => GuardianCheckpointDisposition::Committed,
-            Ok(Err(error)) => {
+            Ok(Err(GuardianCheckpointPublicationFailure::Refused(error))) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                // Nothing below has run: the state is as before the request.
+                return Err(GuardianProtocolError::CapacityExhausted);
+            }
+            Ok(Err(GuardianCheckpointPublicationFailure::Indeterminate(error))) => {
                 let _ = catch_recoverable(
                     RecoverablePanicSite::MuxPaneCallback,
                     AssertUnwindSafe(|| drop(error)),
@@ -10234,7 +10333,9 @@ impl GuardianProtocolState {
     fn reconcile_checkpoint_publication<E>(
         &mut self,
         identity: GuardianCheckpointEffectIdentity,
-        publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
+        publish: impl FnOnce(
+            GuardianCheckpointCatalogAdoptionPermitV1,
+        ) -> Result<(), GuardianCheckpointPublicationFailure<E>>,
     ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
         let stored = self
             .effects
@@ -13823,6 +13924,61 @@ mod tests {
     }
 
     #[test]
+    fn compact_checkpoints_are_an_explicit_hello_requirement() {
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x52)),
+        );
+        let ordinary = hello.encode();
+        let compact = hello.encode_requiring_compact_checkpoints();
+        assert_eq!(compact[5], 2);
+        assert_eq!(compact[..5], ordinary[..5]);
+        assert_eq!(compact[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&compact).is_ok());
+        // Guardians predating compact checkpoints refused a byte 5 above 1.
+        assert!(compact[5] > 1);
+        let mut both = hello.encode_requiring_successor_rotation();
+        both[5] |= compact[5];
+        assert!(GuardianHelloBuildIdentityV1::decode(&both).is_ok());
+        both[5] |= 32;
+        assert!(GuardianHelloBuildIdentityV1::decode(&both).is_err());
+    }
+
+    #[test]
+    fn graphics_checkpoints_are_an_explicit_hello_requirement() {
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x53)),
+        );
+        let ordinary = hello.encode();
+        let graphics = hello.encode_requiring_graphics_checkpoints();
+        assert_eq!(graphics[5], 4);
+        assert_eq!(graphics[..5], ordinary[..5]);
+        assert_eq!(graphics[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&graphics).is_ok());
+        // Guardians predating graphics checkpoints knew bits 1 and 2 only.
+        assert_ne!(graphics[5] & !3, 0);
+        let protection = hello.encode_requiring_protection_checkpoints();
+        assert_eq!(protection[5], 8);
+        assert_eq!(protection[..5], ordinary[..5]);
+        assert_eq!(protection[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&protection).is_ok());
+        // Guardians predating protection checkpoints knew bits 1, 2 and 4.
+        assert_ne!(protection[5] & !7, 0);
+        let rows = hello.encode_requiring_image_scrollback_rows();
+        assert_eq!(rows[5], 16);
+        assert_eq!(rows[..5], ordinary[..5]);
+        assert_eq!(rows[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&rows).is_ok());
+        // Guardians predating image scrollback rows knew bits 1, 2, 4 and 8.
+        assert_ne!(rows[5] & !15, 0);
+        let mut all = hello.encode_requiring_successor_rotation();
+        all[5] |=
+            hello.encode_requiring_compact_checkpoints()[5] | graphics[5] | protection[5] | rows[5];
+        assert!(GuardianHelloBuildIdentityV1::decode(&all).is_ok());
+        all[5] |= 32;
+        assert!(GuardianHelloBuildIdentityV1::decode(&all).is_err());
+    }
+
+    #[test]
     fn successor_rotation_requires_exact_payload_and_explicit_hello_extension() {
         let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
             AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
@@ -13835,7 +13991,7 @@ mod tests {
         // Hello remains byte-for-byte unchanged; requiring the extension cannot
         // be mistaken for an ordinary connection by a historical guardian.
         assert!(extended[5..8].iter().any(|byte| *byte != 0));
-        extended[5] = 2;
+        extended[5] = 32;
         assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_err());
         for generation in [1, 2, 3, u64::MAX] {
             for delta in [-1_isize, 0, 1] {
@@ -14693,6 +14849,57 @@ mod tests {
             Err(GuardianProtocolError::EffectIdentityConflict)
         );
         assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn refused_checkpoint_records_nothing_and_its_exact_retry_commits() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let checkpoint = checkpoint_request(guardian, mux, pane, 1, 1, 8, 9, 0x61, 0x62);
+        let authenticated_checkpoint = authenticate(&checkpoint);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
+        let claimed = |state: &GuardianProtocolState, next: u64| {
+            matches!(
+                state.pane_state(pane),
+                Some(GuardianPaneState::LiveClaimed {
+                    generation: 1,
+                    mux_incarnation,
+                    next_sequence,
+                    pending_input_effect: None,
+                }) if *mux_incarnation == mux && *next_sequence == next
+            )
+        };
+
+        let invocations = std::cell::Cell::new(0_usize);
+        let refuse = |_| {
+            invocations.set(invocations.get() + 1);
+            Err(GuardianCheckpointPublicationFailure::Refused(
+                "catalog-full",
+            ))
+        };
+        let refused =
+            state.apply_checkpoint_transactionally_or_refuse(&authenticated_checkpoint, refuse);
+        assert_eq!(refused, Err(GuardianProtocolError::CapacityExhausted));
+        assert_eq!(invocations.get(), 1);
+        // No effect, receipt or sequence was installed.
+        assert!(claimed(&state, 1));
+
+        let receipt = state
+            .apply_checkpoint_transactionally_or_refuse(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), GuardianCheckpointPublicationFailure<&str>>(())
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 2);
+        assert_eq!(
+            receipt.disposition(),
+            GuardianCheckpointDisposition::Committed
+        );
+        assert_eq!(receipt.sequence(), 1);
+        assert!(claimed(&state, 2));
     }
 
     #[test]

@@ -1,0 +1,29 @@
+[package]
+name = "frankenterm-mobile-mux"
+description = "The iPhone's FrankenTerm mux client: the desktop's mux protocol (codec v46/v47 and the current window) as a sans-IO state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+leb128.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+# The mux server's cells serialize with `use_image` on: without it a cell
+# with true colors or a hyperlink decodes one field short.
+termwiz = { workspace = true, features = ["use_serde", "use_image"] }
+thiserror.workspace = true
+varbincode.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+# The desktop's own codec is the reference every frame here is checked against.
+codec = { workspace = true, features = ["async-asupersync"] }
+frankenterm-term = { workspace = true, features = ["use_serde"] }
+mux.workspace = true

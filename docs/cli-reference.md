@@ -8,7 +8,7 @@ Use it as the command-truth companion to:
 - `docs/ft-xbnl0-4-6-completion-evidence.md`
 - `docs/ft-xbnl0-5-7-completion-evidence.md`
 
-Commands marked as feature-gated require building with the corresponding feature.
+Commands marked as feature-gated sit behind a Cargo feature. The `ft` binary enables all of the ones named here by default, so they only need re-enabling in a `--no-default-features` build.
 
 ## Human CLI (implemented)
 
@@ -24,7 +24,7 @@ ft get-text <pane_id> [--tail <n>] [--escapes]
 ```
 
 Distributed mode notes:
-- With `--features distributed` and `[distributed].enabled = true`, `ft watch` also acts as the aggregator listener.
+- With `[distributed].enabled = true` (and the default `distributed` feature), `ft watch` also acts as the aggregator listener.
 - Remote agents connect with `ft distributed agent --connect <host:port> --agent-id <name>`.
 - Aggregated remote panes are persisted into the same DB and surface through `ft status`, `ft search`, `ft robot state`, MCP `wa.state`, and `wa://panes`.
 
@@ -108,13 +108,31 @@ ft mission explain [--mission-file <path>] [--assignment-id <id>] [-f <plain|jso
 ft mission pause [--mission-file <path>] [--reason <text>] [-f <plain|json>]
 ft mission resume [--mission-file <path>] [-f <plain|json>]
 ft mission abort [--mission-file <path>] [--reason <text>] [-f <plain|json>]
-ft steer plan --objective <text> --scenario <clean-ready|dirty-overlap|rch-blocked|approval-required|capacity-red> [--workspace-id <id>] [--ttl-ms <n>] [-f <plain|json>]
-ft steer run --receipt <steer:id> [--mission-file <path>] [--plan-hash <hash>] [-f <plain|json>]
+ft steer plan --objective <text> --scenario <clean-ready|dirty-overlap|rch-blocked|approval-required|capacity-red> [--workspace-id <id>] [--ttl-ms <n>] [--contract-file <path>] [-f <plain|json>]
+ft steer run --receipt <steer:id> [--contract-file <path>] [--mission-file <path>] [--plan-hash <hash>] [--fail-step <step-id>] [--paused] [--kill-switch <level>] [--dry-run] [-f <plain|json>]
 ```
 
-Transaction-contract control is currently surfaced under robot mode as
-`ft robot tx plan|run|rollback|show`; the top-level human CLI does not expose
-`ft tx` today.
+`ft steer plan` binds the receipt to a transaction contract: `--contract-file`,
+or `.ft/mission/tx-active.json` when it exists. A receipt planned without a
+contract is planning-only, and `ft steer run` refuses it with a hint to re-plan.
+`ft steer run` checks the receipt before the run starts and again before every
+step it dispatches. The receipt must belong to this workspace, be unexpired,
+and match the contract being run (and the `--mission-file` mission, if the
+receipt bound one). A receipt that expires mid-run, or a mission edited mid-run,
+stops the remaining steps. Each run appends an attachment to the contract with
+an `attempt` number, so repeated runs of one receipt can be told apart.
+
+Transaction-contract control is available to humans and robots alike:
+
+```bash
+ft tx plan [--contract-file <path>] [-f <plain|json>]
+ft tx run [--contract-file <path>] [--fail-step <step>] [--paused] [--kill-switch <level>] [--dry-run] [-f <plain|json>]
+ft tx rollback [--contract-file <path>] [--fail-compensation-for-step <step>] [-f <plain|json>]
+ft tx show [--contract-file <path>] [--include-contract] [-f <plain|json>]
+```
+
+The contract defaults to `.ft/mission/tx-active.json` in the workspace. Robot
+callers use the same subcommands as `ft robot tx plan|run|rollback|show`.
 
 ### Proof queue and deferred replay
 
@@ -149,8 +167,18 @@ ft doctor
 ft doctor --json
 ft diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
 ft reproduce export [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
-ft reproduce replay <bundle_dir> [--mode <full|policy|rules>]
+ft reproduce replay <bundle_dir> [--mode <policy|rules>]   # default policy
 ```
+
+`ft doctor` includes a `submit idempotency store` row for the store kept
+beside the database: record and logical-byte occupancy, per-state counts
+(completed, retryable, active, effect pending, in doubt), how many settled rows
+are already evictable, and the age of the oldest unresolved send. It never
+creates the store or changes a record, and prints no keys, panes, or receipts. A store at its ceiling is normal while eviction can reclaim
+it; the row warns when three quarters is pinned by unresolved or recent rows and
+errors when a new idempotency key would be refused with `capacity_exceeded`.
+In-doubt keys never resolve on their own: the row names MCP `wa.send` with
+`reconcile` (`settle` or `abandon`, see the MCP API spec) whenever any exist.
 
 ### Session persistence and forensic export
 
@@ -184,7 +212,7 @@ retains the lock inode to preserve one flock authority.
 
 ### Web server and streaming API
 
-Requires `--features web`.
+Behind the `web` feature, which is on by default.
 
 ```bash
 ft web [--port <n>]
@@ -236,7 +264,8 @@ ft setup [--list-hosts] [--dry-run] [--apply]
 ft setup local
 ft setup remote <host> [--yes] [--install-ft \
   (--ft-version <release-tag> | \
-   --ft-path <target-ft> --mux-server-path <target-mux-server>) \
+   --ft-path <target-ft> --mux-server-path <target-mux-server> \
+   --guardian-path <target-pty-guardian>) \
   --transaction-id <32-lowercase-hex>]
 ft setup config
 ft setup patch [--remove]
@@ -250,6 +279,30 @@ ft config set <key> <value> [--dry-run]
 ft config export [-o <path>] [--json]
 ft config import <path> [--dry-run] [--replace] [--yes]
 ```
+
+```bash
+ft mobile init [<ssh-alias>...] [--inventory <path>]
+ft mobile show [--inventory <path>]
+ft mobile export [--group <id>] [--inventory <path>] [-o <file.ftworkspace>] [--check]
+ft mobile source [--inventory <path>]
+ft mobile themes [-o <path>]
+```
+
+`machines.toml` (in the FrankenTerm config directory) lists each machine once:
+its name, icon, routes (`ssh` alias, direct `host`/`user`/`identity_file`, or a
+`frankenterm_mux` route `via` those) and its theme (a built-in `scheme`, color
+overrides, an `accent`, a desktop background gradient). `frankenterm.lua` reads
+it with `frankenterm.machines()`; a machine without a theme gets one of twelve
+distinct hue themes no other machine uses. `init` writes a first inventory from
+`~/.ssh/config`, each host pinned to its own theme, and refuses to overwrite.
+`export` writes the iPhone workspace (direct SSH routes, public-key references
+and `known_hosts` pins; never private keys) and reports on stderr what stayed
+behind, such as mux routes and ProxyJump hosts. `source` prints what the Mac
+companion loads at launch: that workspace for every group plus the private-key
+file behind each credential (the identities the desktop's ssh uses, OpenSSH's
+defaults when a route names none), as paths only. The companion bundles the
+same output as the `frankenterm-machines` helper. `themes` writes the catalog
+the iPhone app bundles.
 
 An applied remote `--install-ft` requires a caller-chosen stable transaction ID;
 reuse that exact ID after timeout or lost acknowledgement. The current command
@@ -280,7 +333,7 @@ ft auth bootstrap <service> [--account <name>] [--timeout-secs <1..=1800>]
 ```
 
 Notes:
-- `ft auth` requires the `browser` feature to enable Playwright-based flows.
+- `ft auth` uses the `browser` feature (on by default) for Playwright-based flows.
 - `ft auth test` validates bounded local runtime/profile/storage-state evidence;
   it does not launch a browser or prove that a remote service still accepts the
   persisted credentials.
@@ -292,10 +345,10 @@ Notes:
 ## Feature-gated commands
 
 ```bash
-ft tui          # requires --features tui
-ft mcp serve    # requires --features mcp
-ft web          # requires --features web; serves HTTP + SSE `/stream/*`
-ft sync         # requires --features sync
+ft tui          # feature tui or ftui (ftui is on by default)
+ft mcp serve    # feature mcp (on by default)
+ft web          # feature web (on by default); serves HTTP + SSE `/stream/*`
+ft sync status  # feature sync (on by default)
 ```
 
 ## Robot mode (stable JSON/TOON)
@@ -450,7 +503,19 @@ selects `write`, `composer`, `submitted`, or `working`. The receipt records the
 submission state, requested guarantee level, `guarantee_met`, verification
 polls, elapsed time, evidence rule IDs, and idempotency key persisted as the
 audit `correlation_id`; replay it with
-`ft audit --correlation-id <idempotency_key>`.
+`ft audit --correlation-id <idempotency_key>`. In the long-running processes
+(MCP `wa.send`, workflow `send_verified` in the watcher) every freshly built
+receipt is also logged as a
+`frankenterm::verified_submit` tracing event with `pane_id`, `agent_type`,
+`profile_id`, `profile_version`, `state`, `guarantee_level`, `guarantee_met`,
+`elapsed_ms`, `polls`, and `attempts`, never the sent text or the idempotency
+key; `ft watch --metrics` counts the watcher's receipts as
+`verified_submit_receipts_total{agent_type,state}`. It also exports the
+idempotency store's backlog from a census the watcher takes every 5 minutes:
+`verified_submit_idempotency_keys{state}`,
+`verified_submit_idempotency_census_age_seconds` (how old that census is)
+and, while any key is unresolved,
+`verified_submit_idempotency_oldest_unresolved_age_seconds`.
 
 `ft robot health` includes an `active_agents` snapshot for operator
 convergence polling. The snapshot is bounded and evidence-linked; unavailable
@@ -488,31 +553,27 @@ Policy/redaction:
 
 MCP tools mirror robot mode. See `docs/mcp-api-spec.md` and `docs/json-schema/` for details.
 
-Tools (tool IDs currently still use the `wa.*` prefix):
-- wa.state
-- wa.get_text
-- wa.send
-- wa.wait_for
-- wa.search
-- wa.events
-- wa.events_annotate
-- wa.events_triage
-- wa.events_label
-- wa.workflow_run
-- wa.accounts
-- wa.accounts_refresh
-- wa.rules_list
-- wa.rules_test
-- wa.rules_show
-- wa.rules_lint
-- wa.reserve
-- wa.release
-- wa.reservations
-- wa.approve
-- wa.why
-- wa.workflow_list
-- wa.workflow_status
-- wa.workflow_abort
+Tools (tool IDs currently still use the `wa.*` prefix), as registered in
+`mcp_bridge.rs`. Always available, including in degraded mode without a
+workspace database:
+- wa.state, wa.get_text, wa.wait_for
+- wa.rules_list, wa.rules_test
+- wa.cass_search, wa.cass_view, wa.cass_status
+- wa.tx_plan, wa.tx_show
+- wa.attention, wa.rehearsal_score, wa.operating_envelope
+- wa.mission_objective_plan, wa.mission_state, wa.mission_explain, wa.steer_plan
+
+Registered only with a workspace database (audited handlers):
+- wa.dom, wa.search, wa.events, wa.await_event
+- wa.events_annotate, wa.events_triage, wa.events_label
+- wa.reservations, wa.reserve, wa.release
+- wa.send, wa.workflow_run, wa.workflow_status
+- wa.accounts, wa.accounts_refresh
+- wa.tx_run, wa.tx_rollback
+- wa.mission_pause, wa.mission_resume, wa.mission_abort
+
+There are no MCP tools for rule details or linting, approvals, `why`, or
+workflow listing and abort; use the robot CLI for those.
 
 Resources (resource URIs currently still use the `wa://` scheme):
 - wa://panes

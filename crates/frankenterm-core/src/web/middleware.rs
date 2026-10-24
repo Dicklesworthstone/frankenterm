@@ -8,7 +8,8 @@ use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
 use crate::web_framework::{
-    BoxFuture, ControlFlow, Middleware, Request, RequestContext, Response, StatusCode,
+    BoxFuture, ControlFlow, FrameworkRequestBody, Middleware, PreBodyValidator, Request,
+    RequestContext, Response, StatusCode,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -92,14 +93,19 @@ impl Middleware for StateInjector {
     }
 }
 
-/// Rejects requests whose Content-Length exceeds the configured web body limit.
+/// Rejects decoded bodies and declared lengths above the configured body cap.
+///
+/// The pinned framework buffers bodies before its admission hook, and its
+/// parser's total-request allowance includes space for headers. That allowance
+/// must not become extra body capacity for chunked requests. Checking the
+/// actual body also protects routes that never invoke a body extractor.
 #[derive(Clone)]
-pub(super) struct BodySizeGuard {
+pub struct BodySizeGuard {
     max_request_body_bytes: usize,
 }
 
 impl BodySizeGuard {
-    pub(super) fn new(max_request_body_bytes: usize) -> Self {
+    pub(crate) fn new(max_request_body_bytes: usize) -> Self {
         Self {
             max_request_body_bytes,
         }
@@ -112,29 +118,50 @@ impl Default for BodySizeGuard {
     }
 }
 
+impl PreBodyValidator for BodySizeGuard {
+    fn validate(&self, req: &Request) -> std::result::Result<(), Response> {
+        let declared_length = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        let body_length = match req.body() {
+            FrameworkRequestBody::Empty => Some(0),
+            FrameworkRequestBody::Bytes(bytes) => Some(bytes.len()),
+            FrameworkRequestBody::Stream { content_length, .. } => *content_length,
+        };
+        if let Some(length) = declared_length
+            .into_iter()
+            .chain(body_length)
+            .find(|length| *length > self.max_request_body_bytes)
+        {
+            let max_request_body_bytes = self.max_request_body_bytes;
+            return Err(json_err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                format!("Request body too large ({length} bytes); max is {max_request_body_bytes}"),
+            )
+            .header("connection", b"close".to_vec()));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "BodySizeGuard"
+    }
+}
+
 impl Middleware for BodySizeGuard {
     fn before<'a>(
         &'a self,
         _ctx: &'a RequestContext,
         req: &'a mut Request,
     ) -> BoxFuture<'a, ControlFlow> {
-        if let Some(cl) = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            if cl > self.max_request_body_bytes {
-                let max_request_body_bytes = self.max_request_body_bytes;
-                let resp = json_err(
-                    StatusCode::BAD_REQUEST,
-                    "body_too_large",
-                    format!("Request body too large ({cl} bytes); max is {max_request_body_bytes}"),
-                );
-                return Box::pin(async move { ControlFlow::Break(resp) });
-            }
-        }
-        Box::pin(async { ControlFlow::Continue })
+        let decision = match self.validate(req) {
+            Ok(()) => ControlFlow::Continue,
+            Err(response) => ControlFlow::Break(response),
+        };
+        Box::pin(async move { decision })
     }
 
     fn name(&self) -> &'static str {
@@ -147,7 +174,8 @@ mod tests {
     use super::BodySizeGuard;
     use crate::runtime_async::CompatRuntime;
     use crate::web_framework::{
-        ControlFlow, Method, Middleware, Request, RequestContext, ResponseBody, StatusCode,
+        ControlFlow, FrameworkRequestBody, Method, Middleware, PreBodyValidator, Request,
+        RequestContext, ResponseBody, StatusCode,
     };
 
     fn run_async_test<F>(future: F)
@@ -182,7 +210,7 @@ mod tests {
 
             match guard.before(&ctx, &mut req).await {
                 ControlFlow::Break(response) => {
-                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
                     let (_, _, body) = response.into_parts();
                     let ResponseBody::Bytes(bytes) = body else {
                         panic!("expected JSON response body");
@@ -200,5 +228,49 @@ mod tests {
                 ControlFlow::Continue => panic!("request should have been rejected"),
             }
         });
+    }
+
+    #[test]
+    fn body_size_guard_checks_decoded_bytes_without_consuming_them() {
+        let guard = BodySizeGuard::new(8);
+        for size in [0, 7, 8, 9] {
+            for content_length in [None, Some("0"), Some("8")] {
+                let mut request = Request::new(Method::Get, "/health");
+                if let Some(value) = content_length {
+                    request
+                        .headers_mut()
+                        .insert("content-length", value.as_bytes().to_vec());
+                }
+                request.set_body(FrameworkRequestBody::Bytes(vec![b'x'; size]));
+                let result = guard.validate(&request);
+                if size > 8 {
+                    let response = result.expect_err("decoded bytes must enforce the cap");
+                    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                    assert!(response.headers().iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("connection") && value == b"close"
+                    }));
+                } else {
+                    result.expect("an in-bounds body must remain accepted");
+                }
+                let FrameworkRequestBody::Bytes(bytes) = request.body() else {
+                    panic!("admission must preserve the body for its handler");
+                };
+                assert_eq!(bytes, &vec![b'x'; size]);
+            }
+        }
+    }
+
+    #[test]
+    fn body_size_guard_zero_cap_allows_only_empty_bodies() {
+        let guard = BodySizeGuard::new(0);
+        let mut request = Request::new(Method::Get, "/health");
+        guard
+            .validate(&request)
+            .expect("empty requests are allowed");
+        request.set_body(FrameworkRequestBody::Bytes(vec![b'x']));
+        assert_eq!(
+            guard.validate(&request).unwrap_err().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 }

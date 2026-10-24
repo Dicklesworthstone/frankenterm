@@ -1,0 +1,16 @@
+build before 16:17:41
+build after 16:20:33
+build head 16:23:24
+corpus /Users/jemanuel/ft-build/70s4z/corpus/seq_lines-67108864-000000000135288d.bin d07e1bf9614185ea
+run 1 before rc=0 wall=6s load=[261.49 211.77 172.55] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=6.073 MiB/s=10.5 load_avg_1m=261.49 sanity=ok
+run 1 after rc=0 wall=2s load=[257.15 212.41 173.23] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=1.931 MiB/s=33.1 load_avg_1m=257.15 sanity=ok
+run 1 head rc=0 wall=2s load=[257.15 212.41 173.23] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=2.057 MiB/s=31.1 load_avg_1m=257.15 sanity=ok
+run 2 before rc=0 wall=7s load=[255.85 212.89 173.63] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=6.086 MiB/s=10.5 load_avg_1m=255.85 sanity=ok
+run 2 after rc=0 wall=2s load=[252.74 212.96 173.88] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=2.004 MiB/s=31.9 load_avg_1m=252.74 sanity=ok
+run 2 head rc=0 wall=2s load=[252.74 212.96 173.88] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=2.067 MiB/s=31.0 load_avg_1m=246.44 sanity=ok
+run 3 before rc=0 wall=7s load=[246.44 212.31 173.88] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=6.431 MiB/s=10.0 load_avg_1m=246.44 sanity=ok
+run 3 after rc=0 wall=3s load=[247.04 213.00 174.35] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=1.965 MiB/s=32.6 load_avg_1m=247.04 sanity=ok
+run 3 head rc=0 wall=2s load=[241.35 212.39 174.36] [BENCH] ingest_throughput lane=term corpus=file:seq_lines-67108864-000000000135288d.bin bytes=67108864 secs=1.987 MiB/s=32.2 load_avg_1m=241.35 sanity=ok
+sampled before load=[247.84 214.69 175.62]
+sampled head load=[248.82 215.44 176.11]
+done

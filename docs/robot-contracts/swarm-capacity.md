@@ -11,7 +11,7 @@ updates Beads, or calls external services.
 | Command | Purpose |
 | --- | --- |
 | `ft robot swarm-capacity status` | Return the current redacted capacity summary plus doctor guidance. |
-| `ft robot swarm-capacity plan --add-panes N` | Dry-run adding `N` panes through workload-admission and resource-budget models. |
+| `ft robot swarm-capacity plan --add-panes 4` | Dry-run adding panes (here 4; any count of at least 1) through workload-admission and resource-budget models. |
 | `ft robot swarm-capacity explain <decision-id>` | Explain a redacted capacity decision by stable-id hash or audit record id. |
 
 All commands accept `--level 0..3` for the nested capacity summary and
@@ -37,7 +37,7 @@ as `<decision-id>` is not echoed in the response body.
 
 The `doctor` object is embedded in every response. `status=stale_or_missing_evidence`
 means the capacity summary was not attached to the runtime health snapshot; safe
-next steps are `ft robot swarm-capacity status --format json --level 3`,
+next steps are `ft robot --format json swarm-capacity status --level 3`,
 `ft doctor --json`, and `ft status --health`, all read-only.
 
 The retained doctor-remediation fixture is
@@ -46,8 +46,8 @@ It pins four operator states:
 
 | State | Meaning | Safe command examples |
 | --- | --- | --- |
-| `stale_telemetry` | Required capacity evidence is missing, stale, or redacted. | `ft robot swarm-capacity status --format json --level 3`, `ft doctor --json`, `ft status --health` |
-| `capacity_refused` | The dry-run plan returns `defer`, `shed`, `capacity.red`, or `capacity.black`. | `ft robot swarm-capacity plan --add-panes 12 --format json --level 3`, `ft robot swarm-capacity explain <decision-id> --format json` |
+| `stale_telemetry` | Required capacity evidence is missing, stale, or redacted. | `ft robot --format json swarm-capacity status --level 3`, `ft doctor --json`, `ft status --health` |
+| `capacity_refused` | The dry-run plan returns `defer`, `shed`, `capacity.red`, or `capacity.black`. | `ft robot --format json swarm-capacity plan --add-panes 12 --level 3`, `ft robot --format json swarm-capacity explain <decision-id>` |
 | `target_class_unavailable` | The capacity envelope or target-class summary is `skipped_not_proven`. | Inspect `docs/attestations/perf/swarm-capacity-envelope.json` and `docs/perf/target-class-hardware.md`; keep high-scale claims blocked. |
 | `resource_pressure` | Resource, storage, memory, workload, or RCH pressure is red/black/unavailable. | Preserve the pressure artifact and continue only read-only/status work. |
 

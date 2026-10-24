@@ -59,10 +59,36 @@ const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_CENSUS_REFRESH_ATTEMPTS: usize = 2;
 const GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
+/// A restore whose replay ends inside an escape sequence (a child part way
+/// through writing an image) waits for the rest: first this long, doubling
+/// to at most a second, for this long in all, before it fails. The guardian
+/// journals a pane's output one synced 8 KiB record at a time, so a
+/// half-megabyte image took more than two seconds to reach it on macOS.
+const GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT: Duration = Duration::from_millis(50);
+const GUARDIAN_RESTORE_SEQUENCE_WAIT_TOTAL: Duration = Duration::from_secs(20);
+/// A guardian out of replay snapshots (or request bindings) refuses a
+/// restore's request before admitting anything; other panes' replays hold
+/// them until their pages are acknowledged. A successor restoring 40 panes met
+/// this while earlier panes' readers held 32, and the refusal ended the whole
+/// mux, then the put-back mux the same way (ft-udi9a). The restore repeats the
+/// exact request instead, as the live reader does: doubling from the first
+/// wait to a second, for this long in all per request, within the restore
+/// budget.
+const GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL: Duration = Duration::from_millis(200);
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
-const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
+/// A checkpoint publication, or its wait for the pane's lease, slower than
+/// this says where its time went (a recovery capture has 30 s for all panes).
+const SLOW_CHECKPOINT_PHASE: Duration = Duration::from_millis(1_000);
+// The protocol's largest chunk: a pane's reader uploads its checkpoint inline,
+// and every chunk is a guardian round trip under the Stage directory lock.
+const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 =
+    mux::guardian_protocol::GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES;
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,6 +107,42 @@ fn wait_for_genesis_retry(started: Instant, attempts: usize) -> bool {
         .min(remaining);
     thread::sleep(delay);
     started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET
+}
+
+/// Closes the child a guardian birth left running unclaimed when it failed
+/// before its claim: its Spawn's reply lost, its custody or its claim
+/// refused (ft-hn80q). The birth's own spawn custody claims the child at
+/// generation 0, and the staging's rollback, a birth's, closes it on drop
+/// (an unconfirmed close retains cleanup authority, as any rollback does).
+/// An error means nothing was claimed: there is no such child (the guardian
+/// never started it, or it has exited), another claim holds it, or the
+/// guardian could not be reached.
+fn close_unclaimed_birth(
+    socket: &Path,
+    token: &Path,
+    size: PtySize,
+    census: Arc<GuardianCensusCoordinator>,
+    mux_incarnation: Uuid,
+    (pane, effect): (Uuid, Uuid),
+) -> anyhow::Result<()> {
+    let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+        token,
+        census.guardian_incarnation(),
+        mux_incarnation,
+        pane,
+        effect,
+        frankenterm_pty_guardian::guardian_runtime_build_identity()
+            .context("guardian birth requires the compiled mux build")?
+            .into_bytes(),
+    )
+    .context("authenticate the unclaimed birth's custody")?;
+    let staging = GuardianProxyLeasePlan::prepare(socket, token, size, census)
+        .context("prepare the unclaimed birth's lease")?
+        .with_spawn_custody(custody)?
+        .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+        .context("claim the unclaimed birth")?;
+    drop(staging);
+    Ok(())
 }
 
 fn reconcile_genesis_birth(
@@ -136,9 +198,76 @@ impl GuardianRestoreBudget<'_> {
     }
 }
 
+/// Whether the guardian at `socket` validates version 4 (compact) terminal
+/// checkpoints, for `Mux::set_guardian_compact_checkpoints`. The probe owns
+/// nothing at the guardian, so it may run at any time.
+pub fn guardian_admits_compact_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_compact_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "version 4 (compact lines)"
+        } else {
+            "version 3 (the guardian, or this build, predates compact lines)"
+        }
+    );
+    admitted
+}
+
+/// Whether the guardian at `socket` validates terminal checkpoints holding
+/// graphics state, for `Mux::set_guardian_graphics_checkpoints`; a probe like
+/// `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_graphics_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_graphics_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "graphics state held (images, Kitty state)"
+        } else {
+            "no graphics state (the guardian, or this build, predates it); a pane showing an image refuses capture"
+        }
+    );
+    admitted
+}
+
+/// Whether the guardian at `socket` validates terminal checkpoints holding
+/// character protection, for `Mux::set_guardian_protection_checkpoints`; a
+/// probe like `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_protection_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_protection_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "character protection held (DECSCA, SPA)"
+        } else {
+            "no character protection (the guardian, or this build, predates it); a pane holding protected cells refuses capture"
+        }
+    );
+    admitted
+}
+
+/// Whether the guardian at `socket` comes from a build that reads durable
+/// scrollback rows showing images in their own schema, for
+/// `crate::set_image_scrollback_rows`; a probe like
+/// `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_image_scrollback_rows(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_image_scrollback_rows(socket, token);
+    log::info!(
+        "guardian scrollback: {}",
+        if admitted {
+            "rows showing images hold each image once"
+        } else {
+            "rows showing images repeat each image in every cell (the guardian, or this build, predates image rows)"
+        }
+    );
+    admitted
+}
+
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
-/// transaction; an unadopted birth fences further spawning in this domain.
+/// transaction. A birth fences further spawning in this domain until it is
+/// published, fails or is abandoned; a failed or abandoned birth closes its
+/// child once claimed and never fences the domain for good (ft-hn80q).
 pub struct GuardianDomain {
     commands: LocalDomain,
     owner: std::sync::Weak<mux::Mux>,
@@ -154,6 +283,54 @@ struct GuardianDomainState {
     census: Option<Arc<GuardianCensusCoordinator>>,
     unadopted_birth: Option<(Uuid, Uuid, Uuid)>,
     publication: Option<GuardianPanePublicationReceipt>,
+    /// (pane, effect) of births that failed before their claim and whose
+    /// child could not be closed right away: the next spawn tries once more.
+    orphaned_births: Vec<(Uuid, Uuid)>,
+}
+
+/// Births whose unclaimed child the domain still tries to close at the next
+/// spawn; past this, the oldest is given up with a warning.
+const GUARDIAN_MAX_ORPHANED_BIRTHS: usize = 8;
+
+/// Fails the next birth after its custody opens and before its claim, as a
+/// lost claim connection does, once its child has had time to start.
+#[cfg(test)]
+static FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM: AtomicBool = AtomicBool::new(false);
+
+/// What the birth fence still asks of a spawn or a recovery capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BirthFence {
+    /// No birth holds the fence, or the last one was published.
+    Clear,
+    /// A settled birth's pane is about to be registered: retry shortly.
+    AwaitingRegistration,
+}
+
+impl GuardianDomainState {
+    /// Settles the fence a birth sets before its Spawn. A published birth
+    /// asks nothing more, and a settled one not yet registered keeps the
+    /// fence for a retry. Any other birth failed or was abandoned: its child
+    /// was closed with it, or, if the birth failed before claiming it, keeps
+    /// running unclaimed under the guardian. Keeping the fence then refused
+    /// every later spawn and every recovery capture for the mux's lifetime,
+    /// so one failed spawn ended upgrades (ft-hn80q); it is released.
+    fn settle_birth(&mut self) -> BirthFence {
+        let Some((pane, request, effect)) = self.unadopted_birth else {
+            return BirthFence::Clear;
+        };
+        match self.publication.as_ref() {
+            Some(receipt) if receipt.was_published() => BirthFence::Clear,
+            Some(receipt) if receipt.is_pending() => BirthFence::AwaitingRegistration,
+            _ => {
+                log::warn!(
+                    "guardian birth pane={pane} request={request} effect={effect} ended without registration; releasing its spawn fence"
+                );
+                self.unadopted_birth = None;
+                self.publication = None;
+                BirthFence::Clear
+            }
+        }
+    }
 }
 
 struct GuardianDomainSpawnAdmission(Arc<AtomicBool>);
@@ -259,18 +436,17 @@ impl Domain for GuardianDomain {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| mux::domain::DomainRecoveryPolicyBusy)?;
         let _admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
-        let state = self
+        let mut state = self
             .state
             .try_lock()
             .ok_or(mux::domain::DomainRecoveryPolicyBusy)?;
-        anyhow::ensure!(
-            state.unadopted_birth.is_none()
-                || state
-                    .publication
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.was_published()),
-            "guardian domain retains an unpublished birth during recovery capture"
-        );
+        // A settled birth whose pane is about to be registered: the next
+        // capture sees it published. Refusing it as unsupported disabled
+        // recovery for the mux's lifetime whenever the first capture raced
+        // the first spawn.
+        if state.settle_birth() == BirthFence::AwaitingRegistration {
+            return Err(mux::domain::DomainRecoveryPolicyBusy.into());
+        }
         anyhow::ensure!(
             [self.socket_path.as_path(), self.token_path.as_path()]
                 .iter()
@@ -313,17 +489,13 @@ impl Domain for GuardianDomain {
         let admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
         {
             let mut state = self.state.lock();
-            if let Some((pane, request, effect)) = state.unadopted_birth {
-                anyhow::ensure!(
-                    state
-                        .publication
-                        .as_ref()
-                        .is_some_and(|receipt| receipt.was_published()),
-                    "guardian domain retains an unadopted birth: pane={pane} request={request} effect={effect}"
-                );
-                state.unadopted_birth = None;
-                state.publication = None;
-            }
+            anyhow::ensure!(
+                state.settle_birth() == BirthFence::Clear,
+                "guardian domain has a settled birth awaiting registration"
+            );
+            // A published birth's bookkeeping ends with the next spawn.
+            state.unadopted_birth = None;
+            state.publication = None;
         }
         let pane_id = mux::pane::alloc_pane_id()?;
         let command = self
@@ -350,6 +522,15 @@ impl Domain for GuardianDomain {
             pixel_height: size.pixel_height.try_into()?,
         };
         validate_pty_size(pty_size)?;
+        // The birth model holds the graphics configuration, so that replay
+        // applies the child's first image output, and captures protection,
+        // exactly when this mux's guardian admits each.
+        let mux_limits = mux.guardian_checkpoint_limits();
+        let birth_limits = TerminalCheckpointLimits {
+            capture_graphics: mux_limits.capture_graphics,
+            capture_protection: mux_limits.capture_protection,
+            ..TerminalCheckpointLimits::default()
+        };
         let socket = self.socket_path.clone();
         let token = self.token_path.clone();
         let mux_incarnation = self.mux_incarnation;
@@ -418,6 +599,28 @@ impl Domain for GuardianDomain {
                     census
                 }
             };
+            // Children that earlier births left running unclaimed get one more
+            // close before this birth starts another (ft-hn80q).
+            let orphans = std::mem::take(&mut state.lock().orphaned_births);
+            for orphan in orphans {
+                match close_unclaimed_birth(
+                    &socket,
+                    &token,
+                    pty_size,
+                    Arc::clone(&census),
+                    mux_incarnation,
+                    orphan,
+                ) {
+                    Ok(()) => log::info!(
+                        "closed the child that guardian birth pane={} left running unclaimed",
+                        orphan.0
+                    ),
+                    Err(error) => log::warn!(
+                        "guardian birth pane={} has no unclaimed child this mux could close; giving up on it: {error:#}",
+                        orphan.0
+                    ),
+                }
+            }
             let checkpoint = Terminal::new(
                 size,
                 Arc::clone(&config),
@@ -425,7 +628,7 @@ impl Domain for GuardianDomain {
                 config::wezterm_version(),
                 Box::new(io::sink()),
             )
-            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .capture_recovery_checkpoint(birth_limits)
             .context("capture guardian initial terminal model")?;
             let descriptor =
                 GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &checkpoint)?;
@@ -475,53 +678,117 @@ impl Domain for GuardianDomain {
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
-            let (client, reply) = reconcile_genesis_birth(
-                client,
-                (pane, request, effect),
-                command,
-                pty_size,
-                started,
-                || connect(Some(census.guardian_incarnation()), false),
-            )?;
-            anyhow::ensure!(
-                reply
-                    == (GuardianReply::Spawned {
-                        pane_id: pane,
-                        generation: 0
-                    }),
-                "guardian returned an unexpected birth receipt"
-            );
-            // Hello authenticates the guardian UUID, not its or the broker's
-            // build. Recover those nonsecret fields only from private AEAD
-            // custody, binding all identities known by this successful birth.
-            let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
-                &token,
-                client.guardian_incarnation(),
-                mux_incarnation,
-                pane,
-                effect,
-                frankenterm_pty_guardian::guardian_runtime_build_identity()
-                    .context("guardian birth requires the compiled mux build")?
-                    .into_bytes(),
-            )
-            .context("authenticate existing guardian birth custody")?;
-            let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
-                .context("prepare guardian birth lease")?
-                .with_spawn_custody(custody)?
-                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
-                .context("claim guardian birth lease")?
-                .restore_and_activate(config, TerminalCheckpointLimits::default())
-                .context("restore and activate guardian birth")?;
-            let unpublished = UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
-                pane_id,
-                domain_id,
-                description,
-            ))?;
-            // The read-only receipt can become true only after actual mux
-            // publication. Cancellation keeps it false; successful publication
-            // remains remembered even after a short-lived pane is pruned.
-            state.lock().publication = unpublished.guardian_publication_receipt();
-            Ok(unpublished)
+            let reap_census = Arc::clone(&census);
+            let mut claimed = false;
+            let born = (|| -> anyhow::Result<UnpublishedPane> {
+                let (client, reply) = reconcile_genesis_birth(
+                    client,
+                    (pane, request, effect),
+                    command,
+                    pty_size,
+                    started,
+                    || connect(Some(census.guardian_incarnation()), false),
+                )?;
+                anyhow::ensure!(
+                    reply
+                        == (GuardianReply::Spawned {
+                            pane_id: pane,
+                            generation: 0
+                        }),
+                    "guardian returned an unexpected birth receipt"
+                );
+                // Hello authenticates the guardian UUID, not its or the
+                // broker's build. Recover those nonsecret fields only from
+                // private AEAD custody, binding all identities known by this
+                // successful birth.
+                let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+                    &token,
+                    client.guardian_incarnation(),
+                    mux_incarnation,
+                    pane,
+                    effect,
+                    frankenterm_pty_guardian::guardian_runtime_build_identity()
+                        .context("guardian birth requires the compiled mux build")?
+                        .into_bytes(),
+                )
+                .context("authenticate existing guardian birth custody")?;
+                #[cfg(test)]
+                if FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM.swap(false, Ordering::AcqRel) {
+                    thread::sleep(Duration::from_millis(200));
+                    anyhow::bail!("injected guardian birth failure before its claim");
+                }
+                // From the claim on, a failure's lease rollback closes the
+                // child (a birth's), and so does abandoning the unpublished
+                // pane.
+                let staging = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
+                    .context("prepare guardian birth lease")?
+                    .with_spawn_custody(custody)?
+                    .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+                    .context("claim guardian birth lease")?;
+                claimed = true;
+                let activated = staging
+                    .restore_and_activate(config, birth_limits)
+                    .context("restore and activate guardian birth")?;
+                UnpublishedPane::from_guardian_birth(activated.into_local_pane(
+                    pane_id,
+                    domain_id,
+                    description,
+                ))
+            })();
+            match born {
+                Ok(unpublished) => {
+                    // The read-only receipt can become true only after actual
+                    // mux publication. Cancellation keeps it false; successful
+                    // publication remains remembered even after a short-lived
+                    // pane is pruned.
+                    state.lock().publication = unpublished.guardian_publication_receipt();
+                    Ok(unpublished)
+                }
+                Err(error) => {
+                    // Once claimed, the failure's lease rollback closed the
+                    // child. Before its claim, a child the guardian started
+                    // runs unclaimed: close it now, or at the next spawn.
+                    let unclosed = if claimed {
+                        None
+                    } else {
+                        close_unclaimed_birth(
+                            &socket,
+                            &token,
+                            pty_size,
+                            reap_census,
+                            mux_incarnation,
+                            (pane, effect),
+                        )
+                        .err()
+                    };
+                    let mut state = state.lock();
+                    let child = match &unclosed {
+                        None if claimed => "its child was closed with its lease".to_string(),
+                        None => "its unclaimed child was closed".to_string(),
+                        Some(reason) => {
+                            if state.orphaned_births.len() >= GUARDIAN_MAX_ORPHANED_BIRTHS {
+                                let (given_up, _) = state.orphaned_births.remove(0);
+                                log::warn!(
+                                    "giving up closing the unclaimed child of guardian birth pane={given_up}"
+                                );
+                            }
+                            state.orphaned_births.push((pane, effect));
+                            format!(
+                                "no unclaimed child closed yet, the next spawn tries again ({reason:#})"
+                            )
+                        }
+                    };
+                    // A failed birth releases the fence: keeping it refused
+                    // every later spawn and recovery capture for the mux's
+                    // lifetime (ft-hn80q).
+                    log::warn!(
+                        "guardian birth pane={pane} request={request} effect={effect} failed after it sent its Spawn; releasing its spawn fence, {child}: {error:#}"
+                    );
+                    state.unadopted_birth = None;
+                    state.publication = None;
+                    Err(error)
+                }
+            }
         })
         .await;
         drop(cancellation);
@@ -590,6 +857,8 @@ pub enum GuardianProxyError {
     GuardianIncarnationChanged,
     #[error("guardian replay snapshot expired; durable restore must be reopened")]
     ReplaySnapshotExpired,
+    #[error("guardian replay ends inside an escape sequence; durable restore must be reopened")]
+    ReplayEndsInsideSequence,
     #[error("guardian replay has an authenticated output gap")]
     ReplayGap,
     #[error("guardian replay checkpoint was compacted during restore")]
@@ -666,6 +935,7 @@ impl From<GuardianProxyError> for io::Error {
             GuardianProxyError::InputDurabilityPending
             | GuardianProxyError::PendingInputPayloadRequired
             | GuardianProxyError::ReplaySnapshotExpired
+            | GuardianProxyError::ReplayEndsInsideSequence
             | GuardianProxyError::ReplayCompacted => Self::new(io::ErrorKind::WouldBlock, error),
             GuardianProxyError::ReplayGap
             | GuardianProxyError::ReplayInvariant(_)
@@ -1693,8 +1963,12 @@ fn query_guardian_checkpoint_stage(
     request_id: Uuid,
 ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
     let started = Instant::now();
-    let admission_budget = Duration::from_millis(250);
-    for attempt in 0..32 {
+    // A Seal or ACK of a multi-megabyte checkpoint, or a replay page, can hold
+    // the guardian's single protocol state well past a quarter second, and it
+    // closes every request that arrives meanwhile. Two seconds with backoff
+    // lets this capture finish instead of failing its whole recovery round.
+    let admission_budget = Duration::from_secs(2);
+    for attempt in 0..32_u32 {
         let request =
             GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)
                 .map_err(GuardianProxyError::ReplayProtocol)?;
@@ -1705,7 +1979,7 @@ fn query_guardian_checkpoint_stage(
                     return Err(error);
                 }
                 metrics::counter!("mux.guardian_proxy.checkpoint_query_retry_total").increment(1);
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                std::thread::sleep(remaining.min(Duration::from_millis(10 << attempt.min(3))));
                 if started.elapsed() >= admission_budget {
                     return Err(error);
                 }
@@ -2252,15 +2526,39 @@ impl GuardianCheckpointPublisher {
         transport: &mut dyn GuardianCheckpointStageTransport,
         pending: &mut PendingGuardianCheckpointPublication,
     ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+        let started = Instant::now();
         let completion_id = pending.drive_to_sealed(transport)?;
+        let sealed = started.elapsed();
         let adoption_receipt = if let Some(receipt) = pending.adoption_receipt {
             receipt
         } else {
-            let receipt = actor.lock().publish_checkpoint(pending.intent())?;
+            let mut actor = actor.lock();
+            let lease_wait = started.elapsed().saturating_sub(sealed);
+            let receipt = actor.publish_checkpoint(pending.intent())?;
+            drop(actor);
+            if lease_wait > SLOW_CHECKPOINT_PHASE {
+                log::warn!(
+                    "guardian checkpoint adoption waited {} ms for the pane's lease",
+                    lease_wait.as_millis()
+                );
+            }
             pending.adoption_receipt = Some(receipt);
             receipt
         };
+        let adopted = started.elapsed();
         pending.drive_ack(transport, completion_id)?;
+        let total = started.elapsed();
+        if total > SLOW_CHECKPOINT_PHASE {
+            // Which phase a slow capture spent its time in: the staged
+            // upload, the catalog adoption (lease wait included), the Ack.
+            log::warn!(
+                "guardian checkpoint publication took {} ms: stage {} ms, adoption {} ms, ack {} ms",
+                total.as_millis(),
+                sealed.as_millis(),
+                adopted.saturating_sub(sealed).as_millis(),
+                total.saturating_sub(adopted).as_millis()
+            );
+        }
         Ok(adoption_receipt)
     }
 
@@ -3703,6 +4001,43 @@ fn replay_page_with_exact_retry(
     ))
 }
 
+/// Repeat one restore exchange the guardian refused for want of replay
+/// snapshots or request bindings. The refusal admitted nothing, so the exact
+/// request runs again after a wait (see `GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT`).
+/// Reopening the snapshot instead would leave the half-read one holding its
+/// slot with a page no ack can release.
+fn restore_waiting_for_capacity<T>(
+    mut exchange: impl FnMut() -> Result<T, GuardianProxyError>,
+) -> Result<T, GuardianProxyError> {
+    let mut waited = Duration::ZERO;
+    let mut wait = GUARDIAN_RESTORE_CAPACITY_FIRST_WAIT;
+    loop {
+        match exchange() {
+            Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::CapacityExhausted,
+            ))) if waited < GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL => {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_exact_retry_total",
+                    "operation" => "restore_capacity",
+                )
+                .increment(1);
+                std::thread::sleep(wait);
+                waited += wait;
+                wait = (wait * 2).min(Duration::from_secs(1));
+            }
+            result => {
+                if result.is_ok() && !waited.is_zero() {
+                    log::info!(
+                        "guardian restore waited {} ms for replay capacity",
+                        waited.as_millis()
+                    );
+                }
+                return result;
+            }
+        }
+    }
+}
+
 fn replay_ack_with_exact_retry(
     transport: &mut dyn GuardianReplayTransport,
     plan: &GuardianReplayAckPlan,
@@ -3956,7 +4291,10 @@ fn consume_one_guardian_replay_snapshot(
     let mut boundary = None;
 
     for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
-        let page = replay_page_with_exact_retry(transport, Uuid::new_v4(), request)?;
+        let request_id = Uuid::new_v4();
+        let page = restore_waiting_for_capacity(|| {
+            replay_page_with_exact_retry(&mut *transport, request_id, request)
+        })?;
         let page_identity = validate_replay_page_identity(&page, identity)?;
         let snapshot_id = page.header().snapshot_id();
         let snapshot_digest = page.header().snapshot_digest();
@@ -4015,7 +4353,9 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     base.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
 
                 if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
                     let restored = restore_inert_checkpoint(
@@ -4084,7 +4424,9 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     current.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
                 boundary = Some(current);
             }
             GuardianReplayPageBodyDelivery::Complete {
@@ -4116,9 +4458,11 @@ fn consume_one_guardian_replay_snapshot(
                         "terminal replay witness does not match the consumed checkpoint and suffix",
                     ));
                 }
-                restored
-                    .checkpoint()
-                    .map_err(GuardianProxyError::TerminalReplay)?;
+                let at_ground = match restored.checkpoint() {
+                    Ok(_) => true,
+                    Err(InertTerminalError::ParserNotRecoveryGround) => false,
+                    Err(error) => return Err(GuardianProxyError::TerminalReplay(error)),
+                };
                 let ack = replay_page_ack_plan(
                     snapshot_id,
                     snapshot_digest,
@@ -4129,7 +4473,16 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     terminal_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, &ack)?;
+                restore_waiting_for_capacity(|| {
+                    replay_ack_with_exact_retry(&mut *transport, &ack)
+                })?;
+                // The output so far ends inside an escape sequence (an
+                // image's, most often), whose end is still on its way. The
+                // acknowledgement released the snapshot; one reopened once
+                // more output has arrived ends past it.
+                if !at_ground {
+                    return Err(GuardianProxyError::ReplayEndsInsideSequence);
+                }
                 return Ok(VerifiedGuardianReplayRestore {
                     inert_terminal: inert_terminal.ok_or(GuardianProxyError::ReplayInvariant(
                         "verified terminal disappeared before activation",
@@ -4199,7 +4552,10 @@ fn consume_guardian_replay_for_restore(
     limits: TerminalCheckpointLimits,
     selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
-    for attempt in 0..GUARDIAN_RESTORE_REOPEN_ATTEMPTS {
+    let mut expired = 0;
+    let mut waited = Duration::ZERO;
+    let mut wait = GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT;
+    loop {
         match consume_one_guardian_replay_snapshot(
             transport,
             identity,
@@ -4209,18 +4565,38 @@ fn consume_guardian_replay_for_restore(
             selected,
         ) {
             Err(GuardianProxyError::ReplaySnapshotExpired)
-                if attempt + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
+                if expired + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
             {
+                expired += 1;
                 metrics::counter!(
                     "mux.guardian_proxy.replay_snapshot_reopen_total",
                     "phase" => "restore",
                 )
                 .increment(1);
             }
-            result => return result,
+            Err(GuardianProxyError::ReplayEndsInsideSequence)
+                if waited < GUARDIAN_RESTORE_SEQUENCE_WAIT_TOTAL =>
+            {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_snapshot_reopen_total",
+                    "phase" => "restore_inside_sequence",
+                )
+                .increment(1);
+                std::thread::sleep(wait);
+                waited += wait;
+                wait = (wait * 2).min(Duration::from_secs(1));
+            }
+            result => {
+                if result.is_ok() && !waited.is_zero() {
+                    log::info!(
+                        "guardian restore waited {} ms for an escape sequence its replay ended inside",
+                        waited.as_millis()
+                    );
+                }
+                return result;
+            }
         }
     }
-    Err(GuardianProxyError::ReplaySnapshotExpired)
 }
 
 /// Blocking raw-output reader that resumes from the exact terminal witness
@@ -4260,6 +4636,9 @@ struct GuardianReplayTailReader {
     maximum_record_bytes: u32,
     maximum_page_records: u16,
     idle_poll_interval: Duration,
+    /// The anchor of the next snapshot opened, from a checkpoint adopted
+    /// since the current one opened ([`GuardianLiveOutputReader::reanchor`]).
+    next_anchor: Option<(GuardianCheckpointIdentityDigest, u64)>,
 }
 
 impl fmt::Debug for GuardianReplayTailReader {
@@ -4321,13 +4700,35 @@ impl GuardianReplayTailReader {
             maximum_record_bytes,
             maximum_page_records,
             idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
+            next_anchor: None,
         })
     }
 
+    /// Takes a new anchor only when a snapshot is about to be opened: an
+    /// open snapshot's completion names the checkpoint it was opened at.
+    fn apply_next_anchor(&mut self) {
+        if self.cursor.is_none() && self.pending_replay.is_none() {
+            if let Some((checkpoint_id, capture_generation)) = self.next_anchor.take() {
+                self.checkpoint_id = checkpoint_id;
+                self.capture_generation = capture_generation;
+            }
+        }
+    }
+
     fn retain_transport_retry(&mut self, error: GuardianProxyError) -> io::Error {
+        // A guardian out of replay capacity refused the request before
+        // admitting anything (other panes' replays hold the snapshots until
+        // their pages are acknowledged), so the exact request retries like an
+        // I/O failure instead of ending the pane.
+        let capacity_refused = matches!(
+            error,
+            GuardianProxyError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::CapacityExhausted
+            ))
+        );
         self.transport_retry_pending = !self.delivery_failed
             && (self.pending_replay.is_some() || self.pending_ack.is_some())
-            && replay_error_is_retryable_io(&error);
+            && (replay_error_is_retryable_io(&error) || capacity_refused);
         error.into()
     }
 
@@ -4398,6 +4799,7 @@ impl GuardianReplayTailReader {
             let (request_id, request) = match self.pending_replay {
                 Some(pending) => pending,
                 None => {
+                    self.apply_next_anchor();
                     let pending = (Uuid::new_v4(), self.request());
                     self.pending_replay = Some(pending);
                     pending
@@ -4630,6 +5032,14 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
         self.transport_retry_pending
     }
 
+    fn reanchor(
+        &mut self,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        capture_generation: u64,
+    ) {
+        self.next_anchor = Some((checkpoint_id, capture_generation));
+    }
+
     fn deliver_next_record(
         &mut self,
         deliver: &mut dyn FnMut(
@@ -4822,6 +5232,13 @@ struct SelectedRecoveryCheckpoint {
     boundary_id: [u8; 32],
     payload_digest: [u8; 32],
     payload_bytes: u64,
+    /// Successor generations that earlier attempts at this same selection
+    /// already claimed (each through an authenticated recovery intent bound
+    /// to this root, image and checkpoint) before failing or dying without
+    /// a newer publication. Only `claim_recovery` advances it, along exactly
+    /// that intent chain; the guardian journal still holds every record
+    /// after the checkpoint, whoever owned the lease meanwhile.
+    traversed_successors: u64,
 }
 
 impl SelectedRecoveryCheckpoint {
@@ -4857,7 +5274,11 @@ impl SelectedRecoveryCheckpoint {
     }
 
     fn validate_attach(self, pane_id: Uuid, generation: u64) -> Result<(), GuardianProxyError> {
-        if pane_id != self.pane_id || self.generation.checked_add(1) != Some(generation) {
+        let successor = self
+            .generation
+            .checked_add(1)
+            .and_then(|successor| successor.checked_add(self.traversed_successors));
+        if pane_id != self.pane_id || successor != Some(generation) {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "recovery attachment differs from the selected pane and successor generation",
             ));
@@ -4968,6 +5389,7 @@ impl GuardianProxyLeasePlan {
             boundary_id: publication.output_boundary_identity,
             payload_digest,
             payload_bytes,
+            traversed_successors: 0,
         };
         let RecoverySpawnCustody::Original(custody) = &pane.spawn_custody else {
             return Err(GuardianProxyError::InvalidConfiguration(
@@ -5225,6 +5647,13 @@ impl GuardianProxyLeasePlan {
         if self.recovery_claim.is_some() {
             return self.claim_recovery(request_id, effect_id);
         }
+        // A birth: the first claim of a child this mux incarnation's own spawn
+        // started, whose rollback closes it.
+        let birth = self.successor_custody.is_none()
+            && observed_generation == 0
+            && self
+                .spawn_custody
+                .is_some_and(|scope| scope.mux_incarnation == self.client.mux_incarnation());
         let generation = observed_generation
             .checked_add(1)
             .ok_or(GuardianProxyError::Client(GuardianClientError::Protocol(
@@ -5326,6 +5755,7 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             None,
+            birth,
         )?;
         staging.spawn_custody = spawn_custody;
         if let Some(acknowledged) = acknowledged {
@@ -5397,6 +5827,14 @@ impl GuardianProxyLeasePlan {
             let generation = intent
                 .predecessor_generation
                 .checked_add(1)
+                .ok_or_else(rejected)?;
+            // Each traversal below follows an authenticated child intent that
+            // keeps this selection's root, image and checkpoint, so the
+            // generations between the checkpoint and this one were claimed by
+            // earlier attempts at this same recovery.
+            let traversed_successors = generation
+                .checked_sub(selected.generation)
+                .and_then(|claims| claims.checked_sub(1))
                 .ok_or_else(rejected)?;
             let mut current_reservation =
                 if intent.target_mux_incarnation == self.census.mux_incarnation() {
@@ -5542,6 +5980,7 @@ impl GuardianProxyLeasePlan {
                     self.size,
                     Arc::clone(&self.census),
                     Some(Arc::clone(&recovery.admission)),
+                    false,
                 )?;
                 // Rollback is armed before reopening the ACK-selected record.
                 staging.successor_custody = Some(
@@ -5550,7 +5989,10 @@ impl GuardianProxyLeasePlan {
                         .map_err(map_replay_client_error)?,
                 );
                 staging.spawn_custody = Some(original);
-                staging.selected_checkpoint = Some(selected);
+                staging.selected_checkpoint = Some(SelectedRecoveryCheckpoint {
+                    traversed_successors,
+                    ..selected
+                });
                 return Ok(staging);
             }
 
@@ -5672,6 +6114,7 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             None,
+            false,
         )?;
         staging.spawn_custody = spawn_custody;
         staging.successor_custody = successor_custody;
@@ -5731,6 +6174,11 @@ struct GuardianClaimedLeaseRollback {
     actor: SharedGuardianPaneLeaseActor,
     retirement_reservation: Option<GuardianRetirementReservation>,
     armed: bool,
+    /// The lease is a birth's: its child was started for a spawn that never
+    /// reached the mux, so rolling back closes the child rather than leaving
+    /// it running unclaimed (ft-hn80q). A restored pane's child is the user's
+    /// running process, and rolling back only retires the lease.
+    close_child: bool,
 }
 
 impl GuardianClaimedLeaseRollback {
@@ -5742,6 +6190,28 @@ impl GuardianClaimedLeaseRollback {
             actor,
             retirement_reservation: Some(retirement_reservation),
             armed: true,
+            close_child: false,
+        }
+    }
+
+    /// The rollback's mutation: Close for a birth, Retire otherwise.
+    fn release_unpublished_lease(
+        &self,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Result<(), GuardianProxyError> {
+        let mut actor = self.actor.lock();
+        if self.close_child {
+            actor.close(identity)
+        } else {
+            actor.retire(identity)
+        }
+    }
+
+    fn release_name(&self) -> &'static str {
+        if self.close_child {
+            "birth close"
+        } else {
+            "lease retirement"
         }
     }
 
@@ -5754,7 +6224,8 @@ impl GuardianClaimedLeaseRollback {
 
     fn retain_for_later_retry(&mut self, error: &GuardianProxyError) {
         log::error!(
-            "guardian lease retirement after unpublished restore remains unconfirmed; retaining exact cleanup authority: {error}"
+            "guardian {} after unpublished restore remains unconfirmed; retaining exact cleanup authority: {error}",
+            self.release_name()
         );
         if let Some(reservation) = self.retirement_reservation.take() {
             reservation.retain(
@@ -5767,7 +6238,8 @@ impl GuardianClaimedLeaseRollback {
 
     fn resolve_absent_lease(&mut self, error: &GuardianProxyError) {
         log::warn!(
-            "guardian lease retirement after unpublished restore is already resolved by terminal lease state: {error}"
+            "guardian {} after unpublished restore is already resolved by terminal lease state: {error}",
+            self.release_name()
         );
         metrics::counter!(
             "mux.guardian_proxy.retained_retirement_retry_total",
@@ -5777,7 +6249,7 @@ impl GuardianClaimedLeaseRollback {
         self.disarm();
     }
 
-    fn retire_unpublished_lease(&mut self) {
+    fn roll_back_unpublished_lease(&mut self) {
         if !self.armed {
             return;
         }
@@ -5787,7 +6259,7 @@ impl GuardianClaimedLeaseRollback {
         };
         let identity = reservation.identity;
         reservation.coordinator.invalidate();
-        let first_result = self.actor.lock().retire(identity);
+        let first_result = self.release_unpublished_lease(identity);
         match first_result {
             Ok(()) => self.disarm(),
             Err(error) if guardian_retirement_is_resolved(&error) => {
@@ -5795,9 +6267,10 @@ impl GuardianClaimedLeaseRollback {
             }
             Err(error) if guardian_cleanup_retry_is_safe(&error) => {
                 log::warn!(
-                    "guardian lease retirement reply was lost before topology publication; retrying the exact pending mutation: {error}"
+                    "guardian {} reply was lost before topology publication; retrying the exact pending mutation: {error}",
+                    self.release_name()
                 );
-                let retry_result = self.actor.lock().retire(identity);
+                let retry_result = self.release_unpublished_lease(identity);
                 match retry_result {
                     Ok(()) => self.disarm(),
                     Err(retry_error) if guardian_retirement_is_resolved(&retry_error) => {
@@ -5813,7 +6286,7 @@ impl GuardianClaimedLeaseRollback {
 
 impl Drop for GuardianClaimedLeaseRollback {
     fn drop(&mut self) {
-        self.retire_unpublished_lease();
+        self.roll_back_unpublished_lease();
     }
 }
 
@@ -5843,6 +6316,7 @@ impl GuardianProxyStaging {
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
         recovery_admission: Option<Arc<frankenterm_pty_guardian::GuardianRecoveryClaimAdmission>>,
+        birth: bool,
     ) -> Result<Self, GuardianProxyError> {
         debug_assert_eq!(
             claimed_lease.guardian_incarnation(),
@@ -5867,6 +6341,9 @@ impl GuardianProxyStaging {
             retirement_reservation,
         );
         staging.actor.lock()._recovery_admission = recovery_admission;
+        // A birth's rollback closes the child its spawn started (ft-hn80q),
+        // from any failure from here on.
+        staging.lease_rollback.close_child = birth;
         // Stage the rollback guard before opening the independent replay
         // channel. A replay-channel setup failure must not leak the Claim that
         // the caller completed before entering this constructor.
@@ -7067,13 +7544,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
-    fn guardian_domain_real_birth_publishes_output_and_cancellation_retires_only_lease() {
+    fn guardian_domain_real_birth_publishes_output_and_cancellation_closes_its_child() {
         run_guardian_domain_real_birth(RealBirthFixtureMode::BirthAndCancellation);
     }
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
-    fn guardian_domain_in_flight_cancellation_finishes_adoption_then_retires_only_lease() {
+    fn guardian_domain_in_flight_cancellation_finishes_adoption_then_closes_its_child() {
         run_guardian_domain_real_birth(RealBirthFixtureMode::InFlightCancellation);
     }
 
@@ -7357,6 +7834,19 @@ mod tests {
                 mux.iter_panes().is_empty(),
                 "Domain birth published before commit"
             );
+            // Settled but not yet registered: recovery retries, it does not
+            // give up on the mux.
+            assert!(!domain.admission.load(Ordering::Acquire));
+            assert!(
+                domain
+                    .recovery_policy(&config::configuration())
+                    .unwrap_err()
+                    .is::<mux::domain::DomainRecoveryPolicyBusy>()
+            );
+            assert!(matches!(
+                mux.capture_topology_coherent(Default::default()),
+                Err(mux::MuxTopologyCaptureError::DomainPolicyBusy)
+            ));
             let pane = unpublished.publish(&mux).unwrap();
             let published_birth = domain.state.lock().unadopted_birth;
             assert!(published_birth.is_some());
@@ -7640,28 +8130,27 @@ mod tests {
                     Err(error) => panic!("census snapshot refused: {error}"),
                 }
             };
+            // ft-hn80q: abandoning the unpublished birth closed its child
+            // (the fixture traps the HUP and exits), so the census shows it
+            // terminal rather than running unclaimed under the guardian.
+            let closed = |rows: &[GuardianCensusEntry]| {
+                rows.iter()
+                    .filter(|row| row.status == GuardianCensusPaneStatus::ClosedTerminal)
+                    .count()
+            };
             let deadline = Instant::now() + Duration::from_secs(5);
             let rows = loop {
                 let rows = snapshot(deadline);
-                if rows
-                    .iter()
-                    .any(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
-                {
+                if closed(&rows) == 1 {
                     break rows;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "cancelled pane lease was not retired"
+                    "the abandoned birth's child was not closed"
                 );
                 thread::sleep(Duration::from_millis(2));
             };
             assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
-                    .count(),
-                1
-            );
             assert_eq!(
                 rows.iter()
                     .filter(|row| row.status == GuardianCensusPaneStatus::LiveClaimed)
@@ -7673,29 +8162,47 @@ mod tests {
                 b"BB",
                 "exact replay duplicated a birth"
             );
-            assert!(
-                !signaled.exists(),
-                "unpublished cancellation signaled an owned child"
+            let signals = |expected: &[u8], what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while std::fs::read(&signaled).unwrap_or_default() != expected {
+                    assert!(Instant::now() < deadline, "{what}");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            };
+            signals(
+                b"S",
+                "the abandoned birth's child was not signaled exactly once",
             );
-            assert!(domain.state.lock().unadopted_birth.is_some());
-            assert!(
-                !domain
-                    .state
-                    .lock()
-                    .publication
-                    .as_ref()
-                    .unwrap()
-                    .was_published()
-            );
-            let unresolved_birth = domain.state.lock().unadopted_birth;
+            // The fence is released: recovery captures the mux, and the next
+            // spawn starts a child, instead of both refusing for the mux's
+            // lifetime.
             assert!(!domain.admission.load(Ordering::Acquire));
-            assert!(domain.recovery_policy(&config::configuration()).is_err());
-            assert!(matches!(
-                mux.capture_topology_coherent(Default::default()),
-                Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
-            ));
-            assert_eq!(domain.state.lock().unadopted_birth, unresolved_birth);
-            assert!(!domain.admission.load(Ordering::Acquire));
+            domain
+                .recovery_policy(&config::configuration())
+                .expect("an abandoned birth must not disable recovery");
+            assert!(domain.state.lock().unadopted_birth.is_none());
+            assert!(mux.capture_topology_coherent(Default::default()).is_ok());
+            let third = promise::spawn::block_on(domain.spawn_unpublished_pane(
+                &mux,
+                size,
+                Some(command()),
+                None,
+            ))
+            .expect("an abandoned birth must not fence the next spawn");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::read(&births).unwrap() != b"BBB" {
+                assert!(
+                    Instant::now() < deadline,
+                    "the next spawn's child did not start"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            drop(third);
+            signals(b"SS", "the second abandoned birth's child was not closed");
+            // A birth that fails after its Spawn but before its claim (a lost
+            // claim connection) closes the child it started, under its own
+            // custody, and releases the fence too.
+            FAIL_NEXT_GUARDIAN_BIRTH_BEFORE_CLAIM.store(true, Ordering::Release);
             assert!(
                 promise::spawn::block_on(domain.spawn_unpublished_pane(
                     &mux,
@@ -7704,15 +8211,26 @@ mod tests {
                     None,
                 ))
                 .is_err(),
-                "cancelled birth must remain fenced, not create a replacement child"
+                "the injected failure before the claim did not fail the birth"
             );
-            assert_eq!(std::fs::read(&births).unwrap(), b"BB");
+            assert_eq!(std::fs::read(&births).unwrap(), b"BBBB");
+            signals(
+                b"SSS",
+                "the child of a birth that failed before its claim was not closed",
+            );
+            assert!(domain.state.lock().unadopted_birth.is_none());
+            assert!(domain.state.lock().orphaned_births.is_empty());
+            assert!(!domain.admission.load(Ordering::Acquire));
+            domain
+                .recovery_policy(&config::configuration())
+                .expect("a birth that failed before its claim must not disable recovery");
             std::fs::write(&release, b"release").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 while executor.try_tick().unwrap() {}
                 let rows = snapshot(deadline);
-                if rows.len() == 2 && rows.iter().all(|row| row.exit_status == Some(0)) {
+                if rows.len() == 4 && rows.iter().all(|row| row.exit_status == Some(0)) {
+                    assert_eq!(closed(&rows), 3);
                     break;
                 }
                 assert!(
@@ -7721,8 +8239,10 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(std::fs::read(&finished).unwrap(), b"DD");
-            assert!(!signaled.exists());
+            // Only the published child ran to its release; the closed ones
+            // exited from the HUP.
+            assert_eq!(std::fs::read(&finished).unwrap(), b"D");
+            assert_eq!(std::fs::read(&signaled).unwrap(), b"SSS");
             let deadline = Instant::now() + Duration::from_secs(5);
             while !pane.is_dead() {
                 assert!(
@@ -8954,6 +9474,14 @@ mod tests {
             !mux.guardian_checkpoint_is_current(pane_id, &quiet),
             "quiet capture before child output must be stale (detected ABA/mutation)"
         );
+        // Stale for a common cut, yet still this registration's checkpoint
+        // under this lease: its journal replays the output that followed, so a
+        // recovery image may name it.
+        assert!(
+            mux.guardian_checkpoint_is_restorable(pane_id, &quiet),
+            "output after a guardian checkpoint must not make it unrestorable"
+        );
+        assert!(mux.guardian_checkpoint_is_restorable(pane_id, &published));
         drop(quiet);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
@@ -9533,6 +10061,10 @@ mod tests {
             !mux.guardian_checkpoint_is_current(pane_id, &published),
             "predecessor registration was detached; must be stale on predecessor mux"
         );
+        assert!(
+            !mux.guardian_checkpoint_is_restorable(pane_id, &published),
+            "a detached registration's checkpoint must not be restorable"
+        );
 
         assert!(
             successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
@@ -9543,6 +10075,14 @@ mod tests {
         assert!(
             !successor_mux.guardian_checkpoint_is_current(unknown_pane_id, &gen2_published),
             "unknown pane ID must reject guardian checkpoint"
+        );
+        assert!(
+            !successor_mux.guardian_checkpoint_is_restorable(unknown_pane_id, &gen2_published),
+            "unknown pane ID must not restore a guardian checkpoint"
+        );
+        assert!(
+            successor_mux
+                .guardian_checkpoint_is_restorable(successor_pane.pane_id(), &gen2_published)
         );
 
         // A real model-only capture must not acquire guardian authority merely
@@ -9576,6 +10116,10 @@ mod tests {
         assert!(
             !successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &published),
             "predecessor gen1 capture must not be current under successor mux (lease/incarnation mismatch)"
+        );
+        assert!(
+            !successor_mux.guardian_checkpoint_is_restorable(successor_pane.pane_id(), &published),
+            "a predecessor lease's capture must not be restorable under the successor"
         );
 
         // Deterministic cancellation during live guardian wait blocked on live parser
@@ -10111,9 +10655,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication without predecessor custody must fail predecessor reconciliation: {err:?}"
             );
@@ -10157,9 +10701,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication with wrong predecessor custody must fail predecessor reconciliation: {err:?}"
             );
@@ -10199,9 +10743,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
-                        "committed graph rejected"
-                    ))
+                    WholeMuxPublicationError::Publication(
+                        PublicationError::CommittedGraphRejected { generation: 1, .. }
+                    )
                 ),
                 "publication with wrong predecessor image digest must fail predecessor reconciliation: {err:?}"
             );
@@ -10727,6 +11271,16 @@ mod tests {
             .unwrap();
         assert_eq!(staging.actor.lock().identity().generation(), 4);
         assert_eq!(staging.actor.lock().identity().mux_incarnation(), owner);
+        // The whole-mux restore (`--recovery-restore`) holds the traversed
+        // lease to the same selection: the dead attempts claimed 2 and 3.
+        let selected = staging.selected_checkpoint.unwrap();
+        assert_eq!(selected.traversed_successors, 2);
+        selected
+            .validate_root(
+                SelectedRecoveryRoot::from_validated(recovery),
+                staging.identity(),
+            )
+            .expect("a retried recovery activates at the generation its intent chain reached");
         let stale = GuardianClient::connect_for_genesis(socket, token, Uuid::new_v4())
             .unwrap()
             .resolve_mux_successor(
@@ -12083,6 +12637,7 @@ mod tests {
             boundary_id: fixture.descriptor.boundary_id().into_bytes(),
             payload_digest: fixture.descriptor.terminal_payload_digest(),
             payload_bytes: fixture.descriptor.total_bytes(),
+            traversed_successors: 0,
         };
         for control in 0..7 {
             let mut expected = selected;
@@ -12164,6 +12719,30 @@ mod tests {
             ..selected
         };
         assert!(exhausted.validate_attach(selected.pane_id, 0).is_err());
+        // Two earlier attempts at this selection claimed generation + 1 and
+        // + 2; the third attaches at + 3 and nowhere else.
+        let retried = SelectedRecoveryCheckpoint {
+            traversed_successors: 2,
+            ..selected
+        };
+        assert!(
+            retried
+                .validate_attach(selected.pane_id, selected.generation + 3)
+                .is_ok()
+        );
+        for refused in [
+            selected.generation + 1,
+            selected.generation + 2,
+            selected.generation + 4,
+        ] {
+            assert!(retried.validate_attach(selected.pane_id, refused).is_err());
+        }
+        let overflowing = SelectedRecoveryCheckpoint {
+            generation: u64::MAX - 1,
+            traversed_successors: 1,
+            ..selected
+        };
+        assert!(overflowing.validate_attach(selected.pane_id, 0).is_err());
     }
 
     fn genesis_checkpoint_fixture() -> (GuardianCheckpointDescriptorV1, Zeroizing<Vec<u8>>) {
@@ -12284,6 +12863,283 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One replay snapshot of a Genesis checkpoint followed by the output
+    /// records `payloads`, then its completion.
+    fn genesis_pages_with_output(
+        descriptor: GuardianCheckpointDescriptorV1,
+        checkpoint: Zeroizing<Vec<u8>>,
+        snapshot: u128,
+        payloads: &[&[u8]],
+    ) -> VecDeque<GuardianReplayPageDelivery> {
+        let snapshot_id = id(snapshot);
+        let snapshot_digest = [0x61; 32];
+        let cursor = |page: u32, next_sequence: u64, previous_digest: [u8; 32]| {
+            GuardianReplayCursorV1::new(
+                snapshot_id,
+                snapshot_digest,
+                GuardianReplayPhaseV1::Output,
+                page,
+                0,
+                next_sequence,
+                previous_digest,
+                0,
+                GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+                GUARDIAN_MAX_REPLAY_RECORDS,
+            )
+            .expect("construct Genesis output cursor")
+        };
+        let first = cursor(1, 1, [0; 32]);
+        let checkpoint_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            [0; 32],
+            0,
+            Some(first),
+            GuardianReplayPageBodyDelivery::CheckpointChunk(
+                GuardianCheckpointChunkDelivery::new(descriptor, 0, checkpoint)
+                    .expect("construct Genesis checkpoint delivery"),
+            ),
+        )
+        .expect("construct Genesis checkpoint page");
+        // A journal's committed bytes include its file and record headers.
+        let (mut sequence, mut digest, mut cumulative, mut log_bytes) =
+            (0u64, [0u8; 32], 0u64, 4096u64);
+        let mut deliveries = Vec::new();
+        for payload in payloads {
+            sequence += 1;
+            cumulative += payload.len() as u64;
+            log_bytes += payload.len() as u64 + 256;
+            digest = Sha256::digest(payload).into();
+            let metadata = GuardianReplayRecordMetadataV1::new(
+                id(0x650),
+                1,
+                None,
+                sequence,
+                u32::try_from(payload.len()).unwrap(),
+                cumulative,
+                log_bytes,
+                digest,
+            )
+            .expect("construct Genesis record metadata");
+            deliveries.push(
+                GuardianReplayRecordDelivery::new(metadata, Zeroizing::new(payload.to_vec()))
+                    .expect("construct Genesis record delivery"),
+            );
+        }
+        let records = GuardianReplayOutputRecordsDelivery::new(1, [0; 32], deliveries)
+            .expect("construct Genesis output page body");
+        let second = cursor(2, sequence + 1, digest);
+        let output_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            first.digest(),
+            1,
+            Some(second),
+            GuardianReplayPageBodyDelivery::OutputRecords(records),
+        )
+        .expect("construct Genesis output page");
+        let complete_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            second.digest(),
+            2,
+            None,
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: descriptor.checkpoint_id(),
+                through_sequence: sequence,
+                terminal_record_digest: digest,
+                cumulative_plaintext_bytes: cumulative,
+            },
+        )
+        .expect("construct Genesis completion page");
+        VecDeque::from([checkpoint_page, output_page, complete_page])
+    }
+
+    /// A replay that ends inside an escape sequence (a child part way through
+    /// writing an image) is released and reopened once the rest has arrived,
+    /// instead of failing the restore.
+    #[test]
+    fn restore_reopens_a_replay_that_ends_inside_an_escape_sequence() {
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        let mut pages = genesis_pages_with_output(
+            descriptor,
+            checkpoint.clone(),
+            0x600,
+            &[b"\x1b]0;half a ti"],
+        );
+        pages.extend(genesis_pages_with_output(
+            descriptor,
+            checkpoint,
+            0x601,
+            &[b"\x1b]0;half a ti", b"tle\x07ground"],
+        ));
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages,
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let restored = consume_guardian_replay_for_restore(
+            &mut FakeReplayTransport {
+                state: Arc::clone(&state),
+            },
+            identity(),
+            size(24, 80),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+            None,
+        )
+        .expect("restore once the sequence ends");
+        assert_eq!(restored.boundary.next_sequence, 3);
+        let terminal = restored
+            .inert_terminal
+            .activate(Box::new(std::io::sink()))
+            .expect("activate the restored terminal")
+            .0;
+        assert_eq!(terminal.get_title(), "half a title");
+        let state = state.lock();
+        assert!(state.pages.is_empty());
+        // Both snapshots were released: each completion was acknowledged.
+        assert_eq!(
+            state
+                .acks
+                .iter()
+                .filter(|(_, ack)| ack.release_if_complete())
+                .count(),
+            2
+        );
+    }
+
+    /// Refuses the first `refusals` replay requests and the first
+    /// `ack_refusals` acks as a guardian out of replay snapshots or request
+    /// bindings does, before admitting anything.
+    struct CapacityRefusingReplayTransport {
+        inner: FakeReplayTransport,
+        refusals: usize,
+        ack_refusals: usize,
+    }
+
+    fn capacity_refused() -> GuardianProxyError {
+        GuardianProxyError::Client(GuardianClientError::Rejected(
+            GuardianRejectionCode::CapacityExhausted,
+        ))
+    }
+
+    impl GuardianReplayTransport for CapacityRefusingReplayTransport {
+        fn replay(
+            &mut self,
+            request_id: Uuid,
+            request: GuardianReplayRequestV1,
+        ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+            if self.refusals > 0 {
+                self.refusals -= 1;
+                return Err(capacity_refused());
+            }
+            self.inner.replay(request_id, request)
+        }
+
+        fn replay_ack(
+            &mut self,
+            request_id: Uuid,
+            ack: GuardianReplayAckV1,
+        ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+            if self.ack_refusals > 0 {
+                self.ack_refusals -= 1;
+                return Err(capacity_refused());
+            }
+            self.inner.replay_ack(request_id, ack)
+        }
+    }
+
+    /// A successor restoring a fleet host's panes found the guardian's replay
+    /// snapshots held by other panes' readers, and the refusal ended the whole
+    /// mux. Restore repeats the refused request, within a bounded total,
+    /// without reopening the snapshot it was reading.
+    #[test]
+    fn restore_waits_for_a_replay_snapshot_the_guardian_is_out_of() {
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages: genesis_pages_with_output(descriptor, checkpoint, 0x610, &[b"ground"]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut transport = CapacityRefusingReplayTransport {
+            inner: FakeReplayTransport {
+                state: Arc::clone(&state),
+            },
+            refusals: 3,
+            ack_refusals: 2,
+        };
+        let restored = consume_guardian_replay_for_restore(
+            &mut transport,
+            identity(),
+            size(24, 80),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+            None,
+        )
+        .expect("restore once a replay snapshot frees up");
+        assert_eq!((transport.refusals, transport.ack_refusals), (0, 0));
+        assert_eq!(restored.boundary.next_sequence, 2);
+        {
+            let state = state.lock();
+            assert!(state.pages.is_empty());
+            // One request per page and one released snapshot: nothing reopened.
+            assert_eq!(state.requests.len(), 3);
+            assert_eq!(
+                state
+                    .acks
+                    .iter()
+                    .filter(|(_, ack)| ack.release_if_complete())
+                    .count(),
+                1
+            );
+        }
+
+        // A guardian that stays full still fails the restore, after the wait.
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages: genesis_pages_with_output(descriptor, checkpoint, 0x611, &[b"ground"]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let started = Instant::now();
+        let result = consume_guardian_replay_for_restore(
+            &mut CapacityRefusingReplayTransport {
+                inner: FakeReplayTransport {
+                    state: Arc::clone(&state),
+                },
+                refusals: usize::MAX,
+                ack_refusals: 0,
+            },
+            identity(),
+            size(24, 80),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::CapacityExhausted
+            )))
+        ));
+        assert!(started.elapsed() >= GUARDIAN_RESTORE_CAPACITY_WAIT_TOTAL);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(state.lock().requests.is_empty());
     }
 
     #[test]
@@ -13514,6 +14370,58 @@ mod tests {
         assert_eq!(second_payload.as_deref(), Some(b"second".as_slice()));
         assert!(second.has_durable_replay_page_ack());
         assert_eq!(replay_state.lock().acks.len(), 1);
+    }
+
+    #[test]
+    fn tail_reader_takes_a_new_anchor_only_at_its_next_open() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive tail boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page_records(&fixture, &[b"first"])]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct tail reader");
+        // A checkpoint adopted before the first open anchors it.
+        let digest = |byte| GuardianCheckpointIdentityDigest::from_bytes([byte; 32]).unwrap();
+        let adopted = digest(0x5a);
+        reader.reanchor(adopted, 7);
+        reader
+            .deliver_next_record(&mut |_, _, _| Ok(()))
+            .expect("deliver the page's record");
+        assert!(matches!(
+            replay_state.lock().requests[0].1,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
+                    capture_generation: 7,
+                    ..
+                },
+                ..
+            } if checkpoint_id == adopted
+        ));
+        // Inside the open snapshot a later anchor waits for the next open:
+        // the snapshot's completion names the checkpoint it opened at.
+        reader.reanchor(digest(0x6b), 8);
+        reader.apply_next_anchor();
+        assert_eq!(reader.capture_generation, 7);
+        assert!(matches!(
+            reader.request(),
+            GuardianReplayRequestV1::Continue { .. }
+        ));
     }
 
     #[test]

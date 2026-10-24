@@ -77,6 +77,7 @@ use crate::scrollback_mmap_writer::{
     LinearRecordSnapshot, LinearRecordSourceIdentity, MmapScrollbackError,
     read_linear_records_in_directory,
 };
+use crate::system_symlinks::resolve_system_symlinks;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
@@ -1570,17 +1571,15 @@ fn acquire_recovery_lease(lock_path: &Path) -> std::io::Result<LockProbeOutcome>
     let directory_identity = metadata_identity(&directory_metadata);
 
     let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let lock_file = directory.open_with(&lock_leaf, &options)?.into_std();
+    // A recovery racing another opener creates the lock exclusively (ft-nd1c0).
+    let lock_file =
+        crate::lock::open_or_create_exclusively(&directory, &lock_leaf, &options)?.into_std();
     let path_metadata = directory.symlink_metadata(&lock_leaf)?;
     let handle_metadata = lock_file.metadata()?;
     validate_candidate_metadata(&path_metadata, &directory_metadata)
@@ -2006,7 +2005,14 @@ fn header_matches_filename(leaf: &Path, header: &ScrollbackHeader) -> bool {
     hex::decode_to_slice(stem, &mut decoded).is_ok() && decoded == header.pane_uuid
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
+    open_resolved_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -2028,7 +2034,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_directory_tree_nofollow(parent_path)?;
     parent.open_dir_nofollow(leaf)
 }
 
@@ -2391,6 +2397,11 @@ mod tests {
         let uppercase_lock = dir.join(format!("{}.bin.lock", "AB".repeat(32)));
         write_private(&lowercase_lock, &[]);
         write_private(&uppercase_lock, &[]);
+        // A case-insensitive filesystem (APFS's default) keeps both names as
+        // one file, so the uppercase companion this test is about cannot exist.
+        if fs::read_dir(&dir).unwrap().count() < 2 {
+            return;
+        }
 
         let out = scan_orphans(&dir, &AlwaysOrphaned, recovery_limits()).unwrap();
 

@@ -24,6 +24,7 @@ pest = {workspace = true, optional=true}
 pest_derive = {workspace = true, optional=true}
 serde = {workspace=true, optional=true}
 sha2 = {workspace=true, optional=true}
+simdutf8 = { version = "0.1.5", default-features = false }
 thiserror = {version = "2.0", default-features=false }
 vtparse = {workspace = true, features=["alloc"]}
 zeroize.workspace = true
@@ -50,7 +51,7 @@ features = [
 ]
 
 [features]
-std = ["vtparse/std", "thiserror/std", "frankenterm-input-types/std", "hex/std", "frankenterm-dynamic/std"]
+std = ["vtparse/std", "thiserror/std", "frankenterm-input-types/std", "hex/std", "frankenterm-dynamic/std", "simdutf8/std"]
 kitty-shm = ["dep:nix", "dep:winapi"]
 use_serde = ["dep:serde", "frankenterm-color-types/use_serde", "frankenterm-blob-leases/serde", "bitflags/serde", "frankenterm-input-types/serde"]
 use_image = ["image", "dep:image"]

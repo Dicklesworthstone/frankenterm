@@ -123,8 +123,8 @@ Rules:
 ## CLI/TUI/Web Implications (Non-binding)
 
 - `ft search save <name> <query>` should create a row in `saved_searches`.
-- `ft search run <name>` should execute once and update `last_run_at`/`last_result_count`.
-- `ft search schedule <name> --interval 60s` should set `schedule_interval_ms` and enable.
+- `ft search saved run <name>` should execute once and update `last_run_at`/`last_result_count`.
+- `ft search saved schedule <name> 60000` should set `schedule_interval_ms` and enable.
 - UI surfaces should show `last_run_at`, `last_result_count`, and `last_error`.
 
 ## Edge Cases

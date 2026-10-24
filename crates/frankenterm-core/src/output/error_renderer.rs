@@ -57,7 +57,8 @@ impl ErrorRenderer {
                     | MuxRejectionCode::PolicyRejected
                     | MuxRejectionCode::Cancelled
                     | MuxRejectionCode::QuotaExceeded
-                    | MuxRejectionCode::BackendFailure => "FT-1020",
+                    | MuxRejectionCode::BackendFailure
+                    | MuxRejectionCode::ResourceBusy => "FT-1020",
                 },
                 WeztermError::ParseError(_) => "FT-1021",
                 WeztermError::VersionSkew { .. } => "FT-1025",
@@ -1089,8 +1090,8 @@ mod tests {
         assert!(
             alternatives
                 .iter()
-                .any(|alt| alt.contains("ft backup restore")),
-            "expected backup restore guidance in alternatives: {alternatives:?}"
+                .any(|alt| alt.contains("ft backup import")),
+            "expected backup import guidance in alternatives: {alternatives:?}"
         );
         assert!(
             alternatives

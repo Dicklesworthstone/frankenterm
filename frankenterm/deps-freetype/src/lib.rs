@@ -979,7 +979,7 @@ pub use self::FT_Glyph_Format_ as FT_Glyph_Format;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FT_Span_ {
-    pub x: ::std::os::raw::c_short,
+    pub x: ::std::os::raw::c_ushort,
     pub len: ::std::os::raw::c_ushort,
     pub coverage: ::std::os::raw::c_uchar,
 }

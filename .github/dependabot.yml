@@ -37,3 +37,10 @@ updates:
       # porting is a manual job (Linux-only build break, not caught on macOS).
       - dependency-name: "smithay-client-toolkit"
         versions: [">=0.21"]
+      # frankenterm-char-props pins phf exactly: emoji_variation.rs embeds hash
+      # state generated for that release line, and a bump without regenerating
+      # it makes every VS15/VS16 lookup miss (e73b0d7e4, 70b0ee5ec). Upgrade by
+      # hand together with the codegen crate and a regenerated table.
+      - dependency-name: "phf"
+      - dependency-name: "phf_shared"
+      - dependency-name: "phf_codegen"

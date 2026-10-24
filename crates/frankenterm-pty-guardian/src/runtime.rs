@@ -142,7 +142,9 @@ struct RuntimePaneOutput {
     expected_sequence: Option<u64>,
     durable_plaintext_bytes: u64,
     remaining_record_capacity: u64,
+    max_append_bytes: usize,
     waiting_for_slot: bool,
+    waiting_for_capacity: bool,
     failed: bool,
 }
 
@@ -152,16 +154,40 @@ impl RuntimePaneOutput {
             expected_sequence: journal.initial_next_sequence(),
             durable_plaintext_bytes: journal.initial_cumulative_plaintext_bytes(),
             remaining_record_capacity: journal.initial_remaining_records(),
+            max_append_bytes: journal.initial_append_bytes(),
             journal,
             pending_plaintext: None,
             in_flight_bytes: 0,
             waiting_for_slot: false,
+            waiting_for_capacity: false,
             failed: false,
         }
     }
 
     fn is_quiescent(&self) -> bool {
         self.pending_plaintext.is_none() && self.in_flight_bytes == 0 && !self.failed
+    }
+
+    /// Called only after a durable completion or while a capacity-paused pane
+    /// has no append in flight. Ordinary worker-slot availability cannot lift
+    /// journal backpressure; a checkpoint must first release retained output.
+    fn refresh_append_capacity(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.expected_sequence.is_some()
+            && let Ok((remaining, append_bytes)) = self.journal.checked_append_capacity()
+        {
+            self.remaining_record_capacity = remaining;
+            self.max_append_bytes = append_bytes;
+            self.waiting_for_capacity = remaining == 0 || append_bytes == 0;
+            self.waiting_for_slot = !self.waiting_for_capacity;
+            return true;
+        }
+        self.failed = true;
+        self.waiting_for_capacity = false;
+        self.waiting_for_slot = false;
+        false
     }
 }
 
@@ -192,6 +218,16 @@ struct StartingBrokerPane {
     pending_delivery: Option<BrokerOutputDeliveryV1>,
     pending_ack: Option<GuardianDurableBrokerOutputAckV1>,
     read_reservation: usize,
+    /// No Read is sent before this: the last one found no output.
+    read_retry_at: Option<Instant>,
+    /// The wait after the next Read that finds no output.
+    read_backoff: Duration,
+    /// When a Read last delivered output.
+    last_output_at: Option<Instant>,
+    /// When the pane last had output or input.
+    active_at: Option<Instant>,
+    /// When the broker last answered a ChildStatus.
+    status_checked_at: Option<Instant>,
     terminal: bool,
     child_exit_observed: bool,
     status_due: bool,
@@ -202,6 +238,84 @@ struct StartingBrokerPane {
     retry_before_publication: Option<Box<GenesisSpawnJob>>,
     activation: Option<GuardianGenesisActivationContinuationV1>,
     replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+/// The first wait after a broker Read finds no output (ft-2pgul).
+const BROKER_READ_RETRY_FIRST: Duration = Duration::from_micros(250);
+/// The longest wait between broker Reads of a pane with no output.
+const BROKER_READ_RETRY_MAX: Duration = Duration::from_millis(25);
+/// The longest wait once a pane has had no output or input for
+/// [`BROKER_READ_IDLE_AFTER`]: every Read costs the broker a token effect
+/// lease, and twelve idle panes at 25 ms held a broker at ~43% CPU (mac).
+const BROKER_READ_RETRY_IDLE_MAX: Duration = Duration::from_millis(100);
+const BROKER_READ_IDLE_AFTER: Duration = Duration::from_secs(1);
+/// A pane that delivered output this recently is streaming: a Read that
+/// finds none is most likely waiting on a drain the broker has in flight.
+const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
+/// The longest a pane goes without a ChildStatus while its PTY stays open.
+const BROKER_CHILD_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
+impl StartingBrokerPane {
+    /// The broker answers a Read with no output at once, whether its PTY is
+    /// idle or a drain is still syncing, so reading again at once spun the
+    /// guardian and the broker on every idle pane (a core between them). Back
+    /// off from [`BROKER_READ_RETRY_FIRST`], doubling to
+    /// [`BROKER_READ_RETRY_MAX`], or to [`BROKER_READ_RETRY_IDLE_MAX`] once
+    /// the pane has gone quiet; output or input resets it. A streaming pane
+    /// keeps the first wait, so it picks up a drain's record soon after the
+    /// broker has synced it.
+    fn defer_read(&mut self, now: Instant) {
+        let streaming = self
+            .last_output_at
+            .is_some_and(|at| now.saturating_duration_since(at) < BROKER_READ_STREAMING_WINDOW);
+        let maximum = if self
+            .active_at
+            .is_some_and(|at| now.saturating_duration_since(at) < BROKER_READ_IDLE_AFTER)
+        {
+            BROKER_READ_RETRY_MAX
+        } else {
+            BROKER_READ_RETRY_IDLE_MAX
+        };
+        self.read_backoff = if streaming {
+            BROKER_READ_RETRY_FIRST
+        } else {
+            (self.read_backoff * 2).clamp(BROKER_READ_RETRY_FIRST, maximum)
+        };
+        self.read_retry_at = Some(now + self.read_backoff);
+        self.child_status_due_by(now);
+    }
+
+    /// Input or output: read again at once, and back off only to
+    /// [`BROKER_READ_RETRY_MAX`] for a while.
+    fn read_promptly(&mut self, now: Instant) {
+        self.read_backoff = Duration::ZERO;
+        self.read_retry_at = None;
+        self.active_at = Some(now);
+    }
+
+    fn output_delivered(&mut self, now: Instant) {
+        self.read_promptly(now);
+        self.last_output_at = Some(now);
+        self.child_status_due_by(now);
+    }
+
+    /// A ChildStatus after every Read was one more broker round trip per
+    /// record. Ask at most every [`BROKER_CHILD_STATUS_INTERVAL`] instead: a
+    /// child's exit closes its PTY, and that end (`terminal`) still asks at
+    /// once; only a child whose PTY another process holds open waits for the
+    /// interval.
+    fn child_status_due_by(&mut self, now: Instant) {
+        if self
+            .status_checked_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= BROKER_CHILD_STATUS_INTERVAL)
+        {
+            self.status_due = true;
+        }
+    }
+
+    fn read_due(&self, now: Instant) -> bool {
+        self.read_retry_at.is_none_or(|at| at <= now)
+    }
 }
 
 struct RuntimeBrokerConnection {
@@ -683,6 +797,7 @@ struct GenesisSpawnCompletion {
 struct CheckpointWorkerCompletion {
     route: GuardianCheckpointRoute,
     operation: GuardianOperation,
+    pane_id: Option<Uuid>,
     protocol: GuardianProtocolState,
     response: Option<GuardianResponseEnvelope>,
     worker_panicked: bool,
@@ -779,11 +894,21 @@ fn checkpoint_worker(
 ) {
     while let Ok(mut job) = jobs.recv() {
         let operation = job.request.header().operation;
+        let pane_id = job.request.header().pane_id;
+        let started = std::time::Instant::now();
         let authority_valid_before = job.token_effect_authority.validate();
         let execution = authority_valid_before.then(|| {
             catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job))
         });
         let authority_valid_after = job.token_effect_authority.validate();
+        // One worker serves every pane's replay opens and checkpoint stages,
+        // so a recovery capture waits behind them (ft-4wrv7). Enable with
+        // RUST_LOG=frankenterm_pty_guardian::checkpoint_timing=debug.
+        log::debug!(
+            target: "frankenterm_pty_guardian::checkpoint_timing",
+            "{operation:?} ran {} us",
+            started.elapsed().as_micros()
+        );
         let token_authority_failed = !authority_valid_before || !authority_valid_after;
         // Response correlation validates against the authenticated request, so
         // build it first. Then wipe plaintext before publishing any completion.
@@ -840,6 +965,7 @@ fn checkpoint_worker(
         let completion = CheckpointWorkerCompletion {
             route: job.route,
             operation,
+            pane_id,
             protocol: job.protocol,
             response,
             worker_panicked,
@@ -881,11 +1007,32 @@ fn execute_checkpoint_job(
         }
         GuardianOperation::CheckpointStage => execute_checkpoint_stage_job(store, job),
         GuardianOperation::Checkpoint => {
-            let receipt = match job
-                .protocol
-                .apply_checkpoint_transactionally(&job.request, |permit| {
-                    store.publish_checkpoint_catalog_adoption(permit)
-                }) {
+            let receipt = match job.protocol.apply_checkpoint_transactionally_or_refuse(
+                &job.request,
+                |permit| {
+                    let published = store.publish_checkpoint_catalog_adoption(permit);
+                    published.map_err(|error| {
+                        use crate::output::GuardianCheckpointStageStoreError as StoreError;
+                        use mux::guardian_protocol::GuardianCheckpointPublicationFailure as Failure;
+                        match error {
+                            // No room in the pane's catalog yet (a restore's
+                            // replay pins its oldest members): nothing was
+                            // written, so the request is refused, not left
+                            // indeterminate, which would quarantine the lease.
+                            StoreError::CatalogFull => Failure::Refused(error),
+                            error => {
+                                // The mux sees only an indeterminate outcome,
+                                // and quarantines the lease: this names it.
+                                log::warn!(
+                                    "guardian checkpoint catalog adoption failed; \
+                                     outcome indeterminate: {error:?}"
+                                );
+                                Failure::Indeterminate(error)
+                            }
+                        }
+                    })
+                },
+            ) {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     return Some(GuardianResponseEnvelope::rejection(
@@ -1290,6 +1437,11 @@ fn replay_store_error_response(
 ) -> Option<GuardianResponseEnvelope> {
     use crate::output::GuardianCheckpointStageStoreError;
 
+    // The mux sees only the rejection code, which folds several causes.
+    log::warn!(
+        "guardian {:?} store request failed: {error:?}",
+        request.header().operation
+    );
     let rejection = match error {
         GuardianCheckpointStageStoreError::Protocol(error) => {
             GuardianRejectionCode::from_protocol_error(error)
@@ -1304,6 +1456,7 @@ fn replay_store_error_response(
             GuardianRejectionCode::ReplaySnapshotExpired
         }
         GuardianCheckpointStageStoreError::Capacity
+        | GuardianCheckpointStageStoreError::CatalogFull
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
         GuardianCheckpointStageStoreError::SpawnCustody(_)
@@ -1340,6 +1493,8 @@ fn execute_checkpoint_stage_job(
             stage.scope(),
             mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { .. }
         );
+    let kind = stage.kind();
+    let started = std::time::Instant::now();
     let reply = match stage.kind() {
         GuardianCheckpointStageKindV1::Begin => store.apply_begin(&stage),
         GuardianCheckpointStageKindV1::Chunk => store.apply_chunk(stage),
@@ -1364,10 +1519,44 @@ fn execute_checkpoint_stage_job(
             store.apply_runtime_seal(permit, journal)
         }
         GuardianCheckpointStageKindV1::Ack => {
-            store.apply_ack_from_committed_catalog(stage, job.request.header().mux_incarnation)
+            let pane_id = match stage.scope() {
+                mux::guardian_protocol::GuardianCheckpointScopeV1::Pane { pane_id, .. } => {
+                    Some(pane_id)
+                }
+                mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { .. } => None,
+            };
+            let acked =
+                store.apply_ack_from_committed_catalog(stage, job.request.header().mux_incarnation);
+            // An acknowledged capture may have let the catalog drop older
+            // members, so the pane's journal no longer needs the records
+            // before its oldest one; the next rollover reclaims them.
+            if acked.is_ok()
+                && let (Some(pane_id), Some(journal)) = (pane_id, job.journal.as_ref())
+                && let Ok(floor) = store.pane_output_reclaim_floor(pane_id)
+            {
+                journal.release_through_sequence(floor);
+            }
+            acked
         }
     };
-    let reply = reply.ok()?;
+    // The mux waits for this reply on the pane's own connection with a 5 s
+    // I/O deadline, and a missed deadline costs the pane its lease.
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_secs(1) {
+        log::warn!(
+            "guardian checkpoint {kind:?} took {} ms ({})",
+            elapsed.as_millis(),
+            if reply.is_ok() { "applied" } else { "refused" }
+        );
+    }
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The mux sees no reply at all: this names the refusal.
+            log::warn!("guardian checkpoint {kind:?} refused: {error:?}");
+            return None;
+        }
+    };
     job.retain_genesis_begin = retain_genesis_begin;
     GuardianResponseEnvelope::reply(&job.request, &GuardianReply::CheckpointStage(reply)).ok()
 }
@@ -1738,6 +1927,19 @@ impl GuardianRuntime {
         self.pty_tokens.contains_key(&token)
     }
 
+    /// When the first broker pane whose last Read found no output may read
+    /// again; the service loop must wake by then. Only times after `now`: a
+    /// pane already due but not read waits on a busy connection or journal,
+    /// whose completion wakes the loop, and a past time would spin it.
+    #[must_use]
+    pub fn next_broker_read_retry(&self, now: Instant) -> Option<Instant> {
+        self.starting_broker_panes
+            .values()
+            .filter_map(|pane| pane.read_retry_at)
+            .filter(|at| *at > now)
+            .min()
+    }
+
     /// Install one authenticated broker-WAL Spawn fence during startup.
     ///
     /// Recovery must finish before any pane, worker-owned protocol transfer, or
@@ -1992,7 +2194,7 @@ impl GuardianRuntime {
                 GuardianRejectionCode::InvalidRequest,
             ));
         };
-        if let Some(pane) = self.starting_broker_panes.get(&pane_id) {
+        if let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) {
             if !pane.activated {
                 return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
                     &request,
@@ -2007,6 +2209,8 @@ impl GuardianRuntime {
             let Some(protocol) = self.protocol.take() else {
                 return GuardianInputSubmission::CloseRetryably;
             };
+            // Input usually brings output (an echo): read it promptly.
+            pane.read_promptly(Instant::now());
             self.pending_broker_input = Some(PendingBrokerInput {
                 route,
                 pane_id,
@@ -2086,6 +2290,17 @@ impl GuardianRuntime {
     /// straight to the worker so it can return the canonical typed outcome.
     /// A wait is eligible only while the exact requested next sequence remains
     /// the live pane's durable watermark and the pane can still append output.
+    /// Hold the sole protocol authority as an in-flight job does.
+    #[cfg(test)]
+    pub(crate) fn take_protocol_for_test(&mut self) -> Option<GuardianProtocolState> {
+        self.protocol.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_protocol_for_test(&mut self, protocol: GuardianProtocolState) {
+        self.protocol = Some(protocol);
+    }
+
     pub(crate) fn replay_wait_readiness(
         &self,
         request: &AuthenticatedGuardianRequest,
@@ -2597,6 +2812,13 @@ impl GuardianRuntime {
                 pending_delivery: None,
                 pending_ack: None,
                 read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
+                last_output_at: None,
+                // A new child is about to print (a prompt): keep its reads on
+                // the active backoff for a while.
+                active_at: Some(Instant::now()),
+                status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,
@@ -3536,6 +3758,17 @@ impl GuardianRuntime {
                     }
                 }
                 self.replay_deferred_child_exits();
+                if completion.operation == GuardianOperation::CheckpointStage
+                    && !completion.worker_panicked
+                    && !completion.token_authority_failed
+                    && completion.response.as_ref().is_some_and(|response| {
+                        response.header().status
+                            == mux::guardian_protocol::GuardianResponseStatus::Success
+                    })
+                    && let Some(pane_id) = completion.pane_id
+                {
+                    self.refresh_output_capacity_after_checkpoint(pane_id);
+                }
                 GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
                     GuardianRuntimeCheckpointCompletion {
                         route: completion.route,
@@ -3624,6 +3857,7 @@ impl GuardianRuntime {
                 return;
             };
             if pane.output.failed
+                || pane.output.waiting_for_capacity
                 || pane.output.pending_plaintext.is_some()
                 || pane.output.in_flight_bytes != 0
             {
@@ -3637,8 +3871,9 @@ impl GuardianRuntime {
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             }
-            if pane.output.remaining_record_capacity == 0 {
-                pane.output.failed = true;
+            if pane.output.remaining_record_capacity == 0 || pane.output.max_append_bytes == 0 {
+                pane.output.waiting_for_capacity = true;
+                pane.output.waiting_for_slot = false;
                 self.counters.output_segment_exhaustions =
                     self.counters.output_segment_exhaustions.saturating_add(1);
                 deregister_reader(&self.registry, pane, &mut self.counters);
@@ -3656,7 +3891,9 @@ impl GuardianRuntime {
                 return;
             }
 
-            let read_len = remaining.min(OUTPUT_RECORD_BYTES);
+            let read_len = remaining
+                .min(OUTPUT_RECORD_BYTES)
+                .min(pane.output.max_append_bytes);
             let mut bytes = Zeroizing::new(Vec::new());
             if bytes.try_reserve_exact(read_len).is_err() {
                 self.counters.pty_read_failures = self.counters.pty_read_failures.saturating_add(1);
@@ -3748,8 +3985,13 @@ impl GuardianRuntime {
                                 output.durable_plaintext_bytes =
                                     receipt.cumulative_plaintext_bytes();
                                 output.expected_sequence = receipt.sequence().checked_add(1);
-                                output.remaining_record_capacity =
-                                    output.remaining_record_capacity.saturating_sub(1);
+                                if !output.refresh_append_capacity() {
+                                    self.counters.output_commit_failures =
+                                        self.counters.output_commit_failures.saturating_add(1);
+                                } else if output.waiting_for_capacity {
+                                    self.counters.output_segment_exhaustions =
+                                        self.counters.output_segment_exhaustions.saturating_add(1);
+                                }
                                 pane.pending_ack = Some(ack);
                                 self.counters.pty_bytes_durably_committed = self
                                     .counters
@@ -3792,7 +4034,6 @@ impl GuardianRuntime {
                     };
                     self.buffered_output_bytes = remaining_buffered_bytes;
                     pane.output.in_flight_bytes = 0;
-                    let failure_was_already_sticky = pane.output.failed;
                     match completion.result {
                         Ok(receipt)
                             if pane.output.journal.receipt_is_current(receipt)
@@ -3805,27 +4046,10 @@ impl GuardianRuntime {
                                     .checked_add(u64::from(receipt.payload_bytes()))
                                     == Some(receipt.cumulative_plaintext_bytes()) =>
                         {
-                            let Some(remaining_record_capacity) =
-                                pane.output.remaining_record_capacity.checked_sub(1)
-                            else {
-                                pane.output.failed = true;
-                                pane.output.waiting_for_slot = false;
-                                self.counters.output_commit_failures =
-                                    self.counters.output_commit_failures.saturating_add(1);
-                                continue;
-                            };
                             pane.output.durable_plaintext_bytes =
                                 receipt.cumulative_plaintext_bytes();
                             pane.output.expected_sequence = receipt.sequence().checked_add(1);
-                            pane.output.remaining_record_capacity = remaining_record_capacity;
-                            let has_append_capacity = remaining_record_capacity != 0
-                                && pane.output.journal.can_accept_min_record();
-                            pane.output.waiting_for_slot = !failure_was_already_sticky
-                                && pane.output.expected_sequence.is_some()
-                                && has_append_capacity;
-                            pane.output.failed = failure_was_already_sticky
-                                || pane.output.expected_sequence.is_none()
-                                || !has_append_capacity;
+                            let capacity_is_valid = pane.output.refresh_append_capacity();
                             self.counters.pty_bytes_drained = self
                                 .counters
                                 .pty_bytes_drained
@@ -3838,7 +4062,10 @@ impl GuardianRuntime {
                                 .counters
                                 .pty_records_durably_committed
                                 .saturating_add(1);
-                            if !has_append_capacity {
+                            if !capacity_is_valid {
+                                self.counters.output_commit_failures =
+                                    self.counters.output_commit_failures.saturating_add(1);
+                            } else if pane.output.waiting_for_capacity {
                                 self.counters.output_segment_exhaustions =
                                     self.counters.output_segment_exhaustions.saturating_add(1);
                             }
@@ -3889,6 +4116,27 @@ impl GuardianRuntime {
         }
         self.resume_output_flow();
         self.poll_broker_output();
+    }
+
+    fn refresh_output_capacity_after_checkpoint(&mut self, pane_id: Uuid) {
+        let output = if let Some(pane) = self.panes.get_mut(&pane_id) {
+            Some(&mut pane.output)
+        } else {
+            self.starting_broker_panes
+                .get_mut(&pane_id)
+                .and_then(|pane| pane.output.as_mut())
+        };
+        if let Some(output) = output
+            && output.waiting_for_capacity
+            && !output.failed
+            && output.pending_plaintext.is_none()
+            && output.in_flight_bytes == 0
+            && !output.refresh_append_capacity()
+        {
+            self.counters.output_commit_failures =
+                self.counters.output_commit_failures.saturating_add(1);
+        }
+        self.resume_output_flow();
     }
 
     fn poll_broker_output(&mut self) {
@@ -3980,8 +4228,9 @@ impl GuardianRuntime {
                                 {
                                     self.buffered_output_bytes += delivery.bytes().len();
                                     pane.pending_delivery = Some(delivery);
+                                    pane.output_delivered(Instant::now());
                                 }
-                                Ok(BrokerPaneOutputV1::Pending) => {}
+                                Ok(BrokerPaneOutputV1::Pending) => pane.defer_read(Instant::now()),
                                 Ok(BrokerPaneOutputV1::Terminal { sequence })
                                     if sequence == output.durable_plaintext_bytes =>
                                 {
@@ -4004,6 +4253,7 @@ impl GuardianRuntime {
                         BrokerPaneIoCompletionV1::ChildStatus { handle, result } => {
                             pane.handle = Some(handle);
                             pane.status_due = false;
+                            pane.status_checked_at = Some(Instant::now());
                             match result {
                                 Ok(BrokerPaneChildStatusV1::Running) => {}
                                 Ok(BrokerPaneChildStatusV1::Exited { exit_code, .. }) => {
@@ -4121,6 +4371,7 @@ impl GuardianRuntime {
             let Some(worker) = connection.worker.as_mut() else {
                 continue;
             };
+            let now = Instant::now();
             let eligible = |pane: &StartingBrokerPane| {
                 let Some(output) = pane.output.as_ref() else {
                     return false;
@@ -4136,7 +4387,11 @@ impl GuardianRuntime {
                             && ((pane.activated
                                 && !pane.child_exit_observed
                                 && (pane.status_due || pane.terminal))
-                                || (!pane.terminal && output.remaining_record_capacity != 0))))
+                                || (!pane.terminal
+                                    && !output.waiting_for_capacity
+                                    && output.remaining_record_capacity != 0
+                                    && output.max_append_bytes != 0
+                                    && pane.read_due(now)))))
             };
             let pane_id = self
                 .starting_broker_panes
@@ -4188,7 +4443,12 @@ impl GuardianRuntime {
                     .max_total_output_bytes
                     .saturating_sub(self.buffered_output_bytes)
                     .min(self.config.max_output_bytes_per_pane)
-                    .min(OUTPUT_RECORD_BYTES);
+                    .min(OUTPUT_RECORD_BYTES)
+                    .min(
+                        pane.output
+                            .as_ref()
+                            .map_or(0, |output| output.max_append_bytes),
+                    );
                 if maximum_bytes == 0 {
                     continue;
                 }
@@ -4196,7 +4456,6 @@ impl GuardianRuntime {
                     continue;
                 };
                 pane.read_reservation = maximum_bytes;
-                pane.status_due = true;
                 self.buffered_output_bytes += maximum_bytes;
                 BrokerPaneIoCommandV1::Read {
                     handle,
@@ -4640,6 +4899,7 @@ const fn effective_pane_occupancy(pane_count: usize, indeterminate_effect: bool)
 
 fn pane_is_rearm_candidate(pane: &RuntimePane) -> bool {
     pane.output.waiting_for_slot
+        && !pane.output.waiting_for_capacity
         && !pane.output.failed
         && pane.output.pending_plaintext.is_none()
         && pane.output.in_flight_bytes == 0
@@ -4875,6 +5135,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn runtime_for_input_rejection() -> (std::path::PathBuf, Poll, GuardianRuntime) {
+        runtime_with_output_record_limits(None)
+    }
+
+    fn runtime_with_output_record_limits(
+        record_limits: Option<(u64, usize)>,
+    ) -> (std::path::PathBuf, Poll, GuardianRuntime) {
         let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("ft-guardian-runtime-input-rejection-")
@@ -4887,11 +5153,22 @@ mod tests {
         let completion_waker = Arc::new(
             Waker::new(poll.registry(), Token(1)).expect("create runtime completion waker"),
         );
-        let output_pipeline = GuardianOutputPipeline::open(
-            &directory.join("guardian.token"),
-            1,
-            Arc::clone(&completion_waker),
-        )
+        let output_pipeline = match record_limits {
+            Some((max_records, max_segments)) => {
+                GuardianOutputPipeline::open_with_record_limits_for_test(
+                    &directory.join("guardian.token"),
+                    1,
+                    Arc::clone(&completion_waker),
+                    max_records,
+                    max_segments,
+                )
+            }
+            None => GuardianOutputPipeline::open(
+                &directory.join("guardian.token"),
+                1,
+                Arc::clone(&completion_waker),
+            ),
+        }
         .expect("create runtime output pipeline");
         let config = GuardianRuntimeConfig::new(1, OUTPUT_RECORD_BYTES, OUTPUT_RECORD_BYTES, 2)
             .expect("valid runtime test limits");
@@ -6863,6 +7140,112 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_output_pauses_readiness_and_resumes_after_checkpoint_reclamation() {
+        let (_directory, mut poll, mut runtime) = runtime_with_output_record_limits(Some((1, 2)));
+        let pane_id = Uuid::from_u128(31);
+        let spawn = successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
+        assert_eq!(
+            runtime
+                .dispatch(&spawn)
+                .expect("spawn response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        // A real pollable socket supplies deterministic producer records to the
+        // same readiness, bounded worker and encrypted-journal path as the PTY.
+        let (reader, mut producer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        deregister_reader(&runtime.registry, pane, &mut runtime.counters);
+        pane.reader = Box::new(reader);
+        assert!(register_reader(&runtime.registry, pane));
+        let token = pane.token;
+        let journal = pane.output.journal.clone();
+
+        let drive_until = |runtime: &mut GuardianRuntime, poll: &mut Poll, target: u64| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut events = mio::Events::with_capacity(8);
+            while runtime.counters().pty_records_durably_committed < target {
+                assert!(Instant::now() < deadline, "output completion timed out");
+                poll.poll(&mut events, Some(Duration::from_millis(10)))
+                    .unwrap();
+                for event in &events {
+                    if event.token() == token {
+                        runtime.handle_pty_ready(token);
+                    }
+                }
+                runtime.handle_output_completions();
+            }
+        };
+        producer.write_all(b"one").unwrap();
+        drive_until(&mut runtime, &mut poll, 1);
+        producer.write_all(b"two").unwrap();
+        drive_until(&mut runtime, &mut poll, 2);
+
+        let pane = &runtime.panes[&pane_id];
+        assert!(pane.output.waiting_for_capacity);
+        assert!(!pane.output.failed);
+        assert!(
+            pane.output.is_quiescent(),
+            "checkpoint capture remains available"
+        );
+        assert!(!pane.reader_registered);
+        assert!(!pane_is_rearm_candidate(pane));
+        assert_eq!(journal.checked_append_capacity().unwrap(), (0, 0));
+
+        producer.write_all(b"three").unwrap();
+        // Slot availability and stale readiness never consume bytes while the
+        // durable budget is exhausted, nor do they turn the pause into failure.
+        for _ in 0..3 {
+            runtime.resume_output_flow();
+            runtime.handle_pty_ready(token);
+        }
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(!runtime.panes[&pane_id].reader_registered);
+        assert_eq!(runtime.panes[&pane_id].output.expected_sequence, Some(3));
+        assert_eq!(runtime.buffered_output_bytes, 0);
+        let mut events = mio::Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+        assert!(events.iter().all(|event| event.token() != token));
+
+        // This is the exact journal-floor transition made by a catalog-backed
+        // CheckpointStage Ack. Its completion must re-register the paused pane.
+        journal.release_through_sequence(1);
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(runtime.panes[&pane_id].reader_registered);
+        assert!(!runtime.panes[&pane_id].output.waiting_for_capacity);
+        drive_until(&mut runtime, &mut poll, 3);
+        let pane = &runtime.panes[&pane_id];
+        assert_eq!(pane.output.expected_sequence, Some(4));
+        assert_eq!(pane.output.durable_plaintext_bytes, 11);
+        assert!(!pane.output.failed);
+        assert_eq!(runtime.counters().output_commit_failures, 0);
+        assert_eq!(runtime.counters().output_segment_exhaustions, 2);
+    }
+
+    #[test]
+    fn checkpoint_capacity_refresh_does_not_clear_failure_or_sequence_exhaustion() {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        deregister_reader(&runtime.registry, pane, &mut runtime.counters);
+        pane.output.waiting_for_capacity = true;
+        pane.output.failed = true;
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        assert!(runtime.panes[&pane_id].output.failed);
+        assert!(!runtime.panes[&pane_id].reader_registered);
+
+        let journal = runtime.panes[&pane_id].output.journal.clone();
+        let mut output = RuntimePaneOutput::new(journal);
+        output.expected_sequence = None;
+        assert!(!output.refresh_append_capacity());
+        assert!(output.failed);
+        assert!(!output.waiting_for_slot);
+        assert!(!output.waiting_for_capacity);
+    }
+
+    #[test]
     fn terminal_resource_release_requires_exit_eof_empty_output_and_terminal_protocol() {
         assert!(
             TerminalResourceReadiness {
@@ -6953,6 +7336,117 @@ mod tests {
     }
 
     #[test]
+    fn broker_reads_that_find_no_output_back_off_until_output_or_input() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let pane_id = Uuid::new_v4();
+        runtime.starting_broker_panes.insert(
+            pane_id,
+            StartingBrokerPane {
+                mux_incarnation: Uuid::new_v4(),
+                spawn_request_id: Uuid::new_v4(),
+                spawn_effect_id: Uuid::new_v4(),
+                spawn_payload_digest: [1; 32],
+                custody_ack_id: Uuid::new_v4(),
+                initial_pending: false,
+                failed_before_spawn: false,
+                output: None,
+                handle: None,
+                pending_delivery: None,
+                pending_ack: None,
+                read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
+                last_output_at: None,
+                active_at: None,
+                status_checked_at: None,
+                terminal: false,
+                child_exit_observed: false,
+                status_due: false,
+                input_journal: None,
+                activated: false,
+                original_spawn: None,
+                original_begin: None,
+                retry_before_publication: None,
+                activation: None,
+                replay_origin: None,
+            },
+        );
+        let now = Instant::now();
+        assert_eq!(runtime.next_broker_read_retry(now), None);
+        let pane = runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .expect("inserted pane");
+        assert!(pane.read_due(now));
+
+        // An active pane backs off to 25 ms ...
+        pane.read_promptly(now);
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            pane.defer_read(now);
+            waits.push(pane.read_backoff);
+        }
+        assert_eq!(
+            waits,
+            [
+                250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 25_000, 25_000, 25_000
+            ]
+            .map(Duration::from_micros)
+        );
+        // ... and a quiet one on to 100 ms.
+        let quiet = now + BROKER_READ_IDLE_AFTER;
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            pane.defer_read(quiet);
+            waits.push(pane.read_backoff);
+        }
+        assert_eq!(waits, [50, 100, 100].map(Duration::from_millis));
+        pane.read_backoff = BROKER_READ_RETRY_MAX;
+        pane.read_retry_at = Some(now + BROKER_READ_RETRY_MAX);
+        assert!(!pane.read_due(now));
+        assert!(pane.read_due(now + BROKER_READ_RETRY_MAX));
+        assert_eq!(
+            runtime.next_broker_read_retry(now),
+            Some(now + BROKER_READ_RETRY_MAX)
+        );
+        // A due retry is not a wake time: whatever keeps the pane from
+        // reading wakes the loop when it completes.
+        assert_eq!(
+            runtime.next_broker_read_retry(now + BROKER_READ_RETRY_MAX),
+            None
+        );
+
+        let pane = runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .expect("inserted pane");
+        pane.read_promptly(now);
+        assert!(pane.read_due(now));
+        pane.defer_read(now);
+        assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
+
+        // A streaming pane keeps the first wait while a drain is in flight,
+        // and backs off once its output has stopped.
+        pane.output_delivered(now);
+        assert!(pane.read_due(now));
+        for _ in 0..4 {
+            pane.defer_read(now);
+            assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST);
+        }
+        pane.defer_read(now + BROKER_READ_STREAMING_WINDOW);
+        assert_eq!(pane.read_backoff, BROKER_READ_RETRY_FIRST * 2);
+
+        // ChildStatus is due at most once an interval while the PTY is open.
+        pane.status_due = false;
+        pane.status_checked_at = Some(now);
+        pane.output_delivered(now + Duration::from_millis(1));
+        pane.defer_read(now + Duration::from_millis(2));
+        assert!(!pane.status_due);
+        pane.output_delivered(now + BROKER_CHILD_STATUS_INTERVAL);
+        assert!(pane.status_due);
+    }
+
+    #[test]
     fn failed_before_broker_spawn_retains_identity_without_live_occupancy() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         let pane_id = Uuid::new_v4();
@@ -6971,6 +7465,11 @@ mod tests {
                 pending_delivery: None,
                 pending_ack: None,
                 read_reservation: 0,
+                read_retry_at: None,
+                read_backoff: Duration::ZERO,
+                last_output_at: None,
+                active_at: None,
+                status_checked_at: None,
                 terminal: false,
                 child_exit_observed: false,
                 status_due: true,

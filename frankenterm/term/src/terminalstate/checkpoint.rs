@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::color::{ColorAttribute, SrgbaTuple};
+use frankenterm_cell::image::{ImageCell, ImageDataType, TextureCoordinate};
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
+use ordered_float::NotNan;
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +18,50 @@ use zeroize::Zeroizing;
 
 /// Current semantic terminal checkpoint schema.
 pub const TERMINAL_CHECKPOINT_VERSION: u32 = 3;
+
+/// The schema whose lines are runs of cells sharing attributes from a
+/// per-screen table (`TerminalCheckpointLineEncoding::Runs`). Everything
+/// else is version 3's; every decoder of this release admits both.
+pub const COMPACT_TERMINAL_CHECKPOINT_VERSION: u32 = 4;
+
+/// How a capture writes screen lines.
+///
+/// Version 3 stores one object per cell, about 300 bytes each with its
+/// attributes spelled out; a pane with a few thousand rows of history made a
+/// payload of tens of megabytes that the guardian stages, hashes, validates
+/// and stores on every capture. Version 4 stores a line as runs: one string of
+/// text per run of cells sharing attributes, the attributes once per screen.
+/// A reader older than this release refuses version 4, so a writer chooses
+/// it only for a reader known to admit it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalCheckpointLineEncoding {
+    /// Version 3: every release reads it.
+    #[default]
+    Cells,
+    /// Version 4: runs and a per-screen attribute table.
+    Runs,
+}
+
+impl TerminalCheckpointLineEncoding {
+    /// The schema version a capture in this encoding carries.
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        match self {
+            Self::Cells => TERMINAL_CHECKPOINT_VERSION,
+            Self::Runs => COMPACT_TERMINAL_CHECKPOINT_VERSION,
+        }
+    }
+
+    /// The encoding of a schema version this release decodes.
+    #[must_use]
+    pub const fn of_version(version: u32) -> Option<Self> {
+        match version {
+            TERMINAL_CHECKPOINT_VERSION => Some(Self::Cells),
+            COMPACT_TERMINAL_CHECKPOINT_VERSION => Some(Self::Runs),
+            _ => None,
+        }
+    }
+}
 
 fn resource_limit(
     resource: &'static str,
@@ -123,11 +169,22 @@ impl std::io::Write for BoundedCheckpointWriter {
 struct JsonStructuralBudget {
     retained_bytes: usize,
     limits: TerminalCheckpointLimits,
+    /// The ceiling a failed pass exceeded, as (resource, observed, maximum),
+    /// so a refusal reports a typed resource limit rather than a parse error.
+    exceeded: Option<(&'static str, usize, usize)>,
 }
 
 impl JsonStructuralBudget {
     const MAX_DEPTH: usize = 128;
     const BYTES_PER_NODE: usize = 64;
+
+    fn new(limits: TerminalCheckpointLimits) -> Self {
+        Self {
+            retained_bytes: 0,
+            limits,
+            exceeded: None,
+        }
+    }
 
     fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
         self.retained_bytes = self
@@ -135,6 +192,11 @@ impl JsonStructuralBudget {
             .checked_add(bytes)
             .ok_or("checkpoint structural accounting overflow")?;
         if self.retained_bytes > self.limits.max_retained_capture_bytes {
+            self.exceeded = Some((
+                "json_structural_bytes",
+                self.retained_bytes,
+                self.limits.max_retained_capture_bytes,
+            ));
             return Err("checkpoint structural memory limit");
         }
         Ok(())
@@ -146,6 +208,11 @@ impl JsonStructuralBudget {
 
     fn charge_string(&mut self, value: &str) -> Result<(), &'static str> {
         if value.len() > self.limits.max_string_bytes {
+            self.exceeded = Some((
+                "json_string_bytes",
+                value.len(),
+                self.limits.max_string_bytes,
+            ));
             return Err("checkpoint string limit");
         }
         self.charge_node()?;
@@ -186,16 +253,54 @@ impl JsonStructuralVisitor<'_> {
         self.budget.charge_string(value).map_err(E::custom)
     }
 
-    fn child_depth<E: serde::de::Error>(&self) -> Result<usize, E> {
+    fn child_depth<E: serde::de::Error>(&mut self) -> Result<usize, E> {
         let depth = self
             .depth
             .checked_add(1)
             .ok_or_else(|| E::custom("checkpoint nesting overflow"))?;
         if depth > JsonStructuralBudget::MAX_DEPTH {
+            self.budget.exceeded = Some(("json_depth", depth, JsonStructuralBudget::MAX_DEPTH));
             return Err(E::custom("checkpoint nesting limit"));
         }
         Ok(depth)
     }
+}
+
+/// Run the decoder's allocation-light structural pass over canonical JSON and
+/// return the memory it charges. `to_canonical_json` runs the same pass, so a
+/// checkpoint its own decoder would refuse is never emitted.
+fn json_structural_retained_bytes(
+    bytes: &[u8],
+    limits: TerminalCheckpointLimits,
+) -> Result<usize, TerminalCheckpointError> {
+    let mut budget = JsonStructuralBudget::new(limits);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let pass = JsonStructuralSeed {
+        budget: &mut budget,
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
+    match (pass, budget.exceeded) {
+        (Ok(()), _) => Ok(budget.retained_bytes),
+        (Err(_), Some((resource, observed, maximum))) => {
+            Err(resource_limit(resource, observed, maximum))
+        }
+        (Err(_), None) => Err(TerminalCheckpointError::Serialization),
+    }
+}
+
+/// The structural charge and byte length of `value`'s compact JSON. The
+/// plaintext encoding is zeroized as soon as it has been measured.
+fn measure_canonical_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limits: TerminalCheckpointLimits,
+) -> Result<(usize, usize), TerminalCheckpointError> {
+    let encoded = Zeroizing::new(
+        serde_json::to_vec(value).map_err(|_| TerminalCheckpointError::Serialization)?,
+    );
+    let structural = json_structural_retained_bytes(&encoded, limits)?;
+    Ok((structural, encoded.len()))
 }
 
 impl<'de> serde::de::Visitor<'de> for JsonStructuralVisitor<'_> {
@@ -307,7 +412,7 @@ impl std::fmt::Debug for ValidatedTerminalCheckpointV3 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointSrgba {
     red_bits: u32,
@@ -389,7 +494,7 @@ impl CheckpointSrgba {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum CheckpointColorAttribute {
     Default,
@@ -1009,7 +1114,7 @@ impl CheckpointBidiHint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointHyperlink {
     params: BTreeMap<String, String>,
@@ -1044,6 +1149,672 @@ impl CheckpointHyperlink {
     }
 }
 
+/// A capture writes an image's bytes as base64 strings of this many bytes
+/// (65536 characters) each, the last holding the rest: far under the
+/// decoder's per-string limit, whatever the image's size.
+const CHECKPOINT_IMAGE_CHUNK_BYTES: usize = 48 * 1024;
+
+/// Image bytes in canonical JSON, `CHECKPOINT_IMAGE_CHUNK_BYTES` to a base64
+/// string. Decoding admits any chunking; re-encoding the decoded checkpoint
+/// then refuses every one but this.
+mod checkpoint_image_bytes {
+    use super::CHECKPOINT_IMAGE_CHUNK_BYTES;
+    use base64::Engine as _;
+    use serde::ser::SerializeSeq;
+
+    const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let chunks = bytes.chunks(CHECKPOINT_IMAGE_CHUNK_BYTES);
+        let mut sequence = serializer.serialize_seq(Some(chunks.len()))?;
+        let mut text = String::new();
+        for chunk in chunks {
+            text.clear();
+            BASE64.encode_string(chunk, &mut text);
+            sequence.serialize_element(&text)?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Chunks;
+
+        impl<'de> serde::de::Visitor<'de> for Chunks {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("base64 strings of image bytes")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut chunks: A,
+            ) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = chunks.next_element::<String>()? {
+                    BASE64
+                        .decode_vec(chunk.as_bytes(), &mut bytes)
+                        .map_err(serde::de::Error::custom)?;
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_seq(Chunks)
+    }
+}
+
+/// One image a cell shows: a region of an entry of the checkpoint's image
+/// table, as `ImageCell` holds it, its texture coordinates as f32 bits.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImageCell {
+    image: u32,
+    top_left: (u32, u32),
+    bottom_right: (u32, u32),
+    z_index: i32,
+    padding: (u16, u16, u16, u16),
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+}
+
+impl CheckpointImageCell {
+    fn capture(cell: &ImageCell, image: u32) -> Self {
+        let bits = |coordinate: TextureCoordinate| {
+            (
+                coordinate.x.into_inner().to_bits(),
+                coordinate.y.into_inner().to_bits(),
+            )
+        };
+        Self {
+            image,
+            top_left: bits(cell.top_left()),
+            bottom_right: bits(cell.bottom_right()),
+            z_index: cell.z_index(),
+            padding: cell.padding(),
+            image_id: cell.image_id(),
+            placement_id: cell.placement_id(),
+        }
+    }
+
+    fn coordinate((x, y): (u32, u32)) -> Result<TextureCoordinate, TerminalCheckpointError> {
+        let number = |bits| {
+            NotNan::new(f32::from_bits(bits)).map_err(|_| TerminalCheckpointError::InvalidField {
+                field: "image_cell.texture",
+                reason: "texture coordinates must be numbers",
+            })
+        };
+        Ok(TextureCoordinate::new(number(x)?, number(y)?))
+    }
+
+    fn validate(&self, images: usize) -> Result<(), TerminalCheckpointError> {
+        if self.image as usize >= images {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "image_cell.image",
+                reason: "an image cell must name an entry of the image table",
+            });
+        }
+        Self::coordinate(self.top_left)?;
+        Self::coordinate(self.bottom_right)?;
+        Ok(())
+    }
+
+    fn into_live(self, images: &[Arc<ImageData>]) -> Result<ImageCell, TerminalCheckpointError> {
+        let data =
+            images
+                .get(self.image as usize)
+                .ok_or(TerminalCheckpointError::InvalidField {
+                    field: "image_cell.image",
+                    reason: "an image cell must name an entry of the image table",
+                })?;
+        let (left, top, right, bottom) = self.padding;
+        Ok(ImageCell::with_z_index(
+            Self::coordinate(self.top_left)?,
+            Self::coordinate(self.bottom_right)?,
+            Arc::clone(data),
+            self.z_index,
+            left,
+            top,
+            right,
+            bottom,
+            self.image_id,
+            self.placement_id,
+        ))
+    }
+}
+
+/// An entry of a checkpoint's image table: one image object's content as
+/// `ImageDataType` holds it, and the stable identity it was created with
+/// (`ImageData::hash`, lowercase hex), which a Kitty edit keeps while the
+/// content changes. Embedded pixel hashes are derived again on restore.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImage {
+    identity: String,
+    data: CheckpointImageData,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum CheckpointImageData {
+    /// An image file's bytes: `EncodedFile`, or the blob of `EncodedLease`,
+    /// which restores as `EncodedFile` with the same content and identity.
+    Encoded {
+        #[serde(with = "checkpoint_image_bytes")]
+        bytes: Vec<u8>,
+    },
+    Rgba8 {
+        width: u32,
+        height: u32,
+        #[serde(with = "checkpoint_image_bytes")]
+        bytes: Vec<u8>,
+    },
+    Animation {
+        width: u32,
+        height: u32,
+        frames: Vec<CheckpointImageFrame>,
+    },
+}
+
+/// An animation frame: how long it shows (seconds, nanoseconds) and its
+/// RGBA bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointImageFrame {
+    duration: (u64, u32),
+    #[serde(with = "checkpoint_image_bytes")]
+    bytes: Vec<u8>,
+}
+
+/// The bytes of a `width` by `height` RGBA frame; `None` for no pixels,
+/// which a decoded image never has (`ImageDataType::new_single_frame`).
+fn rgba_bytes(width: u32, height: u32) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    usize::try_from(u128::from(width) * u128::from(height) * 4).ok()
+}
+
+impl CheckpointImage {
+    /// Copy a pinned image's content, outside the terminal lock: refused if
+    /// an edit has changed it since it was pinned.
+    fn capture(pinned: &PinnedImage) -> Result<Self, TerminalCheckpointError> {
+        fn copy(bytes: &[u8]) -> Result<Vec<u8>, TerminalCheckpointError> {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+            copied.extend_from_slice(bytes);
+            Ok(copied)
+        }
+        let content = pinned
+            .data
+            .data_for_content_revision(pinned.revision)
+            .ok_or(TerminalCheckpointError::StaleGraphicsGeneration)?;
+        let data = match &*content {
+            ImageDataType::EncodedFile(bytes) => CheckpointImageData::Encoded {
+                bytes: copy(bytes)?,
+            },
+            ImageDataType::EncodedLease(lease) => CheckpointImageData::Encoded {
+                bytes: lease
+                    .get_data()
+                    .map_err(|_| TerminalCheckpointError::InvalidField {
+                        field: "images",
+                        reason: "an image's stored blob could not be read",
+                    })?,
+            },
+            ImageDataType::Rgba8 {
+                data,
+                width,
+                height,
+                ..
+            } => CheckpointImageData::Rgba8 {
+                width: *width,
+                height: *height,
+                bytes: copy(data)?,
+            },
+            ImageDataType::AnimRgba8 {
+                width,
+                height,
+                durations,
+                frames,
+                ..
+            } => {
+                if durations.len() != frames.len() {
+                    return Err(TerminalCheckpointError::InvalidField {
+                        field: "images",
+                        reason: "an animation needs one duration per frame",
+                    });
+                }
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(frames.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                for (duration, frame) in durations.iter().zip(frames) {
+                    captured.push(CheckpointImageFrame {
+                        duration: (duration.as_secs(), duration.subsec_nanos()),
+                        bytes: copy(frame)?,
+                    });
+                }
+                CheckpointImageData::Animation {
+                    width: *width,
+                    height: *height,
+                    frames: captured,
+                }
+            }
+        };
+        Ok(Self {
+            identity: hex::encode(pinned.data.hash()),
+            data,
+        })
+    }
+
+    /// The bytes it holds.
+    fn bytes(&self) -> usize {
+        match &self.data {
+            CheckpointImageData::Encoded { bytes } | CheckpointImageData::Rgba8 { bytes, .. } => {
+                bytes.len()
+            }
+            CheckpointImageData::Animation { frames, .. } => {
+                frames.iter().map(|frame| frame.bytes.len()).sum()
+            }
+        }
+    }
+
+    fn identity(&self) -> Result<[u8; 32], TerminalCheckpointError> {
+        let invalid = || TerminalCheckpointError::InvalidField {
+            field: "image.identity",
+            reason: "an image identity is 32 bytes in lowercase hex",
+        };
+        let mut identity = [0u8; 32];
+        hex::decode_to_slice(&self.identity, &mut identity).map_err(|_| invalid())?;
+        if hex::encode(identity) != self.identity {
+            return Err(invalid());
+        }
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), TerminalCheckpointError> {
+        self.identity()?;
+        let geometry = TerminalCheckpointError::InvalidField {
+            field: "image.bytes",
+            reason: "decoded image bytes must be width times height RGBA pixels",
+        };
+        match &self.data {
+            CheckpointImageData::Encoded { .. } => {}
+            CheckpointImageData::Rgba8 {
+                width,
+                height,
+                bytes,
+            } => {
+                if rgba_bytes(*width, *height) != Some(bytes.len()) {
+                    return Err(geometry);
+                }
+            }
+            CheckpointImageData::Animation {
+                width,
+                height,
+                frames,
+            } => {
+                if frames.is_empty()
+                    || frames.len() > frankenterm_cell::image::MAX_IMAGE_WIRE_FRAMES
+                {
+                    return Err(TerminalCheckpointError::InvalidField {
+                        field: "image.frames",
+                        reason: "an animation holds between one frame and the wire limit",
+                    });
+                }
+                for frame in frames {
+                    if rgba_bytes(*width, *height) != Some(frame.bytes.len()) {
+                        return Err(geometry);
+                    }
+                    if frame.duration.1 >= 1_000_000_000 {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "image.frames.duration",
+                            reason: "a frame duration's nanoseconds are under one second",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_live(self) -> Result<Arc<ImageData>, TerminalCheckpointError> {
+        let identity = self.identity()?;
+        let data = match self.data {
+            CheckpointImageData::Encoded { bytes } => ImageDataType::EncodedFile(bytes),
+            CheckpointImageData::Rgba8 {
+                width,
+                height,
+                bytes,
+            } => ImageDataType::new_single_frame(width, height, bytes),
+            CheckpointImageData::Animation {
+                width,
+                height,
+                frames,
+            } => {
+                let mut durations = Vec::new();
+                let mut hashes = Vec::new();
+                let mut bytes = Vec::new();
+                for reserved in [
+                    durations.try_reserve_exact(frames.len()),
+                    hashes.try_reserve_exact(frames.len()),
+                    bytes.try_reserve_exact(frames.len()),
+                ] {
+                    reserved.map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                }
+                for frame in frames {
+                    durations.push(std::time::Duration::new(frame.duration.0, frame.duration.1));
+                    hashes.push(ImageDataType::hash_bytes(&frame.bytes));
+                    bytes.push(frame.bytes);
+                }
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    durations,
+                    frames: bytes,
+                    hashes,
+                }
+            }
+        };
+        Ok(Arc::new(ImageData::with_data_and_identity(data, identity)))
+    }
+}
+
+/// An image object a capture names, and the content revision it had when
+/// pinned: under the terminal lock for a live object, which a Kitty edit
+/// may change once the lock is released.
+#[derive(Debug)]
+struct PinnedImage {
+    data: Arc<ImageData>,
+    revision: [u8; 32],
+}
+
+/// The images a capture's cells and Kitty state name, one entry per image
+/// object, numbered as they enter. A live object stays one object however
+/// many cells and Kitty ids hold it: an edit through any of them changes it
+/// for all. Rows read back from cold storage hold copies no edit reaches,
+/// so equal copies share an entry.
+#[derive(Debug, Default)]
+struct CheckpointImageRegistry {
+    images: Vec<PinnedImage>,
+    live: HashMap<usize, u32>,
+    copies: HashMap<([u8; 32], [u8; 32]), u32>,
+    /// Copy objects already looked up, so that the cells of a row sharing
+    /// one hash its content once; it holds them, so no address is reused.
+    copy_objects: HashMap<usize, (u32, Arc<ImageData>)>,
+}
+
+impl CheckpointImageRegistry {
+    fn push(
+        &mut self,
+        data: &Arc<ImageData>,
+        revision: [u8; 32],
+    ) -> Result<u32, TerminalCheckpointError> {
+        let index = u32::try_from(self.images.len())
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("images"))?;
+        self.images
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.images.push(PinnedImage {
+            data: Arc::clone(data),
+            revision,
+        });
+        Ok(index)
+    }
+
+    /// The entry of a live object, pinned at its current revision; called
+    /// under the terminal lock.
+    fn pin(&mut self, data: &Arc<ImageData>) -> Result<u32, TerminalCheckpointError> {
+        let key = Arc::as_ptr(data) as usize;
+        if let Some(index) = self.live.get(&key) {
+            return Ok(*index);
+        }
+        let index = self.push(data, data.current_content_hash())?;
+        self.live
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.live.insert(key, index);
+        Ok(index)
+    }
+
+    /// Pin every image the lines' cells show; called under the terminal lock.
+    fn pin_lines(&mut self, lines: &[Line]) -> Result<(), TerminalCheckpointError> {
+        for line in lines.iter().filter(|line| line.has_image_attachments()) {
+            for cell in line.visible_cells() {
+                for image in cell.attrs().images().into_iter().flatten() {
+                    self.pin(image.image_data())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The entry of an image a captured cell shows: a live object's from
+    /// its pin, which an image no lock pinned does not have; a copy's
+    /// (`copy`, a row read back from cold storage) from its content.
+    fn entry(&mut self, data: &Arc<ImageData>, copy: bool) -> Result<u32, TerminalCheckpointError> {
+        if !copy {
+            return self
+                .live
+                .get(&(Arc::as_ptr(data) as usize))
+                .copied()
+                .ok_or(TerminalCheckpointError::StaleGraphicsGeneration);
+        }
+        let object = Arc::as_ptr(data) as usize;
+        if let Some((index, _)) = self.copy_objects.get(&object) {
+            return Ok(*index);
+        }
+        let revision = data.current_content_hash();
+        let key = (data.hash(), revision);
+        let index = match self.copies.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = self.push(data, revision)?;
+                self.copies
+                    .try_reserve(1)
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                self.copies.insert(key, index);
+                index
+            }
+        };
+        self.copy_objects
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        self.copy_objects.insert(object, (index, Arc::clone(data)));
+        Ok(index)
+    }
+
+    /// The bytes and count of the images pinned, for replay's resource check.
+    fn usage(&self) -> (usize, usize) {
+        let bytes = self.images.iter().fold(0usize, |total, image| {
+            total.saturating_add(image.data.len())
+        });
+        (self.images.len(), bytes)
+    }
+}
+
+/// Kitty graphics state outside the cells: stored images by id (entries of
+/// the image table), image numbers with the ids they name, and placements,
+/// each in ascending key order. A chunked transmission without its last
+/// chunk refuses capture instead.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointKittyState {
+    images: Vec<(u32, u32)>,
+    numbers: Vec<(u32, u32)>,
+    placements: Vec<CheckpointKittyPlacement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointKittyPlacement {
+    image_id: u32,
+    placement_id: Option<u32>,
+    first_row: i64,
+    rows: u64,
+    cols: u64,
+}
+
+impl CheckpointKittyState {
+    /// `None` for a state holding nothing; its images are pinned.
+    fn capture(
+        parts: &KittyCheckpointParts,
+        registry: &mut CheckpointImageRegistry,
+    ) -> Result<Option<Self>, TerminalCheckpointError> {
+        if parts.images.is_empty() && parts.numbers.is_empty() && parts.placements.is_empty() {
+            return Ok(None);
+        }
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(parts.images.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.images"))?;
+        for (id, data) in &parts.images {
+            images.push((*id, registry.pin(data)?));
+        }
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(parts.placements.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.placements"))?;
+        for ((image_id, placement_id), info) in &parts.placements {
+            placements.push(CheckpointKittyPlacement {
+                image_id: *image_id,
+                placement_id: *placement_id,
+                first_row: i64::try_from(info.first_row)
+                    .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("kitty.placements"))?,
+                rows: u64_from_usize(info.rows, "kitty.placements.rows")?,
+                cols: u64_from_usize(info.cols, "kitty.placements.cols")?,
+            });
+        }
+        Ok(Some(Self {
+            images,
+            numbers: parts.numbers.clone(),
+            placements,
+        }))
+    }
+
+    fn validate(
+        &self,
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<(), TerminalCheckpointError> {
+        fn ascending<K: Ord>(keys: impl Iterator<Item = K>) -> bool {
+            let mut previous = None;
+            keys.into_iter().all(|key| {
+                let ascends = previous.as_ref().is_none_or(|previous| *previous < key);
+                previous = Some(key);
+                ascends
+            })
+        }
+        if self.images.is_empty() && self.numbers.is_empty() && self.placements.is_empty() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty",
+                reason: "a Kitty state holding nothing is absent",
+            });
+        }
+        ensure_limit("kitty_images", self.images.len(), limits.max_images)?;
+        ensure_limit(
+            "kitty_image_numbers",
+            self.numbers.len(),
+            MAX_KITTY_NUMBER_TO_ID_ENTRIES,
+        )?;
+        ensure_limit(
+            "kitty_placements",
+            self.placements.len(),
+            limits.max_total_cell_records,
+        )?;
+        if !ascending(self.images.iter().map(|(id, _)| *id))
+            || !ascending(self.numbers.iter().map(|(number, _)| *number))
+            || !ascending(
+                self.placements
+                    .iter()
+                    .map(|placement| (placement.image_id, placement.placement_id)),
+            )
+        {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty",
+                reason: "Kitty images, numbers and placements are in ascending key order",
+            });
+        }
+        if !self.numbers.iter().all(|(_, id)| {
+            self.images
+                .binary_search_by_key(id, |(image, _)| *image)
+                .is_ok()
+        }) {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "kitty.numbers",
+                reason: "an image number names a stored image",
+            });
+        }
+        for placement in &self.placements {
+            StableRowIndex::try_from(placement.first_row)
+                .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("kitty.placements"))?;
+            usize_from_u64(placement.rows, "kitty.placements.rows")?;
+            usize_from_u64(placement.cols, "kitty.placements.cols")?;
+        }
+        let records = self.images.len() + self.numbers.len() + self.placements.len();
+        let bytes = records
+            .checked_mul(64)
+            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                "retained_capture_bytes",
+            ))?;
+        checked_accumulate(
+            &mut usage.retained_capture_bytes,
+            bytes,
+            limits.max_retained_capture_bytes,
+            "retained_capture_bytes",
+        )
+    }
+
+    fn into_parts(
+        self,
+        max_image_id: u32,
+        images: &[Arc<ImageData>],
+    ) -> Result<KittyCheckpointParts, TerminalCheckpointError> {
+        let mut stored = Vec::new();
+        stored
+            .try_reserve_exact(self.images.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.images"))?;
+        for (id, image) in self.images {
+            let data = images
+                .get(image as usize)
+                .ok_or(TerminalCheckpointError::InvalidField {
+                    field: "kitty.images",
+                    reason: "a stored Kitty image must name an entry of the image table",
+                })?;
+            stored.push((id, Arc::clone(data)));
+        }
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(self.placements.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty.placements"))?;
+        for placement in self.placements {
+            placements.push((
+                (placement.image_id, placement.placement_id),
+                PlacementInfo {
+                    first_row: StableRowIndex::try_from(placement.first_row).map_err(|_| {
+                        TerminalCheckpointError::ArithmeticOverflow("kitty.placements")
+                    })?,
+                    rows: usize_from_u64(placement.rows, "kitty.placements.rows")?,
+                    cols: usize_from_u64(placement.cols, "kitty.placements.cols")?,
+                },
+            ));
+        }
+        Ok(KittyCheckpointParts {
+            max_image_id,
+            images: stored,
+            numbers: self.numbers,
+            placements,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointCellAttributes {
@@ -1062,13 +1833,72 @@ struct CheckpointCellAttributes {
     background: CheckpointColorAttribute,
     underline_color: CheckpointColorAttribute,
     hyperlink: Option<CheckpointHyperlink>,
+    /// The images the cell shows, in its z-index order; absent for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<CheckpointImageCell>>,
+    /// DECSCA or SPA protection; absent for none.
+    #[serde(default, skip_serializing_if = "is_false")]
+    protected: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+// Keys a capture's attribute table. The parser's enums have no Hash; their
+// discriminants hash what their Eq compares.
+impl std::hash::Hash for CheckpointCellAttributes {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.intensity).hash(state);
+        self.underline.hash(state);
+        std::mem::discriminant(&self.blink).hash(state);
+        (
+            self.italic,
+            self.reverse,
+            self.strikethrough,
+            self.invisible,
+            self.wrapped,
+            self.overline,
+        )
+            .hash(state);
+        std::mem::discriminant(&self.semantic_type).hash(state);
+        std::mem::discriminant(&self.vertical_align).hash(state);
+        self.foreground.hash(state);
+        self.background.hash(state);
+        self.underline_color.hash(state);
+        self.hyperlink.hash(state);
+        self.images.hash(state);
+        self.protected.hash(state);
+    }
 }
 
 impl CheckpointCellAttributes {
-    fn capture(value: &CellAttributes) -> Result<Self, TerminalCheckpointError> {
-        if value.has_image_attachments() {
-            return Err(TerminalCheckpointError::UnsupportedGraphicsState);
-        }
+    /// Capture `value`; its images enter `images` (`copy` for a row read
+    /// back from cold storage). Without a registry, as for a pen, an image
+    /// refuses capture.
+    fn capture(
+        value: &CellAttributes,
+        images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Self, TerminalCheckpointError> {
+        let images = match (value.images(), images) {
+            (None, _) => None,
+            (Some(_), None) => return Err(TerminalCheckpointError::UnsupportedGraphicsState),
+            (Some(cells), Some(registry)) => {
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(cells.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("cell.images"))?;
+                for cell in &cells {
+                    let entry = registry.entry(cell.image_data(), copy)?;
+                    captured.push(CheckpointImageCell::capture(cell, entry));
+                }
+                Some(captured)
+            }
+        };
+        // Protection without `TerminalCheckpointLimits::capture_protection`
+        // refused capture earlier, where the screen and the pens were
+        // inspected.
         Ok(Self {
             intensity: value.intensity(),
             underline: value.underline(),
@@ -1087,10 +1917,16 @@ impl CheckpointCellAttributes {
             hyperlink: value
                 .hyperlink()
                 .map(|link| CheckpointHyperlink::capture(link)),
+            images,
+            protected: value.protected(),
         })
     }
 
-    fn into_live(self) -> Result<CellAttributes, TerminalCheckpointError> {
+    /// `images` is the restored image table.
+    fn into_live(
+        self,
+        images: &[Arc<ImageData>],
+    ) -> Result<CellAttributes, TerminalCheckpointError> {
         let mut value = CellAttributes::blank();
         value
             .set_intensity(self.intensity)
@@ -1106,24 +1942,68 @@ impl CheckpointCellAttributes {
             .set_vertical_align(self.vertical_align)
             .set_foreground(self.foreground.into_live())
             .set_background(self.background.into_live())
-            .set_underline_color(self.underline_color.into_live());
+            .set_underline_color(self.underline_color.into_live())
+            .set_protected(self.protected);
         value.set_hyperlink(
             self.hyperlink
                 .map(CheckpointHyperlink::into_live)
                 .transpose()?
                 .map(Arc::new),
         );
+        if let Some(cells) = self.images {
+            let mut live = Vec::new();
+            live.try_reserve_exact(cells.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("cell.images"))?;
+            for cell in cells {
+                live.push(Box::new(cell.into_live(images)?));
+            }
+            value.set_images(live);
+        }
         Ok(value)
     }
 
+    /// `images` is the length of the checkpoint's image table.
     fn validate(
         &self,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
         self.foreground.validate()?;
         self.background.validate()?;
         self.underline_color.validate()?;
+        usage.protected_attributes |= self.protected;
+        if let Some(cells) = self.images.as_ref() {
+            // `CellAttributes::attach_image` keeps a cell's images in
+            // z-index order and binary-searches that order.
+            if cells.is_empty()
+                || cells
+                    .windows(2)
+                    .any(|pair| pair[0].z_index > pair[1].z_index)
+            {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "cell.images",
+                    reason: "a cell's images are present, and in z-index order",
+                });
+            }
+            for cell in cells {
+                cell.validate(images)?;
+            }
+            let bytes = cells
+                .len()
+                .checked_mul(
+                    std::mem::size_of::<ImageCell>() + std::mem::size_of::<CheckpointImageCell>(),
+                )
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
+            checked_accumulate(
+                &mut usage.retained_capture_bytes,
+                bytes,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+        }
         let Some(link) = self.hyperlink.as_ref() else {
             return Ok(());
         };
@@ -1207,43 +2087,179 @@ enum CheckpointLineScale {
     DoubleHeightBottom,
 }
 
+/// Version 4's cells: consecutive cells of one line sharing one entry of
+/// their screen's attribute table. Without `clusters`, each char of `text` is
+/// a cell one column wide. Otherwise `clusters` gives every cell as (chars,
+/// columns); it is present only when some cell is not one char one column
+/// wide, so each run has one encoding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRun {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clusters: Option<Vec<(u32, u8)>>,
+    attributes: u32,
+}
+
+/// A capture closes a run at this much text, well under the decoder's
+/// per-string limit however long the line or its clusters.
+const CHECKPOINT_RUN_TEXT_BYTES: usize = 32 * 1024;
+
+impl CheckpointRun {
+    fn push_cell(&mut self, text: &str, width: u8) -> Result<(), TerminalCheckpointError> {
+        let chars = if text.len() == 1 {
+            1
+        } else {
+            text.chars().count()
+        };
+        if self.clusters.is_none() && (chars != 1 || width != 1) {
+            // Every earlier cell was one char one column wide.
+            let mut clusters = Vec::new();
+            let earlier = self.text.chars().count();
+            clusters
+                .try_reserve(earlier + 1)
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("run.clusters"))?;
+            clusters.resize(earlier, (1, 1));
+            self.clusters = Some(clusters);
+        }
+        if let Some(clusters) = self.clusters.as_mut() {
+            let chars = u32::try_from(chars)
+                .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("run.clusters"))?;
+            clusters.push((chars, width));
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+
+    /// The columns its cells cover.
+    fn columns(&self) -> usize {
+        match &self.clusters {
+            None => self.text.chars().count(),
+            Some(clusters) => clusters.iter().map(|(_, width)| usize::from(*width)).sum(),
+        }
+    }
+
+    /// The text of its `index`th cell, if it has that many.
+    fn cell_text(&self, index: usize) -> Option<&str> {
+        let (start, chars) = match &self.clusters {
+            None => (index, 1),
+            Some(clusters) => {
+                let chars = clusters.get(index)?.0 as usize;
+                let start = clusters[..index]
+                    .iter()
+                    .map(|(chars, _)| *chars as usize)
+                    .sum();
+                (start, chars)
+            }
+        };
+        char_span(&self.text, start, chars)
+    }
+
+    /// How many cells it holds.
+    fn cells(&self) -> usize {
+        match &self.clusters {
+            None => self.text.chars().count(),
+            Some(clusters) => clusters.len(),
+        }
+    }
+}
+
+/// The `chars` chars of `text` that start after its first `start` chars,
+/// if it has them all.
+fn char_span(text: &str, start: usize, chars: usize) -> Option<&str> {
+    let mut bounds = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()));
+    let begin = bounds.nth(start)?;
+    let end = bounds.nth(chars.checked_sub(1)?)?;
+    Some(&text[begin..end])
+}
+
+/// A capture's attribute table for one screen: each distinct attribute set
+/// once, in the order the screen's lines first use it.
+#[derive(Default)]
+struct CheckpointAttributeTable {
+    entries: Vec<CheckpointCellAttributes>,
+    index: HashMap<CheckpointCellAttributes, u32>,
+}
+
+impl CheckpointAttributeTable {
+    fn intern(
+        &mut self,
+        attributes: CheckpointCellAttributes,
+    ) -> Result<u32, TerminalCheckpointError> {
+        if let Some(index) = self.index.get(&attributes) {
+            return Ok(*index);
+        }
+        let index = u32::try_from(self.entries.len())
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("screen.attributes"))?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
+        self.index
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
+        self.entries.push(attributes.clone());
+        self.index.insert(attributes, index);
+        Ok(index)
+    }
+}
+
+/// Exactly one of `cells` (version 3) and `runs` (version 4) is present;
+/// version 3's bytes are what they were before version 4 existed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointLine {
-    cells: Vec<CheckpointCell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cells: Option<Vec<CheckpointCell>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runs: Option<Vec<CheckpointRun>>,
     seqno: u64,
     scale: CheckpointLineScale,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
 }
 
+fn checkpoint_cell_width(width: usize) -> Result<u8, TerminalCheckpointError> {
+    let width = u8::try_from(width).map_err(|_| TerminalCheckpointError::InvalidField {
+        field: "cell.width",
+        reason: "cell width does not fit the checkpoint wire type",
+    })?;
+    if !(1..=2).contains(&width) {
+        return Err(TerminalCheckpointError::InvalidField {
+            field: "cell.width",
+            reason: "cell width must be one or two columns",
+        });
+    }
+    Ok(width)
+}
+
+fn line_encoding_mismatch() -> TerminalCheckpointError {
+    TerminalCheckpointError::InvalidField {
+        field: "line.cells",
+        reason: "a line's cells must be encoded as its checkpoint version encodes them",
+    }
+}
+
 impl CheckpointLine {
-    fn capture(line: &Line) -> Result<Self, TerminalCheckpointError> {
-        if line.has_image_attachments() {
+    /// Capture `line` as cells (version 3) or, given its screen's attribute
+    /// table, as runs (version 4). Its images enter `images` (`copy` for a
+    /// row read back from cold storage); without a registry they refuse
+    /// capture.
+    fn capture(
+        line: &Line,
+        table: Option<&mut CheckpointAttributeTable>,
+        images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Self, TerminalCheckpointError> {
+        if images.is_none() && line.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
         }
-        let mut cells = Vec::new();
-        cells
-            .try_reserve_exact(line.len())
-            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
-        for cell in line.visible_cells() {
-            let width =
-                u8::try_from(cell.width()).map_err(|_| TerminalCheckpointError::InvalidField {
-                    field: "cell.width",
-                    reason: "cell width does not fit the checkpoint wire type",
-                })?;
-            if !(1..=2).contains(&width) {
-                return Err(TerminalCheckpointError::InvalidField {
-                    field: "cell.width",
-                    reason: "cell width must be one or two columns",
-                });
-            }
-            cells.push(CheckpointCell {
-                text: cell.str().to_string(),
-                width,
-                attributes: CheckpointCellAttributes::capture(cell.attrs())?,
-            });
-        }
+        let (cells, runs) = match table {
+            None => (Some(Self::capture_cells(line, images, copy)?), None),
+            Some(table) => (None, Some(Self::capture_runs(line, table, images, copy)?)),
+        };
         let scale = if line.is_double_height_top() {
             CheckpointLineScale::DoubleHeightTop
         } else if line.is_double_height_bottom() {
@@ -1256,6 +2272,7 @@ impl CheckpointLine {
         let (bidi_enabled, bidi_hint) = line.bidi_info();
         Ok(Self {
             cells,
+            runs,
             seqno: u64_from_usize(line.current_seqno(), "line.seqno")?,
             scale,
             bidi_enabled,
@@ -1263,29 +2280,179 @@ impl CheckpointLine {
         })
     }
 
-    fn into_live(self) -> Result<Line, TerminalCheckpointError> {
-        let seqno = usize_from_u64(self.seqno, "line.seqno")?;
+    fn capture_cells(
+        line: &Line,
+        mut images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Vec<CheckpointCell>, TerminalCheckpointError> {
         let mut cells = Vec::new();
-        let stored_cells = self.cells.iter().try_fold(0usize, |total, cell| {
-            total
-                .checked_add(usize::from(cell.width))
-                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
-        })?;
         cells
-            .try_reserve_exact(stored_cells)
+            .try_reserve_exact(line.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
-        for cell in self.cells {
-            let width = usize::from(cell.width);
-            let attributes = cell.attributes.into_live()?;
-            cells.push(Cell::new_grapheme_with_width(
-                &cell.text,
-                width,
-                attributes.clone(),
-            ));
-            for _ in 1..width {
-                cells.push(Cell::blank_with_attrs(attributes.clone()));
+        for cell in line.visible_cells() {
+            cells.push(CheckpointCell {
+                text: cell.str().to_string(),
+                width: checkpoint_cell_width(cell.width())?,
+                attributes: CheckpointCellAttributes::capture(
+                    cell.attrs(),
+                    images.as_deref_mut(),
+                    copy,
+                )?,
+            });
+        }
+        // A row's trailing default blanks are what a line past its end shows
+        // anyway (`Line::prune_trailing_blanks` drops them likewise); a
+        // scroll creates a row with a full width of them. Stored, they made
+        // every pane's checkpoint about 2 MB, whatever it showed, and the
+        // guardian stages, scans, validates and acknowledges every byte. A
+        // wrapped row's last cell carries the wrap and stays.
+        if cells
+            .last()
+            .is_some_and(|cell| cell.width == 1 && cell.text == " ")
+        {
+            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank(), None, false)?;
+            while cells
+                .last()
+                .is_some_and(|cell| cell.width == 1 && cell.text == " " && cell.attributes == blank)
+            {
+                cells.pop();
             }
         }
+        Ok(cells)
+    }
+
+    /// How many of the line's leading cells `capture_cells` keeps: all but
+    /// its trailing default blanks (one-column " " whose attributes capture
+    /// as the blank's; a cell showing an image never does).
+    fn kept_cells(line: &Line) -> Result<usize, TerminalCheckpointError> {
+        let live_blank = CellAttributes::blank();
+        let mut blank = None;
+        let mut kept = 0;
+        for (index, cell) in line.visible_cells().enumerate() {
+            let default_blank = cell.width() == 1 && cell.str() == " " && {
+                let attributes = cell.attrs();
+                *attributes == live_blank
+                    || !attributes.has_image_attachments() && {
+                        if blank.is_none() {
+                            blank =
+                                Some(CheckpointCellAttributes::capture(&live_blank, None, false)?);
+                        }
+                        Some(CheckpointCellAttributes::capture(attributes, None, false)?) == blank
+                    }
+            };
+            if !default_blank {
+                kept = index + 1;
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The cells `capture_cells` keeps, as runs. A run ends where the
+    /// attributes change; attributes that compare unequal live but capture
+    /// equal continue it, so neighbouring runs name different entries unless
+    /// the first closed at `CHECKPOINT_RUN_TEXT_BYTES`. Only kept cells are
+    /// interned, so a screen's table holds exactly the attributes its runs
+    /// name, in the order they first name them: a restored screen's table is
+    /// the same.
+    fn capture_runs(
+        line: &Line,
+        table: &mut CheckpointAttributeTable,
+        mut images: Option<&mut CheckpointImageRegistry>,
+        copy: bool,
+    ) -> Result<Vec<CheckpointRun>, TerminalCheckpointError> {
+        let kept = Self::kept_cells(line)?;
+        let mut runs: Vec<CheckpointRun> = Vec::new();
+        let mut previous: Option<&CellAttributes> = None;
+        let mut entry = 0u32;
+        for cell in line.visible_cells().take(kept) {
+            let width = checkpoint_cell_width(cell.width())?;
+            let (text, attributes) = match cell {
+                CellRef::CellRef { cell, .. } => (cell.str(), cell.attrs()),
+                CellRef::ClusterRef { text, attrs, .. } => (text, attrs),
+            };
+            // Live attributes compare images by content: equal attributes
+            // can show two objects, which must stay two entries.
+            if previous != Some(attributes) || attributes.has_image_attachments() {
+                entry = table.intern(CheckpointCellAttributes::capture(
+                    attributes,
+                    images.as_deref_mut(),
+                    copy,
+                )?)?;
+                previous = Some(attributes);
+            }
+            let continues = runs.last().is_some_and(|run| {
+                run.attributes == entry && run.text.len() + text.len() <= CHECKPOINT_RUN_TEXT_BYTES
+            });
+            if !continues {
+                runs.try_reserve(1)
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.runs"))?;
+                runs.push(CheckpointRun {
+                    text: String::new(),
+                    clusters: None,
+                    attributes: entry,
+                });
+            }
+            if let Some(run) = runs.last_mut() {
+                run.push_cell(text, width)?;
+            }
+        }
+        Ok(runs)
+    }
+
+    /// The text and attributes of its `index`th stored cell; a wide cell is
+    /// one stored cell. `table` is its screen's version 4 attribute table.
+    fn cell<'a>(
+        &'a self,
+        index: usize,
+        table: Option<&'a [CheckpointCellAttributes]>,
+    ) -> Option<(&'a str, &'a CheckpointCellAttributes)> {
+        if let Some(cells) = &self.cells {
+            return cells
+                .get(index)
+                .map(|cell| (cell.text.as_str(), &cell.attributes));
+        }
+        let (runs, table) = (self.runs.as_ref()?, table?);
+        let mut index = index;
+        for run in runs {
+            let cells = run.cells();
+            if index < cells {
+                return Some((run.cell_text(index)?, table.get(run.attributes as usize)?));
+            }
+            index -= cells;
+        }
+        None
+    }
+
+    /// The image table entries its cells show; `table` is its screen's
+    /// version 4 attribute table.
+    fn image_entries<'a>(
+        &'a self,
+        table: Option<&'a [CheckpointCellAttributes]>,
+    ) -> impl Iterator<Item = u32> + 'a {
+        let cells = self.cells.iter().flatten().map(|cell| &cell.attributes);
+        let runs = self
+            .runs
+            .iter()
+            .flatten()
+            .filter_map(move |run| table?.get(run.attributes as usize));
+        cells
+            .chain(runs)
+            .flat_map(|attributes| attributes.images.iter().flatten().map(|cell| cell.image))
+    }
+
+    /// `table` is its screen's restored version 4 attribute table, `images`
+    /// the restored image table.
+    fn into_live(
+        self,
+        table: Option<&[CellAttributes]>,
+        images: &[Arc<ImageData>],
+    ) -> Result<Line, TerminalCheckpointError> {
+        let seqno = usize_from_u64(self.seqno, "line.seqno")?;
+        let cells = match (self.cells, self.runs, table) {
+            (Some(cells), None, None) => Self::cells_into_live(cells, images)?,
+            (None, Some(runs), Some(table)) => Self::runs_into_live(&runs, table)?,
+            _ => return Err(line_encoding_mismatch()),
+        };
         let mut line = Line::from_cells(cells, seqno);
         match self.scale {
             CheckpointLineScale::Single => {}
@@ -1298,11 +2465,90 @@ impl CheckpointLine {
         Ok(line)
     }
 
+    fn cells_into_live(
+        cells: Vec<CheckpointCell>,
+        images: &[Arc<ImageData>],
+    ) -> Result<Vec<Cell>, TerminalCheckpointError> {
+        let mut live = Vec::new();
+        let stored_cells = cells.iter().try_fold(0usize, |total, cell| {
+            total
+                .checked_add(usize::from(cell.width))
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
+        })?;
+        live.try_reserve_exact(stored_cells)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
+        for cell in cells {
+            let width = usize::from(cell.width);
+            let attributes = cell.attributes.into_live(images)?;
+            live.push(Cell::new_grapheme_with_width(
+                &cell.text,
+                width,
+                attributes.clone(),
+            ));
+            for _ in 1..width {
+                live.push(Cell::blank_with_attrs(attributes.clone()));
+            }
+        }
+        Ok(live)
+    }
+
+    fn runs_into_live(
+        runs: &[CheckpointRun],
+        table: &[CellAttributes],
+    ) -> Result<Vec<Cell>, TerminalCheckpointError> {
+        let mut live = Vec::new();
+        let columns = runs.iter().try_fold(0usize, |total, run| {
+            total
+                .checked_add(run.columns())
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
+        })?;
+        live.try_reserve_exact(columns)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
+        for run in runs {
+            let attributes = table
+                .get(run.attributes as usize)
+                .ok_or_else(line_encoding_mismatch)?;
+            match &run.clusters {
+                None => {
+                    for (start, ch) in run.text.char_indices() {
+                        live.push(Cell::new_grapheme_with_width(
+                            &run.text[start..start + ch.len_utf8()],
+                            1,
+                            attributes.clone(),
+                        ));
+                    }
+                }
+                Some(clusters) => {
+                    let mut rest = run.text.as_str();
+                    for (chars, width) in clusters {
+                        let text = char_span(rest, 0, *chars as usize)
+                            .ok_or_else(line_encoding_mismatch)?;
+                        rest = &rest[text.len()..];
+                        let width = usize::from(*width);
+                        live.push(Cell::new_grapheme_with_width(
+                            text,
+                            width,
+                            attributes.clone(),
+                        ));
+                        for _ in 1..width {
+                            live.push(Cell::blank_with_attrs(attributes.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// `table` is its screen's version 4 attribute table; a version 3 line
+    /// has none. `images` is the length of the image table.
     fn validate(
         &self,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
+        table: Option<&[CheckpointCellAttributes]>,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
         if self.seqno > terminal_seqno {
             return Err(TerminalCheckpointError::InvalidField {
@@ -1317,8 +2563,134 @@ impl CheckpointLine {
             limits.max_retained_capture_bytes,
             "retained_capture_bytes",
         )?;
+        let occupied_columns = match (&self.cells, &self.runs, table) {
+            (Some(cells), None, None) => Self::validate_cells(cells, limits, usage, images)?,
+            (None, Some(runs), Some(table)) => {
+                Self::validate_runs(runs, table.len(), limits, usage)?
+            }
+            _ => return Err(line_encoding_mismatch()),
+        };
+        checked_accumulate(
+            &mut usage.cells,
+            occupied_columns,
+            limits.max_total_cells,
+            "screen_cells",
+        )?;
+        if occupied_columns > limits.max_cols {
+            return Err(resource_limit(
+                "line_occupied_columns",
+                occupied_columns,
+                limits.max_cols,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The columns a version 4 line's runs cover, each cell charged as
+    /// `validate_cells` charges one; the attributes are charged once, with
+    /// their table.
+    fn validate_runs(
+        runs: &[CheckpointRun],
+        table_entries: usize,
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<usize, TerminalCheckpointError> {
         let mut occupied_columns = 0usize;
-        for cell in &self.cells {
+        for run in runs {
+            if run.attributes as usize >= table_entries {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "run.attributes",
+                    reason: "a run's attributes must be an entry of its screen's table",
+                });
+            }
+            if run.text.is_empty() || run.text.chars().any(char::is_control) {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "run.text",
+                    reason: "run text must be nonempty and contain no control characters",
+                });
+            }
+            ensure_limit("run_text_bytes", run.text.len(), limits.max_string_bytes)?;
+            checked_accumulate(
+                &mut usage.cell_text_bytes,
+                run.text.len(),
+                limits.max_total_cell_text_bytes,
+                "cell_text_bytes",
+            )?;
+            let (cells, columns) = match &run.clusters {
+                None => {
+                    let chars = run.text.chars().count();
+                    (chars, chars)
+                }
+                Some(clusters) => {
+                    if clusters.iter().all(|cluster| *cluster == (1, 1)) {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "run.clusters",
+                            reason: "clusters are stored only when some cell is not one char one column wide",
+                        });
+                    }
+                    let mut rest = run.text.as_str();
+                    let mut columns = 0usize;
+                    for (chars, width) in clusters {
+                        if !(1..=2).contains(width) {
+                            return Err(TerminalCheckpointError::InvalidField {
+                                field: "cell.width",
+                                reason: "cell width must be one or two columns",
+                            });
+                        }
+                        let text = char_span(rest, 0, *chars as usize).ok_or(
+                            TerminalCheckpointError::InvalidField {
+                                field: "run.clusters",
+                                reason: "every cell holds at least one char of the run's text",
+                            },
+                        )?;
+                        ensure_limit("cell_text_value_bytes", text.len(), limits.max_string_bytes)?;
+                        rest = &rest[text.len()..];
+                        columns += usize::from(*width);
+                    }
+                    if !rest.is_empty() {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "run.clusters",
+                            reason: "a run's cells must hold all of its text",
+                        });
+                    }
+                    (clusters.len(), columns)
+                }
+            };
+            checked_accumulate(
+                &mut usage.cell_records,
+                cells,
+                limits.max_total_cell_records,
+                "screen_cell_records",
+            )?;
+            let retained = cells
+                .checked_mul(std::mem::size_of::<Cell>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CheckpointRun>()))
+                .and_then(|bytes| bytes.checked_add(run.text.len()))
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
+            checked_accumulate(
+                &mut usage.retained_capture_bytes,
+                retained,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+            occupied_columns = occupied_columns.checked_add(columns).ok_or(
+                TerminalCheckpointError::ArithmeticOverflow("line_occupied_columns"),
+            )?;
+        }
+        Ok(occupied_columns)
+    }
+
+    /// The columns a version 3 line's cells cover.
+    fn validate_cells(
+        cells: &[CheckpointCell],
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+        images: usize,
+    ) -> Result<usize, TerminalCheckpointError> {
+        let mut occupied_columns = 0usize;
+        for cell in cells {
             checked_accumulate(
                 &mut usage.cell_records,
                 1,
@@ -1361,22 +2733,9 @@ impl CheckpointLine {
                 limits.max_retained_capture_bytes,
                 "retained_capture_bytes",
             )?;
-            cell.attributes.validate(limits, usage)?;
+            cell.attributes.validate(limits, usage, images)?;
         }
-        checked_accumulate(
-            &mut usage.cells,
-            occupied_columns,
-            limits.max_total_cells,
-            "screen_cells",
-        )?;
-        if occupied_columns > limits.max_cols {
-            return Err(resource_limit(
-                "line_occupied_columns",
-                occupied_columns,
-                limits.max_cols,
-            ));
-        }
-        Ok(())
+        Ok(occupied_columns)
     }
 }
 
@@ -1806,6 +3165,35 @@ pub(crate) struct CheckpointReplayConfigV2 {
     normalize_output_to_unicode_nfc: bool,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
+    /// Present exactly when the checkpoint holds graphics state: replay of
+    /// image output then runs under these values, as the live terminal did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graphics: Option<CheckpointGraphicsConfig>,
+}
+
+/// The configuration that changes how image output changes the terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointGraphicsConfig {
+    enable_kitty_graphics: bool,
+    kitty_image_budget_bytes: u64,
+    kitty_image_max_transmission_bytes: u64,
+}
+
+impl CheckpointGraphicsConfig {
+    fn capture(config: &dyn TerminalConfiguration) -> Result<Self, TerminalCheckpointError> {
+        Ok(Self {
+            enable_kitty_graphics: config.enable_kitty_graphics(),
+            kitty_image_budget_bytes: u64_from_usize(
+                config.kitty_image_budget_bytes(),
+                "config.kitty_image_budget_bytes",
+            )?,
+            kitty_image_max_transmission_bytes: u64_from_usize(
+                config.kitty_image_max_transmission_bytes(),
+                "config.kitty_image_max_transmission_bytes",
+            )?,
+        })
+    }
 }
 
 struct PendingReplayConfigV2 {
@@ -1820,6 +3208,7 @@ struct PendingReplayConfigV2 {
     normalize_output_to_unicode_nfc: bool,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
+    graphics: CheckpointGraphicsConfig,
 }
 
 impl PendingReplayConfigV2 {
@@ -1828,6 +3217,16 @@ impl PendingReplayConfigV2 {
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, TerminalCheckpointError> {
         limits.validate_policy()?;
+        // V3 recovery checkpoints do not encode the native feature/resource
+        // profile. Refuse both capture and restore projection rather than
+        // replay a suffix under different image/grapheme semantics.
+        if config.feature_profile() != crate::config::TerminalFeatureProfile::Full
+            || config.maximum_cell_grapheme_bytes() != usize::MAX
+        {
+            return Err(TerminalCheckpointError::InvalidRestoreConfiguration {
+                reason: "checkpoint format does not encode bounded native feature profiles",
+            });
+        }
         let revision_before = config.revision();
         let scrollback_size = config.scrollback_size();
         let enable_kitty_keyboard = config.enable_kitty_keyboard();
@@ -1838,6 +3237,7 @@ impl PendingReplayConfigV2 {
         let bidi = config.bidi_mode();
         let palette = config.color_palette();
         let unicode_version = config.unicode_version();
+        let graphics = CheckpointGraphicsConfig::capture(config)?;
         let custom_widths = unicode_version
             .cell_widths
             .as_ref()
@@ -1888,6 +3288,7 @@ impl PendingReplayConfigV2 {
             normalize_output_to_unicode_nfc,
             bidi_enabled: bidi.enabled,
             bidi_hint: bidi.hint.into(),
+            graphics,
         };
         if config.revision() != revision_before {
             return Err(TerminalCheckpointError::ConfigurationChangedDuringProjection);
@@ -1895,9 +3296,11 @@ impl PendingReplayConfigV2 {
         Ok(projection)
     }
 
+    /// `graphics`: the checkpoint holds graphics state.
     fn into_checkpoint(
         self,
         tables: &[CheckpointCustomCellWidthMap],
+        graphics: bool,
     ) -> Result<CheckpointReplayConfigV2, TerminalCheckpointError> {
         Ok(CheckpointReplayConfigV2 {
             version: self.version,
@@ -1911,6 +3314,7 @@ impl PendingReplayConfigV2 {
             normalize_output_to_unicode_nfc: self.normalize_output_to_unicode_nfc,
             bidi_enabled: self.bidi_enabled,
             bidi_hint: self.bidi_hint,
+            graphics: graphics.then_some(self.graphics),
         })
     }
 
@@ -1931,6 +3335,10 @@ impl PendingReplayConfigV2 {
             && checkpoint.normalize_output_to_unicode_nfc == self.normalize_output_to_unicode_nfc
             && checkpoint.bidi_enabled == self.bidi_enabled
             && checkpoint.bidi_hint == self.bidi_hint)
+        // The graphics configuration need not match: replay applies image
+        // output under the checkpoint's own, and once activated the terminal
+        // takes the live one, as a configuration reload would. Requiring it
+        // would fail every restore after a release changed a Kitty default.
     }
 }
 
@@ -2019,7 +3427,36 @@ impl CheckpointReplayConfigV2 {
                 enabled: self.bidi_enabled,
                 hint: self.bidi_hint.into_live(),
             },
+            graphics: self
+                .graphics
+                .map(|graphics| -> Result<_, TerminalCheckpointError> {
+                    Ok((
+                        graphics.enable_kitty_graphics,
+                        usize_from_u64(
+                            graphics.kitty_image_budget_bytes,
+                            "config.kitty_image_budget_bytes",
+                        )?,
+                        usize_from_u64(
+                            graphics.kitty_image_max_transmission_bytes,
+                            "config.kitty_image_max_transmission_bytes",
+                        )?,
+                    ))
+                })
+                .transpose()?,
         })
+    }
+
+    /// Whether replay may apply image output: only under the graphics
+    /// configuration the live terminal applied it with.
+    pub(crate) fn admits_graphics(&self) -> bool {
+        self.graphics.is_some()
+    }
+
+    /// Whether replay applies Kitty graphics commands; under a graphics
+    /// configuration with them disabled, the live terminal ignored them.
+    pub(crate) fn replays_kitty_graphics(&self) -> bool {
+        self.graphics
+            .is_some_and(|graphics| graphics.enable_kitty_graphics)
     }
 
     pub(crate) fn matches_stable(
@@ -2043,6 +3480,20 @@ struct ReplayTerminalConfiguration {
     unicode_version: UnicodeVersion,
     normalize_output_to_unicode_nfc: bool,
     bidi_mode: BidiMode,
+    /// Kitty graphics enabled, image budget, transmission cap; without
+    /// them, replay refuses image output and these are the defaults.
+    graphics: Option<(bool, usize, usize)>,
+}
+
+/// `TerminalConfiguration`'s own defaults, for a value a replay
+/// configuration does not hold.
+#[derive(Debug)]
+struct ConfigurationDefaults;
+
+impl TerminalConfiguration for ConfigurationDefaults {
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
 }
 
 impl std::fmt::Debug for ReplayTerminalConfiguration {
@@ -2094,6 +3545,23 @@ impl TerminalConfiguration for ReplayTerminalConfiguration {
     fn bidi_mode(&self) -> BidiMode {
         self.bidi_mode
     }
+
+    fn enable_kitty_graphics(&self) -> bool {
+        self.graphics
+            .map_or_else(|| ConfigurationDefaults.enable_kitty_graphics(), |g| g.0)
+    }
+
+    fn kitty_image_budget_bytes(&self) -> usize {
+        self.graphics
+            .map_or_else(|| ConfigurationDefaults.kitty_image_budget_bytes(), |g| g.1)
+    }
+
+    fn kitty_image_max_transmission_bytes(&self) -> usize {
+        self.graphics.map_or_else(
+            || ConfigurationDefaults.kitty_image_max_transmission_bytes(),
+            |g| g.2,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2114,7 +3582,7 @@ impl CheckpointSavedCursor {
             position: CheckpointCursorPosition::capture(value.position)?,
             wrap_next: value.wrap_next,
             wrap_next_column: value.wrap_next_column.map(|column| column as u64),
-            pen: CheckpointCellAttributes::capture(&value.pen)?,
+            pen: CheckpointCellAttributes::capture(&value.pen, None, false)?,
             dec_origin_mode: value.dec_origin_mode,
             g0_charset: value.g0_charset.into(),
             g1_charset: value.g1_charset.into(),
@@ -2129,7 +3597,7 @@ impl CheckpointSavedCursor {
                 .wrap_next_column
                 .map(|column| usize_from_u64(column, "screen.saved_cursor.wrap_next_column"))
                 .transpose()?,
-            pen: self.pen.into_live()?,
+            pen: self.pen.into_live(&[])?,
             dec_origin_mode: self.dec_origin_mode,
             g0_charset: self.g0_charset.into_live(),
             g1_charset: self.g1_charset.into_live(),
@@ -2154,7 +3622,8 @@ impl CheckpointSavedCursor {
                 reason: "pending wrap requires a bounded insertion point after the cursor",
             });
         }
-        self.pen.validate(limits, usage)
+        // A pen shows no image.
+        self.pen.validate(limits, usage, 0)
     }
 }
 
@@ -2193,6 +3662,9 @@ impl CheckpointScrollbackGeneration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointScreen {
+    /// Version 4 only: the attribute sets its lines' runs name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attributes: Option<Vec<CheckpointCellAttributes>>,
     lines: Vec<CheckpointLine>,
     stable_row_index_offset: u64,
     cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
@@ -2206,15 +3678,30 @@ struct CheckpointScreen {
 }
 
 impl CheckpointScreen {
+    /// Capture `value`, its images entering `images`; without a registry an
+    /// image refuses capture. Its cold prefix holds rows read back from cold
+    /// storage, whose images are copies.
     fn capture(
         value: crate::screen::ScreenCheckpointParts,
+        encoding: TerminalCheckpointLineEncoding,
+        mut images: Option<&mut CheckpointImageRegistry>,
     ) -> Result<Self, TerminalCheckpointError> {
         let mut lines = Vec::new();
         lines
             .try_reserve_exact(value.lines.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
-        for line in &value.lines {
-            lines.push(CheckpointLine::capture(line)?);
+        let mut table = match encoding {
+            TerminalCheckpointLineEncoding::Cells => None,
+            TerminalCheckpointLineEncoding::Runs => Some(CheckpointAttributeTable::default()),
+        };
+        for (index, line) in value.lines.iter().enumerate() {
+            let copy = index < value.cold_prefix_line_count;
+            lines.push(CheckpointLine::capture(
+                line,
+                table.as_mut(),
+                images.as_deref_mut(),
+                copy,
+            )?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2224,6 +3711,7 @@ impl CheckpointScreen {
             keyboard_stack.push(CheckpointKeyboardEncoding::from(encoding));
         }
         Ok(Self {
+            attributes: table.map(|table| table.entries),
             lines,
             stable_row_index_offset: u64_from_usize(
                 value.stable_row_index_offset,
@@ -2257,13 +3745,103 @@ impl CheckpointScreen {
         })
     }
 
-    fn into_live(self) -> Result<crate::screen::ScreenCheckpointParts, TerminalCheckpointError> {
+    /// Keep only the attribute table entries its runs still name, renumbered
+    /// in the order they first name them, as a capture of these lines builds
+    /// it (after dropped lines took the only runs naming some entries).
+    fn compact_attribute_table(&mut self) -> Result<(), TerminalCheckpointError> {
+        let Some(entries) = self.attributes.take() else {
+            return Ok(());
+        };
+        let mut entries: Vec<Option<CheckpointCellAttributes>> =
+            entries.into_iter().map(Some).collect();
+        let mut renumbered = vec![None; entries.len()];
+        let mut compacted = Vec::new();
+        for run in self
+            .lines
+            .iter_mut()
+            .filter_map(|line| line.runs.as_mut())
+            .flatten()
+        {
+            let old = run.attributes as usize;
+            let new = match renumbered.get(old).copied().flatten() {
+                Some(new) => new,
+                None => {
+                    let entry = entries
+                        .get_mut(old)
+                        .and_then(Option::take)
+                        .ok_or_else(line_encoding_mismatch)?;
+                    let new = u32::try_from(compacted.len()).map_err(|_| {
+                        TerminalCheckpointError::ArithmeticOverflow("screen.attributes")
+                    })?;
+                    compacted.push(entry);
+                    renumbered[old] = Some(new);
+                    new
+                }
+            };
+            run.attributes = new;
+        }
+        self.attributes = Some(compacted);
+        Ok(())
+    }
+
+    /// The text and attributes of the `col`th stored cell of line `row`.
+    fn cell(&self, row: usize, col: usize) -> Option<(&str, &CheckpointCellAttributes)> {
+        self.lines.get(row)?.cell(col, self.attributes.as_deref())
+    }
+
+    /// Its attribute sets in the order its lines first use them: its
+    /// table's entries (version 4), or every cell's (version 3).
+    fn attribute_sets(&self) -> Box<dyn Iterator<Item = &CheckpointCellAttributes> + '_> {
+        match &self.attributes {
+            Some(table) => Box::new(table.iter()),
+            None => Box::new(
+                self.lines
+                    .iter()
+                    .flat_map(|line| line.cells.iter().flatten())
+                    .map(|cell| &cell.attributes),
+            ),
+        }
+    }
+
+    fn attribute_sets_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = &mut CheckpointCellAttributes> + '_> {
+        match &mut self.attributes {
+            Some(table) => Box::new(table.iter_mut()),
+            None => Box::new(
+                self.lines
+                    .iter_mut()
+                    .flat_map(|line| line.cells.iter_mut().flatten())
+                    .map(|cell| &mut cell.attributes),
+            ),
+        }
+    }
+
+    /// `images` is the restored image table.
+    fn into_live(
+        self,
+        images: &[Arc<ImageData>],
+    ) -> Result<crate::screen::ScreenCheckpointParts, TerminalCheckpointError> {
+        // Each entry becomes live attributes once; its cells share clones.
+        let table = match self.attributes {
+            None => None,
+            Some(entries) => {
+                let mut live = Vec::new();
+                live.try_reserve_exact(entries.len()).map_err(|_| {
+                    TerminalCheckpointError::ResourceAllocation("screen.attributes")
+                })?;
+                for entry in entries {
+                    live.push(entry.into_live(images)?);
+                }
+                Some(live)
+            }
+        };
         let mut lines = Vec::new();
         lines
             .try_reserve_exact(self.lines.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
         for line in self.lines {
-            lines.push(line.into_live()?);
+            lines.push(line.into_live(table.as_deref(), images)?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2307,13 +3885,43 @@ impl CheckpointScreen {
         })
     }
 
+    /// `images` is the length of the checkpoint's image table.
     fn validate(
         &self,
         expected_scrollback: bool,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
+        encoding: TerminalCheckpointLineEncoding,
+        images: usize,
     ) -> Result<(), TerminalCheckpointError> {
+        let table = match (encoding, self.attributes.as_deref()) {
+            (TerminalCheckpointLineEncoding::Cells, None) => None,
+            (TerminalCheckpointLineEncoding::Runs, Some(table)) => Some(table),
+            _ => {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "screen.attributes",
+                    reason: "a screen has an attribute table exactly when its lines are runs",
+                });
+            }
+        };
+        if let Some(table) = table {
+            ensure_limit(
+                "screen_attributes",
+                table.len(),
+                limits.max_total_cell_records,
+            )?;
+            for entry in table {
+                checked_accumulate(
+                    &mut usage.retained_capture_bytes,
+                    std::mem::size_of::<CheckpointCellAttributes>()
+                        + std::mem::size_of::<CellAttributes>(),
+                    limits.max_retained_capture_bytes,
+                    "retained_capture_bytes",
+                )?;
+                entry.validate(limits, usage, images)?;
+            }
+        }
         if self.allow_scrollback != expected_scrollback {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "screen.allow_scrollback",
@@ -2424,7 +4032,7 @@ impl CheckpointScreen {
             });
         }
         for line in &self.lines {
-            line.validate(limits, usage, terminal_seqno)?;
+            line.validate(limits, usage, terminal_seqno, table, images)?;
         }
         if let Some(saved) = self.saved_cursor.as_ref() {
             saved.validate(terminal_seqno, limits, usage)?;
@@ -2474,6 +4082,28 @@ pub struct TerminalCheckpointLimits {
     pub max_terminal_string_bytes: usize,
     pub max_pixel_dimension: usize,
     pub max_dpi: u32,
+    /// How a capture under these limits writes its lines. Decoding admits
+    /// either encoding; a terminal restored from a checkpoint captures
+    /// again in the encoding it was restored from.
+    pub line_encoding: TerminalCheckpointLineEncoding,
+    /// Whether a capture holds graphics state (images in cells, Kitty
+    /// state) and the configuration replay of image output needs; without
+    /// it, graphics state refuses capture. A reader older than graphics
+    /// checkpoints refuses one that holds them, so a writer captures them
+    /// only for a reader known to admit them. Decoding admits graphics
+    /// state either way; a terminal restored from a checkpoint captures it
+    /// again exactly when the checkpoint held it.
+    pub capture_graphics: bool,
+    pub max_images: usize,
+    pub max_total_image_bytes: usize,
+    /// Whether a capture holds character protection (DECSCA, SPA): each
+    /// cell's and pen's protection, and the protection mode, which decides
+    /// the erases that keep protected cells. Without it, protection refuses
+    /// capture. A reader older than protection checkpoints refuses one that
+    /// holds it, so a writer captures it only for a reader known to admit
+    /// it; a terminal restored from a checkpoint captures it again exactly
+    /// when the checkpoint held it.
+    pub capture_protection: bool,
 }
 
 impl Default for TerminalCheckpointLimits {
@@ -2508,6 +4138,11 @@ impl Default for TerminalCheckpointLimits {
             max_terminal_string_bytes: 8 * 1024 * 1024,
             max_pixel_dimension: 1_048_576,
             max_dpi: 1_000_000,
+            line_encoding: TerminalCheckpointLineEncoding::Cells,
+            capture_graphics: false,
+            max_images: 4_096,
+            max_total_image_bytes: 64 * 1024 * 1024,
+            capture_protection: false,
         }
     }
 }
@@ -2543,6 +4178,9 @@ impl TerminalCheckpointLimits {
     const ABSOLUTE_MAX_TERMINAL_STRING_BYTES: usize = 32 * 1024 * 1024;
     const ABSOLUTE_MAX_PIXEL_DIMENSION: usize = 1_048_576;
     const ABSOLUTE_MAX_DPI: u32 = 1_000_000;
+    const ABSOLUTE_MAX_IMAGES: usize = 65_536;
+    // Base64 makes these 213 MiB, within the absolute encoded ceiling.
+    const ABSOLUTE_MAX_TOTAL_IMAGE_BYTES: usize = 160 * 1024 * 1024;
 
     fn validate_policy(self) -> Result<(), TerminalCheckpointError> {
         for (resource, observed, maximum) in [
@@ -2686,6 +4324,16 @@ impl TerminalCheckpointLimits {
                 self.max_pixel_dimension,
                 Self::ABSOLUTE_MAX_PIXEL_DIMENSION,
             ),
+            (
+                "configured_max_images",
+                self.max_images,
+                Self::ABSOLUTE_MAX_IMAGES,
+            ),
+            (
+                "configured_max_total_image_bytes",
+                self.max_total_image_bytes,
+                Self::ABSOLUTE_MAX_TOTAL_IMAGE_BYTES,
+            ),
         ] {
             ensure_limit(resource, observed, maximum)?;
         }
@@ -2773,6 +4421,8 @@ impl TerminalCheckpointLimits {
             max_cols: self.max_cols,
             max_visible_grid_cells: self.max_visible_grid_cells,
             max_retained_capture_bytes: self.max_retained_capture_bytes,
+            allow_images: self.capture_graphics,
+            allow_protection: self.capture_protection,
             estimated_bytes_per_line: std::mem::size_of::<Line>()
                 .saturating_add(std::mem::size_of::<CheckpointLine>()),
             estimated_bytes_per_cell: std::mem::size_of::<Cell>()
@@ -2858,6 +4508,46 @@ pub struct TerminalCheckpointV3 {
     focused: bool,
     bidi_enabled: Option<bool>,
     bidi_hint: Option<CheckpointBidiHint>,
+    /// The images cells and Kitty state show, in the order they first name
+    /// them: the primary screen's cells, the alternate screen's, then
+    /// Kitty's stored images by id. Absent when nothing names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<CheckpointImage>>,
+    /// Absent when Kitty holds no image, number or placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kitty: Option<CheckpointKittyState>,
+    /// The protection mode, present exactly when the checkpoint holds
+    /// character protection: a terminal restored from it captures
+    /// protection again, whatever replay protects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_mode: Option<CheckpointProtectedMode>,
+}
+
+/// Which erases keep protected cells (`ProtectedMode`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointProtectedMode {
+    Off,
+    Iso,
+    Dec,
+}
+
+impl CheckpointProtectedMode {
+    fn capture(value: ProtectedMode) -> Self {
+        match value {
+            ProtectedMode::Off => Self::Off,
+            ProtectedMode::Iso => Self::Iso,
+            ProtectedMode::Dec => Self::Dec,
+        }
+    }
+
+    fn into_live(self) -> ProtectedMode {
+        match self {
+            Self::Off => ProtectedMode::Off,
+            Self::Iso => ProtectedMode::Iso,
+            Self::Dec => ProtectedMode::Dec,
+        }
+    }
 }
 
 impl std::fmt::Debug for TerminalCheckpointV3 {
@@ -2931,6 +4621,8 @@ mod historical_saved_cursor_option {
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "CheckpointScreen", deny_unknown_fields)]
 struct HistoricalScreenV2 {
+    #[serde(skip)]
+    attributes: Option<Vec<CheckpointCellAttributes>>,
     lines: Vec<CheckpointLine>,
     stable_row_index_offset: u64,
     cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
@@ -3019,6 +4711,12 @@ struct HistoricalTerminalV2 {
     focused: bool,
     bidi_enabled: Option<bool>,
     bidi_hint: Option<CheckpointBidiHint>,
+    #[serde(skip)]
+    images: Option<Vec<CheckpointImage>>,
+    #[serde(skip)]
+    kitty: Option<CheckpointKittyState>,
+    #[serde(skip)]
+    protected_mode: Option<CheckpointProtectedMode>,
 }
 
 #[derive(Serialize)]
@@ -3060,10 +4758,7 @@ impl PreparedTerminalCheckpointV2Migration {
         if !bytes.starts_with(b"{\"version\":2,") {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
+        let mut budget = JsonStructuralBudget::new(limits);
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
         JsonStructuralSeed {
             budget: &mut budget,
@@ -3261,6 +4956,11 @@ pub struct StagedHotCheckpoint {
     screen_limits: crate::screen::ScreenCheckpointLimits,
     screen_usage: crate::screen::ScreenCheckpointUsage,
     limits: TerminalCheckpointLimits,
+    /// With `limits.capture_graphics`: the images pinned under the lock;
+    /// the alternate screen and Kitty state name entries of it.
+    images: Option<CheckpointImageRegistry>,
+    kitty: Option<CheckpointKittyState>,
+    protected_mode: Option<CheckpointProtectedMode>,
 }
 
 /// Immutable hot state bound to the actual external parser boundary before
@@ -3279,10 +4979,10 @@ impl StagedRecoveryCheckpoint {
     pub fn materialize(
         self,
     ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
-        let checkpoint = self.hot.materialize_cold_history(self.limits)?;
+        let mut checkpoint = self.hot.materialize_cold_history(self.limits)?;
         let rows = checkpoint.primary_rows();
         let cols = checkpoint.primary_cols();
-        let payload = checkpoint.to_canonical_json(self.limits)?;
+        let payload = checkpoint.encode_trimming_history(self.limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             payload,
             rows,
@@ -3327,15 +5027,15 @@ impl StagedHotCheckpoint {
                 crate::screen::ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade => {
                     TerminalCheckpointError::ColdScrollbackNotRecoveryGrade
                 }
-                _ => TerminalCheckpointError::InvalidField {
-                    field: "primary_screen",
-                    reason: "screen checkpoint capture failed",
-                },
+                other => TerminalCheckpointError::from(other),
             })?;
 
-        let primary_screen = CheckpointScreen::capture(parts)?;
-        let checkpoint = TerminalCheckpointV3 {
-            version: TERMINAL_CHECKPOINT_VERSION,
+        // The alternate screen was captured in this encoding when staged.
+        let encoding = self.limits.line_encoding;
+        let mut images = self.images;
+        let primary_screen = CheckpointScreen::capture(parts, encoding, images.as_mut())?;
+        let mut checkpoint = TerminalCheckpointV3 {
+            version: encoding.version(),
             custom_cell_width_maps: self.custom_cell_width_maps,
             replay_config: self.replay_config,
             primary_screen,
@@ -3406,7 +5106,34 @@ impl StagedHotCheckpoint {
             focused: self.focused,
             bidi_enabled: self.bidi_enabled,
             bidi_hint: self.bidi_hint,
+            images: None,
+            kitty: self.kitty,
+            protected_mode: self.protected_mode,
         };
+        if let Some(registry) = images {
+            // Number the images as they are first named, then copy exactly
+            // those, outside the terminal lock and each at its pinned revision.
+            let order = checkpoint.renumber_images(registry.images.len())?;
+            if !order.is_empty() {
+                ensure_limit("images", order.len(), self.limits.max_images)?;
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(order.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                let mut bytes = 0usize;
+                for old in order {
+                    let image = CheckpointImage::capture(&registry.images[old])?;
+                    checked_accumulate(
+                        &mut bytes,
+                        image.bytes(),
+                        self.limits.max_total_image_bytes,
+                        "image_bytes",
+                    )?;
+                    captured.push(image);
+                }
+                checkpoint.images = Some(captured);
+            }
+        }
 
         checkpoint.validate(self.limits)?;
         checkpoint.validate(limits)?;
@@ -3434,6 +5161,10 @@ impl TerminalCheckpointV3 {
     ) -> Result<(), TerminalCheckpointError> {
         if attributes.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
+        }
+        // A protected pen would come back unprotected.
+        if !limits.capture_protection && attributes.protected() {
+            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
         }
         for color in [
             attributes.foreground(),
@@ -3759,6 +5490,13 @@ impl TerminalCheckpointV3 {
         limits: TerminalCheckpointLimits,
     ) -> Result<(), TerminalCheckpointError> {
         limits.validate_policy()?;
+        // This checks resources, which protection holds none of: whether a
+        // protected cell or mode can be captured is decided at capture, and
+        // replayed protection an erase clears again never needs to be.
+        let limits = TerminalCheckpointLimits {
+            capture_protection: true,
+            ..limits
+        };
         let mut usage = crate::screen::ScreenCheckpointUsage::default();
         validate_live_custom_cell_width_maps(custom_cell_width_maps, limits, &mut usage)?;
         let table_count = custom_cell_width_maps.len();
@@ -3776,10 +5514,28 @@ impl TerminalCheckpointV3 {
             }
         }
         Self::preflight_terminal_fields(terminal, limits, &mut usage, false)?;
-        terminal
-            .kitty_img
-            .checkpoint_high_water_if_quiescent()
-            .ok_or(TerminalCheckpointError::UnsupportedGraphicsState)?;
+        if limits.capture_graphics {
+            // A chunked transmission may span records; its chunks are
+            // bounded by the transmission cap. The images replay holds stay
+            // within what a capture of them may hold.
+            let mut registry = CheckpointImageRegistry::default();
+            for data in terminal.kitty_img.stored_images() {
+                registry.pin(data)?;
+            }
+            for screen in [&terminal.screen.screen, &terminal.screen.alt_screen] {
+                for line in screen.lines_with_images() {
+                    registry.pin_lines(std::slice::from_ref(line))?;
+                }
+            }
+            let (count, bytes) = registry.usage();
+            ensure_limit("images", count, limits.max_images)?;
+            ensure_limit("image_bytes", bytes, limits.max_total_image_bytes)?;
+        } else {
+            terminal
+                .kitty_img
+                .checkpoint_high_water_if_quiescent()
+                .ok_or(TerminalCheckpointError::UnsupportedGraphicsState)?;
+        }
         Self::preflight_checkpoint_attributes(&terminal.pen, limits, &mut usage)?;
         for saved in [
             terminal.screen.screen.saved_cursor.as_ref(),
@@ -3833,6 +5589,18 @@ impl TerminalCheckpointV3 {
         limits: TerminalCheckpointLimits,
     ) -> Result<StagedHotCheckpoint, TerminalCheckpointError> {
         limits.validate_policy()?;
+        if terminal.cell_grapheme_limit_exceeded() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "cell_grapheme_bytes",
+                reason: "terminal refused data at its configured retained grapheme bound",
+            });
+        }
+        if terminal.native_execution_limit_exceeded() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "native_execution_limit",
+                reason: "terminal refused expanded command work at its native execution bound",
+            });
+        }
         if terminal.current_seqno() == usize::MAX {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "seqno",
@@ -3861,15 +5629,43 @@ impl TerminalCheckpointV3 {
             width_table_builder.register(&entry.vers, limits)?;
         }
         let custom_cell_width_maps = width_table_builder.finish();
-        let replay_config = pending_replay_config.into_checkpoint(&custom_cell_width_maps)?;
+        let replay_config = pending_replay_config
+            .into_checkpoint(&custom_cell_width_maps, limits.capture_graphics)?;
         let mut screen_usage = crate::screen::ScreenCheckpointUsage::default();
         validate_custom_cell_width_maps(&custom_cell_width_maps, limits, &mut screen_usage)?;
         replay_config.validate(limits, custom_cell_width_maps.len(), &mut screen_usage)?;
         Self::preflight_terminal_fields(terminal, limits, &mut screen_usage, true)?;
-        let kitty_max_image_id = terminal
-            .kitty_img
-            .checkpoint_high_water_if_quiescent()
-            .ok_or(TerminalCheckpointError::UnsupportedGraphicsState)?;
+        // The mode decides which erases keep protected cells, possibly in
+        // cold scrollback; without protection, restore starts with it off.
+        let protected_mode = if limits.capture_protection {
+            Some(CheckpointProtectedMode::capture(terminal.protected_mode))
+        } else if terminal.protected_mode != ProtectedMode::Off {
+            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
+        } else {
+            None
+        };
+        let mut images = None;
+        let mut kitty = None;
+        let kitty_max_image_id = if limits.capture_graphics {
+            if terminal.kitty_img.transmission_in_flight() {
+                return Err(TerminalCheckpointError::GraphicsTransferInFlight);
+            }
+            let parts = terminal.kitty_img.checkpoint_parts().map_err(|_| {
+                TerminalCheckpointError::InvalidField {
+                    field: "kitty",
+                    reason: "Kitty image memory accounting differs from its images",
+                }
+            })?;
+            let mut registry = CheckpointImageRegistry::default();
+            kitty = CheckpointKittyState::capture(&parts, &mut registry)?;
+            images = Some(registry);
+            parts.max_image_id
+        } else {
+            terminal
+                .kitty_img
+                .checkpoint_high_water_if_quiescent()
+                .ok_or(TerminalCheckpointError::UnsupportedGraphicsState)?
+        };
         let screen_limits = limits.screen_limits();
         Self::preflight_checkpoint_attributes(&terminal.pen, limits, &mut screen_usage)?;
         for saved in [
@@ -3903,11 +5699,17 @@ impl TerminalCheckpointV3 {
                 crate::screen::ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade => {
                     TerminalCheckpointError::ColdScrollbackNotRecoveryGrade
                 }
-                _ => TerminalCheckpointError::InvalidField {
-                    field: "primary_screen",
-                    reason: "screen checkpoint capture failed",
-                },
+                // An image the capture does not hold refuses as graphics.
+                other => TerminalCheckpointError::from(other),
             })?;
+        // Pin every live image under the lock: a Kitty edit may change it
+        // once the lock is released, before its bytes are copied.
+        if let Some(registry) = images.as_mut() {
+            registry.pin_lines(&staged_primary.resident_lines)?;
+            registry.pin_lines(&alternate_screen.lines)?;
+        }
+        let alternate_screen =
+            CheckpointScreen::capture(alternate_screen, limits.line_encoding, images.as_mut())?;
 
         let checkpoint_unicode_version =
             CheckpointUnicodeVersion::capture(&terminal.unicode_version, &custom_cell_width_maps)?;
@@ -3924,9 +5726,9 @@ impl TerminalCheckpointV3 {
 
         Ok(StagedHotCheckpoint {
             staged_primary,
-            alternate_screen: CheckpointScreen::capture(alternate_screen)?,
+            alternate_screen,
             alternate_screen_active: terminal.screen.alt_screen_is_active,
-            pen: CheckpointCellAttributes::capture(&terminal.pen)?,
+            pen: CheckpointCellAttributes::capture(&terminal.pen, None, false)?,
             cursor: CheckpointCursorPosition::capture(terminal.cursor)?,
             wrap_next: terminal.wrap_next,
             clear_semantic_attribute_on_newline: terminal.clear_semantic_attribute_on_newline,
@@ -4023,7 +5825,171 @@ impl TerminalCheckpointV3 {
             screen_limits,
             screen_usage,
             limits,
+            images,
+            kitty,
+            protected_mode,
         })
+    }
+
+    /// Validate the image table and Kitty state; returns the table's length.
+    fn validate_images(
+        &self,
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<usize, TerminalCheckpointError> {
+        if (self.images.is_some() || self.kitty.is_some()) && !self.replay_config.admits_graphics()
+        {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "replay_config.graphics",
+                reason: "a checkpoint holding graphics state holds the configuration replay needs",
+            });
+        }
+        if let Some(kitty) = self.kitty.as_ref() {
+            kitty.validate(limits, usage)?;
+        }
+        let Some(images) = self.images.as_ref() else {
+            return Ok(0);
+        };
+        if images.is_empty() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "images",
+                reason: "an image table holding nothing is absent",
+            });
+        }
+        ensure_limit("images", images.len(), limits.max_images)?;
+        let mut bytes = 0usize;
+        for image in images {
+            image.validate()?;
+            checked_accumulate(
+                &mut bytes,
+                image.bytes(),
+                limits.max_total_image_bytes,
+                "image_bytes",
+            )?;
+            checked_accumulate(
+                &mut usage.retained_capture_bytes,
+                image.bytes().saturating_add(
+                    std::mem::size_of::<ImageData>() + std::mem::size_of::<CheckpointImage>(),
+                ),
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+        }
+        Ok(images.len())
+    }
+
+    /// Every image table index the checkpoint names, in canonical order:
+    /// the primary screen's attribute sets, the alternate screen's, then
+    /// Kitty's stored images by id.
+    fn image_references(&self) -> impl Iterator<Item = u32> + '_ {
+        self.primary_screen
+            .attribute_sets()
+            .chain(self.alternate_screen.attribute_sets())
+            .flat_map(|attributes| attributes.images.iter().flatten().map(|cell| cell.image))
+            .chain(
+                self.kitty
+                    .iter()
+                    .flat_map(|kitty| kitty.images.iter().map(|(_, image)| *image)),
+            )
+    }
+
+    /// Every one of the `images` table entries is named, and first named in
+    /// table order.
+    fn validate_image_order(&self, images: usize) -> Result<(), TerminalCheckpointError> {
+        let unnamed = || TerminalCheckpointError::InvalidField {
+            field: "images",
+            reason: "a reference to an image must name an entry of the image table",
+        };
+        if images == 0 {
+            // Screen validation refused every image cell; only Kitty is left.
+            if self
+                .kitty
+                .as_ref()
+                .is_some_and(|kitty| !kitty.images.is_empty())
+            {
+                return Err(unnamed());
+            }
+            return Ok(());
+        }
+        let mut named = Vec::new();
+        named
+            .try_reserve_exact(images)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        named.resize(images, false);
+        let mut next = 0usize;
+        for reference in self.image_references() {
+            let index = reference as usize;
+            let seen = named.get_mut(index).ok_or_else(unnamed)?;
+            if !*seen {
+                if index != next {
+                    return Err(TerminalCheckpointError::InvalidField {
+                        field: "images",
+                        reason:
+                            "image table entries are in the order cells and Kitty first name them",
+                    });
+                }
+                *seen = true;
+                next += 1;
+            }
+        }
+        if next != images {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "images",
+                reason: "every image table entry is named",
+            });
+        }
+        Ok(())
+    }
+
+    /// Renumber the references to an image table of `entries` entries in
+    /// the order they first name them; returns the old entry of each new
+    /// one. An entry nothing names gets no new number.
+    fn renumber_images(&mut self, entries: usize) -> Result<Vec<usize>, TerminalCheckpointError> {
+        let mut renumbered: Vec<Option<u32>> = Vec::new();
+        renumbered
+            .try_reserve_exact(entries)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        renumbered.resize(entries, None);
+        let mut order = Vec::new();
+        let references = self
+            .primary_screen
+            .attribute_sets_mut()
+            .chain(self.alternate_screen.attribute_sets_mut())
+            .flat_map(|attributes| {
+                attributes
+                    .images
+                    .iter_mut()
+                    .flatten()
+                    .map(|cell| &mut cell.image)
+            })
+            .chain(
+                self.kitty
+                    .iter_mut()
+                    .flat_map(|kitty| kitty.images.iter_mut().map(|(_, image)| image)),
+            );
+        for reference in references {
+            let old = *reference as usize;
+            let slot = renumbered
+                .get_mut(old)
+                .ok_or(TerminalCheckpointError::InvalidField {
+                    field: "images",
+                    reason: "a reference to an image must name an entry of the image table",
+                })?;
+            *reference = match *slot {
+                Some(new) => new,
+                None => {
+                    let new = u32::try_from(order.len())
+                        .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("images"))?;
+                    order
+                        .try_reserve(1)
+                        .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+                    order.push(old);
+                    *slot = Some(new);
+                    new
+                }
+            };
+        }
+        Ok(order)
     }
 
     /// Validate the complete semantic authority before any runtime object,
@@ -4075,12 +6041,12 @@ impl TerminalCheckpointV3 {
         }
 
         limits.validate_policy()?;
-        if self.version != TERMINAL_CHECKPOINT_VERSION {
-            return Err(TerminalCheckpointError::UnsupportedVersion {
+        let encoding = TerminalCheckpointLineEncoding::of_version(self.version).ok_or(
+            TerminalCheckpointError::UnsupportedVersion {
                 observed: self.version,
-                supported: TERMINAL_CHECKPOINT_VERSION,
-            });
-        }
+                supported: COMPACT_TERMINAL_CHECKPOINT_VERSION,
+            },
+        )?;
         let native_seqno = usize_from_u64(self.seqno, "seqno")?;
         if native_seqno == 0 || native_seqno == SequenceNo::MAX {
             return Err(TerminalCheckpointError::InvalidField {
@@ -4118,11 +6084,13 @@ impl TerminalCheckpointV3 {
             limits.max_retained_capture_bytes,
             "retained_capture_bytes",
         )?;
-        self.pen.validate(limits, &mut usage)?;
+        // A pen shows no image.
+        self.pen.validate(limits, &mut usage, 0)?;
         validate_custom_cell_width_maps(&self.custom_cell_width_maps, limits, &mut usage)?;
         let table_count = self.custom_cell_width_maps.len();
         self.replay_config
             .validate(limits, table_count, &mut usage)?;
+        let images = self.validate_images(limits, &mut usage)?;
         let mut referenced_tables = 0u8;
         if let Some(index) = self
             .replay_config
@@ -4132,9 +6100,17 @@ impl TerminalCheckpointV3 {
             referenced_tables |= 1u8 << index;
         }
         self.primary_screen
-            .validate(true, limits, &mut usage, self.seqno)?;
+            .validate(true, limits, &mut usage, self.seqno, encoding, images)?;
         self.alternate_screen
-            .validate(false, limits, &mut usage, self.seqno)?;
+            .validate(false, limits, &mut usage, self.seqno, encoding, images)?;
+        self.validate_image_order(images)?;
+        // Every cell and pen was validated above, the pens included.
+        if self.protected_mode.is_none() && usage.protected_attributes {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "protected_mode",
+                reason: "a checkpoint holding protected cells holds the protection mode",
+            });
+        }
 
         let rows = self.primary_screen.physical_rows;
         let cols = self.primary_screen.physical_cols;
@@ -4357,8 +6333,204 @@ impl TerminalCheckpointV3 {
 
     /// Encode the unique compact JSON representation under a writer-enforced
     /// byte ceiling.  Validation runs first, so impossible state is never
-    /// emitted as a recovery authority.
+    /// emitted as a recovery authority, and the decoder's structural pass
+    /// runs last, so neither is a payload the decoder would refuse.
     pub fn to_canonical_json(
+        &self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
+        let encoded = self.encode_validated_canonical_json(limits)?;
+        json_structural_retained_bytes(&encoded, limits)?;
+        Ok(encoded)
+    }
+
+    /// Like `to_canonical_json` for a live recovery capture, except that a
+    /// checkpoint over the decoder's structural or encoded-byte budget first
+    /// gives up its oldest primary-screen scrollback (see
+    /// `drop_oldest_primary_history_to_fit`). A recovery image of the newest
+    /// history beats none: a payload its decoder refused used to poison the
+    /// pane's live parser and end the pane.
+    fn encode_trimming_history(
+        &mut self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
+        match self.to_canonical_json(limits) {
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes" | "encoded_bytes",
+                ..
+            }) => {
+                self.drop_oldest_primary_history_to_fit(limits)?;
+                self.to_canonical_json(limits)
+            }
+            result => result,
+        }
+    }
+
+    /// Drop the fewest oldest primary-screen scrollback lines that bring the
+    /// canonical encoding within 7/8 of both the decoder's structural budget
+    /// and the encoded-byte ceiling. Each line's share is measured alone: the
+    /// structural pass charges every node once wherever it sits, so the shares
+    /// add up exactly. The cold prefix is the oldest history, so it shrinks
+    /// first; the stable row offset moves past the dropped lines.
+    fn drop_oldest_primary_history_to_fit(
+        &mut self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<(), TerminalCheckpointError> {
+        let structural_target =
+            limits.max_retained_capture_bytes - limits.max_retained_capture_bytes / 8;
+        let encoded_target = limits.max_encoded_bytes - limits.max_encoded_bytes / 8;
+        let measuring = TerminalCheckpointLimits {
+            max_retained_capture_bytes: usize::MAX,
+            max_string_bytes: usize::MAX,
+            ..limits
+        };
+
+        let rows = self.primary_screen.physical_rows as usize;
+        let droppable = self.primary_screen.lines.len().saturating_sub(rows);
+        let mut shares = Vec::with_capacity(droppable);
+        for line in &self.primary_screen.lines[..droppable] {
+            let (structural, bytes) = measure_canonical_json(line, measuring)?;
+            // Inside the lines array a line also costs its separating comma.
+            shares.push((structural, bytes + 1));
+        }
+        // An attribute table entry or an image goes with the last droppable
+        // line that names it, unless something kept names it too: its share
+        // moves from the rest to that line's.
+        let mut moved = (0usize, 0usize);
+        if let Some(table) = self.primary_screen.attributes.as_ref() {
+            fn entries(line: &CheckpointLine) -> impl Iterator<Item = usize> + '_ {
+                line.runs
+                    .iter()
+                    .flatten()
+                    .map(|run| run.attributes as usize)
+            }
+            let mut last_named: Vec<Option<usize>> = vec![None; table.len()];
+            for (index, line) in self.primary_screen.lines[..droppable].iter().enumerate() {
+                for entry in entries(line) {
+                    if let Some(last) = last_named.get_mut(entry) {
+                        *last = Some(index);
+                    }
+                }
+            }
+            for line in &self.primary_screen.lines[droppable..] {
+                for entry in entries(line) {
+                    if let Some(last) = last_named.get_mut(entry) {
+                        *last = None;
+                    }
+                }
+            }
+            for (entry, last) in table.iter().zip(&last_named) {
+                if let Some(line) = last {
+                    let (structural, bytes) = measure_canonical_json(entry, measuring)?;
+                    let share = &mut shares[*line];
+                    share.0 = share.0.saturating_add(structural);
+                    share.1 = share.1.saturating_add(bytes + 1);
+                    moved.0 = moved.0.saturating_add(structural);
+                    moved.1 = moved.1.saturating_add(bytes + 1);
+                }
+            }
+        }
+        if let Some(images) = self.images.as_ref() {
+            let mut last_named: Vec<Option<usize>> = vec![None; images.len()];
+            let table = self.primary_screen.attributes.as_deref();
+            for (index, line) in self.primary_screen.lines[..droppable].iter().enumerate() {
+                for image in line.image_entries(table) {
+                    if let Some(last) = last_named.get_mut(image as usize) {
+                        *last = Some(index);
+                    }
+                }
+            }
+            let kept = self.primary_screen.lines[droppable..]
+                .iter()
+                .flat_map(|line| line.image_entries(table))
+                .chain(
+                    self.alternate_screen
+                        .attribute_sets()
+                        .flat_map(|attributes| attributes.images.iter().flatten())
+                        .map(|cell| cell.image),
+                )
+                .chain(
+                    self.kitty
+                        .iter()
+                        .flat_map(|kitty| kitty.images.iter().map(|(_, image)| *image)),
+                );
+            for image in kept {
+                if let Some(last) = last_named.get_mut(image as usize) {
+                    *last = None;
+                }
+            }
+            for (image, last) in images.iter().zip(&last_named) {
+                if let Some(line) = last {
+                    let (structural, bytes) = measure_canonical_json(image, measuring)?;
+                    let share = &mut shares[*line];
+                    share.0 = share.0.saturating_add(structural);
+                    share.1 = share.1.saturating_add(bytes + 1);
+                    moved.0 = moved.0.saturating_add(structural);
+                    moved.1 = moved.1.saturating_add(bytes + 1);
+                }
+            }
+        }
+        let scrollback: Vec<CheckpointLine> =
+            self.primary_screen.lines.drain(..droppable).collect();
+        let rest = measure_canonical_json(&*self, measuring);
+        self.primary_screen.lines.splice(0..0, scrollback);
+        let (mut structural, mut encoded) = rest?;
+        structural = structural.saturating_sub(moved.0);
+        encoded = encoded.saturating_sub(moved.1);
+        for (line_structural, line_bytes) in &shares {
+            structural = structural.saturating_add(*line_structural);
+            encoded = encoded.saturating_add(*line_bytes);
+        }
+
+        let mut dropped = 0;
+        while (structural > structural_target || encoded > encoded_target) && dropped < droppable {
+            structural -= shares[dropped].0;
+            encoded -= shares[dropped].1;
+            dropped += 1;
+        }
+        if structural > structural_target {
+            return Err(resource_limit(
+                "json_structural_bytes",
+                structural,
+                structural_target,
+            ));
+        }
+        if encoded > encoded_target {
+            return Err(resource_limit("encoded_bytes", encoded, encoded_target));
+        }
+        if dropped == 0 {
+            return Ok(());
+        }
+        self.primary_screen.lines.drain(..dropped);
+        self.primary_screen.compact_attribute_table()?;
+        if let Some(images) = self.images.take() {
+            let order = self.renumber_images(images.len())?;
+            let mut images: Vec<Option<CheckpointImage>> = images.into_iter().map(Some).collect();
+            let kept: Vec<CheckpointImage> = order
+                .into_iter()
+                .filter_map(|old| images.get_mut(old).and_then(Option::take))
+                .collect();
+            self.images = (!kept.is_empty()).then_some(kept);
+        }
+        let dropped = u64::try_from(dropped)
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("screen.dropped_history"))?;
+        self.primary_screen.stable_row_index_offset = self
+            .primary_screen
+            .stable_row_index_offset
+            .checked_add(dropped)
+            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                "screen.stable_row_index_offset",
+            ))?;
+        self.primary_screen.cold_prefix_line_count = self
+            .primary_screen
+            .cold_prefix_line_count
+            .saturating_sub(dropped);
+        Ok(())
+    }
+
+    /// `to_canonical_json` without the structural pass: decoding has already
+    /// run that pass over the bytes it compares this re-encoding against.
+    fn encode_validated_canonical_json(
         &self,
         limits: TerminalCheckpointLimits,
     ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
@@ -4411,39 +6583,43 @@ impl TerminalCheckpointV3 {
         let observed = version_text
             .parse::<u32>()
             .map_err(|_| TerminalCheckpointError::Serialization)?;
-        if observed != TERMINAL_CHECKPOINT_VERSION {
-            return Err(TerminalCheckpointError::UnsupportedVersion {
+        let encoding = TerminalCheckpointLineEncoding::of_version(observed).ok_or(
+            TerminalCheckpointError::UnsupportedVersion {
                 observed,
-                supported: TERMINAL_CHECKPOINT_VERSION,
-            });
-        }
-        if version_text != TERMINAL_CHECKPOINT_VERSION.to_string() {
+                supported: COMPACT_TERMINAL_CHECKPOINT_VERSION,
+            },
+        )?;
+        if version_text != observed.to_string() {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
 
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
-        let mut structural_deserializer = serde_json::Deserializer::from_slice(bytes);
-        JsonStructuralSeed {
-            budget: &mut budget,
-            depth: 0,
-        }
-        .deserialize(&mut structural_deserializer)
-        .map_err(|_| TerminalCheckpointError::Serialization)?;
-        structural_deserializer
-            .end()
-            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        json_structural_retained_bytes(bytes, limits)?;
 
         let checkpoint: Self =
             serde_json::from_slice(bytes).map_err(|_| TerminalCheckpointError::Serialization)?;
-        checkpoint.validate(limits)?;
-        let canonical = checkpoint.to_canonical_json(limits)?;
+        // Validates, then re-encodes: the structural pass already ran above.
+        let canonical = checkpoint.encode_validated_canonical_json(limits)?;
         if canonical.as_slice() != bytes {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
+        // What it restores captures again as it was captured.
+        let limits = TerminalCheckpointLimits {
+            line_encoding: encoding,
+            capture_graphics: checkpoint.replay_config.admits_graphics(),
+            capture_protection: checkpoint.protected_mode.is_some(),
+            ..limits
+        };
         Ok(ValidatedTerminalCheckpointV3 { checkpoint, limits })
+    }
+
+    /// The schema version a canonical payload declares, read from its prefix
+    /// without decoding it; `None` for bytes no decoder would admit.
+    #[must_use]
+    pub fn canonical_payload_version(bytes: &[u8]) -> Option<u32> {
+        let tail = bytes.strip_prefix(b"{\"version\":")?;
+        let comma = tail.iter().take(11).position(|byte| *byte == b',')?;
+        let version = std::str::from_utf8(&tail[..comma]).ok()?.parse().ok()?;
+        TerminalCheckpointLineEncoding::of_version(version).map(|_| version)
     }
 
     #[must_use]
@@ -4463,7 +6639,7 @@ impl TerminalCheckpointV3 {
     }
 
     pub fn into_recovery_checkpoint_at_external_parser_ground(
-        self,
+        mut self,
         ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
@@ -4474,7 +6650,7 @@ impl TerminalCheckpointV3 {
         };
         let rows = active_screen.physical_rows as usize;
         let cols = active_screen.physical_cols as usize;
-        let canonical_payload = self.to_canonical_json(limits)?;
+        let canonical_payload = self.encode_trimming_history(limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             canonical_payload,
             rows,
@@ -4562,41 +6738,29 @@ impl TerminalCheckpointV3 {
     /// Text of the cell at `(row, col)` in the primary screen.
     #[must_use]
     pub fn primary_cell_text(&self, row: usize, col: usize) -> Option<&str> {
-        self.primary_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.text.as_str())
+        self.primary_screen.cell(row, col).map(|(text, _)| text)
     }
 
     /// Text of the cell at `(row, col)` in the alternate screen.
     #[must_use]
     pub fn alternate_cell_text(&self, row: usize, col: usize) -> Option<&str> {
-        self.alternate_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.text.as_str())
+        self.alternate_screen.cell(row, col).map(|(text, _)| text)
     }
 
     /// Intensity attribute of the cell at `(row, col)` in the primary screen.
     #[must_use]
     pub fn primary_cell_intensity(&self, row: usize, col: usize) -> Option<Intensity> {
         self.primary_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.attributes.intensity)
+            .cell(row, col)
+            .map(|(_, attributes)| attributes.intensity)
     }
 
     /// Underline attribute of the cell at `(row, col)` in the alternate screen.
     #[must_use]
     pub fn alternate_cell_underline(&self, row: usize, col: usize) -> Option<Underline> {
         self.alternate_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.attributes.underline)
+            .cell(row, col)
+            .map(|(_, attributes)| attributes.underline)
     }
 }
 
@@ -4618,6 +6782,20 @@ impl ValidatedTerminalCheckpointV3 {
     #[must_use]
     pub fn checkpoint(&self) -> &TerminalCheckpointV3 {
         &self.checkpoint
+    }
+
+    /// Whether the checkpoint holds graphics state, so that a terminal
+    /// restored from it, which replays image output, captures it again.
+    #[must_use]
+    pub const fn captures_graphics(&self) -> bool {
+        self.limits.capture_graphics
+    }
+
+    /// Whether the checkpoint holds character protection, so that a terminal
+    /// restored from it, which replays protected output, captures it again.
+    #[must_use]
+    pub const fn captures_protection(&self) -> bool {
+        self.limits.capture_protection
     }
 
     /// Consume the wrapper and return the validated `TerminalCheckpointV3`.
@@ -4675,6 +6853,17 @@ impl ValidatedTerminalCheckpointV3 {
             }
             revision
         };
+        let images = self.checkpoint.images.as_ref().map_or(0, Vec::len);
+        let kitty_images = self
+            .checkpoint
+            .kitty
+            .as_ref()
+            .map_or(0, |kitty| kitty.images.len());
+        if images != 0 || kitty_images != 0 {
+            log::info!(
+                "restoring a terminal checkpoint holding {images} image(s); Kitty stores {kitty_images}"
+            );
+        }
         let replay_projection = self.checkpoint.replay_config.clone();
         let replay_config: Arc<dyn TerminalConfiguration> = Arc::new(
             replay_projection.to_replay_configuration(self.limits, &custom_cell_width_maps)?,
@@ -4822,8 +7011,21 @@ impl TerminalState {
             focused,
             bidi_enabled,
             bidi_hint,
+            images,
+            kitty,
+            protected_mode,
         } = checkpoint;
 
+        // Each entry becomes one object, which every cell and Kitty id
+        // naming it shares, as they shared it live.
+        let images = images.unwrap_or_default();
+        let mut restored_images = Vec::new();
+        restored_images
+            .try_reserve_exact(images.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("images"))?;
+        for image in images {
+            restored_images.push(image.into_live()?);
+        }
         let seqno = usize_from_u64(seqno, "seqno")?;
         let size = TerminalSize {
             rows,
@@ -4834,13 +7036,13 @@ impl TerminalState {
         };
         let bidi_mode = config.bidi_mode();
         let primary_screen = Screen::from_validated_checkpoint_parts(
-            primary_screen.into_live()?,
+            primary_screen.into_live(&restored_images)?,
             &config,
             seqno,
             bidi_mode,
         )?;
         let alternate_screen = Screen::from_validated_checkpoint_parts(
-            alternate_screen.into_live()?,
+            alternate_screen.into_live(&restored_images)?,
             &config,
             seqno,
             bidi_mode,
@@ -4895,7 +7097,7 @@ impl TerminalState {
         // Complete every fallible semantic conversion before constructing the
         // terminal.  Restore must not allocate a default state and then replace
         // its collections: the validated checkpoint is the sole state source.
-        let restored_pen = pen.into_live()?;
+        let restored_pen = pen.into_live(&[])?;
         let restored_cursor = cursor.into_live()?;
         let restored_left_margin = usize_from_u64(left_margin, "left_margin")?;
         let restored_right_margin = usize_from_u64(right_margin, "right_margin")?;
@@ -4918,11 +7120,19 @@ impl TerminalState {
         let restored_lost_focus_seqno = usize_from_u64(lost_focus_seqno, "lost_focus_seqno")?;
         let restored_lost_focus_alerted_seqno =
             usize_from_u64(lost_focus_alerted_seqno, "lost_focus_alerted_seqno")?;
-        let restored_kitty = KittyImageState::quiescent_for_checkpoint_restore(
-            config.kitty_image_budget_bytes(),
-            config.kitty_image_max_transmission_bytes(),
-            kitty_max_image_id,
-        );
+        let restored_kitty = match kitty {
+            None => KittyImageState::quiescent_for_checkpoint_restore(
+                config.kitty_image_budget_bytes(),
+                config.kitty_image_max_transmission_bytes(),
+                kitty_max_image_id,
+            ),
+            Some(kitty) => KittyImageState::from_checkpoint_parts(
+                config.kitty_image_budget_bytes(),
+                config.kitty_image_max_transmission_bytes(),
+                kitty.into_parts(kitty_max_image_id, &restored_images)?,
+            )
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("kitty"))?,
+        };
         let mut restored_image_cache = lru::LruCache::unbounded();
         restored_image_cache.resize(NonZeroUsize::new(16).expect("nonzero cache capacity"));
         // Hot per-batch configuration is derived from the restoring config,
@@ -4934,6 +7144,9 @@ impl TerminalState {
             batch_config,
             screen: screens,
             pen: restored_pen,
+            // Without protection, capture refused any other mode.
+            protected_mode: protected_mode
+                .map_or(ProtectedMode::Off, CheckpointProtectedMode::into_live),
             cursor: restored_cursor,
             wrap_next,
             clear_semantic_attribute_on_newline,
@@ -4992,12 +7205,16 @@ impl TerminalState {
             user_vars: restored_user_vars,
             kitty_img: restored_kitty,
             seqno,
+            cell_grapheme_limit_exceeded: false,
+            native_execution_limit_exceeded: false,
             unicode_version: restored_unicode_version,
             unicode_version_stack: restored_unicode_stack,
             // Restored cells were not written by this performer, so any of
             // them may end in ZWJ; keep the continuation scan enabled.
             zwj_tail_cell_possible: true,
+            print_char_table: Default::default(),
             enable_conpty_quirks,
+            line_flood: super::performer::line_flood_default(),
             suppress_initial_title_change,
             accumulating_title,
             lost_focus_seqno: restored_lost_focus_seqno,
@@ -5012,6 +7229,15 @@ impl TerminalState {
 #[derive(Debug, Eq, PartialEq)]
 pub enum TerminalCheckpointError {
     UnsupportedGraphicsState,
+    /// A Kitty chunked transmission has chunks but not yet its last: a
+    /// capture a few records later holds the image.
+    GraphicsTransferInFlight,
+    /// An image changed after the capture pinned it under the terminal
+    /// lock: a later capture holds the new content.
+    StaleGraphicsGeneration,
+    /// A protected cell or pen, or a protection mode other than off: state
+    /// the checkpoint format does not hold (DECSCA, SPA).
+    UnsupportedCharacterProtection,
     UnsupportedVersion {
         observed: u32,
         supported: u32,
@@ -5068,6 +7294,9 @@ impl From<crate::screen::ScreenCheckpointCaptureError> for TerminalCheckpointErr
             crate::screen::ScreenCheckpointCaptureError::UnsupportedGraphicsState => {
                 Self::UnsupportedGraphicsState
             }
+            crate::screen::ScreenCheckpointCaptureError::UnsupportedCharacterProtection => {
+                Self::UnsupportedCharacterProtection
+            }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
                 Self::ColdScrollbackMetadataInconsistent
             }
@@ -5086,6 +7315,15 @@ impl std::fmt::Display for TerminalCheckpointError {
         match self {
             Self::UnsupportedGraphicsState => formatter.write_str(
                 "terminal contains graphics state unsupported by checkpointing",
+            ),
+            Self::GraphicsTransferInFlight => formatter.write_str(
+                "a Kitty image transmission is unfinished; a later checkpoint holds it",
+            ),
+            Self::StaleGraphicsGeneration => formatter.write_str(
+                "an image changed while the checkpoint was captured",
+            ),
+            Self::UnsupportedCharacterProtection => formatter.write_str(
+                "terminal contains character protection unsupported by checkpointing",
             ),
             Self::UnsupportedVersion {
                 observed,
@@ -5432,6 +7670,65 @@ mod tests {
         );
     }
 
+    /// A scroll creates rows a full width of default blanks; a checkpoint
+    /// stores none of a row's trailing ones (what a line past its end shows
+    /// anyway), but keeps a colored blank and a wrapped row's last cell.
+    #[test]
+    fn trailing_default_blanks_are_not_stored() {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 80,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 1280,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTestConfig),
+            "FrankenTerm",
+            "checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for tick in 0..200 {
+            terminal.advance_bytes(format!("tick {tick}\r\n").as_bytes());
+        }
+        terminal.advance_bytes(b"red:\x1b[41m \x1b[0m\r\n");
+        terminal.advance_bytes([b'w'; 121]);
+        let checkpoint = TerminalCheckpointV3::capture(&terminal).expect("capture terminal");
+        let blank = CheckpointCellAttributes::capture(&CellAttributes::blank(), None, false)
+            .expect("blank attributes");
+        let lines = checkpoint
+            .primary_screen
+            .lines
+            .iter()
+            .map(|line| line.cells.as_deref().expect("version 3 cells"))
+            .collect::<Vec<_>>();
+        assert!(lines.iter().all(|cells| cells.last().is_none_or(|cell| {
+            !(cell.width == 1 && cell.text == " " && cell.attributes == blank)
+        })));
+        // The colored blank and the wrapped row's last cell stay.
+        assert!(lines.iter().any(|cells| cells
+            .last()
+            .is_some_and(|cell| cell.text == " " && cell.attributes != blank)));
+        assert!(lines
+            .iter()
+            .any(|cells| cells.len() == 120
+                && cells.last().is_some_and(|cell| cell.attributes.wrapped)));
+
+        let limits = TerminalCheckpointLimits::default();
+        let payload = checkpoint
+            .to_canonical_json(limits)
+            .expect("encode checkpoint");
+        // Its ~280 rows, each stored a full 120 cells wide, were about 8 MB;
+        // their short lines alone are well under 1 MB.
+        assert!(payload.len() < 1024 * 1024, "{} bytes", payload.len());
+        let decoded =
+            TerminalCheckpointV3::decode_canonical_json(&payload, limits).expect("decode");
+        assert_eq!(decoded.checkpoint(), &checkpoint);
+        decoded
+            .restore_inert(Arc::new(CheckpointTestConfig))
+            .expect("restore");
+    }
+
     #[test]
     fn unsupported_out_of_band_graphics_fail_closed() {
         let mut terminal = terminal();
@@ -5441,6 +7738,163 @@ mod tests {
             TerminalCheckpointV3::capture(&terminal),
             Err(TerminalCheckpointError::UnsupportedGraphicsState)
         );
+    }
+
+    /// The format holds no character protection (DECSCA, SPA), so capture
+    /// refuses while a pen, a cell or the protection mode could still
+    /// change what an erase keeps.
+    #[test]
+    fn character_protection_fails_closed() {
+        let refused = Err(TerminalCheckpointError::UnsupportedCharacterProtection);
+        let mut terminal = terminal();
+        terminal.advance_bytes(b"\x1b[1\"q");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+
+        // DECSCA 0 stops protecting, but leaves the DEC mode.
+        terminal.advance_bytes(b"P\x1b[0\"q");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+
+        // DECSTR turns protection off; the cell printed before stays
+        // protected for a later DECSCA or SPA.
+        terminal.advance_bytes(b"\x1b[!p");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+        terminal.advance_bytes(b"\x1b[2J");
+        assert!(TerminalCheckpointV3::capture(&terminal).is_ok());
+
+        // SPA's mode outlasts EPA, until an ED 2 keeps no protected cell.
+        terminal.advance_bytes(b"\x1bV\x1bW");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+        terminal.advance_bytes(b"\x1b[2J");
+        assert!(TerminalCheckpointV3::capture(&terminal).is_ok());
+    }
+
+    fn protection_limits(
+        line_encoding: TerminalCheckpointLineEncoding,
+    ) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            line_encoding,
+            capture_protection: true,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// With protection admitted, protected cells, a protected pen and saved
+    /// pen, and each protection mode restore exactly in either encoding, and
+    /// erases after the restore keep what they keep live.
+    #[test]
+    fn character_protection_restores_exactly_when_admitted() {
+        for (setup, erase) in [
+            // DECSCA: protected cells and pen, DEC mode; DECSED keeps them.
+            (
+                &b"\x1b[1\"qkept\x1b[0\"q gone\r\n\x1b[1\"q\x1b7"[..],
+                &b"\x1b[?2J"[..],
+            ),
+            // SPA: ISO mode outlasts EPA; ED keeps protected cells too.
+            (&b"\x1bVkept\x1bW gone\r\n"[..], &b"\x1b[2J"[..]),
+        ] {
+            let mut live = terminal();
+            live.advance_bytes(setup);
+            for encoding in [
+                TerminalCheckpointLineEncoding::Cells,
+                TerminalCheckpointLineEncoding::Runs,
+            ] {
+                let limits = protection_limits(encoding);
+                assert_eq!(
+                    TerminalCheckpointV3::capture_with_limits(
+                        &live,
+                        TerminalCheckpointLimits {
+                            capture_protection: false,
+                            ..limits
+                        }
+                    )
+                    .err(),
+                    Some(TerminalCheckpointError::UnsupportedCharacterProtection)
+                );
+                let payload = TerminalCheckpointV3::capture_with_limits(&live, limits)
+                    .unwrap()
+                    .to_canonical_json(limits)
+                    .unwrap();
+                let decoded = TerminalCheckpointV3::decode_canonical_json(
+                    &payload,
+                    TerminalCheckpointLimits::default(),
+                )
+                .unwrap();
+                assert!(decoded.captures_protection());
+                let mut restored = decoded
+                    .restore_inert(Arc::new(CheckpointTestConfig))
+                    .unwrap();
+                assert_eq!(
+                    restored
+                        .checkpoint()
+                        .unwrap()
+                        .to_canonical_json(limits)
+                        .unwrap(),
+                    payload
+                );
+                let mut erased = terminal();
+                erased.advance_bytes(setup);
+                erased.advance_bytes(erase);
+                restored.replay_bytes(erase).unwrap();
+                let expected = TerminalCheckpointV3::capture_with_limits(&erased, limits)
+                    .unwrap()
+                    .to_canonical_json(limits)
+                    .unwrap();
+                assert_eq!(
+                    restored
+                        .checkpoint()
+                        .unwrap()
+                        .to_canonical_json(limits)
+                        .unwrap(),
+                    expected
+                );
+                let text = std::str::from_utf8(&expected).unwrap();
+                assert!(text.contains("\"protected\":true"));
+            }
+        }
+        // A protection-capable capture of an unprotected terminal holds only
+        // the mode, off; without protection its bytes are as before.
+        let plain = terminal();
+        let text = String::from_utf8(
+            TerminalCheckpointV3::capture_with_limits(
+                &plain,
+                protection_limits(TerminalCheckpointLineEncoding::Runs),
+            )
+            .unwrap()
+            .to_canonical_json(protection_limits(TerminalCheckpointLineEncoding::Runs))
+            .unwrap()
+            .to_vec(),
+        )
+        .unwrap();
+        assert!(text.ends_with(",\"protected_mode\":\"off\"}"));
+        assert!(!text.contains("\"protected\":"));
+        let text = String::from_utf8(
+            TerminalCheckpointV3::capture(&plain)
+                .unwrap()
+                .to_canonical_json(TerminalCheckpointLimits::default())
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!text.contains("protected"));
+    }
+
+    /// A protected cell needs the mode beside it: without, the checkpoint
+    /// would restore a terminal that cannot capture what it holds.
+    #[test]
+    fn protected_cells_without_the_mode_fail_validation() {
+        let mut live = terminal();
+        live.advance_bytes(b"\x1b[1\"qkept\x1b[0\"q");
+        let limits = protection_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert!(checkpoint.validate(limits).is_ok());
+        checkpoint.protected_mode = None;
+        assert!(matches!(
+            checkpoint.validate(limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "protected_mode",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -5669,7 +8123,13 @@ mod tests {
             screen
                 .lines
                 .iter()
-                .map(|line| line.clone().into_live().unwrap().as_str().into_owned())
+                .map(|line| {
+                    line.clone()
+                        .into_live(None, &[])
+                        .unwrap()
+                        .as_str()
+                        .into_owned()
+                })
                 .collect::<String>()
         };
         assert_eq!(text(&before.primary_screen), text(&captured.primary_screen));
@@ -5716,6 +8176,125 @@ mod tests {
             committed_generation.revision,
             original_generation.revision + 1
         );
+    }
+
+    /// A 4x10 terminal holding about 100 lines of scrollback, and its checkpoint.
+    fn checkpoint_with_scrollback() -> TerminalCheckpointV3 {
+        let mut live = Terminal::new(
+            TerminalSize {
+                rows: 4,
+                cols: 10,
+                pixel_width: 100,
+                pixel_height: 80,
+                dpi: 96,
+            },
+            Arc::new(RichCheckpointTestConfig),
+            "FrankenTerm",
+            "history-budget",
+            Box::new(std::io::sink()),
+        );
+        for line in 0..104 {
+            live.advance_bytes(format!("line {line:04}\r\n").as_bytes());
+        }
+        let checkpoint =
+            TerminalCheckpointV3::capture_with_limits(&live, TerminalCheckpointLimits::default())
+                .unwrap();
+        assert!(checkpoint.primary_screen.lines.len() > 100);
+        checkpoint
+    }
+
+    /// Default limits with a retained-memory budget of `retained` bytes.
+    fn limits_with_retained_budget(retained: usize) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            max_retained_capture_bytes: retained,
+            max_replay_actions_per_record: retained
+                / std::mem::size_of::<frankenterm_escape_parser::Action>(),
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    #[test]
+    fn encoder_refuses_a_payload_its_decoder_would_refuse() {
+        let checkpoint = checkpoint_with_scrollback();
+        let full = checkpoint
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        let charged =
+            json_structural_retained_bytes(&full, TerminalCheckpointLimits::default()).unwrap();
+        let tight = limits_with_retained_budget(charged / 2);
+        tight.validate_policy().unwrap();
+
+        // The decoder's structural pass refuses the full payload, and the
+        // encoder now says so too, with the same typed limit, instead of
+        // emitting a recovery image nothing can decode.
+        assert!(matches!(
+            TerminalCheckpointV3::decode_canonical_json(&full, tight),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            checkpoint.to_canonical_json(tight),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn live_capture_drops_only_the_oldest_history_until_its_decoder_admits_it() {
+        let checkpoint = checkpoint_with_scrollback();
+        let full = checkpoint
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        let charged =
+            json_structural_retained_bytes(&full, TerminalCheckpointLimits::default()).unwrap();
+        let tight = limits_with_retained_budget(charged / 2);
+
+        let mut trimmed = checkpoint.clone();
+        let payload = trimmed.encode_trimming_history(tight).unwrap();
+        let before = &checkpoint.primary_screen;
+        let after = &trimmed.primary_screen;
+        let dropped = before.lines.len() - after.lines.len();
+        assert!(dropped > 0, "an over-budget capture must give up history");
+        assert!(
+            after.lines.len() > before.physical_rows as usize,
+            "the newest history is kept"
+        );
+        // Exactly the oldest lines go; the newest stay, in order.
+        assert_eq!(after.lines[..], before.lines[dropped..]);
+        assert_eq!(
+            after.stable_row_index_offset,
+            before.stable_row_index_offset + dropped as u64
+        );
+        // It fits with the 1/8 headroom, and its decoder admits it.
+        let fitted = json_structural_retained_bytes(&payload, tight).unwrap();
+        assert!(fitted <= tight.max_retained_capture_bytes - tight.max_retained_capture_bytes / 8);
+        let restored = TerminalCheckpointV3::decode_canonical_json(&payload, tight)
+            .unwrap()
+            .restore_inert(Arc::new(RichCheckpointTestConfig))
+            .unwrap()
+            .into_live(Box::new(std::io::sink()))
+            .unwrap();
+        let recaptured = TerminalCheckpointV3::capture_with_limits(
+            &restored,
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(recaptured.primary_screen.lines, after.lines);
+        assert_eq!(
+            recaptured.primary_screen.stable_row_index_offset,
+            after.stable_row_index_offset
+        );
+
+        // A capture within budget is left whole.
+        let mut whole = checkpoint.clone();
+        whole
+            .encode_trimming_history(TerminalCheckpointLimits::default())
+            .unwrap();
+        assert!(whole == checkpoint);
     }
 
     #[test]
@@ -5776,8 +8355,267 @@ mod tests {
         assert_eq!(sink.load_scrollback_line(oldest).unwrap(), original);
     }
 
+    /// A guardian restore replays every output record after its checkpoint,
+    /// so a row a dead writer spilled after the checkpoint is already in the
+    /// model: activation supersedes the advanced store with the model's
+    /// exact cold prefix, keeping neither the stale row nor a duplicate.
     #[test]
-    fn canonical_restore_roundtrips_complete_semantic_projection() {
+    fn cold_seam_checkpoint_supersedes_a_store_its_replay_cleared() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        assert!(sink.retained_scrollback_rows() > 0);
+        // The writer printed ESC[3J after the checkpoint and committed that
+        // clear, which moves a real store to a content epoch the restored
+        // model cannot name; replaying the same bytes tells activation so.
+        live.advance_bytes(b"\x1b[3J");
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        inert.replay_bytes(b"\x1b[3J").unwrap();
+        let model = inert.checkpoint().unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("superseding activation failed: {:?}", failure.error()),
+        };
+        assert!(sink
+            .last_supersede_cleared
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let restored = TerminalCheckpointV3::capture_with_limits(&activated, limits).unwrap();
+        assert_eq!(restored.primary_screen.lines, model.primary_screen.lines);
+    }
+
+    /// A model that replayed more scrollback than the live configuration
+    /// retains (a child printing thousands of lines during its guardian
+    /// birth) activates with exactly the rows a live terminal fed the same
+    /// bytes keeps; it used to fail ConfiguredRetentionInsufficient, and the
+    /// spawn with it (ft-gufg7).
+    #[test]
+    fn activation_keeps_what_a_live_terminal_keeps_after_an_overflowing_replay() {
+        let limits = TerminalCheckpointLimits::default();
+        let config = Arc::new(ReplacementActivationConfig {
+            tier_enabled: false,
+            sink: Arc::new(MalformedReplacementReceiptSink::default()),
+        });
+        let terminal = |name: &str| {
+            Terminal::new(
+                TerminalSize::default(),
+                Arc::clone(&config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+                "FrankenTerm",
+                name,
+                Box::new(Vec::<u8>::new()),
+            )
+        };
+        let born = terminal("overflowing-replay-birth");
+        let canonical = TerminalCheckpointV3::capture_with_limits(&born, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(Arc::clone(&config) as Arc<dyn TerminalConfiguration>)
+            .unwrap();
+        let mut oracle = terminal("overflowing-replay-oracle");
+        // 300 lines against a retention of 128, in records as a journal holds
+        // them.
+        let output: Vec<u8> = (0..300)
+            .flat_map(|index| format!("row-{index}\r\n").into_bytes())
+            .collect();
+        for record in output.chunks(1024) {
+            inert.replay_bytes(record).unwrap();
+        }
+        oracle.advance_bytes(&output);
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("an overflowing replay must activate: {:?}", failure.error()),
+        };
+        let texts = |terminal: &Terminal| {
+            let screen = terminal.screen();
+            screen
+                .lines_in_phys_range(0..screen.scrollback_rows())
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let kept = texts(&activated);
+        assert_eq!(kept, texts(&oracle));
+        assert_eq!(kept.len(), activated.screen().physical_rows + 128);
+        assert_eq!(kept[0], "row-149");
+        assert_eq!(
+            activated.screen().phys_to_stable_row_index(0),
+            oracle.screen().phys_to_stable_row_index(0)
+        );
+    }
+
+    /// The same with a cold tier: the sink receives only retained rows, the
+    /// newest ones, and nothing older survives activation (ft-gufg7).
+    #[test]
+    fn tiered_activation_publishes_only_the_retained_rows_of_an_overflowing_replay() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        // 100 rows against a retention of 32.
+        let output: Vec<u8> = (0..100)
+            .flat_map(|index| format!("r{index}\r\n").into_bytes())
+            .collect();
+        inert.replay_bytes(&output).unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("an overflowing replay must activate: {:?}", failure.error()),
+        };
+        let screen = activated.screen();
+        let resident_scrollback = screen.scrollback_rows() - screen.physical_rows;
+        assert_eq!(sink.retained_scrollback_rows() + resident_scrollback, 32);
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        assert_eq!(oldest, screen.phys_to_stable_row_index(0) - 31);
+        let newest_cold = sink.load_scrollback_line(oldest + 30).unwrap();
+        let oldest_cold = sink.load_scrollback_line(oldest).unwrap();
+        assert!(oldest_cold.as_str().starts_with('r'));
+        assert!(newest_cold.as_str().starts_with('r'));
+        let last = screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .rfind(|text| !text.trim().is_empty());
+        assert_eq!(last.as_deref(), Some("r99"));
+    }
+
+    #[test]
+    fn scrollback_ancestry_admits_only_its_lineage() {
+        use crate::config::{ScrollbackAncestry, ScrollbackSnapshotGeneration};
+
+        let epoch = [7; 16];
+        let other = [9; 16];
+        let ancestor = ScrollbackSnapshotGeneration::new(epoch, 5);
+        let strict = ScrollbackAncestry {
+            ancestor,
+            cleared_since: false,
+        };
+        let cleared = ScrollbackAncestry {
+            cleared_since: true,
+            ..strict
+        };
+        let generation = ScrollbackSnapshotGeneration::new;
+        // The ancestor's epoch: no older than the ancestor, either way.
+        for ancestry in [strict, cleared] {
+            assert!(ancestry.admits(generation(epoch, 5)));
+            assert!(ancestry.admits(generation(epoch, 9)));
+            assert!(!ancestry.admits(generation(epoch, 4)));
+            assert!(ancestry.admits_receipt(generation(epoch, 6)));
+            assert!(!ancestry.admits_receipt(generation(epoch, 5)));
+        }
+        // Another epoch only after a replayed clear, and a receipt there is a
+        // published revision.
+        assert!(!strict.admits(generation(other, 0)));
+        assert!(!strict.admits_receipt(generation(other, 1)));
+        assert!(cleared.admits(generation(other, 0)));
+        assert!(cleared.admits_receipt(generation(other, 1)));
+        assert!(!cleared.admits_receipt(generation(other, 0)));
+    }
+
+    #[test]
+    fn cold_seam_checkpoint_supersedes_an_advanced_store_when_asked() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let mut prepared = live
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("fixture must exercise a real cold/resident seam")
+            .hydrate(|| false)
+            .unwrap();
+        assert!(prepared.is_ready());
+        live.increment_seqno();
+        let seqno = live.current_seqno();
+        assert!(live
+            .screen_mut()
+            .install_cold_seam_reflow(&mut prepared, seqno)
+            .unwrap());
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        let original = sink.load_scrollback_line(oldest).unwrap();
+        // The dead writer's last spill: one more row past the checkpoint's
+        // cold prefix, after the checkpoint pinned its generation.
+        let stale_tail =
+            oldest + crate::StableRowIndex::try_from(sink.retained_scrollback_rows()).unwrap();
+        assert!(sink.store_scrollback_line(stale_tail, &original, 32));
+
+        let failure = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(_) => panic!("strict activation must refuse an advanced cold store"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.error(),
+            &crate::InertTerminalError::ScrollbackActivation(
+                crate::config::ScrollbackActivationError::Spill(
+                    crate::config::ScrollbackSpillError::SnapshotGenerationMismatch,
+                ),
+            )
+        );
+        let (_, mut recovered) = failure.into_parts();
+        let model = recovered.checkpoint().unwrap();
+        let ancestor = model.primary_screen.cold_snapshot_generation.unwrap();
+        recovered.supersede_cold_scrollback_successors();
+        let activated = match recovered.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("superseding activation failed: {:?}", failure.error()),
+        };
+
+        let first_resident = activated.screen().phys_to_stable_row_index(0);
+        assert_eq!(sink.oldest_scrollback_row(), Some(oldest));
+        assert_eq!(
+            sink.retained_scrollback_rows(),
+            usize::try_from(first_resident - oldest).unwrap(),
+            "the store holds exactly the published prefix, contiguous and without duplicates"
+        );
+        assert!(
+            sink.load_scrollback_line(first_resident).is_none(),
+            "no stored row survives past the published prefix"
+        );
+        // Reading the cold rows back from the store yields the model's rows.
+        let after = TerminalCheckpointV3::capture_with_limits(&activated, limits).unwrap();
+        assert_eq!(after.primary_screen.lines, model.primary_screen.lines);
+        let committed = after.primary_screen.cold_snapshot_generation.unwrap();
+        assert_eq!(committed.content_epoch, ancestor.content_epoch);
+        assert!(
+            committed.revision > ancestor.revision + 1,
+            "the successor advances the store's generation, not the checkpoint's"
+        );
+    }
+
+    /// A terminal using every part of the schema: a resize, both screens,
+    /// a hyperlink, saved cursors, user vars, a palette, a custom width map.
+    fn rich_terminal() -> Terminal {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> =
             Arc::new(RichCheckpointTestConfig);
         let mut terminal = Terminal::new(
@@ -5818,7 +8656,12 @@ mod tests {
                 label: Some("prior-unicode".into()),
             });
         terminal.accumulating_title = Some("pending-title-fragment".into());
+        terminal
+    }
 
+    #[test]
+    fn canonical_restore_roundtrips_complete_semantic_projection() {
+        let terminal = rich_terminal();
         let limits = TerminalCheckpointLimits::default();
         let before = TerminalCheckpointV3::capture_with_limits(&terminal, limits)
             .expect("capture rich terminal");
@@ -5838,6 +8681,312 @@ mod tests {
                 .expect("encode restored rich terminal"),
             canonical,
         );
+    }
+
+    fn runs_limits() -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            line_encoding: TerminalCheckpointLineEncoding::Runs,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// Captures `terminal` in both encodings, restores each payload, and
+    /// captures every restored terminal in both encodings again: each must
+    /// give back exactly what capturing `terminal` in that encoding gave, so
+    /// either payload restores the same terminal. Returns both payloads.
+    fn assert_both_encodings_restore_alike(
+        terminal: &Terminal,
+        config: fn() -> Arc<dyn TerminalConfiguration + Send + Sync>,
+    ) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
+        let cells_limits = TerminalCheckpointLimits::default();
+        let runs_limits = runs_limits();
+        let encode = |limits: TerminalCheckpointLimits| {
+            TerminalCheckpointV3::capture_with_limits(terminal, limits)
+                .expect("capture")
+                .to_canonical_json(limits)
+                .expect("encode")
+        };
+        let cells = encode(cells_limits);
+        let runs = encode(runs_limits);
+        assert!(cells.starts_with(b"{\"version\":3,"));
+        assert!(runs.starts_with(b"{\"version\":4,"));
+        for payload in [&cells, &runs] {
+            let decoded = TerminalCheckpointV3::decode_canonical_json(payload, cells_limits)
+                .expect("decode")
+                .into_checkpoint();
+            for (limits, expected) in [(cells_limits, &cells), (runs_limits, &runs)] {
+                let restored = ValidatedTerminalCheckpointV3 {
+                    checkpoint: decoded.clone(),
+                    limits,
+                }
+                .restore_inert(config())
+                .expect("restore");
+                let again = restored
+                    .checkpoint()
+                    .expect("capture the restored terminal")
+                    .to_canonical_json(limits)
+                    .expect("encode the restored terminal");
+                assert!(
+                    again == *expected,
+                    "a version {} payload restored and captured as {:?} differs",
+                    decoded.version,
+                    limits.line_encoding,
+                );
+            }
+        }
+        (cells, runs)
+    }
+
+    fn plain_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(CheckpointTestConfig)
+    }
+
+    fn rich_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(RichCheckpointTestConfig)
+    }
+
+    /// Every cell shape and attribute a run holds: wide and custom-width
+    /// cells, emoji sequences, combining marks, colors of every kind,
+    /// hyperlinks, colored and trailing blanks, wrapped and double-width
+    /// rows, tabs, history, and an active alternate screen.
+    const MIXED_CELLS: &str = concat!(
+        "plain ascii\r\n",
+        "\x1b[1;31mbold red\x1b[0m normal \x1b[38;2;10;20;30mtruecolor\x1b[0m\r\n",
+        "wide \u{65e5}\u{672c} crab \u{1f980} thumb \u{1f44d}\u{1f3fd} family ",
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} flag \u{1f1fa}\u{1f1f8} heart \u{2764}\u{fe0f}\r\n",
+        "combining e\u{301}a\u{308} x-wide xx\r\n",
+        "\x1b[4:3m\x1b[58;2;1;2;3mcurly\x1b[0m \x1b[7mreverse\x1b[0m \x1b[9mstrike\x1b[0m\r\n",
+        "\x1b[44m   \x1b[0m colored blanks, trailing spaces    \r\n",
+        "\x1b#6double width\r\n",
+        "tab\tseparated\tcells\r\n",
+        "\x1b]8;id=a;https://example.invalid/a\x07link\x1b]8;;\x07 after\r\n",
+    );
+
+    #[test]
+    fn both_line_encodings_restore_the_same_terminal() {
+        let mut mixed = terminal();
+        mixed.advance_bytes(MIXED_CELLS.as_bytes());
+        mixed.advance_bytes([b'w'; 200]);
+        mixed.advance_bytes(b"\r\n");
+        for tick in 0..40 {
+            mixed.advance_bytes(format!("tick {tick}\r\n").as_bytes());
+        }
+        assert_both_encodings_restore_alike(&mixed, plain_config);
+
+        mixed.advance_bytes(b"\x1b[?1049h\x1b[32malt \xe6\xbc\xa2 green\x1b[0m\r\nsecond row");
+        assert_both_encodings_restore_alike(&mixed, plain_config);
+
+        let mut rich = rich_terminal();
+        rich.advance_bytes(MIXED_CELLS.as_bytes());
+        assert_both_encodings_restore_alike(&rich, rich_config);
+        assert_both_encodings_restore_alike(&terminal(), plain_config);
+
+        // The trailing blanks of a full-width row are not stored; interning
+        // their attributes anyway put the default ahead of red in the table
+        // of a capture but not of its restored terminal's.
+        let mut blanks = terminal();
+        blanks.advance_bytes(b"\r\n\x1b[31ma\x1b[0m\r\n  \r\n");
+        assert_both_encodings_restore_alike(&blanks, plain_config);
+    }
+
+    /// The payload a pane of short log lines makes: runs carry each line's
+    /// text once and each attribute set once per screen.
+    #[test]
+    fn runs_make_a_small_fraction_of_the_cells_payload() {
+        let mut ticks = Terminal::new(
+            TerminalSize {
+                rows: 80,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 1280,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTestConfig),
+            "FrankenTerm",
+            "checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for tick in 0..500 {
+            ticks.advance_bytes(
+                format!("\x1b[32m{tick:>6}\x1b[0m tick at \x1b[1msome time\x1b[0m done\r\n")
+                    .as_bytes(),
+            );
+        }
+        let (cells, runs) = assert_both_encodings_restore_alike(&ticks, plain_config);
+        assert!(
+            runs.len() * 20 < cells.len(),
+            "runs {} bytes, cells {} bytes",
+            runs.len(),
+            cells.len()
+        );
+        let checkpoint = TerminalCheckpointV3::decode_canonical_json(&runs, runs_limits())
+            .expect("decode runs")
+            .into_checkpoint();
+        assert_eq!(
+            checkpoint.primary_screen.attributes.as_ref().map(Vec::len),
+            Some(3),
+            "default, green and bold, each once"
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(&runs),
+            Some(COMPACT_TERMINAL_CHECKPOINT_VERSION)
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(&cells),
+            Some(TERMINAL_CHECKPOINT_VERSION)
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(b"{\"version\":5,"),
+            None
+        );
+        assert_eq!(TerminalCheckpointV3::canonical_payload_version(b"{}"), None);
+    }
+
+    /// History dropped to fit a budget takes the attributes only it used out
+    /// of the table, which stays what a capture of the remaining lines builds.
+    #[test]
+    fn dropped_history_takes_its_attributes_out_of_the_table() {
+        let mut live = terminal();
+        for line in 0..40 {
+            let color = if line < 10 { "\x1b[31m" } else { "" };
+            live.advance_bytes(format!("{}line {}\x1b[0m\r\n", color, line).as_bytes());
+        }
+        let limits = runs_limits();
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let table = |checkpoint: &TerminalCheckpointV3| {
+            checkpoint.primary_screen.attributes.clone().unwrap()
+        };
+        let default =
+            CheckpointCellAttributes::capture(&CellAttributes::blank(), None, false).unwrap();
+        assert_eq!(table(&checkpoint).len(), 2);
+        assert_eq!(table(&checkpoint)[1], default);
+
+        checkpoint.primary_screen.lines.drain(..12);
+        checkpoint.primary_screen.compact_attribute_table().unwrap();
+        assert_eq!(table(&checkpoint), vec![default]);
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let again = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(plain_config())
+            .unwrap()
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        assert_eq!(again, payload);
+    }
+
+    fn run_of(checkpoint: &mut TerminalCheckpointV3, line: usize) -> &mut CheckpointRun {
+        &mut checkpoint.primary_screen.lines[line]
+            .runs
+            .as_mut()
+            .expect("version 4 runs")[0]
+    }
+
+    #[test]
+    fn decoder_refuses_runs_that_misstate_their_cells() {
+        let mut terminal = terminal();
+        terminal.advance_bytes("plain\r\nwide \u{65e5}\u{672c} e\u{301}".as_bytes());
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, runs_limits())
+            .expect("capture runs");
+        assert!(run_of(&mut checkpoint.clone(), 0).clusters.is_none());
+        assert!(run_of(&mut checkpoint.clone(), 1).clusters.is_some());
+        let table_len = checkpoint
+            .primary_screen
+            .attributes
+            .as_ref()
+            .map_or(0, Vec::len);
+
+        type Damage = Box<dyn Fn(&mut TerminalCheckpointV3)>;
+        let cases: Vec<(&str, Damage)> = vec![
+            (
+                "run.attributes",
+                Box::new(move |c| run_of(c, 0).attributes = table_len as u32),
+            ),
+            ("run.text", Box::new(|c| run_of(c, 0).text.clear())),
+            ("run.text", Box::new(|c| run_of(c, 0).text.push('\u{7}'))),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 0).clusters = Some(vec![(1, 1); 5])),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| {
+                    run_of(c, 1).clusters.as_mut().unwrap().pop();
+                }),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap().push((1, 1))),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap()[0] = (0, 1)),
+            ),
+            (
+                "cell.width",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap()[0] = (1, 3)),
+            ),
+            (
+                "screen.attributes",
+                Box::new(|c| c.primary_screen.attributes = None),
+            ),
+            ("screen.attributes", Box::new(|c| c.version = 3)),
+            (
+                "line.cells",
+                Box::new(|c| {
+                    let line = &mut c.primary_screen.lines[0];
+                    line.runs = None;
+                    line.cells = Some(Vec::new());
+                }),
+            ),
+        ];
+        let limits = TerminalCheckpointLimits::default();
+        for (field, damage) in cases {
+            let mut damaged = checkpoint.clone();
+            damage(&mut damaged);
+            let bytes = serde_json::to_vec(&damaged).expect("encode damaged checkpoint");
+            match TerminalCheckpointV3::decode_canonical_json(&bytes, limits) {
+                Err(TerminalCheckpointError::InvalidField { field: refused, .. })
+                    if refused == field => {}
+                other => panic!("expected {} refused, got {:?}", field, other),
+            }
+        }
+        let undamaged = serde_json::to_vec(&checkpoint).expect("encode checkpoint");
+        TerminalCheckpointV3::decode_canonical_json(&undamaged, limits).expect("decode runs");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+        /// Any output, in a small pane whose history scrolls, restores alike
+        /// from either encoding.
+        #[test]
+        fn any_output_restores_alike_from_either_encoding(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "a", "word ", "  ", "\u{65e5}", "\u{1f980}", "e\u{301}", "\u{2764}\u{fe0f}",
+                "\r\n", "\r", "\t", "\x1b[31m", "\x1b[1;4m", "\x1b[38;2;1;2;3m", "\x1b[44m",
+                "\x1b[0m", "\x1b[7m", "\x1b[2K", "\x1b[H", "\x1b[3;5H", "\x1b#6",
+                "\x1b]8;;https://example.invalid\x07", "\x1b]8;;\x07", "\x1b[?1049h",
+                "\x1b[?1049l", "0123456789",
+            ]), 0..160)
+        ) {
+            let mut small = Terminal::new(
+                TerminalSize {
+                    rows: 5,
+                    cols: 12,
+                    pixel_width: 120,
+                    pixel_height: 100,
+                    dpi: 96,
+                },
+                Arc::new(CheckpointTestConfig),
+                "FrankenTerm",
+                "checkpoint-proptest",
+                Box::new(Vec::<u8>::new()),
+            );
+            small.advance_bytes(pieces.concat().as_bytes());
+            assert_both_encodings_restore_alike(&small, plain_config);
+        }
     }
 
     #[test]
@@ -6038,10 +9187,20 @@ mod tests {
         let mut unknown_version = canonical.clone();
         let version = b"{\"version\":3";
         assert!(unknown_version.starts_with(version));
-        unknown_version[version.len() - 1] = b'4';
+        unknown_version[version.len() - 1] = b'5';
         assert!(matches!(
             TerminalCheckpointV3::decode_canonical_json(&unknown_version, limits),
-            Err(TerminalCheckpointError::UnsupportedVersion { observed: 4, .. })
+            Err(TerminalCheckpointError::UnsupportedVersion { observed: 5, .. })
+        ));
+        // Version 4 names the encoding, which these cells are not.
+        let mut relabelled = canonical.clone();
+        relabelled[version.len() - 1] = b'4';
+        assert!(matches!(
+            TerminalCheckpointV3::decode_canonical_json(&relabelled, limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "screen.attributes",
+                ..
+            })
         ));
 
         // Mutate the canonical bytes in place so this negative reaches typed
@@ -6199,10 +9358,7 @@ mod tests {
         }
         let prepared =
             PreparedTerminalCheckpointV2Migration::decode_canonical_json(&source, limits).unwrap();
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
+        let mut budget = JsonStructuralBudget::new(limits);
         let mut decoder = serde_json::Deserializer::from_slice(&source);
         JsonStructuralSeed {
             budget: &mut budget,
@@ -6558,5 +9714,739 @@ mod tests {
             Some(TerminalCheckpointError::StaleColdGeneration),
             "materialize_cold_history must reject stale cold generation"
         );
+    }
+
+    #[derive(Debug)]
+    struct GraphicsCheckpointTestConfig;
+
+    impl TerminalConfiguration for GraphicsCheckpointTestConfig {
+        fn scrollback_size(&self) -> usize {
+            64
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn enable_kitty_graphics(&self) -> bool {
+            true
+        }
+    }
+
+    fn graphics_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(GraphicsCheckpointTestConfig)
+    }
+
+    fn graphics_limits(line_encoding: TerminalCheckpointLineEncoding) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            line_encoding,
+            capture_graphics: true,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    fn graphics_terminal() -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            graphics_config(),
+            "FrankenTerm",
+            "checkpoint-graphics-test",
+            Box::new(Vec::<u8>::new()),
+        )
+    }
+
+    fn base64_of(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// `width` by `height` RGBA pixels no two images share, which PNG
+    /// barely compresses.
+    fn rgba_pixels(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        let mut state = u32::from(seed).wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect()
+    }
+
+    fn png_of(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        use ::image::ImageEncoder;
+        let mut encoded = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(
+                &rgba_pixels(width, height, seed),
+                width,
+                height,
+                ::image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        encoded
+    }
+
+    fn kitty_command(control: &str, payload: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = format!("\x1b_G{control}").into_bytes();
+        if let Some(payload) = payload {
+            bytes.push(b';');
+            bytes.extend_from_slice(base64_of(payload).as_bytes());
+        }
+        bytes.extend_from_slice(b"\x1b\\");
+        bytes
+    }
+
+    fn iterm_image(png: &[u8]) -> Vec<u8> {
+        format!("\x1b]1337;File=inline=1:{}\x07", base64_of(png)).into_bytes()
+    }
+
+    /// Every kind of graphics state, from real escape sequences: iTerm2
+    /// inline PNGs (kept encoded), a sixel (decoded RGBA), a Kitty image
+    /// placed twice, once with a placement id, then given a second frame
+    /// (an animation), a stored image named by a number and never placed,
+    /// two stored images with equal pixels, history scrolled past them all,
+    /// and the alternate screen showing one of the equal pair and an image
+    /// of its own.
+    fn feed_graphics(terminal: &mut Terminal) {
+        terminal.advance_bytes(b"before the images\r\n");
+        terminal.advance_bytes(&iterm_image(&png_of(16, 32, 1)));
+        terminal.advance_bytes(b"\r\n\x1bPq#0;2;100;0;0#0!16~-!16~\x1b\\\r\n");
+        terminal.advance_bytes(&kitty_command(
+            "a=T,f=32,s=4,v=4,i=7,q=2",
+            Some(&rgba_pixels(4, 4, 7)),
+        ));
+        terminal.advance_bytes(b" beside\r\n");
+        terminal.advance_bytes(&kitty_command("a=p,i=7,p=2,q=2", None));
+        terminal.advance_bytes(&kitty_command(
+            "a=f,i=7,f=32,s=4,v=4,z=40,q=2",
+            Some(&rgba_pixels(4, 4, 8)),
+        ));
+        terminal.advance_bytes(&kitty_command(
+            "a=t,f=32,s=2,v=2,I=3,q=2",
+            Some(&rgba_pixels(2, 2, 9)),
+        ));
+        for id in [11, 12] {
+            terminal.advance_bytes(&kitty_command(
+                &format!("a=t,f=32,s=2,v=2,i={id},q=2"),
+                Some(&rgba_pixels(2, 2, 5)),
+            ));
+        }
+        for row in 0..30 {
+            terminal.advance_bytes(format!("\r\nhistory {row}").as_bytes());
+        }
+        terminal.advance_bytes(b"\x1b[?1049h");
+        terminal.advance_bytes(&kitty_command("a=p,i=11,q=2", None));
+        terminal.advance_bytes(&iterm_image(&png_of(8, 16, 2)));
+    }
+
+    fn graphics_payload(
+        terminal: &Terminal,
+        limits: TerminalCheckpointLimits,
+    ) -> Zeroizing<Vec<u8>> {
+        TerminalCheckpointV3::capture_with_limits(terminal, limits)
+            .expect("capture graphics")
+            .to_canonical_json(limits)
+            .expect("encode graphics")
+    }
+
+    fn restore_graphics(payload: &[u8], limits: TerminalCheckpointLimits) -> crate::InertTerminal {
+        TerminalCheckpointV3::decode_canonical_json(payload, limits)
+            .expect("decode graphics")
+            .restore_inert(graphics_config())
+            .expect("restore graphics")
+    }
+
+    /// The images each cell of both screens shows, and Kitty's stored
+    /// images, numbers and placements, compared field by field and byte by
+    /// byte, with each live image object matched to exactly one restored
+    /// object: what one shared, the other shares.
+    fn assert_same_graphics(live: &TerminalState, restored: &TerminalState) {
+        let mut objects: HashMap<usize, usize> = HashMap::new();
+        let mut inverse: HashMap<usize, usize> = HashMap::new();
+        let mut same_object = |left: &Arc<ImageData>, right: &Arc<ImageData>| {
+            let (left_ptr, right_ptr) = (Arc::as_ptr(left) as usize, Arc::as_ptr(right) as usize);
+            assert_eq!(*objects.entry(left_ptr).or_insert(right_ptr), right_ptr);
+            assert_eq!(*inverse.entry(right_ptr).or_insert(left_ptr), left_ptr);
+            assert!(*left.data() == *right.data(), "image content differs");
+            assert_eq!(left.hash(), right.hash());
+            assert_eq!(left.current_content_hash(), right.current_content_hash());
+        };
+        let mut shown = 0;
+        for (left, right) in [
+            (&live.screen.screen, &restored.screen.screen),
+            (&live.screen.alt_screen, &restored.screen.alt_screen),
+        ] {
+            let (left, right) = (left.all_lines(), right.all_lines());
+            assert_eq!(left.len(), right.len());
+            for (left, right) in left.iter().zip(&right) {
+                assert_eq!(left.has_image_attachments(), right.has_image_attachments());
+                for (left, right) in left.visible_cells().zip(right.visible_cells()) {
+                    let (left, right) = (left.attrs().images(), right.attrs().images());
+                    assert_eq!(left.is_some(), right.is_some());
+                    for (left, right) in left.iter().flatten().zip(right.iter().flatten()) {
+                        assert_eq!(left.top_left(), right.top_left());
+                        assert_eq!(left.bottom_right(), right.bottom_right());
+                        assert_eq!(left.z_index(), right.z_index());
+                        assert_eq!(left.padding(), right.padding());
+                        assert_eq!(left.image_id(), right.image_id());
+                        assert_eq!(left.placement_id(), right.placement_id());
+                        same_object(left.image_data(), right.image_data());
+                        shown += 1;
+                    }
+                }
+            }
+        }
+        assert!(shown > 0, "no cell shows an image");
+        let left = live.kitty_img.checkpoint_parts().expect("live Kitty state");
+        let right = restored
+            .kitty_img
+            .checkpoint_parts()
+            .expect("restored Kitty state");
+        assert_eq!(left.max_image_id, right.max_image_id);
+        assert_eq!(left.numbers, right.numbers);
+        assert_eq!(left.placements, right.placements);
+        assert_eq!(left.images.len(), right.images.len());
+        for ((left_id, left), (right_id, right)) in left.images.iter().zip(&right.images) {
+            assert_eq!(left_id, right_id);
+            same_object(left, right);
+        }
+    }
+
+    #[test]
+    fn graphics_state_restores_exactly_in_either_encoding() {
+        let mut terminal = graphics_terminal();
+        feed_graphics(&mut terminal);
+        let cells = graphics_limits(TerminalCheckpointLineEncoding::Cells);
+        let runs = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, runs).unwrap();
+        let images = checkpoint.images.as_ref().expect("an image table");
+        // Two iTerm images, the sixel, Kitty's animation, numbered image and
+        // the equal pair, which stay two objects.
+        assert_eq!(images.len(), 7);
+        for kind in ["encoded", "rgba8", "animation"] {
+            assert!(
+                images.iter().any(|image| matches!(
+                    (&image.data, kind),
+                    (CheckpointImageData::Encoded { .. }, "encoded")
+                        | (CheckpointImageData::Rgba8 { .. }, "rgba8")
+                        | (CheckpointImageData::Animation { .. }, "animation")
+                )),
+                "no {} image",
+                kind
+            );
+        }
+        let kitty = checkpoint.kitty.as_ref().expect("Kitty state");
+        assert_eq!(kitty.images.len(), 4);
+        assert_eq!(kitty.numbers.len(), 1);
+        assert!(kitty
+            .placements
+            .iter()
+            .any(|placement| placement.placement_id == Some(2)));
+
+        for (limits, version) in [(cells, b"{\"version\":3,"), (runs, b"{\"version\":4,")] {
+            let payload = graphics_payload(&terminal, limits);
+            assert!(payload.starts_with(version));
+            let restored = restore_graphics(&payload, limits);
+            // Captured again, and restored and captured in the other
+            // encoding, each gives what capturing the live terminal gives.
+            assert_eq!(
+                restored
+                    .checkpoint()
+                    .unwrap()
+                    .to_canonical_json(limits)
+                    .unwrap(),
+                payload
+            );
+            let other = if limits == cells { runs } else { cells };
+            let decoded = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+                .unwrap()
+                .into_checkpoint();
+            let crossed = ValidatedTerminalCheckpointV3 {
+                checkpoint: decoded,
+                limits: other,
+            }
+            .restore_inert(graphics_config())
+            .unwrap()
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(other)
+            .unwrap();
+            assert_eq!(crossed, graphics_payload(&terminal, other));
+
+            let live = restored
+                .into_live(Box::new(std::io::sink()))
+                .expect("activate the restored terminal");
+            assert_same_graphics(&terminal, &live);
+        }
+    }
+
+    /// Image output after the checkpoint, replayed into the restored
+    /// terminal, leaves it as the same output leaves the live one: Kitty
+    /// places a stored image, edits the animation every placement of it
+    /// shows, deletes an image, and an iTerm image arrives.
+    #[test]
+    fn image_output_replays_onto_a_restored_terminal_as_it_applied_live() {
+        let mut live = graphics_terminal();
+        feed_graphics(&mut live);
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let payload = graphics_payload(&live, limits);
+        let mut restored = restore_graphics(&payload, limits);
+
+        let mut tail = b"\x1b[?1049l".to_vec();
+        tail.extend(kitty_command("a=p,I=3,q=2", None));
+        tail.extend(kitty_command(
+            "a=f,i=7,r=1,f=32,s=2,v=2,x=1,y=1,q=2",
+            Some(&rgba_pixels(2, 2, 77)),
+        ));
+        tail.extend(kitty_command("a=d,d=I,i=12,q=2", None));
+        tail.extend(iterm_image(&png_of(8, 16, 3)));
+        tail.extend(b"\r\nafter\r\n");
+        live.advance_bytes(&tail);
+        restored.replay_bytes(&tail).expect("replay image output");
+
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            graphics_payload(&live, limits)
+        );
+        let restored = restored.into_live(Box::new(std::io::sink())).unwrap();
+        assert_same_graphics(&live, &restored);
+    }
+
+    /// Without graphics capture, as for a reader older than graphics
+    /// checkpoints, a cell showing an image refuses capture as before.
+    #[test]
+    fn graphics_state_refuses_capture_unless_admitted() {
+        let mut terminal = graphics_terminal();
+        terminal.advance_bytes(&iterm_image(&png_of(16, 32, 1)));
+        for limits in [TerminalCheckpointLimits::default(), runs_limits()] {
+            assert_eq!(
+                TerminalCheckpointV3::capture_with_limits(&terminal, limits).err(),
+                Some(TerminalCheckpointError::UnsupportedGraphicsState)
+            );
+        }
+        let mut stored = graphics_terminal();
+        stored.advance_bytes(&kitty_command(
+            "a=t,f=32,s=2,v=2,i=4,q=2",
+            Some(&rgba_pixels(2, 2, 4)),
+        ));
+        assert_eq!(
+            TerminalCheckpointV3::capture(&stored).err(),
+            Some(TerminalCheckpointError::UnsupportedGraphicsState)
+        );
+    }
+
+    /// An image-free terminal captured with graphics admitted holds no
+    /// image table or Kitty state, only the replay configuration; captured
+    /// without, its bytes are what they were before graphics checkpoints.
+    #[test]
+    fn image_free_payloads_hold_no_graphics_fields() {
+        let mut terminal = graphics_terminal();
+        terminal.advance_bytes(b"plain text\r\n");
+        let plain = graphics_payload(&terminal, runs_limits());
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(!text.contains("\"graphics\"") && !text.contains("\"images\""));
+        let admitted = graphics_payload(
+            &terminal,
+            graphics_limits(TerminalCheckpointLineEncoding::Runs),
+        );
+        let text = std::str::from_utf8(&admitted).unwrap();
+        assert!(text.contains("\"graphics\":{\"enable_kitty_graphics\":true"));
+        assert!(!text.contains("\"images\"") && !text.contains("\"kitty\""));
+        // Restored from the plain payload, replay refuses image output: it
+        // has no graphics configuration to apply it with.
+        let mut restored = TerminalCheckpointV3::decode_canonical_json(&plain, runs_limits())
+            .unwrap()
+            .restore_inert(graphics_config())
+            .unwrap();
+        assert_eq!(
+            restored.replay_bytes(&iterm_image(&png_of(8, 16, 1))),
+            Err(crate::InertTerminalError::UnsupportedGraphicsAction)
+        );
+        // Restored from the admitted payload, as a guardian birth restores a
+        // pane's first output, it applies the image and captures it again,
+        // whatever limits its caller restored it under.
+        let decoded =
+            TerminalCheckpointV3::decode_canonical_json(&admitted, runs_limits()).unwrap();
+        assert!(decoded.captures_graphics());
+        let mut restored = decoded.restore_inert(graphics_config()).unwrap();
+        restored
+            .replay_bytes(&iterm_image(&png_of(8, 16, 1)))
+            .expect("replay the first image");
+        let recaptured = restored.checkpoint().expect("capture the replayed image");
+        assert_eq!(recaptured.images.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// Restore reads nothing but the journal: Kitty data from a file or
+    /// shared memory refuses replay, even under graphics configuration.
+    #[test]
+    fn replay_refuses_kitty_data_outside_the_journal() {
+        let mut terminal = graphics_terminal();
+        terminal.advance_bytes(b"text\r\n");
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let payload = graphics_payload(&terminal, limits);
+        for medium in ["t=f", "t=t", "t=s"] {
+            let mut restored = restore_graphics(&payload, limits);
+            let command = kitty_command(
+                &format!("a=T,f=100,{medium},i=5,q=2"),
+                Some(b"/tmp/frankenterm-checkpoint-image.png"),
+            );
+            assert_eq!(
+                restored.replay_bytes(&command),
+                Err(crate::InertTerminalError::UnsupportedGraphicsAction),
+                "{medium}"
+            );
+        }
+    }
+
+    /// A query changes nothing replay keeps, so replay drops it instead of
+    /// reading the file it names; with Kitty graphics disabled the live
+    /// terminal ignored every Kitty command, and replay ignores even one
+    /// that names a file.
+    #[test]
+    fn replay_drops_kitty_queries_and_ignores_kitty_when_disabled() {
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut terminal = graphics_terminal();
+        terminal.advance_bytes(b"text\r\n");
+        let payload = graphics_payload(&terminal, limits);
+        let mut restored = restore_graphics(&payload, limits);
+        let query = kitty_command(
+            "a=q,t=f,i=5",
+            Some(b"/tmp/frankenterm-checkpoint-query.png"),
+        );
+        restored
+            .replay_bytes(&query)
+            .expect("a query replays as nothing");
+        terminal.advance_bytes(&query);
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            graphics_payload(&terminal, limits)
+        );
+
+        #[derive(Debug)]
+        struct KittyDisabledConfig;
+        impl TerminalConfiguration for KittyDisabledConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+        }
+        let mut disabled = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(KittyDisabledConfig),
+            "FrankenTerm",
+            "checkpoint-kitty-disabled-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let payload = graphics_payload(&disabled, limits);
+        let mut restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(KittyDisabledConfig))
+            .unwrap();
+        let file = kitty_command(
+            "a=T,f=100,t=f,i=5,q=2",
+            Some(b"/tmp/frankenterm-checkpoint-image.png"),
+        );
+        restored
+            .replay_bytes(&file)
+            .expect("disabled Kitty graphics ignore the command");
+        disabled.advance_bytes(&file);
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            graphics_payload(&disabled, limits)
+        );
+    }
+
+    /// Replay applies image output under the checkpoint's own graphics
+    /// configuration, so a restoring configuration with other Kitty limits,
+    /// as after a release changed a default, still restores.
+    #[test]
+    fn restore_admits_a_different_graphics_configuration() {
+        #[derive(Debug)]
+        struct SmallerKittyBudget;
+        impl TerminalConfiguration for SmallerKittyBudget {
+            fn scrollback_size(&self) -> usize {
+                64
+            }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn enable_kitty_graphics(&self) -> bool {
+                true
+            }
+            fn kitty_image_budget_bytes(&self) -> usize {
+                1024 * 1024
+            }
+        }
+        let mut terminal = graphics_terminal();
+        feed_graphics(&mut terminal);
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let payload = graphics_payload(&terminal, limits);
+        let restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(SmallerKittyBudget))
+            .expect("restore under another Kitty budget");
+        assert_eq!(
+            restored
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            payload
+        );
+    }
+
+    /// Replay checks resources, not protection: protection replayed output
+    /// sets and clears again restores from a checkpoint without protection,
+    /// as it did before protection checkpoints.
+    #[test]
+    fn replayed_protection_cleared_again_restores_without_protection() {
+        let limits = TerminalCheckpointLimits::default();
+        let payload = TerminalCheckpointV3::capture(&terminal())
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let mut restored = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(Arc::new(CheckpointTestConfig))
+            .unwrap();
+        restored
+            .replay_bytes(b"\x1b[1\"qkept\x1b[0\"q")
+            .expect("replay protected output");
+        assert_eq!(
+            restored.checkpoint().err(),
+            Some(crate::InertTerminalError::Checkpoint(
+                TerminalCheckpointError::UnsupportedCharacterProtection
+            ))
+        );
+        restored
+            .replay_bytes(b"\x1b[!p\x1b[2J")
+            .expect("replay the erase that clears it");
+        restored.checkpoint().expect("nothing protected remains");
+    }
+
+    #[test]
+    fn transient_graphics_states_refuse_capture_until_they_settle() {
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut terminal = graphics_terminal();
+        let pixels = rgba_pixels(4, 4, 3);
+        // A chunked transmission without its last chunk.
+        terminal.advance_bytes(&kitty_command(
+            "a=T,f=32,s=4,v=4,i=6,m=1,q=2",
+            Some(&pixels[..24]),
+        ));
+        assert_eq!(
+            TerminalCheckpointV3::capture_with_limits(&terminal, limits).err(),
+            Some(TerminalCheckpointError::GraphicsTransferInFlight)
+        );
+        terminal.advance_bytes(&kitty_command("m=0,q=2", Some(&pixels[24..])));
+        let staged = TerminalCheckpointV3::capture_staged(&terminal, limits).expect("stage");
+        // An edit after the lock is released, before the bytes are copied.
+        terminal.advance_bytes(&kitty_command(
+            "a=f,i=6,r=1,f=32,s=1,v=1,q=2",
+            Some(&[1, 2, 3, 4]),
+        ));
+        assert_eq!(
+            staged.materialize_cold_history(limits).err(),
+            Some(TerminalCheckpointError::StaleGraphicsGeneration)
+        );
+        assert!(TerminalCheckpointV3::capture_with_limits(&terminal, limits).is_ok());
+    }
+
+    /// Damaged, oversized, duplicated or unnamed graphics state fails
+    /// validation before anything is restored: nothing is dropped or
+    /// replaced.
+    #[test]
+    fn invalid_graphics_state_fails_before_restore() {
+        let mut terminal = graphics_terminal();
+        feed_graphics(&mut terminal);
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, limits).unwrap();
+        let invalid = |damage: &dyn Fn(&mut TerminalCheckpointV3)| {
+            let mut damaged = checkpoint.clone();
+            damage(&mut damaged);
+            damaged
+                .validate(limits)
+                .expect_err("damaged graphics state validates");
+        };
+        invalid(&|c| {
+            if let Some(CheckpointImageData::Rgba8 { width, .. }) = c
+                .images
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .map(|i| &mut i.data)
+                .find(|d| matches!(d, CheckpointImageData::Rgba8 { .. }))
+            {
+                *width += 1;
+            }
+        });
+        invalid(&|c| {
+            c.images.as_mut().unwrap()[0]
+                .identity
+                .make_ascii_uppercase()
+        });
+        invalid(&|c| {
+            let first = c.images.as_ref().unwrap()[0].clone();
+            c.images.as_mut().unwrap().push(first);
+        });
+        // A cell naming the last entry before any other is named.
+        invalid(&|c| {
+            let last = c.images.as_ref().unwrap().len() as u32 - 1;
+            let first = c
+                .primary_screen
+                .attribute_sets_mut()
+                .find_map(|attributes| attributes.images.as_mut())
+                .unwrap();
+            first[0].image = last;
+        });
+        invalid(&|c| c.images = None);
+        invalid(&|c| c.replay_config.graphics = None);
+        invalid(&|c| {
+            let kitty = c.kitty.as_mut().unwrap();
+            let duplicate = kitty.images[0];
+            kitty.images.insert(0, duplicate);
+        });
+        invalid(&|c| c.kitty.as_mut().unwrap().numbers[0].1 = 999);
+        invalid(&|c| {
+            c.kitty = Some(CheckpointKittyState {
+                images: Vec::new(),
+                numbers: Vec::new(),
+                placements: Vec::new(),
+            })
+        });
+        let small = TerminalCheckpointLimits {
+            max_total_image_bytes: 64,
+            ..limits
+        };
+        assert!(matches!(
+            checkpoint.validate(small),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "image_bytes",
+                ..
+            })
+        ));
+
+        // A base64 chunk that is not base64 does not decode.
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let text = std::str::from_utf8(&payload).unwrap();
+        let start = text.find("\"bytes\":[\"").unwrap() + "\"bytes\":[\"".len();
+        let mut corrupt = payload.to_vec();
+        corrupt[start] = b'*';
+        assert!(TerminalCheckpointV3::decode_canonical_json(&corrupt, limits).is_err());
+    }
+
+    /// Trimming history to fit the encoding ceiling drops the images only
+    /// the dropped lines showed, and the table stays canonical.
+    #[test]
+    fn trimming_history_drops_images_only_dropped_lines_show() {
+        let mut terminal = graphics_terminal();
+        // One row of eight cells.
+        terminal.advance_bytes(&iterm_image(&png_of(64, 16, 9)));
+        for row in 0..60 {
+            terminal.advance_bytes(format!("\r\nrow {row}").as_bytes());
+        }
+        terminal.advance_bytes(&iterm_image(&png_of(8, 16, 4)));
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, limits).unwrap();
+        assert_eq!(checkpoint.images.as_ref().unwrap().len(), 2);
+        let full = checkpoint.to_canonical_json(limits).unwrap().len();
+        // An eighth of the payload must go: the oldest row, the image's,
+        // holds more, so it goes alone, and the image with it.
+        let tight = TerminalCheckpointLimits {
+            max_encoded_bytes: full - 1,
+            ..limits
+        };
+        let trimmed = checkpoint
+            .encode_trimming_history(tight)
+            .expect("trim to fit");
+        assert_eq!(checkpoint.primary_screen.stable_row_index_offset, 1);
+        assert_eq!(checkpoint.images.as_ref().unwrap().len(), 1);
+        TerminalCheckpointV3::decode_canonical_json(&trimmed, tight).expect("trimmed decodes");
+    }
+
+    /// Rows read back from cold storage hold their own copies of an image;
+    /// equal copies share one entry and come back as one object.
+    #[test]
+    fn cold_rows_share_one_entry_per_image_content() {
+        let sink = Arc::new(StagedCaptureTestSink::new());
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(StagedCaptureTestConfig {
+            sink: Arc::clone(&sink),
+        });
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 10,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "FrankenTerm",
+            "cold-image-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(&iterm_image(&png_of(16, 48, 6)));
+        for row in 0..20 {
+            terminal.advance_bytes(format!("\r\nrow {row}").as_bytes());
+        }
+        // A durable store decodes every cell's image separately.
+        for (_, line) in sink.rows.lock().unwrap().iter_mut() {
+            *line = serde_json::from_slice(&serde_json::to_vec(&*line).unwrap()).unwrap();
+        }
+        let cold_images = sink
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, line)| line.has_image_attachments())
+            .count();
+        assert!(cold_images >= 2, "the image did not reach cold storage");
+
+        let limits = graphics_limits(TerminalCheckpointLineEncoding::Runs);
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, limits).unwrap();
+        assert!(checkpoint.primary_screen.cold_prefix_line_count > 0);
+        assert_eq!(checkpoint.images.as_ref().unwrap().len(), 1);
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let decoded = TerminalCheckpointV3::decode_canonical_json(&payload, limits).unwrap();
+        let restored = TerminalState::from_validated_checkpoint(
+            decoded.into_checkpoint(),
+            limits,
+            Arc::new(GraphicsCheckpointTestConfig),
+            &[],
+        )
+        .unwrap();
+        let mut objects = std::collections::HashSet::new();
+        for line in restored.screen.screen.all_lines() {
+            for cell in line.visible_cells() {
+                for image in cell.attrs().images().into_iter().flatten() {
+                    objects.insert(Arc::as_ptr(image.image_data()) as usize);
+                }
+            }
+        }
+        assert_eq!(objects.len(), 1);
     }
 }

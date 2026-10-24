@@ -149,6 +149,16 @@ pub enum MmapStoreError {
     TruncateIntoPrunedPrefix { next_seq: u64, oldest: u64 },
 }
 
+impl MmapStoreError {
+    /// A read-only snapshot saw the pane log or sequence journal change while
+    /// it read them: a race with that pane's live writer, not damage. The
+    /// caller may retry the snapshot.
+    #[must_use]
+    pub fn is_concurrent_change(&self) -> bool {
+        matches!(self, Self::InvalidPaneLogHeader(detail) if detail.ends_with("changed during snapshot"))
+    }
+}
+
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
 const COLD_ERASURE_TOTAL_SHARDS: usize = 5;
 const COLD_ERASURE_VERSION: u8 = 1;
@@ -223,6 +233,34 @@ std::thread_local! {
     static PANE_APPEND_DATA_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PANE_APPEND_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static PANE_APPEND_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PANE_COMPACTION_WRITTEN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PANE_COMPACTION_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PANE_SEQUENCE_JOURNAL_FAULT: std::cell::Cell<Option<PaneSequenceJournalFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneSequenceJournalFault {
+    AppendBeforeSync,
+    CheckpointPartialWrite,
+    CheckpointBeforePublish,
+    CheckpointAfterPublish,
+    CompactionBeforePublish,
+    CompactionAfterPublish,
+}
+
+#[cfg(test)]
+fn sequence_journal_fault(point: PaneSequenceJournalFault) -> std::io::Result<()> {
+    PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| {
+        if fault.get() == Some(point) {
+            fault.set(None);
+            Err(std::io::Error::other(format!(
+                "injected sequence journal failure at {point:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 // Keep the remaining slice cursor, including progress within a record or its
@@ -403,6 +441,252 @@ fn read_record_growth_target(current: usize, required: usize, limit: usize) -> u
     current.saturating_mul(2).max(required).min(limit)
 }
 
+/// The window a pane-log record read is charged in: std's `BufReader`
+/// capacity, which record reads used before block reads (ft-y0gy9).
+const PANE_LOG_READ_WINDOW: usize = 8 * 1024;
+/// The most one block read asks the file for (ft-y0gy9).
+const PANE_LOG_READ_MAX_BLOCK: usize = 256 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Forces this thread's record reads onto block reads (true) or
+    /// `BufReader` reads (false), for a same-run comparison in tests.
+    static FORCE_BLOCK_READS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether pane-log record reads go through `BlockPaneLogReader` and a
+/// `memchr` newline scan: on unless FT_STORE_BLOCK_READS=0, read once per
+/// process (ft-y0gy9). Both paths return the same records and the same
+/// errors; only the read calls and the scan differ.
+fn block_reads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(forced) = FORCE_BLOCK_READS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    *ENABLED
+        .get_or_init(|| std::env::var_os("FT_STORE_BLOCK_READS").is_none_or(|value| value != "0"))
+}
+
+/// The block size for reading `count` records from `offsets`: the bytes
+/// from the first record to the one after the last (or the log's end), in
+/// window steps from one window to `PANE_LOG_READ_MAX_BLOCK`. Reading more
+/// or less than the records need changes no result, only the read calls.
+fn pane_log_read_block(offsets: &[LineOffset], count: usize, file_len: u64) -> usize {
+    let Some(first) = offsets.first() else {
+        return PANE_LOG_READ_WINDOW;
+    };
+    let end = offsets.get(count).map_or(file_len, |next| next.0);
+    usize::try_from(end.saturating_sub(first.0))
+        .unwrap_or(usize::MAX)
+        .clamp(PANE_LOG_READ_WINDOW, PANE_LOG_READ_MAX_BLOCK)
+        .next_multiple_of(PANE_LOG_READ_WINDOW)
+}
+
+/// Reads a pane log in blocks of many windows but hands out exactly the
+/// windows an 8 KiB `BufReader` hands out (ft-y0gy9). A window ends at the
+/// next `PANE_LOG_READ_WINDOW` boundary counted from the last seek (or from
+/// where reading started), or where the file ends, and the next window
+/// starts where the caller's consumption stopped. `read_pane_log_records`
+/// charges every window against its budgets, so the same windows give the
+/// same records and the same errors, at one read call per block instead of
+/// one per window.
+struct BlockPaneLogReader<R> {
+    inner: R,
+    block: Vec<u8>,
+    /// The unconsumed bytes are `block[consumed..filled]`.
+    consumed: usize,
+    filled: usize,
+    /// Bytes from the last seek, or the start, to `block[0]`.
+    block_origin: u64,
+}
+
+impl<R: Read> BlockPaneLogReader<R> {
+    fn new(inner: R, block_bytes: usize) -> Self {
+        Self {
+            inner,
+            block: vec![0; block_bytes.max(PANE_LOG_READ_WINDOW)],
+            consumed: 0,
+            filled: 0,
+            block_origin: 0,
+        }
+    }
+
+    fn discard_block(&mut self) {
+        self.consumed = 0;
+        self.filled = 0;
+        self.block_origin = 0;
+    }
+}
+
+impl<R: Read> Read for BlockPaneLogReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let window = self.fill_buf()?;
+        let copied = window.len().min(out.len());
+        out[..copied].copy_from_slice(&window[..copied]);
+        self.consume(copied);
+        Ok(copied)
+    }
+}
+
+impl<R: Read> BufRead for BlockPaneLogReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.consumed == self.filled {
+            // As `BufReader` refills: only once everything handed out is
+            // consumed, from where it ends. Errors reach the caller.
+            self.block_origin = self
+                .block_origin
+                .checked_add(self.filled as u64)
+                .ok_or_else(|| std::io::Error::other("pane log read position overflows"))?;
+            self.consumed = 0;
+            self.filled = 0;
+            while self.filled < self.block.len() {
+                let read = self.inner.read(&mut self.block[self.filled..])?;
+                if read == 0 {
+                    break;
+                }
+                self.filled += read;
+            }
+        }
+        let at = self.block_origin + self.consumed as u64;
+        let window = PANE_LOG_READ_WINDOW as u64;
+        let to_boundary = usize::try_from(window - at % window).unwrap_or(usize::MAX);
+        let end = self.filled.min(self.consumed.saturating_add(to_boundary));
+        Ok(&self.block[self.consumed..end])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.consumed = self.consumed.saturating_add(amount).min(self.filled);
+    }
+}
+
+impl<R: Read + Seek> Seek for BlockPaneLogReader<R> {
+    /// As `BufReader`'s, every seek discards the block; windows then count
+    /// from the new position.
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let to = match to {
+            SeekFrom::Current(offset) => {
+                let here = self.stream_position()?;
+                SeekFrom::Start(here.checked_add_signed(offset).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pane log seek before the start or past u64",
+                    )
+                })?)
+            }
+            other => other,
+        };
+        let position = self.inner.seek(to)?;
+        self.discard_block();
+        Ok(position)
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        let unconsumed = (self.filled - self.consumed) as u64;
+        self.inner
+            .stream_position()?
+            .checked_sub(unconsumed)
+            .ok_or_else(|| {
+                std::io::Error::other("pane log read position precedes its buffered bytes")
+            })
+    }
+}
+
+/// Up to `count` newline-terminated records of a pane log of `file_len`
+/// bytes, starting at `offsets`, within `max_stored_bytes`, read through
+/// `reader` from its current position; `newline` finds a window's first
+/// `\n`. `PaneLog::read_records` passes either reader (ft-y0gy9).
+fn read_pane_log_records<R: BufRead + Seek>(
+    mut reader: R,
+    file_len: u64,
+    offsets: &[LineOffset],
+    count: usize,
+    max_stored_bytes: u64,
+    newline: impl Fn(&[u8]) -> Option<usize>,
+) -> Result<Vec<String>, MmapStoreError> {
+    let mut position = reader.stream_position()?;
+    let mut total = 0;
+    let mut lines = Vec::new();
+    // Every complete record consumes at least its newline. Bound the
+    // result slots by both budgets, without reallocating for every row.
+    lines
+        .try_reserve_exact(
+            count
+                .min(offsets.len())
+                .min(usize::try_from(max_stored_bytes).unwrap_or(usize::MAX)),
+        )
+        .map_err(std::io::Error::other)?;
+    for start in offsets.iter().take(count) {
+        if start.0 > file_len {
+            return Err(MmapStoreError::OffsetOutOfBounds {
+                offset: start.0,
+                len: file_len,
+            });
+        }
+        if position != start.0 {
+            // Interrupted appends can leave gaps between indexed rows.
+            // Sequential rows need no seek or new buffered reader.
+            reader.seek(SeekFrom::Start(start.0))?;
+            position = start.0;
+        }
+        let mut bytes = Vec::new();
+        let mut terminated = false;
+        while position < file_len {
+            let buffer = reader.fill_buf()?;
+            let available = usize::try_from(file_len - position)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            if available == 0 {
+                break;
+            }
+            let buffer = &buffer[..available];
+            let take = newline(buffer).map_or(available, |end| end + 1);
+            let record_bytes = u64::try_from(bytes.len())
+                .ok()
+                .and_then(|len| len.checked_add(u64::try_from(take).ok()?))
+                .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
+            // Check before allocating/copying each chunk, including CRLF.
+            charge_read_bytes(total, record_bytes, max_stored_bytes)?;
+            let required = usize::try_from(record_bytes)
+                .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?;
+            if required > bytes.capacity() {
+                let limit =
+                    usize::try_from((max_stored_bytes - total).min(PANE_LOG_MAX_RECORD_BYTES))
+                        .map_err(|_| MmapStoreError::NumericOverflow("read_capacity"))?;
+                // Geometric growth avoids copying the whole record for
+                // every buffered chunk. Cap the requested capacity at
+                // the remaining stored-byte budget and per-record limit.
+                let target = read_record_growth_target(bytes.capacity(), required, limit);
+                bytes
+                    .try_reserve_exact(target - bytes.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            terminated = buffer[take - 1] == b'\n';
+            bytes.extend_from_slice(&buffer[..take]);
+            reader.consume(take);
+            position += u64::try_from(take)
+                .map_err(|_| MmapStoreError::NumericOverflow("read_position"))?;
+            if terminated {
+                break;
+            }
+        }
+        if !terminated {
+            break;
+        }
+        total = charge_read_bytes(
+            total,
+            u64::try_from(bytes.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?,
+            max_stored_bytes,
+        )?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        lines.push(String::from_utf8(bytes)?);
+    }
+    Ok(lines)
+}
+
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
 /// The snapshot excludes a final non-newline-terminated record because an
@@ -439,6 +723,7 @@ pub struct MmapStagedPaneLedger {
     record_bytes: u64,
     committed_bytes: u64,
     reused_existing: bool,
+    set_aside_interrupted: bool,
 }
 
 impl MmapStagedPaneLedger {
@@ -466,6 +751,13 @@ impl MmapStagedPaneLedger {
     pub const fn reused_existing(self) -> bool {
         self.reused_existing
     }
+
+    /// An earlier attempt at this transaction stopped partway (a failed
+    /// write or a crash); its files were set aside before this one staged.
+    #[must_use]
+    pub const fn set_aside_interrupted(self) -> bool {
+        self.set_aside_interrupted
+    }
 }
 
 impl std::fmt::Debug for MmapStagedPaneLedger {
@@ -477,6 +769,7 @@ impl std::fmt::Debug for MmapStagedPaneLedger {
             .field("record_bytes", &self.record_bytes)
             .field("committed_bytes", &self.committed_bytes)
             .field("reused_existing", &self.reused_existing)
+            .field("set_aside_interrupted", &self.set_aside_interrupted)
             .finish()
     }
 }
@@ -899,6 +1192,13 @@ struct PaneFile {
     log_path: PathBuf,
     file: File,
     base_seq_file: File,
+    /// Length of the last acknowledged journal image. A changed length, a
+    /// torn tail, or a failed write requires validation before another prune.
+    base_seq_journal_len: u64,
+    base_seq_journal_needs_checkpoint: bool,
+    /// Reuse our one unpublished stage after an I/O failure. Retrying must
+    /// neither accumulate siblings nor adopt an uncertain crash artifact.
+    base_seq_checkpoint_stage: Option<PaneSequenceCheckpointStage>,
     /// End offset of the last newline-terminated, crash-durable record.
     file_len: u64,
     /// The physical file contains an interrupted record after `file_len`.
@@ -925,6 +1225,18 @@ enum PaneOpenPolicy {
     RecoverOrCreate,
     RecoverExisting,
     VerifyExisting,
+}
+
+struct PaneSequenceJournalState {
+    latest: Option<u64>,
+    bytes: u64,
+    trailing_partial: bool,
+}
+
+#[derive(Debug)]
+struct PaneSequenceCheckpointStage {
+    path: PathBuf,
+    file: File,
 }
 
 impl PaneFile {
@@ -969,6 +1281,9 @@ impl PaneFile {
             log_path,
             file,
             base_seq_file,
+            base_seq_journal_len: 0,
+            base_seq_journal_needs_checkpoint: false,
+            base_seq_checkpoint_stage: None,
             file_len: 0,
             trailing_partial: false,
             data_start: 0,
@@ -976,6 +1291,57 @@ impl PaneFile {
             line_offsets: Vec::new(),
             pruned_offsets: Vec::new(),
         }))
+    }
+
+    /// Whether an existing deterministic slot is an earlier attempt at the
+    /// same transaction that stopped before writing all `expected_records`.
+    /// Staging creates the log, then the empty sequence journal, then writes
+    /// records; setting a slot aside renames the log first. So a failed
+    /// write, a crash, or an interrupted set-aside leaves an empty or absent
+    /// journal beside a header-free log holding fewer complete records than
+    /// expected (or no log, or an empty log with no journal yet).
+    fn versioned_slot_is_interrupted(
+        log_path: &Path,
+        sequence_path: &Path,
+        log_exists: bool,
+        sequence_exists: bool,
+        expected_records: usize,
+        max_physical_bytes: u64,
+    ) -> Result<bool, MmapStoreError> {
+        if sequence_exists && std::fs::symlink_metadata(sequence_path)?.len() != 0 {
+            return Ok(false);
+        }
+        if !log_exists {
+            return Ok(true);
+        }
+        let file = Self::open_existing_append_file(log_path)?;
+        let physical_bytes = file.metadata()?.len();
+        Ok(matches!(
+            Self::scan_offsets_and_base_bounded(
+                &file,
+                Some(expected_records),
+                Some(max_physical_bytes),
+            ),
+            Ok((line_offsets, _, 0, 0))
+                if line_offsets.len() < expected_records
+                    || (!sequence_exists && physical_bytes == 0)
+        ))
+    }
+
+    /// Retain an interrupted slot's files under unique hidden names, log
+    /// first, so the slot can be staged again. Nothing is deleted.
+    fn set_aside_interrupted_slot(
+        log_path: &Path,
+        sequence_path: &Path,
+    ) -> Result<(), MmapStoreError> {
+        for path in [log_path, sequence_path] {
+            match std::fs::rename(path, Self::unique_staging_path(path, "interrupted")?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Self::sync_parent_directory(log_path)
     }
 
     fn unique_staging_path(path: &Path, purpose: &str) -> Result<PathBuf, MmapStoreError> {
@@ -1146,13 +1512,14 @@ impl PaneFile {
         log_path.with_extension("seq")
     }
 
-    fn scan_base_seq_journal(file: &File) -> Result<Option<u64>, MmapStoreError> {
+    fn scan_base_seq_journal(file: &File) -> Result<PaneSequenceJournalState, MmapStoreError> {
         let mut file = file.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::new(file.take(PANE_BASE_SEQ_JOURNAL_MAX_BYTES + 1));
         let mut latest = None;
         let mut record = Vec::new();
         let mut total_bytes = 0u64;
+        let mut trailing_partial = false;
         loop {
             let bytes_read = (&mut reader).take(129).read_until(b'\n', &mut record)?;
             if bytes_read == 0 {
@@ -1194,10 +1561,16 @@ impl PaneFile {
                     ));
                 }
                 latest = Some(value);
+            } else {
+                trailing_partial = true;
             }
             record.clear();
         }
-        Ok(latest)
+        Ok(PaneSequenceJournalState {
+            latest,
+            bytes: total_bytes,
+            trailing_partial,
+        })
     }
 
     fn scan_offsets_and_base_bounded(
@@ -1341,18 +1714,23 @@ impl PaneFile {
         }
         // Verifying a deterministic stage must neither create missing files
         // nor repair a conflicting journal into an apparently valid receipt.
-        let journal_base_seq = if file_len == 0 && !matches!(policy, PaneOpenPolicy::VerifyExisting)
-        {
+        let journal = if file_len == 0 && !matches!(policy, PaneOpenPolicy::VerifyExisting) {
             // An empty synchronized content log is authoritative for clear.
             // Reset any journal value left by a crash between clearing the log
             // and clearing its sequence sidecar.
             base_seq_file.set_len(0)?;
             base_seq_file.sync_data()?;
-            None
+            PaneSequenceJournalState {
+                latest: None,
+                bytes: 0,
+                trailing_partial: false,
+            }
         } else {
             Self::scan_base_seq_journal(&base_seq_file)?
         };
-        let base_seq = journal_base_seq.map_or(log_base_seq, |seq| seq.max(log_base_seq));
+        let base_seq = journal
+            .latest
+            .map_or(log_base_seq, |seq| seq.max(log_base_seq));
         let logically_pruned = base_seq.saturating_sub(log_base_seq);
         let logically_pruned = usize::try_from(logically_pruned)
             .map_err(|_| MmapStoreError::NumericOverflow("logically_pruned"))?;
@@ -1373,6 +1751,9 @@ impl PaneFile {
             log_path,
             file,
             base_seq_file,
+            base_seq_journal_len: journal.bytes,
+            base_seq_journal_needs_checkpoint: journal.trailing_partial,
+            base_seq_checkpoint_stage: None,
             file_len,
             trailing_partial,
             data_start,
@@ -1384,7 +1765,11 @@ impl PaneFile {
 
     fn persist_base_seq(&mut self, base_seq: u64) -> Result<(), MmapStoreError> {
         let record = format!("{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}\n");
+        Self::revalidate_open_file(&Self::base_seq_path(&self.log_path), &self.base_seq_file)?;
         let current_len = self.base_seq_file.seek(SeekFrom::End(0))?;
+        if current_len != self.base_seq_journal_len {
+            self.base_seq_journal_needs_checkpoint = true;
+        }
         let attempted = current_len
             .checked_add(
                 u64::try_from(record.len())
@@ -1397,9 +1782,107 @@ impl PaneFile {
                 attempted,
             });
         }
+        if self.base_seq_journal_needs_checkpoint
+            || attempted >= PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES
+        {
+            return self.checkpoint_base_seq(base_seq);
+        }
+        // A failed write or sync can leave a complete, newer value on disk.
+        // Validate it on retry instead of appending a possibly older value or
+        // joining a new record onto an unterminated write.
+        self.base_seq_journal_needs_checkpoint = true;
         self.base_seq_file.write_all(record.as_bytes())?;
         self.base_seq_file.flush()?;
+        #[cfg(test)]
+        sequence_journal_fault(PaneSequenceJournalFault::AppendBeforeSync)?;
         ordered_durability_sync_data(&self.base_seq_file)?;
+        self.base_seq_journal_len = attempted;
+        self.base_seq_journal_needs_checkpoint = false;
+        Ok(())
+    }
+
+    /// Publish one exact logical sequence authority without rewriting the
+    /// content log. Either journal image is sufficient with either log image,
+    /// including when the log begins with pruned authentication support rows.
+    fn checkpoint_base_seq(&mut self, base_seq: u64) -> Result<(), MmapStoreError> {
+        let path = Self::base_seq_path(&self.log_path);
+        Self::revalidate_open_file(&path, &self.base_seq_file)?;
+        let before = self.base_seq_file.metadata()?;
+        let journal = Self::scan_base_seq_journal(&self.base_seq_file)?;
+        if base_seq < self.base_seq || journal.latest.is_some_and(|latest| latest > base_seq) {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "sequence checkpoint would roll back a complete prune authority".to_string(),
+            ));
+        }
+        if Self::metadata_changed(&before, &self.base_seq_file.metadata()?)? {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "pane sequence journal changed while preparing checkpoint".to_string(),
+            ));
+        }
+
+        self.base_seq_journal_needs_checkpoint = true;
+        if self.base_seq_checkpoint_stage.is_none() {
+            let stage_path = Self::unique_staging_path(&path, "sequence-installing")?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).read(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options.open(&stage_path)?;
+            // Capture ownership before any fallible validation so retrying a
+            // permission or identity failure cannot create another sibling.
+            self.base_seq_checkpoint_stage = Some(PaneSequenceCheckpointStage {
+                path: stage_path,
+                file,
+            });
+        }
+        let stage = self
+            .base_seq_checkpoint_stage
+            .as_mut()
+            .expect("checkpoint stage was created");
+        Self::harden_open_file_permissions(&stage.file)?;
+        Self::revalidate_open_file(&stage.path, &stage.file)?;
+        stage.file.set_len(0)?;
+        let record = format!("{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}\n");
+        #[cfg(test)]
+        if PANE_SEQUENCE_JOURNAL_FAULT.with(std::cell::Cell::get)
+            == Some(PaneSequenceJournalFault::CheckpointPartialWrite)
+        {
+            stage
+                .file
+                .write_all(&record.as_bytes()[..record.len() / 2])?;
+            sequence_journal_fault(PaneSequenceJournalFault::CheckpointPartialWrite)?;
+        }
+        stage.file.write_all(record.as_bytes())?;
+        ordered_durability_sync(&stage.file)?;
+        #[cfg(test)]
+        sequence_journal_fault(PaneSequenceJournalFault::CheckpointBeforePublish)?;
+
+        Self::revalidate_open_file(&path, &self.base_seq_file)?;
+        if Self::metadata_changed(&before, &self.base_seq_file.metadata()?)? {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "pane sequence journal changed before checkpoint publication".to_string(),
+            ));
+        }
+        Self::revalidate_open_file(&stage.path, &stage.file)?;
+        Self::publish_staging_file(&stage.path, &path)?;
+        // Rename changes the authoritative inode. Even if directory sync
+        // fails, subsequent writes must use the published handle, never the
+        // old unlinked journal. Keep the repair flag until durability succeeds.
+        self.base_seq_file = self
+            .base_seq_checkpoint_stage
+            .take()
+            .expect("published checkpoint stage exists")
+            .file;
+        self.base_seq_journal_len = u64::try_from(record.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("sequence_journal_bytes"))?;
+        #[cfg(test)]
+        sequence_journal_fault(PaneSequenceJournalFault::CheckpointAfterPublish)?;
+        Self::sync_parent_directory(&path)?;
+        self.base_seq_journal_needs_checkpoint = false;
         Ok(())
     }
 
@@ -1668,91 +2151,27 @@ impl PaneFile {
     ) -> Result<Vec<String>, MmapStoreError> {
         // A cloned descriptor pins the same file, NOT an independent seek
         // offset. The owning store must serialize this read with other users.
-        let mut reader = BufReader::new(self.file.try_clone()?);
-        let mut position = reader.stream_position()?;
-        let mut total = 0;
-        let mut lines = Vec::new();
-        // Every complete record consumes at least its newline. Bound the
-        // result slots by both budgets, without reallocating for every row.
-        lines
-            .try_reserve_exact(
-                count
-                    .min(offsets.len())
-                    .min(usize::try_from(max_stored_bytes).unwrap_or(usize::MAX)),
-            )
-            .map_err(std::io::Error::other)?;
-        for start in offsets.iter().take(count) {
-            if start.0 > self.file_len {
-                return Err(MmapStoreError::OffsetOutOfBounds {
-                    offset: start.0,
-                    len: self.file_len,
-                });
-            }
-            if position != start.0 {
-                // Interrupted appends can leave gaps between indexed rows.
-                // Sequential rows need no seek or new buffered reader.
-                reader.seek(SeekFrom::Start(start.0))?;
-                position = start.0;
-            }
-            let mut bytes = Vec::new();
-            let mut terminated = false;
-            while position < self.file_len {
-                let buffer = reader.fill_buf()?;
-                let available = usize::try_from(self.file_len - position)
-                    .unwrap_or(usize::MAX)
-                    .min(buffer.len());
-                if available == 0 {
-                    break;
-                }
-                let buffer = &buffer[..available];
-                let take = buffer
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map_or(available, |end| end + 1);
-                let record_bytes = u64::try_from(bytes.len())
-                    .ok()
-                    .and_then(|len| len.checked_add(u64::try_from(take).ok()?))
-                    .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
-                // Check before allocating/copying each chunk, including CRLF.
-                charge_read_bytes(total, record_bytes, max_stored_bytes)?;
-                let required = usize::try_from(record_bytes)
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?;
-                if required > bytes.capacity() {
-                    let limit =
-                        usize::try_from((max_stored_bytes - total).min(PANE_LOG_MAX_RECORD_BYTES))
-                            .map_err(|_| MmapStoreError::NumericOverflow("read_capacity"))?;
-                    // Geometric growth avoids copying the whole record for
-                    // every buffered chunk. Cap the requested capacity at
-                    // the remaining stored-byte budget and per-record limit.
-                    let target = read_record_growth_target(bytes.capacity(), required, limit);
-                    bytes
-                        .try_reserve_exact(target - bytes.len())
-                        .map_err(std::io::Error::other)?;
-                }
-                terminated = buffer[take - 1] == b'\n';
-                bytes.extend_from_slice(&buffer[..take]);
-                reader.consume(take);
-                position += u64::try_from(take)
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_position"))?;
-                if terminated {
-                    break;
-                }
-            }
-            if !terminated {
-                break;
-            }
-            total = charge_read_bytes(
-                total,
-                u64::try_from(bytes.len())
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?,
+        let file = self.file.try_clone()?;
+        if block_reads_enabled() {
+            let block = pane_log_read_block(offsets, count, self.file_len);
+            read_pane_log_records(
+                BlockPaneLogReader::new(file, block),
+                self.file_len,
+                offsets,
+                count,
                 max_stored_bytes,
-            )?;
-            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-                bytes.pop();
-            }
-            lines.push(String::from_utf8(bytes)?);
+                |window| memchr::memchr(b'\n', window),
+            )
+        } else {
+            read_pane_log_records(
+                BufReader::new(file),
+                self.file_len,
+                offsets,
+                count,
+                max_stored_bytes,
+                |window| window.iter().position(|byte| *byte == b'\n'),
+            )
         }
-        Ok(lines)
     }
 
     fn prune_before(&mut self, seq: u64) -> Result<(), MmapStoreError> {
@@ -1840,9 +2259,12 @@ impl PaneFile {
         self.base_seq = 0;
         self.line_offsets.clear();
         self.pruned_offsets.clear();
+        self.base_seq_journal_needs_checkpoint = true;
         self.base_seq_file.set_len(0)?;
         self.base_seq_file.flush()?;
         ordered_durability_sync_data(&self.base_seq_file)?;
+        self.base_seq_journal_len = 0;
+        self.base_seq_journal_needs_checkpoint = false;
         Ok(())
     }
 
@@ -2011,11 +2433,34 @@ impl PaneFile {
         Some((keep, usize::try_from(keep - start).ok()?))
     }
 
+    /// Every byte a replacement writes, including the header and any pruned
+    /// rows retained for authentication. Uncommitted trailing bytes are never
+    /// copied and do not count as a reclaimable committed prefix.
+    fn compacted_file_len(&self, keep_from: Option<u64>) -> Result<u64, MmapStoreError> {
+        let first_kept_seq = self
+            .kept_pruned_row(keep_from)
+            .map_or(self.base_seq, |(keep, _)| keep);
+        let header = format!("\0FTMMAP1:{first_kept_seq}\n");
+        let retained_start = self
+            .data_start
+            .checked_add(self.stale_prefix_bytes(keep_from))
+            .ok_or(MmapStoreError::NumericOverflow("retained_start"))?;
+        self.file_len
+            .checked_sub(retained_start)
+            .and_then(|bytes| bytes.checked_add(header.len() as u64))
+            .ok_or(MmapStoreError::NumericOverflow("compacted_file_len"))
+    }
+
     fn compact_retained_prefix(&mut self, keep_from: Option<u64>) -> Result<bool, MmapStoreError> {
         let stale_bytes = self.stale_prefix_bytes(keep_from);
         if stale_bytes == 0 {
             return Ok(false);
         }
+        // Preserve the exact logical base before changing either log image.
+        // The new header can name an earlier authentication support row, so
+        // truncating its journal afterwards would resurrect pruned rows on a
+        // crash. A separately durable atomic checkpoint has no such interval.
+        self.checkpoint_base_seq(self.base_seq)?;
         // Keeping a pruned-tail row keeps it and every later pruned row; the
         // new log's header names it as the log's first row, so reopening
         // replays the same pruned tail from the base sequence journal.
@@ -2094,13 +2539,24 @@ impl PaneFile {
             }
             let mut compacted = options.open(&tmp_path)?;
             compacted.write_all(header.as_bytes())?;
+            #[cfg(test)]
+            PANE_COMPACTION_WRITTEN_BYTES.with(|count| count.set(count.get() + header_len));
             compacted.write_all(&retained)?;
+            #[cfg(test)]
+            {
+                PANE_COMPACTION_WRITTEN_BYTES
+                    .with(|count| count.set(count.get() + retained.len() as u64));
+                PANE_COMPACTION_WRITES.with(|count| count.set(count.get() + 1));
+            }
             // Persist the retained bytes before the rename so the swap can never
             // expose a partially written compacted log.
             ordered_durability_sync(&compacted)?;
             compacted
         };
         Self::revalidate_open_file(&tmp_path, &compacted_file)?;
+        Self::revalidate_open_file(&self.log_path, &self.file)?;
+        #[cfg(test)]
+        sequence_journal_fault(PaneSequenceJournalFault::CompactionBeforePublish)?;
         Self::publish_staging_file(&tmp_path, &self.log_path)?;
         // The open staged handle names the same inode after rename. Publish it
         // into the object before any later fallible durability operation so an
@@ -2111,18 +2567,13 @@ impl PaneFile {
         self.data_start = header_len;
         self.line_offsets = compacted_offsets;
         self.pruned_offsets = compacted_pruned_offsets;
+        #[cfg(test)]
+        sequence_journal_fault(PaneSequenceJournalFault::CompactionAfterPublish)?;
         // Make the rename itself durable: without a directory fsync a crash
         // after the rename but before the directory entry reaches disk could
         // resurrect the pre-compaction file. Successful compaction requires
         // this acknowledgement on platforms that support directory handles.
         Self::sync_parent_directory(&self.log_path)?;
-        // The compacted log header is now the sequence authority. Collapse the
-        // append-only journal only after that header and its rename are durable;
-        // a crash at any point leaves either the old journal or the new header
-        // sufficient to recover the same base sequence.
-        self.base_seq_file.set_len(0)?;
-        self.base_seq_file.seek(SeekFrom::Start(0))?;
-        self.persist_base_seq(self.base_seq)?;
         Ok(true)
     }
 
@@ -2734,7 +3185,7 @@ fn read_pane_snapshot_bounded(
                     ));
                 }
             }
-            let value = PaneFile::scan_base_seq_journal(&journal)?;
+            let value = PaneFile::scan_base_seq_journal(&journal)?.latest;
             let journal_metadata_after = journal.metadata()?;
             if PaneFile::metadata_changed(&journal_metadata_before, &journal_metadata_after)? {
                 return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -3052,10 +3503,26 @@ impl MmapScrollbackStore {
         };
         let log_exists = path_is_regular(&log_path)?;
         let sequence_exists = path_is_regular(&sequence_path)?;
-        if log_exists != sequence_exists {
+        // A slot this store has open was staged or published here; never
+        // move it.
+        let set_aside_interrupted = (log_exists || sequence_exists)
+            && !self.panes.contains_key(&pane_id)
+            && PaneFile::versioned_slot_is_interrupted(
+                &log_path,
+                &sequence_path,
+                log_exists,
+                sequence_exists,
+                records.len(),
+                committed_byte_limit_observation,
+            )?;
+        if set_aside_interrupted {
+            // Publication follows a complete, synchronized stage, so a short
+            // slot was never published. Refusing it as a collision would fail
+            // every retry of this transaction for good.
+            PaneFile::set_aside_interrupted_slot(&log_path, &sequence_path)?;
+        } else if log_exists != sequence_exists {
             return Err(MmapStoreError::VersionedPaneIdentityCollision);
-        }
-        if log_exists {
+        } else if log_exists {
             let pane = PaneFile::open_bounded(
                 &self.base_dir,
                 pane_id,
@@ -3089,6 +3556,7 @@ impl MmapScrollbackStore {
                 record_bytes,
                 committed_bytes: pane.file_len,
                 reused_existing: true,
+                set_aside_interrupted: false,
             };
             self.panes.insert(pane_id, pane);
             return Ok(staged);
@@ -3127,6 +3595,7 @@ impl MmapScrollbackStore {
             record_bytes,
             committed_bytes,
             reused_existing: false,
+            set_aside_interrupted,
         };
         self.verify_staged_pane_ledger(staged, records)?;
         Ok(staged)
@@ -3351,17 +3820,24 @@ impl MmapScrollbackStore {
         pane_id: PaneId,
         min_stale_bytes: u64,
     ) -> Result<bool, MmapStoreError> {
-        self.compact_pane_if_stale_keeping(pane_id, min_stale_bytes, None)
+        self.compact_pane_if_stale_keeping(pane_id, min_stale_bytes, None, None)
     }
 
     /// `compact_pane_if_stale`, keeping the pruned rows from `keep_from` on
     /// in the log and readable in the pruned tail (ft-yccm0.2.1.4). `None`
     /// drops every pruned row, as `compact_pane_if_stale` does.
+    ///
+    /// Ordinary maintenance waits until reclaimed bytes cover both the
+    /// minimum and the entire replacement, so repeated small prunes amortize
+    /// the copied suffix. A caller's optional publication ceiling forces a
+    /// fitting replacement when the committed file reaches that ceiling;
+    /// already oversized files whose kept rows cannot fit are refused.
     pub fn compact_pane_if_stale_keeping(
         &mut self,
         pane_id: PaneId,
         min_stale_bytes: u64,
         keep_from: Option<u64>,
+        max_physical_bytes: Option<u64>,
     ) -> Result<bool, MmapStoreError> {
         if self.fallback_panes.contains(&pane_id) {
             return Ok(false);
@@ -3371,11 +3847,30 @@ impl MmapScrollbackStore {
             return Ok(false);
         };
         let stale_bytes = pane.stale_prefix_bytes(keep_from);
-        let retained_bytes = pane.retained_bytes();
+        let replacement_bytes = pane.compacted_file_len(keep_from)?;
+        if let Some(limit) = max_physical_bytes {
+            if pane.file_len > limit && (stale_bytes == 0 || replacement_bytes > limit) {
+                return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                    limit_name: "compacted_log_bytes",
+                    limit,
+                    observed: if stale_bytes == 0 {
+                        pane.file_len
+                    } else {
+                        replacement_bytes
+                    },
+                });
+            }
+            // A file that already fits need not grow a hypothetical new
+            // header merely because a byte ceiling was supplied.
+            if replacement_bytes > limit {
+                return Ok(false);
+            }
+        }
         if stale_bytes == 0 {
             return Ok(false);
         }
-        if stale_bytes < min_stale_bytes && stale_bytes < retained_bytes {
+        let at_ceiling = max_physical_bytes.is_some_and(|limit| pane.file_len >= limit);
+        if !at_ceiling && (stale_bytes < min_stale_bytes || stale_bytes < replacement_bytes) {
             return Ok(false);
         }
 
@@ -3497,20 +3992,10 @@ impl MmapScrollbackStore {
         self.panes.get(&pane_id).map(PaneFile::pruned_tail_start)
     }
 
+    /// Persist a logical prune and retain a bounded tail of offsets for
+    /// authentication. Sequence-journal maintenance never rewrites the data
+    /// log; physical support-row selection belongs to explicit compaction.
     pub fn prune_before(&mut self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
-        self.prune_before_keeping(pane_id, seq, None)
-    }
-
-    /// `prune_before`, keeping the pruned rows from `keep_from` on readable
-    /// in the pruned tail even when the prune also compacts the log
-    /// (ft-yccm0.2.1.4: `keep_from` is the first row of the sealed segment
-    /// that holds `seq`). `None` keeps nothing, as `prune_before` does.
-    pub fn prune_before_keeping(
-        &mut self,
-        pane_id: PaneId,
-        seq: u64,
-        keep_from: Option<u64>,
-    ) -> Result<(), MmapStoreError> {
         if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
             self.activate_sqlite_fallback(pane_id)?;
             return self
@@ -3520,15 +4005,8 @@ impl MmapScrollbackStore {
                 .prune_before(pane_id, seq);
         }
 
-        let cold_erasure = self.cold_erasure;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.prune_before(seq)?;
-            if pane.base_seq_file.metadata()?.len() >= PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES
-                && pane.compact_retained_prefix(keep_from)?
-                && cold_erasure == ColdErasureMode::ReedSolomon
-            {
-                pane.write_erasure_sidecars()?;
-            }
         }
         Ok(())
     }
@@ -4200,6 +4678,256 @@ mod tests {
         ));
     }
 
+    /// A pane-log byte stream of `records` (length, content, terminator) and
+    /// each record's start (ft-y0gy9). Content 0 is printable ASCII; 1 is
+    /// multi-byte UTF-8 cut at the length, so possibly mid-character; 2 is
+    /// arbitrary bytes, invalid UTF-8 and CRs included, with no LF.
+    /// Terminator 0 is LF, 1 is CRLF, and 2 is none: the record runs into the
+    /// next one, or is the stream's torn tail.
+    fn pane_log_stream(records: &[(usize, u8, u8)], seed: u64) -> (Vec<u8>, Vec<u64>) {
+        const UTF8: &[u8] = "é\u{1f642}ж".as_bytes();
+        let mut state = seed | 1;
+        let mut stream = Vec::new();
+        let mut starts = Vec::new();
+        for &(len, content, terminator) in records {
+            starts.push(stream.len() as u64);
+            for index in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                stream.push(match content {
+                    0 => b' ' + (state % 95) as u8,
+                    1 => UTF8[index % UTF8.len()],
+                    _ => match state as u8 {
+                        b'\n' => b'\r',
+                        byte => byte,
+                    },
+                });
+            }
+            match terminator {
+                0 => stream.push(b'\n'),
+                1 => stream.extend_from_slice(b"\r\n"),
+                _ => {}
+            }
+        }
+        (stream, starts)
+    }
+
+    /// `read_pane_log_records` over the log at `path` through `BufReader`
+    /// and the old scan, then through block reads and `memchr`, each from a
+    /// descriptor positioned at `start_at`: both results, debug-formatted.
+    fn read_pane_log_both_ways(
+        path: &Path,
+        start_at: u64,
+        file_len: u64,
+        offsets: &[LineOffset],
+        count: usize,
+        budget: u64,
+        block: usize,
+    ) -> (String, String) {
+        let open = || {
+            let mut file = File::open(path).unwrap();
+            file.seek(SeekFrom::Start(start_at)).unwrap();
+            file
+        };
+        let buffered = read_pane_log_records(
+            BufReader::new(open()),
+            file_len,
+            offsets,
+            count,
+            budget,
+            |window| window.iter().position(|byte| *byte == b'\n'),
+        );
+        let blocks = read_pane_log_records(
+            BlockPaneLogReader::new(open(), block),
+            file_len,
+            offsets,
+            count,
+            budget,
+            |window| memchr::memchr(b'\n', window),
+        );
+        (format!("{buffered:?}"), format!("{blocks:?}"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ft-y0gy9: block reads return exactly what `BufReader` reads
+        /// returned, records and errors alike, every error field included.
+        /// Random record streams: records across 8 KiB window edges, CRLF,
+        /// invalid UTF-8, records running into the next, torn tails, a
+        /// snapshot length short of the file. Random requests: skipped and
+        /// mid-record offsets, offsets past the end, counts, byte budgets,
+        /// block sizes, and the descriptor's starting position.
+        #[test]
+        fn block_reads_return_the_records_and_errors_buffered_reads_return(
+            records in proptest::collection::vec(
+                (
+                    prop_oneof![0usize..40, 8_180usize..8_200, 16_370usize..16_400, 0usize..20_000],
+                    0u8..3,
+                    0u8..3,
+                ),
+                0..12,
+            ),
+            seed in any::<u64>(),
+            skip_mask in any::<u16>(),
+            mid in proptest::option::of((0usize..12, 1u64..9_000)),
+            beyond in proptest::option::of(0u64..4),
+            cut in 0usize..64,
+            count in 0usize..16,
+            budget in prop_oneof![Just(u64::MAX), 0u64..120_000],
+            windows in 1usize..=32,
+            start_at in 0u64..40_000,
+            start_at_first in any::<bool>(),
+        ) {
+            let (stream, starts) = pane_log_stream(&records, seed);
+            let dir = temp_dir();
+            let path = dir.path().join("7.log");
+            std::fs::write(&path, &stream).unwrap();
+            let file_len = (stream.len() - cut.min(stream.len())) as u64;
+            let mut offsets: Vec<LineOffset> = starts
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| skip_mask & (1 << (index % 16)) == 0)
+                .map(|(_, start)| LineOffset(*start))
+                .collect();
+            if let Some((index, delta)) = mid
+                && let Some(start) = starts.get(index)
+            {
+                offsets.push(LineOffset(start + delta));
+            }
+            if let Some(extra) = beyond {
+                offsets.push(LineOffset(file_len + 1 + extra));
+            }
+            let start_at = match offsets.first() {
+                Some(first) if start_at_first => first.0,
+                _ => start_at.min(stream.len() as u64),
+            };
+            let (buffered, blocks) = read_pane_log_both_ways(
+                &path,
+                start_at,
+                file_len,
+                &offsets,
+                count,
+                budget,
+                windows * PANE_LOG_READ_WINDOW,
+            );
+            prop_assert_eq!(buffered, blocks);
+        }
+    }
+
+    /// Counts the read calls that reach the wrapped file (ft-y0gy9).
+    struct CountingReads<R> {
+        inner: R,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: Read> Read for CountingReads<R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read(out)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingReads<R> {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// ft-y0gy9: reading 4096 records of 740 bytes, the size of a sealed T0
+    /// row, takes one read call per 256 KiB block where `BufReader` took
+    /// one per 8 KiB, and returns the same records.
+    #[test]
+    fn block_reads_issue_one_read_call_per_block() {
+        const RECORDS: usize = 4096;
+        let dir = temp_dir();
+        let path = dir.path().join("7.log");
+        let stream = format!("{}\n", "r".repeat(740)).repeat(RECORDS);
+        std::fs::write(&path, &stream).unwrap();
+        let file_len = stream.len() as u64;
+        let offsets: Vec<LineOffset> = (0..RECORDS)
+            .map(|index| LineOffset((index * 741) as u64))
+            .collect();
+        let block = pane_log_read_block(&offsets, RECORDS, file_len);
+        let read = |blocks: bool| {
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let file = CountingReads {
+                inner: File::open(&path).unwrap(),
+                reads: std::rc::Rc::clone(&reads),
+            };
+            let records = if blocks {
+                read_pane_log_records(
+                    BlockPaneLogReader::new(file, block),
+                    file_len,
+                    &offsets,
+                    RECORDS,
+                    u64::MAX,
+                    |window| memchr::memchr(b'\n', window),
+                )
+            } else {
+                read_pane_log_records(
+                    BufReader::new(file),
+                    file_len,
+                    &offsets,
+                    RECORDS,
+                    u64::MAX,
+                    |window| window.iter().position(|byte| *byte == b'\n'),
+                )
+            }
+            .unwrap();
+            (records, reads.get())
+        };
+        let (buffered, buffered_reads) = read(false);
+        let (blocks, block_reads) = read(true);
+        eprintln!(
+            "{RECORDS} records of 741 stored bytes: {buffered_reads} read calls through \
+             BufReader, {block_reads} in {block}-byte blocks"
+        );
+        assert_eq!(block, PANE_LOG_READ_MAX_BLOCK);
+        assert_eq!(blocks.len(), RECORDS);
+        assert_eq!(blocks, buffered);
+        assert_eq!(buffered_reads, stream.len().div_ceil(PANE_LOG_READ_WINDOW));
+        assert!(
+            block_reads <= stream.len().div_ceil(block) + 1,
+            "{block_reads} read calls for {} bytes in {block}-byte blocks",
+            stream.len()
+        );
+    }
+
+    /// ft-y0gy9: the store's ranged reads return the same rows, and refuse
+    /// the same budgets, on both read paths, a torn tail included.
+    #[test]
+    fn store_ranged_reads_match_on_both_read_paths() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        for row in 0..64_usize {
+            store
+                .append_line(7, &format!("{}{row}", "x".repeat(row * 397 % 9_000)))
+                .unwrap();
+        }
+        let through = |blocks: bool, range: std::ops::Range<u64>, budget: u64| {
+            FORCE_BLOCK_READS.with(|forced| forced.set(Some(blocks)));
+            let read = store.lines_range(7, range, 64, budget);
+            FORCE_BLOCK_READS.with(|forced| forced.set(None));
+            format!("{read:?}")
+        };
+        for range in [0..64, 5..40, 63..64] {
+            for budget in [u64::MAX, 100_000, 20_000, 9_000, 0] {
+                assert_eq!(
+                    through(true, range.clone(), budget),
+                    through(false, range.clone(), budget),
+                    "rows {range:?} under {budget} bytes"
+                );
+            }
+        }
+        let pane = store.panes.get(&7).unwrap();
+        pane.file.set_len(pane.file_len - 3).unwrap();
+        let torn = through(true, 0..64, u64::MAX);
+        assert_eq!(torn, through(false, 0..64, u64::MAX));
+        assert!(torn.starts_with("Ok("), "{torn}");
+    }
+
     #[test]
     fn lines_range_sqlite_stops_at_gap_and_preflights_large_content() {
         let dir = temp_dir();
@@ -4628,21 +5356,30 @@ mod tests {
     }
 
     #[test]
-    fn sequence_journal_pressure_forces_crash_safe_compaction_before_cap() {
+    fn sequence_journal_pressure_checkpoints_without_copying_the_data_log() {
         let dir = temp_dir();
         {
             let mut store = file_only_store(dir.path());
+            let copied_before = PANE_COMPACTION_WRITTEN_BYTES.with(std::cell::Cell::get);
             for idx in 0..100 {
                 store.append_line(1, &format!("line-{idx}")).unwrap();
             }
+            let original = std::fs::read(dir.path().join("1.log")).unwrap();
             for oldest in 1..90 {
                 store.prune_before(1, oldest).unwrap();
             }
             assert!(
                 std::fs::metadata(dir.path().join("1.seq")).unwrap().len()
                     < PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES,
-                "journal-pressure compaction must collapse sequence history"
+                "independent checkpoints must bound sequence history"
             );
+            assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), original);
+            assert_eq!(
+                PANE_COMPACTION_WRITTEN_BYTES.with(std::cell::Cell::get),
+                copied_before,
+                "sequence history alone must never copy retained payloads"
+            );
+            assert_eq!(store.pruned_tail_start(1), Some(0));
         }
 
         let mut reopened = file_only_store(dir.path());
@@ -4650,6 +5387,169 @@ mod tests {
         assert_eq!(reopened.oldest_seq(1), Some(89));
         assert_eq!(reopened.line_count(1), 11);
         assert_eq!(reopened.line_at(1, 89).unwrap().as_deref(), Some("line-89"));
+    }
+
+    #[test]
+    fn sustained_small_prunes_amortize_actual_retained_log_writes() {
+        const RETAINED_ROWS: usize = 128;
+        const RECORD_BYTES: usize = 4096;
+        const WINDOW_ROWS: usize = 4;
+        const WINDOWS: usize = 96;
+        let row = |seq| format!("{seq:08}{}", "x".repeat(RECORD_BYTES - 9));
+        let dir = temp_dir();
+        let copied_before = PANE_COMPACTION_WRITTEN_BYTES.with(std::cell::Cell::get);
+        let writes_before = PANE_COMPACTION_WRITES.with(std::cell::Cell::get);
+        {
+            let mut store = file_only_store(dir.path());
+            let initial: Vec<String> = (0..RETAINED_ROWS).map(row).collect();
+            let refs: Vec<&str> = initial.iter().map(String::as_str).collect();
+            store.append_lines(1, &refs).unwrap();
+            let mut peak_committed_bytes = store.file_bytes(1);
+            for window in 0..WINDOWS {
+                let first = RETAINED_ROWS + window * WINDOW_ROWS;
+                let rows: Vec<String> = (first..first + WINDOW_ROWS).map(row).collect();
+                let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+                store.append_lines(1, &refs).unwrap();
+                peak_committed_bytes = peak_committed_bytes.max(store.file_bytes(1));
+                store
+                    .prune_before(1, ((window + 1) * WINDOW_ROWS) as u64)
+                    .unwrap();
+                store
+                    .compact_pane_if_stale(1, (WINDOW_ROWS * RECORD_BYTES) as u64)
+                    .unwrap();
+                assert_eq!(store.line_count(1), RETAINED_ROWS);
+                assert!(
+                    std::fs::metadata(dir.path().join("1.seq")).unwrap().len()
+                        < PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES
+                );
+            }
+            let copied = PANE_COMPACTION_WRITTEN_BYTES.with(std::cell::Cell::get) - copied_before;
+            let writes = PANE_COMPACTION_WRITES.with(std::cell::Cell::get) - writes_before;
+            assert_eq!(
+                writes, 2,
+                "small prune windows must not each rewrite the suffix"
+            );
+            assert!(
+                copied <= (WINDOWS * WINDOW_ROWS * RECORD_BYTES) as u64,
+                "cumulative physical replacement writes {copied} exceed reclaimed row bytes"
+            );
+            assert!(
+                peak_committed_bytes
+                    <= ((2 * RETAINED_ROWS + WINDOW_ROWS) * RECORD_BYTES + 64) as u64,
+                "amortization must also bound the stale prefix"
+            );
+            assert_eq!(store.oldest_seq(1), Some((WINDOWS * WINDOW_ROWS) as u64));
+        }
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        let oldest = WINDOWS * WINDOW_ROWS;
+        assert_eq!(reopened.oldest_seq(1), Some(oldest as u64));
+        assert_eq!(reopened.line_count(1), RETAINED_ROWS);
+        assert_eq!(
+            reopened.line_at(1, oldest as u64).unwrap(),
+            Some(row(oldest))
+        );
+    }
+
+    #[test]
+    fn compaction_cost_includes_authentication_support_and_honors_publication_ceiling() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let rows: Vec<String> = (0..10)
+            .map(|seq| format!("{seq}{}", "x".repeat(62)))
+            .collect();
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        store.append_lines(1, &refs).unwrap();
+        store.prune_before(1, 8).unwrap();
+        let original = std::fs::read(dir.path().join("1.log")).unwrap();
+        // Four stale records outweigh the two reachable records, but not the
+        // six physically kept records (four also authenticate a sealed segment).
+        assert!(
+            !store
+                .compact_pane_if_stale_keeping(1, 1, Some(4), None)
+                .unwrap()
+        );
+        let replacement = store
+            .panes
+            .get(&1)
+            .unwrap()
+            .compacted_file_len(Some(4))
+            .unwrap();
+        assert!(matches!(
+            store.compact_pane_if_stale_keeping(1, 1, Some(4), Some(replacement - 1)),
+            Err(MmapStoreError::PaneSnapshotLimitExceeded { .. })
+        ));
+        assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), original);
+        let ceiling = store.file_bytes(1);
+        assert!(
+            store
+                .compact_pane_if_stale_keeping(1, u64::MAX, Some(4), Some(ceiling))
+                .unwrap()
+        );
+        assert_eq!(store.file_bytes(1), replacement);
+        assert!(store.file_bytes(1) <= ceiling);
+        assert_eq!(store.oldest_seq(1), Some(8));
+        assert_eq!(store.pruned_tail_start(1), Some(4));
+        assert_eq!(
+            store
+                .lines_range_reaching_pruned(1, 4..10, 10, 4096)
+                .unwrap(),
+            rows[4..].to_vec()
+        );
+    }
+
+    #[test]
+    fn compaction_ceiling_distinguishes_an_oversized_log_from_a_larger_hypothetical_header() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_lines(1, &["", ""]).unwrap();
+        assert!(
+            !store
+                .compact_pane_if_stale_keeping(1, 1, None, Some(2))
+                .unwrap()
+        );
+        assert!(matches!(
+            store.compact_pane_if_stale_keeping(1, 1, None, Some(1)),
+            Err(MmapStoreError::PaneSnapshotLimitExceeded { observed: 2, .. })
+        ));
+        store.prune_before(1, 1).unwrap();
+        assert!(
+            !store
+                .compact_pane_if_stale_keeping(1, 1, None, Some(2))
+                .unwrap()
+        );
+        assert!(matches!(
+            store.compact_pane_if_stale_keeping(1, 1, None, Some(1)),
+            Err(MmapStoreError::PaneSnapshotLimitExceeded { .. })
+        ));
+        assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), b"\n\n");
+    }
+
+    #[test]
+    fn compaction_minimum_and_cost_ignore_an_uncommitted_partial_tail() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_lines(1, &["row"; 10]).unwrap();
+        store.prune_before(1, 9).unwrap();
+        assert!(!store.compact_pane_if_stale(1, 1024).unwrap());
+        let committed = store.file_bytes(1);
+        PANE_APPEND_FAULT.with(|fault| fault.set(Some(0)));
+        let failed = store.append_line(1, &"?".repeat(128 * 1024));
+        PANE_APPEND_FAULT.with(|fault| fault.set(None));
+        assert!(failed.is_err());
+        assert!(std::fs::metadata(dir.path().join("1.log")).unwrap().len() > committed);
+        assert!(
+            !store
+                .compact_pane_if_stale_keeping(1, 1024, None, Some(committed + 1))
+                .unwrap()
+        );
+        assert_eq!(store.file_bytes(1), committed);
+        store.append_line(1, "next").unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("1.log")).unwrap().len(),
+            committed + 5
+        );
+        assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["row", "next"]);
     }
 
     #[test]
@@ -4675,6 +5575,292 @@ mod tests {
         ));
         assert_eq!(store.oldest_seq(1), Some(0));
         assert_eq!(store.line_count(1), 2);
+    }
+
+    #[test]
+    fn journal_and_data_publication_faults_preserve_exact_logical_prune_authority() {
+        for fault in [
+            PaneSequenceJournalFault::CheckpointPartialWrite,
+            PaneSequenceJournalFault::CheckpointBeforePublish,
+            PaneSequenceJournalFault::CheckpointAfterPublish,
+            PaneSequenceJournalFault::CompactionBeforePublish,
+            PaneSequenceJournalFault::CompactionAfterPublish,
+        ] {
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            let rows: Vec<String> = (0..10).map(|seq| format!("row-{seq}")).collect();
+            let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            store.append_lines(1, &refs).unwrap();
+            store.prune_before(1, 3).unwrap();
+            store.prune_before(1, 6).unwrap();
+            let old_log = std::fs::read(dir.path().join("1.log")).unwrap();
+            PANE_SEQUENCE_JOURNAL_FAULT.with(|value| value.set(Some(fault)));
+            let failed = store
+                .panes
+                .get_mut(&1)
+                .unwrap()
+                .compact_retained_prefix(Some(4));
+            PANE_SEQUENCE_JOURNAL_FAULT.with(|value| value.set(None));
+            assert!(failed.is_err(), "{fault:?}");
+            // Exercise real files at each stopped boundary. The journal must
+            // never disappear when the physical log can begin before base 6.
+            let reopened = PaneFile::open(dir.path(), 1).unwrap();
+            assert_eq!(reopened.oldest_seq(), Some(6), "{fault:?}");
+            assert_eq!(reopened.next_seq().unwrap(), 10, "{fault:?}");
+            assert_eq!(
+                reopened.tail_lines(10).unwrap(),
+                rows[6..].to_vec(),
+                "{fault:?}"
+            );
+            assert_eq!(
+                PaneFile::scan_base_seq_journal(&reopened.base_seq_file)
+                    .unwrap()
+                    .latest,
+                Some(6),
+                "{fault:?}"
+            );
+            if fault == PaneSequenceJournalFault::CompactionAfterPublish {
+                assert_eq!(reopened.pruned_tail_start(), 4);
+                assert!(
+                    std::fs::read(dir.path().join("1.log"))
+                        .unwrap()
+                        .starts_with(b"\0FTMMAP1:4\n")
+                );
+            } else {
+                assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), old_log);
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_reuses_one_owned_stage_until_publication() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_lines(1, &["row"; 10]).unwrap();
+        store.prune_before(1, 6).unwrap();
+        let pane = store.panes.get_mut(&1).unwrap();
+        let mut owned_path = None;
+        for attempt in 0..12 {
+            let point = if attempt % 2 == 0 {
+                PaneSequenceJournalFault::CheckpointPartialWrite
+            } else {
+                PaneSequenceJournalFault::CheckpointBeforePublish
+            };
+            PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(Some(point)));
+            let failed = pane.checkpoint_base_seq(6);
+            PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(None));
+            assert!(failed.is_err());
+            let stage = pane.base_seq_checkpoint_stage.as_ref().unwrap();
+            if let Some(previous) = &owned_path {
+                assert_eq!(&stage.path, previous);
+            }
+            owned_path = Some(stage.path.clone());
+            let stages = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".1.seq.sequence-installing-")
+                })
+                .count();
+            assert_eq!(stages, 1, "persistent failures must not accumulate stages");
+            assert_eq!(
+                std::fs::read(dir.path().join("1.seq")).unwrap(),
+                b"FTSEQ1:6\n"
+            );
+        }
+        pane.checkpoint_base_seq(6).unwrap();
+        assert!(pane.base_seq_checkpoint_stage.is_none());
+        assert!(
+            !owned_path.unwrap().exists(),
+            "successful rename consumes our stage path"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("1.seq")).unwrap(),
+            b"FTSEQ1:6\n"
+        );
+    }
+
+    #[test]
+    fn checkpoint_after_rename_failure_keeps_appending_to_the_published_inode() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_lines(1, &["row"; 10]).unwrap();
+        store.prune_before(1, 3).unwrap();
+        store.prune_before(1, 6).unwrap();
+        let mut old_journal = store
+            .panes
+            .get(&1)
+            .unwrap()
+            .base_seq_file
+            .try_clone()
+            .unwrap();
+        PANE_SEQUENCE_JOURNAL_FAULT
+            .with(|fault| fault.set(Some(PaneSequenceJournalFault::CheckpointAfterPublish)));
+        let failed = store.panes.get_mut(&1).unwrap().checkpoint_base_seq(6);
+        PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(None));
+        assert!(failed.is_err());
+        PaneFile::revalidate_open_file(
+            &dir.path().join("1.seq"),
+            &store.panes.get(&1).unwrap().base_seq_file,
+        )
+        .unwrap();
+        store.prune_before(1, 7).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("1.seq")).unwrap(),
+            b"FTSEQ1:7\n"
+        );
+        old_journal.seek(SeekFrom::Start(0)).unwrap();
+        let mut retired_bytes = Vec::new();
+        old_journal.read_to_end(&mut retired_bytes).unwrap();
+        assert_eq!(
+            retired_bytes, b"FTSEQ1:3\nFTSEQ1:6\n",
+            "retired inode must receive no later appends"
+        );
+        let reopened = PaneFile::open(dir.path(), 1).unwrap();
+        assert_eq!(reopened.oldest_seq(), Some(7));
+        assert_eq!(reopened.next_seq().unwrap(), 10);
+    }
+
+    #[test]
+    fn checkpoint_refuses_to_roll_back_a_complete_prune_left_by_failed_sync() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_lines(1, &["row"; 10]).unwrap();
+        store.prune_before(1, 2).unwrap();
+        let old_log = std::fs::read(dir.path().join("1.log")).unwrap();
+        PANE_SEQUENCE_JOURNAL_FAULT
+            .with(|fault| fault.set(Some(PaneSequenceJournalFault::AppendBeforeSync)));
+        let failed = store.prune_before(1, 4);
+        PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(None));
+        assert!(failed.is_err());
+        assert_eq!(store.oldest_seq(1), Some(2));
+        let complete_journal = std::fs::read(dir.path().join("1.seq")).unwrap();
+        assert_eq!(complete_journal, b"FTSEQ1:2\nFTSEQ1:4\n");
+        assert!(matches!(
+            store.prune_before(1, 3),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+        assert!(matches!(
+            store
+                .panes
+                .get_mut(&1)
+                .unwrap()
+                .compact_retained_prefix(None),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join("1.seq")).unwrap(),
+            complete_journal
+        );
+        assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), old_log);
+        store.prune_before(1, 4).unwrap();
+        assert_eq!(store.oldest_seq(1), Some(4));
+        assert_eq!(
+            std::fs::read(dir.path().join("1.seq")).unwrap(),
+            b"FTSEQ1:4\n"
+        );
+        assert_eq!(PaneFile::open(dir.path(), 1).unwrap().oldest_seq(), Some(4));
+    }
+
+    #[test]
+    fn reopening_a_torn_sequence_tail_checkpoints_before_the_next_prune() {
+        let dir = temp_dir();
+        {
+            let mut store = file_only_store(dir.path());
+            store.append_lines(1, &["row"; 10]).unwrap();
+            store.prune_before(1, 2).unwrap();
+        }
+        let path = dir.path().join("1.seq");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"FTSEQ1:5")
+            .unwrap();
+        let mut reopened = PaneFile::open(dir.path(), 1).unwrap();
+        assert_eq!(reopened.oldest_seq(), Some(2));
+        assert!(reopened.base_seq_journal_needs_checkpoint);
+        reopened.prune_before(3).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"FTSEQ1:3\n");
+        assert_eq!(PaneFile::open(dir.path(), 1).unwrap().oldest_seq(), Some(3));
+    }
+
+    #[test]
+    fn checkpoint_never_discards_malformed_or_nonmonotonic_complete_records() {
+        for suffix in [b"not-a-record\n".as_slice(), b"FTSEQ1:1\n".as_slice()] {
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            store.append_lines(1, &["row"; 10]).unwrap();
+            store.prune_before(1, 2).unwrap();
+            let path = dir.path().join("1.seq");
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix)
+                .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                store.prune_before(1, 3),
+                Err(MmapStoreError::InvalidPaneLogHeader(_))
+            ));
+            assert_eq!(store.oldest_seq(1), Some(2));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(
+                store
+                    .panes
+                    .get(&1)
+                    .unwrap()
+                    .base_seq_checkpoint_stage
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_substituted_active_or_pending_journal_paths() {
+        use std::os::unix::fs::symlink;
+
+        for substitute_pending in [false, true] {
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            store.append_lines(1, &["row"; 10]).unwrap();
+            store.prune_before(1, 6).unwrap();
+            let pane = store.panes.get_mut(&1).unwrap();
+            let path = if substitute_pending {
+                PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| {
+                    fault.set(Some(PaneSequenceJournalFault::CheckpointPartialWrite));
+                });
+                let failed = pane.checkpoint_base_seq(6);
+                PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(None));
+                assert!(failed.is_err());
+                pane.base_seq_checkpoint_stage
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .clone()
+            } else {
+                dir.path().join("1.seq")
+            };
+            let target = dir.path().join("unrelated-sequence-target");
+            std::fs::write(&target, b"do-not-adopt-or-modify").unwrap();
+            std::fs::rename(&path, dir.path().join("retained-displaced-journal")).unwrap();
+            symlink(&target, &path).unwrap();
+            assert!(pane.checkpoint_base_seq(6).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"do-not-adopt-or-modify");
+            assert_eq!(pane.oldest_seq(), Some(6));
+            if substitute_pending {
+                assert_eq!(
+                    std::fs::read(dir.path().join("1.seq")).unwrap(),
+                    b"FTSEQ1:6\n"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4805,7 +5991,12 @@ mod tests {
                 .unwrap();
         }
         store.prune_before(1, 4).unwrap();
-        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+        let ceiling = store.file_bytes(1);
+        assert!(
+            store
+                .compact_pane_if_stale_keeping(1, 1, None, Some(ceiling))
+                .unwrap()
+        );
 
         let raw = std::fs::read(dir.path().join("1.log")).unwrap();
         let paths = erasure_sidecar_paths(dir.path(), 1);
@@ -5288,6 +6479,89 @@ mod tests {
             2,
             "one deterministic transaction owns exactly one .log/.seq pair"
         );
+    }
+
+    #[test]
+    fn interrupted_replacement_slot_is_set_aside_and_staged_again() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let records = vec!["first".to_string(), "second".to_string()];
+        let set_aside = |replacement_id: u64| -> Vec<Vec<u8>> {
+            let mut kept: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with(&format!(".{replacement_id}."))
+                        && name.contains(".interrupted-")
+                })
+                .map(|entry| entry.path())
+                .collect();
+            kept.sort();
+            kept.into_iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect()
+        };
+        // A write that failed after one record and part of the next, a crash
+        // between the set-aside renames, and a crash between creating the
+        // log and its journal: (slot, log bytes, journal bytes, records).
+        type Case<'a> = (u64, Option<&'a [u8]>, Option<&'a [u8]>, &'a [String]);
+        let cases: [Case<'_>; 3] = [
+            (0x260, Some(b"first\nsec"), Some(b""), &records),
+            (0x261, None, Some(b""), &records),
+            (0x262, Some(b""), None, &[]),
+        ];
+        for (low, log, sequence, expected) in cases {
+            let replacement_id = (1_u64 << 63) | low;
+            let log_path = dir.path().join(format!("{replacement_id}.log"));
+            let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+            if let Some(bytes) = log {
+                std::fs::write(&log_path, bytes).unwrap();
+            }
+            if let Some(bytes) = sequence {
+                std::fs::write(&sequence_path, bytes).unwrap();
+            }
+            let committed =
+                u64::try_from(expected.iter().map(|r| r.len() + 1).sum::<usize>()).unwrap();
+            let staged = store
+                .stage_versioned_pane_replacement(
+                    replacement_id,
+                    expected,
+                    expected.len(),
+                    committed,
+                )
+                .expect("an interrupted attempt must not block its retry");
+            assert!(staged.set_aside_interrupted());
+            assert!(!staged.reused_existing());
+            assert_eq!(staged.record_count(), expected.len());
+            let mut kept: Vec<Vec<u8>> = [log, sequence]
+                .into_iter()
+                .flatten()
+                .map(<[u8]>::to_vec)
+                .collect();
+            kept.sort();
+            let mut retained = set_aside(replacement_id);
+            retained.sort();
+            assert_eq!(retained, kept, "every interrupted file is retained");
+            store
+                .verify_staged_pane_ledger(staged, expected)
+                .expect("the restaged slot holds this transaction exactly");
+        }
+
+        // A journal entry or a header means the slot is not this
+        // transaction's interrupted stage: refuse it, untouched.
+        let replacement_id = (1_u64 << 63) | 0x263;
+        let log_path = dir.path().join(format!("{replacement_id}.log"));
+        let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+        std::fs::write(&log_path, b"first\n").unwrap();
+        std::fs::write(&sequence_path, b"FTSEQ1:0\n").unwrap();
+        assert!(
+            store
+                .stage_versioned_pane_replacement(replacement_id, &records, 2, 13)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"first\n");
+        assert!(set_aside(replacement_id).is_empty());
     }
 
     #[test]
@@ -6211,8 +7485,8 @@ mod tests {
 
     /// ft-yccm0.2.1.4: pruned rows stay readable in the pruned tail, only
     /// through lines_range_reaching_pruned, until a compaction drops them. A
-    /// compaction or a journal-compacting prune that keeps from a tail row
-    /// keeps that row and every later one, across reopen; reachable-row
+    /// compaction that keeps from a tail row keeps that row and every later
+    /// one, across reopen; independent journal checkpoints never alter it. Reachable-row
     /// accounting never includes the tail.
     #[test]
     fn pruned_tail_rows_stay_readable_until_a_compaction_drops_them() {
@@ -6237,7 +7511,12 @@ mod tests {
             );
             let reachable = store.retained_record_bytes(5);
             // Compaction keeping from row 4 keeps rows 4 and 5 readable.
-            assert!(store.compact_pane_if_stale_keeping(5, 1, Some(4)).unwrap());
+            let ceiling = store.file_bytes(5);
+            assert!(
+                store
+                    .compact_pane_if_stale_keeping(5, 1, Some(4), Some(ceiling))
+                    .unwrap()
+            );
             assert_eq!(store.retained_record_bytes(5), reachable);
             assert_eq!(store.pruned_tail_start(5), Some(4));
             assert!(

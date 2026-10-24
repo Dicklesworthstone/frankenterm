@@ -65,7 +65,7 @@ impl Into<ColorAttribute> for SmallColor {
 /// The setter methods return a mutable self reference so that they can
 /// be chained together.
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq)]
 pub struct CellAttributes {
     attributes: u32,
     /// The foreground color
@@ -76,6 +76,29 @@ pub struct CellAttributes {
     /// allocated struct in order to keep CellAttributes
     /// smaller in the common case.
     fat: Option<Box<FatAttributes>>,
+}
+
+/// Field for field what `derive(PartialEq)` compares, with the rare deep
+/// comparison of two fat attribute sets kept out of line. The derived body
+/// carried that comparison inline, which kept this comparison (on every
+/// scroll and every appended cell run) a call.
+impl PartialEq for CellAttributes {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.attributes == other.attributes
+            && self.foreground == other.foreground
+            && self.background == other.background
+            && match (&self.fat, &other.fat) {
+                (None, None) => true,
+                (Some(left), Some(right)) => fat_attributes_eq(left, right),
+                _ => false,
+            }
+    }
+}
+
+#[inline(never)]
+fn fat_attributes_eq(left: &FatAttributes, right: &FatAttributes) -> bool {
+    left == right
 }
 
 impl core::fmt::Debug for CellAttributes {
@@ -92,6 +115,7 @@ impl core::fmt::Debug for CellAttributes {
             .field("wrapped", &self.wrapped())
             .field("overline", &self.overline())
             .field("semantic_type", &self.semantic_type())
+            .field("protected", &self.protected())
             .field("foreground", &self.foreground)
             .field("background", &self.background)
             .field("fat", &self.fat)
@@ -700,6 +724,12 @@ impl CellAttributes {
     bitfield!(overline, set_overline, 12);
     bitfield!(semantic_type, set_semantic_type, SemanticType, 0b11, 13);
     bitfield!(vertical_align, set_vertical_align, VerticalAlign, 0b11, 15);
+    // The character protection attribute: xterm's PROTECTED (ptyx.h), set on
+    // the pen by DECSCA 1 and SPA and cleared by DECSCA 0/2 and EPA. A
+    // protected cell survives DECSED and DECSEL, and also ED, EL and ECH
+    // while the last protection mode set was SPA's (charproc.c CASE_DECSCA,
+    // CASE_SPA, CASE_EPA; util.c ClearInLine2).
+    bitfield!(protected, set_protected, 17);
 
     pub const fn blank() -> Self {
         Self {
@@ -708,6 +738,49 @@ impl CellAttributes {
             background: SmallColor::Default,
             fat: None,
         }
+    }
+
+    /// The foreground and background as a packed page cell's palette codes
+    /// (0 for the default color, else the palette index plus one), when no
+    /// fat attributes are set: both colors are then default or palette
+    /// colors and the underline color is the default, so the style fits
+    /// inline. `None` otherwise.
+    #[inline]
+    pub fn inline_color_codes(&self) -> Option<(u16, u16)> {
+        if self.fat.is_some() {
+            return None;
+        }
+        let code = |color: SmallColor| match color {
+            SmallColor::Default => 0,
+            SmallColor::PaletteIndex(index) => u16::from(index) + 1,
+        };
+        Some((code(self.foreground), code(self.background)))
+    }
+
+    /// The style attributes a packed page cell keeps inline, in its order:
+    /// intensity 2 bits, underline 3, blink 2, italic, reverse,
+    /// strikethrough, invisible, overline, vertical align 2. That is every
+    /// attribute but wrap, semantic type and protection, each decoded as its
+    /// getter decodes it (a value no setter stores reads as the default),
+    /// read straight off the bitfield rather than through each getter.
+    #[inline]
+    pub fn inline_style_bits(&self) -> u16 {
+        let a = self.attributes;
+        // Intensity through invisible keep their positions (bits 0-10).
+        let mut bits = (a & 0x7ff) | (((a >> 12) & 1) << 11) | (((a >> 15) & 0b11) << 12);
+        if a & 0b11 == 0b11 {
+            bits &= !0b11;
+        }
+        if (a >> 2) & 0b111 > 5 {
+            bits &= !(0b111 << 2);
+        }
+        if (a >> 5) & 0b11 == 0b11 {
+            bits &= !(0b11 << 5);
+        }
+        if (a >> 15) & 0b11 == 0b11 {
+            bits &= !(0b11 << 12);
+        }
+        bits as u16
     }
 
     /// Returns true if the attribute bits in both objects are equal.
@@ -860,6 +933,18 @@ impl CellAttributes {
         self
     }
 
+    /// Replace the cell's images with `images`, kept in the order given,
+    /// which the caller keeps in z-index order as `attach_image` does: how a
+    /// checkpoint restores a list exactly, equal z-indexes included.
+    pub fn set_images(&mut self, images: Vec<Box<ImageCell>>) -> &mut Self {
+        if images.is_empty() {
+            return self.clear_images();
+        }
+        self.allocate_fat_attributes();
+        self.fat.as_mut().unwrap().image = images;
+        self
+    }
+
     /// Clear all images from a cell
     pub fn clear_images(&mut self) -> &mut Self {
         if let Some(fat) = self.fat.as_mut() {
@@ -948,7 +1033,27 @@ impl CellAttributes {
         res.set_underline(Underline::None);
         res.set_overline(false);
         res.set_strikethrough(false);
+        // An erased or inserted blank is never protected: xterm's ClearCells
+        // (screen.c) stores only the colour flags with the blank.
+        res.set_protected(false);
         res
+    }
+
+    /// Whether [`Self::clone_sgr_only`] is [`Self::blank`], without building
+    /// the clone: the test a line feed makes for the row it adds.
+    #[inline]
+    pub fn sgr_only_is_blank(&self) -> bool {
+        // The bits `clone_sgr_only` resets: underline, strikethrough,
+        // overline, semantic type and protection.
+        const RESET: u32 = (0b111 << 2) | (1 << 9) | (1 << 12) | (0b11 << 13) | (1 << 17);
+        self.attributes & !RESET == 0
+            && self.foreground == SmallColor::Default
+            && self.background == SmallColor::Default
+            && self.fat.as_ref().is_none_or(|fat| {
+                fat.foreground == ColorAttribute::Default
+                    && fat.background == ColorAttribute::Default
+                    && fat.underline_color == ColorAttribute::Default
+            })
     }
 
     pub fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
@@ -961,6 +1066,7 @@ impl CellAttributes {
     /// This intentionally does not clone the image descriptors.  Persistence
     /// preflights use it to reject unsupported graphics before allocating a
     /// terminal checkpoint projection.
+    #[inline]
     pub fn has_image_attachments(&self) -> bool {
         #[cfg(feature = "use_image")]
         {
@@ -1033,7 +1139,7 @@ fn deserialize_teenystring<'de, D>(deserializer: D) -> Result<TeenyString, D::Er
 where
     D: Deserializer<'de>,
 {
-    let text = Zeroizing::new(String::deserialize(deserializer)?);
+    let text = Zeroizing::new(alloc::string::String::deserialize(deserializer)?);
     Ok(TeenyString::from_str(&text, None, None))
 }
 
@@ -1154,6 +1260,39 @@ impl TeenyString {
         }
     }
 
+    /// The inline word holding `bytes` (fewer than 8): each byte at the
+    /// offset in the word's memory that copying `bytes` into it gives,
+    /// assembled in a register (ft-yccm0.3.2.6). The copy took a memmove
+    /// call, and reading the word back after it stalled, on every non-ASCII
+    /// cell written.
+    fn inline_word(bytes: &[u8]) -> u64 {
+        let mut word = 0u64;
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let shift = if cfg!(target_endian = "little") {
+                8 * offset
+            } else {
+                56 - 8 * offset
+            };
+            word |= u64::from(byte) << shift;
+        }
+        word
+    }
+
+    /// `FT_CELL_TEXT_WORD_COPY=1` makes `from_str` copy short text into its
+    /// inline word through memory, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. Both build the same word. Resolved once per process.
+    fn word_copies() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *COPY.get_or_init(|| {
+                std::env::var_os("FT_CELL_TEXT_WORD_COPY").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
+    }
+
     pub fn from_str(
         s: &str,
         width: Option<usize>,
@@ -1184,14 +1323,19 @@ impl TeenyString {
         let width = explicit_width.unwrap_or_else(|| grapheme_column_width(s, unicode_version));
 
         if len < core::mem::size_of::<u64>() && width < 3 {
-            let mut word = 0u64;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut word as *mut u64 as *mut u8,
-                    len,
-                );
-            }
+            let word = if Self::word_copies() {
+                let mut word = 0u64;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut word as *mut u64 as *mut u8,
+                        len,
+                    );
+                }
+                word
+            } else {
+                Self::inline_word(bytes)
+            };
             let word = Self::set_marker_bit(word as u64, width);
             Self(word)
         } else {
@@ -1868,6 +2012,26 @@ mod test {
             1
         );
 
+        // ft-vylyj: a keycap's VS16 widens it like any other variation
+        // sequence, although the keycap mark follows the selector.
+        for keycap in [
+            "1\u{FE0F}\u{20E3}",
+            "#\u{FE0F}\u{20E3}",
+            "*\u{FE0F}\u{20E3}",
+        ] {
+            assert_eq!(
+                Graphemes::new(keycap).collect::<Vec<_>>(),
+                vec![keycap.to_string()]
+            );
+            assert_eq!(unicode_column_width(keycap, None), 2, "{keycap:?}");
+            assert_eq!(
+                unicode_column_width(keycap, Some(&UnicodeVersion::new(9))),
+                1,
+                "{keycap:?}"
+            );
+        }
+        assert_eq!(unicode_column_width("1\u{FE0E}\u{20E3}", None), 1);
+
         let copyright_text_presentation = "\u{00A9}";
         assert_eq!(
             Graphemes::new(copyright_text_presentation).collect::<Vec<_>>(),
@@ -2402,6 +2566,156 @@ mod test {
         assert!(!cloned.strikethrough());
     }
 
+    #[test]
+    fn clone_sgr_only_clears_protection_and_keeps_the_rest() {
+        let mut a = CellAttributes::blank();
+        a.set_protected(true)
+            .set_reverse(true)
+            .set_background(ColorAttribute::PaletteIndex(4));
+        let cloned = a.clone_sgr_only();
+        assert!(!cloned.protected());
+        assert!(cloned.reverse());
+        assert_eq!(cloned.background(), ColorAttribute::PaletteIndex(4));
+    }
+
+    #[test]
+    fn inline_color_codes_are_the_palette_codes_of_small_colors() {
+        let code = |color: ColorAttribute| match color {
+            ColorAttribute::Default => Some(0),
+            ColorAttribute::PaletteIndex(index) => Some(u16::from(index) + 1),
+            _ => None,
+        };
+        let colors = [
+            ColorAttribute::Default,
+            ColorAttribute::PaletteIndex(0),
+            ColorAttribute::PaletteIndex(255),
+            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.5, 0.25, 0.0, 1.0)),
+        ];
+        for fg in colors {
+            for bg in colors {
+                for underline in [ColorAttribute::Default, ColorAttribute::PaletteIndex(3)] {
+                    let mut a = CellAttributes::blank();
+                    a.set_foreground(fg)
+                        .set_background(bg)
+                        .set_underline_color(underline);
+                    let colors = (code(a.foreground()), code(a.background()));
+                    let expected = match (colors, a.underline_color()) {
+                        ((Some(fg), Some(bg)), ColorAttribute::Default) => Some((fg, bg)),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        a.inline_color_codes(),
+                        expected,
+                        "{fg:?} {bg:?} {underline:?}"
+                    );
+                }
+            }
+        }
+        // A hyperlink takes fat attributes: the general classification
+        // handles that pen.
+        let mut linked = CellAttributes::blank();
+        linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        assert_eq!(linked.inline_color_codes(), None);
+    }
+
+    #[test]
+    fn inline_style_bits_decode_as_the_getters_do() {
+        // Every pattern of the 18 attribute bits, values no setter stores
+        // included, plus garbage above them.
+        let reference = |a: &CellAttributes| -> u16 {
+            let intensity = match a.intensity() {
+                Intensity::Normal => 0,
+                Intensity::Bold => 1,
+                Intensity::Half => 2,
+            };
+            let underline = match a.underline() {
+                Underline::None => 0,
+                Underline::Single => 1,
+                Underline::Double => 2,
+                Underline::Curly => 3,
+                Underline::Dotted => 4,
+                Underline::Dashed => 5,
+            };
+            let blink = match a.blink() {
+                Blink::None => 0,
+                Blink::Slow => 1,
+                Blink::Rapid => 2,
+            };
+            let vertical_align = match a.vertical_align() {
+                VerticalAlign::BaseLine => 0,
+                VerticalAlign::SuperScript => 1,
+                VerticalAlign::SubScript => 2,
+            };
+            intensity
+                | (underline << 2)
+                | (blink << 5)
+                | (u16::from(a.italic()) << 7)
+                | (u16::from(a.reverse()) << 8)
+                | (u16::from(a.strikethrough()) << 9)
+                | (u16::from(a.invisible()) << 10)
+                | (u16::from(a.overline()) << 11)
+                | (vertical_align << 12)
+        };
+        let mut a = CellAttributes::blank();
+        for bits in (0..1_u32 << 18).chain([0xfffc_0000, u32::MAX]) {
+            a.attributes = bits;
+            assert_eq!(a.inline_style_bits(), reference(&a), "{bits:#x}");
+        }
+    }
+
+    #[test]
+    fn sgr_only_is_blank_answers_as_the_clone() {
+        // No bit, then each attribute bit alone, under every mix of the
+        // colors and extras `clone_sgr_only` keeps or drops.
+        let colors = [
+            ColorAttribute::Default,
+            ColorAttribute::PaletteIndex(4),
+            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.5, 0.25, 0.0, 1.0)),
+        ];
+        for bit in core::iter::once(None).chain((0..32).map(Some)) {
+            for fg in colors {
+                for bg in colors {
+                    for underline_color in colors {
+                        for link in [false, true] {
+                            let mut a = CellAttributes::blank();
+                            if let Some(bit) = bit {
+                                a.attributes |= 1 << bit;
+                            }
+                            a.set_foreground(fg)
+                                .set_background(bg)
+                                .set_underline_color(underline_color);
+                            if link {
+                                let link = Hyperlink::new("https://example.com");
+                                a.set_hyperlink(Some(Arc::new(link)));
+                            }
+                            assert_eq!(
+                                a.sgr_only_is_blank(),
+                                a.clone_sgr_only() == CellAttributes::blank(),
+                                "bit {bit:?} fg {fg:?} bg {bg:?} underline {underline_color:?} \
+                                 link {link}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bitfield_protected_is_its_own_bit() {
+        let mut a = CellAttributes::blank();
+        a.set_vertical_align(VerticalAlign::SubScript)
+            .set_semantic_type(SemanticType::Prompt);
+        let before = a.clone();
+        a.set_protected(true);
+        assert!(a.protected());
+        assert_eq!(a.vertical_align(), VerticalAlign::SubScript);
+        assert_eq!(a.semantic_type(), SemanticType::Prompt);
+        assert!(!a.attribute_bits_equal(&before));
+        a.set_protected(false);
+        assert_eq!(a, before);
+    }
+
     // ── CellAttributes: apply_change ────────────────────────
 
     #[test]
@@ -2517,6 +2831,64 @@ mod test {
     }
 
     // ── TeenyString extras ──────────────────────────────────
+
+    /// ft-yccm0.3.2.6: the inline word assembled in a register is the word
+    /// copying the text into memory gives, for every length an inline word
+    /// holds, every byte value at every offset, and random byte strings.
+    #[test]
+    fn inline_word_matches_copying_the_text_into_the_word() {
+        let copied = |bytes: &[u8]| {
+            let mut word = [0u8; 8];
+            word[..bytes.len()].copy_from_slice(bytes);
+            u64::from_ne_bytes(word)
+        };
+        for len in 1..8 {
+            for offset in 0..len {
+                for byte in 0..=255u8 {
+                    let mut bytes = [b'a'; 7];
+                    bytes[offset] = byte;
+                    let bytes = &bytes[..len];
+                    assert_eq!(TeenyString::inline_word(bytes), copied(bytes), "{bytes:?}");
+                }
+            }
+        }
+        let mut seed = 0x2026_1008_u64;
+        for _ in 0..200_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = 1 + (seed >> 61) as usize % 7;
+            let bytes = (seed >> 3).to_ne_bytes();
+            let bytes = &bytes[..len];
+            assert_eq!(TeenyString::inline_word(bytes), copied(bytes), "{bytes:?}");
+        }
+    }
+
+    /// ft-yccm0.3.2.6: every scalar value, and every T0 emoji with a
+    /// selector, a skin tone or a ZWJ join, keeps its text and explicit
+    /// width in a cell, through whichever word builder the process uses.
+    #[test]
+    fn short_cell_text_reads_back_as_written() {
+        use alloc::string::String;
+        let mut texts: Vec<String> = (0..=0x10_FFFFu32)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_ascii_control())
+            .map(String::from)
+            .collect();
+        for emoji in 0x1F600..0x1F650u32 {
+            let emoji = char::from_u32(emoji).unwrap();
+            texts.push(format!("{emoji}\u{FE0F}"));
+            texts.push(format!("{emoji}\u{1F3FB}"));
+            texts.push(format!("{emoji}\u{200D}"));
+        }
+        for text in &texts {
+            for width in [1, 2] {
+                let cell = Cell::new_grapheme_with_width(text, width, CellAttributes::blank());
+                assert_eq!(cell.str(), text.as_str());
+                assert_eq!(cell.width(), width, "{:?}", text);
+            }
+        }
+    }
 
     #[test]
     fn teeny_string_clone_inline() {

@@ -12,6 +12,7 @@ use crate::redactor::{BytesRedactionEvidence, RedactionResult, StreamingRedactor
 use crate::scrollback_mmap_format::{
     HEADER_SIZE, HeaderFlags, RECORD_HEADER_SIZE, RecordHeader, RecordKind, ScrollbackHeader,
 };
+use crate::system_symlinks::resolve_system_symlinks;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
@@ -2515,7 +2516,14 @@ fn validate_owner_against_directory(
     Ok(())
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
+    open_resolved_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -2536,7 +2544,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_directory_tree_nofollow(parent_path)?;
     parent.open_dir_nofollow(leaf)
 }
 
@@ -2546,7 +2554,19 @@ fn ensure_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
     })
 }
 
+/// Like [`open_directory_tree_nofollow`], creating the directories that are
+/// missing.
 fn ensure_directory_tree_nofollow_with_sync<F>(
+    path: &Path,
+    sync_parent: &mut F,
+) -> std::io::Result<CapDir>
+where
+    F: FnMut(&CapDir, LinearRecordSourceIdentity) -> std::io::Result<()>,
+{
+    ensure_resolved_directory_tree_nofollow_with_sync(&resolve_system_symlinks(path), sync_parent)
+}
+
+fn ensure_resolved_directory_tree_nofollow_with_sync<F>(
     path: &Path,
     sync_parent: &mut F,
 ) -> std::io::Result<CapDir>
@@ -2573,7 +2593,7 @@ where
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = ensure_directory_tree_nofollow_with_sync(parent_path, sync_parent)?;
+    let parent = ensure_resolved_directory_tree_nofollow_with_sync(parent_path, sync_parent)?;
     let parent_identity = metadata_identity(&parent.dir_metadata()?);
     let publication_required = match parent.symlink_metadata(leaf) {
         Ok(_) => false,

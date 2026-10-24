@@ -1,0 +1,9 @@
+build B 16:13:38
+build A 16:22:45
+run 1 arm B: title evaluations=0 with-token=0 16:23:32
+run 2 arm A: title evaluations=1 with-token=1 16:24:03
+run 3 arm B: title evaluations=0 with-token=0 16:24:33
+run 4 arm A: title evaluations=1 with-token=1 16:25:03
+run 5 arm B: title evaluations=0 with-token=0 16:25:33
+run 6 arm A: title evaluations=1 with-token=1 16:26:03
+done

@@ -50,7 +50,32 @@ const MAX_OUTPUT_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
+/// A connection refused for want of a slot is logged at most this often.
+const CAPACITY_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A checkpoint Stage step can make the guardian authenticate and publish a
+/// whole checkpoint before it replies. A missed I/O deadline on a pane's own
+/// connection costs the pane its lease, so these steps wait as long as a
+/// whole-mux capture may take.
+const CHECKPOINT_STAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request waits for the protocol authority a job holds before
+/// closing retryably; below the client's I/O deadline.
+const CHECKPOINT_AUTHORITY_WAIT: Duration = Duration::from_secs(4);
+/// The same wait for a Stage step or catalog adoption, whose client allows
+/// `CHECKPOINT_STAGE_IO_TIMEOUT`: another pane's Seal or adoption can hold
+/// the authority for several seconds on a loaded host, and closing the
+/// waiting step at four seconds failed a capture its client would have
+/// finished.
+const CHECKPOINT_STAGE_AUTHORITY_WAIT: Duration = Duration::from_secs(25);
+
+const fn checkpoint_authority_wait(operation: GuardianOperation) -> Duration {
+    match operation {
+        GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint => {
+            CHECKPOINT_STAGE_AUTHORITY_WAIT
+        }
+        _ => CHECKPOINT_AUTHORITY_WAIT,
+    }
+}
 const TOKEN_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
@@ -274,6 +299,13 @@ struct DeferredGuardianReplay {
     route: GuardianCheckpointRoute,
     effect_lease: Option<GuardianTokenEffectLease>,
     deadline: Instant,
+    /// When the request arrived: a replay wait that first waited for the
+    /// protocol authority still owes its client only `wait_millis` from here.
+    parked_at: Instant,
+    /// A synchronous request (a probe, a census page, a child observation)
+    /// that met the protocol authority out with a job: served by `dispatch`,
+    /// not the checkpoint worker, once the authority returns.
+    dispatch: bool,
     #[cfg(test)]
     wipe_probe: Option<Arc<AtomicBool>>,
 }
@@ -291,9 +323,30 @@ impl DeferredGuardianReplay {
             route,
             effect_lease: Some(effect_lease),
             deadline,
+            parked_at: Instant::now(),
+            dispatch: false,
             #[cfg(test)]
             wipe_probe: None,
         }
+    }
+
+    fn new_dispatch(
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        effect_lease: GuardianTokenEffectLease,
+        deadline: Instant,
+    ) -> Self {
+        let mut deferred = Self::new(request, route, effect_lease, deadline);
+        deferred.dispatch = true;
+        deferred
+    }
+
+    /// Whether a replay wait has used the `wait_millis` its client asked for,
+    /// counted from arrival, not from when a busy authority came back.
+    fn replay_wait_elapsed(&self, now: Instant, wait_millis: u16) -> bool {
+        self.parked_at
+            .checked_add(Duration::from_millis(u64::from(wait_millis)))
+            .is_none_or(|release| now >= release)
     }
 
     #[cfg(test)]
@@ -954,6 +1007,8 @@ pub struct GuardianService {
     free_connection_tokens: Vec<usize>,
     poll_interval: Duration,
     transport_failures: u64,
+    /// When a connection refused for want of a slot was last logged.
+    capacity_refusal_logged_at: Option<Instant>,
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
     next_connection_generation: u64,
@@ -1077,6 +1132,7 @@ impl GuardianService {
             free_connection_tokens,
             poll_interval: config.poll_interval,
             transport_failures: 0,
+            capacity_refusal_logged_at: None,
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
             next_connection_generation: 1,
@@ -1158,12 +1214,15 @@ impl GuardianService {
         bounded_replay_poll_timeout(
             self.poll_interval,
             now,
-            self.connections.values().filter_map(|connection| {
-                connection
-                    .deferred_replay
-                    .as_ref()
-                    .map(|deferred| deferred.deadline)
-            }),
+            self.connections
+                .values()
+                .filter_map(|connection| {
+                    connection
+                        .deferred_replay
+                        .as_ref()
+                        .map(|deferred| deferred.deadline)
+                })
+                .chain(self.runtime.next_broker_read_retry(now)),
         )
     }
 
@@ -1171,7 +1230,12 @@ impl GuardianService {
         if self.lifecycle == GuardianLifecycle::ExitReady {
             return Ok(());
         }
-        self.token_authority.validate()?;
+        // The token authority is validated once per batch, after the poll
+        // and before any event in it is handled. Validating it before the
+        // poll too made every wakeup pay for two validations (each two
+        // descriptor-relative reopens, a material digest and a parent
+        // walk); with 24 panes printing, token validation was a quarter of
+        // the main thread.
         self.socket_authority.validate()?;
         let poll_timeout = self.next_poll_timeout(Instant::now());
         match self.poll.poll(&mut self.events, Some(poll_timeout)) {
@@ -1268,7 +1332,7 @@ impl GuardianService {
                 continue;
             }
             let Some(raw_token) = self.free_connection_tokens.pop() else {
-                self.transport_failures = self.transport_failures.saturating_add(1);
+                self.refuse_for_capacity();
                 continue;
             };
             let generation = self.next_connection_generation;
@@ -1289,10 +1353,14 @@ impl GuardianService {
                 self.transport_failures = self.transport_failures.saturating_add(1);
                 continue;
             }
-            if self.mux_connections.observe_accept(identity).is_err() {
+            if let Err(error) = self.mux_connections.observe_accept(identity) {
                 let _ = self.poll.registry().deregister(&mut stream);
                 self.free_connection_tokens.push(raw_token);
-                self.transport_failures = self.transport_failures.saturating_add(1);
+                if error == MuxConnectionTrackingError::CapacityExhausted {
+                    self.refuse_for_capacity();
+                } else {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                }
                 continue;
             }
             self.next_connection_generation = next_generation;
@@ -1300,6 +1368,25 @@ impl GuardianService {
                 .insert(token, Connection::new(stream, generation));
         }
         Ok(())
+    }
+
+    /// A connection accepted with every slot in use is closed at once: its
+    /// client reads end of file. A mux spawn then fails mid-claim and leaves
+    /// a fenced birth (ft-bxeig), so say why in the service log.
+    fn refuse_for_capacity(&mut self) {
+        self.transport_failures = self.transport_failures.saturating_add(1);
+        let now = Instant::now();
+        if self
+            .capacity_refusal_logged_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= CAPACITY_REFUSAL_LOG_INTERVAL)
+        {
+            self.capacity_refusal_logged_at = Some(now);
+            log::warn!(
+                "guardian closed a new connection: all {} connection slots are in use \
+                 (a mux holds three per pane; see --max-connections)",
+                self.mux_connections.max_connections
+            );
+        }
     }
 
     fn drive_connection(&mut self, event: ReadyEvent) {
@@ -1668,6 +1755,40 @@ impl GuardianService {
                             return FrameProcessing::PendingCheckpoint;
                         }
                     }
+                    if matches!(
+                        self.runtime.replay_wait_readiness(&request),
+                        GuardianReplayWaitReadiness::AuthorityInFlight
+                    ) {
+                        // The sole protocol authority is out with a job (a
+                        // checkpoint step, an output commit). Closing made a
+                        // mux's capture fail mid-publication and leave a
+                        // checkpoint no recovery root names; wait for the
+                        // authority instead, bounded below the client's I/O
+                        // deadline, exactly as a replay wait does.
+                        let Some(deadline) = Instant::now()
+                            .checked_add(checkpoint_authority_wait(request.header().operation))
+                        else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        if connection.deferred_replay.is_some() {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        }
+                        let Some(effect_lease) = effect_lease.take() else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        connection.pending_checkpoint = Some(route);
+                        connection.deferred_replay = Some(DeferredGuardianReplay::new(
+                            request,
+                            route,
+                            effect_lease,
+                            deadline,
+                        ));
+                        self.runtime.record_replay_wait_deferred();
+                        return FrameProcessing::PendingCheckpoint;
+                    }
                     let Some(effect_lease) = effect_lease.take() else {
                         request.zeroize_payload();
                         return FrameProcessing::Close;
@@ -1687,6 +1808,44 @@ impl GuardianService {
                         }
                         GuardianCheckpointSubmission::CloseRetryably => FrameProcessing::Close,
                     };
+                }
+                if matches!(
+                    self.runtime.replay_wait_readiness(&request),
+                    GuardianReplayWaitReadiness::AuthorityInFlight
+                ) {
+                    // A probe, census page or child observation meets the
+                    // authority out with a job almost every time on a busy
+                    // guardian; closing it made upgrade verification and
+                    // child observation fail for a minute at a time. Wait for
+                    // the authority as a checkpoint request does.
+                    let (Some(route), Some(deadline)) = (
+                        GuardianCheckpointRoute::new(
+                            token,
+                            connection.generation,
+                            request.header().request_id,
+                        ),
+                        Instant::now().checked_add(CHECKPOINT_AUTHORITY_WAIT),
+                    ) else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    if connection.deferred_replay.is_some() {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    }
+                    let Some(effect_lease) = effect_lease.take() else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    connection.pending_checkpoint = Some(route);
+                    connection.deferred_replay = Some(DeferredGuardianReplay::new_dispatch(
+                        request,
+                        route,
+                        effect_lease,
+                        deadline,
+                    ));
+                    self.runtime.record_replay_wait_deferred();
+                    return FrameProcessing::PendingCheckpoint;
                 }
                 let response = self.runtime.dispatch(&request);
                 request.zeroize_payload();
@@ -1830,7 +1989,13 @@ impl GuardianService {
                 .map_or(GuardianReplayWaitReadiness::Immediate, |request| {
                     self.runtime.replay_wait_readiness(request)
                 });
+            let wait_elapsed = matches!(
+                readiness,
+                GuardianReplayWaitReadiness::Pending { wait_millis }
+                    if deferred.replay_wait_elapsed(now, wait_millis)
+            );
             if now >= deferred.deadline
+                || wait_elapsed
                 || matches!(readiness, GuardianReplayWaitReadiness::Immediate)
             {
                 self.deferred_replay_tokens
@@ -1866,7 +2031,10 @@ impl GuardianService {
                     self.connections.insert(token, connection);
                     continue;
                 }
-                GuardianReplayWaitReadiness::Pending { .. } if !deadline_elapsed => {
+                GuardianReplayWaitReadiness::Pending { wait_millis }
+                    if !deadline_elapsed
+                        && !deferred.replay_wait_elapsed(Instant::now(), wait_millis) =>
+                {
                     connection.deferred_replay = Some(deferred);
                     self.connections.insert(token, connection);
                     continue;
@@ -1879,7 +2047,43 @@ impl GuardianService {
                 }
             }
 
+            // A guarded stop may have fenced requests while this one waited:
+            // answer it exactly as the fence answers a fresh frame, never
+            // spawn or mutate on behalf of a guardian that is draining.
+            if self.lifecycle.request_fence().is_err() {
+                let Some((mut request, _effect_lease)) = deferred.take_submission() else {
+                    self.finish_connection(token, connection);
+                    continue;
+                };
+                connection.close_after_write = true;
+                let response = GuardianResponseEnvelope::rejection(
+                    &request,
+                    GuardianRejectionCode::InvalidRequest,
+                );
+                request.zeroize_payload();
+                self.route_checkpoint_response(token, connection, Some(response));
+                continue;
+            }
             let route = deferred.route;
+            if deferred.dispatch {
+                let Some((mut request, mut effect_lease)) = deferred.take_submission() else {
+                    self.finish_connection(token, connection);
+                    continue;
+                };
+                // Answered synchronously: the authority stays here, so the
+                // remaining waits are served in this pass too.
+                let response = self.runtime.dispatch(&request);
+                request.zeroize_payload();
+                // As for a fresh frame: a token effect revoked while the
+                // request ran voids its reply.
+                if effect_lease.validate().is_err() {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                    self.finish_connection(token, connection);
+                    continue;
+                }
+                self.route_checkpoint_response(token, connection, response);
+                continue;
+            }
             let Some((request, effect_lease)) = deferred.take_submission() else {
                 self.finish_connection(token, connection);
                 continue;
@@ -2384,6 +2588,79 @@ impl GuardianClient {
         Self::connect_with_hello(socket_path, token_path, mux_incarnation, Vec::new())
     }
 
+    /// Whether the guardian at `socket_path` validates version 4 (compact)
+    /// terminal checkpoints: it accepted an authenticated Hello requiring
+    /// them. A guardian predating them refuses that Hello, as any guardian
+    /// refuses a build-bearing Hello from an unsealed build; every failure
+    /// reads as no, and the mux keeps publishing version 3.
+    ///
+    /// The probe connects as a throwaway mux incarnation that owns nothing,
+    /// so the guardian's retirement of it on disconnect retires nothing of
+    /// the caller's.
+    pub fn admits_compact_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_compact_checkpoints().to_vec(),
+        )
+        .is_ok()
+    }
+
+    /// Whether the guardian at `socket_path` validates terminal checkpoints
+    /// holding graphics state, probed as `admits_compact_checkpoints` probes
+    /// version 4. Every failure reads as no, and the mux keeps refusing to
+    /// checkpoint a pane that shows an image.
+    pub fn admits_graphics_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_graphics_checkpoints().to_vec(),
+        )
+        .is_ok()
+    }
+
+    /// Whether the guardian at `socket_path` validates terminal checkpoints
+    /// holding character protection, probed as `admits_compact_checkpoints`
+    /// probes version 4. Every failure reads as no, and the mux keeps
+    /// refusing to checkpoint a pane holding protected cells.
+    pub fn admits_protection_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_protection_checkpoints().to_vec(),
+        )
+        .is_ok()
+    }
+
+    /// Whether the guardian at `socket_path` comes from a build that reads
+    /// durable scrollback rows showing images in their own schema, probed as
+    /// `admits_compact_checkpoints` probes version 4. Every failure reads as
+    /// no, and the mux keeps writing such rows as before.
+    pub fn admits_image_scrollback_rows(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_image_scrollback_rows().to_vec(),
+        )
+        .is_ok()
+    }
+
     /// Authenticate the build compiled into this mux for Genesis staging.
     /// This does not reserve or start a child.
     pub fn connect_for_genesis(
@@ -2830,10 +3107,30 @@ impl GuardianClient {
             effect_id,
             payload,
         );
-        match self.exchange(request)? {
+        match self.exchange_checkpoint_step(request)? {
             GuardianReply::CheckpointStage(reply) if reply.upload_id() == upload_id => Ok(reply),
             _ => Err(GuardianClientError::UnexpectedReply),
         }
+    }
+
+    /// Exchange one Stage step or catalog adoption under
+    /// `CHECKPOINT_STAGE_IO_TIMEOUT`: the guardian may authenticate, copy and
+    /// publish a whole checkpoint before it replies, and a missed deadline on
+    /// a pane's own connection costs the pane its lease.
+    fn exchange_checkpoint_step(
+        &mut self,
+        request: GuardianRequestEnvelope,
+    ) -> Result<GuardianReply, GuardianClientError> {
+        self.stream
+            .set_read_timeout(Some(CHECKPOINT_STAGE_IO_TIMEOUT))
+            .inspect_err(|error| log_client_io_failure("stage_read_timeout", error))?;
+        let exchanged = self.exchange(request);
+        // As in with_client_io_deadline: a failed exchange's error wins over
+        // a failed restoration.
+        let restored = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
+        let reply = exchanged?;
+        restored.inspect_err(|error| log_client_io_failure("reset_read_timeout", error))?;
+        Ok(reply)
     }
 
     /// Adopt one exact sealed checkpoint through the pane mutation sequence.
@@ -2862,7 +3159,7 @@ impl GuardianClient {
             Some(effect_id),
             intent.encode().to_vec(),
         );
-        match self.exchange(request)? {
+        match self.exchange_checkpoint_step(request)? {
             GuardianReply::CheckpointReceipt(receipt)
                 if receipt.pane_id() == pane_id
                     && receipt.generation() == generation
@@ -4341,6 +4638,24 @@ fn validate_absolute_path(path: &Path) -> Result<(), GuardianServiceError> {
     Ok(())
 }
 
+/// How long one thread trusts its last walk of a guardian path's ancestors
+/// (ft-2pgul). Every broker request took a token effect lease that walked the
+/// token path about a dozen times, an `lstat` per component each time: 30-40%
+/// of a streaming broker's CPU, on the path of every round trip. The walk
+/// only proves hygiene (no symlink, no group- or other-writable non-sticky
+/// directory): each caller still checks the immediate parent's owner and mode
+/// every time, and the pinned-descriptor checks still resolve the whole path
+/// and compare identities, so a replaced or redirected ancestor fails at
+/// once; a loosened ancestor mode fails within this interval.
+const PRIVATE_PARENT_WALK_TTL: Duration = Duration::from_millis(250);
+const PRIVATE_PARENT_WALKS_RETAINED: usize = 8;
+
+std::thread_local! {
+    /// Parent directories whose ancestors this thread walked, and when.
+    static PRIVATE_PARENT_WALKS: std::cell::RefCell<Vec<(PathBuf, Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
     validate_absolute_path(path)?;
     let parent = path
@@ -4348,28 +4663,36 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
         .ok_or(GuardianServiceError::FilesystemSecurity(
             "guardian path has no parent directory",
         ))?;
-    let mut current = PathBuf::from("/");
-    for component in parent.components() {
-        match component {
-            Component::RootDir => continue,
-            Component::Normal(part) => current.push(part),
-            _ => {
+    let now = Instant::now();
+    let walked = PRIVATE_PARENT_WALKS.with(|walks| {
+        walks.borrow().iter().any(|(walked, at)| {
+            walked == parent && now.saturating_duration_since(*at) < PRIVATE_PARENT_WALK_TTL
+        })
+    });
+    if !walked {
+        let mut current = PathBuf::from("/");
+        for component in parent.components() {
+            match component {
+                Component::RootDir => continue,
+                Component::Normal(part) => current.push(part),
+                _ => {
+                    return Err(GuardianServiceError::FilesystemSecurity(
+                        "guardian parent path is not normalized",
+                    ));
+                }
+            }
+            let metadata = std::fs::symlink_metadata(&current)
+                .map_err(|error| GuardianServiceError::io("parent-metadata", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(GuardianServiceError::FilesystemSecurity(
-                    "guardian parent path is not normalized",
+                    "guardian parent path contains a symlink or non-directory",
                 ));
             }
-        }
-        let metadata = std::fs::symlink_metadata(&current)
-            .map_err(|error| GuardianServiceError::io("parent-metadata", error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(GuardianServiceError::FilesystemSecurity(
-                "guardian parent path contains a symlink or non-directory",
-            ));
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            return Err(GuardianServiceError::FilesystemSecurity(
-                "guardian parent path contains a group-or-other-writable non-sticky directory",
-            ));
+            if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+                return Err(GuardianServiceError::FilesystemSecurity(
+                    "guardian parent path contains a group-or-other-writable non-sticky directory",
+                ));
+            }
         }
     }
     let metadata = std::fs::symlink_metadata(parent)
@@ -4378,6 +4701,16 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian immediate parent must be owned by the current user and owner-only",
         ));
+    }
+    if !walked {
+        PRIVATE_PARENT_WALKS.with(|walks| {
+            let mut walks = walks.borrow_mut();
+            walks.retain(|(walked, _)| walked != parent);
+            if walks.len() >= PRIVATE_PARENT_WALKS_RETAINED {
+                walks.remove(0);
+            }
+            walks.push((parent.to_path_buf(), now));
+        });
     }
     Ok(())
 }
@@ -5977,6 +6310,230 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A checkpoint-class request that arrives while a job holds the sole
+    /// protocol authority waits for it and is served, instead of meeting a
+    /// closed connection (which made a mux's capture fail mid-publication).
+    #[test]
+    fn checkpoint_request_waits_for_the_protocol_authority_a_job_holds() {
+        use mux::guardian_protocol::GuardianCheckpointDescriptorV1;
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-authority-wait-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_tx, send_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let client = std::thread::spawn(move || {
+            let mut client = GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+            connected_tx.send(()).unwrap();
+            send_rx.recv().unwrap();
+            let effect = Uuid::new_v4();
+            let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
+                effect,
+                &transport_checkpoint(),
+            )
+            .unwrap();
+            let query = GuardianCheckpointStageRequestV1::query(
+                GuardianCheckpointScopeV1::Genesis {
+                    spawn_effect_id: effect,
+                },
+                Uuid::new_v4(),
+                descriptor,
+                1_024,
+            )
+            .unwrap();
+            result_tx
+                .send(client.checkpoint_stage(Uuid::new_v4(), query))
+                .unwrap();
+        });
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while connected_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "client never connected");
+            service.poll_once().unwrap();
+        }
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let deferred_before = service.runtime.counters().replay_waits_deferred;
+        send_tx.send(()).unwrap();
+        // The request arrives while the authority is out and is parked.
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while service.runtime.counters().replay_waits_deferred == deferred_before {
+            assert!(Instant::now() < deadline, "request was never parked");
+            service.poll_once().unwrap();
+        }
+        for _ in 0..20 {
+            service.poll_once().unwrap();
+        }
+        assert!(
+            result_rx.try_recv().is_err(),
+            "a parked request is neither answered nor closed while the authority is out"
+        );
+
+        service.runtime.restore_protocol_for_test(held);
+        let mut result = None;
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while result.is_none() {
+            assert!(Instant::now() < deadline, "parked request never served");
+            service.poll_once().unwrap();
+            result = result_rx.try_recv().ok();
+        }
+        // Served by the protocol (here, refused: this connection has no
+        // Genesis authority), never closed as busy.
+        assert!(
+            !matches!(result, Some(Err(GuardianClientError::Io(_)))),
+            "parked request was closed: {result:?}"
+        );
+        client.join().unwrap();
+    }
+
+    /// A synchronous request (here a census page, as a probe or an upgrade
+    /// verification sends) waits for the authority a job holds and is
+    /// answered, instead of meeting a closed connection.
+    #[test]
+    fn census_waits_for_the_protocol_authority_a_job_holds() {
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-census-wait-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_tx, send_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let client = std::thread::spawn(move || {
+            let mut client = GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+            connected_tx.send(()).unwrap();
+            send_rx.recv().unwrap();
+            result_tx.send(client.census_snapshot()).unwrap();
+        });
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while connected_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "client never connected");
+            service.poll_once().unwrap();
+        }
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let deferred_before = service.runtime.counters().replay_waits_deferred;
+        send_tx.send(()).unwrap();
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while service.runtime.counters().replay_waits_deferred == deferred_before {
+            assert!(Instant::now() < deadline, "census was never parked");
+            service.poll_once().unwrap();
+        }
+        for _ in 0..20 {
+            service.poll_once().unwrap();
+        }
+        assert!(
+            result_rx.try_recv().is_err(),
+            "a parked census is neither answered nor closed while the authority is out"
+        );
+
+        service.runtime.restore_protocol_for_test(held);
+        let mut result = None;
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while result.is_none() {
+            assert!(Instant::now() < deadline, "parked census never answered");
+            service.poll_once().unwrap();
+            result = result_rx.try_recv().ok();
+        }
+        assert!(
+            matches!(result, Some(Ok(ref entries)) if entries.is_empty()),
+            "the parked census is answered by the protocol: {result:?}"
+        );
+        client.join().unwrap();
+    }
+
+    /// A guardian of this release admits a Hello requiring compact
+    /// checkpoints exactly when it admits this build's sealed Hello (an
+    /// unsealed development build gets neither), and the probe leaves it
+    /// serving ordinary connections.
+    #[test]
+    fn compact_checkpoint_probe_follows_the_sealed_hello() {
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-compact-probe-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.path().join("token");
+        let socket = directory.path().join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop_guard = StopOnDrop(&stop);
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_stop = &stop;
+            let worker = scope.spawn(move || {
+                let mut service = GuardianService::bind(config).unwrap();
+                ready_tx.send(()).unwrap();
+                service.run_until(worker_stop).unwrap();
+                assert_eq!(service.runtime.pane_count(), 0);
+            });
+            ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            let compact = GuardianClient::admits_compact_checkpoints(&socket, &token);
+            let graphics = GuardianClient::admits_graphics_checkpoints(&socket, &token);
+            let protection = GuardianClient::admits_protection_checkpoints(&socket, &token);
+            let rows = GuardianClient::admits_image_scrollback_rows(&socket, &token);
+            let sealed = GuardianClient::connect_for_genesis(&socket, &token, Uuid::new_v4());
+            assert_eq!(compact, sealed.is_ok());
+            assert_eq!(graphics, sealed.is_ok());
+            assert_eq!(protection, sealed.is_ok());
+            assert_eq!(rows, sealed.is_ok());
+            drop(sealed);
+            GuardianClient::connect(&socket, &token, Uuid::new_v4())
+                .expect("the guardian still serves an ordinary connection");
+            drop(stop_guard);
+            worker.join().unwrap();
+        });
     }
 
     #[test]
@@ -8407,6 +8964,35 @@ mod tests {
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(validate_private_parent(&private.join("guardian.sock")).is_err());
+    }
+
+    #[test]
+    fn a_reused_ancestor_walk_still_checks_the_immediate_parent_and_expires() {
+        let canonical_temp = crate::canonical_test_temp_root();
+        let directory = tempfile::Builder::new()
+            .prefix("frankenterm-guardian-walk-reuse-")
+            .tempdir_in(canonical_temp)
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = directory.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = shared.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("guardian.sock");
+        validate_private_parent(&path).expect("private path");
+
+        // The immediate parent is checked on every call, walked or not.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(validate_private_parent(&path).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A loosened ancestor fails once the last walk has expired.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::thread::sleep(PRIVATE_PARENT_WALK_TTL);
+        assert!(validate_private_parent(&path).is_err());
     }
 
     #[test]

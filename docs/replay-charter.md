@@ -49,8 +49,11 @@ Operational traces from resolved incidents become permanent regression
 artifacts. Pattern rule changes and workflow modifications are tested against
 this library before deployment.
 
-**Verification gate:** `ft replay regression-suite` exits 0 when no decision
-diffs exceed tolerance; exits non-zero with diff report on regression.
+**Verification gate (planned):** a suite command that exits 0 when no decision
+diffs exceed tolerance and non-zero with a diff report on regression. No such
+command ships yet; today each pair is gated with
+`ft replay diff --baseline <a> --candidate <b> --budget <budget.toml>`, which
+exits non-zero when the diff exceeds the budget.
 
 ### 2.3 Counterfactual Comparison
 

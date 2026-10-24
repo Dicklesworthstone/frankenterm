@@ -1,12 +1,20 @@
+# Copyright (C) 2024 Cosmin Truta
+# SPDX-License-Identifier: MIT-0
+
 name: Linting libpng
 
 on:
   push:
     branches:
       - libpng16
+      - libpng18
   pull_request:
     branches:
       - libpng16
+      - libpng18
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -21,6 +29,8 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
       - name: Install yamllint
         run: pip install yamllint
+      - name: Install editorconfig-checker
+        uses: editorconfig-checker/action-editorconfig-checker@main
       - name: Check out the code
         uses: actions/checkout@v4
       - name: Run the linting script

@@ -739,7 +739,10 @@ impl TripleVertexBuffer {
             })
             .extend_lifetime()
         };
-        let mut bufs = self.current_vb_mut();
+        // SAFETY: the mapping and this owner travel together in the returned
+        // MappedQuads, and the owner is dropped after the mapping (see the
+        // comment below).
+        let mut bufs = unsafe { self.current_vb_mut().extend_lifetime() };
 
         // To map the vertex buffer, we need to hold a mutable reference to
         // the buffer and hold the mapping object alive for the duration
@@ -776,10 +779,12 @@ impl TripleVertexBuffer {
         }
     }
 
-    pub fn current_vb_mut(&self) -> RefMut<'static, VertexBuffer> {
+    /// The current frame's vertex buffer, borrowed from `self` (4tenz.8.13:
+    /// this safe function used to hand out a `'static` borrow that could
+    /// outlive the buffers).
+    pub fn current_vb_mut(&self) -> RefMut<'_, VertexBuffer> {
         let index = *self.index.borrow();
-        let bufs = self.bufs.borrow_mut();
-        unsafe { RefMut::map(bufs, |bufs| &mut bufs[index]).extend_lifetime() }
+        RefMut::map(self.bufs.borrow_mut(), |bufs| &mut bufs[index])
     }
 
     pub fn current_glyph_quad_instances(&self) -> Ref<'_, WebGpuGlyphQuadSoaStaging> {

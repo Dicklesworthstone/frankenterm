@@ -182,7 +182,7 @@
   "tools": [
     {
       "annotations": null,
-      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)",
+      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds, plus the server workspace's git status and ready beads (ft robot attention also reads the watcher envelope, crash bundles and the active transaction)",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -203,6 +203,11 @@
           "item_id": {
             "description": "Attention item id to explain when surface=explain",
             "type": "string"
+          },
+          "live": {
+            "default": false,
+            "description": "When input is omitted, add the live read-only sources from the workspace database (policy denials, unresolved approval holds, verified-submit drift, unhandled warning and critical events, operator pane holds) and honor active ft mutes; reported unavailable when the server has no workspace database",
+            "type": "boolean"
           },
           "surface": {
             "default": "status",

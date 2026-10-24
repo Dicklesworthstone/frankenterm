@@ -1,0 +1,12 @@
+{"arm": "old", "block": 1, "windowserver_gpu_pct": -215.5, "gui_gpu_pct": 12.9, "gui_fps": 165.5, "alpha_modes": []}
+{"arm": "new", "block": 1, "windowserver_gpu_pct": 28.7, "gui_gpu_pct": 14.3, "gui_fps": 168.6, "alpha_modes": ["Opaque"]}
+{"arm": "new-noshadow", "block": 1, "windowserver_gpu_pct": 6.3, "gui_gpu_pct": 11.8, "gui_fps": 168.4, "alpha_modes": ["Opaque"]}
+{"arm": "old", "block": 2, "windowserver_gpu_pct": 29.5, "gui_gpu_pct": 12.7, "gui_fps": 168.3, "alpha_modes": []}
+{"arm": "new", "block": 2, "windowserver_gpu_pct": 32.0, "gui_gpu_pct": 13.1, "gui_fps": 167.2, "alpha_modes": ["Opaque"]}
+{"arm": "new-noshadow", "block": 2, "windowserver_gpu_pct": 6.1, "gui_gpu_pct": 12.7, "gui_fps": 168.1, "alpha_modes": ["Opaque"]}
+{"arm": "old", "block": 3, "windowserver_gpu_pct": 28.8, "gui_gpu_pct": 12.3, "gui_fps": 168.0, "alpha_modes": []}
+{"arm": "new", "block": 3, "windowserver_gpu_pct": 28.7, "gui_gpu_pct": 13.6, "gui_fps": 168.0, "alpha_modes": ["Opaque"]}
+{"arm": "new-noshadow", "block": 3, "windowserver_gpu_pct": 6.1, "gui_gpu_pct": 11.8, "gui_fps": 168.0, "alpha_modes": ["Opaque"]}
+old: WindowServer GPU median 28.8% (range -215.5-29.5, 3 blocks)
+new: WindowServer GPU median 28.7% (range 28.7-32.0, 3 blocks)
+new-noshadow: WindowServer GPU median 6.1% (range 6.1-6.3, 3 blocks)

@@ -13,15 +13,18 @@ publish = false
 
 [features]
 bench-scalar-vte-scan = []
+native = []
+native-ffi = ["native", "dep:frankenterm-sigpipe", "dep:frankenterm-mobile-mux"]
 use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-escape-parser/use_serde", "frankenterm-surface/use_serde", "dep:zeroize"]
 
 [dependencies]
 anyhow.workspace = true
+base64 = { workspace = true, features = ["alloc"] }
 bitflags.workspace = true
 csscolorparser.workspace = true
 downcast-rs.workspace = true
 finl_unicode.workspace = true
-hex.workspace = true
+hex = { workspace = true, features = ["alloc"] }
 humansize.workspace = true
 image.workspace = true
 lazy_static.workspace = true
@@ -42,6 +45,9 @@ frankenterm-dynamic = {workspace = true, features=["std"]}
 frankenterm-cell = {workspace = true, features=["std", "use_image"]}
 frankenterm-escape-parser = {workspace = true, features=["std", "use_image"]}
 frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"]}
+frankenterm-sigpipe = { workspace = true, optional = true }
+# The phone's mux client, exported through native_mux_ffi in the same staticlib.
+frankenterm-mobile-mux = { path = "../../crates/frankenterm-mobile-mux", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

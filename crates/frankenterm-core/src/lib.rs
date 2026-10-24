@@ -161,6 +161,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod approval_impact_simulator;
 pub mod approval_impact_simulator_doctor;
+pub mod attention_live;
 pub mod attention_router;
 // `atlas_bin_packing` extracted to `frankenterm-core-atlas-pack-types`
 // (ft-kxopr second half) so the vendored `frankenterm/window/`
@@ -775,6 +776,7 @@ pub mod swarm_pipeline;
 pub mod swarm_scheduler;
 pub mod swarm_tail_risk_conformal;
 pub mod swarm_work_queue;
+mod system_symlinks;
 pub mod tailer;
 // ft-y0loj.1: tantivy_* + recorder_lexical_* modules extracted into the
 // `frankenterm-core-tantivy` sub-crate. The `recorder-lexical` feature

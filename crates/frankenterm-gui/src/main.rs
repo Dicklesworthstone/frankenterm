@@ -309,6 +309,12 @@ enum SubCommand {
 
     #[command(name = "show-keys", about = "Show key assignments")]
     ShowKeys(ShowKeysCommand),
+
+    #[command(
+        name = "cli",
+        about = "Send one request (list, spawn, move-pane-to-new-tab) to a running mux"
+    )]
+    Cli(frankenterm_gui::cli::CliCommand),
 }
 
 async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -1068,6 +1074,15 @@ async fn populate_local_recovery_window_after_remote_failure(
     let recovery_domain = mux
         .get_domain_by_name("local")
         .context("local recovery domain is not available after remote attach failure")?;
+    // A failed first attach can retire the still-empty window it was handed
+    // (e.g. the proxy exits during the version handshake). Spawning into that
+    // id then failed and aborted startup (ft-aoiku); recover into a new window.
+    let window_id = if mux.get_window(window_id).is_some() {
+        window_id
+    } else {
+        let builder = mux.new_empty_window(None, None);
+        *builder
+    };
     let config = config::configuration();
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
     crate::spawn::attach_domain_to_window_or_spawn_recovery(
@@ -2899,10 +2914,20 @@ fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
 }
 
 fn register_gui_lua_modules() {
-    let setup_funcs: [config::lua::SetupFunc; 5] = [
+    let setup_funcs: [config::lua::SetupFunc; 13] = [
         termwiz_funcs::register,
         mux_lua::register,
         url_funcs::register,
+        color_funcs::register,
+        filesystem::register,
+        procinfo_funcs::register,
+        serde_funcs::register,
+        share_data::register,
+        spawn_funcs::register,
+        ssh_funcs::register,
+        // `gui.screens()` and `gui.get_appearance()`: GUI-only, so the
+        // headless mux server does not register them.
+        window_funcs::register,
         scripting::register,
         stats::register,
     ];
@@ -3157,6 +3182,23 @@ impl Publish {
         }
     }
 
+    fn require_existing_gui_executable(
+        &mut self,
+        running: &std::path::Path,
+        launching: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if running != launching {
+            // Every install lives at its own versioned bundle path, so an
+            // upgrade launched while the predecessor runs lands here. Like a
+            // version change, it starts its own GUI, but it is the one later
+            // launches should reach: publish it. Not publishing left the
+            // pointer on the predecessor, dead once that quit (ft-i6k24).
+            *self = Self::NoConnectButShouldPublish;
+            anyhow::bail!("Running GUI is a different executable from us, will start a new one");
+        }
+        Ok(())
+    }
+
     fn require_existing_gui_version(
         &mut self,
         running_version: &str,
@@ -3190,25 +3232,20 @@ impl Publish {
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
-            match frankenterm_client::client::Client::new_unix_domain(
-                None,
-                &dom,
-                false,
-                &mut ui,
-                true,
-                std::sync::Weak::new(),
-            ) {
+            // Request-only: the running GUI announces the very tab this
+            // spawns to every connection, and a client that rejected that
+            // notification could lose the spawn's reply.
+            match frankenterm_client::client::Client::new_request_only_unix_domain(&dom, &mut ui) {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
                     let res = block_on(executor.run(async move {
                         let vers = client.verify_version_compat(&ui).await?;
 
-                        if vers.executable_path != std::env::current_exe().context("resolve executable path")? {
-                            *self = Publish::NoConnect;
-                            anyhow::bail!(
-                                "Running GUI is a different executable from us, will start a new one");
-                        }
+                        self.require_existing_gui_executable(
+                            &vers.executable_path,
+                            &std::env::current_exe().context("resolve executable path")?,
+                        )?;
                         if vers.config_file_path
                             != std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into)
                         {
@@ -3942,6 +3979,63 @@ fn maybe_show_configuration_error_window() {
 mod tests {
     use super::*;
 
+    /// The GUI's Lua context has `gui.get_appearance()` and `gui.screens()`
+    /// (window-funcs, unregistered since the GUI was vendored). Configs pick
+    /// a light or dark theme with the first; with no window connection yet it
+    /// answers "Light".
+    #[test]
+    fn gui_lua_context_has_window_funcs() {
+        register_gui_lua_modules();
+        let lua = config::lua::make_lua_context(std::path::Path::new("")).expect("lua context");
+        let appearance: String = lua
+            .load("return require('frankenterm').gui.get_appearance()")
+            .eval()
+            .expect("gui.get_appearance()");
+        assert_eq!(appearance, "Light");
+        let screens: String = lua
+            .load("return type(require('wezterm').gui.screens)")
+            .eval()
+            .expect("type of gui.screens");
+        assert_eq!(screens, "function");
+    }
+
+    /// The rest of WezTerm's Lua API that configs call at load time or from
+    /// event handlers (the operator's own `open-uri` handler calls
+    /// `run_child_process`) is in the GUI's Lua context.
+    #[test]
+    fn gui_lua_context_has_the_wezterm_lua_api() {
+        register_gui_lua_modules();
+        let lua = config::lua::make_lua_context(std::path::Path::new("")).expect("lua context");
+        let missing: String = lua
+            .load(
+                r#"
+                local w = require('frankenterm')
+                local missing = {}
+                for _, name in ipairs {
+                  'run_child_process', 'background_child_process', 'open_with', 'json_parse',
+                  'json_encode', 'read_dir', 'glob', 'enumerate_ssh_hosts', 'default_ssh_domains',
+                  'strftime', 'strftime_utc', 'sleep_ms', 'gradient_colors',
+                  'get_builtin_color_schemes',
+                } do
+                  if type(w[name]) ~= 'function' then table.insert(missing, name) end
+                end
+                for _, sub in ipairs { 'serde', 'procinfo', 'color' } do
+                  if type(w[sub]) ~= 'table' then table.insert(missing, sub) end
+                end
+                if w.GLOBAL == nil then table.insert(missing, 'GLOBAL') end
+                return table.concat(missing, ' ')
+            "#,
+            )
+            .eval()
+            .expect("probe the Lua API");
+        assert_eq!(missing, "", "missing from the GUI's Lua context");
+        let n: i64 = lua
+            .load("return require('wezterm').json_parse('{\"n\": 3}').n")
+            .eval()
+            .expect("json_parse");
+        assert_eq!(n, 3);
+    }
+
     /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the
     /// running jemalloc must report exactly the tuned options. Reading them
     /// back from jemalloc proves the symbol is honoured, not just present.
@@ -3989,6 +4083,27 @@ mod tests {
         );
         assert!(matches!(publish, Publish::NoConnectButShouldPublish));
         assert!(publish.should_publish());
+    }
+
+    #[test]
+    fn different_executable_gui_starts_its_own_and_publishes_it() {
+        let mut publish = Publish::TryPath(PathBuf::from("existing-gui.sock"));
+        publish
+            .require_existing_gui_executable(
+                std::path::Path::new("/Applications/.frankenterm-versions/old/frankenterm-gui"),
+                std::path::Path::new("/Applications/.frankenterm-versions/new/frankenterm-gui"),
+            )
+            .expect_err("a different executable must not delegate its spawn");
+        assert!(matches!(publish, Publish::NoConnectButShouldPublish));
+        assert!(publish.should_publish());
+
+        let socket = PathBuf::from("existing-gui.sock");
+        let mut publish = Publish::TryPath(socket.clone());
+        let same = std::path::Path::new("/Applications/FrankenTerm.app/frankenterm-gui");
+        publish
+            .require_existing_gui_executable(same, same)
+            .expect("the same executable may retain its existing GUI");
+        assert!(matches!(&publish, Publish::TryPath(path) if path == &socket));
     }
 
     #[test]
@@ -5817,6 +5932,17 @@ fn run() -> anyhow::Result<()> {
         SubCommand::ShowKeys(cmd) => {
             check_cli_config_health()?;
             run_show_keys(config, &cmd)
+        }
+        SubCommand::Cli(cmd) => {
+            // Report failures on stderr with a nonzero status: scripts run
+            // this, so it must not raise the GUI's startup-failure toast.
+            if let Err(err) =
+                check_cli_config_health().and_then(|()| frankenterm_gui::cli::run(cmd))
+            {
+                eprintln!("frankenterm-gui cli: {err:#}");
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }

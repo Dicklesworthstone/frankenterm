@@ -673,7 +673,7 @@ impl AsupersyncTelemetrySnapshot {
 
 /// Asupersync runtime context for incident bundle enrichment.
 ///
-/// Provides structured runtime state for `ft doctor --export-bundle` and
+/// Provides structured runtime state for `ft diag bundle` and
 /// diagnostic pipelines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsupersyncIncidentContext {
@@ -763,7 +763,7 @@ fn check_scope_tree(
             remediation: vec![
                 RemediationHint::with_command(
                     "Check for scope leaks in long-running tasks",
-                    "ft doctor --check runtime",
+                    "ft status --health",
                 )
                 .effort(RemediationEffort::Medium),
                 RemediationHint::text("Review task cancellation paths for unclosed scopes")
@@ -831,7 +831,7 @@ fn check_task_lifecycle(
             remediation: vec![
                 RemediationHint::with_command(
                     "Inspect leaked tasks for missing cancellation handlers",
-                    "ft doctor --check runtime",
+                    "ft status --health",
                 )
                 .effort(RemediationEffort::High),
             ],
@@ -916,7 +916,7 @@ fn check_cancellation(
             remediation: vec![
                 RemediationHint::with_command(
                     "Check for tasks ignoring cancellation tokens",
-                    "ft doctor --check runtime",
+                    "ft status --health",
                 )
                 .effort(RemediationEffort::High),
                 RemediationHint::text(
@@ -1110,7 +1110,7 @@ fn check_recovery_health(snapshot: &AsupersyncTelemetrySnapshot) -> RuntimeHealt
             remediation: vec![
                 RemediationHint::with_command(
                     "Export diagnostic bundle for analysis",
-                    "ft doctor --export-bundle",
+                    "ft diag bundle",
                 )
                 .effort(RemediationEffort::Medium),
                 RemediationHint::text("Check recovery handlers for persistent failure conditions")

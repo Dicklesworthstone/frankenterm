@@ -25,7 +25,7 @@ pub mod style;
 mod tests;
 pub mod view;
 
-pub use cell::{CellStyle, Glyph, InlineStyle, PackedCell, StyleClass};
+pub use cell::{CellStyle, Glyph, InlineStyle, PackedCell, RunGrapheme, StyleClass};
 pub use list::{OverCap, PageList, RangeFloor, RowRef, Scrolled, MAX_POOLED_PAGES, SEAL_DISTANCE};
 pub use page::{rows_per_page, CellWrite, Page, StyleSpec, STD_PAGE_CELLS};
 pub use row::RowHeader;

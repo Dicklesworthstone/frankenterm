@@ -219,6 +219,20 @@ durability calls.
 
 - **Asynchronous, ordered.** The PTY parse thread queues evicted rows in
   memory, and one `scrollback-durability` writer thread stores them in order.
+- **Finite writer turns.** A scheduled turn writes one bounded transaction
+  and returns the remaining work to the shared queue. A continuously
+  replenished pane cannot keep the writer in its drain loop indefinitely.
+  Remaining rows re-enter the configured age, idle and byte policy using
+  their original admission times. A single indivisible row can exceed the
+  window's byte target, while storage admission keeps its independent hard
+  bounds.
+- **Explicit commit boundaries.** A flush captures the admitted stable-row
+  frontier and publishes after those rows are durable. Later arrivals belong
+  to another window. Partial acknowledgements and publication failures keep
+  the commit request pending; an empty queue with an unpublished tail still
+  schedules publication. Closing a pane retains its outstanding work until
+  the writer has processed its rows and publication request, subject to the
+  existing failure policy.
 - **Not durable until written.** Queued rows are lost if the process dies.
 - **Power loss.** The store syncs with ordering barriers (F_BARRIERFSYNC on
   macOS), so a power loss may also drop the newest written batch. It never

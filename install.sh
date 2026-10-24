@@ -351,9 +351,10 @@ resolve_version() {
     local api_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
     local resolved
     resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$api_url" 2>/dev/null \
-      | grep '"tag_name":' \
-      | sed -E 's/.*"([^"]+)".*/\1/' \
+      | grep -o '"tag_name": *"[^"]*"' \
+      | sed -E 's/.*"([^"]*)"$/\1/' \
       | head -1 || true)
+    case "$resolved" in v[0-9]*|[0-9]*) ;; *) resolved="" ;; esac
     if [ -n "$resolved" ]; then
       VERSION="$resolved"
       info "Resolved latest version: $VERSION"

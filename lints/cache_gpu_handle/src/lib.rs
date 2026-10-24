@@ -972,7 +972,9 @@ mod tests {
         assert_eq!(f.reason, FindingReason::CacheFieldReachesGpuHandle);
         assert_eq!(f.forbidden_leaf, "CachedGlyph");
         assert!(f.path.iter().any(|node| node == "ShapedInfo"));
-        assert!(f.render().contains("unfenced cache field `TermWindow.shape_cache`"));
+        assert!(f
+            .render()
+            .contains("unfenced cache field `TermWindow.shape_cache`"));
     }
 
     #[test]
@@ -1014,7 +1016,10 @@ mod tests {
         "#;
         let report = cache_field_report(src);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
-        assert_eq!(report.total_cache_fields, 1, "only the LfuCache field is a root");
+        assert_eq!(
+            report.total_cache_fields, 1,
+            "only the LfuCache field is a root"
+        );
         assert_eq!(report.clean_cache_fields, 1);
     }
 

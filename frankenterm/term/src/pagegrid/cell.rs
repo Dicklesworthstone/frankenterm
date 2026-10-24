@@ -12,39 +12,13 @@ use frankenterm_cell::{Blink, CellAttributes, Intensity, SemanticType, Underline
 /// The 14 inline attribute bits, in legacy order minus wrap and semantic
 /// type: intensity 2, underline 3, blink 2, italic, reverse, strikethrough,
 /// invisible, overline, vertical align 2.
+///
+/// Read straight off the legacy bitfield (`CellAttributes::inline_style_bits`),
+/// whose order these bits follow, rather than through each getter: every
+/// printed run encodes its pen (ft-yccm0.3.2.6).
+#[inline]
 pub fn encode_attrs(attrs: &CellAttributes) -> u16 {
-    let intensity: u16 = match attrs.intensity() {
-        Intensity::Normal => 0,
-        Intensity::Bold => 1,
-        Intensity::Half => 2,
-    };
-    let underline: u16 = match attrs.underline() {
-        Underline::None => 0,
-        Underline::Single => 1,
-        Underline::Double => 2,
-        Underline::Curly => 3,
-        Underline::Dotted => 4,
-        Underline::Dashed => 5,
-    };
-    let blink: u16 = match attrs.blink() {
-        Blink::None => 0,
-        Blink::Slow => 1,
-        Blink::Rapid => 2,
-    };
-    let vertical_align: u16 = match attrs.vertical_align() {
-        VerticalAlign::BaseLine => 0,
-        VerticalAlign::SuperScript => 1,
-        VerticalAlign::SubScript => 2,
-    };
-    intensity
-        | (underline << 2)
-        | (blink << 5)
-        | (u16::from(attrs.italic()) << 7)
-        | (u16::from(attrs.reverse()) << 8)
-        | (u16::from(attrs.strikethrough()) << 9)
-        | (u16::from(attrs.invisible()) << 10)
-        | (u16::from(attrs.overline()) << 11)
-        | (vertical_align << 12)
+    attrs.inline_style_bits()
 }
 
 /// Applies [`encode_attrs`] bits to `attrs`.
@@ -152,6 +126,11 @@ pub enum StyleClass {
 /// and side maps.
 pub fn classify(attrs: &CellAttributes) -> StyleClass {
     let bits = encode_attrs(attrs);
+    // Without fat attributes the colors are default or palette ones and the
+    // underline color is the default: the codes come straight off them.
+    if let Some((fg, bg)) = attrs.inline_color_codes() {
+        return StyleClass::Inline(InlineStyle::new(bits, fg, bg));
+    }
     let underline_color = attrs.underline_color();
     match (
         encode_color(attrs.foreground()),
@@ -206,11 +185,18 @@ impl<'a> Glyph<'a> {
     /// tell a printed space from an erased cell either. A cluster that starts
     /// with a space keeps U+0020 as its first scalar.
     pub fn from_text(text: &'a str) -> Self {
-        let mut chars = text.chars();
-        match (chars.next(), chars.next()) {
-            (None, _) | (Some(' '), None) => Glyph::Blank,
-            (Some(ch), None) => Glyph::Char(ch),
-            (Some(_), Some(_)) => Glyph::Cluster(text),
+        // One scalar fills the whole text: no second decode, whose
+        // length-dependent branches mispredict on mixed-script runs.
+        match text.chars().next() {
+            None => Glyph::Blank,
+            Some(ch) if text.len() == ch.len_utf8() => {
+                if ch == ' ' {
+                    Glyph::Blank
+                } else {
+                    Glyph::Char(ch)
+                }
+            }
+            Some(_) => Glyph::Cluster(text),
         }
     }
 
@@ -221,6 +207,56 @@ impl<'a> Glyph<'a> {
             Glyph::Blank | Glyph::Char(' ') => 0,
             Glyph::Char(ch) => u32::from(ch),
             Glyph::Cluster(text) => text.chars().next().map_or(0, u32::from),
+        }
+    }
+}
+
+/// One cell of a printed run ([`super::Page::append_graphemes`]): its text,
+/// its width (1 or 2) and its first scalar, which the print path's
+/// segmentation decoded already. Storing the run classifies each cell from
+/// that scalar instead of decoding its text again, which was a tenth of a
+/// mixed-script ingest (ft-yccm0.3.2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunGrapheme<'a> {
+    pub text: &'a str,
+    pub width: u8,
+    first: char,
+    cluster: bool,
+}
+
+impl<'a> RunGrapheme<'a> {
+    /// `text` as one cell `width` columns wide.
+    #[inline]
+    pub fn new(text: &'a str, width: u8) -> Self {
+        let first = text.chars().next();
+        Self {
+            text,
+            width,
+            first: first.unwrap_or(' '),
+            cluster: first.is_some_and(|first| text.len() != first.len_utf8()),
+        }
+    }
+
+    /// `text`, the single scalar `c`, as one cell `width` columns wide.
+    #[inline]
+    pub fn scalar(text: &'a str, c: char, width: u8) -> Self {
+        debug_assert_eq!(text.len(), c.len_utf8());
+        debug_assert!(text.starts_with(c));
+        Self {
+            text,
+            width,
+            first: c,
+            cluster: false,
+        }
+    }
+
+    /// [`Glyph::from_text`] of the text.
+    #[inline]
+    pub fn glyph(self) -> Glyph<'a> {
+        match self.first {
+            _ if self.cluster => Glyph::Cluster(self.text),
+            ' ' => Glyph::Blank,
+            first => Glyph::Char(first),
         }
     }
 }
@@ -253,7 +289,12 @@ impl PackedCell {
     const STYLE_SHIFT: u32 = 29;
     const STYLE_MASK: u64 = 0xFFFF_FFFF << 29;
     const WRAPPED: u64 = 1 << 61;
-    pub const RESERVED: u64 = 0b11 << 62;
+    /// Legacy `CellAttributes::protected` (DECSCA, SPA). It is a cell bit
+    /// rather than a style bit, since the inline style's 32 bits are full.
+    /// Writes never set it; `Page::protect_cells` marks cells after a write
+    /// with a protecting pen, so unprotected printing pays nothing for it.
+    const PROTECTED: u64 = 1 << 62;
+    pub const RESERVED: u64 = 1 << 63;
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -303,8 +344,19 @@ impl PackedCell {
         self.0 & Self::RICH != 0
     }
 
+    /// Whether the cell owns entries in its page's side tables (a rich
+    /// style, a grapheme, a hyperlink or images), which overwriting it must
+    /// release.
+    pub fn has_side_entries(self) -> bool {
+        self.0 & (Self::RICH | Self::GRAPHEME | Self::HYPERLINK | Self::IMAGE) != 0
+    }
+
     pub fn is_wrapped(self) -> bool {
         self.0 & Self::WRAPPED != 0
+    }
+
+    pub fn is_protected(self) -> bool {
+        self.0 & Self::PROTECTED != 0
     }
 
     pub fn semantic(self) -> SemanticType {
@@ -361,6 +413,10 @@ impl PackedCell {
 
     pub fn with_wrapped(self, on: bool) -> Self {
         self.with_flag(Self::WRAPPED, on)
+    }
+
+    pub fn with_protected(self, on: bool) -> Self {
+        self.with_flag(Self::PROTECTED, on)
     }
 
     pub fn with_semantic(self, semantic: SemanticType) -> Self {

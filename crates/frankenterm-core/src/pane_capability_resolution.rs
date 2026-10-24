@@ -893,6 +893,35 @@ mod tests {
         }
     }
 
+    /// ft-zrwue: two live fixtures on one pane share custody, so the first
+    /// to finish leaves the other's state in place.
+    #[test]
+    fn equal_overlapping_pane_state_fixtures_share_custody() {
+        let pane_id = 4_390;
+        let state = IpcPaneState {
+            pane_id,
+            known: true,
+            observed: Some(true),
+            alt_screen: Some(false),
+            last_status_at: Some(1),
+            in_gap: Some(false),
+            cursor_alt_screen: Some(false),
+            reason: None,
+            live_prompt: None,
+        };
+
+        let first = set_test_pane_state_override(state.clone());
+        let second = set_test_pane_state_override(state.clone());
+        drop(first);
+        assert_eq!(
+            test_pane_state_override(pane_id),
+            Some(state),
+            "a finished fixture must not remove a live one's pane state"
+        );
+        drop(second);
+        assert_eq!(test_pane_state_override(pane_id), None);
+    }
+
     #[test]
     fn osc_segment_limit_is_bounded() {
         const {

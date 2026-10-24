@@ -13,8 +13,8 @@
 |---|---|---|---|
 | zones | `ft robot dom zones <pane>` | `zones` | the flat `zones[]` list |
 | last-command | `ft robot dom last-command <pane>` | `last_command` | the most recent command-input zone (`command`) |
-| output-of | `ft robot dom output-of <pane> <index>` | `output_of` | the output zone for command `index` (`output`) |
-| exit-code | `ft robot dom exit-code <pane> [index]` | `exit_code` | the exit status for a command (`exit_code`) |
+| output-of | `ft robot dom output-of <pane> --command-index <index>` | `output_of` | the output zone for command `index` (`output`) |
+| exit-code | `ft robot dom exit-code <pane> [--command-index <index>]` | `exit_code` | the exit status for a command (`exit_code`) |
 
 All four verbs are **read-only** observations of the live mux's OSC 133
 semantic-prompt zones (fetched via `MuxInterface::get_semantic_zones`, codec

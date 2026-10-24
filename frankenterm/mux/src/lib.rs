@@ -61,7 +61,7 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    capture_and_bind_live_parser_checkpoint, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
+    capture_and_bind_live_parser_checkpoint, LiveParserCheckpointAck,
 };
 #[cfg(test)]
 use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
@@ -71,7 +71,6 @@ use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
     GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,
 };
-use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::pane::{CachePolicy, CloseReason, GuardianLiveOutputReader, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, PaneEntry, PaneNode, SplitRequest, Tab, TabId};
@@ -90,7 +89,9 @@ use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
-use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+use frankenterm_term::terminalstate::checkpoint::{
+    TerminalCheckpointLimits, TerminalCheckpointLineEncoding,
+};
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -112,7 +113,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 #[cfg(windows)]
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2143,7 +2144,66 @@ impl AdmittedHistoricalAlerts {
 /// needs. The successor is released only after delivery completes or cancels.
 #[derive(Default)]
 pub struct PaneAlertDispatchQueue {
-    tail: Mutex<Option<promise::Future<()>>>,
+    tail: Mutex<Option<PaneStatePublication>>,
+    // State publication must not wait for a Lua consumer: that consumer may
+    // itself need an authoritative metadata RPC before it can finish.
+    state_tail: Mutex<Option<PaneStatePublication>>,
+}
+
+pub(crate) type PaneStatePublication =
+    futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+impl PaneAlertDispatchQueue {
+    fn fence_tail(
+        tail: &Mutex<Option<PaneStatePublication>>,
+    ) -> (Option<PaneStatePublication>, promise::Promise<()>) {
+        use futures::FutureExt;
+        let mut completion = promise::Promise::new();
+        let own_gate = completion
+            .get_future()
+            .expect("new state publication future");
+        let mut tail = tail.lock();
+        let predecessor = tail.take();
+        let prior = predecessor.clone();
+        *tail = Some(
+            async move {
+                // Cancellation releases only this producer's gate. A later
+                // producer still waits for all of its predecessors.
+                if let Some(prior) = prior {
+                    prior.await;
+                }
+                let _ = own_gate.await;
+            }
+            .boxed()
+            .shared(),
+        );
+        (predecessor, completion)
+    }
+
+    pub(crate) fn fence_state(&self) -> (Option<PaneStatePublication>, promise::Promise<()>) {
+        Self::fence_tail(&self.state_tail)
+    }
+}
+
+/// Separates ordered model publication from ordered historical callbacks.
+/// Dropping either phase releases its successor, including cancellation.
+pub struct PaneAlertDispatchOrdering {
+    state_completion: Option<promise::Promise<()>>,
+    historical_predecessor: Option<PaneStatePublication>,
+    _historical_completion: promise::Promise<()>,
+}
+
+impl PaneAlertDispatchOrdering {
+    /// Call after publishing every ordinary mux alert in the batch, before
+    /// invoking historical consumers. Metadata snapshots can then complete
+    /// even when a consumer awaits an RPC on this same pane.
+    pub async fn begin_history(&mut self) {
+        drop(self.state_completion.take());
+        if let Some(predecessor) = self.historical_predecessor.as_mut() {
+            predecessor.await;
+        }
+        self.historical_predecessor = None;
+    }
 }
 
 /// Both executor hops are funded before a producer changes its model. Dropping
@@ -2205,22 +2265,36 @@ impl FundedPaneAlertDispatch {
         B: std::future::Future<Output = ()> + Send + 'static,
         D: std::future::Future<Output = ()> + Send + 'static,
     {
-        let mut completion = promise::Promise::<()>::new();
-        let successor = completion
-            .get_future()
-            .expect("new alert completion future");
-        let predecessor = queue.tail.lock().replace(successor);
+        self.publish_stateful(queue, ready, move |mut ordering| async move {
+            ordering.begin_history().await;
+            deliver.await;
+        });
+    }
+
+    /// Publish state in producer order independently of historical callback
+    /// completion. The caller publishes its ordinary mux alerts, calls
+    /// `begin_history`, and only then invokes/awaits historical consumers.
+    pub fn publish_stateful<B, F, D>(self, queue: &PaneAlertDispatchQueue, ready: B, deliver: F)
+    where
+        B: std::future::Future<Output = ()> + Send + 'static,
+        F: FnOnce(PaneAlertDispatchOrdering) -> D + Send + 'static,
+        D: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (predecessor, completion) = PaneAlertDispatchQueue::fence_tail(&queue.tail);
+        let (state_predecessor, state_completion) = queue.fence_state();
+        let ordering = PaneAlertDispatchOrdering {
+            state_completion: Some(state_completion),
+            historical_predecessor: predecessor,
+            _historical_completion: completion,
+        };
         let Self { background, main } = self;
         background.spawn(async move {
-            if let Some(predecessor) = predecessor {
-                let _ = predecessor.await;
+            if let Some(predecessor) = state_predecessor {
+                predecessor.await;
             }
             ready.await;
             main.spawn(async move {
-                // Capture the entire promise before polling deliver: even an
-                // unpolled cancellation must release the next admitted batch.
-                let _completion = completion;
-                deliver.await;
+                deliver(ordering).await;
             })
             .detach();
         });
@@ -2497,6 +2571,68 @@ const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 const GUARDIAN_LIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Live checkpoints a pane adopts after the one its newest committed recovery
+/// root names, while a root publisher runs: none. Every root capture adopts a
+/// fresh member for each pane, which re-anchors its replay and bounds its
+/// journal, so live checkpoints only repeat that work, and the guardian does
+/// all of it on one worker: at three per root interval, 12 panes' live
+/// checkpoints (1-2 s each for a 2 MB payload) saturated it and recovery
+/// captures overran their budget. The guardian also keeps only a pane's
+/// newest eight catalog members, reclaiming the oldest first; a root whose
+/// member is gone can no longer be restored, and at one live checkpoint every
+/// five seconds an ungated pane reclaimed its root's member in 40 seconds.
+/// Without a root publisher, live checkpoints are the only ones and stay.
+const GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT: usize = 0;
+/// Adoptions a ledger remembers while no committed root names one of them.
+const GUARDIAN_ADOPTION_LEDGER_CAPACITY: usize = 64;
+
+/// The guardian checkpoints one pane registration adopted, as far as keeping
+/// its newest committed recovery root's member needs them.
+#[derive(Debug, Default)]
+struct GuardianAdoptionLedger {
+    /// Effect ids adopted after the member the newest committed root names,
+    /// oldest first; every adoption while no committed root names one.
+    since_root: VecDeque<uuid::Uuid>,
+    root_named: bool,
+    /// The newest adoption the live replay has not yet anchored at.
+    reanchor: Option<(
+        crate::guardian_protocol::GuardianCheckpointIdentityDigest,
+        u64,
+    )>,
+}
+
+impl GuardianAdoptionLedger {
+    fn record(
+        &mut self,
+        effect_id: uuid::Uuid,
+        checkpoint_id: crate::guardian_protocol::GuardianCheckpointIdentityDigest,
+        capture_generation: u64,
+    ) {
+        if self.since_root.len() == GUARDIAN_ADOPTION_LEDGER_CAPACITY {
+            self.since_root.pop_front();
+        }
+        self.since_root.push_back(effect_id);
+        self.reanchor = Some((checkpoint_id, capture_generation));
+    }
+
+    /// A committed root names the member adopted as `effect_id`: from now on
+    /// only what this registration adopted after it counts. A member this
+    /// ledger no longer remembers changes nothing.
+    fn root_committed(&mut self, effect_id: uuid::Uuid) -> bool {
+        let Some(at) = self.since_root.iter().position(|id| *id == effect_id) else {
+            return false;
+        };
+        self.since_root.drain(..=at);
+        self.root_named = true;
+        true
+    }
+
+    /// Whether a live checkpoint may be adopted, `limit` after the member
+    /// the newest committed root names.
+    fn live_adoption_allowed(&self, limit: usize) -> bool {
+        self.root_named && self.since_root.len() < limit
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct GuardianLiveCheckpointSchedule {
@@ -4225,6 +4361,7 @@ struct PaneRegistrationGeneration {
     operation_state: AtomicUsize,
     reader_dead: Arc<AtomicBool>,
     live_parser_checkpoint: Arc<LiveParserCheckpointControl>,
+    guardian_adoptions: Mutex<GuardianAdoptionLedger>,
     retirement_tracker: Weak<PaneRetirementTracker>,
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
@@ -4256,6 +4393,7 @@ impl PaneRegistrationGeneration {
             operation_state: AtomicUsize::new(0),
             reader_dead: Arc::new(AtomicBool::new(false)),
             live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::new(wire_identity)),
+            guardian_adoptions: Mutex::new(GuardianAdoptionLedger::default()),
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
@@ -4692,6 +4830,119 @@ mod pane_registration_handle {
             >,
         > {
             self.pane.capture_surface_snapshot(baseline)
+        }
+
+        fn local(&self) -> Option<&crate::localpane::LocalPane> {
+            self.pane.downcast_ref::<crate::localpane::LocalPane>()
+        }
+
+        /// [`Self::capture_surface_snapshot`] that waits up to `wait` for a
+        /// local pane's terminal, registering demand so a flooding parser
+        /// hands it over at its next slice (ft-pjjeg). Other panes only try.
+        pub fn capture_surface_snapshot_waiting(
+            &self,
+            baseline: termwiz::surface::SequenceNo,
+            wait: std::time::Duration,
+        ) -> Option<
+            Result<
+                crate::pane::PaneSurfaceSnapshot,
+                frankenterm_term::screen::ColdReadMetadataBusy,
+            >,
+        > {
+            match self.local() {
+                Some(local) => local.capture_surface_snapshot_waiting(baseline, wait),
+                None => self.pane.capture_surface_snapshot(baseline),
+            }
+        }
+
+        /// [`Self::capture_line_read`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn capture_line_read_waiting(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+            wait: std::time::Duration,
+        ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+            match self.local() {
+                Some(local) => local.capture_line_read_waiting(range, budget, wait),
+                None => self.pane.capture_line_read(range, budget),
+            }
+        }
+
+        /// [`Self::publish_line_reads`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn publish_line_reads_waiting(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            publish: &mut dyn FnMut(),
+            wait: std::time::Duration,
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+            match self.local() {
+                Some(local) => local.publish_line_reads_waiting(reads, publish, wait),
+                None => self.pane.publish_line_reads(reads, publish),
+            }
+        }
+
+        /// [`Self::get_line_layout`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn get_line_layout_waiting(
+            &self,
+            wait: std::time::Duration,
+        ) -> Result<
+            Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            frankenterm_term::screen::ColdReadMetadataBusy,
+        > {
+            match self.local() {
+                Some(local) => local.get_line_layout_waiting(wait),
+                None => self.pane.get_line_layout(),
+            }
+        }
+
+        /// [`Self::publish_line_reads_at_layout`] waiting up to `wait`
+        /// (ft-pjjeg); see [`Self::capture_surface_snapshot_waiting`].
+        pub fn publish_line_reads_at_layout_waiting(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            expected_seqno: termwiz::surface::SequenceNo,
+            expected_dimensions: crate::renderable::RenderableDimensions,
+            publish: &mut dyn FnMut(),
+            wait: std::time::Duration,
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+            match self.local() {
+                Some(local) => local.publish_line_reads_at_layout_waiting(
+                    reads,
+                    expected_seqno,
+                    expected_dimensions,
+                    publish,
+                    wait,
+                ),
+                None => self.pane.publish_line_reads_at_layout(
+                    reads,
+                    expected_seqno,
+                    expected_dimensions,
+                    publish,
+                ),
+            }
+        }
+
+        /// [`crate::localpane::LocalPane::read_resident_lines_atomically`];
+        /// `None` (use the worker path) for other pane types.
+        pub fn read_resident_lines_atomically(
+            &self,
+            ranges: &[std::ops::Range<frankenterm_term::StableRowIndex>],
+            layout: Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            max_rows: usize,
+            wait: std::time::Duration,
+            publish: &mut dyn FnMut(&[frankenterm_term::screen::ScreenLineRead]),
+        ) -> Option<anyhow::Result<bool>> {
+            self.local()?
+                .read_resident_lines_atomically(ranges, layout, max_rows, wait, publish)
         }
 
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
@@ -5188,7 +5439,9 @@ mod pane_registration_handle {
             self.deliver_historical(batch, &alert) && self.dispatch_alert(alert)
         }
 
-        pub(crate) fn dispatch_alert(&self, alert: Alert) -> bool {
+        /// Publish the ordinary mux occurrence without awaiting historical
+        /// subscribers. Callers retain this exact output generation.
+        pub fn dispatch_alert(&self, alert: Alert) -> bool {
             let Some(owner) = self.registration.generation.owner.upgrade() else {
                 return false;
             };
@@ -5688,7 +5941,24 @@ mod pane_registration_handle {
             let capture = self
                 .capture_live_parser_checkpoint(segment, output, limits, timeout)
                 .map_err(anyhow::Error::new)?;
-            self.pane.publish_guardian_checkpoint(capture)
+            self.publish_and_record_guardian_checkpoint(capture)
+        }
+
+        /// Every adoption, live or for a recovery root, enters this
+        /// registration's ledger: the live replay re-anchors at the newest,
+        /// and live adoptions count against the newest committed root.
+        fn publish_and_record_guardian_checkpoint(
+            &self,
+            capture: LiveParserCheckpointAck,
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            let published = self.pane.publish_guardian_checkpoint(capture)?;
+            let receipt = published.receipt();
+            self.generation.guardian_adoptions.lock().record(
+                receipt.effect_id(),
+                receipt.intent().checkpoint_identity(),
+                receipt.generation(),
+            );
+            Ok(published)
         }
 
         /// Capture the current fully parsed authenticated guardian prefix.
@@ -5725,12 +5995,29 @@ mod pane_registration_handle {
                     .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?;
                 cursor.source
             };
+            let started = Instant::now();
             let capture = self
                 .capture_live_parser_checkpoint_source_cancelling(
                     source, limits, timeout, cancelled,
                 )
                 .map_err(anyhow::Error::new)?;
-            self.pane.publish_guardian_checkpoint(capture)
+            let captured = started.elapsed();
+            let payload_bytes = capture.terminal_checkpoint().canonical_payload().len();
+            let published = self.publish_and_record_guardian_checkpoint(capture);
+            let total = started.elapsed();
+            if total > Duration::from_secs(1) {
+                // A recovery capture takes every pane's checkpoint in turn
+                // within one budget: say what a slow one spent its time on.
+                log::warn!(
+                    "guardian checkpoint of pane {} took {} ms: parser {} ms, publication {} ms, {} payload bytes",
+                    self.generation.pane_id,
+                    total.as_millis(),
+                    captured.as_millis(),
+                    total.saturating_sub(captured).as_millis(),
+                    payload_bytes
+                );
+            }
+            published
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -6617,6 +6904,30 @@ mod pane_registration_handle {
             Some(result)
         }
 
+        /// Capture metadata for this exact registration, retaining its output
+        /// continuation until the caller enqueues the response. Removal and
+        /// numeric-id reuse cannot pass an in-flight snapshot.
+        pub fn capture_user_vars_snapshot(
+            &self,
+            max_entries: usize,
+            max_text_bytes: usize,
+        ) -> Option<anyhow::Result<RegisteredPaneUserVarsSnapshot>> {
+            let pane = self.pane.upgrade()?;
+            let mux = self.generation.owner.upgrade()?;
+            let output = mux.reserve_pane_output_for_reader(
+                &pane,
+                &self.generation,
+                promise::spawn::is_scheduler_configured(),
+            )?;
+            Some(
+                pane.capture_user_vars_snapshot(max_entries, max_text_bytes)
+                    .map(|snapshot| RegisteredPaneUserVarsSnapshot {
+                        snapshot,
+                        _output: output,
+                    }),
+            )
+        }
+
         /// Capture recipients outside terminal/tab mutation locks. Membership
         /// is an admission snapshot; delivery revalidates current membership.
         pub fn reserve_alert_output(&self) -> Option<PaneAlertOutput> {
@@ -7165,6 +7476,22 @@ struct PaneOutputBatch {
 struct PaneOutputContinuation {
     batch: Arc<PaneOutputBatch>,
     operation: Option<PaneRegistrationOperationLease>,
+}
+
+/// An ordered metadata snapshot bound to one live pane incarnation.
+pub struct RegisteredPaneUserVarsSnapshot {
+    snapshot: pane::PaneUserVarsSnapshot,
+    _output: PaneOutputContinuation,
+}
+
+impl RegisteredPaneUserVarsSnapshot {
+    pub async fn wait_ready(&mut self) {
+        self.snapshot.wait_ready().await;
+    }
+
+    pub fn take_user_vars(&mut self) -> HashMap<String, String> {
+        self.snapshot.take_user_vars()
+    }
 }
 
 impl PaneOutputContinuation {
@@ -10353,6 +10680,18 @@ pub struct Mux {
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
     pane_registration: Mutex<()>,
+    /// A recovery root publisher runs: live guardian checkpoints keep the
+    /// members newest committed roots name (`guardian_live_adoption_allowed`).
+    guardian_root_retention: AtomicBool,
+    /// This mux's guardian validates version 4 (compact) terminal
+    /// checkpoints (`set_guardian_compact_checkpoints`).
+    guardian_compact_checkpoints: AtomicBool,
+    /// This mux's guardian validates checkpoints holding graphics state
+    /// (`set_guardian_graphics_checkpoints`).
+    guardian_graphics_checkpoints: AtomicBool,
+    /// This mux's guardian validates checkpoints holding character
+    /// protection (`set_guardian_protection_checkpoints`).
+    guardian_protection_checkpoints: AtomicBool,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
     pane_removal_cleanup_outstanding_leases: AtomicUsize,
@@ -10425,10 +10764,13 @@ pub struct Mux {
 }
 
 /// Maximum number of distinct client incarnations whose latest reliable input
-/// identity is retained for one mux lifetime. Reconnects reuse the same
-/// [`ClientId`] entry. A new identity beyond this bound is admitted as an
-/// ordinary client but receives a typed reliable-input refusal rather than
-/// growing mux memory without limit.
+/// identity is retained at once. Reconnects reuse the same [`ClientId`] entry.
+/// An entry is created on a client's first reliable-input claim, so clients
+/// that never send reliable input hold none. When the bound is reached, the
+/// least recently used entry of an unregistered client with no claim in
+/// flight is evicted; only when no entry is evictable does a new identity
+/// receive a typed reliable-input refusal, rather than mux memory growing
+/// without limit.
 pub const MAX_RELIABLE_INPUT_CLIENTS: usize = 4_096;
 
 /// Opaque authority for one operation admitted against one exact client
@@ -10558,29 +10900,107 @@ impl ReliableInputClientLedger {
 }
 
 #[derive(Debug)]
+struct ReliableInputLedgerEntry {
+    ledger: Arc<Mutex<ReliableInputClientLedger>>,
+    /// Ledger-wide tick of this client's most recent claim. When the ledger
+    /// is full, the evictable entry with the oldest tick is replaced first.
+    last_claim_tick: u64,
+}
+
+#[derive(Debug)]
 struct ReliableInputLedger {
-    clients: HashMap<ClientId, Arc<Mutex<ReliableInputClientLedger>>>,
+    clients: HashMap<ClientId, ReliableInputLedgerEntry>,
+    claim_tick: u64,
 }
 
 impl ReliableInputLedger {
     fn new() -> Self {
         Self {
-            clients: HashMap::with_capacity(MAX_RELIABLE_INPUT_CLIENTS),
+            clients: HashMap::new(),
+            claim_tick: 0,
         }
     }
 
-    fn prepare_client(&mut self, client_id: &ClientId) -> bool {
-        if self.clients.contains_key(client_id) {
-            return true;
+    /// Return `client_id`'s ledger, creating it on the client's first claim.
+    ///
+    /// Entries are created lazily, so a client that never sends reliable input
+    /// (a one-shot CLI connection, an observer, a reattached domain that never
+    /// types) never holds a slot. The history of a client that unregistered
+    /// is kept, because a client that reconnects under the same identity may
+    /// retry its last serial and must be answered from that history. When the
+    /// ledger is full, the least recently used entry whose client is not
+    /// registered and has no claim in flight makes room. `None` means every
+    /// entry belongs to a registered client or has a claim in flight.
+    fn client_ledger(
+        &mut self,
+        client_id: &ClientId,
+        is_registered: impl Fn(&ClientId) -> bool,
+    ) -> Option<Arc<Mutex<ReliableInputClientLedger>>> {
+        self.claim_tick = self.claim_tick.saturating_add(1);
+        let tick = self.claim_tick;
+        if let Some(entry) = self.clients.get_mut(client_id) {
+            entry.last_claim_tick = tick;
+            return Some(Arc::clone(&entry.ledger));
         }
-        if self.clients.len() >= MAX_RELIABLE_INPUT_CLIENTS {
-            return false;
+        if self.clients.len() >= MAX_RELIABLE_INPUT_CLIENTS && !self.evict_one(&is_registered) {
+            return None;
         }
+        let ledger = Arc::new(Mutex::new(ReliableInputClientLedger::new()));
         self.clients.insert(
             client_id.clone(),
-            Arc::new(Mutex::new(ReliableInputClientLedger::new())),
+            ReliableInputLedgerEntry {
+                ledger: Arc::clone(&ledger),
+                last_claim_tick: tick,
+            },
         );
+        Some(ledger)
+    }
+
+    /// Remove the least recently used entry of an unregistered client with no
+    /// claim in flight. An entry whose lock is held is in use and is skipped.
+    fn evict_one(&mut self, is_registered: &impl Fn(&ClientId) -> bool) -> bool {
+        let victim = self
+            .clients
+            .iter()
+            .filter(|(client_id, entry)| {
+                !is_registered(client_id)
+                    && entry
+                        .ledger
+                        .try_lock()
+                        .is_some_and(|ledger| ledger.pending.is_none())
+            })
+            .min_by_key(|(_, entry)| entry.last_claim_tick)
+            .map(|(client_id, _)| client_id.clone());
+        let Some(victim) = victim else {
+            return false;
+        };
+        self.clients.remove(&victim);
+        metrics::counter!("mux.reliable_input.client_admission", "outcome" => "evicted")
+            .increment(1);
         true
+    }
+}
+
+/// Reliable-input claims refused because every ledger slot is held by a
+/// registered client or a claim in flight.
+static RELIABLE_INPUT_LEDGER_FULL_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a full-ledger refusal and log it on the first occurrence and each
+/// power of two after that, so the condition is visible without logging once
+/// per key.
+fn note_reliable_input_ledger_full(client_id: &ClientId) {
+    metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity").increment(1);
+    let refusals = RELIABLE_INPUT_LEDGER_FULL_REFUSALS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if refusals.is_power_of_two() {
+        log::error!(
+            "reliable input refused for client pid {} id {}: all {MAX_RELIABLE_INPUT_CLIENTS} \
+             reliable-input ledger slots belong to registered clients or claims in flight \
+             ({refusals} refusals so far)",
+            client_id.pid,
+            client_id.id,
+        );
     }
 }
 
@@ -12192,7 +12612,14 @@ fn attempt_live_parser_checkpoint(
             return LiveParserAttemptOutcome::Fatal;
         }
         Ok(Err(error)) => {
-            if matches!(&error, LiveParserCaptureAndBindError::Pane(_)) {
+            if error.leaves_live_parser_consistent() {
+                // The pane lives on, but no whole-mux recovery image can be
+                // published without it, so an upgrade waits; name the pane.
+                log::warn!(
+                    "live parser checkpoint capture of pane {} failed; the pane continues, \
+                     but whole-mux recovery cannot publish until it captures: {error:?}",
+                    generation.pane_id
+                );
                 control.complete_capture(
                     request.request_id(),
                     Err(LiveParserCheckpointError::CaptureAndBind),
@@ -12776,12 +13203,28 @@ fn attempt_live_parser_checkpoint_after_raw(
 ) -> LiveParserAttemptOutcome {
     let control = &generation.live_parser_checkpoint;
     debug_assert!(!raw.is_framed() || hold.is_holding());
-    if !raw.is_empty()
-        && !raw.is_framed()
-        && (control.has_ready_model_checkpoint()
-            || matches!(control.ready_checkpoint_target(), Ok(Some(_))))
-    {
-        flush_coalesced_output(pane, generation, dead, parser, raw, actions, hold);
+    if !raw.is_empty() && !raw.is_framed() {
+        // Held raw bytes already count as parsed, but the parser has not
+        // consumed them, so a capture must feed them first. This one read of
+        // the request decides that (ft-3woiu). The attempt reads the target
+        // again: a request registered, or a delivery call finished, on
+        // another thread between the two reads would show it a ready target
+        // with the parser short of it by the held bytes, and it would poison
+        // the pane ("external parser recovery watermark disagreed with
+        // delivery fence"). So when nothing is ready here, nothing is
+        // attempted. The request's wake, or the next loop iteration (each
+        // starts with an attempt), makes the attempt after a read that sees
+        // it, and flushes first.
+        let ready = control.has_ready_model_checkpoint()
+            || match control.ready_checkpoint_target() {
+                Ok(Some(_)) => true,
+                Ok(None) => return LiveParserAttemptOutcome::NoRequest,
+                // An overshoot: the attempt reads it again and poisons.
+                Err(_) => false,
+            };
+        if ready {
+            flush_coalesced_output(pane, generation, dead, parser, raw, actions, hold);
+        }
     }
     attempt_live_parser_checkpoint(pane, generation, dead, parser, actions, hold, worker)
 }
@@ -12891,7 +13334,7 @@ fn publish_guardian_checkpoint_after_typed_delivery(
     pane_id: PaneId,
     segment: GuardianOutputSegmentIdentity,
     output: GuardianOutputAppendReceipt,
-) -> anyhow::Result<GuardianCheckpointReceipt> {
+) -> anyhow::Result<()> {
     let _generation_lease = generation
         .try_acquire()
         .ok_or(LiveParserCheckpointError::StaleRegistration)?;
@@ -12910,10 +13353,25 @@ fn publish_guardian_checkpoint_after_typed_delivery(
         .capture_and_publish_guardian_checkpoint(
             segment,
             output,
-            TerminalCheckpointLimits::default(),
+            mux.guardian_checkpoint_limits(),
             GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
         )
-        .map(|published| published.receipt())
+        .map(drop)
+}
+
+/// Whether a live checkpoint may be adopted now: always without a recovery
+/// root publisher, otherwise only within `GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT`
+/// of the member this pane's newest committed root names.
+fn guardian_live_adoption_allowed(generation: &PaneRegistrationGeneration) -> bool {
+    let retains_roots = generation
+        .owner
+        .upgrade()
+        .is_some_and(|mux| mux.guardian_root_retention.load(Ordering::Acquire));
+    !retains_roots
+        || generation
+            .guardian_adoptions
+            .lock()
+            .live_adoption_allowed(GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT)
 }
 
 /// This function is run in a separate thread; its purpose is to perform
@@ -13002,7 +13460,19 @@ fn read_from_guardian_live_output(
             }
         };
         let now = Instant::now();
-        if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
+        if checkpoint_schedule.is_due(now)
+            && delivery.has_durable_replay_page_ack()
+            && !guardian_live_adoption_allowed(&generation)
+        {
+            // The guardian would reclaim the member the newest committed
+            // root names; the next root capture adopts and lifts this.
+            metrics::counter!(
+                "mux.guardian_checkpoint.publication_total",
+                "outcome" => "deferred_for_root"
+            )
+            .increment(1);
+            checkpoint_schedule.record_outcome(now, true);
+        } else if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
             let Some((segment, output)) = delivered_boundary else {
                 log::error!(
                     "guardian record reader returned success without one typed delivery: pane {}",
@@ -13018,7 +13488,7 @@ fn read_from_guardian_live_output(
                 segment,
                 output,
             ) {
-                Ok(_) => {
+                Ok(()) => {
                     metrics::counter!(
                         "mux.guardian_checkpoint.publication_total",
                         "outcome" => "committed"
@@ -13042,6 +13512,13 @@ fn read_from_guardian_live_output(
                     checkpoint_schedule.record_outcome(Instant::now(), false);
                 }
             }
+        }
+        // Later snapshots resume from the newest checkpoint adopted, live or
+        // for a recovery root, whose boundary this reader already delivered,
+        // and stop pinning the one the pane was restored from.
+        let reanchor = generation.guardian_adoptions.lock().reanchor.take();
+        if let Some((checkpoint_id, capture_generation)) = reanchor {
+            reader.reanchor(checkpoint_id, capture_generation);
         }
     }
 
@@ -13379,6 +13856,10 @@ impl Mux {
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
             pane_registration: Mutex::new(()),
+            guardian_root_retention: AtomicBool::new(false),
+            guardian_compact_checkpoints: AtomicBool::new(false),
+            guardian_graphics_checkpoints: AtomicBool::new(false),
+            guardian_protection_checkpoints: AtomicBool::new(false),
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
             pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
@@ -14142,11 +14623,6 @@ impl Mux {
     }
 
     pub fn register_client(&self, client_id: Arc<ClientId>) {
-        let reliable_input_prepared = self.reliable_input.lock().prepare_client(&client_id);
-        if !reliable_input_prepared {
-            metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity")
-                .increment(1);
-        }
         let replaced = {
             let mut clients = self.clients.write();
             if clients
@@ -14313,11 +14789,16 @@ impl Mux {
         input_serial: u64,
         payload: ReliableInputPayloadFingerprint,
     ) -> ReliableInputClaimOutcome {
-        if !self.client_operation_is_current(client) {
+        if !client
+            .owner
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
+        {
             return ReliableInputClaimOutcome::ClientRegistrationRetired;
         }
-        self.claim_reliable_input(
+        self.claim_reliable_input_for_registration(
             Some(client.client_id()),
+            Some(&client.generation),
             registration,
             input_serial,
             payload,
@@ -14369,22 +14850,54 @@ impl Mux {
         input_serial: u64,
         payload: ReliableInputPayloadFingerprint,
     ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input_for_registration(
+            client_id,
+            None,
+            registration,
+            input_serial,
+            payload,
+        )
+    }
+
+    /// Claim for the exact registration `client_id` (and, for a guarded
+    /// operation, its registration `generation`).
+    ///
+    /// The `clients` read guard is held until the pending claim is published.
+    /// Unregister and replacement need the write guard, so the registration
+    /// checked here stays current for the whole claim, and the ledger cannot
+    /// evict this client's entry (only unregistered clients are evictable)
+    /// between its lookup and the claim. Lock order: `clients`, then
+    /// `reliable_input`, then the client's own ledger.
+    fn claim_reliable_input_for_registration(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        generation: Option<&Arc<ClientRegistrationGeneration>>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        payload: ReliableInputPayloadFingerprint,
+    ) -> ReliableInputClaimOutcome {
         if input_serial == 0 {
             return ReliableInputClaimOutcome::IdentityConflict;
         }
         let Some(client_id) = client_id else {
             return ReliableInputClaimOutcome::ClientNotRegistered;
         };
-        if !self.client_registration_is_current(client_id) {
+        let clients = self.clients.read();
+        let current = clients.get(client_id.as_ref()).is_some_and(|info| {
+            Arc::ptr_eq(&info.client_id, client_id)
+                && generation
+                    .is_none_or(|generation| Arc::ptr_eq(&info.registration_generation, generation))
+        });
+        if !current {
             return ReliableInputClaimOutcome::ClientRegistrationRetired;
         }
-        let Some(client_ledger) = self
+        let client_ledger = self
             .reliable_input
             .lock()
-            .clients
-            .get(client_id.as_ref())
-            .cloned()
-        else {
+            .client_ledger(client_id, |candidate| clients.contains_key(candidate));
+        let Some(client_ledger) = client_ledger else {
+            drop(clients);
+            note_reliable_input_ledger_full(client_id);
             return ReliableInputClaimOutcome::ClientLedgerUnavailable;
         };
         let mut ledger = client_ledger.lock();
@@ -20971,21 +21484,40 @@ impl Mux {
                 .as_ref()
                 .map(|registration| registration.domain_id);
             let mut captured_domains = Vec::with_capacity(domain_candidates.len());
+            // Domains with no durable policy, left out of the image while they
+            // host no pane (checked against the pane census below).
+            let mut unrecoverable_domains: Vec<(DomainId, anyhow::Error)> = Vec::new();
             let mut domain_policy_bytes = 0usize;
             for (domain_id, domain) in &domain_candidates {
                 if domain.domain_id() != *domain_id || domain.domain_name().len() > 65536 {
                     return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
                 }
-                let policy = domain.recovery_policy(&captured_config).map_err(|error| {
-                    if error.is::<domain::DomainRecoveryPolicyBusy>() {
-                        MuxTopologyCaptureError::DomainPolicyBusy
-                    } else {
-                        MuxTopologyCaptureError::UnsupportedDomainPolicy
+                // A refusal ends whole-mux recovery for this mux, and the
+                // capture error names no domain: say which one and why. Domain
+                // names and policy refusals carry no pane content.
+                let refused = |error: &anyhow::Error| {
+                    log::warn!(
+                        "domain {:?} has no recoverable policy: {error:#}",
+                        domain.domain_name()
+                    );
+                    MuxTopologyCaptureError::UnsupportedDomainPolicy
+                };
+                let policy = match domain.recovery_policy(&captured_config) {
+                    Ok(policy) => policy,
+                    Err(error) if error.is::<domain::DomainRecoveryPolicyBusy>() => {
+                        return Err(MuxTopologyCaptureError::DomainPolicyBusy);
                     }
-                })?;
-                policy
-                    .validate()
-                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                    // A transport with no durable policy, such as the SSH
+                    // domains every host in ~/.ssh/config registers, is never
+                    // needed by a restore while it hosts no pane. Refusing it
+                    // disabled recovery on any mux with an SSH config.
+                    Err(error) if Some(*domain_id) != default_domain_id => {
+                        unrecoverable_domains.push((*domain_id, error));
+                        continue;
+                    }
+                    Err(error) => return Err(refused(&error)),
+                };
+                policy.validate().map_err(|error| refused(&error))?;
                 domain_policy_bytes = domain_policy_bytes
                     .checked_add(
                         policy
@@ -21116,6 +21648,21 @@ impl Mux {
                 })
                 .collect();
             let domains_guard = self.domains.read().clone();
+            // A pane in a domain left out of the image could not be restored.
+            if let Some((domain_id, error)) = unrecoverable_domains.iter().find(|(domain_id, _)| {
+                panes_guard
+                    .values()
+                    .any(|registration| registration.domain_id == *domain_id)
+            }) {
+                log::warn!(
+                    "a pane's domain {:?} has no recoverable policy: {error:#}",
+                    domains_guard
+                        .get(domain_id)
+                        .map(|domain| domain.domain_name().to_owned())
+                        .unwrap_or_default()
+                );
+                return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
+            }
 
             let mut pane_bindings = Vec::new();
             for tab in &captured_tabs {
@@ -21399,6 +21946,9 @@ impl Mux {
             // capture must be able to refuse a newly unresolved spawn.
             let mut domain_policies_current = true;
             for (domain_id, domain) in &domain_candidates {
+                if unrecoverable_domains.iter().any(|(id, _)| id == domain_id) {
+                    continue;
+                }
                 let expected = &captured_domains[captured_domains
                     .binary_search_by_key(domain_id, |domain| domain.domain_id)
                     .expect("captured domain census preserves every candidate")];
@@ -21561,6 +22111,134 @@ impl Mux {
         self.panes.read().get(&pane_id).is_some_and(|current| {
             Arc::ptr_eq(&current.pane, &registered.0)
                 && Arc::ptr_eq(&current.generation, &registered.1)
+        })
+    }
+
+    /// While a recovery root publisher runs, each guardian pane adopts live
+    /// checkpoints only from the member its newest committed root names up to
+    /// `GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT` after it, so the guardian, which
+    /// keeps a pane's newest members, still holds that member for a restore.
+    /// Without a publisher no root names a member and live adoption is free.
+    pub fn set_guardian_root_retention(&self, enabled: bool) {
+        self.guardian_root_retention
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Whether this mux's guardian validates version 4 (compact) terminal
+    /// checkpoints: the caller learned it from the guardian itself
+    /// (`GuardianClient::admits_compact_checkpoints`).
+    ///
+    /// Every reader of what this mux publishes then admits version 4: the
+    /// guardian, and any mux that restores it, which is the guardian's own
+    /// family or an upgrade of it, since the guardian stays on the family it
+    /// was installed with.
+    pub fn set_guardian_compact_checkpoints(&self, enabled: bool) {
+        self.guardian_compact_checkpoints
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Whether this mux's guardian validates terminal checkpoints holding
+    /// graphics state (`GuardianClient::admits_graphics_checkpoints`); every
+    /// reader of what this mux publishes then admits them, as for
+    /// `set_guardian_compact_checkpoints`. Without it a pane showing an
+    /// image refuses capture, and with it every whole-mux recovery image.
+    pub fn set_guardian_graphics_checkpoints(&self, enabled: bool) {
+        self.guardian_graphics_checkpoints
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Whether this mux's guardian validates terminal checkpoints holding
+    /// character protection (`GuardianClient::admits_protection_checkpoints`),
+    /// as for `set_guardian_graphics_checkpoints`: without it a pane holding
+    /// protected cells (DECSCA, SPA) refuses capture.
+    pub fn set_guardian_protection_checkpoints(&self, enabled: bool) {
+        self.guardian_protection_checkpoints
+            .store(enabled, Ordering::Release);
+    }
+
+    /// The limits for checkpoints this mux publishes: version 4 lines,
+    /// graphics state and character protection each when its guardian
+    /// admits them.
+    pub fn guardian_checkpoint_limits(&self) -> TerminalCheckpointLimits {
+        let line_encoding = if self.guardian_compact_checkpoints.load(Ordering::Acquire) {
+            TerminalCheckpointLineEncoding::Runs
+        } else {
+            TerminalCheckpointLineEncoding::Cells
+        };
+        TerminalCheckpointLimits {
+            line_encoding,
+            capture_graphics: self.guardian_graphics_checkpoints.load(Ordering::Acquire),
+            capture_protection: self.guardian_protection_checkpoints.load(Ordering::Acquire),
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// A committed recovery root names `published` for `pane_id`. Returns
+    /// whether the pane's current registration adopted it.
+    pub fn note_guardian_root_committed(
+        &self,
+        pane_id: PaneId,
+        published: &crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> bool {
+        let generation = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            Arc::clone(&registered.generation)
+        };
+        generation.wire_identity == published.capture().registration_wire_identity()
+            && generation
+                .guardian_adoptions
+                .lock()
+                .root_committed(published.receipt().effect_id())
+    }
+
+    /// Whether a guardian checkpoint still belongs to the exact pane
+    /// registration and guardian lease it was captured from, so a recovery
+    /// image may name it. Unlike `guardian_checkpoint_is_current` it admits
+    /// output parsed after the checkpoint: the guardian journal holds every
+    /// byte after its boundary and a restore replays them, so a guardian pane
+    /// needs no common cut with the rest of the mux. A pane that never stops
+    /// printing could otherwise never be part of a published image.
+    pub fn guardian_checkpoint_is_restorable(
+        &self,
+        pane_id: PaneId,
+        published: &crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> bool {
+        let capture = published.capture();
+        let current = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            (
+                Arc::clone(&registered.pane),
+                Arc::clone(&registered.generation),
+            )
+        };
+        if current.1.wire_identity != capture.registration_wire_identity()
+            || current.0.durable_pane_id() != Some(*capture.durable_pane_id().as_bytes())
+        {
+            return false;
+        }
+        let Some(local) = current.0.downcast_ref::<crate::localpane::LocalPane>() else {
+            return false;
+        };
+        if local.guardian_lease_identity() != Some(published.owner()) {
+            return false;
+        }
+        {
+            let state = current.1.live_parser_checkpoint.state.lock();
+            if state.dead || state.poison.is_some() || !state.attached || !state.guardian_mode {
+                return false;
+            }
+        }
+        let _registration = self.pane_registration.lock();
+        let panes = self.panes.read();
+        panes.get(&pane_id).is_some_and(|registered| {
+            Arc::ptr_eq(&current.0, &registered.pane)
+                && Arc::ptr_eq(&current.1, &registered.generation)
         })
     }
 
@@ -24732,6 +25410,64 @@ mod tests {
         schedule.record_outcome(retry, true);
         assert!(!schedule.is_due(retry));
         assert!(schedule.is_due(retry + GUARDIAN_LIVE_CHECKPOINT_INTERVAL));
+    }
+
+    #[test]
+    fn guardian_live_adoptions_stay_within_reach_of_the_newest_committed_root() {
+        let digest = |byte| {
+            crate::guardian_protocol::GuardianCheckpointIdentityDigest::from_bytes([byte; 32])
+                .expect("checkpoint identity")
+        };
+        // The gate's mechanics, under an allowance of three.
+        let limit = 3;
+        let mut ledger = GuardianAdoptionLedger::default();
+        // Nothing a committed root names yet: no live adoption.
+        assert!(!ledger.live_adoption_allowed(limit));
+        let root = uuid::Uuid::from_u128(1);
+        ledger.record(root, digest(1), 3);
+        assert!(!ledger.live_adoption_allowed(limit));
+        let (_, generation) = ledger.reanchor.take().expect("root capture re-anchors");
+        assert_eq!(generation, 3);
+
+        // A capture still in flight when the root commits counts after it.
+        let in_flight = uuid::Uuid::from_u128(2);
+        ledger.record(in_flight, digest(2), 3);
+        assert!(!ledger.root_committed(uuid::Uuid::from_u128(99)));
+        assert!(!ledger.live_adoption_allowed(limit));
+        assert!(ledger.root_committed(root));
+        assert_eq!(ledger.since_root, [in_flight]);
+        // Production allows none after a committed root: root captures are
+        // the only adoptions while a root publisher runs.
+        assert!(!ledger.live_adoption_allowed(GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT));
+        for live in 3..=4 {
+            assert!(ledger.live_adoption_allowed(limit));
+            ledger.record(uuid::Uuid::from_u128(live), digest(3), 3);
+        }
+        assert_eq!(ledger.since_root.len(), limit);
+        assert!(!ledger.live_adoption_allowed(limit));
+
+        // The next root's member lifts the gate for what follows it only.
+        let next_root = uuid::Uuid::from_u128(10);
+        ledger.record(next_root, digest(4), 3);
+        let failed_capture = uuid::Uuid::from_u128(11);
+        ledger.record(failed_capture, digest(5), 3);
+        assert!(ledger.root_committed(next_root));
+        assert_eq!(ledger.since_root, [failed_capture]);
+        assert!(ledger.live_adoption_allowed(limit));
+
+        // A ledger that forgot a root's member keeps the gate where it was.
+        let mut forgetful = GuardianAdoptionLedger::default();
+        let forgotten = uuid::Uuid::from_u128(20);
+        forgetful.record(forgotten, digest(6), 3);
+        for capture in 0..GUARDIAN_ADOPTION_LEDGER_CAPACITY {
+            forgetful.record(uuid::Uuid::from_u128(100 + capture as u128), digest(7), 3);
+        }
+        assert_eq!(
+            forgetful.since_root.len(),
+            GUARDIAN_ADOPTION_LEDGER_CAPACITY
+        );
+        assert!(!forgetful.root_committed(forgotten));
+        assert!(!forgetful.live_adoption_allowed(limit));
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -29495,12 +30231,211 @@ mod tests {
         let mut client_id = ClientId::new();
         for id in 0..MAX_RELIABLE_INPUT_CLIENTS {
             client_id.id = id;
-            assert!(ledger.prepare_client(&client_id));
+            assert!(ledger.client_ledger(&client_id, |_| true).is_some());
         }
         assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
         client_id.id = MAX_RELIABLE_INPUT_CLIENTS;
-        assert!(!ledger.prepare_client(&client_id));
+        assert!(
+            ledger.client_ledger(&client_id, |_| true).is_none(),
+            "the entry of a registered client is never evicted"
+        );
         assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
+    }
+
+    #[test]
+    fn reliable_input_client_ledger_evicts_the_least_recent_idle_unregistered_entry() {
+        let mut ledger = ReliableInputLedger::new();
+        let mut client_id = ClientId::new();
+        for id in 0..MAX_RELIABLE_INPUT_CLIENTS {
+            client_id.id = id;
+            assert!(ledger.client_ledger(&client_id, |_| true).is_some());
+        }
+        // Id 0 claims again, so ids 1 and 2 are now the least recent entries.
+        client_id.id = 0;
+        assert!(ledger.client_ledger(&client_id, |_| true).is_some());
+        // Only ids 0, 1 and 2 are unregistered.
+        let registered = |candidate: &ClientId| candidate.id > 2;
+        let mut entry_id = client_id.clone();
+        let has_entry = |ledger: &ReliableInputLedger, entry_id: &mut ClientId, id: usize| {
+            entry_id.id = id;
+            ledger.clients.contains_key(entry_id)
+        };
+
+        // Id 1 is the least recent, but its ledger is in use, so id 2 goes.
+        entry_id.id = 1;
+        let in_use = Arc::clone(&ledger.clients[&entry_id].ledger);
+        let held = in_use.lock();
+        let mut newcomer = client_id.clone();
+        newcomer.id = MAX_RELIABLE_INPUT_CLIENTS;
+        assert!(ledger.client_ledger(&newcomer, registered).is_some());
+        assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
+        assert!(has_entry(&ledger, &mut entry_id, 1));
+        assert!(!has_entry(&ledger, &mut entry_id, 2));
+        drop(held);
+
+        newcomer.id += 1;
+        assert!(ledger.client_ledger(&newcomer, registered).is_some());
+        assert!(!has_entry(&ledger, &mut entry_id, 1));
+        assert!(has_entry(&ledger, &mut entry_id, 0));
+
+        newcomer.id += 1;
+        assert!(ledger.client_ledger(&newcomer, registered).is_some());
+        assert!(!has_entry(&ledger, &mut entry_id, 0));
+
+        newcomer.id += 1;
+        assert!(
+            ledger.client_ledger(&newcomer, registered).is_none(),
+            "with every remaining entry registered the newcomer is refused"
+        );
+        assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
+    }
+
+    fn claim_test_key_down(
+        mux: &Mux,
+        client: &Arc<ClientId>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        event: &KeyEvent,
+    ) -> ReliableInputClaimOutcome {
+        mux.claim_reliable_key_event(
+            Some(client),
+            registration,
+            input_serial,
+            ReliableInputKeyKind::KeyDown,
+            event,
+        )
+    }
+
+    fn apply_test_key_down(
+        mux: &Mux,
+        client: &Arc<ClientId>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        event: &KeyEvent,
+    ) {
+        let outcome = claim_test_key_down(mux, client, registration, input_serial, event);
+        let ReliableInputClaimOutcome::Execute(mut permit) = outcome else {
+            panic!(
+                "client {} serial {input_serial} must own execution, got {outcome:?}",
+                client.id
+            );
+        };
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_key_applied());
+    }
+
+    /// GitHub #131: every registered client used to take a reliable-input
+    /// ledger slot for the life of the mux, so after MAX_RELIABLE_INPUT_CLIENTS
+    /// short-lived clients that never typed (CLI calls, observers), every key
+    /// typed by a client registered later was refused.
+    #[test]
+    fn reliable_input_ledger_is_not_exhausted_by_clients_that_never_type() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(307, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('n');
+
+        let mut churn = ClientId::new();
+        for id in 0..=MAX_RELIABLE_INPUT_CLIENTS {
+            churn.id = 1_000_000 + id;
+            let client = Arc::new(churn.clone());
+            mux.register_client(Arc::clone(&client));
+            assert!(mux.unregister_client_if_same(&client));
+        }
+        assert!(
+            mux.reliable_input.lock().clients.is_empty(),
+            "a client that never claimed reliable input holds no ledger slot"
+        );
+
+        let late = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&late));
+        apply_test_key_down(&mux, &late, &registration, 1, &event);
+        assert_eq!(mux.reliable_input.lock().clients.len(), 1);
+    }
+
+    #[test]
+    fn reliable_input_history_outlives_unregister_until_the_ledger_needs_the_slot() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(308, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('h');
+        let has_entry = |client: &ClientId| mux.reliable_input.lock().clients.contains_key(client);
+
+        // A client types, disconnects and reconnects under the same identity:
+        // its retry is answered from the history it left behind.
+        let typist = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&typist));
+        apply_test_key_down(&mux, &typist, &registration, 1, &event);
+        assert!(mux.unregister_client_if_same(&typist));
+        let reconnected = Arc::new(typist.as_ref().clone());
+        mux.register_client(Arc::clone(&reconnected));
+        assert!(matches!(
+            claim_test_key_down(&mux, &reconnected, &registration, 1, &event),
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
+        ));
+
+        // A claim in flight outlives its client's unregister.
+        let in_flight = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&in_flight));
+        let ReliableInputClaimOutcome::Execute(mut pending) =
+            claim_test_key_down(&mux, &in_flight, &registration, 1, &event)
+        else {
+            panic!("the in-flight client must own execution");
+        };
+        assert!(mux.unregister_client_if_same(&in_flight));
+
+        // Clients that typed and left fill the rest of the ledger.
+        let mut departed = ClientId::new();
+        let first_departed = 3_000_000;
+        let free = MAX_RELIABLE_INPUT_CLIENTS - mux.reliable_input.lock().clients.len();
+        for id in 0..free {
+            departed.id = first_departed + id;
+            let client = Arc::new(departed.clone());
+            mux.register_client(Arc::clone(&client));
+            apply_test_key_down(&mux, &client, &registration, 1, &event);
+            assert!(mux.unregister_client_if_same(&client));
+        }
+        assert_eq!(
+            mux.reliable_input.lock().clients.len(),
+            MAX_RELIABLE_INPUT_CLIENTS
+        );
+
+        // A new client takes the least recently used slot of a departed,
+        // idle client instead of being refused. The reconnected typist is
+        // registered and the in-flight claim is pending, so both are kept.
+        let newcomer = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&newcomer));
+        apply_test_key_down(&mux, &newcomer, &registration, 1, &event);
+        assert_eq!(
+            mux.reliable_input.lock().clients.len(),
+            MAX_RELIABLE_INPUT_CLIENTS
+        );
+        departed.id = first_departed;
+        assert!(
+            !has_entry(&departed),
+            "the oldest departed entry is evicted"
+        );
+        departed.id = first_departed + 1;
+        assert!(has_entry(&departed));
+        assert!(has_entry(&typist));
+        assert!(has_entry(&in_flight));
+
+        assert!(pending.begin_side_effect());
+        assert!(pending.commit_key_applied());
+        let returned = Arc::new(in_flight.as_ref().clone());
+        mux.register_client(Arc::clone(&returned));
+        assert!(matches!(
+            claim_test_key_down(&mux, &returned, &registration, 1, &event),
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
+        ));
     }
 
     #[test]

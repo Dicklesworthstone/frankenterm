@@ -5566,6 +5566,7 @@ impl ObservationRuntime {
             snapshot_scheduler_status,
             snapshot_shutdown_requested,
             snapshot_trigger_shutdown_acknowledged,
+            terminal_checkpoint_timeout: None,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: self.storage.clone(),
             metrics: Arc::clone(&self.metrics),
@@ -11020,6 +11021,11 @@ pub struct RuntimeHandle {
     /// after an explicit shutdown with no earlier loss of its event source.
     /// Early failure or abort leaves this false even when the task joins `Ok`.
     snapshot_trigger_shutdown_acknowledged: Option<Arc<AtomicBool>>,
+    /// Replaces the terminal snapshot's `min(shutdown_timeout, 5 s)` wait
+    /// limit. Production leaves it `None`; tests of ordering and cleanliness
+    /// widen it so a starved full-suite worker cannot fail the clean mark
+    /// (ft-fbngg) while every other shutdown phase keeps its budget.
+    terminal_checkpoint_timeout: Option<Duration>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
@@ -11177,6 +11183,19 @@ fn connector_diagnostic_hash(value: &str) -> String {
 }
 
 fn process_connector_outbound_runtime_event(
+    bridge: &mut ConnectorOutboundBridge,
+    event: &Event,
+    now_ms: u64,
+) {
+    route_connector_outbound_runtime_event(bridge, event, now_ms);
+    // The bridge's policy engine lives as long as the runtime, and its rate
+    // limiter keeps an entry per (pane, action) it authorized. A pane that
+    // left takes its entries with it. This runs after routing, because a rule
+    // matching `pane.disappeared` authorizes, and so records, one more.
+    bridge.policy_engine_mut().handle_lifecycle_event(event);
+}
+
+fn route_connector_outbound_runtime_event(
     bridge: &mut ConnectorOutboundBridge,
     event: &Event,
     now_ms: u64,
@@ -12472,6 +12491,13 @@ fn record_capture_pipeline_depth(
 }
 
 impl RuntimeHandle {
+    /// Test seam: see [`Self::terminal_checkpoint_timeout`].
+    #[cfg(test)]
+    fn with_terminal_checkpoint_timeout(mut self, timeout: Duration) -> Self {
+        self.terminal_checkpoint_timeout = Some(timeout);
+        self
+    }
+
     fn take_task_join_set(&mut self) -> JoinSet<()> {
         let mut tasks = JoinSet::new();
         for handle in [
@@ -13074,7 +13100,9 @@ impl RuntimeHandle {
                 };
                 match pane_list_result {
                     Ok(Ok(panes)) => {
-                        let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
+                        let checkpoint_timeout = self
+                            .terminal_checkpoint_timeout
+                            .unwrap_or_else(|| shutdown_timeout.min(Duration::from_secs(5)));
                         let checkpoint_started = Instant::now();
                         match snapshot_engine
                             .shutdown_checkpoint_with_cx(&snapshot_cx, &panes, checkpoint_timeout)
@@ -16504,6 +16532,78 @@ mod tests {
 
             storage.shutdown().await.expect("shutdown test storage");
         });
+    }
+
+    /// A pane that disappears takes its rate-limit entries out of the
+    /// bridge's long-lived policy engine, also when a rule routed
+    /// `pane.disappeared` itself (which authorizes, and records, once more).
+    #[test]
+    fn connector_outbound_pane_disappearance_drops_its_policy_rate_limit_entries() {
+        use crate::connector_outbound_bridge::{
+            ConnectorActionKind, ConnectorOutboundBridge, ConnectorOutboundBridgeConfig,
+            OutboundEventSource, OutboundRoutingRule,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        for (rule_id, source, prefix) in [
+            (
+                "notify-usage",
+                OutboundEventSource::PatternDetected,
+                "pattern.",
+            ),
+            (
+                "notify-pane-gone",
+                OutboundEventSource::PaneLifecycle,
+                "pane.",
+            ),
+        ] {
+            bridge.add_rule(OutboundRoutingRule {
+                rule_id: rule_id.to_string(),
+                source_filter: Some(source),
+                event_type_prefix: Some(prefix.to_string()),
+                min_severity: None,
+                target_connector: "worker".to_string(),
+                action_kind: ConnectorActionKind::Invoke,
+                enabled: true,
+                priority: 0,
+            });
+        }
+        let detected = |pane_id| Event::PatternDetected {
+            pane_id,
+            pane_uuid: None,
+            detection: crate::patterns::Detection {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: crate::patterns::AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: crate::patterns::Severity::Warning,
+                confidence: 0.95,
+                extracted: serde_json::json!({}),
+                matched_text: "[redacted]".to_string(),
+                span: (0, 10),
+            },
+            event_id: i64::try_from(pane_id).ok(),
+        };
+        process_connector_outbound_runtime_event(&mut bridge, &detected(7), 5_000);
+        process_connector_outbound_runtime_event(&mut bridge, &detected(8), 5_001);
+        let tracked = bridge.policy_engine().tracked_rate_limit_entry_count();
+        assert!(
+            tracked >= 2,
+            "both panes' routed actions are rate limited: {tracked}"
+        );
+
+        process_connector_outbound_runtime_event(
+            &mut bridge,
+            &Event::PaneDisappeared { pane_id: 7 },
+            5_002,
+        );
+
+        let remaining = bridge.policy_engine().tracked_rate_limit_entry_count();
+        assert!(remaining >= 1, "pane 8 keeps its entries: {remaining}");
+        process_connector_outbound_runtime_event(
+            &mut bridge,
+            &Event::PaneDisappeared { pane_id: 8 },
+            5_003,
+        );
+        assert_eq!(bridge.policy_engine().tracked_rate_limit_entry_count(), 0);
     }
 
     #[test]
@@ -20061,6 +20161,7 @@ mod tests {
             snapshot_scheduler_status: None,
             snapshot_shutdown_requested: None,
             snapshot_trigger_shutdown_acknowledged: None,
+            terminal_checkpoint_timeout: None,
             shutdown_flag: Arc::clone(&runtime.shutdown_flag),
             storage: runtime.storage.clone(),
             metrics: Arc::clone(&runtime.metrics),
@@ -20562,8 +20663,12 @@ mod tests {
                     .with_wezterm_handle(wezterm_handle)
                     .with_snapshot_config(snapshot_config);
 
-            let handle = runtime.start().await.expect("runtime should start");
-            let startup_deadline = Instant::now() + Duration::from_secs(10);
+            let handle = runtime
+                .start()
+                .await
+                .expect("runtime should start")
+                .with_terminal_checkpoint_timeout(TEST_TERMINAL_CHECKPOINT_TIMEOUT);
+            let startup_deadline = Instant::now() + STARTUP_CHECKPOINT_WAIT;
             loop {
                 let checkpoint_exists = rusqlite::Connection::open(&db_path)
                     .and_then(|connection| {
@@ -20614,6 +20719,17 @@ mod tests {
         });
     }
 
+    /// Terminal-checkpoint wait limit for tests of shutdown ordering and
+    /// cleanliness, not speed. A saturated full-suite worker spent about 5 s
+    /// committing the terminal checkpoint and clean mark (ft-fbngg).
+    const TEST_TERMINAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// A startup checkpoint is only a precondition, so this bounds a hang
+    /// rather than asserting speed; loaded workers have needed over 10 s.
+    /// Event checkpoints keep a 10 s wait: tests rely on it staying below the
+    /// 30 s bridge idle tick.
+    const STARTUP_CHECKPOINT_WAIT: Duration = Duration::from_secs(60);
+
     async fn start_snapshot_settlement_fixture(
         enabled: bool,
     ) -> (tempfile::TempDir, String, Arc<EventBus>, RuntimeHandle) {
@@ -20639,7 +20755,11 @@ mod tests {
             enabled,
             ..Default::default()
         });
-        let handle = runtime.start().await.unwrap();
+        let handle = runtime
+            .start()
+            .await
+            .unwrap()
+            .with_terminal_checkpoint_timeout(TEST_TERMINAL_CHECKPOINT_TIMEOUT);
         (dir, db_path, bus, handle)
     }
 
@@ -20652,7 +20772,12 @@ mod tests {
         checkpoint_type: &str,
         diagnostics: impl Fn() -> String,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let wait = if checkpoint_type == "startup" {
+            STARTUP_CHECKPOINT_WAIT
+        } else {
+            Duration::from_secs(10)
+        };
+        let deadline = Instant::now() + wait;
         loop {
             let exists: bool = rusqlite::Connection::open(db_path)
                 .unwrap()
@@ -21145,7 +21270,11 @@ mod tests {
             )
             .with_wezterm_handle(Arc::new(mock))
             .with_snapshot_config(SnapshotConfig::default());
-            let handle = runtime.start().await.unwrap();
+            let handle = runtime
+                .start()
+                .await
+                .unwrap()
+                .with_terminal_checkpoint_timeout(TEST_TERMINAL_CHECKPOINT_TIMEOUT);
             wait_for_snapshot_checkpoint_with_diagnostics(&db_path, "startup", || {
                 format!(
                     "telemetry={:?}; scheduler_finished={:?}; scheduler_status={:?}; bridge_finished={:?}",
@@ -21167,9 +21296,14 @@ mod tests {
             .await;
             sleep(Duration::from_millis(30)).await;
             let started = Instant::now();
-            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+            // The task-join phase keeps the production 5 s budget: a bridge
+            // stuck on its 30 s idle timer exhausts it and leaves the summary
+            // unclean. Only the terminal checkpoint wait is widened (ft-fbngg).
+            let summary = handle
+                .shutdown_with_timeout(DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT)
+                .await;
             assert!(summary.is_clean(), "{:?}", summary.warnings);
-            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS));
             assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
         });
     }
@@ -21202,9 +21336,11 @@ mod tests {
             let caller_cx = crate::cx::for_testing();
             // Mandatory cleanup must remain independent of a cancelled caller.
             caller_cx.cancel_with(crate::outcome::CancelKind::User, Some("fixture shutdown"));
+            // Ordering, not wall-clock speed, is under test here; the fixture
+            // widens the terminal checkpoint wait (ft-fbngg).
             let shutdown = handle.shutdown_with_settlement_with_cx(
                 &caller_cx,
-                Duration::from_secs(2),
+                DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT,
                 |cleanup_cx| async move {
                     assert!(cleanup_cx.checkpoint().is_ok());
                     assert!(!entered.swap(true, Ordering::SeqCst), "settle exactly once");

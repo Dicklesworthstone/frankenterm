@@ -93,4 +93,22 @@ pub const ALLOWED_CACHE_FIELDS: &[CacheFieldAllowEntry] = &[
         proven_by: "termwindow::resize::tests::\
                     thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size",
     },
+    // The Metal front end's frame per drawn pane. The path the lint follows,
+    // `MetalFrame -> FontGlyphs -> ImageSlices -> GlyphCache`, ends in a glyph
+    // cache over a CPU `ImageTexture`: image cells are sampled out of it into
+    // bitmaps the renderer's own atlas holds by slot, so no GPU handle is
+    // reachable. It stays bounded all the same: each draw keeps only the
+    // panes it drew, and an image that outgrows the texture replaces the
+    // texture and the cache over it together.
+    CacheFieldAllowEntry {
+        path: "termwindow/metal_window.rs",
+        owner: "MetalPanes",
+        field: "frames",
+        released_by: "termwindow/metal_window.rs: MetalPanes::draw; \
+                      termwindow/metal_images.rs: ImageSlices::cached",
+        proven_by: "termwindow::metal_render_thread::tests::\
+                    a_pane_no_longer_drawn_drops_its_frame, \
+                    termwindow::metal_images::tests::\
+                    an_outgrown_image_texture_is_freed_with_its_glyph_cache",
+    },
 ];

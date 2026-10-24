@@ -501,7 +501,7 @@ impl<Q: QueryClient> App<Q> {
                     } else {
                         self.pending_command = None;
                         self.view_state.set_error(
-                            "Saved search has no schedule; set one via `ft search saved schedule`",
+                            "Saved search has no schedule; set one via `ft search saved schedule <name> <interval-ms>`",
                         );
                     }
                 } else {

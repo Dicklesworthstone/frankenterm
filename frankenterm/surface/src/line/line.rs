@@ -229,6 +229,23 @@ impl Clone for Line {
     }
 }
 
+impl Line {
+    /// A copy of the row's content without its appdata cache, which `clone`
+    /// carries over under a lock: for copies that only keep the content,
+    /// such as the durability queue every scrolled row enters
+    /// (ft-yccm0.2.1.8). `PartialEq` ignores appdata, so it equals `clone`.
+    pub fn clone_content(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            zones: self.zones.clone(),
+            seqno: self.seqno,
+            bits: self.bits,
+            #[cfg(feature = "appdata")]
+            appdata: Mutex::new(None),
+        }
+    }
+}
+
 impl PartialEq for Line {
     fn eq(&self, other: &Self) -> bool {
         self.seqno == other.seqno && self.bits == other.bits && self.cells == other.cells
@@ -451,6 +468,40 @@ impl Line {
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
+    }
+
+    /// Turn this line into one equal to `Line::new(seqno)`, reusing its
+    /// clustered storage when this line is that storage's only owner.
+    ///
+    /// The screen recycles a row evicted from scrollback as the new blank row
+    /// at the bottom. Dropping it and calling `Line::new` paid for wiping and
+    /// freeing the old row, a fresh allocation, and the regrowth of its text
+    /// buffer as the new row was written (ft-yccm0.2.9). The old text is still
+    /// wiped. A row whose text buffer is unusually large is not kept.
+    pub fn recycle_as_new(mut self, seqno: SequenceNo) -> Self {
+        const MAX_RECYCLED_TEXT_CAPACITY: usize = 4096;
+        if let CellStorage::C(clustered) = &mut self.cells {
+            if let Some(clustered) = Arc::get_mut(clustered) {
+                if clustered.text_capacity() <= MAX_RECYCLED_TEXT_CAPACITY {
+                    clustered.reset_for_reuse();
+                    self.zones.clear();
+                    self.seqno = seqno;
+                    self.bits = LineBits::NONE;
+                    // The row is owned here, so no one else can hold the
+                    // lock: clearing through `get_mut` skips a lock and an
+                    // unlock per recycled row (~3% of a `seq` flood).
+                    #[cfg(feature = "appdata")]
+                    {
+                        *self
+                            .appdata
+                            .get_mut()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    }
+                    return self;
+                }
+            }
+        }
+        Self::new(seqno)
     }
 
     /// Computes a hash over the line that will change if the way that
@@ -1297,8 +1348,38 @@ impl Line {
                 }
                 Cow::Owned(s)
             }
-            CellStorage::C(cl) => Cow::Borrowed(&cl.text),
+            CellStorage::C(cl) => Cow::Borrowed(cl.text()),
         }
+    }
+
+    /// Approximate bytes an owned copy of this line keeps allocated: the
+    /// struct, its zones and its cells. Clustered storage counts its text,
+    /// attribute runs and their heap (the snapshot clone cost) behind its
+    /// `Arc`; vector storage counts one `Cell` per column plus its visible
+    /// text, an upper bound for grapheme text kept out of line. Shared
+    /// payloads (hyperlinks, images) are not counted. For charging memory
+    /// budgets such as the durability queue, which billed every row as
+    /// vector cells and so held about a tenth of the clustered rows it could
+    /// (ft-yccm0.2.1.6). `None` on overflow.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let zone_bytes = self
+            .zones
+            .len()
+            .checked_mul(core::mem::size_of::<ZoneRange>())?;
+        let cell_bytes = match &self.cells {
+            CellStorage::V(_) => self
+                .len()
+                .checked_mul(core::mem::size_of::<Cell>())?
+                .checked_add(self.visible_text_bytes()?)?,
+            CellStorage::C(line) => line
+                .snapshot_clone_cost(usize::MAX)?
+                .0
+                .checked_add(core::mem::size_of::<ClusteredLine>())?
+                .checked_add(2 * core::mem::size_of::<usize>())?,
+        };
+        core::mem::size_of::<Self>()
+            .checked_add(zone_bytes)?
+            .checked_add(cell_bytes)
     }
 
     /// Count UTF-8 bytes in visible cells, excluding wide-cell padding.
@@ -1308,7 +1389,7 @@ impl Line {
     /// Returns `None` if the sum of vector-cell text lengths overflows.
     pub fn visible_text_bytes(&self) -> Option<usize> {
         match &self.cells {
-            CellStorage::C(line) => Some(line.text.len()),
+            CellStorage::C(line) => Some(line.text().len()),
             CellStorage::V(cells) => cells
                 .visible_cells()
                 .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.str().len())),
@@ -1452,10 +1533,25 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_arm(idx, text, width, attr, seqno, Self::grapheme_write_direct());
+    }
+
+    /// `set_cell_grapheme`, writing a vector row's cell directly when
+    /// `direct` (ft-yccm0.3.2.6), or through `set_cell` as before. Both
+    /// leave the same line.
+    fn set_cell_grapheme_arm(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+        direct: bool,
+    ) {
         let width = normalize_cell_width(width);
-        if checked_materialized_end(idx, width).is_none() {
+        let Some(end_idx) = checked_materialized_end(idx, width) else {
             return;
-        }
+        };
 
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
@@ -1486,7 +1582,38 @@ impl Line {
             }
         }
 
-        self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+        let cell = Cell::new_grapheme_with_width(text, width, attr);
+        if direct && matches!(self.cells, CellStorage::V(_)) {
+            // `set_cell_impl` without the steps taken above (the width, the
+            // bounds and the hyperlink bit) or that a vector row skips (the
+            // clustered append). The cell's width is `width`: it was built
+            // with it.
+            self.invalidate_implicit_hyperlinks(seqno);
+            self.invalidate_zones();
+            self.update_last_change_seqno(seqno);
+            if let CellStorage::V(cells) = &mut self.cells {
+                cells.write_grapheme(idx, cell, width, end_idx);
+            }
+            return;
+        }
+        self.set_cell(idx, cell, seqno);
+    }
+
+    /// `FT_LINE_GRAPHEME_DIRECT=0` sends `set_cell_grapheme`'s vector-row
+    /// writes through `set_cell`, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. `FT_LINE_WRITE_SPLIT=1` does too. Both arms leave the
+    /// same line. Resolved once per process.
+    fn grapheme_write_direct() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *DIRECT.get_or_init(|| {
+                !Self::write_split()
+                    && std::env::var_os("FT_LINE_GRAPHEME_DIRECT").is_none_or(|v| v != "0")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        true
     }
 
     /// Assign a contiguous printable width-1 ASCII run when it can be
@@ -1508,10 +1635,9 @@ impl Line {
         if text.is_empty() {
             return true;
         }
-        if !text
-            .as_bytes()
-            .iter()
-            .all(|byte| *byte == b' ' || byte.is_ascii_graphic())
+        // Printable ASCII, a word at a time: one row of long lines is 120
+        // or more bytes, and the byte-at-a-time check was ~21% of that flood.
+        if !crate::line::clusterline::printable_ascii(text.as_bytes())
             || checked_materialized_end(idx, text.len()).is_none()
         {
             return false;
@@ -1523,8 +1649,11 @@ impl Line {
         if !cl.can_append_cell_at(idx, text) {
             return false;
         }
-        // Past the end, `set_cell` leaves a blank cell implicit.
-        let implicit = if idx > cl.len() && Cell::new(' ', attr.clone()) == Cell::blank() {
+        // Past the end, `set_cell` leaves a blank cell implicit. A space
+        // with `attr` is the blank cell exactly when `attr` is blank; this
+        // compares that without building and comparing two cells, which was
+        // ~4% of a raw `seq` flood, where every line starts past the end.
+        let implicit = if idx > cl.len() && attr == CellAttributes::blank() {
             text.bytes().take_while(|&byte| byte == b' ').count()
         } else {
             0
@@ -1788,7 +1917,7 @@ impl Line {
 
     pub fn prune_trailing_blanks(&mut self, seqno: SequenceNo) {
         if let CellStorage::C(cl) = &mut self.cells {
-            if !cl.text.ends_with(' ') {
+            if !cl.text().ends_with(' ') {
                 return;
             }
             if Arc::make_mut(cl).prune_trailing_blanks() {
@@ -1907,6 +2036,30 @@ impl Line {
         match &self.cells {
             CellStorage::V(cells) => cells.len(),
             CellStorage::C(cl) => cl.len(),
+        }
+    }
+
+    /// The text of a non-empty row whose every cell is one printable ASCII
+    /// byte of width 1 (cell `i` is byte `i`), when its storage shows that
+    /// without visiting the cells.
+    fn single_width_printable_ascii(&self) -> Option<&str> {
+        match &self.cells {
+            CellStorage::V(_) => None,
+            CellStorage::C(cl) => cl.single_width_printable_ascii(),
+        }
+    }
+
+    /// The attribute runs, as (cells, attributes) in column order, of a
+    /// non-empty clustered row whose every cell is one printable ASCII byte
+    /// of width 1; `None` for any other row. A caller that would visit every
+    /// cell only to read widths and attributes can work per run instead
+    /// (ft-yccm0.2.1.8).
+    pub fn single_width_ascii_runs(
+        &self,
+    ) -> Option<impl Iterator<Item = (usize, &CellAttributes)> + '_> {
+        match &self.cells {
+            CellStorage::V(_) => None,
+            CellStorage::C(cl) => cl.single_width_ascii_runs(),
         }
     }
 
@@ -2492,6 +2645,120 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+/// The token widths of a [`LineWrapGeometry`]: per token its width (low
+/// seven bits), with 0x80 set when it is a wrap separator. A row of at most
+/// [`TokenWidths::ASCII_MAX`] single-width printable ASCII cells keeps only a
+/// bitmap of its spaces, inline (ft-yccm0.2.1.8): every row of plain output
+/// that scrolls into the durable store is captured on the parse thread, and
+/// allocating and later freeing a width buffer per row was most of that
+/// cost. The two forms compare by their tokens.
+#[derive(Debug, Clone)]
+enum TokenWidths {
+    Cells(Vec<u8>),
+    /// `len` tokens of width 1; bit `i` of `spaces` marks token `i` a space.
+    Ascii {
+        len: u16,
+        spaces: [u64; 4],
+    },
+}
+
+impl TokenWidths {
+    /// The longest row held in the inline form.
+    const ASCII_MAX: usize = 256;
+
+    /// The inline form of a row of single-width printable ASCII `text`, at
+    /// most [`Self::ASCII_MAX`] bytes, and the row's length without its
+    /// trailing spaces. Eight bytes at a time: a branch per byte was most of
+    /// capturing such a row on the parse thread.
+    fn ascii(text: &[u8]) -> (Self, usize) {
+        const ONES: u64 = u64::from_le_bytes([1; 8]);
+        // Moves bit 8i + 7 (byte i's high bit) to bit 56 + i. No two of
+        // the shifted copies overlap, so nothing carries.
+        const GATHER: u64 = 0x0102_0408_1020_4080;
+        debug_assert!(text.len() <= Self::ASCII_MAX);
+        debug_assert!(text.iter().all(|byte| matches!(byte, b' '..=b'~')));
+        let mut spaces = [0u64; 4];
+        let mut mark = |chunk: usize, word: u64| {
+            // A printable byte is a space exactly when adding 0x5f leaves
+            // its high bit clear; no sum carries into the next byte.
+            let marks = !word.wrapping_add(0x5f * ONES) & (0x80 * ONES);
+            spaces[chunk / 8] |= ((marks >> 7).wrapping_mul(GATHER) >> 56) << (chunk % 8 * 8);
+        };
+        let (words, tail) = text.as_chunks::<8>();
+        for (chunk, &word) in words.iter().enumerate() {
+            mark(chunk, u64::from_le_bytes(word));
+        }
+        if !tail.is_empty() {
+            // First byte lowest, shifted into a word of non-spaces. Copying
+            // them into one instead made 1-7 byte rows slower than the byte
+            // loop this replaces.
+            let word = tail
+                .iter()
+                .rev()
+                .fold(u64::from(b'x') * ONES, |word, &byte| {
+                    word << 8 | u64::from(byte)
+                });
+            mark(words.len(), word);
+        }
+        let len = text.len();
+        let trimmed = (0..len.div_ceil(64))
+            .rev()
+            .find_map(|word| {
+                let cells = len.saturating_sub(word * 64).min(64);
+                let visible = u64::MAX.checked_shr(64 - cells as u32).unwrap_or(0) & !spaces[word];
+                (visible != 0).then(|| word * 64 + 64 - visible.leading_zeros() as usize)
+            })
+            .unwrap_or(0);
+        let len = <u16 as core::convert::TryFrom<usize>>::try_from(len).unwrap_or(u16::MAX);
+        (Self::Ascii { len, spaces }, trimmed)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Cells(widths) => widths.len(),
+            Self::Ascii { len, .. } => usize::from(*len),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Heap bytes this owns; the inline form owns none.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Cells(widths) => widths.capacity(),
+            Self::Ascii { .. } => 0,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<u8> {
+        match self {
+            Self::Cells(widths) => widths.get(index).copied(),
+            Self::Ascii { len, spaces } => (index < usize::from(*len)).then(|| {
+                if (spaces[index / 64] >> (index % 64)) & 1 == 1 {
+                    1 | 0x80
+                } else {
+                    1
+                }
+            }),
+        }
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = u8> + '_ {
+        // `get` is `Some` for every index below `len`.
+        (0..self.len()).map(move |index| self.get(index).unwrap_or(0))
+    }
+}
+
+impl PartialEq for TokenWidths {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for TokenWidths {}
+
 /// Width and ordinary-space snapshot of a physical row or certified logical join.
 /// No text, attributes, cells, images or output rows are retained. Capture is
 /// fallible under the caller's byte budget; a refused join must use the ordinary
@@ -2500,7 +2767,7 @@ pub struct LineWrapReport {
 /// not equivalent to `Line::append_line`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineWrapGeometry {
-    widths: Vec<u8>,
+    widths: TokenWidths,
     physical_len: usize,
     trimmed_tokens: usize,
     join_safe: bool,
@@ -2537,6 +2804,18 @@ impl LineWrapGeometry {
     /// be certified where a pictograph starts the next row, and a T0 row is
     /// captured without segmenting its cells and seams.
     fn capture_with(line: &Line, max_bytes: usize, pictographs: bool) -> Option<Self> {
+        Self::capture_cells(line, max_bytes, pictographs, true)
+    }
+
+    /// [`Self::capture_with`]; `ascii_rows` takes the shortcut for a row of
+    /// single-width printable ASCII (see below). Tests compare it with the
+    /// general loop.
+    fn capture_cells(
+        line: &Line,
+        max_bytes: usize,
+        pictographs: bool,
+        ascii_rows: bool,
+    ) -> Option<Self> {
         let available = max_bytes.checked_sub(core::mem::size_of::<Self>())?;
         // Visible tokens cannot outnumber columns in canonical physical rows.
         // Reserve once, before certificate scratch exists, so a growing width
@@ -2545,7 +2824,7 @@ impl LineWrapGeometry {
             return None;
         }
         let mut result = Self {
-            widths: Vec::new(),
+            widths: TokenWidths::Cells(Vec::new()),
             physical_len: line.len(),
             trimmed_tokens: 0,
             join_safe: line.len() <= u32::MAX as usize,
@@ -2556,11 +2835,53 @@ impl LineWrapGeometry {
             head_pictograph: false,
             tail_before_pictograph: false,
         };
-        result.widths.try_reserve_exact(line.len()).ok()?;
-        if result.widths.capacity() > available {
+        // Every row of plain output that scrolls into the durable store is
+        // captured on the parse thread, under the terminal lock: 0.6 of the
+        // 0.9 us per 80-column row with the store on (ft-yccm0.2.1.8). When
+        // each cell is one printable ASCII byte of width 1, every cell is a
+        // basic starter, so the loop below segments nothing and certifies
+        // every boundary and both ends; only the widths, the separators and
+        // the trimmed length depend on the text. Such a row refuses exactly
+        // where the loop's path does: when its widths cannot fit `available`
+        // (checked above). A short one keeps its spaces inline.
+        if let Some(text) = ascii_rows
+            .then(|| line.single_width_printable_ascii())
+            .flatten()
+        {
+            let bytes = text.as_bytes();
+            if bytes.len() <= TokenWidths::ASCII_MAX {
+                (result.widths, result.trimmed_tokens) = TokenWidths::ascii(bytes);
+            } else {
+                let mut widths = Vec::new();
+                widths.try_reserve_exact(bytes.len()).ok()?;
+                if widths.capacity() > available {
+                    return None;
+                }
+                widths.extend(
+                    bytes
+                        .iter()
+                        .map(|&byte| if byte == b' ' { 1 | 0x80 } else { 1 }),
+                );
+                result.widths = TokenWidths::Cells(widths);
+                result.trimmed_tokens = bytes
+                    .iter()
+                    .rposition(|&byte| byte != b' ')
+                    .map_or(0, |last| last + 1);
+            }
+            result.head_basic = true;
+            result.head_after_basic = true;
+            result.tail_basic = true;
+            result.tail_before_basic = true;
+            result.tail_before_pictograph = pictographs;
+            return Some(result);
+        }
+        let mut widths = Vec::new();
+        widths.try_reserve_exact(line.len()).ok()?;
+        if widths.capacity() > available {
             return None;
         }
-        let boundary_budget = max_bytes.checked_sub(result.retained_bytes())?;
+        let boundary_budget = max_bytes
+            .checked_sub(core::mem::size_of::<Self>().saturating_add(widths.capacity()))?;
         let mut previous: Option<&str> = None;
         let mut previous_basic = false;
         let mut columns = 0usize;
@@ -2570,10 +2891,10 @@ impl LineWrapGeometry {
             let width = cell.width();
             // Current cells use widths 0..=2. Refuse a future extended width
             // rather than silently truncating it in this compact encoding.
-            if width > 2 || result.widths.len() == result.widths.capacity() {
+            if width > 2 || widths.len() == widths.capacity() {
                 return None;
             }
-            result.widths.push(
+            widths.push(
                 width as u8
                     | if is_wrap_separator(cell.str()) {
                         0x80
@@ -2588,7 +2909,7 @@ impl LineWrapGeometry {
                 CellRef::ClusterRef { text, .. } => text,
             };
             if text != " " {
-                result.trimmed_tokens = result.widths.len();
+                result.trimmed_tokens = widths.len();
             }
             result.join_safe &= cell.cell_index() == columns && (1..=2).contains(&width);
             columns = columns.checked_add(width.max(1))?;
@@ -2637,6 +2958,7 @@ impl LineWrapGeometry {
             previous = Some(text);
             previous_basic = basic;
         }
+        result.widths = TokenWidths::Cells(widths);
         result.join_safe &= columns == line.len();
         if let Some(last) = previous {
             result.tail_basic = previous_basic;
@@ -2678,7 +3000,7 @@ impl LineWrapGeometry {
     /// Owned allocation plus the inline representation; an external Arc header
     /// and collection slots must be charged separately by their owner.
     pub fn retained_bytes(&self) -> usize {
-        core::mem::size_of::<Self>().saturating_add(self.widths.capacity())
+        core::mem::size_of::<Self>().saturating_add(self.widths.heap_bytes())
     }
 
     /// Conservative upper bound for live planner allocations, including the
@@ -2797,28 +3119,44 @@ impl LineWrapGeometry {
         let Some(available) = max_bytes.checked_sub(core::mem::size_of::<Self>()) else {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         };
-        if len > available || self.widths.capacity() > available {
+        let capacity = self.widths.heap_bytes();
+        if len > available || capacity > available {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
-        if len > self.widths.capacity()
-            && self
-                .widths
-                .capacity()
+        if len > capacity
+            && capacity
                 .checked_add(len)
                 .is_none_or(|peak| peak > available)
         {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
-        if self.widths.try_reserve_exact(other.widths.len()).is_err() {
+        // A join grows a width buffer; an inline row becomes one first, sized
+        // for the join. Every refusal above has passed, and none below can
+        // fire for it, so a refused join still leaves `self` as it was.
+        if let TokenWidths::Ascii { .. } = self.widths {
+            let mut cells = Vec::new();
+            if cells.try_reserve_exact(len).is_err() {
+                return Err(LineWrapGeometryJoinError::Allocation);
+            }
+            if cells.capacity() > available {
+                return Err(LineWrapGeometryJoinError::ByteBudget);
+            }
+            cells.extend(self.widths.iter());
+            self.widths = TokenWidths::Cells(cells);
+        }
+        let TokenWidths::Cells(widths) = &mut self.widths else {
+            return Err(LineWrapGeometryJoinError::Allocation);
+        };
+        if widths.try_reserve_exact(other.widths.len()).is_err() {
             return Err(LineWrapGeometryJoinError::Allocation);
         }
-        if self.widths.capacity() > available {
+        if widths.capacity() > available {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
         if other.trimmed_tokens > 0 {
-            self.trimmed_tokens = self.widths.len() + other.trimmed_tokens;
+            self.trimmed_tokens = widths.len() + other.trimmed_tokens;
         }
-        if self.widths.is_empty() {
+        if widths.is_empty() {
             self.head_basic = other.head_basic;
             self.head_after_basic = other.head_after_basic;
             self.head_pictograph = other.head_pictograph;
@@ -2828,7 +3166,10 @@ impl LineWrapGeometry {
             self.tail_before_basic = other.tail_before_basic;
             self.tail_before_pictograph = other.tail_before_pictograph;
         }
-        self.widths.extend_from_slice(&other.widths);
+        match &other.widths {
+            TokenWidths::Cells(cells) => widths.extend_from_slice(cells),
+            TokenWidths::Ascii { .. } => widths.extend(other.widths.iter()),
+        }
         self.physical_len = physical_len;
         Ok(())
     }
@@ -2845,12 +3186,13 @@ impl LineWrapGeometry {
         if self.physical_len <= cols || self.trimmed_tokens == 0 {
             return 1;
         }
-        let widths = &self.widths[..self.trimmed_tokens];
+        let tokens = self.trimmed_tokens;
+        let widths = || self.widths.iter().take(tokens);
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         let cache_key = {
             let mut hasher = SipHasher::new();
-            widths.len().hash(&mut hasher);
-            for &width in widths {
+            tokens.hash(&mut hasher);
+            for width in widths() {
                 usize::from(width & 0x7f).hash(&mut hasher);
                 (width & 0x80 != 0).hash(&mut hasher);
             }
@@ -2864,12 +3206,9 @@ impl LineWrapGeometry {
         if let Some(count) = memoized_wrap_point_cache_row_count(cache_key) {
             return count;
         }
-        scratch.rebuild_metadata(
-            widths
-                .iter()
-                .map(|&width| (usize::from(width & 0x7f), width & 0x80 != 0)),
-        );
-        let (plan, scorecard) = wrap_plan_and_scorecard(widths.len(), cols, cost_model, scratch);
+        scratch
+            .rebuild_metadata(widths().map(|width| (usize::from(width & 0x7f), width & 0x80 != 0)));
+        let (plan, scorecard) = wrap_plan_and_scorecard(tokens, cols, cost_model, scratch);
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         memoized_wrap_point_cache_insert(
             cache_key,
@@ -4329,6 +4668,9 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+    // The crate is no_std without its `std` feature; tests link std through
+    // the crate root's `#[cfg(test)] extern crate std;`.
+    use std::eprintln;
 
     #[test]
     fn em_space_wrap_preserves_words_bytes_and_geometry() {
@@ -4465,6 +4807,30 @@ mod tests {
             line.compress_for_scrollback();
             assert_eq!(line.visible_text_bytes(), expected);
         }
+    }
+
+    /// ft-yccm0.2.1.6: a clustered row is charged its text and attribute
+    /// runs, a vector row one Cell per column. A plain 62-column row, the
+    /// usual spilled form, costs a small fraction clustered.
+    #[test]
+    fn retained_bytes_charges_clustered_rows_their_text_not_a_cell_per_column() {
+        let text = alloc::format!("seq {:012} {}", 1, "y".repeat(45));
+        let vector = Line::from_text(&text, &CellAttributes::blank(), 1, None);
+        assert!(vector.clustered_storage_owners().is_none());
+        let mut clustered = vector.clone();
+        clustered.compress_for_scrollback();
+        assert!(clustered.clustered_storage_owners().is_some());
+        assert_eq!(clustered.as_str(), vector.as_str());
+        let vector_bytes = vector.retained_bytes().unwrap();
+        let clustered_bytes = clustered.retained_bytes().unwrap();
+        assert!(vector_bytes >= text.len() * core::mem::size_of::<Cell>());
+        assert!(clustered_bytes >= text.len() + core::mem::size_of::<Line>());
+        assert!(
+            clustered_bytes * 5 < vector_bytes,
+            "clustered {} vs vector {}",
+            clustered_bytes,
+            vector_bytes
+        );
     }
 
     #[test]
@@ -4808,6 +5174,125 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.3.2.6: `set_cell_grapheme` writing a vector row's cell
+    /// directly leaves the line, its sequence number, bits and zones that
+    /// writing it through `set_cell` leaves. Rows start as styled blanks,
+    /// text with wide and combining cells, clustered rows, deferred wrap
+    /// rows, rows with implicit links and rows with image placements.
+    /// Random graphemes (control bytes, CR LF and empty text among them)
+    /// with random widths, colours and links land on random columns: past
+    /// the end, on wide heads and their placeholders, and over each other.
+    #[test]
+    fn direct_grapheme_writes_match_writes_through_set_cell() {
+        use crate::hyperlink::Hyperlink;
+        use frankenterm_cell::color::ColorAttribute;
+        let texts = [
+            "a",
+            " ",
+            "\u{4e2d}",
+            "\u{1f600}",
+            "e\u{301}",
+            "\u{7}",
+            "\r\n",
+            "",
+            "\u{1f468}\u{200d}\u{1f469}",
+        ];
+        let rules = [Rule::new(r"https://[a-z.]+", "$0").unwrap()];
+        let link = Arc::new(Hyperlink::new("https://explicit.example"));
+        let mut seed = 0x2026_1008_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        for case in 0..3000 {
+            let mut pen = CellAttributes::default();
+            pen.set_background(ColorAttribute::PaletteIndex(next(16) as u8));
+            let start = match case % 6 {
+                0 => Line::with_width_and_cell(10, Cell::blank_with_attrs(pen.clone()), 1),
+                1 => Line::from_text("ab\u{4e2d}e\u{301}\u{1f680} xyz", &pen, 1, None),
+                2 => {
+                    let mut line = Line::from_text("plain \u{4e2d} row", &pen, 1, None);
+                    line.compress_for_scrollback();
+                    line
+                }
+                3 => Line::from_text("ab\u{4e2d}e\u{301}\u{1f680} xyz wrapped", &pen, 1, None)
+                    .plan_wrap_with_width_prefix_scratch(
+                        7,
+                        MonospaceKpCostModel::terminal_default(),
+                        &mut LineWrapWidthPrefixScratch::default(),
+                    )
+                    .deferred_rows(0..1, 1)
+                    .pop()
+                    .unwrap(),
+                4 => {
+                    let mut line = Line::from_text("go https://a.b now", &pen, 1, None);
+                    Line::apply_hyperlink_rules(&rules, &mut [&mut line]);
+                    line
+                }
+                _ => {
+                    #[cfg_attr(not(feature = "use_image"), allow(unused_mut))]
+                    let mut line = Line::with_width_and_cell(10, Cell::blank_with_attrs(pen), 1);
+                    #[cfg(feature = "use_image")]
+                    {
+                        use frankenterm_cell::image::{
+                            ImageCell, ImageData, ImageDataType, TextureCoordinate,
+                        };
+                        let image = Arc::new(ImageData::with_data(
+                            ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]),
+                        ));
+                        for column in 0..10 {
+                            let placement = (column % 3 != 0).then_some(column as u32);
+                            let mut attrs = CellAttributes::default();
+                            attrs.set_image(Box::new(ImageCell::with_z_index(
+                                TextureCoordinate::new_f32(0.0, 0.0),
+                                TextureCoordinate::new_f32(1.0, 1.0),
+                                Arc::clone(&image),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                Some(7),
+                                placement,
+                            )));
+                            line.set_cell(column, Cell::new('i', attrs), 1);
+                        }
+                    }
+                    line
+                }
+            };
+            let mut direct = start.clone();
+            let mut through_set_cell = start;
+            for step in 0..10 {
+                let text = texts[next(texts.len())];
+                let width = next(4);
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                if next(5) == 0 {
+                    attrs.set_hyperlink(Some(Arc::clone(&link)));
+                }
+                let idx = next(16);
+                let seqno = 2 + step;
+                direct.set_cell_grapheme_arm(idx, text, width, attrs.clone(), seqno, true);
+                through_set_cell.set_cell_grapheme_arm(idx, text, width, attrs, seqno, false);
+                assert!(
+                    direct == through_set_cell
+                        && direct.zones == through_set_cell.zones
+                        && direct.has_clustered_storage()
+                            == through_set_cell.has_clustered_storage(),
+                    "case {} step {}: {:?} width {} at {}",
+                    case,
+                    step,
+                    text,
+                    width,
+                    idx
+                );
+            }
+        }
+    }
+
     /// ft-yccm0.3.3.4: a lone control byte or CR LF appended at the start of
     /// a clustered row reads back as the blank a cell built from it keeps,
     /// before and after the row becomes a vector, like any other text.
@@ -4941,6 +5426,77 @@ mod tests {
             column += width;
         }
         row
+    }
+
+    /// ft-yccm0.3.2.6: what writing a T0 cell costs, as the performer writes
+    /// it: `Line::set_cell_grapheme` of a wide pool emoji with its own
+    /// palette colours, left to right across fresh 120-column vector rows.
+    /// Rows start as blanks with a palette background, as a recycled row
+    /// cleared under a coloured pen does. Text and attributes are drawn
+    /// before timing. Both arms of `set_cell_grapheme_arm` (direct, and
+    /// through `set_cell`) alternate; best of 5 rounds (`FT_T0_WRITE_ROUNDS`)
+    /// over 2,000 rows each. `FT_T0_WRITE_ARM=direct` or `set_cell` times
+    /// one arm only, for a profiler. A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored t0_cell_write_cost --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn t0_cell_write_cost() {
+        use frankenterm_cell::color::ColorAttribute;
+        let mut seed = 0x0007_0e11_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let cells: Vec<(String, CellAttributes)> = (0..2000 * 60)
+            .map(|_| {
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                attrs.set_background(ColorAttribute::PaletteIndex(next(256) as u8));
+                let ch = char::from_u32(0x1F600 + next(80) as u32).unwrap();
+                (ch.to_string(), attrs)
+            })
+            .collect();
+        let mut blank = CellAttributes::default();
+        blank.set_background(ColorAttribute::PaletteIndex(4));
+        let rounds = std::env::var("FT_T0_WRITE_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        let only = std::env::var("FT_T0_WRITE_ARM").ok();
+        let arms: Vec<(&str, bool)> = [("direct", true), ("set_cell", false)]
+            .iter()
+            .copied()
+            .filter(|(name, _)| only.as_deref().is_none_or(|only| only == *name))
+            .collect();
+        let mut best = vec![f64::INFINITY; arms.len()];
+        for _ in 0..rounds {
+            for (arm, &(_, direct)) in arms.iter().enumerate() {
+                let mut rows: Vec<Line> = (0..2000)
+                    .map(|_| {
+                        Line::with_width_and_cell(120, Cell::blank_with_attrs(blank.clone()), 1)
+                    })
+                    .collect();
+                let mut source = cells.iter();
+                let start = std::time::Instant::now();
+                for row in &mut rows {
+                    for column in (0..120).step_by(2) {
+                        let (text, attrs) = source.next().unwrap();
+                        row.set_cell_grapheme_arm(column, text, 2, attrs.clone(), 2, direct);
+                    }
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+                std::hint::black_box(&rows);
+            }
+        }
+        for ((name, _), best) in arms.iter().zip(&best) {
+            eprintln!(
+                "[BENCH] T0 cell write ({}), 120,000 wide cells into vector rows: {:.1} ns/write",
+                name,
+                best * 1e9 / (2000.0 * 60.0)
+            );
+        }
     }
 
     /// ft-951ev: a row compressed for scrollback reads back as the cells it
@@ -5564,6 +6120,197 @@ mod tests {
         );
     }
 
+    /// A clustered row of printable ASCII cells in `runs`, one attribute
+    /// run each (colors 0..3 alternate so neighbouring runs can differ).
+    fn clustered_ascii_row(runs: &[(String, u8)]) -> Line {
+        let mut cells = Vec::new();
+        for (text, color) in runs {
+            let mut attrs = CellAttributes::default();
+            if *color > 0 {
+                attrs.set_foreground(frankenterm_cell::color::ColorAttribute::PaletteIndex(
+                    *color,
+                ));
+            }
+            for ch in text.chars() {
+                cells.push(Cell::new(ch, attrs.clone()));
+            }
+        }
+        let mut line = Line::from_cells(cells, 1);
+        line.compress_for_scrollback();
+        line
+    }
+
+    #[test]
+    #[cfg(feature = "appdata")]
+    fn clone_content_equals_clone_without_the_appdata_cache() {
+        let line = clustered_ascii_row(&[("ls -la".to_owned(), 0), (" ~/x".to_owned(), 2)]);
+        let cache = Arc::new(7u32);
+        line.set_appdata(Arc::clone(&cache));
+        let content = line.clone_content();
+        assert_eq!(content, line);
+        assert_eq!(content, line.clone());
+        assert!(content.get_appdata().is_none());
+        assert!(line.clone().get_appdata().is_some());
+    }
+
+    #[test]
+    fn ascii_row_geometry_shortcut_applies_only_to_single_width_printable_ascii() {
+        let ascii = clustered_ascii_row(&[("ls -la  ".to_owned(), 0), ("~/x".to_owned(), 2)]);
+        assert_eq!(ascii.single_width_printable_ascii(), Some("ls -la  ~/x"));
+        for text in ["", "e\u{301}", "\u{4e2d}a", "a\u{1F600}"] {
+            let mut line = Line::from_text(text, &CellAttributes::default(), 1, None);
+            line.compress_for_scrollback();
+            assert_eq!(line.single_width_printable_ascii(), None, "{text:?}");
+        }
+        // Vector storage is never read through the shortcut.
+        let vector = Line::from_cells(vec![Cell::new('a', CellAttributes::default())], 1);
+        assert_eq!(vector.single_width_printable_ascii(), None);
+        // Edge rows: all spaces, one cell, trailing spaces, budgets that refuse.
+        for (text, max_bytes) in [
+            ("    ", 1 << 16),
+            ("x", 1 << 16),
+            ("a b  ", 1 << 16),
+            ("abcdef", core::mem::size_of::<LineWrapGeometry>() + 6),
+            ("abcdef", core::mem::size_of::<LineWrapGeometry>() + 5),
+            ("abcdef", 3),
+        ] {
+            let line = clustered_ascii_row(&[(text.to_owned(), 0)]);
+            for pictographs in [false, true] {
+                assert_eq!(
+                    LineWrapGeometry::capture_cells(&line, max_bytes, pictographs, true),
+                    LineWrapGeometry::capture_cells(&line, max_bytes, pictographs, false),
+                    "{text:?} max_bytes={max_bytes} pictographs={pictographs}"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.2.1.8: the word-at-a-time space bitmap and trimmed length
+        /// of the inline form match a byte-by-byte reading, on rows dense
+        /// with spaces and trailing runs of them, at every length up to
+        /// ASCII_MAX.
+        #[test]
+        fn inline_ascii_spaces_match_a_byte_by_byte_reading(
+            text in "[ x~!]{0,256}",
+            trailing in 0usize..70,
+        ) {
+            let mut text = text;
+            text.truncate(TokenWidths::ASCII_MAX.saturating_sub(trailing));
+            text.extend(core::iter::repeat_n(' ', trailing));
+            let bytes = text.as_bytes();
+            let (widths, trimmed) = TokenWidths::ascii(bytes);
+            let mut expected = [0u64; 4];
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte == b' ' {
+                    expected[index / 64] |= 1 << (index % 64);
+                }
+            }
+            match widths {
+                TokenWidths::Ascii { len, spaces } => {
+                    proptest::prop_assert_eq!(usize::from(len), bytes.len());
+                    proptest::prop_assert_eq!(spaces, expected);
+                }
+                TokenWidths::Cells(_) => proptest::prop_assert!(false, "not inline"),
+            }
+            proptest::prop_assert_eq!(
+                trimmed,
+                bytes.iter().rposition(|&byte| byte != b' ').map_or(0, |last| last + 1)
+            );
+        }
+
+        /// ft-yccm0.2.1.8: the inline ASCII widths behave as the per-token
+        /// buffer does: equality, wrap planning, joins in either order and
+        /// with either form, and refusals. Rows run past ASCII_MAX so both
+        /// forms and the u64 word edges are covered.
+        #[test]
+        fn inline_ascii_widths_plan_and_join_as_the_token_buffer(
+            first in "[ -~]{1,300}",
+            second in "[ -~]{1,300}",
+            cols in 1usize..400,
+            budget in proptest::prop_oneof![
+                proptest::strategy::Just(1usize << 16),
+                0usize..(core::mem::size_of::<LineWrapGeometry>() + 700),
+            ],
+        ) {
+            let a_line = clustered_ascii_row(&[(first.clone(), 0)]);
+            let b_line = clustered_ascii_row(&[(second.clone(), 1)]);
+            let a_fast = LineWrapGeometry::capture_cells(&a_line, 1 << 16, true, true).unwrap();
+            let a_slow = LineWrapGeometry::capture_cells(&a_line, 1 << 16, true, false).unwrap();
+            let b_fast = LineWrapGeometry::capture_cells(&b_line, 1 << 16, true, true).unwrap();
+            let b_slow = LineWrapGeometry::capture_cells(&b_line, 1 << 16, true, false).unwrap();
+            proptest::prop_assert_eq!(
+                matches!(a_fast.widths, TokenWidths::Ascii { .. }),
+                first.len() <= TokenWidths::ASCII_MAX
+            );
+            proptest::prop_assert_eq!(&a_fast, &a_slow);
+            if first.len() <= TokenWidths::ASCII_MAX {
+                proptest::prop_assert_eq!(
+                    a_fast.retained_bytes(),
+                    core::mem::size_of::<LineWrapGeometry>()
+                );
+            }
+            let model = MonospaceKpCostModel::terminal_default();
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            proptest::prop_assert_eq!(
+                a_fast.row_count(cols, model, &mut scratch),
+                a_slow.row_count(cols, model, &mut scratch)
+            );
+            let mut unbounded = a_slow.clone();
+            unbounded.try_append(&b_slow, usize::MAX).unwrap();
+            for (left, right) in [(&a_fast, &b_fast), (&a_fast, &b_slow), (&a_slow, &b_fast)] {
+                let mut joined = left.clone();
+                let mut reference = a_slow.clone();
+                let outcome = joined.try_append(right, budget);
+                let expected = reference.try_append(&b_slow, budget);
+                match (outcome, expected) {
+                    // An inline row has no buffer to keep while the joined one
+                    // grows, so it escapes the buffer form's growth peak: it
+                    // may join where that form refuses its budget.
+                    (Ok(()), Err(LineWrapGeometryJoinError::ByteBudget))
+                        if matches!(left.widths, TokenWidths::Ascii { .. }) =>
+                    {
+                        proptest::prop_assert_eq!(&joined, &unbounded);
+                    }
+                    (outcome, expected) => {
+                        proptest::prop_assert_eq!(outcome, expected);
+                        proptest::prop_assert_eq!(&joined, &reference);
+                    }
+                }
+                if outcome.is_ok() {
+                    proptest::prop_assert_eq!(
+                        joined.row_count(cols, model, &mut scratch),
+                        unbounded.row_count(cols, model, &mut scratch)
+                    );
+                }
+            }
+        }
+
+        /// ft-yccm0.2.1.8: the single-width ASCII shortcut of geometry
+        /// capture gives exactly what the per-cell loop gives, budgets and
+        /// refusals included.
+        #[test]
+        fn ascii_row_geometry_shortcut_matches_the_cell_loop(
+            runs in proptest::collection::vec(("[ -~]{0,40}", 0u8..3), 1..6),
+            budget in proptest::prop_oneof![
+                proptest::strategy::Just(1usize << 16),
+                0usize..(core::mem::size_of::<LineWrapGeometry>() + 300),
+            ],
+            pictographs in proptest::bool::ANY,
+        ) {
+            let line = clustered_ascii_row(&runs);
+            let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+            proptest::prop_assert_eq!(
+                line.single_width_printable_ascii().is_some(),
+                !text.is_empty()
+            );
+            proptest::prop_assert_eq!(
+                LineWrapGeometry::capture_cells(&line, budget, pictographs, true),
+                LineWrapGeometry::capture_cells(&line, budget, pictographs, false)
+            );
+        }
+    }
+
     #[test]
     fn width_only_geometry_enforces_capture_join_and_planning_budgets() {
         let accented = Line::from_text("e\u{301}", &CellAttributes::blank(), 1, None);
@@ -5715,6 +6462,56 @@ mod tests {
     }
 
     #[test]
+    fn recycled_clustered_row_equals_a_new_line_and_keeps_its_text_buffer() {
+        let mut line = Line::new(1);
+        assert!(line.append_ascii_cell_run(0, &"x".repeat(200), CellAttributes::blank(), 1));
+        line.set_last_cell_was_wrapped(true, 1);
+        let text = match &line.cells {
+            CellStorage::C(clustered) => clustered.text().as_ptr(),
+            CellStorage::V(_) => panic!("an ASCII run on a new line stays clustered"),
+        };
+
+        let recycled = line.recycle_as_new(7);
+
+        assert_eq!(recycled, Line::new(7));
+        assert_eq!(recycled.len(), 0);
+        assert!(!recycled.last_cell_was_wrapped());
+        match &recycled.cells {
+            CellStorage::C(clustered) => {
+                assert!(clustered.text().is_empty());
+                assert_eq!(clustered.text().as_ptr(), text, "the text buffer is reused");
+            }
+            CellStorage::V(_) => panic!("a recycled row stays clustered"),
+        }
+
+        // Written again, it behaves like a fresh row.
+        let mut recycled = recycled;
+        assert!(recycled.append_ascii_cell_run(0, "abc", CellAttributes::blank(), 8));
+        let mut fresh = Line::new(7);
+        assert!(fresh.append_ascii_cell_run(0, "abc", CellAttributes::blank(), 8));
+        assert_eq!(recycled, fresh);
+        assert_eq!(recycled.as_str(), "abc");
+    }
+
+    #[test]
+    fn recycling_a_shared_or_vector_row_allocates_a_new_line() {
+        let mut line = Line::new(1);
+        assert!(line.append_ascii_cell_run(0, "shared", CellAttributes::blank(), 1));
+        let other_owner = line.clone();
+        let recycled = line.recycle_as_new(2);
+        assert_eq!(recycled, Line::new(2));
+        assert_eq!(
+            other_owner.as_str(),
+            "shared",
+            "the other owner keeps its text"
+        );
+
+        let vector = Line::with_width_and_cell(4, Cell::blank(), 1);
+        assert!(matches!(vector.cells, CellStorage::V(_)));
+        assert_eq!(vector.recycle_as_new(3), Line::new(3));
+    }
+
+    #[test]
     fn clustered_snapshots_share_payload_and_isolate_same_seqno_mutations() {
         let mutations: &[fn(&mut Line)] = &[
             |line| line.set_cell_grapheme(4, "界", 2, CellAttributes::blank(), 1),
@@ -5742,7 +6539,7 @@ mod tests {
                 (CellStorage::C(live), CellStorage::C(snapshot), CellStorage::C(cloned)) => {
                     assert!(Arc::ptr_eq(live, snapshot));
                     assert!(Arc::ptr_eq(live, cloned));
-                    assert_eq!(live.text.as_ptr(), snapshot.text.as_ptr());
+                    assert_eq!(live.text().as_ptr(), snapshot.text().as_ptr());
                 }
                 _ => panic!("clustered clones must retain clustered shared storage"),
             }
@@ -5788,7 +6585,7 @@ mod tests {
         let restored: CellStorage = serde_json::from_value(expected.clone()).unwrap();
         if let CellStorage::C(other) = &restored {
             assert!(!Arc::ptr_eq(payload, other));
-            assert_eq!(payload.text, other.text);
+            assert_eq!(payload.text(), other.text());
             assert_eq!(payload.len(), other.len());
             assert_eq!(
                 payload.last_cell_was_wrapped(),

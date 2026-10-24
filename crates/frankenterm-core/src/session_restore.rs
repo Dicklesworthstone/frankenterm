@@ -62,7 +62,7 @@ use crate::mux_recovery_image::{RecoveryImageHeader, RecoveryTopology};
 use crate::snapshot_publication::{GenerationRootPublishRequest, PredecessorBinding};
 use crate::snapshot_publication::{
     PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
-    VerifiedRootSelection,
+    VerifiedRootSelection, repair_descriptor_object_id,
 };
 #[cfg(test)]
 use crate::snapshot_publication::{RecoveryObjectPayload, RootSlot, sha256_hex};
@@ -6540,6 +6540,15 @@ pub enum WholeMuxRecoveryError {
     #[error("unproved guardian authority rejected for pane {pane_id}: {reason}")]
     UnprovedGuardianAuthority { pane_id: u64, reason: String },
 
+    /// The guardian, its custody of the pane authenticated, no longer holds
+    /// the catalog member (or its acknowledgement) this authenticated root
+    /// names: it keeps a pane's newest adopted checkpoints, and newer ones
+    /// superseded this one.
+    #[error(
+        "guardian checkpoint superseded for pane {pane_id}: the guardian no longer holds the member this root names"
+    )]
+    SupersededGuardianCheckpoint { pane_id: u64 },
+
     #[error("publication store error: {0}")]
     Publication(#[from] PublicationError),
 
@@ -7320,10 +7329,25 @@ impl WholeMuxRecoveryVerifier {
                 return Err(fail());
             }
         }
+        // Custody authenticated above. The store's error tells a reclaimed
+        // checkpoint (absent) from a catalog caught mid-adoption (out of
+        // order) or a damaged one.
         custody
             .reopen_checkpoint(selector)
             .map(Some)
-            .map_err(|_| fail())
+            .map_err(|error| match error {
+                frankenterm_pty_guardian::GuardianCheckpointStageStoreError::CandidateAbsent => {
+                    WholeMuxRecoveryError::SupersededGuardianCheckpoint {
+                        pane_id: pane.pane_id as u64,
+                    }
+                }
+                error => WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: pane.pane_id as u64,
+                    reason: format!(
+                        "existing guardian custody/catalog/ACK does not authenticate the manifest entry: {error:?}"
+                    ),
+                },
+            })
     }
 
     /// Authorize offline validation of this exact freshly published capture.
@@ -7630,6 +7654,41 @@ impl WholeMuxRecoveryVerifier {
         .map_err(WholeMuxRecoveryError::Representation)?;
 
         Ok(decoded.into_plaintext())
+    }
+
+    /// Each pane checkpoint object `candidate` names and its repair
+    /// descriptor, read from the authenticated manifest alone: unlike
+    /// [`Self::verify_root_with_cx`], this needs neither the objects nor
+    /// guardian evidence, which a newer capture may have superseded.
+    pub fn root_objects_with_cx(
+        &self,
+        cx: &Cx,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Result<Vec<String>, WholeMuxRecoveryError> {
+        cx.checkpoint()
+            .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+        if candidate.manifest_bytes.len() > self.limits.max_image_bytes {
+            return Err(WholeMuxRecoveryError::TopologyValidation(format!(
+                "root manifest payload exceeds limit ({} > {})",
+                candidate.manifest_bytes.len(),
+                self.limits.max_image_bytes
+            )));
+        }
+        let (raw_image_json, _) = self.decode_and_verify_manifest_payload(cx, candidate, store)?;
+        let image = MuxRecoveryImage::from_json_slice(raw_image_json.as_slice())?;
+        image.validate()?;
+        Ok(image
+            .panes
+            .iter()
+            .flat_map(|pane| {
+                let object = &pane.checkpoint.checkpoint_ref;
+                [
+                    object.object_id.clone(),
+                    repair_descriptor_object_id(&object.payload_digest),
+                ]
+            })
+            .collect())
     }
 
     pub fn verify_root_with_cx(
@@ -7993,9 +8052,7 @@ impl WholeMuxRecoveryVerifier {
                 let checkpoint = validated.checkpoint();
                 let (pixel_width, pixel_height, dpi) = checkpoint.pixel_dimensions_and_dpi();
                 let (row, column) = checkpoint.cursor_position();
-                let mismatch = if obj_ref.schema_version
-                    != frankenterm_term::terminalstate::checkpoint::TERMINAL_CHECKPOINT_VERSION
-                {
+                let mismatch = if obj_ref.schema_version != checkpoint.version() {
                     Some(TerminalProjectionField::SchemaVersion)
                 } else if pane.size.rows != checkpoint.primary_rows()
                     || pane.size.cols != checkpoint.primary_cols()
@@ -8058,6 +8115,27 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
     ) -> Result<Self::Verified, Self::Error> {
         let cx = crate::cx::for_request();
         self.verify_root_with_cx(&cx, candidate, store)
+    }
+
+    /// Guardian evidence a root names goes once newer captures of the pane
+    /// are adopted; the rejection is raised only after the root's envelope
+    /// and image authenticated and the pane's guardian custody opened. Any
+    /// other guardian authority failure (no or wrong custody, a mismatched
+    /// witness) still blocks publication.
+    fn superseded_by_newer(&self, error: &Self::Error) -> bool {
+        matches!(
+            error,
+            WholeMuxRecoveryError::SupersededGuardianCheckpoint { .. }
+        )
+    }
+
+    fn root_objects(
+        &self,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Option<Vec<String>> {
+        self.root_objects_with_cx(&crate::cx::for_request(), candidate, store)
+            .ok()
     }
 }
 
@@ -8231,6 +8309,41 @@ pub fn validate_whole_mux_image_layout_only<S: std::hash::BuildHasher>(
     Ok(())
 }
 
+/// Whether the root diagnostics leave recovery root authority unresolved,
+/// after marking superseded guardian evidence. A root older than the newest
+/// verified generation, rejected only for guardian evidence (the indices
+/// `guardian_rejections` into `diagnostics`, whose generations authenticated),
+/// is superseded: the guardian keeps the newest adopted checkpoint of each
+/// pane, so an older root's evidence goes once a newer root's capture is
+/// adopted. A rejected root at or above the newest verified generation, or
+/// with none verified, still blocks, as does every other diagnostic but an
+/// authenticated reconstruction.
+fn settle_root_authority(
+    diagnostics: &mut [crate::snapshot_publication::TornRootDiagnostic],
+    guardian_rejections: &[usize],
+    newest_verified: Option<u64>,
+) -> bool {
+    use crate::snapshot_publication::RootDiagnosticAuthority;
+    if let Some(newest) = newest_verified {
+        for &index in guardian_rejections {
+            let diagnostic = &mut diagnostics[index];
+            if diagnostic
+                .generation
+                .is_some_and(|generation| generation < newest)
+            {
+                diagnostic.authority = RootDiagnosticAuthority::SupersededGuardianEvidence;
+            }
+        }
+    }
+    diagnostics.iter().any(|diagnostic| {
+        !matches!(
+            diagnostic.authority,
+            RootDiagnosticAuthority::AuthenticatedReconstruction
+                | RootDiagnosticAuthority::SupersededGuardianEvidence
+        )
+    })
+}
+
 /// Select the latest verified recovery root from the publication store using
 /// `WholeMuxRecoveryVerifier`.
 pub fn select_verified_recovery_roots(
@@ -8276,6 +8389,8 @@ pub fn select_verified_recovery_roots_with_cx(
         .as_deref()
         .unwrap_or_else(|| shared_admission_controller());
     let mut accepted_roots = Vec::with_capacity(2);
+    // Indices into `diagnostics` of roots rejected for guardian evidence.
+    let mut guardian_rejections = Vec::new();
     for slot in [RootSlot::SlotA, RootSlot::SlotB] {
         let ordinary = candidates.iter().find(|candidate| candidate.slot == slot);
         let discovery = discoveries.iter().find(|discovery| discovery.slot == slot);
@@ -8408,17 +8523,29 @@ pub fn select_verified_recovery_roots_with_cx(
                         RepairError::AdmissionExceeded(_),
                     ))),
                 ) => return Err(error),
-                Err(_) => {
+                Err(error) => {
+                    // The verifier's own error, after the fixed prefix, is
+                    // what tells one rejected graph from another: a refused
+                    // restore logs these reasons.
+                    let prefix = if repair {
+                        "authenticated root repair or graph rejected"
+                    } else {
+                        "root graph rejected"
+                    };
+                    // Only raised after the root's envelope and image
+                    // authenticated, `generation` included.
+                    if matches!(
+                        error,
+                        WholeMuxRecoveryError::UnprovedGuardianAuthority { .. }
+                            | WholeMuxRecoveryError::SupersededGuardianCheckpoint { .. }
+                    ) {
+                        guardian_rejections.push(diagnostics.len());
+                    }
                     diagnostics.push(TornRootDiagnostic {
                         slot,
                         generation: Some(generation),
                         authority: RootDiagnosticAuthority::Unresolved,
-                        reason: if repair {
-                            "authenticated root repair or graph rejected"
-                        } else {
-                            "root graph rejected"
-                        }
-                        .to_owned(),
+                        reason: format!("{prefix}: {error}"),
                     });
                 }
             }
@@ -8431,9 +8558,11 @@ pub fn select_verified_recovery_roots_with_cx(
         }
         .into());
     }
-    let unresolved_authority = diagnostics.iter().any(|diagnostic| {
-        diagnostic.authority != RootDiagnosticAuthority::AuthenticatedReconstruction
-    });
+    let unresolved_authority = settle_root_authority(
+        &mut diagnostics,
+        &guardian_rejections,
+        accepted_roots.first().map(|root| root.0),
+    );
     diagnostics.truncate(store.limits().max_error_records);
     let mut accepted_roots = accepted_roots.into_iter();
     Ok(VerifiedRootSelection {
@@ -8464,6 +8593,84 @@ mod tests {
         assert_ne!(short, semantic_object_id_from_str("pane\0"));
         assert_ne!(short, semantic_object_id_from_str(&hex::encode(short)));
         assert_eq!(short, semantic_object_id_from_str("pane"));
+    }
+
+    #[test]
+    fn only_a_newer_verified_root_supersedes_guardian_evidence() {
+        use crate::snapshot_publication::{RootDiagnosticAuthority, RootSlot, TornRootDiagnostic};
+        let rejected = |generation| TornRootDiagnostic {
+            slot: RootSlot::SlotA,
+            generation,
+            reason: "root graph rejected: unproved guardian authority".to_owned(),
+            authority: RootDiagnosticAuthority::Unresolved,
+        };
+        // An older root rejected for guardian evidence blocks nothing.
+        let mut older = vec![rejected(Some(5))];
+        assert!(!settle_root_authority(&mut older, &[0], Some(6)));
+        assert_eq!(
+            older[0].authority,
+            RootDiagnosticAuthority::SupersededGuardianEvidence
+        );
+        // At or above the newest verified generation, with none verified, or
+        // without a generation, it blocks.
+        for (generation, newest) in [
+            (Some(6), Some(6)),
+            (Some(7), Some(6)),
+            (Some(5), None),
+            (None, Some(6)),
+        ] {
+            let mut diagnostics = vec![rejected(generation)];
+            assert!(
+                settle_root_authority(&mut diagnostics, &[0], newest),
+                "{generation:?} under {newest:?}"
+            );
+            assert_eq!(
+                diagnostics[0].authority,
+                RootDiagnosticAuthority::Unresolved
+            );
+        }
+        // Any other rejection of an older root still blocks.
+        let mut other = vec![rejected(Some(5))];
+        assert!(settle_root_authority(&mut other, &[], Some(6)));
+        // Beside an authenticated reconstruction nothing blocks; beside a
+        // rejected newer root, the superseded one does not hide it.
+        let mut mixed = vec![
+            rejected(Some(5)),
+            TornRootDiagnostic {
+                authority: RootDiagnosticAuthority::AuthenticatedReconstruction,
+                ..rejected(Some(6))
+            },
+        ];
+        assert!(!settle_root_authority(&mut mixed, &[0], Some(6)));
+        let mut mixed = vec![rejected(Some(5)), rejected(Some(7))];
+        assert!(settle_root_authority(&mut mixed, &[0, 1], Some(6)));
+    }
+
+    #[test]
+    fn only_a_reclaimed_guardian_member_is_superseded_for_publication() {
+        use crate::snapshot_publication::RootVerifier;
+        let verifier = whole_mux_test_verifier();
+        assert!(verifier.superseded_by_newer(
+            &WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 3 }
+        ));
+        // Missing or wrong custody, or a witness that does not match, says
+        // nothing about newer captures: it still blocks publication.
+        for reason in [
+            "no authenticated guardian witness is installed",
+            "existing guardian custody/catalog/ACK does not authenticate the manifest entry",
+            "reopened guardian witness does not match image",
+        ] {
+            assert!(!verifier.superseded_by_newer(
+                &WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: 3,
+                    reason: reason.to_owned(),
+                }
+            ));
+        }
+        assert!(
+            !verifier
+                .superseded_by_newer(&WholeMuxRecoveryError::FakeGuardianAuthority { pane_id: 3 })
+        );
     }
 
     fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {

@@ -50,6 +50,7 @@ downcast-rs.workspace = true
 fancy-regex.workspace = true
 filedescriptor.workspace = true
 finl_unicode.workspace = true
+futures.workspace = true
 frankenterm-alloc.workspace = true
 frankenterm-build-identity.workspace = true
 hmac.workspace = true
@@ -91,6 +92,8 @@ frankenterm-ssh = { path = "../ssh", default-features = false, features = ["libs
 frankenterm-term = { workspace=true, features=["use_serde"] }
 
 [target."cfg(unix)".dependencies]
+# time: thread CPU time in the slow parser-stretch log (ft-t162y).
+rustix = { workspace = true, features = ["time"] }
 nix = { workspace = true, features = ["term", "user"] }
 
 [target."cfg(windows)".dependencies]

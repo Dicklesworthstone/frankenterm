@@ -21,6 +21,33 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+/// The render facts a local pane publishes, which the mouse path reads
+/// instead of locking its terminal (ft-yccm0.2.2.2). None for other panes,
+/// whose getters it keeps, and with FT_DISABLE_LOCK_FREE_MOUSE=1.
+fn published_facts(pane: &dyn Pane) -> Option<Arc<mux::pane::PaneRenderFacts>> {
+    (mux::localpane::lock_free_mouse_enabled()
+        && pane.downcast_ref::<mux::localpane::LocalPane>().is_some())
+    .then(|| pane.render_facts())
+}
+
+/// Whether `pane` reports the mouse; see [`published_facts`].
+fn mouse_grabbed(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(|| pane.is_mouse_grabbed(), |facts| facts.mouse_grabbed)
+}
+
+/// Whether `pane` shows its alternate screen; see [`published_facts`].
+fn alt_screen_active(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(
+        || pane.is_alt_screen_active(),
+        |facts| facts.alt_screen_active,
+    )
+}
+
+/// `pane`'s dimensions; see [`published_facts`].
+pub(super) fn pane_dimensions(pane: &dyn Pane) -> mux::renderable::RenderableDimensions {
+    published_facts(pane).map_or_else(|| pane.get_dimensions(), |facts| facts.dimensions)
+}
+
 fn checked_mouse_stable_row(viewport: StableRowIndex, row: i64) -> Option<StableRowIndex> {
     let offset = StableRowIndex::try_from(row).ok()?;
     if offset < 0 {
@@ -123,7 +150,7 @@ impl super::TermWindow {
             .sub((padding_left + border.left.get() as f32) as isize)
             .max(0) as f32)
             / cell_w;
-        let x = if !pane.is_mouse_grabbed() {
+        let x = if !mouse_grabbed(&*pane) {
             // Round the x coordinate so that we're a bit more forgiving of
             // the horizontal position when selecting cells
             x.round()
@@ -361,7 +388,7 @@ impl super::TermWindow {
             None => return,
         };
 
-        let dims = pane.get_dimensions();
+        let dims = pane_dimensions(&*pane);
         let current_viewport = self.get_viewport(pane.pane_id());
 
         let tab_bar_height = if self.show_tab_bar {
@@ -389,7 +416,7 @@ impl super::TermWindow {
         // in ScrollHit::thumb
         let row = ScrollHit::thumb_top_to_scroll_top(
             effective_thumb_top,
-            &*pane,
+            &dims,
             current_viewport,
             self.dimensions.pixel_height.saturating_sub(
                 y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
@@ -670,7 +697,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let dims = pane.get_dimensions();
+            let dims = pane_dimensions(&*pane);
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page up
             self.set_viewport(
@@ -695,7 +722,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let dims = pane.get_dimensions();
+            let dims = pane_dimensions(&*pane);
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page down
             self.set_viewport(
@@ -979,7 +1006,7 @@ impl super::TermWindow {
             // When hovering over a hyperlink, show an appropriate
             // mouse cursor to give the cue that it is clickable
             MouseCursor::Hand
-        } else if pane.is_mouse_grabbed() || outside_window {
+        } else if mouse_grabbed(&*pane) || outside_window {
             MouseCursor::Arrow
         } else {
             MouseCursor::Text
@@ -1063,7 +1090,7 @@ impl super::TermWindow {
 
                 // Since we use shift to force assessing the mouse bindings, pretend
                 // that shift is not one of the mods when the mouse is grabbed.
-                let mut mouse_reporting = pane.is_mouse_grabbed();
+                let mut mouse_reporting = mouse_grabbed(&*pane);
                 if mouse_reporting {
                     if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
                         modifiers.remove(self.config.bypass_mouse_reporting_modifiers);
@@ -1116,7 +1143,7 @@ impl super::TermWindow {
                 let mouse_mods = config::MouseEventTriggerMods {
                     mods: modifiers,
                     mouse_reporting,
-                    alt_screen: if pane.is_alt_screen_active() {
+                    alt_screen: if alt_screen_active(&*pane) {
                         MouseEventAltScreen::True
                     } else {
                         MouseEventAltScreen::False
@@ -1264,5 +1291,221 @@ mod tests {
             active,
             42,
         ));
+    }
+
+    /// ft-yccm0.2.2.2: the mouse path's grabbed, alternate-screen and
+    /// dimension reads of a local pane are its published render facts, not
+    /// a terminal lock, for a grabbed pane on the alternate screen and for
+    /// one that is neither.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_reads_a_local_panes_published_facts() {
+        use mux::pane::Pane;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        for (id, output, grabbed) in [
+            (998_321, &b"\x1b[?1000h\x1b[?1049h"[..], true),
+            (998_322, &b"plain"[..], false),
+        ] {
+            let terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 4,
+                    cols: 20,
+                    dpi: 96,
+                    pixel_width: 160,
+                    pixel_height: 64,
+                },
+                Arc::new(FactsConfig),
+                "mouse-facts-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+                id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                id,
+                [0x35; 16],
+                "mouse facts test".to_owned(),
+            ));
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+            pane.perform_actions(actions).unwrap();
+
+            let facts = pane.render_facts();
+            assert_eq!(facts.mouse_grabbed, grabbed);
+            assert_eq!(facts.alt_screen_active, grabbed);
+            assert!(super::published_facts(&*pane).is_some_and(|read| Arc::ptr_eq(&read, &facts)));
+            assert_eq!(super::mouse_grabbed(&*pane), grabbed);
+            assert_eq!(super::alt_screen_active(&*pane), grabbed);
+            assert_eq!(super::pane_dimensions(&*pane), facts.dimensions);
+            pane.kill();
+        }
+    }
+
+    /// ft-yccm0.2.2.2 acceptance: while another thread holds a local pane's
+    /// terminal mutex for 500 ms, the mouse path on the main thread returns
+    /// at once. Its reads (grabbed, alternate screen, dimensions) are
+    /// published facts, and the report for a grabbed pane is queued for the
+    /// pane to apply after the holder. The M.4 ledger records no wait.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_never_waits_for_a_terminal_another_thread_holds() {
+        use frankenterm_alloc::resource_ledger::TerminalLockLedger;
+        use mux::pane::{Pane, WithPaneLines};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Holds a pane's terminal mutex from inside `with_lines_mut`.
+        struct HoldTerminal {
+            held: std::sync::mpsc::SyncSender<()>,
+            hold: Duration,
+        }
+        impl WithPaneLines for HoldTerminal {
+            fn with_lines_mut(
+                &mut self,
+                _first: StableRowIndex,
+                _lines: &mut [&mut termwiz::surface::Line],
+            ) {
+                let _ = self.held.send(());
+                std::thread::sleep(self.hold);
+            }
+        }
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+
+        const HOLD: Duration = Duration::from_millis(500);
+        let terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 20,
+                dpi: 96,
+                pixel_width: 160,
+                pixel_height: 64,
+            },
+            Arc::new(FactsConfig),
+            "mouse-hold-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_323,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_323,
+            [0x36; 16],
+            "mouse hold test".to_owned(),
+        ));
+        // SGR mouse reporting on the alternate screen: a grabbed pane.
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"\x1b[?1000h\x1b[?1006h\x1b[?1049h", |action| {
+                actions.push(action)
+            });
+        pane.perform_actions(actions).unwrap();
+        let dims = pane.render_facts().dimensions;
+
+        let released = AtomicBool::new(false);
+        let (elapsed, grabbed, alt_screen, read_dims, before, after) =
+            std::thread::scope(|scope| {
+                let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+                let (pane, released) = (&pane, &released);
+                scope.spawn(move || {
+                    pane.with_lines_mut(
+                        0..1,
+                        &mut HoldTerminal {
+                            held: held_tx,
+                            hold: HOLD,
+                        },
+                    );
+                    released.store(true, Ordering::Release);
+                });
+                held_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the holder took the terminal");
+                let before = TerminalLockLedger::global().snapshot();
+                // The ledger counts waits by threads named "main", the name
+                // std gives the process's main thread, the AppKit thread.
+                let reads = std::thread::Builder::new()
+                    .name("main".to_string())
+                    .spawn_scoped(scope, move || {
+                        let started = Instant::now();
+                        let grabbed = super::mouse_grabbed(&**pane);
+                        let alt_screen = super::alt_screen_active(&**pane);
+                        let read_dims = super::pane_dimensions(&**pane);
+                        pane.mouse_event(wezterm_term::MouseEvent {
+                            kind: wezterm_term::input::MouseEventKind::Press,
+                            x: 3,
+                            y: 1,
+                            x_pixel_offset: 0,
+                            y_pixel_offset: 0,
+                            button: wezterm_term::input::MouseButton::Left,
+                            modifiers: wezterm_term::KeyModifiers::NONE,
+                        })
+                        .unwrap();
+                        (started.elapsed(), grabbed, alt_screen, read_dims)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                let after = TerminalLockLedger::global().snapshot();
+                assert!(
+                    !released.load(Ordering::Acquire),
+                    "the terminal was held throughout the mouse path"
+                );
+                (reads.0, reads.1, reads.2, reads.3, before, after)
+            });
+        assert!(released.load(Ordering::Acquire));
+        assert!(grabbed && alt_screen, "the pane reads as grabbed");
+        assert_eq!(read_dims, dims);
+        // A bound, not an equality: the ledger is process-wide, and a test
+        // on another thread named "main" (paint's bounded capture) may wait
+        // in the same window. Waiting out the holder would be ~500 ms.
+        let blocked =
+            Duration::from_nanos(after.main_thread_blocked_ns - before.main_thread_blocked_ns);
+        assert!(
+            blocked < Duration::from_millis(50),
+            "the main thread was blocked {blocked:?} while the terminal was held for {HOLD:?}"
+        );
+        eprintln!("mouse path while the terminal was held: {elapsed:?}");
+        // Honest slack for a loaded debug build; any wait would be ~500 ms.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the mouse path took {elapsed:?} while the terminal was held for {HOLD:?}"
+        );
+        pane.kill();
     }
 }

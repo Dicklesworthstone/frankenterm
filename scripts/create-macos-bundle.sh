@@ -530,10 +530,12 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 BROWSER_RUNTIME_DEST="$APP_BUNDLE/Contents/Resources/browser-runtime"
 BROWSER_SOURCE_MANIFEST_DEST="$APP_BUNDLE/Contents/Resources/browser-runtime.source-manifest.json"
 mkdir -p "$BROWSER_RUNTIME_DEST"
-# Archive streaming preserves the component's verified internal symlink
-# topology without following those links or merging it with prior output.
-COPYFILE_DISABLE=1 tar -C "$BROWSER_RUNTIME_ROOT" -cf - . \
-    | COPYFILE_DISABLE=1 tar -C "$BROWSER_RUNTIME_DEST" -xf -
+# ditto copies the component's verified internal symlinks as symlinks,
+# without following them, into the fresh destination, and copies contents
+# and modes only, as the COPYFILE_DISABLE archive stream it replaces did. On
+# macOS 27 that `tar -cf - | tar -xf -` stream stopped partway: the reading
+# bsdtar exited 0 early and the writer failed with "tar: Write error".
+ditto --norsrc --noextattr --noacl "$BROWSER_RUNTIME_ROOT" "$BROWSER_RUNTIME_DEST"
 cp "$BROWSER_RUNTIME_MANIFEST" "$BROWSER_SOURCE_MANIFEST_DEST"
 if ! bash "$ATOMIC_MANIFEST_TOOL" verify \
     --root "$BROWSER_RUNTIME_DEST" \

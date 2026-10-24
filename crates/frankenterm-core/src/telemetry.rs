@@ -223,16 +223,101 @@ fn collect_system_memory() -> (u64, u64) {
     (total, available)
 }
 
+/// Longest one telemetry probe command may run (ft-ati70). `lsof` can stall on
+/// an unresponsive mount, and no probe may hold a sample, or the collector's
+/// shutdown, behind a hung child.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait for a finished probe's stdout reader.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const PROBE_READ_GRACE: Duration = Duration::from_secs(1);
+
+/// Probe output past this many bytes is not trusted.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const PROBE_OUTPUT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What a finished probe command printed, and whether it exited successfully.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct ProbeOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+/// Start one telemetry probe command: no shell, stdin and stderr closed.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn spawn_probe(program: &str, args: &[&str]) -> Option<std::process::Child> {
+    use std::process::{Command, Stdio};
+
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Wait for a probe command under a hard deadline (ft-ati70). Its stdout is
+/// read on a helper thread, so a child that fills the pipe cannot stall, and
+/// at the deadline the child is killed and reaped. `None` when it timed out
+/// or printed more than [`PROBE_OUTPUT_MAX_BYTES`]. The child is always
+/// reaped before this returns.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn finish_probe(mut child: std::process::Child, timeout: Duration) -> Option<ProbeOutput> {
+    use std::io::Read as _;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = child.stdout.take().and_then(|stdout| {
+        std::thread::Builder::new()
+            .name("ft-telemetry-probe".to_string())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let read = stdout
+                    .take(PROBE_OUTPUT_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes);
+                let _ = sender.send(read.map(|_| bytes));
+            })
+            .ok()
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if reader.is_some() => break Some(status),
+            Ok(None) if reader.is_some() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let status = status?;
+    let stdout = receiver.recv_timeout(PROBE_READ_GRACE).ok()?.ok()?;
+    if stdout.len() as u64 > PROBE_OUTPUT_MAX_BYTES {
+        return None;
+    }
+    Some(ProbeOutput {
+        success: status.success(),
+        stdout,
+    })
+}
+
+/// Run one telemetry probe command under [`PROBE_COMMAND_TIMEOUT`].
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn run_probe_command(program: &str, args: &[&str]) -> Option<ProbeOutput> {
+    finish_probe(spawn_probe(program, args)?, PROBE_COMMAND_TIMEOUT)
+}
+
 /// Collect system-wide memory statistics: (total_bytes, available_bytes).
 #[cfg(target_os = "macos")]
 fn collect_system_memory() -> (u64, u64) {
     // Total memory via sysctl
-    let total = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
+    let total = run_probe_command("sysctl", &["-n", "hw.memsize"])
         .and_then(|o| {
-            if o.status.success() {
+            if o.success {
                 String::from_utf8_lossy(&o.stdout)
                     .trim()
                     .parse::<u64>()
@@ -244,11 +329,9 @@ fn collect_system_memory() -> (u64, u64) {
         .unwrap_or(0);
 
     // Free pages via vm_stat
-    let available = std::process::Command::new("vm_stat")
-        .output()
-        .ok()
+    let available = run_probe_command("vm_stat", &[])
         .and_then(|o| {
-            if o.status.success() {
+            if o.success {
                 let text = String::from_utf8_lossy(&o.stdout);
                 let mut free_pages: u64 = 0;
                 let mut page_size: u64 = 16384; // Apple Silicon default fallback
@@ -1357,11 +1440,8 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) -> bool {
     let mut observed = false;
 
     // Use ps to get RSS and VSZ for the specific PID
-    if let Ok(output) = std::process::Command::new("ps")
-        .args(["-o", "rss=,vsz=", "-p", &pid.to_string()])
-        .output()
-    {
-        if output.status.success() {
+    if let Some(output) = run_probe_command("ps", &["-o", "rss=,vsz=", "-p", &pid.to_string()]) {
+        if output.success {
             let text = String::from_utf8_lossy(&output.stdout);
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
@@ -1384,18 +1464,14 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) -> bool {
             snap.fd_count = entries.count() as u64;
         }
     } else if observed {
-        // For other PIDs, use lsof -p <pid> | wc -l as approximation
-        if let Ok(output) = std::process::Command::new("sh")
-            .args(["-c", &format!("lsof -p {pid} 2>/dev/null | wc -l")])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Ok(count) = text.trim().parse::<u64>() {
-                    // lsof includes a header line
-                    snap.fd_count = count.saturating_sub(1);
-                }
-            }
+        // For other PIDs, the lines `lsof -p <pid>` prints approximate the
+        // count. Counted here rather than through a `sh -c '… | wc -l'`
+        // pipeline, whose grandchildren no deadline could reap (ft-ati70).
+        // Like that pipeline, any exit status counts the lines printed.
+        if let Some(output) = run_probe_command("lsof", &["-p", &pid.to_string()]) {
+            let lines = memchr::memchr_iter(b'\n', &output.stdout).count() as u64;
+            // lsof includes a header line
+            snap.fd_count = lines.saturating_sub(1);
         }
     }
 
@@ -1728,6 +1804,82 @@ impl std::fmt::Debug for TelemetryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ft-ati70: every probe command has a hard deadline, is reaped, and runs
+    // without a shell.
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_returns_a_successful_commands_output() {
+        let output = run_probe_command("sh", &["-c", "printf 'a\\nb\\n'"]).expect("probe ran");
+        assert!(output.success);
+        assert_eq!(output.stdout, b"a\nb\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_reports_a_failed_exit_with_its_output() {
+        let output = run_probe_command("sh", &["-c", "echo partial; exit 3"]).expect("probe ran");
+        assert!(!output.success);
+        assert_eq!(output.stdout, b"partial\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_kills_and_reaps_a_hung_child_at_the_deadline() {
+        let child = spawn_probe("sleep", &["30"]).expect("spawn sleep");
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid fits"))
+            .expect("a child pid is nonzero");
+        let started = Instant::now();
+        assert!(
+            finish_probe(child, Duration::from_millis(200)).is_none(),
+            "a hung probe yields no sample"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline bounds the wait: {:?}",
+            started.elapsed()
+        );
+        // A zombie still answers a null signal; a reaped child is gone.
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "the timed-out child was left unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_drains_output_larger_than_a_pipe_buffer() {
+        let output =
+            run_probe_command("sh", &["-c", "head -c 1000000 /dev/zero"]).expect("probe ran");
+        assert!(output.success);
+        assert_eq!(output.stdout.len(), 1_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_refuses_output_past_the_cap() {
+        let script = format!("head -c {} /dev/zero", PROBE_OUTPUT_MAX_BYTES + 1024);
+        assert!(run_probe_command("sh", &["-c", &script]).is_none());
+    }
+
+    #[test]
+    fn telemetry_probes_run_no_shell_and_no_undeadlined_command() {
+        let source = include_str!("telemetry.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source");
+        assert!(
+            !production.contains("Command::new(\"sh\")"),
+            "a shell pipeline's grandchildren escape the probe deadline"
+        );
+        assert!(
+            !production.contains(".output()"),
+            "every probe command goes through run_probe_command's deadline"
+        );
+    }
 
     // br-ft-pu2mg: Histogram's running count must plateau at u64::MAX, not
     // debug-panic / release-wrap. A wrap to 0 is not just a wrong count — mean()

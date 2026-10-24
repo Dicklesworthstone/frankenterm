@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -83,8 +83,13 @@ pub(crate) fn register_spawned_pane_or_rollback(
 pub struct UnpublishedPane {
     pane: Option<Arc<dyn Pane>>,
     rollback: UnpublishedPaneRollback,
-    guardian_publication: Option<Arc<AtomicBool>>,
+    guardian_publication: Option<Arc<AtomicU8>>,
 }
+
+/// [`GuardianPanePublicationReceipt`] states.
+const GUARDIAN_PUBLICATION_PENDING: u8 = 0;
+const GUARDIAN_PUBLICATION_PUBLISHED: u8 = 1;
+const GUARDIAN_PUBLICATION_ABANDONED: u8 = 2;
 
 /// Private restored topology and its still-armed pane rollback custody.
 ///
@@ -308,19 +313,27 @@ impl UnpublishedRecoveredTopology {
 /// The receipt remains true after the registered pane is removed.
 #[derive(Clone)]
 pub struct GuardianPanePublicationReceipt {
-    published: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 impl GuardianPanePublicationReceipt {
     #[must_use]
     pub fn was_published(&self) -> bool {
-        self.published.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == GUARDIAN_PUBLICATION_PUBLISHED
+    }
+
+    /// Whether publication may still happen: the unpublished pane has been
+    /// neither registered nor dropped.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) == GUARDIAN_PUBLICATION_PENDING
     }
 }
 
 enum UnpublishedPaneRollback {
     KillNative,
     RetireGuardian,
+    CloseGuardianBirth,
 }
 
 impl UnpublishedPane {
@@ -339,7 +352,25 @@ impl UnpublishedPane {
         Ok(Self {
             pane: Some(Arc::new(pane)),
             rollback: UnpublishedPaneRollback::RetireGuardian,
-            guardian_publication: Some(Arc::new(AtomicBool::new(false))),
+            guardian_publication: Some(Arc::new(AtomicU8::new(GUARDIAN_PUBLICATION_PENDING))),
+        })
+    }
+
+    /// [`Self::from_guardian_proxy`] for a pane whose child the guardian
+    /// started for this spawn (a birth). Nothing ever showed the pane, so
+    /// abandoning it closes the child, as a native spawn's rollback kills
+    /// its own, instead of leaving it running unclaimed under the guardian
+    /// (ft-hn80q). A restored pane keeps lease-only retirement: its child is
+    /// the user's running process.
+    pub fn from_guardian_birth(pane: LocalPane) -> anyhow::Result<Self> {
+        if let Err(error) = pane.validate_unpublished_guardian_proxy() {
+            Pane::kill(&pane);
+            return Err(error);
+        }
+        Ok(Self {
+            pane: Some(Arc::new(pane)),
+            rollback: UnpublishedPaneRollback::CloseGuardianBirth,
+            guardian_publication: Some(Arc::new(AtomicU8::new(GUARDIAN_PUBLICATION_PENDING))),
         })
     }
 
@@ -348,8 +379,8 @@ impl UnpublishedPane {
     pub fn guardian_publication_receipt(&self) -> Option<GuardianPanePublicationReceipt> {
         self.guardian_publication
             .as_ref()
-            .map(|published| GuardianPanePublicationReceipt {
-                published: Arc::clone(published),
+            .map(|state| GuardianPanePublicationReceipt {
+                state: Arc::clone(state),
             })
     }
 
@@ -373,8 +404,8 @@ impl UnpublishedPane {
             .pane
             .take()
             .expect("unpublished pane consumed more than once");
-        if let Some(published) = self.guardian_publication.as_ref() {
-            published.store(true, Ordering::Release);
+        if let Some(state) = self.guardian_publication.as_ref() {
+            state.store(GUARDIAN_PUBLICATION_PUBLISHED, Ordering::Release);
         }
         pane
     }
@@ -385,12 +416,18 @@ impl Drop for UnpublishedPane {
         let Some(pane) = self.pane.take() else {
             return;
         };
+        if let Some(state) = self.guardian_publication.as_ref() {
+            state.store(GUARDIAN_PUBLICATION_ABANDONED, Ordering::Release);
+        }
         if matches!(self.rollback, UnpublishedPaneRollback::RetireGuardian) {
             // This Arc is created only from an owned LocalPane, and never
             // escapes before publication. Its Drop retires the exact lease.
             drop(pane);
             return;
         }
+        // A birth (CloseGuardianBirth) closes its guardian child through
+        // the pane's kill, which marks the lease closed so the LocalPane's
+        // Drop then retires nothing; a native pane kills its child.
         let rollback = catch_recoverable(
             RecoverablePanicSite::MuxRegistrationRollback,
             std::panic::AssertUnwindSafe(|| pane.kill()),
@@ -1945,6 +1982,25 @@ mod tests {
             ));
             drop(held);
             assert!(mux.capture_topology_coherent(Default::default()).is_ok());
+            // A non-default domain with no durable policy and no pane (the
+            // domain an ~/.ssh/config host registers, say) is left out of the
+            // image instead of refusing whole-mux recovery.
+            let pane_less: Arc<dyn Domain> = Arc::new(LocalDomain::new_exec_domain(ExecDomain {
+                name: "pane-less-callback".into(),
+                fixup_command: "uncaptured-function".into(),
+                label: None,
+            })?);
+            mux.add_domain(&pane_less)?;
+            let captured = mux.capture_topology_coherent(Default::default())?;
+            assert_eq!(captured.default_domain_id, Some(native.domain_id()));
+            assert_eq!(
+                captured
+                    .domains
+                    .iter()
+                    .map(|domain| domain.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["busy-backend"]
+            );
         }
         let domain = LocalDomain::new_exec_domain(ExecDomain {
             name: "callback-domain".into(),

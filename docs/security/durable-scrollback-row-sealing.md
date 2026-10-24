@@ -98,6 +98,38 @@ They never read back as rows: every reader refuses rows before the oldest
 retained row. A tampered slack row makes the segment fail to open, which
 fails closed as above.
 
+Payload compaction is amortized against the bytes it reclaims (`ft-y0gy9`).
+Ordinary maintenance copies the kept suffix only when the stale prefix is
+both at least the configured minimum and at least as large as the suffix
+being copied. That suffix includes the physically retained authentication
+support rows, and the accounting includes the replacement header. Reaching
+the minimum alone must not copy a much larger live history on every small
+retention advance. The live writer can override the
+ratio to preserve the existing 1 GiB bound on a complete published content
+log. An oversized log whose kept suffix and new header cannot fit is refused
+instead of widening the recovery bound. WAL recovery applies the same
+maintenance before repairing a complete manifest.
+
+The sequence journal is checkpointed independently of the payload log.
+Journal pressure writes one `FTSEQ1` record containing the logical base to a
+private sibling file, synchronizes it, atomically replaces the journal, and
+synchronizes the directory. Payload compaction uses the same checkpoint.
+It must never truncate the old journal before its replacement is durable:
+the new payload header may name an earlier authentication support row, so
+the journal remains necessary to recover the exact logical retention
+boundary. A checkpoint preserves the current format and does not re-encode
+or re-seal any retained row. A retry reuses its one owned unpublished staging
+file only after validating its path and open handle, so repeated failures do
+not create an additional sibling on every attempt.
+
+The amortization bound applies to ordinary payload-copy work, not to total
+OS disk writes or to compaction forced by the physical limit. Encoded row
+bytes, journal and manifest writes, filesystem behavior, and unpublished
+tails have separate costs and bounds. In particular, the 1 GiB complete
+manifest limit is not a promise that an unpublished tail always stays below
+every snapshot reader's physical-byte budget. Native sustained-output
+measurement is still required to establish the bead's amplification target.
+
 ## Plaintext hygiene
 
 - The writer's reusable encode buffers are wiped after every row and
@@ -166,3 +198,38 @@ With the writer's segments (1024 rows, 128 KiB):
   (mux-server-impl).
 - `pruned_tail_rows_stay_readable_until_a_compaction_drops_them`,
   `the_pruned_tail_is_bounded` (frankenterm-core).
+
+### Retention maintenance and writer turns (`ft-y0gy9`)
+
+The maintenance regressions count actual replacement-file writes over 96
+small retention advances, verify the exact suffix after reopen, and require
+journal-pressure checkpoints to leave the payload log untouched. Additional
+cases cover authentication support rows, hard publication ceilings, partial
+append tails, journal and data publication boundaries, retry-stage reuse,
+published file-handle identity, failed-sync authority, malformed journals,
+and substituted paths.
+
+The deferred-writer regressions use the production scheduler thread and a
+gated backing store. They cover a quiet pane behind a replenished hot pane,
+fresh arrival windows, partial acknowledgements, finite explicit-flush
+frontiers, publication retry with an empty queue, pane close, coalesced gaps,
+and nonblocking window parking. A live encrypted-store regression crosses a
+small test-only cumulative-byte trigger, checks immediate publication, and
+reopens the exact rows. Production uses the newly appended byte total for
+that decision rather than the preceding window's total.
+
+Validation recorded on 2026-10-12:
+
+| Check | Executed result |
+| --- | --- |
+| Pinned `nightly-2026-08-31` Rustfmt | Full storage file passed. The complete changed deferred module, changed storage/publication functions, and affected mux tests passed bounded formatting checks. Full mux-file formatting was killed with exit 137 and remains unverified. |
+| `git diff --check` | Passed for the changed files. |
+| RCH library tests and Clippy | Neither started: `rch: command not found` (exit 127). No native test or Clippy result is claimed. |
+| `scripts/measure-mux-write-amplification.sh` | Skipped on Linux; requires macOS `proc_pid_rusage` (exit 2). |
+| `scripts/mac-gui-throughput.sh --self-test` | Refused on Linux; macOS only (exit 2). |
+
+The regression cases above were added and independently source-reviewed;
+they were not executed here. Fault injection is not power-loss proof. The
+P0 amplification target remains open pending native tests, Clippy, and
+sustained mux/GUI measurement, including normal-retention overflow and a
+second pane producing output concurrently.

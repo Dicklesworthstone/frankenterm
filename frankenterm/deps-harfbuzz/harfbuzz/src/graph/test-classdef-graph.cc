@@ -38,7 +38,7 @@ static unsigned actual_class_def_size(It glyph_and_class) {
   hb_serialize_context_t serializer(buffer, 100);
   OT::ClassDef_serialize (&serializer, glyph_and_class);
   serializer.end_serialize ();
-  assert(!serializer.in_error());
+  hb_always_assert(!serializer.in_error());
 
   hb_blob_t* blob = serializer.copy_blob();
   unsigned size = hb_blob_get_length(blob);
@@ -66,7 +66,7 @@ static unsigned actual_coverage_size(It glyphs) {
   hb_serialize_context_t serializer(buffer, 100);
   OT::Layout::Common::Coverage_serialize (&serializer, glyphs);
   serializer.end_serialize ();
-  assert(!serializer.in_error());
+  hb_always_assert(!serializer.in_error());
 
   hb_blob_t* blob = serializer.copy_blob();
   unsigned size = hb_blob_get_length(blob);
@@ -101,9 +101,9 @@ static bool check_coverage_size(graph::class_def_size_estimator_t& estimator,
   return true;
 }
 
-static bool check_add_class_def_size(graph::class_def_size_estimator_t& estimator,
-                                     const gid_and_class_list_t& map,
-                                     unsigned klass, hb_vector_t<unsigned> klasses)
+static HB_UNUSED bool check_add_class_def_size(graph::class_def_size_estimator_t& estimator,
+					       const gid_and_class_list_t& map,
+					       unsigned klass, hb_vector_t<unsigned> klasses)
 {
   unsigned result = estimator.add_class_def_size(klass);
   unsigned expected = actual_class_def_size(map, klasses);
@@ -115,9 +115,9 @@ static bool check_add_class_def_size(graph::class_def_size_estimator_t& estimato
   return check_coverage_size(estimator, map, klasses);
 }
 
-static bool check_add_class_def_size (const gid_and_class_list_t& list, unsigned klass)
+static HB_UNUSED bool check_add_class_def_size (const gid_and_class_list_t& list, unsigned klass)
 {
-  graph::class_def_size_estimator_t estimator (list.iter ());
+  graph::class_def_size_estimator_t estimator = *graph::class_def_size_estimator_t::create (list.iter ());
 
   unsigned result = estimator.add_class_def_size (klass);
   auto filtered_it =
@@ -149,13 +149,13 @@ static void test_class_and_coverage_size_estimates ()
 {
   gid_and_class_list_t empty = {
   };
-  assert (check_add_class_def_size (empty, 0));
-  assert (check_add_class_def_size (empty, 1));
+  hb_always_assert (check_add_class_def_size (empty, 0));
+  hb_always_assert (check_add_class_def_size (empty, 1));
 
   gid_and_class_list_t class_zero = {
     {5, 0},
   };
-  assert (check_add_class_def_size (class_zero, 0));
+  hb_always_assert (check_add_class_def_size (class_zero, 0));
 
   gid_and_class_list_t consecutive = {
     {4, 0},
@@ -169,9 +169,9 @@ static void test_class_and_coverage_size_estimates ()
     {10, 2},
     {11, 2},
   };
-  assert (check_add_class_def_size (consecutive, 0));
-  assert (check_add_class_def_size (consecutive, 1));
-  assert (check_add_class_def_size (consecutive, 2));
+  hb_always_assert (check_add_class_def_size (consecutive, 0));
+  hb_always_assert (check_add_class_def_size (consecutive, 1));
+  hb_always_assert (check_add_class_def_size (consecutive, 2));
 
   gid_and_class_list_t non_consecutive = {
     {4, 0},
@@ -185,9 +185,9 @@ static void test_class_and_coverage_size_estimates ()
     {11, 2},
     {13, 2},
   };
-  assert (check_add_class_def_size (non_consecutive, 0));
-  assert (check_add_class_def_size (non_consecutive, 1));
-  assert (check_add_class_def_size (non_consecutive, 2));
+  hb_always_assert (check_add_class_def_size (non_consecutive, 0));
+  hb_always_assert (check_add_class_def_size (non_consecutive, 1));
+  hb_always_assert (check_add_class_def_size (non_consecutive, 2));
 
   gid_and_class_list_t multiple_ranges = {
     {4, 0},
@@ -202,9 +202,49 @@ static void test_class_and_coverage_size_estimates ()
     {12, 1},
     {13, 1},
   };
-  assert (check_add_class_def_size (multiple_ranges, 0));
-  assert (check_add_class_def_size (multiple_ranges, 1));
+  hb_always_assert (check_add_class_def_size (multiple_ranges, 0));
+  hb_always_assert (check_add_class_def_size (multiple_ranges, 1));
+
+#ifndef HB_NO_BEYOND_64K
+  gid_and_class_list_t high_consecutive = {
+    {0x10000, 1},
+    {0x10001, 1},
+  };
+  hb_always_assert (check_add_class_def_size (high_consecutive, 1));
+
+  gid_and_class_list_t high_non_consecutive = {
+    {0x10000, 1},
+    {0x10002, 1},
+  };
+  hb_always_assert (check_add_class_def_size (high_non_consecutive, 1));
+
+  gid_and_class_list_t high_class = {
+    {5, 0x10000},
+  };
+  hb_always_assert (check_add_class_def_size (high_class, 0x10000));
+#endif
 }
+
+#ifndef HB_NO_BEYOND_64K
+static void test_class_def_format_3_values ()
+{
+  alignas (OT::ClassDef) static const unsigned char data[] = {
+    0x00, 0x03,             // format
+    0x00, 0x00, 0x05,       // startGlyphID
+    0x00, 0x00, 0x02,       // glyphCount
+    0x00, 0x00, 0x01,       // classValue[0]
+    0x01, 0x00, 0x00,       // classValue[1]
+  };
+  const OT::ClassDef &class_def = *reinterpret_cast<const OT::ClassDef *> (data);
+
+  hb_always_assert (class_def.get_class (5) == 1);
+  hb_always_assert (class_def.get_class (6) == 0x10000u);
+
+  hb_set_t glyphs;
+  glyphs.add (6);
+  hb_always_assert (class_def.intersects_class (&glyphs, 0x10000u));
+}
+#endif
 
 static void test_running_class_and_coverage_size_estimates () {
   // #### With consecutive gids: switches formats ###
@@ -228,15 +268,15 @@ static void test_running_class_and_coverage_size_estimates () {
     {12, 3},
   };
 
-  graph::class_def_size_estimator_t estimator1(consecutive_map.iter());
-  assert(check_add_class_def_size(estimator1, consecutive_map, 1, {1}));
-  assert(check_add_class_def_size(estimator1, consecutive_map, 2, {1, 2}));
-  assert(check_add_class_def_size(estimator1, consecutive_map, 2, {1, 2})); // check that adding the same class again works
-  assert(check_add_class_def_size(estimator1, consecutive_map, 3, {1, 2, 3}));
+  graph::class_def_size_estimator_t estimator1 = *graph::class_def_size_estimator_t::create (consecutive_map.iter());
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 1, {1}));
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 2, {1, 2}));
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 2, {1, 2})); // check that adding the same class again works
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 3, {1, 2, 3}));
 
   estimator1.reset();
-  assert(check_add_class_def_size(estimator1, consecutive_map, 2, {2}));
-  assert(check_add_class_def_size(estimator1, consecutive_map, 3, {2, 3}));
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 2, {2}));
+  hb_always_assert(check_add_class_def_size(estimator1, consecutive_map, 3, {2, 3}));
 
   // #### With non-consecutive gids: always uses format 2 ###
   gid_and_class_list_t non_consecutive_map = {
@@ -260,14 +300,14 @@ static void test_running_class_and_coverage_size_estimates () {
     {15, 3},
   };
 
-  graph::class_def_size_estimator_t estimator2(non_consecutive_map.iter());
-  assert(check_add_class_def_size(estimator2, non_consecutive_map, 1, {1}));
-  assert(check_add_class_def_size(estimator2, non_consecutive_map, 2, {1, 2}));
-  assert(check_add_class_def_size(estimator2, non_consecutive_map, 3, {1, 2, 3}));
+  graph::class_def_size_estimator_t estimator2 = *graph::class_def_size_estimator_t::create (non_consecutive_map.iter());
+  hb_always_assert(check_add_class_def_size(estimator2, non_consecutive_map, 1, {1}));
+  hb_always_assert(check_add_class_def_size(estimator2, non_consecutive_map, 2, {1, 2}));
+  hb_always_assert(check_add_class_def_size(estimator2, non_consecutive_map, 3, {1, 2, 3}));
 
   estimator2.reset();
-  assert(check_add_class_def_size(estimator2, non_consecutive_map, 2, {2}));
-  assert(check_add_class_def_size(estimator2, non_consecutive_map, 3, {2, 3}));
+  hb_always_assert(check_add_class_def_size(estimator2, non_consecutive_map, 2, {2}));
+  hb_always_assert(check_add_class_def_size(estimator2, non_consecutive_map, 3, {2, 3}));
 }
 
 static void test_running_class_size_estimates_with_locally_consecutive_glyphs () {
@@ -277,14 +317,14 @@ static void test_running_class_size_estimates_with_locally_consecutive_glyphs ()
     {7, 3},
   };
 
-  graph::class_def_size_estimator_t estimator(map.iter());
-  assert(check_add_class_def_size(estimator, map, 1, {1}));
-  assert(check_add_class_def_size(estimator, map, 2, {1, 2}));
-  assert(check_add_class_def_size(estimator, map, 3, {1, 2, 3}));
+  graph::class_def_size_estimator_t estimator = *graph::class_def_size_estimator_t::create (map.iter());
+  hb_always_assert(check_add_class_def_size(estimator, map, 1, {1}));
+  hb_always_assert(check_add_class_def_size(estimator, map, 2, {1, 2}));
+  hb_always_assert(check_add_class_def_size(estimator, map, 3, {1, 2, 3}));
 
   estimator.reset();
-  assert(check_add_class_def_size(estimator, map, 2, {2}));
-  assert(check_add_class_def_size(estimator, map, 3, {2, 3}));
+  hb_always_assert(check_add_class_def_size(estimator, map, 2, {2}));
+  hb_always_assert(check_add_class_def_size(estimator, map, 3, {2, 3}));
 }
 
 int
@@ -293,4 +333,7 @@ main (int argc, char **argv)
   test_class_and_coverage_size_estimates ();
   test_running_class_and_coverage_size_estimates ();
   test_running_class_size_estimates_with_locally_consecutive_glyphs ();
+#ifndef HB_NO_BEYOND_64K
+  test_class_def_format_3_values ();
+#endif
 }

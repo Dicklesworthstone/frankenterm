@@ -13,8 +13,20 @@ Local changes retain OpenSSL and zlib native linkage through their Rust sys
 dependencies, remove duplicate library-mode declarations from the build script,
 and enable static zlib with `vendored`. The non-vendored source-build fallback
 retains its system zlib link. Both Cargo manifests record the feature change.
-Bundled C sources are unchanged. The workspace uses a relative Cargo patch;
-the imported source travels in the committed DSR source archive.
+The workspace uses a relative Cargo patch; the imported source travels in the
+committed DSR source archive.
+
+Bundled C sources (libssh 0.11.4) carry one security backport: upstream libssh
+commit `44b186fa17aff497dae420c59c003222e438103c` ("channels: Fail when
+receiving max packet size 0", CVE-2026-59843), applied by hand to
+`vendored/src/channels.c` and `vendored/src/messages.c` because the context
+differs slightly from upstream; the diff is the same 22 insertions and 4
+deletions. A peer that advertises a maximum packet size of 0 in
+SSH2_MSG_CHANNEL_OPEN or SSH2_MSG_CHANNEL_OPEN_CONFIRMATION is now refused
+instead of leaving channel writes in an endless loop. libssh 0.11.5 and 0.12.2
+ship the same fix. `build.rs` declares `rerun-if-changed` for itself and
+`vendored/`; before, its `rerun-if-env-changed` lines alone stopped Cargo from
+recompiling the C sources after they were edited.
 
 FrankenTerm release and validation receipts come from DSR and RCH, respectively.
 Upstream workflow badges are not qualification evidence for this import.

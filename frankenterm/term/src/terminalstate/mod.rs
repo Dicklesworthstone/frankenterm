@@ -27,14 +27,21 @@ use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
 
+mod bounded_output;
 #[cfg(feature = "use_serde")]
 pub mod checkpoint;
+use bounded_output::BoundedOutputWriter;
+pub use bounded_output::{
+    BoundedOutputDrain, BoundedOutputLimits, BoundedOutputSettlement, BoundedOutputStatus,
+    BoundedReplyCopy, BoundedReplyDisposition, BoundedWriteResult,
+};
 mod image;
 mod iterm;
 mod keyboard;
 mod kitty;
 mod mouse;
 pub(crate) mod performer;
+mod print_segments;
 mod sixel;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
@@ -56,6 +63,20 @@ pub(crate) enum CharSet {
     Ascii,
     Uk,
     DecLineDrawing,
+}
+
+/// The character protection mode the last DECSCA or SPA selected: xterm's
+/// `protected_mode` (charproc.c), which decides the erases that keep
+/// protected cells (util.c `do_erase_char`, `do_erase_line`,
+/// `do_erase_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedMode {
+    /// None since the last reset: every erase clears protected cells.
+    Off,
+    /// SPA (ESC V): ED, EL and ECH keep protected cells too.
+    Iso,
+    /// DECSCA: only DECSED and DECSEL keep them.
+    Dec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +371,12 @@ impl ScreenOrAlt {
         self.alt_screen.finish_recovery_without_scrollback();
         Ok(())
     }
+
+    /// Only the primary screen holds cold scrollback.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn supersede_recovered_cold_successors(&mut self) {
+        self.screen.supersede_recovered_cold_successors();
+    }
 }
 
 /// Configuration that per-character and per-row ingest paths read, captured
@@ -359,6 +386,7 @@ impl ScreenOrAlt {
 #[derive(Clone, Debug)]
 struct BatchConfig {
     max_accumulating_title_len: usize,
+    maximum_cell_grapheme_bytes: usize,
     normalize_output_to_unicode_nfc: bool,
     bidi_mode: BidiMode,
 }
@@ -367,6 +395,7 @@ impl BatchConfig {
     fn capture(config: &dyn TerminalConfiguration) -> Self {
         Self {
             max_accumulating_title_len: config.max_accumulating_title_len(),
+            maximum_cell_grapheme_bytes: config.maximum_cell_grapheme_bytes(),
             normalize_output_to_unicode_nfc: config.normalize_output_to_unicode_nfc(),
             bidi_mode: config.bidi_mode(),
         }
@@ -382,6 +411,8 @@ pub struct TerminalState {
     /// The current set of attributes in effect for the next
     /// attempt to print to the display
     pen: CellAttributes,
+    /// Which erases keep the cells the pen's protection marked.
+    protected_mode: ProtectedMode,
     /// The current cursor position, relative to the top left
     /// of the screen.  0-based index.
     cursor: CursorPosition,
@@ -512,6 +543,8 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     seqno: SequenceNo,
+    cell_grapheme_limit_exceeded: bool,
+    native_execution_limit_exceeded: bool,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -528,7 +561,14 @@ pub struct TerminalState {
     /// so `print` skips the cluster-continuation scan entirely.
     zwj_tail_cell_possible: bool,
 
+    /// The print path's character classes and widths (ft-yccm0.3.2.6), a
+    /// cache that follows `unicode_version`.
+    print_char_table: print_segments::PrintCharTable,
+
     enable_conpty_quirks: bool,
+    /// Whether the parser's line-feed floods take the batched path
+    /// (ft-wd6cy); `FT_LINE_FEED_FLOOD=0` keeps every line on the per-line one.
+    line_flood: bool,
     /// On Windows, the ConPTY layer emits an OSC sequence to
     /// set the title shortly after it starts up.
     /// We don't want that, so we use this flag to remember
@@ -620,6 +660,11 @@ enum ThreadedWriter {
         /// the child whole or not at all.
         reply_unit_dropped: Option<bool>,
     },
+    /// Mobile/embedder path: a fixed ring drained by the caller. No thread,
+    /// channel, callback retention or implicit downstream writer exists.
+    /// Boxed so the desktop `Live` writer does not carry the ring's ~288-byte
+    /// inline state in every terminal (clippy::large_enum_variant).
+    Bounded(Box<BoundedOutputWriter>),
     #[cfg(feature = "use_serde")]
     Inert,
     Failed,
@@ -643,11 +688,13 @@ pub(crate) struct PreparedRecoveryConfiguration {
 /// input; they differ only under backpressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteClass {
-    /// Keystrokes, pastes, mouse and focus reports. Never dropped.
+    /// Keystrokes, pastes, mouse and focus reports. Admitted bytes are never
+    /// silently dropped; bounded output can refuse a whole unit at admission.
     UserInput,
     /// Answers to the child's own queries (DA, DSR/CPR, DECRQSS, DECRQM,
     /// XTVERSION, OSC color queries, kitty graphics acknowledgements). Dropped
-    /// whole, and counted, once [`REPLY_BACKLOG_LIMIT`] is reached.
+    /// whole, and counted, once the writer's reply budget is reached (the
+    /// desktop threaded writer uses [`REPLY_BACKLOG_LIMIT`]).
     Reply,
 }
 
@@ -847,6 +894,7 @@ impl ThreadedWriter {
     fn class(&self) -> WriteClass {
         match self {
             Self::Live { class, .. } => *class,
+            Self::Bounded(writer) => writer.class(),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriteClass::Reply,
             Self::Failed => WriteClass::Reply,
@@ -856,6 +904,10 @@ impl ThreadedWriter {
     /// Changes the class of subsequent writes. The caller flushes first, so
     /// no buffered byte changes class.
     fn set_class(&mut self, new_class: WriteClass) {
+        if let Self::Bounded(writer) = self {
+            writer.set_class(new_class);
+            return;
+        }
         if let Self::Live {
             class,
             reply_unit_dropped,
@@ -870,6 +922,7 @@ impl ThreadedWriter {
     fn backlog(&self) -> WriterBacklog {
         match self {
             Self::Live { counters, .. } => counters.snapshot(),
+            Self::Bounded(writer) => writer.backlog(),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriterBacklog::default(),
             Self::Failed => WriterBacklog::default(),
@@ -885,6 +938,9 @@ impl ThreadedWriter {
                     Err(_) => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
                 }
             }
+            // A bounded sink reports acceptance, not a child flush. Never
+            // manufacture the stronger desktop WriterBarrier evidence.
+            Self::Bounded(_) => WriterBarrierState::Unavailable(std::io::ErrorKind::Unsupported),
             #[cfg(feature = "use_serde")]
             Self::Inert => WriterBarrierState::Complete,
             Self::Failed => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
@@ -896,6 +952,7 @@ impl ThreadedWriter {
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
+            Self::Bounded(writer) => writer.write(buf),
             Self::Live {
                 sender,
                 counters,
@@ -952,6 +1009,7 @@ impl std::io::Write for ThreadedWriter {
     /// thread; use [`TerminalState::writer_barrier`] to observe completion.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
+            Self::Bounded(writer) => writer.flush(),
             Self::Live {
                 sender,
                 reply_unit_dropped,
@@ -994,6 +1052,24 @@ impl TerminalState {
         )
     }
 
+    pub(crate) fn new_bounded_output(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        limits: BoundedOutputLimits,
+    ) -> std::io::Result<Self> {
+        let writer = BoundedOutputWriter::new(limits)?;
+        Ok(Self::new_with_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            ThreadedWriter::Bounded(Box::new(writer)),
+            false,
+        ))
+    }
+
     fn new_with_writer(
         size: TerminalSize,
         config: Arc<dyn TerminalConfiguration>,
@@ -1027,7 +1103,14 @@ impl TerminalState {
         seqno: SequenceNo,
         screen: ScreenOrAlt,
     ) -> TerminalState {
-        let writer = BufWriter::new(writer);
+        // The bounded writer already stages complete units within its ring.
+        // Even a small hidden BufWriter would admit bytes before reservation
+        // and could retain a rejected unit until a later unrelated operation.
+        let writer = if matches!(&writer, ThreadedWriter::Bounded(_)) {
+            BufWriter::with_capacity(0, writer)
+        } else {
+            BufWriter::new(writer)
+        };
 
         let color_map = default_color_map();
 
@@ -1041,6 +1124,7 @@ impl TerminalState {
             batch_config,
             screen,
             pen: CellAttributes::default(),
+            protected_mode: ProtectedMode::Off,
             cursor: CursorPosition::default(),
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
             left_and_right_margins: 0..size.cols,
@@ -1105,11 +1189,15 @@ impl TerminalState {
                 kitty
             },
             seqno,
+            cell_grapheme_limit_exceeded: false,
+            native_execution_limit_exceeded: false,
             unicode_version,
             unicode_version_stack: vec![],
             zwj_tail_cell_possible: false,
+            print_char_table: Default::default(),
             suppress_initial_title_change: false,
             enable_conpty_quirks: false,
+            line_flood: performer::line_flood_default(),
             accumulating_title: None,
             lost_focus_seqno: seqno,
             lost_focus_alerted_seqno: seqno,
@@ -1161,6 +1249,11 @@ impl TerminalState {
             kitty_image_max_transmission_bytes,
             refreshed_unicode_version,
         }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn supersede_recovered_cold_successors(&mut self) {
+        self.screen.supersede_recovered_cold_successors();
     }
 
     #[cfg(feature = "use_serde")]
@@ -1221,6 +1314,20 @@ impl TerminalState {
             self.seqno = seqno;
         }
         evicted
+    }
+
+    /// Applies a smaller scrollback size now: after installing a
+    /// configuration with less history, drops the primary screen's oldest
+    /// rows beyond it (see `Screen::trim_scrollback_to_policy`). Returns the
+    /// rows dropped; the sequence number advances only when rows went.
+    pub fn trim_scrollback_to_config(&mut self) -> usize {
+        self.refresh_batch_config();
+        let seqno = next_sequence_no(self.seqno);
+        let trimmed = self.screen.screen.trim_scrollback_to_policy(seqno);
+        if trimmed > 0 {
+            self.seqno = seqno;
+        }
+        trimmed
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
@@ -1372,8 +1479,10 @@ impl TerminalState {
 
     /// Prefer completed rows before both cursors. An active paragraph may
     /// include the cursor only with an explicit logical-offset mapping and
-    /// exact cursor validation at commit. Saved cursors and pending autowrap
-    /// currently retain the completed-row-only path.
+    /// exact cursor validation at commit. A pending autowrap maps from its
+    /// insertion point just past the row's last cell, as resize maps it
+    /// (ft-3e1yj). Saved cursors currently retain the completed-row-only
+    /// path.
     #[cfg(feature = "use_serde")]
     pub fn capture_cold_seam_reflow(
         &self,
@@ -1381,7 +1490,7 @@ impl TerminalState {
         let completed = self
             .screen
             .capture_cold_seam_reflow_before(self.cold_seam_resident_end())?;
-        if completed.is_some() || self.wrap_next || self.screen.saved_cursor.is_some() {
+        if completed.is_some() || self.screen.saved_cursor.is_some() {
             return Ok(completed);
         }
         let physical_row = self.screen.phys_row(self.cursor.y);
@@ -1391,6 +1500,12 @@ impl TerminalState {
         if let Some(seam) = &mut active {
             seam.cursor = Some(crate::screen::ColdSeamCursor {
                 before: self.cursor,
+                pending_wrap: self.wrap_next,
+                insertion_x: if self.wrap_next {
+                    self.left_and_right_margins.end
+                } else {
+                    self.cursor.x
+                },
                 physical_row,
                 after: None,
             });
@@ -1408,7 +1523,7 @@ impl TerminalState {
     ) -> anyhow::Result<bool> {
         let mut resident_end = self.cold_seam_resident_end();
         let mapped_cursor = if let Some(cursor) = &prepared.cursor {
-            if self.wrap_next
+            if self.wrap_next != cursor.pending_wrap
                 || self.screen.saved_cursor.is_some()
                 || self.cursor.x != cursor.before.x
                 || self.cursor.y != cursor.before.y
@@ -1529,8 +1644,13 @@ impl TerminalState {
         self.focus_tracking
     }
 
-    /// Advise the terminal about a change in its focus state
+    /// Advise the terminal about a change in its focus state. Bounded embedders
+    /// should use [`Self::try_bounded_focus_change`] to observe refused cleanup.
     pub fn focus_changed(&mut self, focused: bool) {
+        if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            self.try_bounded_focus_change(focused).ok();
+            return;
+        }
         if focused == self.focused {
             return;
         }
@@ -1561,6 +1681,52 @@ impl TerminalState {
         }
     }
 
+    /// Admit all button-release cleanup and the focus report as one bounded
+    /// event. A failure preserves focus and logical mouse state; the embedder
+    /// can explicitly retry on this source or close it. No cleanup prefix was
+    /// admitted on an error. Local navigation itself need not wait for a sink.
+    pub fn try_bounded_focus_change(&mut self, focused: bool) -> Result<(), Error> {
+        if !matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into());
+        }
+        if focused == self.focused {
+            return Ok(());
+        }
+        let buttons = self.current_mouse_buttons.clone();
+        let last_move = self.last_mouse_move;
+        let result = self.with_user_input(|term| -> Result<(), Error> {
+            if !focused {
+                for button in buttons.iter().copied() {
+                    term.mouse_event(MouseEvent {
+                        kind: MouseEventKind::Release,
+                        button,
+                        modifiers: KeyModifiers::NONE,
+                        x: 0,
+                        y: 0,
+                        x_pixel_offset: 0,
+                        y_pixel_offset: 0,
+                    })?;
+                }
+            }
+            if term.focus_tracking {
+                let report = if focused { "\x1b[I" } else { "\x1b[O" };
+                term.write_user_input(report.as_bytes())?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.current_mouse_buttons = buttons;
+            self.last_mouse_move = last_move;
+            return result;
+        }
+        self.increment_seqno();
+        self.focused = focused;
+        if !focused {
+            self.lost_focus_seqno = self.seqno;
+        }
+        Ok(())
+    }
+
     /// Returns true if there is new output since the terminal
     /// lost focus
     pub fn has_unseen_output(&self) -> bool {
@@ -1589,11 +1755,23 @@ impl TerminalState {
     /// De-fang the text by removing any embedded bracketed paste
     /// sequence that may be present.
     ///
-    /// A paste larger than [`MAX_PASTE_BYTES`] is refused whole with
+    /// With the desktop writer, a paste larger than [`MAX_PASTE_BYTES`] is refused whole with
     /// [`PasteTooLarge`]; nothing is sent. Otherwise the paste is queued in
     /// full behind earlier input and never dropped, however slowly the child
-    /// reads it.
+    /// reads it. Caller-drained bounded output uses its configured smaller
+    /// limit and refuses capacity failure or non-text controls before sending
+    /// any byte, including the bracketed-paste opening delimiter.
     pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
+        if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+            let bracketed = self.bracketed_paste;
+            let canon = self.config.canonicalize_pasted_newlines();
+            return self.with_user_input(|term| {
+                let ThreadedWriter::Bounded(writer) = term.writer.get_mut() else {
+                    unreachable!("bounded writer kind cannot change during paste")
+                };
+                writer.paste(text, bracketed, canon).map_err(Error::from)
+            });
+        }
         if text.len() > MAX_PASTE_BYTES {
             return Err(PasteTooLarge {
                 len: text.len(),
@@ -1624,27 +1802,51 @@ impl TerminalState {
         Ok(())
     }
 
-    /// Runs `f` with every write classed as user input (keys, pastes, mouse
-    /// and focus reports), which backpressure never drops. Bytes buffered
-    /// before the call go out first under their own class; nesting is safe.
-    pub(crate) fn with_user_input<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// Runs `f` with every write classed as user input. The bounded writer
+    /// reserves one complete outer input transaction even when nested key or
+    /// mouse encoders flush repeatedly. Rejection rolls back the whole event.
+    /// Bytes buffered before the call retain their class; nesting is safe.
+    pub(crate) fn with_user_input<R, E>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<std::io::Error>,
+    {
         let previous = self.writer.get_ref().class();
         if previous != WriteClass::UserInput {
             // Hand buffered replies over as replies before the class changes.
-            // A failure here means the writer is gone, which `f` reports.
-            self.writer.flush().ok();
+            let flush = self.writer.flush();
+            if matches!(self.writer.get_ref(), ThreadedWriter::Bounded(_)) {
+                flush.map_err(E::from)?;
+            }
             self.writer.get_mut().set_class(WriteClass::UserInput);
+            if let ThreadedWriter::Bounded(writer) = self.writer.get_mut() {
+                writer.begin_input_batch();
+            }
         }
         let result = f(self);
         if previous != WriteClass::UserInput {
-            self.writer.flush().ok();
+            let flush = if let ThreadedWriter::Bounded(writer) = self.writer.get_mut() {
+                writer.finish_input_batch(result.is_ok())
+            } else {
+                // Preserve the threaded writer's existing explicit-flush
+                // contract; its input functions report their own I/O errors.
+                self.writer.flush().ok();
+                Ok(())
+            };
             self.writer.get_mut().set_class(previous);
+            if result.is_ok() {
+                flush.map_err(E::from)?;
+            }
         }
         result
     }
 
     /// Queues user input (keys, pastes, composed text) behind everything
-    /// already written. Never blocks and is never dropped under backpressure.
+    /// already written. Never blocks. Caller-drained bounded output returns
+    /// `WouldBlock` when it cannot reserve the complete unit; no prefix is
+    /// admitted and a later call cannot accidentally flush rejected bytes.
     pub fn write_user_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.with_user_input(|term| {
             term.writer.write_all(bytes)?;
@@ -1678,6 +1880,94 @@ impl TerminalState {
     /// The writer queue's current backlog and reply-drop counters.
     pub fn writer_backlog(&self) -> WriterBacklog {
         self.writer.get_ref().backlog()
+    }
+
+    /// Snapshot of the caller-drained egress owner, if this terminal was
+    /// constructed with [`Terminal::new_bounded_output`]. `accepted_through`
+    /// is a local downstream-acceptance watermark, not remote execution proof.
+    pub fn bounded_output_status(&self) -> Option<BoundedOutputStatus> {
+        match self.writer.get_ref() {
+            ThreadedWriter::Bounded(writer) => Some(writer.status()),
+            _ => None,
+        }
+    }
+
+    /// Offer at most `maximum` bytes of the oldest complete output unit.
+    ///
+    /// `sink` MUST return without blocking, retain no borrowed bytes, and copy
+    /// only into pre-reserved bounded storage or use a nonblocking transport.
+    /// The bytes remain reserved until its exact accepted-prefix result. No
+    /// subsequent unit can overtake a partially accepted one. Replies continue
+    /// to be queued independently of keyboard focus, including hidden panes.
+    ///
+    /// Failure (or a sink panic caught by the embedding boundary) permanently
+    /// closes this egress owner. Close the corresponding transport before
+    /// replacing it; never replay the uncertain input on a new connection.
+    pub fn drain_bounded_output<F>(
+        &mut self,
+        maximum: usize,
+        sink: F,
+    ) -> std::io::Result<BoundedOutputDrain>
+    where
+        F: FnOnce(WriteClass, &[u8]) -> BoundedWriteResult,
+    {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => writer.drain(maximum, sink),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    /// Permanently stop this output owner and settle its remaining bytes.
+    /// Idempotent; does not close the embedder's independently owned transport.
+    pub fn close_bounded_output(&mut self) -> std::io::Result<BoundedOutputSettlement> {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => Ok(writer.close()),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    /// Copy the oldest complete parser reply into caller-owned bounded storage.
+    /// No reservation is released. Refuses user input and any reply previously
+    /// partially drained. Do not mix this whole-reply protocol with prefix
+    /// drains: after downstream admission, settle the exact sequence before
+    /// copying another reply, closing, or retrying. A capacity refusal copies
+    /// nothing; an empty queue returns `None`.
+    pub fn copy_bounded_reply(
+        &self,
+        output: &mut [u8],
+    ) -> std::io::Result<Option<BoundedReplyCopy>> {
+        match self.writer.get_ref() {
+            ThreadedWriter::Bounded(writer) => writer.copy_reply(output),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    /// Sticky, content-free evidence that an explicitly configured retained
+    /// grapheme bound refused model data. The embedding must stop presenting
+    /// this model as exact; default desktop configuration has no such limit.
+    pub fn cell_grapheme_limit_exceeded(&self) -> bool {
+        self.cell_grapheme_limit_exceeded
+    }
+
+    /// Sticky evidence that the native text profile refused expanded command
+    /// work. Later parser actions are inert; the embedding must close this
+    /// model rather than display a truncated execution as exact output.
+    pub fn native_execution_limit_exceeded(&self) -> bool {
+        self.native_execution_limit_exceeded
+    }
+
+    /// Release one exact complete reply after the downstream owner accepted it
+    /// or deliberately dropped it whole. A stale/repeated sequence cannot
+    /// release the next reply. This does not assert remote delivery.
+    pub fn settle_bounded_reply(
+        &mut self,
+        sequence: u64,
+        disposition: BoundedReplyDisposition,
+    ) -> std::io::Result<()> {
+        match self.writer.get_mut() {
+            ThreadedWriter::Bounded(writer) => writer.settle_reply(sequence, disposition),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
     }
 
     /// Informs the terminal that the viewport of the window has resized to the
@@ -1774,6 +2064,30 @@ impl TerminalState {
                 &Position::Absolute(adjusted_cursor_main.x as i64),
                 &Position::Absolute(adjusted_cursor_main.y),
             );
+            // Rewrap can leave the cursor just past the last cell of a row the
+            // reflowed line fills: the insertion point after it, whether a
+            // wrap was pending before or the line now fits the row exactly.
+            // It becomes a wrap pending on the row's last grapheme (ft-3e1yj),
+            // never an off-screen column, so the next character continues the
+            // logical line on the row below. Like printing that grapheme, it
+            // leaves the cursor on its first column (a wide one's too), as the
+            // cold seam's mapping places the same insertion point. Past a row
+            // with room left (a cursor parked beyond shorter text), it is only
+            // clamped.
+            if adjusted_cursor_main.x >= size.cols && self.dec_auto_wrap {
+                let last = {
+                    let screen = self.screen();
+                    let line = screen.phys_line(screen.phys_row(self.cursor.y));
+                    (line.len() >= size.cols)
+                        .then(|| line.visible_cells().last().map(|cell| cell.cell_index()))
+                };
+                if let Some(last) = last {
+                    if let Some(column) = last {
+                        self.cursor.x = column;
+                    }
+                    self.wrap_next = true;
+                }
+            }
         }
     }
 
@@ -1801,6 +2115,13 @@ impl TerminalState {
         let seqno = self.seqno;
         // One floor for page-engine rows (ft-yccm0.3.3.4).
         self.screen.touch_all_rows(seqno);
+    }
+
+    /// Whether a wrap is pending at the cursor: the next character goes to
+    /// the start of the next row.
+    #[cfg(test)]
+    pub(crate) fn wrap_pending(&self) -> bool {
+        self.wrap_next
     }
 
     /// Returns the 0-based cursor position relative to the top left of
@@ -1867,15 +2188,19 @@ impl TerminalState {
                 } else {
                     0
                 })
-                .min(if self.dec_origin_mode {
-                    usize_to_i64_saturating(self.left_and_right_margins.end).saturating_sub(1)
-                } else {
-                    // We allow 1 extra for the cursor x position
-                    // to account for some resize/rewrap scenarios
-                    // where we don't want to forget that the
-                    // cursor belongs to a wrapped line.
-                    usize_to_i64_saturating(self.screen().physical_cols)
-                })
+                .min(
+                    if self.dec_origin_mode {
+                        usize_to_i64_saturating(self.left_and_right_margins.end)
+                    } else {
+                        // The last column, as VT510 and xterm clamp CUP and
+                        // CHA (ft-3e1yj). A cursor that resize/rewrap leaves
+                        // just past a wrapped line's end keeps that line as a
+                        // pending wrap instead (`resize_with_prepared_reflow`),
+                        // never as an off-screen column.
+                        usize_to_i64_saturating(self.screen().physical_cols)
+                    }
+                    .saturating_sub(1),
+                )
                 .max(0),
         };
 
@@ -1915,6 +2240,20 @@ impl TerminalState {
 
     fn scroll_up(&mut self, num_rows: usize) {
         let seqno = self.seqno;
+        // A line feed at the bottom of the whole screen under a pen whose
+        // blank is the default: the page engine's own path, without the
+        // blank or the region arguments built (ft-yccm0.3.2.6).
+        if num_rows == 1 && self.pen.sgr_only_is_blank() {
+            let bidi_mode = self.get_bidi_mode();
+            if self.screen.scroll_up_line(
+                &self.top_and_bottom_margins,
+                &self.left_and_right_margins,
+                seqno,
+                &bidi_mode,
+            ) {
+                return;
+            }
+        }
         let blank_attr = self.pen.clone_sgr_only();
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();
@@ -1968,7 +2307,26 @@ impl TerminalState {
         } else {
             next_row_saturating(y)
         };
-        self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Absolute(y as i64));
+        // x and y are screen coordinates already: they take only the clamp
+        // a cursor move applies. As `Position::Absolute` they were offset by
+        // the margins' starts again under origin mode, which moved a line
+        // feed below a top margin past the next row.
+        let (x_end, y_end) = if self.dec_origin_mode {
+            (
+                self.left_and_right_margins.end,
+                self.top_and_bottom_margins.end,
+            )
+        } else {
+            let screen = self.screen();
+            (
+                screen.physical_cols,
+                usize_to_i64_saturating(screen.physical_rows),
+            )
+        };
+        self.set_cursor_position_absolute(
+            x.min(x_end.saturating_sub(1)),
+            y.min(y_end.saturating_sub(1)).max(0),
+        );
     }
 
     /// Moves the cursor down one line in the same column.
@@ -2018,6 +2376,20 @@ impl TerminalState {
     }
 
     fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+        let link = link.filter(|link| {
+            if self.config.feature_profile() != crate::config::TerminalFeatureProfile::NativeText {
+                return true;
+            }
+            // OSC parsing has a separate retained-string cap. Bound metadata
+            // retained by every cell as well, including arbitrary OSC 8
+            // parameter names/values rather than just the URI.
+            link.params()
+                .iter()
+                .try_fold(link.uri().len(), |total, (key, value)| {
+                    total.checked_add(key.len())?.checked_add(value.len())
+                })
+                .is_some_and(|total| total <= 512)
+        });
         self.pen.set_hyperlink(match link {
             Some(hyperlink) => Some(Arc::new(hyperlink)),
             None => None,
@@ -2039,7 +2411,14 @@ impl TerminalState {
                     res.push_str(&encoded_name);
                     res.push('=');
 
-                    let encoded_val = hex::encode_upper(&self.term_program);
+                    let name = if self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
+                    {
+                        "xterm-256color"
+                    } else {
+                        &self.term_program
+                    };
+                    let encoded_val = hex::encode_upper(name);
                     res.push_str(&encoded_val);
                 }
 
@@ -2060,7 +2439,10 @@ impl TerminalState {
                 }
 
                 _ => {
-                    if let Some(value) = DB.raw(name) {
+                    let unavailable = self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
+                        && matches!(name.as_str(), "Ms" | "set_selection");
+                    if let Some(value) = DB.raw(name).filter(|_| !unavailable) {
                         res.push_str("1+r");
                         res.push_str(&encoded_name);
                         res.push('=');
@@ -2099,6 +2481,8 @@ impl TerminalState {
             Device::SoftReset => {
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
+                // xterm's ReallyReset (charproc.c), "Reset DECSCA".
+                self.protected_mode = ProtectedMode::Off;
                 self.insert = false;
                 self.dec_origin_mode = false;
                 // Note that xterm deviates from the documented DECSTR
@@ -2126,10 +2510,16 @@ impl TerminalState {
             }
             Device::RequestPrimaryDeviceAttributes => {
                 let mut ident = "\x1b[?65".to_string(); // Vt500
-                ident.push_str(";4"); // Sixel graphics
-                ident.push_str(";18"); // windowing extensions
+                let native = self.config.feature_profile()
+                    == crate::config::TerminalFeatureProfile::NativeText;
+                if !native {
+                    ident.push_str(";4"); // Sixel graphics
+                    ident.push_str(";18"); // windowing extensions
+                }
                 ident.push_str(";22"); // ANSI color, vt525
-                ident.push_str(";52"); // Clipboard access
+                if !native {
+                    ident.push_str(";52"); // Clipboard access
+                }
                 ident.push('c');
 
                 self.writer.write(ident.as_bytes()).ok();
@@ -2176,7 +2566,10 @@ impl TerminalState {
                 self.writer.flush().ok();
             }
             Device::XtSmGraphics(g) => {
-                let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_)) {
+                let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_))
+                    || self.config.feature_profile()
+                        == crate::config::TerminalFeatureProfile::NativeText
+                {
                     XtSmGraphics {
                         item: g.item,
                         action_or_status: XtSmGraphicsStatus::InvalidItem.to_i64(),
@@ -3035,18 +3428,102 @@ impl TerminalState {
     }
 
     fn erase_in_display(&mut self, erase: EraseInDisplay) {
+        self.erase_in_display_with(erase, false);
+    }
+
+    /// Whether an erase keeps protected cells. xterm's `do_erase_char`,
+    /// `do_erase_line` and `do_erase_display` (util.c) honor protection in
+    /// SPA's mode, and in DECSCA's only for DECSED and DECSEL (`selective`).
+    fn erase_skips_protected(&self, selective: bool) -> bool {
+        match self.protected_mode {
+            ProtectedMode::Off => false,
+            ProtectedMode::Iso => true,
+            ProtectedMode::Dec => selective,
+        }
+    }
+
+    /// The parts of columns `cols` of row `y` that hold no protected cell,
+    /// and whether any protected cell lies within `cols`.
+    fn unprotected_runs(
+        &self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+    ) -> (Vec<Range<usize>>, bool) {
+        let screen = self.screen();
+        let line = screen.phys_line(screen.phys_row(y));
+        let mut runs = Vec::new();
+        let mut start = cols.start;
+        let mut kept = false;
+        for cell in line.visible_cells() {
+            let x = cell.cell_index();
+            if x >= cols.end {
+                break;
+            }
+            let end = x.saturating_add(cell.width().max(1));
+            if end <= cols.start || !cell.attrs().protected() {
+                continue;
+            }
+            kept = true;
+            if x > start {
+                runs.push(start..x);
+            }
+            start = start.max(end);
+        }
+        if start < cols.end {
+            runs.push(start..cols.end);
+        }
+        (runs, kept)
+    }
+
+    /// Erases the unprotected cells in columns `cols` of row `y`, as xterm's
+    /// `ClearInLine2` (util.c) does while protection is honored. Returns
+    /// whether a protected cell was kept.
+    fn clear_unprotected(
+        &mut self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+        pen: &CellAttributes,
+        seqno: SequenceNo,
+        bidi_mode: BidiMode,
+    ) -> bool {
+        let (runs, kept) = self.unprotected_runs(y, cols);
+        let screen = self.screen_mut();
+        for run in runs {
+            screen.clear_line(y, run, pen, seqno, bidi_mode);
+        }
+        kept
+    }
+
+    /// ED, or with `selective` DECSED (`CSI ? Ps J`). When protected cells
+    /// are kept, the rows keep their line size too (xterm clears them with
+    /// `ClearInLine`, not `ClearBufRows`), and an erase of the whole screen
+    /// that keeps none turns protection off, as `do_erase_display` does
+    /// (util.c, case 2, which ED 0 from the home position and ED 1 from the
+    /// last cell also take).
+    fn erase_in_display_with(&mut self, erase: EraseInDisplay, selective: bool) {
         let seqno = self.seqno;
         let cy = self.cursor.y;
         let pen = self.pen.clone_sgr_only();
         let rows = self.screen().physical_rows as VisibleRowIndex;
-        let col_range = 0..self.screen().physical_cols;
+        let cols = self.screen().physical_cols;
+        let col_range = 0..cols;
+        let skip_protected = self.erase_skips_protected(selective);
+        let whole_screen = match erase {
+            EraseInDisplay::EraseDisplay => true,
+            EraseInDisplay::EraseToEndOfDisplay => cy == 0 && self.cursor.x == 0,
+            EraseInDisplay::EraseToStartOfDisplay => {
+                cy == rows - 1 && self.cursor.x.saturating_add(1) >= cols
+            }
+            EraseInDisplay::EraseScrollback => false,
+        };
+        let mut kept = false;
         let row_range = match erase {
             EraseInDisplay::EraseToEndOfDisplay => {
-                self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine));
+                kept |= self.erase_in_line_with(EraseInLine::EraseToEndOfLine, selective);
                 cy.saturating_add(1)..rows
             }
             EraseInDisplay::EraseToStartOfDisplay => {
-                self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine));
+                kept |= self.erase_in_line_with(EraseInLine::EraseToStartOfLine, selective);
                 0..cy
             }
             EraseInDisplay::EraseDisplay => 0..rows,
@@ -3057,6 +3534,17 @@ impl TerminalState {
                 return;
             }
         };
+
+        if skip_protected {
+            let bidi_mode = self.get_bidi_mode();
+            for y in row_range {
+                kept |= self.clear_unprotected(y, col_range.clone(), &pen, seqno, bidi_mode);
+            }
+            if whole_screen && !kept {
+                self.protected_mode = ProtectedMode::Off;
+            }
+            return;
+        }
 
         {
             let bidi_mode = self.get_bidi_mode();
@@ -3078,6 +3566,82 @@ impl TerminalState {
             mode.hint = *hint;
         }
         mode
+    }
+
+    /// EL, or with `selective` DECSEL (`CSI ? Ps K`). Returns whether a
+    /// protected cell was kept.
+    fn erase_in_line_with(&mut self, erase: EraseInLine, selective: bool) -> bool {
+        let seqno = self.seqno;
+        let cx = self.cursor.x;
+        let cy = self.cursor.y;
+        let pen = self.pen.clone_sgr_only();
+        let cols = self.screen().physical_cols;
+        let bidi_mode = self.get_bidi_mode();
+        let range = match erase {
+            // If wrap_next is true, then cx is effectively 1 column to the right.
+            // It feels wrong to handle this here, but in trying to centralize
+            // the logic for updating the cursor position, it causes regressions
+            // in the test suite.
+            // So this is here for now until a better solution is found.
+            // <https://github.com/wezterm/wezterm/issues/3548>
+            EraseInLine::EraseToEndOfLine => {
+                // Bind the start of the range to a variable: without
+                // the binding (or extra parens), the parser treats
+                // the `if` block as a statement and then the trailing
+                // `..cols` becomes a RangeTo, which then doesn't unify
+                // with the other match arms that produce Range<usize>.
+                let start = if self.wrap_next {
+                    next_col_saturating(cx)
+                } else {
+                    cx
+                };
+                start..cols
+            }
+            EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
+            EraseInLine::EraseLine => 0..cols,
+        };
+
+        if self.erase_skips_protected(selective) {
+            return self.clear_unprotected(cy, range, &pen, seqno, bidi_mode);
+        }
+        self.screen_mut()
+            .clear_line(cy, range, &pen, seqno, bidi_mode);
+        false
+    }
+
+    /// SL (`CSI Ps SP @`) and SR (`CSI Ps SP A`), as xterm's `xtermScrollLR`
+    /// and `xtermColScroll` (util.c) apply them: with the cursor inside the
+    /// margins, every row within the top and bottom margins loses (SL) or
+    /// gains (SR) `n` cells at the left margin (`ScrnDeleteChar`,
+    /// `ScrnInsertChar`). The cells that appear take the current colours, as
+    /// xterm's `ClearCells` (screen.c) gives them; FrankenTerm's ICH still
+    /// inserts default blanks. The cursor stays where it is.
+    fn scroll_left_right(&mut self, n: u32, left: bool) {
+        if !self.top_and_bottom_margins.contains(&self.cursor.y)
+            || !self.left_and_right_margins.contains(&self.cursor.x)
+        {
+            return;
+        }
+        let seqno = self.seqno;
+        let left_margin = self.left_and_right_margins.start;
+        let right_margin = self.left_and_right_margins.end;
+        let count = usize::try_from(n)
+            .unwrap_or(usize::MAX)
+            .min(right_margin - left_margin);
+        let rows = self.top_and_bottom_margins.clone();
+        let blank_attr = self.pen.clone_sgr_only();
+        let blank = Cell::blank_with_attrs(blank_attr.clone());
+        let screen = self.screen_mut();
+        for y in rows {
+            for _ in 0..count {
+                if left {
+                    screen.erase_cell(left_margin, y, right_margin, seqno, blank_attr.clone());
+                } else {
+                    screen.insert_cell(left_margin, y, right_margin, seqno);
+                    screen.set_cell(left_margin, y, &blank, seqno);
+                }
+            }
+        }
     }
 
     fn perform_csi_edit(&mut self, edit: Edit) {
@@ -3120,8 +3684,18 @@ impl TerminalState {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
                 let limit = add_u32_to_usize_saturating(x, n).min(self.screen().physical_cols);
-                {
-                    let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
+                let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
+                if self.erase_skips_protected(false) {
+                    // SPA's protected cells survive ECH (util.c
+                    // `do_erase_char`, `ClearInLine2`).
+                    let (runs, _) = self.unprotected_runs(y, x..limit);
+                    let screen = self.screen_mut();
+                    for run in runs {
+                        for x in run {
+                            screen.set_cell(x, y, &blank, seqno);
+                        }
+                    }
+                } else {
                     let screen = self.screen_mut();
                     for x in x..limit as usize {
                         screen.set_cell(x, y, &blank, seqno);
@@ -3130,37 +3704,7 @@ impl TerminalState {
             }
 
             Edit::EraseInLine(erase) => {
-                let cx = self.cursor.x;
-                let cy = self.cursor.y;
-                let pen = self.pen.clone_sgr_only();
-                let cols = self.screen().physical_cols;
-                let bidi_mode = self.get_bidi_mode();
-                let range = match erase {
-                    // If wrap_next is true, then cx is effectively 1 column to the right.
-                    // It feels wrong to handle this here, but in trying to centralize
-                    // the logic for updating the cursor position, it causes regressions
-                    // in the test suite.
-                    // So this is here for now until a better solution is found.
-                    // <https://github.com/wezterm/wezterm/issues/3548>
-                    EraseInLine::EraseToEndOfLine => {
-                        // Bind the start of the range to a variable: without
-                        // the binding (or extra parens), the parser treats
-                        // the `if` block as a statement and then the trailing
-                        // `..cols` becomes a RangeTo, which then doesn't unify
-                        // with the other match arms that produce Range<usize>.
-                        let start = if self.wrap_next {
-                            next_col_saturating(cx)
-                        } else {
-                            cx
-                        };
-                        start..cols
-                    }
-                    EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
-                    EraseInLine::EraseLine => 0..cols,
-                };
-
-                self.screen_mut()
-                    .clear_line(cy, range, &pen, seqno, bidi_mode);
+                self.erase_in_line_with(erase, false);
             }
             Edit::InsertCharacter(n) => {
                 // https://vt100.net/docs/vt510-rm/ICH.html
@@ -3175,8 +3719,12 @@ impl TerminalState {
                     && self.left_and_right_margins.contains(&x)
                 {
                     let right_margin = self.left_and_right_margins.end;
+                    // Once every cell through the margin is blank, further
+                    // insertions have no effect. A remote u32 count must not
+                    // turn that fixed geometry into billions of iterations.
+                    let count = (n as usize).min(right_margin - x);
                     let screen = self.screen_mut();
-                    for _ in 0..n as usize {
+                    for _ in 0..count {
                         screen.insert_cell(x, y, right_margin, seqno);
                     }
                 }
@@ -3202,6 +3750,18 @@ impl TerminalState {
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
             Edit::ScrollUp(n) => self.scroll_up(n as usize),
             Edit::EraseInDisplay(erase) => self.erase_in_display(erase),
+            Edit::SelectiveEraseInDisplay(erase) => self.erase_in_display_with(erase, true),
+            Edit::SelectiveEraseInLine(erase) => {
+                self.erase_in_line_with(erase, true);
+            }
+            Edit::ScrollLeft(n) => self.scroll_left_right(n, true),
+            Edit::ScrollRight(n) => self.scroll_left_right(n, false),
+            Edit::SelectCharacterProtection(protected) => {
+                // xterm's CASE_DECSCA (charproc.c): DEC mode, and the
+                // protection of what is printed next.
+                self.protected_mode = ProtectedMode::Dec;
+                self.pen.set_protected(protected);
+            }
             Edit::Repeat(n) => {
                 let mut y = self.cursor.y;
                 let mut x = self.cursor.x;
@@ -3318,16 +3878,24 @@ impl TerminalState {
 
             Cursor::ForwardTabulation(n) => {
                 for _ in 0..n {
+                    let prior = self.cursor.x;
                     self.c0_horizontal_tab();
+                    if self.cursor.x == prior {
+                        break;
+                    }
                 }
             }
             Cursor::BackwardTabulation(n) => {
                 for _ in 0..n {
+                    let prior = self.cursor.x;
                     let x = match self.tabs.find_prev_tab_stop(self.cursor.x) {
                         Some(x) => x,
                         None => 0,
                     };
                     self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Relative(0));
+                    if self.cursor.x == prior {
+                        break;
+                    }
                 }
             }
 
@@ -3608,9 +4176,14 @@ impl TerminalState {
             Sgr::Reset => {
                 let link = self.pen.hyperlink().map(Arc::clone);
                 let semantic_type = self.pen.semantic_type();
+                // SGR 0 leaves character protection alone: xterm's
+                // resetRendition (charproc.c) clears SGR_MASK, SGR_MASK2 and
+                // INVISIBLE, not PROTECTED.
+                let protected = self.pen.protected();
                 self.pen = CellAttributes::default();
                 self.pen.set_hyperlink(link);
                 self.pen.set_semantic_type(semantic_type);
+                self.pen.set_protected(protected);
             }
             Sgr::Intensity(intensity) => {
                 self.pen.set_intensity(intensity);
@@ -4408,13 +4981,17 @@ mod tests {
     fn user_input_class_nests_and_is_restored_after_every_input_path() {
         let (mut terminal, output) = terminal_state_with_capture(false);
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
-        terminal.with_user_input(|terminal| {
-            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            terminal.with_user_input(|terminal| {
+        terminal
+            .with_user_input(|terminal| -> std::io::Result<()> {
                 assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-            });
-            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
-        });
+                terminal.with_user_input(|terminal| -> std::io::Result<()> {
+                    assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+                    Ok(())
+                })?;
+                assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
 
         terminal

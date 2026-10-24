@@ -70,8 +70,13 @@ serde_json.workspace = true
 
 [target."cfg(unix)".dependencies]
 signal-hook.workspace = true
-termios.workspace = true
 nix = {workspace=true, features=["mman", "fs"]}
+
+# The tty `Terminal` device (terminal/unix.rs) is the only termios user. iOS has
+# no controlling tty and termios 0.3 has no iOS target, so the native iOS
+# terminal build (frankenterm-term native-ffi) omits that device.
+[target.'cfg(all(unix, not(target_os = "ios")))'.dependencies]
+termios.workspace = true
 
 [target."cfg(windows)".dependencies.winapi]
 features = [

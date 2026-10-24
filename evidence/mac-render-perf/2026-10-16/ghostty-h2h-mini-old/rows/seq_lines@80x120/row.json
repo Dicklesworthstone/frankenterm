@@ -1,0 +1,263 @@
+{
+  "schema": "ft.bench.ghostty-h2h-row.v1",
+  "corpus": "seq_lines",
+  "input_sha256": "d07e1bf9614185eac008cfa31cf516978d2fed62b7bf5880e35ee9a6f5f90459",
+  "geometry": {
+    "rows": 80,
+    "cols": 120
+  },
+  "ft_scrollback": 3500,
+  "ft_chunk_bytes": 65536,
+  "commands": {
+    "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+    "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+  },
+  "arms": {
+    "ghostty": {
+      "n": 10,
+      "median_s": 0.26600710450000004,
+      "p95_s": 0.267945708,
+      "mean_s": 0.2653932667,
+      "stddev_s": 0.0021920796383093073,
+      "cv_pct": 0.8259740970697759,
+      "min_s": 0.261446458,
+      "max_s": 0.267945708,
+      "times_s": [
+        0.267945708,
+        0.26727958300000004,
+        0.266793917,
+        0.266991833,
+        0.26557066700000004,
+        0.262159792,
+        0.261446458,
+        0.26644354200000003,
+        0.264211167,
+        0.26509
+      ],
+      "peak_rss_bytes_median": 40935424.0
+    },
+    "frankenterm": {
+      "n": 10,
+      "median_s": 1.1303593335,
+      "p95_s": 1.301205583,
+      "mean_s": 1.1473981333999999,
+      "stddev_s": 0.05425441918535991,
+      "cv_pct": 4.728473718585528,
+      "min_s": 1.124695,
+      "max_s": 1.301205583,
+      "times_s": [
+        1.13214325,
+        1.125850375,
+        1.301205583,
+        1.125929834,
+        1.1387405,
+        1.124695,
+        1.128575417,
+        1.127001541,
+        1.133318834,
+        1.1365210000000001
+      ],
+      "internal_lane_secs_untimed_runs": [
+        1.083398417,
+        1.088296042
+      ],
+      "state_fingerprints": [
+        "93073af563a551a8"
+      ],
+      "peak_rss_bytes_median": 72294400.0
+    }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "order": [
+        "ghostty",
+        "frankenterm"
+      ],
+      "file": "round-01.json",
+      "ghostty_s": 0.267945708,
+      "ghostty_peak_rss_bytes": 9601024,
+      "frankenterm_s": 1.13214325,
+      "frankenterm_peak_rss_bytes": 72302592
+    },
+    {
+      "round": 2,
+      "order": [
+        "frankenterm",
+        "ghostty"
+      ],
+      "file": "round-02.json",
+      "frankenterm_s": 1.125850375,
+      "frankenterm_peak_rss_bytes": 72269824,
+      "ghostty_s": 0.26727958300000004,
+      "ghostty_peak_rss_bytes": 72269824
+    },
+    {
+      "round": 3,
+      "order": [
+        "ghostty",
+        "frankenterm"
+      ],
+      "file": "round-03.json",
+      "ghostty_s": 0.266793917,
+      "ghostty_peak_rss_bytes": 9568256,
+      "frankenterm_s": 1.301205583,
+      "frankenterm_peak_rss_bytes": 72269824
+    },
+    {
+      "round": 4,
+      "order": [
+        "frankenterm",
+        "ghostty"
+      ],
+      "file": "round-04.json",
+      "frankenterm_s": 1.125929834,
+      "frankenterm_peak_rss_bytes": 72302592,
+      "ghostty_s": 0.266991833,
+      "ghostty_peak_rss_bytes": 72302592
+    },
+    {
+      "round": 5,
+      "order": [
+        "ghostty",
+        "frankenterm"
+      ],
+      "file": "round-05.json",
+      "ghostty_s": 0.26557066700000004,
+      "ghostty_peak_rss_bytes": 9551872,
+      "frankenterm_s": 1.1387405,
+      "frankenterm_peak_rss_bytes": 72302592
+    },
+    {
+      "round": 6,
+      "order": [
+        "frankenterm",
+        "ghostty"
+      ],
+      "file": "round-06.json",
+      "frankenterm_s": 1.124695,
+      "frankenterm_peak_rss_bytes": 72286208,
+      "ghostty_s": 0.262159792,
+      "ghostty_peak_rss_bytes": 72286208
+    },
+    {
+      "round": 7,
+      "order": [
+        "ghostty",
+        "frankenterm"
+      ],
+      "file": "round-07.json",
+      "ghostty_s": 0.261446458,
+      "ghostty_peak_rss_bytes": 9551872,
+      "frankenterm_s": 1.128575417,
+      "frankenterm_peak_rss_bytes": 72302592
+    },
+    {
+      "round": 8,
+      "order": [
+        "frankenterm",
+        "ghostty"
+      ],
+      "file": "round-08.json",
+      "frankenterm_s": 1.127001541,
+      "frankenterm_peak_rss_bytes": 72286208,
+      "ghostty_s": 0.26644354200000003,
+      "ghostty_peak_rss_bytes": 72286208
+    },
+    {
+      "round": 9,
+      "order": [
+        "ghostty",
+        "frankenterm"
+      ],
+      "file": "round-09.json",
+      "ghostty_s": 0.264211167,
+      "ghostty_peak_rss_bytes": 9551872,
+      "frankenterm_s": 1.133318834,
+      "frankenterm_peak_rss_bytes": 72302592
+    },
+    {
+      "round": 10,
+      "order": [
+        "frankenterm",
+        "ghostty"
+      ],
+      "file": "round-10.json",
+      "frankenterm_s": 1.1365210000000001,
+      "frankenterm_peak_rss_bytes": 72269824,
+      "ghostty_s": 0.26509,
+      "ghostty_peak_rss_bytes": 72269824
+    }
+  ],
+  "load_1m": {
+    "samples": [
+      {
+        "at": "2026-10-16T17:17:44Z",
+        "load_1m": 3.17
+      },
+      {
+        "at": "2026-10-16T17:17:49Z",
+        "load_1m": 3.16
+      },
+      {
+        "at": "2026-10-16T17:17:51Z",
+        "load_1m": 3.14
+      },
+      {
+        "at": "2026-10-16T17:17:52Z",
+        "load_1m": 3.14
+      },
+      {
+        "at": "2026-10-16T17:17:54Z",
+        "load_1m": 3.14
+      },
+      {
+        "at": "2026-10-16T17:17:55Z",
+        "load_1m": 3.05
+      },
+      {
+        "at": "2026-10-16T17:17:57Z",
+        "load_1m": 3.05
+      },
+      {
+        "at": "2026-10-16T17:17:58Z",
+        "load_1m": 3.05
+      },
+      {
+        "at": "2026-10-16T17:18:00Z",
+        "load_1m": 3.05
+      },
+      {
+        "at": "2026-10-16T17:18:01Z",
+        "load_1m": 3.05
+      },
+      {
+        "at": "2026-10-16T17:18:03Z",
+        "load_1m": 3.05
+      }
+    ],
+    "peak": 3.17
+  },
+  "paired": {
+    "pairs": 10,
+    "ft_wins": 0,
+    "median_pair_speedup": 0.23323064319503956
+  },
+  "ft_speedup": 0.23532968377086438,
+  "ft_speedup_unadmitted": 0.23532968377086438,
+  "hyperfine_json": [
+    "round-01.json",
+    "round-02.json",
+    "round-03.json",
+    "round-04.json",
+    "round-05.json",
+    "round-06.json",
+    "round-07.json",
+    "round-08.json",
+    "round-09.json",
+    "round-10.json"
+  ],
+  "verdict": "ghostty_faster",
+  "refusal_reasons": [],
+  "dir": "rows/seq_lines@80x120"
+}

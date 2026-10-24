@@ -7,33 +7,28 @@ namespace OT {
 namespace Layout {
 namespace GPOS_impl {
 
-typedef AnchorMatrix Mark2Array;        /* mark2-major--
-                                         * in order of Mark2Coverage Index--,
-                                         * mark1-minor--
-                                         * ordered by class--zero-based. */
-
 template <typename Types>
 struct MarkMarkPosFormat1_2
 {
   protected:
   HBUINT16      format;                 /* Format identifier--format = 1 */
-  typename Types::template OffsetTo<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 mark1Coverage;          /* Offset to Combining Mark1 Coverage
                                          * table--from beginning of MarkMarkPos
                                          * subtable */
-  typename Types::template OffsetTo<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 mark2Coverage;          /* Offset to Combining Mark2 Coverage
                                          * table--from beginning of MarkMarkPos
                                          * subtable */
   HBUINT16      classCount;             /* Number of defined mark classes */
-  typename Types::template OffsetTo<MarkArray>
+  typename Types::template LOffsetTo<MarkArray<Types>>
                 mark1Array;             /* Offset to Mark1Array table--from
                                          * beginning of MarkMarkPos subtable */
-  typename Types::template OffsetTo<Mark2Array>
+  typename Types::template LOffsetTo<AnchorMatrix<Types, HBUINT16>>
                 mark2Array;             /* Offset to Mark2Array table--from
                                          * beginning of MarkMarkPos subtable */
   public:
-  DEFINE_SIZE_STATIC (4 + 4 * Types::size);
+  DEFINE_SIZE_STATIC (4 + 4 * Types::LOffset::static_size);
 
   bool sanitize (hb_sanitize_context_t *c) const
   {
@@ -59,7 +54,7 @@ struct MarkMarkPosFormat1_2
     + hb_zip (this+mark1Coverage, this+mark1Array)
     | hb_filter (c->glyph_set, hb_first)
     | hb_map (hb_second)
-    | hb_apply ([&] (const MarkRecord& record) { record.collect_variation_indices (c, &(this+mark1Array)); })
+    | hb_apply ([&] (const MarkRecord<Types>& record) { record.collect_variation_indices (c, &(this+mark1Array)); })
     ;
 
     hb_map_t klass_mapping;
@@ -89,6 +84,9 @@ struct MarkMarkPosFormat1_2
     if (unlikely (!(this+mark1Coverage).collect_coverage (c->input))) return;
     if (unlikely (!(this+mark2Coverage).collect_coverage (c->input))) return;
   }
+
+  void collect_second_glyphs (hb_set_digest_t *digest) const
+  { (this+mark2Coverage).collect_coverage (digest); }
 
   const Coverage &get_coverage () const { return this+mark1Coverage; }
 
@@ -196,19 +194,23 @@ struct MarkMarkPosFormat1_2
     ;
 
     new_coverage.reset ();
-    + mark2_iter
-    | hb_map (hb_first)
-    | hb_map (glyph_map)
-    | hb_sink (new_coverage)
-    ;
-
-    if (!out->mark2Coverage.serialize_serialize (c->serializer, new_coverage.iter ()))
-      return_trace (false);
-
     hb_sorted_vector_t<unsigned> mark2_indexes;
-    for (const unsigned row : + mark2_iter
-                              | hb_map (hb_second))
+    auto &mark2_array = (this+mark2Array);
+    for (const auto _ : + mark2_iter)
     {
+      unsigned row = _.second;
+
+      bool non_empty = + hb_range ((unsigned) classCount)
+                       | hb_filter (klass_mapping)
+                       | hb_map ([&] (const unsigned col) { return !mark2_array.offset_is_null (row, col, (unsigned) classCount); })
+                       | hb_any
+                       ;
+
+      if (!non_empty) continue;
+
+      hb_codepoint_t new_g = glyph_map.get ( _.first);
+      new_coverage.push (new_g);
+
       + hb_range ((unsigned) classCount)
       | hb_filter (klass_mapping)
       | hb_map ([&] (const unsigned col) { return row * (unsigned) classCount + col; })
@@ -216,8 +218,12 @@ struct MarkMarkPosFormat1_2
       ;
     }
 
+    if (!new_coverage) return_trace (false);
+    if (!out->mark2Coverage.serialize_serialize (c->serializer, new_coverage.iter ()))
+      return_trace (false);
+
     return_trace (out->mark2Array.serialize_subset (c, mark2Array, this,
-						    mark2_iter.len (),
+						    new_coverage.length,
 						    mark2_indexes.iter ()));
 
   }

@@ -1,0 +1,34 @@
+[package]
+name = "frankenterm-browser-ui"
+description = "Read-only browser fleet viewer: a FrankenTUI model run in WASM over ft web's read API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# cdylib is the wasm32 module the browser loads; rlib keeps the model and
+# runner testable natively.
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Same frankentui revision as the native TUI (workspace `ftui`). No terminal
+# backend: the browser host drives the program through ftui-web.
+ftui-core = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "befbd2471a1ec4a6b8ce0a0df32116c317cca9db" }
+ftui-render = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "befbd2471a1ec4a6b8ce0a0df32116c317cca9db" }
+ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "befbd2471a1ec4a6b8ce0a0df32116c317cca9db" }
+ftui-web = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "befbd2471a1ec4a6b8ce0a0df32116c317cca9db", features = ["input-parser"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Must equal the wasm-bindgen CLI that generates the JS glue.
+wasm-bindgen = "=0.2.128"
+js-sys = "0.3.105"
+getrandom = { workspace = true, features = ["wasm_js"] }

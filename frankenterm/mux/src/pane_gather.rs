@@ -208,6 +208,7 @@ impl Drop for PtyGatherSource<'_> {
 #[cfg(unix)]
 impl GatherSource for PtyGatherSource<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _read = procinfo::signpost_interval(procinfo::SignpostName::PtyRead);
         self.reader.read(buf)
     }
 

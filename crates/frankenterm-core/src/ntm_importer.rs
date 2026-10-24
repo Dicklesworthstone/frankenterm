@@ -941,7 +941,7 @@ impl NtmImporter {
                             trigger.value
                         ),
                         remediation: Some(
-                            "Set up a cron job that calls `ft robot workflow run <name>` \
+                            "Set up a cron job that calls `ft robot workflow run <name> <pane-id>` \
                              at the desired interval."
                                 .to_string(),
                         ),
@@ -953,8 +953,9 @@ impl NtmImporter {
                         severity: ImportSeverity::Info,
                         source_path: source_id.clone(),
                         code: "MANUAL_TRIGGER_PRESERVED".to_string(),
-                        message: "Manual trigger preserved; invoke via `ft robot workflow run`"
-                            .to_string(),
+                        message:
+                            "Manual trigger preserved; invoke via `ft robot workflow run <name> <pane-id>`"
+                                .to_string(),
                         remediation: None,
                     });
                 }

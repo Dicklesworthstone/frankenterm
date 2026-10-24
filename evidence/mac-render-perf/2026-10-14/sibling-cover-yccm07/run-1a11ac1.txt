@@ -1,0 +1,6 @@
+1a11ac1-front: pid 65597, run dir /tmp/ftcv.1fqz48b4
+1a11ac1-front: three stacked (12-21 s): 57.6 frames/s presented, drawables 9 (1.2 MiB)
+1a11ac1-front: front moved aside (32-41 s): 121.7 frames/s presented, drawables 9 (2.4 MiB)
+1a11ac1-front: middle turned glass (52-61 s): 183.3 frames/s presented, drawables 9 (3.6 MiB)
+1a11ac1-front: cover transitions: ['window 2 covered by another window: true', 'window 2 covered by another window: false', 'window 1 covered by another window: true', 'window 3 covered by another window: true', 'window 2 covered by another window: true', 'window 3 covered by another window: false', 'window 2 covered by another window: false', 'window 1 covered by another window: false']
+run directory kept: /tmp/ftcv.1fqz48b4

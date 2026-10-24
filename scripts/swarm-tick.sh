@@ -601,8 +601,18 @@ stale_targets=$(find /tmp -maxdepth 1 -name "ft-*-target" -type d -mmin +720 2>/
 total_targets=$(ls -d /tmp/ft-*-target 2>/dev/null | wc -l | tr -d ' ')
 target_size_mb=$(du -sk /tmp/ft-*-target 2>/dev/null | awk '{s+=$1} END{print int(s/1024)}')
 
-# Per-pane state
-panes_json=$(ntm --robot-status 2>/dev/null | jq --arg s "$session" '.sessions[] | select(.name==$s) | {panes_count: .panes, agents: [.agents[] | {idx: .pane_idx, type, pane}]}')
+# Per-pane state. ntm before 1.36 listed panes under --robot-status. From
+# 1.36 (ntm.robot.status.v2) status carries only session headers, and the
+# per-pane rows live in --robot-snapshot as .sessions[].agents[] with a "W.P"
+# pane id (GitHub #124).
+status_json=$(ntm --robot-status 2>/dev/null || true)
+panes_json=$(printf '%s' "$status_json" | jq --arg s "$session" '.sessions[]? | select(.name==$s and (.agents|type=="array")) | {panes_count: .panes, agents: [.agents[] | {idx: .pane_idx, type, pane}]}' 2>/dev/null)
+if [ -z "$panes_json" ] && printf '%s' "$status_json" | jq -e --arg s "$session" 'any(.sessions[]?; .name==$s)' >/dev/null 2>&1; then
+  panes_json=$(ntm --robot-snapshot 2>/dev/null | jq --arg s "$session" '.sessions[]? | select(.name==$s and (.agents|type=="array")) | {panes_count: (.agents|length), agents: [.agents[] | {idx: ((.pane|tostring|split(".")|last|tonumber?) // null), type, pane}]}' 2>/dev/null)
+  if [ -z "$panes_json" ]; then
+    echo "swarm-tick: ntm reports session '$session' but no readable per-pane rows; .swarm is empty" >&2
+  fi
+fi
 # Fallback so output remains valid JSON if the session isn't present.
 if [ -z "$panes_json" ]; then
   panes_json='{ "panes_count": 0, "agents": [] }'

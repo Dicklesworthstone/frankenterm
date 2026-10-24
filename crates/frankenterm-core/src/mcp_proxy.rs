@@ -1151,7 +1151,11 @@ for raw in sys.stdin:
         config.mcp_client.proxy_mount_all_discovered = true;
         config.mcp_client.include_default_paths = false;
         config.mcp_client.discovery_paths = vec![discovery.display().to_string()];
-        config.mcp_client.timeout_ms = 5_000;
+        // Starting python3 and finishing the MCP handshake is only the
+        // precondition here; on a saturated full-suite worker it outran a 5 s
+        // client timeout and wait. Cancellation happens as soon as the peer
+        // receives tools/list, well inside its 10 s sleep.
+        config.mcp_client.timeout_ms = 30_000;
         config.mcp_client.max_retries = 0;
         let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
             .worker_threads(2)
@@ -1161,7 +1165,7 @@ for raw in sys.stdin:
             let cx = crate::cx::Cx::current().expect("runtime-owned startup context");
             let cancelling_cx = cx.clone();
             let cancel = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !requested.exists() && std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }

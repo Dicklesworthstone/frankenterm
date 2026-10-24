@@ -219,7 +219,9 @@ pub trait MuxInterface: Send + Sync {
     /// cwd fallback cannot tell a proxied remote pane from a local one.
     /// Best effort and user-facing only: a backend or peer without the
     /// request leaves the fields untouched, so callers keep the inferred
-    /// domain. Background loops should not pay this extra round trip.
+    /// domain. Background loops should not pay this extra round trip; the
+    /// mux client's single-pane `get_pane_with_cx` pays it, because a pane is
+    /// fetched alone to act on it.
     fn annotate_pane_domains_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -679,9 +681,20 @@ impl CwdInfo {
     /// WezTerm uses file:// URIs:
     /// - Local: `file:///home/user` (host empty, 3 slashes)
     /// - Remote: `file://hostname/path` (host present, 2 slashes before host)
+    ///
+    /// `localhost` and this machine's own hostname are local: shell
+    /// integration (OSC 7) reports `file://$HOSTNAME/...` for every local
+    /// shell, so a host naming this machine is not a remote cwd.
+    #[must_use]
+    pub fn parse(uri: &str) -> Self {
+        Self::parse_with_local_hostname(uri, local_hostname())
+    }
+
+    /// [`parse`](Self::parse) against an explicit local hostname; with `None`
+    /// only `localhost` is local.
     #[must_use]
     #[allow(clippy::option_if_let_else)] // if-let-else is clearer for this multi-branch logic
-    pub fn parse(uri: &str) -> Self {
+    pub fn parse_with_local_hostname(uri: &str, local_hostname: Option<&str>) -> Self {
         let uri = uri.trim();
 
         if uri.is_empty() {
@@ -710,7 +723,7 @@ impl CwdInfo {
                 // Remote path: host/path
                 let host = &rest[..slash_pos];
                 let path = &rest[slash_pos..];
-                let is_localhost = host.eq_ignore_ascii_case("localhost");
+                let is_localhost = cwd_host_is_local(host, local_hostname);
                 Self {
                     raw_uri: uri.to_string(),
                     path: percent_decode_file_uri_path(path),
@@ -723,7 +736,7 @@ impl CwdInfo {
                 }
             } else {
                 // Just host, no path
-                let is_localhost = rest.eq_ignore_ascii_case("localhost");
+                let is_localhost = cwd_host_is_local(rest, local_hostname);
                 Self {
                     raw_uri: uri.to_string(),
                     path: String::new(),
@@ -745,6 +758,47 @@ impl CwdInfo {
             }
         }
     }
+
+    /// The `ssh:<host>` alias a remote cwd suggests. Shell integration
+    /// reports the host the shell runs on, which says nothing about which
+    /// mux domain owns the pane, so this is a hint, never ownership.
+    #[must_use]
+    pub fn domain_alias(&self) -> Option<String> {
+        (self.is_remote && !self.host.is_empty()).then(|| format!("ssh:{}", self.host))
+    }
+}
+
+/// This machine's hostname, read once.
+fn local_hostname() -> Option<&'static str> {
+    static LOCAL_HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOCAL_HOSTNAME
+        .get_or_init(|| {
+            hostname::get()
+                .ok()?
+                .into_string()
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
+/// Whether a cwd URI host names this machine: `localhost`, or the local
+/// hostname compared case-insensitively, also when one side is the other's
+/// first label (`mac-mini` for `Mac-mini.local`).
+fn cwd_host_is_local(host: &str, local_hostname: Option<&str>) -> bool {
+    fn first_label(name: &str) -> &str {
+        name.split('.').next().unwrap_or(name)
+    }
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(local) = local_hostname else {
+        return false;
+    };
+    host.eq_ignore_ascii_case(local)
+        || (!host.contains('.') && host.eq_ignore_ascii_case(first_label(local)))
+        || (!local.contains('.') && local.eq_ignore_ascii_case(first_label(host)))
 }
 
 fn percent_decode_file_uri_path(path: &str) -> String {
@@ -925,14 +979,10 @@ impl PaneInfo {
             return name.to_string();
         }
 
-        // Try to infer from cwd URI
-        let cwd_info = self.parsed_cwd();
-        if cwd_info.is_remote && !cwd_info.host.is_empty() {
-            return format!("ssh:{}", cwd_info.host);
-        }
-
-        // Default to local
-        "local".to_string()
+        // Try to infer from cwd URI, else default to local
+        self.parsed_cwd()
+            .domain_alias()
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// Get the title, with a default fallback
@@ -1825,13 +1875,20 @@ impl WeztermClient {
     /// capability context (ft-xbnl0.2.3 Cx-first entry point).
     ///
     /// Delegates to [`list_panes_with_cx`](Self::list_panes_with_cx)
-    /// so the underlying pane listing respects caller Cx.
+    /// so the underlying pane listing respects caller Cx, then fills the
+    /// pane's owning domain ([`annotate_pane_domains_with_cx`](Self::annotate_pane_domains_with_cx),
+    /// one more bounded round trip). A single pane is fetched to act on it:
+    /// policy `pane_domains` rules, audit records and robot output must see
+    /// the domain the mux reports, not a cwd guess (ft-hr0cw).
     pub async fn get_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
         let panes = self.list_panes_with_cx(cx).await?;
-        panes
+        let mut pane = panes
             .into_iter()
             .find(|p| p.pane_id == pane_id)
-            .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
+            .ok_or(WeztermError::PaneNotFound(pane_id))?;
+        self.annotate_pane_domains_with_cx(cx, std::slice::from_mut(&mut pane))
+            .await;
+        Ok(pane)
     }
 
     /// Get text content from a pane
@@ -2801,9 +2858,33 @@ impl WeztermClient {
                                 // Claude Code folds an Enter that arrives right
                                 // behind a multi-line paste into the paste.
                                 pause_before_paste_submit(cx, body, false).await;
-                                pool.write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
+                                match pool
+                                    .write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
                                     .await
-                                    .map(|_| ())
+                                {
+                                    Ok(_) => Ok(()),
+                                    Err(error) if !body.is_empty() => {
+                                        // The body is already in the pane. Even
+                                        // a proven refusal of Enter cannot
+                                        // certify that this composite send had
+                                        // no effect, or authorize replaying it.
+                                        // Preserve the original transport's
+                                        // health evidence before promoting the
+                                        // whole operation's effect certainty.
+                                        self.mux_circuit_record_error(&error);
+                                        return Err(WeztermError::MuxRejection(
+                                            MuxRejection::indeterminate(
+                                                MuxOperation::SendText,
+                                                Some(MuxObjectIdentity {
+                                                    kind: MuxObjectKind::Pane,
+                                                    id: pane_id,
+                                                }),
+                                            ),
+                                        )
+                                        .into());
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(e) => Err(e),
                         }
@@ -3305,6 +3386,7 @@ impl WeztermClient {
                 "quota_exceeded" => MuxRejectionCode::QuotaExceeded,
                 "backend_failure" => MuxRejectionCode::BackendFailure,
                 "indeterminate_mutation" => MuxRejectionCode::IndeterminateMutation,
+                "resource_busy" => MuxRejectionCode::ResourceBusy,
                 "unknown_future" => MuxRejectionCode::UnknownFuture,
                 _ => return None,
             };
@@ -3397,6 +3479,7 @@ impl WeztermClient {
                 )
                 | ("get_dimensions", MuxOperation::ReadPaneRenderableDimensions)
                 | ("get_semantic_zones", MuxOperation::ReadSemanticZones)
+                | ("get_pane_user_vars_v1", MuxOperation::ReadPaneUserVars)
                 | ("write_to_pane" | "send_paste", MuxOperation::SendText)
                 | ("resize", MuxOperation::ResizePane)
                 | ("adjust_pane_size", MuxOperation::AdjustPaneSize)
@@ -3720,6 +3803,7 @@ impl WeztermClient {
             Some("ReleaseSelectionAnchorV1") => MuxOperation::ReleaseSelectionAnchor,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
+            Some("GetPaneUserVarsV1") => MuxOperation::ReadPaneUserVars,
             Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
                 MuxOperation::SendText
             }
@@ -3789,6 +3873,7 @@ impl WeztermClient {
             codec::MuxErrorCode::QUOTA_EXCEEDED => MuxRejectionCode::QuotaExceeded,
             codec::MuxErrorCode::BACKEND_FAILURE => MuxRejectionCode::BackendFailure,
             codec::MuxErrorCode::INDETERMINATE_MUTATION => MuxRejectionCode::IndeterminateMutation,
+            codec::MuxErrorCode::RESOURCE_BUSY => MuxRejectionCode::ResourceBusy,
             _ => MuxRejectionCode::UnknownFuture,
         };
         let object = response.object.map(|object| MuxObjectIdentity {
@@ -5865,6 +5950,367 @@ mod tests {
         assert_eq!(split_paste_submit(""), ("", false));
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CompositeSendFault {
+        None,
+        RefusePaste,
+        RefuseEnter,
+        LoseEnterReply,
+        InitialVersionSkew,
+        VersionSkewAfterPaste,
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[derive(Debug, Default)]
+    struct CompositeSendTrace {
+        requests: Vec<(&'static str, Vec<u8>)>,
+        effects: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    /// Exercise the production client, connection pool and codec over an owned
+    /// Unix socket. The server records applied effects independently from the
+    /// replies it sends, so a lost/refused Enter cannot erase a successful paste.
+    #[cfg(all(feature = "vendored", unix))]
+    fn composite_send_fixture(
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+        fault: CompositeSendFault,
+    ) -> (Result<()>, CompositeSendTrace, CircuitBreakerStatus) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        use crate::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
+        use codec::{Pdu, PduWireIdent, StreamingPduBuffer, UnitResponse};
+
+        let directory = tempfile::tempdir().expect("composite send socket directory");
+        let socket_path = directory.path().join("composite-send.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind composite send fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("bounded fixture accept");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut trace = CompositeSendTrace::default();
+            let connections = if fault == CompositeSendFault::VersionSkewAfterPaste {
+                2
+            } else {
+                1
+            };
+            for connection in 0..connections {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture connection timed out");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking fixture stream with bounded I/O");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bounded fixture reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("bounded fixture writes");
+                let mut buffer = StreamingPduBuffer::new();
+                loop {
+                    let mut bytes = [0u8; 4096];
+                    let count = stream.read(&mut bytes).expect("read fixture request");
+                    if count == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&bytes[..count]);
+                    while let Some(decoded) =
+                        Pdu::stream_decode(&mut buffer).expect("decode request")
+                    {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let skew = fault == CompositeSendFault::InitialVersionSkew
+                                    || (fault == CompositeSendFault::VersionSkewAfterPaste
+                                        && connection == 1);
+                                Pdu::GetCodecVersionResponse(codec::GetCodecVersionResponse {
+                                    codec_vers: if skew {
+                                        codec::CODEC_VERSION + 1
+                                    } else {
+                                        codec::CODEC_VERSION
+                                    },
+                                    version_string: "frankenterm-composite-send-test".to_owned(),
+                                    executable_path: std::path::PathBuf::from(
+                                        "/fixture/frankenterm",
+                                    ),
+                                    config_file_path: None,
+                                    min_supported: if skew {
+                                        codec::CODEC_VERSION + 1
+                                    } else {
+                                        codec::CODEC_VERSION_MIN_SUPPORTED
+                                    },
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::SendPaste(request) => {
+                                assert_eq!(request.pane_id, 77);
+                                let effect = ("paste", request.data.into_bytes());
+                                trace.requests.push(effect.clone());
+                                if fault == CompositeSendFault::RefusePaste {
+                                    Pdu::ErrorResponse(codec::ErrorResponse::policy_rejected(
+                                        <codec::SendPaste as PduWireIdent>::IDENT,
+                                    ))
+                                } else {
+                                    trace.effects.push(effect);
+                                    Pdu::UnitResponse(UnitResponse {})
+                                }
+                            }
+                            Pdu::WriteToPane(request) => {
+                                assert_eq!(request.pane_id, 77);
+                                let effect = ("write", request.data);
+                                trace.requests.push(effect.clone());
+                                if fault == CompositeSendFault::RefuseEnter {
+                                    Pdu::ErrorResponse(codec::ErrorResponse::policy_rejected(
+                                        <codec::WriteToPane as PduWireIdent>::IDENT,
+                                    ))
+                                } else {
+                                    trace.effects.push(effect);
+                                    if fault == CompositeSendFault::LoseEnterReply {
+                                        return trace;
+                                    }
+                                    Pdu::UnitResponse(UnitResponse {})
+                                }
+                            }
+                            other => panic!("unexpected composite fixture request: {other:?}"),
+                        };
+                        let mut encoded = Vec::new();
+                        response
+                            .encode(&mut encoded, decoded.serial)
+                            .expect("encode fixture reply");
+                        stream.write_all(&encoded).expect("write fixture reply");
+                    }
+                }
+            }
+            trace
+        });
+
+        let mut result = None;
+        let mut circuit_status = None;
+        run_async_test(async {
+            let pool = Arc::new(MuxPool::new(MuxPoolConfig {
+                pool: crate::pool::PoolConfig {
+                    max_size: 1,
+                    idle_timeout: if fault == CompositeSendFault::VersionSkewAfterPaste {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(60)
+                    },
+                    acquire_timeout: Duration::from_secs(2),
+                },
+                mux: DirectMuxClientConfig {
+                    connect_timeout: Duration::from_secs(2),
+                    read_timeout: Duration::from_secs(2),
+                    write_timeout: Duration::from_secs(2),
+                    ..DirectMuxClientConfig::default().with_socket_path(&socket_path)
+                },
+                ..MuxPoolConfig::default()
+            }));
+            let mut client = isolated_cli_client_with_socket(socket_path.to_string_lossy())
+                .with_mux_pool(Arc::clone(&pool));
+            // A framed refusal must clear an earlier backend failure, while a
+            // lost reply must add one. Effect uncertainty is a separate axis.
+            let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::default());
+            circuit.record_failure();
+            client.mux_circuit_breaker = Arc::new(Mutex::new(circuit));
+            let cx = crate::cx::for_testing();
+            result = Some(
+                client
+                    .send_text_with_options_with_cx(&cx, 77, text, no_paste, no_newline)
+                    .await,
+            );
+            circuit_status = Some(client.mux_circuit_breaker.lock().unwrap().status());
+            let stats = pool.stats_with_cx(&cx).await.expect("fixture pool stats");
+            assert_eq!(
+                stats.connections_created,
+                u64::from(fault != CompositeSendFault::InitialVersionSkew)
+            );
+            assert_eq!(
+                stats.connections_failed,
+                u64::from(matches!(
+                    fault,
+                    CompositeSendFault::InitialVersionSkew
+                        | CompositeSendFault::VersionSkewAfterPaste
+                ))
+            );
+            assert_eq!(stats.recovery_attempts, 0, "mutations must not replay");
+            drop(client);
+            drop(pool);
+        });
+        let trace = server.join().expect("composite send fixture completes");
+        (result.unwrap(), trace, circuit_status.unwrap())
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_retains_uncertainty_after_the_body_is_applied() {
+        for fault in [
+            CompositeSendFault::RefuseEnter,
+            CompositeSendFault::LoseEnterReply,
+        ] {
+            let (result, trace, health) = composite_send_fixture("command", false, false, fault);
+            let error = result.expect_err("a partial composite send cannot certify failure");
+            let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+                panic!("whole-operation uncertainty must retain typed authority");
+            };
+            assert_eq!(
+                rejection,
+                MuxRejection::indeterminate(
+                    MuxOperation::SendText,
+                    Some(MuxObjectIdentity {
+                        kind: MuxObjectKind::Pane,
+                        id: 77
+                    }),
+                )
+            );
+            assert_eq!(
+                trace.requests,
+                vec![("paste", b"command".to_vec()), ("write", b"\r".to_vec())]
+            );
+            if fault == CompositeSendFault::RefuseEnter {
+                assert_eq!(trace.effects, vec![("paste", b"command".to_vec())]);
+                assert_eq!(
+                    health.consecutive_failures, 0,
+                    "framed refusal proves mux health"
+                );
+            } else {
+                assert_eq!(trace.effects, trace.requests);
+                assert_eq!(
+                    health.consecutive_failures, 2,
+                    "lost reply retains backend failure evidence"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_preserves_single_operation_refusal_authority() {
+        for (text, no_paste, no_newline, fault, request) in [
+            (
+                "command",
+                false,
+                false,
+                CompositeSendFault::RefusePaste,
+                ("paste", b"command".to_vec()),
+            ),
+            (
+                "",
+                false,
+                false,
+                CompositeSendFault::RefuseEnter,
+                ("write", b"\r".to_vec()),
+            ),
+            (
+                "command",
+                true,
+                false,
+                CompositeSendFault::RefuseEnter,
+                ("write", b"command\n".to_vec()),
+            ),
+            (
+                "command",
+                false,
+                true,
+                CompositeSendFault::RefusePaste,
+                ("paste", b"command".to_vec()),
+            ),
+        ] {
+            let (result, trace, health) = composite_send_fixture(text, no_paste, no_newline, fault);
+            let error = result.expect_err("server refused before applying any input");
+            let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+                panic!("pre-effect refusal must retain typed authority");
+            };
+            // The pool conservatively marks an admitted operation uncertain,
+            // even for a remote refusal. Preserve that existing authority:
+            // without an acknowledged body, there is no composite promotion.
+            assert_eq!(
+                rejection,
+                MuxRejection::indeterminate(MuxOperation::SendText, None)
+            );
+            assert!(rejection.has_consistent_authority());
+            assert_eq!(trace.requests, vec![request]);
+            assert!(trace.effects.is_empty());
+            assert_eq!(health.consecutive_failures, 0);
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_reconnect_failure_cannot_erase_the_applied_body() {
+        // The production multiline pause lets the zero-idle-timeout pool
+        // replace the acknowledged paste's connection before sending Enter.
+        // Version skew proves Enter was never admitted, but the prior paste
+        // still makes replaying the entire command unsafe.
+        let body = "line one\nline two";
+        let (result, trace, health) = composite_send_fixture(
+            body,
+            false,
+            false,
+            CompositeSendFault::VersionSkewAfterPaste,
+        );
+        let error = result.expect_err("reconnecting for Enter failed after paste committed");
+        let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
+            panic!("second-leg version skew must become whole-send uncertainty");
+        };
+        assert_eq!(
+            rejection,
+            MuxRejection::indeterminate(
+                MuxOperation::SendText,
+                Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id: 77
+                })
+            )
+        );
+        assert_eq!(trace.requests, vec![("paste", body.as_bytes().to_vec())]);
+        assert_eq!(trace.effects, trace.requests);
+        assert_eq!(health.consecutive_failures, 2);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_initial_version_skew_preserves_pre_effect_authority() {
+        let (result, trace, health) = composite_send_fixture(
+            "command",
+            false,
+            false,
+            CompositeSendFault::InitialVersionSkew,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::Error::Wezterm(WeztermError::VersionSkew { .. }))
+        ));
+        assert!(trace.requests.is_empty());
+        assert!(trace.effects.is_empty());
+        assert_eq!(health.consecutive_failures, 2);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn composite_paste_success_preserves_body_then_enter_order() {
+        let (result, trace, health) =
+            composite_send_fixture("command", false, false, CompositeSendFault::None);
+        result.expect("both paste and Enter were acknowledged");
+        assert_eq!(
+            trace.requests,
+            vec![("paste", b"command".to_vec()), ("write", b"\r".to_vec())]
+        );
+        assert_eq!(trace.effects, trace.requests);
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
     fn isolated_cli_client() -> WeztermClient {
         WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default())
     }
@@ -6261,6 +6707,59 @@ mod tests {
         assert!(!cwd.is_remote);
         assert_eq!(cwd.host, "");
         assert_eq!(cwd.path, "");
+    }
+
+    #[test]
+    fn cwd_info_domain_alias_names_only_a_remote_host() {
+        assert_eq!(
+            CwdInfo::parse("file://prod/home/agent").domain_alias(),
+            Some("ssh:prod".to_string())
+        );
+        assert_eq!(CwdInfo::parse("file:///home/agent").domain_alias(), None);
+        assert_eq!(
+            CwdInfo::parse("file://localhost/home/agent").domain_alias(),
+            None
+        );
+        assert_eq!(CwdInfo::parse("/home/agent").domain_alias(), None);
+        assert_eq!(CwdInfo::parse("").domain_alias(), None);
+    }
+
+    #[test]
+    fn cwd_info_treats_this_machines_hostname_as_local() {
+        // OSC 7 reports file://$HOSTNAME/... for every local shell.
+        let local = CwdInfo::parse_with_local_hostname(
+            "file://mac-mini-max/Users/agent/projects",
+            Some("mac-mini-max"),
+        );
+        assert!(!local.is_remote);
+        assert_eq!(local.host, "");
+        assert_eq!(local.path, "/Users/agent/projects");
+        assert_eq!(local.domain_alias(), None);
+
+        // Case and the short/qualified forms of the same name are local too.
+        for (host, hostname) in [
+            ("Mac-Mini-Max", "mac-mini-max"),
+            ("mac-mini-max", "Mac-mini-max.local"),
+            ("mac-mini-max.local", "mac-mini-max"),
+        ] {
+            let cwd =
+                CwdInfo::parse_with_local_hostname(&format!("file://{host}/tmp"), Some(hostname));
+            assert!(!cwd.is_remote, "{host} names {hostname}");
+        }
+        let host_only =
+            CwdInfo::parse_with_local_hostname("file://mac-mini-max", Some("mac-mini-max"));
+        assert!(!host_only.is_remote);
+
+        // Another machine stays remote, including one sharing a first label.
+        for (host, hostname) in [
+            ("hetzner1", Some("mac-mini-max")),
+            ("db1.prod", Some("db1.dev")),
+            ("mac-mini-max", None),
+        ] {
+            let cwd = CwdInfo::parse_with_local_hostname(&format!("file://{host}/data"), hostname);
+            assert!(cwd.is_remote, "{host} vs {hostname:?}");
+            assert_eq!(cwd.domain_alias(), Some(format!("ssh:{host}")));
+        }
     }
 
     #[test]
@@ -8431,6 +8930,7 @@ mod tests {
             codec::ErrorResponse::deadline_exceeded(request_ident),
             codec::ErrorResponse::quota_exceeded(request_ident),
             codec::ErrorResponse::backend_failure(request_ident),
+            codec::ErrorResponse::resource_busy(request_ident),
             codec::ErrorResponse::indeterminate_mutation(
                 request_ident,
                 Some(codec::MuxErrorObject {
@@ -8631,6 +9131,13 @@ mod tests {
                 "indeterminate",
                 "reconcile_before_retry",
                 MuxRejectionCode::IndeterminateMutation,
+            ),
+            (
+                "resource_busy",
+                "none",
+                "not_applied",
+                "safe_after_backoff",
+                MuxRejectionCode::ResourceBusy,
             ),
             (
                 "unknown_future",

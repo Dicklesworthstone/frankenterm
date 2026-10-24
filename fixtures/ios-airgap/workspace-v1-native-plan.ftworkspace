@@ -1,0 +1,152 @@
+{
+  "format": "ftworkspace",
+  "version": 1,
+  "bundle_id": "bundle-example-001",
+  "source": {
+    "exporter_id": "mac-example",
+    "kind": "mac_snapshot",
+    "configuration_revision": "config-example-007",
+    "export_sequence": 7
+  },
+  "required_capabilities": [],
+  "workspace": {
+    "id": "workspace-agents",
+    "name": "Agent Machines",
+    "groups": [
+      {
+        "id": "group-agents",
+        "name": "Agents",
+        "machine_order": ["machine-build", "machine-gpu"],
+        "auto_connect": true
+      }
+    ],
+    "machines": [
+      {
+        "id": "machine-build",
+        "name": "Build",
+        "short_label": "BLD",
+        "theme_ref": "theme-cobalt",
+        "route_refs": ["route-build"],
+        "preferred_route_ref": "route-build",
+        "auto_connect": true,
+        "pane_selection": "last_surviving"
+      },
+      {
+        "id": "machine-gpu",
+        "name": "GPU",
+        "short_label": "GPU",
+        "theme_ref": "theme-orchid",
+        "route_refs": ["route-gpu"],
+        "preferred_route_ref": "route-gpu",
+        "auto_connect": true,
+        "pane_selection": "last_surviving"
+      }
+    ],
+    "routes": [
+      {
+        "id": "route-build",
+        "mode": "direct_ssh",
+        "session_creation": "on_select",
+        "host": "build.example.invalid",
+        "port": 22,
+        "user": "operator",
+        "credential_refs": ["credential-main"],
+        "authentication_methods": ["publickey"],
+        "host_trust_ref": "trust-build",
+        "jump_routes": []
+      },
+      {
+        "id": "route-gpu",
+        "mode": "frankenterm_mux",
+        "host": "gpu.example.invalid",
+        "port": 22,
+        "user": "operator",
+        "credential_refs": ["credential-main"],
+        "authentication_methods": ["publickey"],
+        "host_trust_ref": "trust-gpu",
+        "jump_routes": [],
+        "attach_policy": "existing_only"
+      }
+    ],
+    "credentials": [
+      {
+        "id": "credential-main",
+        "algorithm": "ssh-ed25519",
+        "public_fingerprint": "SHA256:ERERERERERERERERERERERERERERERERERERERERERE",
+        "requirement": "matching_private_key",
+        "private_material": "not_included"
+      }
+    ],
+    "host_trust": [
+      {
+        "id": "trust-build",
+        "host": "build.example.invalid",
+        "port": 22,
+        "claimed_source": "mac_known_hosts",
+        "revoked_keys": [],
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ]
+      },
+      {
+        "id": "trust-gpu",
+        "host": "gpu.example.invalid",
+        "port": 22,
+        "claimed_source": "mac_known_hosts",
+        "revoked_keys": [],
+        "pins": [
+          {
+            "algorithm": "ssh-ed25519",
+            "fingerprint": "SHA256://////////////////////////////////////////8"
+          }
+        ]
+      }
+    ],
+    "themes": [
+      {
+        "id": "theme-cobalt",
+        "name": "Cobalt",
+        "foreground": "#EAF2FF",
+        "background": "#10223C",
+        "cursor_foreground": "#10223C",
+        "cursor_background": "#FFFFFF",
+        "cursor_border": "#FFFFFF",
+        "selection_foreground": "#FFFFFF",
+        "selection_background": "#345D91",
+        "accent": "#3B82F6",
+        "ansi": [
+          "#14253D", "#FF6B7A", "#7BD88F", "#FFD166",
+          "#6DA9FF", "#C792EA", "#66D9E8", "#CEDAF0",
+          "#657B99", "#FF9AA5", "#A4E8B2", "#FFE29A",
+          "#9BC3FF", "#DDB4F5", "#98E8F1", "#FFFFFF"
+        ]
+      },
+      {
+        "id": "theme-orchid",
+        "name": "Orchid",
+        "foreground": "#F6EFFF",
+        "background": "#271B35",
+        "cursor_foreground": "#271B35",
+        "cursor_background": "#FFFFFF",
+        "cursor_border": "#FFFFFF",
+        "selection_foreground": "#FFFFFF",
+        "selection_background": "#66457D",
+        "accent": "#D946EF",
+        "ansi": [
+          "#30203E", "#FF718D", "#92D88D", "#F2CC75",
+          "#94A9FF", "#E397EE", "#7BDCD5", "#E2D6ED",
+          "#887496", "#FFA1B3", "#B8E8AE", "#FFE1A0",
+          "#BCC9FF", "#F2BCF8", "#AAF0E9", "#FFFFFF"
+        ]
+      }
+    ],
+    "preferences": {
+      "initial_group_ref": "group-agents",
+      "initial_machine_ref": "machine-build",
+      "connect_on_open": true
+    }
+  }
+}

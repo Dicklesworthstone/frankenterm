@@ -1,0 +1,2 @@
+⚠️  Process zsh didn't exit cleanly
+Exited with code 1.

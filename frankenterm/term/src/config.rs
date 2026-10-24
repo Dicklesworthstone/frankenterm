@@ -17,6 +17,15 @@ pub enum NewlineCanon {
     CarriageReturnAndLineFeed,
 }
 
+/// A consumer's implemented terminal feature surface. The native text profile
+/// deliberately refuses image execution and clipboard capability claims until
+/// those consumers exist; changing TERM alone does not change these protocols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalFeatureProfile {
+    Full,
+    NativeText,
+}
+
 /// Operator policy for OSC 52 clipboard write requests. Per
 /// ft-io922 (cont of ft-2okh0.1.5).
 ///
@@ -132,28 +141,35 @@ impl NewlineCanon {
     }
 
     pub fn canonicalize(self, text: &str) -> String {
-        let target = self.target();
         let mut buf = String::new();
+        self.for_each_chunk(text, |chunk| buf.push_str(chunk));
+        buf
+    }
+
+    /// Visit the canonical bytes without allocating a second complete paste.
+    /// The bounded writer uses the same implementation for its size pass and
+    /// its reserved write pass; desktop paste keeps its existing String API.
+    pub(crate) fn for_each_chunk(self, text: &str, mut emit: impl FnMut(&str)) {
+        let target = self.target();
         let mut iter = text.chars().peekable();
         while let Some(c) = iter.next() {
             match target {
-                None => buf.push(c),
+                None => emit(c.encode_utf8(&mut [0; 4])),
                 Some(canon) => {
                     if c == '\n' {
-                        buf.push_str(canon);
+                        emit(canon);
                     } else if c == '\r' {
-                        buf.push_str(canon);
+                        emit(canon);
                         if let Some('\n') = iter.peek() {
                             // Paired with the \r, so consume this one
                             iter.next();
                         }
                     } else {
-                        buf.push(c);
+                        emit(c.encode_utf8(&mut [0; 4]));
                     }
                 }
             }
         }
-        buf
     }
 }
 
@@ -557,6 +573,43 @@ impl std::fmt::Debug for ScrollbackSnapshotGeneration {
             .field("content_epoch", &"[REDACTED]")
             .field("revision", &self.revision)
             .finish()
+    }
+}
+
+/// What a superseding replacement knows about its cold lineage since the
+/// generation its checkpoint recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackAncestry {
+    /// The generation the caller's checkpoint recorded.
+    pub ancestor: ScrollbackSnapshotGeneration,
+    /// The caller's model applied a scrollback clear after `ancestor`. Every
+    /// committed clear starts a new content epoch derived from the store's
+    /// revision at that moment, which a replayed model cannot name, so the
+    /// published generation may then sit in any later epoch.
+    pub cleared_since: bool,
+}
+
+impl ScrollbackAncestry {
+    /// Whether `published`, a sink's current generation, descends from the
+    /// ancestor as far as the caller's model can tell: the ancestor's epoch at
+    /// a revision no older than its, or another epoch after a replayed clear.
+    pub fn admits(self, published: ScrollbackSnapshotGeneration) -> bool {
+        if published.content_epoch() == self.ancestor.content_epoch() {
+            published.revision() >= self.ancestor.revision()
+        } else {
+            self.cleared_since
+        }
+    }
+
+    /// Whether `committed`, a superseding replacement's receipt, is one the
+    /// sink could have published: past the ancestor in its epoch, or the
+    /// first revision or later of another epoch after a replayed clear.
+    pub fn admits_receipt(self, committed: ScrollbackSnapshotGeneration) -> bool {
+        if committed.content_epoch() == self.ancestor.content_epoch() {
+            committed.revision() > self.ancestor.revision()
+        } else {
+            self.cleared_since && committed.revision() >= 1
+        }
     }
 }
 
@@ -1149,6 +1202,20 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         }))
     }
 
+    /// `store_scrollback_lines` for rows the caller holds behind `Arc`s, as a
+    /// deferred durability writer does (ft-y0gy9). The default clones each
+    /// row and stores the clones; a sink that can encode borrowed rows
+    /// overrides it to skip the clones. Either way the same rows are stored.
+    fn store_scrollback_shared_lines(
+        &self,
+        first_stable_row: StableRowIndex,
+        lines: &[Arc<Line>],
+        max_retained_rows: usize,
+    ) -> usize {
+        let owned: Vec<Line> = lines.iter().map(|line| line.as_ref().clone()).collect();
+        self.store_scrollback_lines(first_stable_row, &owned, max_retained_rows)
+    }
+
     /// Store one marker row in place of `gap_rows` rows (`gap_bytes` charged
     /// bytes) that overload dropped from durability, and return whether it
     /// was durably acknowledged. A sink that keeps durability-gap totals
@@ -1298,6 +1365,24 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         max_retained_rows: usize,
     ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError>;
 
+    /// [`Self::replace_scrollback_prefix`] for a caller whose model is
+    /// authoritative past `ancestry.ancestor`, such as a guardian restore that
+    /// has replayed every output record after its checkpoint. Under the same
+    /// mutation boundary, the sink accepts its currently published generation
+    /// when [`ScrollbackAncestry::admits`] it: rows a dead writer appended,
+    /// published or cleared after the checkpoint are superseded by `prefix`,
+    /// never merged with it. The receipt keeps the published epoch and
+    /// advances the published revision by exactly one. The default accepts
+    /// only the ancestor itself.
+    fn replace_scrollback_prefix_superseding(
+        &self,
+        ancestry: ScrollbackAncestry,
+        prefix: ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+        self.replace_scrollback_prefix(Some(ancestry.ancestor), prefix, max_retained_rows)
+    }
+
     /// Commit a logical clear before returning success.
     ///
     /// Physical reclamation may be retried after this method returns, but
@@ -1347,6 +1432,19 @@ impl TerminalConfigurationRevision {
 /// increments the generation counter appropriately, the changes will be detected
 /// and applied at the next appropriate opportunity.
 pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
+    fn feature_profile(&self) -> TerminalFeatureProfile {
+        TerminalFeatureProfile::Full
+    }
+
+    /// Retained UTF-8 bytes in one cell, including continuations across parse
+    /// batches. Unlimited preserves desktop semantics. A bounded embedding
+    /// must inspect `cell_grapheme_limit_exceeded` after feeding and close a
+    /// model that exceeded the limit; it must not present a truncated cell as
+    /// an exact copy of the remote terminal.
+    fn maximum_cell_grapheme_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Returns a generation counter for the active
     /// configuration.  If the implementation may be
     /// changed at runtime, it must increment the generation
@@ -1534,14 +1632,15 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
 
     /// The default unicode version to assume.
     /// This affects how the width of certain sequences is interpreted.
-    /// At the time of writing, we default to 9 even though the current
-    /// version of unicode is 14.  14 introduced emoji presentation selectors
-    /// that also alter the width of certain sequences, and that is too
-    /// new for most deployed applications.
-    // Coupled with config/src/lib.rs:default_unicode_version
+    /// 14 makes an emoji presentation selector (VS16) widen its character
+    /// to two cells, as Ghostty and kitty do and as the width libraries of
+    /// the agent CLIs this terminal hosts (string-width, unicode-width)
+    /// assume. Under 9, "⚠️" took one cell here and two in the program
+    /// that printed it, shifting the rest of its line.
+    // Coupled with config/src/config.rs:default_unicode_version
     fn unicode_version(&self) -> UnicodeVersion {
         UnicodeVersion {
-            version: 9,
+            version: 14,
             ambiguous_are_wide: false,
             cell_widths: None,
         }

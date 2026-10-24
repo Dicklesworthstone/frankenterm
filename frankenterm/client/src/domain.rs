@@ -1,13 +1,14 @@
 use crate::client::{
-    with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
-    RpcGenerationScope, RpcTopologySnapshot,
+    reserve_client_main_thread, with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind,
+    RpcGenerationAbortGuard, RpcGenerationScope, RpcTopologySnapshot,
 };
 use crate::pane::{ClientPane, ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
 use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
-use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, SpawnV2, SplitPane};
+use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, PduWireIdent, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
+use futures::StreamExt;
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
@@ -25,17 +26,19 @@ use mux::{
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use wezterm_term::TerminalSize;
 
 thread_local! {
@@ -216,12 +219,151 @@ enum ClientTopologySessionError {
     DialectChanged,
 }
 
+/// Whether a failed reattach found a different server session (the remote
+/// mux restarted, or its dialect changed). Such an attachment can never
+/// resume: it is detached, and only a fresh attachment shows the domain again.
+pub(crate) fn reattach_needs_fresh_attachment(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ClientTopologySessionError>(),
+            Some(ClientTopologySessionError::Changed | ClientTopologySessionError::DialectChanged)
+        )
+    })
+}
+
 #[derive(Default)]
 enum ClientTopologySessionState {
     #[default]
     Unbound,
     Bound(ClientTopologySession),
     Revoked(ClientTopologySessionError),
+}
+
+/// The session a layout receipt is scoped to, so the GUI can remember tab
+/// order across restarts. A current-codec server supplies its incarnation. A
+/// codec-46 server has none, but its numeric tab IDs stay valid for the life
+/// of that server process, which outlives many GUI restarts; its tabs are
+/// scoped to a session derived from the durable binding instead. Without this,
+/// order on legacy hosts was never saved and every reopen fell back to the
+/// server's creation order. If such a server restarts, a saved ID can match an
+/// unrelated new tab: the cost is a misplaced tab, never a lost one.
+fn layout_session(
+    state: &ClientTopologySessionState,
+    binding: DurableClientBinding,
+) -> Option<MuxSessionIncarnation> {
+    match state {
+        ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => {
+            Some(*session)
+        }
+        ClientTopologySessionState::Bound(ClientTopologySession::Legacy46) => {
+            let mut hasher = openssl::sha::Sha256::new();
+            hasher.update(b"frankenterm-legacy46-layout-session-v1");
+            hasher.update(&binding.binding_id.as_bytes());
+            let digest = hasher.finish();
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            Some(MuxSessionIncarnation::from_bytes(bytes))
+        }
+        ClientTopologySessionState::Unbound | ClientTopologySessionState::Revoked(_) => None,
+    }
+}
+
+/// What one attempt to publish an attachment's layout receipt achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPublication {
+    Published,
+    /// The domain has no durable layout binding, so there is nothing to
+    /// restore and input is never fenced on it.
+    NoDurableBinding,
+    /// No receipt can be published in the attachment's current state.
+    Unavailable(&'static str),
+}
+
+/// Ends a topology resync's layout restore attempt if the resync exits after
+/// withdrawing the layout receipt but before republishing it, so typed input
+/// is never fenced on a restore that can no longer land (GitHub #132).
+struct LayoutRestoreSettlement<'a> {
+    domain: &'a ClientDomain,
+    inner: &'a ClientInner,
+    receipt_withdrawn: AtomicBool,
+}
+
+impl<'a> LayoutRestoreSettlement<'a> {
+    fn new(domain: &'a ClientDomain, inner: &'a ClientInner) -> Self {
+        Self {
+            domain,
+            inner,
+            receipt_withdrawn: AtomicBool::new(false),
+        }
+    }
+
+    /// Record that the layout receipt is about to be withdrawn.
+    fn receipt_withdrawn(&self) {
+        self.receipt_withdrawn.store(true, Ordering::Release);
+    }
+
+    /// The caller republishes the receipt itself. Consumes the guard, which
+    /// also releases its borrow of the attachment.
+    fn disarm(self) {
+        self.receipt_withdrawn.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for LayoutRestoreSettlement<'_> {
+    fn drop(&mut self) {
+        if self.receipt_withdrawn.load(Ordering::Acquire) {
+            self.domain.end_layout_restore(
+                self.inner,
+                &"the topology resync ended before the layout was restored",
+                true,
+            );
+        }
+    }
+}
+
+/// Focus changes this client advised (SetFocusedPane) whose `PaneFocused`
+/// echo has not arrived yet, oldest first.
+///
+/// Servers broadcast every focus change to all clients, including the one that
+/// made it; current servers do too, not only legacy (codec-46) ones, so this
+/// applies to every attachment. Applying our own late echoes as remote
+/// commands made two quick local focus changes (attach focusing the server's
+/// active tab, then layout restore selecting the saved one) chase each other:
+/// each stale echo moved local focus back and was advised again, and whichever
+/// echo landed last won (ft-ox00h).
+#[derive(Debug, Default)]
+pub(crate) struct FocusAdvisories {
+    in_flight: VecDeque<(PaneId, Instant)>,
+}
+
+impl FocusAdvisories {
+    /// Generous for a loaded SSH proxy; an advisory the server never echoes
+    /// (focus was already there) must not mask a genuine remote change forever.
+    const ECHO_WINDOW: Duration = Duration::from_secs(10);
+    const MAX_IN_FLIGHT: usize = 32;
+
+    pub(crate) fn advised(&mut self, pane_id: PaneId, now: Instant) {
+        if self.in_flight.len() == Self::MAX_IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back((pane_id, now));
+    }
+
+    /// Whether a remote `PaneFocused` should move local focus. An echo of one
+    /// of our own in-flight advisories only confirms what we already applied
+    /// locally (and settles every older advisory); anything else is a genuine
+    /// remote focus change.
+    pub(crate) fn is_remote_change(&mut self, pane_id: PaneId, now: Instant) -> bool {
+        self.in_flight
+            .retain(|(_, at)| now.saturating_duration_since(*at) < Self::ECHO_WINDOW);
+        match self.in_flight.iter().position(|(id, _)| *id == pane_id) {
+            Some(echo) => {
+                self.in_flight.drain(..=echo);
+                false
+            }
+            None => true,
+        }
+    }
 }
 
 pub struct ClientInner {
@@ -235,6 +377,7 @@ pub struct ClientInner {
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    pub(crate) focus_advisories: Mutex<FocusAdvisories>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
     pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
@@ -243,7 +386,79 @@ pub struct ClientInner {
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
     layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
     layout_failed: AtomicBool,
+    user_var_hydration: Mutex<UserVarHydrationState>,
     detached: AtomicBool,
+}
+
+#[derive(Default)]
+struct UserVarHydrationState {
+    generation: Option<NonZeroU64>,
+    running: bool,
+    census_requested: bool,
+    pending_panes: BTreeSet<PaneId>,
+    waiters: Vec<async_channel::Sender<anyhow::Result<()>>>,
+}
+
+impl UserVarHydrationState {
+    fn request(&mut self, pane_id: Option<PaneId>) {
+        match pane_id {
+            Some(pane_id)
+                if !self.census_requested
+                    && (self.pending_panes.len() < 4096
+                        || self.pending_panes.contains(&pane_id)) =>
+            {
+                self.pending_panes.insert(pane_id);
+            }
+            Some(_) if self.census_requested => {}
+            // A burst beyond the bounded targeted set becomes one complete
+            // census rather than losing a refresh or retaining more IDs.
+            _ => {
+                self.census_requested = true;
+                self.pending_panes.clear();
+            }
+        }
+    }
+}
+
+fn user_var_snapshot_may_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::client::RemoteRejectionError>()
+        .is_some_and(|error| {
+            error.response.request_ident == codec::GetPaneUserVarsV1::IDENT
+                && error.response.effect == codec::MuxErrorEffect::NOT_APPLIED
+                && error.response.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF
+        })
+}
+
+struct UserVarHydrationGuard {
+    inner: Arc<ClientInner>,
+    rpc: RpcGenerationScope,
+    armed: bool,
+}
+
+impl Drop for UserVarHydrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let waiters = {
+            let mut state = lock_or_recover(&self.inner.user_var_hydration, "user_var_hydration");
+            if state.generation != self.rpc.connection_generation() {
+                return;
+            }
+            state.running = false;
+            state.census_requested = false;
+            state.pending_panes.clear();
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.try_send(Err(anyhow!(
+                "user-variable hydration failed or was cancelled"
+            )));
+        }
+        self.rpc
+            .abort_exact_generation("user-variable hydration failed or was cancelled");
+    }
 }
 
 /// A committed attachment's remote identities. Construction is private: a
@@ -1825,6 +2040,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
+            focus_advisories: Mutex::new(FocusAdvisories::default()),
             reliable_input_queue: ReliableInputQueue::new(),
             resize_coordinator: ClientResizeCoordinator::new(),
             fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
@@ -1833,6 +2049,7 @@ impl ClientInner {
             layout_tab_owners: Mutex::new(HashMap::new()),
             layout_snapshot: Mutex::new(None),
             layout_failed: AtomicBool::new(false),
+            user_var_hydration: Mutex::new(UserVarHydrationState::default()),
             detached: AtomicBool::new(false),
         }
     }
@@ -2915,17 +3132,23 @@ impl ClientDomain {
         &self,
         mux: &Arc<Mux>,
         inner: &Arc<ClientInner>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<LayoutPublication> {
         let Some(binding) = self.durable_layout_binding() else {
-            return Ok(());
+            return Ok(LayoutPublication::NoDurableBinding);
         };
-        let session = match *lock_or_recover(&inner.topology_session, "topology_session") {
-            ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => session,
-            _ => return Ok(()),
+        let Some(session) = layout_session(
+            &lock_or_recover(&inner.topology_session, "topology_session"),
+            binding,
+        ) else {
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment has no current topology session",
+            ));
         };
         let rpc = inner.client.rpc_scope();
         if !rpc.is_available() {
-            return Ok(());
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment's mux RPC is unavailable",
+            ));
         }
         rpc.commit_sync(
             RpcConsumerKind::TopologySnapshot,
@@ -2968,17 +3191,50 @@ impl ClientDomain {
             },
         )
         .map_err(anyhow::Error::new)??;
-        Ok(())
+        Ok(LayoutPublication::Published)
     }
 
+    /// Publish this attachment's layout receipt, or record that it cannot be
+    /// published. Either way the restore attempt is over, so typed input stops
+    /// being fenced on it (GitHub #132).
     fn refresh_layout_snapshot(&self, mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
-        if let Err(error) = self.publish_layout_snapshot(mux, inner) {
-            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
-            inner.layout_failed.store(true, Ordering::Release);
-            log::warn!("remote layout publication unavailable: {error:#}");
-        } else {
-            inner.layout_failed.store(false, Ordering::Release);
+        match self.publish_layout_snapshot(mux, inner) {
+            Ok(LayoutPublication::Published | LayoutPublication::NoDurableBinding) => {
+                inner.layout_failed.store(false, Ordering::Release);
+                self.notify_layout_ready();
+            }
+            // Nothing could be published now. A receipt published earlier
+            // stays usable; without one, no restore lands until a later
+            // refresh, so the fence must end here.
+            Ok(LayoutPublication::Unavailable(reason)) => {
+                self.end_layout_restore(inner, &reason, false);
+            }
+            Err(error) => self.end_layout_restore(inner, &format!("{error:#}"), true),
         }
+    }
+
+    /// End this attachment's layout restore attempt without a new receipt,
+    /// withdrawing the current receipt when `withdraw_receipt` is set.
+    /// `layout_restore_pending` reports `false` until a later refresh
+    /// publishes a receipt.
+    fn end_layout_restore(
+        &self,
+        inner: &ClientInner,
+        reason: &dyn std::fmt::Display,
+        withdraw_receipt: bool,
+    ) {
+        if withdraw_receipt {
+            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+        }
+        inner.layout_failed.store(true, Ordering::Release);
+        log::warn!(
+            "remote layout publication unavailable for domain {}: {reason}",
+            self.local_domain_id
+        );
+        self.notify_layout_ready();
+    }
+
+    fn notify_layout_ready(&self) {
         if let Some(observer) = LAYOUT_READY_OBSERVER.get() {
             observer(self.local_domain_id);
         }
@@ -3270,6 +3526,8 @@ impl ClientDomain {
             .client
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
+        Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
+        Self::start_pane_push_tracking(&expected, rpc.clone());
         Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
@@ -3286,6 +3544,240 @@ impl ClientDomain {
             return Self::sync_remote_topology(mux, self, expected, rpc, None).await;
         }
         Ok(false)
+    }
+
+    /// Start or coalesce a complete metadata census after pane mappings and
+    /// transport readiness have committed. Only four bounded pane replies can
+    /// be outstanding, regardless of server population. Metadata convergence
+    /// therefore continues beyond the fixed connection-bootstrap timeout.
+    fn request_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, None)
+    }
+
+    pub(crate) fn request_pane_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, Some(pane_id))?;
+        Ok(())
+    }
+
+    fn request_user_var_hydration_inner(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: Option<PaneId>,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        let (waiter, completion) = async_channel::bounded(1);
+        if !rpc
+            .agreed_codec_version()
+            .is_some_and(|version| version >= codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION)
+        {
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "legacy_unavailable")
+                .increment(1);
+            log::debug!(
+                "remote codec has no authoritative user-variable snapshot protocol; initial background values remain unavailable until updated"
+            );
+            let _ = waiter.try_send(Ok(()));
+            return Ok(completion);
+        }
+        let generation = rpc
+            .connection_generation()
+            .context("user-variable hydration has no live generation")?;
+        let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+        ensure!(
+            rpc.is_ready(),
+            "user-variable hydration requires committed RPC readiness"
+        );
+        if state.generation != Some(generation) {
+            *state = UserVarHydrationState {
+                generation: Some(generation),
+                ..UserVarHydrationState::default()
+            };
+        }
+        state.waiters.retain(|waiter| !waiter.is_closed());
+        ensure!(
+            state.waiters.len() < 64,
+            "user-variable hydration waiter limit reached"
+        );
+        let reservation = if state.running {
+            None
+        } else {
+            Some(reserve_client_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4096,
+                "user-variable hydration census",
+            )?)
+        };
+        state.waiters.push(waiter);
+        state.request(pane_id);
+        if let Some(reservation) = reservation {
+            state.running = true;
+            drop(state);
+            let mut guard = UserVarHydrationGuard {
+                inner: Arc::clone(&inner),
+                rpc: rpc.clone(),
+                armed: true,
+            };
+            reservation
+                .spawn(async move {
+                    let result = Self::hydrate_user_vars(&mux, &inner, &rpc, &mut guard).await;
+                    if let Err(error) = result {
+                        metrics::counter!("mux.client.user_vars.hydration", "outcome" => "failed")
+                            .increment(1);
+                        log::error!("remote user-variable hydration failed: {error:#}");
+                    }
+                })
+                .detach();
+        }
+        Ok(completion)
+    }
+
+    async fn hydrate_user_vars(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        guard: &mut UserVarHydrationGuard,
+    ) -> anyhow::Result<()> {
+        let current = || {
+            rpc.is_ready()
+                && !inner.is_detached()
+                && mux.get_domain(inner.local_domain_id).is_some_and(|domain| {
+                    domain
+                        .downcast_ref::<Self>()
+                        .is_some_and(|domain| domain.inner_is_current(inner))
+                })
+        };
+        loop {
+            ensure!(current(), "user-variable hydration attachment retired");
+            let (full_census, targets) = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed"
+                );
+                (
+                    std::mem::take(&mut state.census_requested),
+                    std::mem::take(&mut state.pending_panes),
+                )
+            };
+            let mut panes = {
+                let mappings = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+                if full_census {
+                    mappings
+                        .iter()
+                        .map(|(remote, local)| (*remote, *local))
+                        .collect::<Vec<_>>()
+                } else {
+                    targets
+                        .into_iter()
+                        .filter_map(|remote| mappings.get(&remote).map(|local| (remote, *local)))
+                        .collect()
+                }
+            };
+            panes.sort_unstable_by_key(|(remote, _)| *remote);
+            let mut requests = futures::stream::iter(panes.into_iter().map(|(remote, local)| {
+                Self::hydrate_one_pane_user_vars(mux, inner, rpc, remote, local)
+            }))
+            .buffer_unordered(4);
+            let mut busy = Vec::new();
+            while let Some(result) = requests.next().await {
+                busy.extend(result?);
+                ensure!(
+                    current(),
+                    "user-variable hydration attachment retired during reply application"
+                );
+            }
+            let waiters = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed before completion"
+                );
+                // A pane printing continuously can keep its snapshot busy
+                // through every attempt. Ask it again on the next pass; it
+                // used to fail the whole census, so no pane got its values
+                // (ft-ypblq).
+                for remote in busy {
+                    state.request(Some(remote));
+                }
+                if state.census_requested || !state.pending_panes.is_empty() {
+                    continue;
+                }
+                state.running = false;
+                guard.armed = false;
+                std::mem::take(&mut state.waiters)
+            };
+            for waiter in waiters {
+                let _ = waiter.try_send(Ok(()));
+            }
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "complete")
+                .increment(1);
+            return Ok(());
+        }
+    }
+
+    /// Returns `Some(remote)` when the pane's snapshot was still busy after
+    /// every attempt.
+    async fn hydrate_one_pane_user_vars(
+        mux: &Mux,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        remote: PaneId,
+        local: PaneId,
+    ) -> anyhow::Result<Option<PaneId>> {
+        // Scheduler and outbound quota pressure is temporary and explicitly
+        // retryable. Keep the same four census slots during backoff so a busy
+        // server cannot turn one census into an unbounded retry population.
+        for attempt in 0..8 {
+            ensure!(rpc.is_ready(), "user-variable hydration generation retired");
+            let belongs = mux.get_pane(local).is_some_and(|pane| {
+                pane.downcast_ref::<ClientPane>().is_some_and(|pane| {
+                    pane.belongs_to_client(inner) && pane.remote_pane_id() == remote
+                })
+            });
+            if !belongs {
+                return Ok(None);
+            }
+            match rpc
+                .get_pane_user_vars_v1(codec::GetPaneUserVarsV1 { pane_id: remote })
+                .await
+            {
+                Ok(response) => {
+                    ensure!(
+                        response.pane_id == remote,
+                        "user-variable reply changed its requested pane identity"
+                    );
+                    return Ok(None);
+                }
+                Err(error) if attempt == 7 && user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "deferred")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot still busy; asking again next pass: {error:#}");
+                    return Ok(Some(remote));
+                }
+                Err(error) if user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "backoff")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot temporarily rejected: {error:#}");
+                    promise::spawn::sleep(std::time::Duration::from_millis(
+                        (50_u64 << attempt).min(2000),
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("hydrating remote pane {remote} user variables"));
+                }
+            }
+        }
+        unreachable!("the final metadata attempt returns its response or error")
     }
 
     async fn sync_remote_topology(
@@ -3309,12 +3801,17 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
+        // Applying the topology withdraws the layout receipt, which fences
+        // typed input until `refresh_layout_snapshot` below republishes it.
+        // Every earlier exit after the withdrawal ends the restore instead.
+        let layout_settlement = LayoutRestoreSettlement::new(domain, &inner);
         let topology_current = rpc
             .with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
                 if !incarnation_is_current() {
                     bail!("client attachment retired before coherent topology application");
                 }
                 let _remote_application = inner.begin_remote_metadata_application()?;
+                layout_settlement.receipt_withdrawn();
                 Self::process_topology_snapshot(
                     &mux,
                     Arc::clone(&inner),
@@ -3343,8 +3840,61 @@ impl ClientDomain {
                 Ok(true)
             })
             .map_err(anyhow::Error::new)??;
+        layout_settlement.disarm();
         domain.refresh_layout_snapshot(&mux, &inner);
+        if prepared && rpc.is_ready() {
+            Self::request_user_var_hydration(mux, inner, rpc.clone())?;
+        }
         Ok(prepared)
+    }
+
+    /// Ask the server about every pane of this attachment, once the connection
+    /// is ready, so that it pushes their later changes.
+    ///
+    /// A current-codec server pushes a pane's title, working directory and
+    /// output only to a session that has already asked about that pane. The
+    /// paint path asks for the panes it draws; without this pass a tab that is
+    /// attached or reconnected behind another tab keeps the title it had at
+    /// that moment until it is first shown (ft-pzu8b). Four requests are
+    /// outstanding at a time, whatever the population, and their replies are
+    /// not needed: the changes arrive as ordinary pushes.
+    pub(crate) fn start_pane_push_tracking(inner: &Arc<ClientInner>, rpc: RpcGenerationScope) {
+        if !crate::pane::needs_push_tracking_request(rpc.agreed_codec_version()) {
+            return;
+        }
+        let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            return;
+        }
+        panes.sort_unstable();
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4096,
+            "pane push tracking",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // Not fatal: each pane still asks when it is first painted.
+                log::warn!("remote panes will be tracked as they are shown: {error:#}");
+                return;
+            }
+        };
+        reservation
+            .spawn(async move {
+                let mut requests = futures::stream::iter(panes.into_iter().map(|pane_id| {
+                    rpc.get_pane_render_changes(codec::GetPaneRenderChanges { pane_id })
+                }))
+                .buffer_unordered(4);
+                while requests.next().await.is_some() {
+                    if !rpc.is_ready() {
+                        break;
+                    }
+                }
+            })
+            .detach();
     }
 
     pub(crate) fn flush_bootstrap_resizes(mux: &Mux, inner: &ClientInner) {
@@ -4905,6 +5455,8 @@ impl ClientDomain {
         }
         .await;
         bootstrap_result?;
+        Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
+        Self::start_pane_push_tracking(&inner, rpc.clone());
         Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
@@ -5131,7 +5683,7 @@ impl Domain for ClientDomain {
             })?;
             let rpc = inner.client.rpc_scope();
             ensure!(
-                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id,).await?,
+                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id).await?,
                 "client attachment retired while coalescing an attach request"
             );
             return Ok(());
@@ -5277,6 +5829,50 @@ mod tests {
             .build()
             .expect("build client-domain test runtime")
             .block_on(future)
+    }
+
+    #[test]
+    fn own_focus_echoes_never_move_local_focus() {
+        // The ft-ox00h sequence against a legacy server: attach focuses the
+        // server's active pane 0, layout restore then selects the saved pane 2,
+        // and the server echoes both, in order.
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(0, t0);
+        focus.advised(2, t0);
+        assert!(!focus.is_remote_change(0, t0), "stale echo of pane 0");
+        assert!(!focus.is_remote_change(2, t0), "echo of the restored pane");
+        // Another client focusing a pane is still applied.
+        assert!(focus.is_remote_change(5, t0));
+        // A later echo of a settled advisory is a genuine change again.
+        assert!(focus.is_remote_change(0, t0));
+    }
+
+    #[test]
+    fn a_newer_echo_settles_older_unechoed_advisories() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        // The server does not echo a focus it already had, so 1 never returns.
+        focus.advised(1, t0);
+        focus.advised(3, t0);
+        assert!(!focus.is_remote_change(3, t0));
+        assert!(
+            focus.is_remote_change(1, t0),
+            "pane 1's advisory was superseded, so a later focus there is remote"
+        );
+    }
+
+    #[test]
+    fn unechoed_focus_advisories_expire() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(4, t0);
+        let later = t0 + FocusAdvisories::ECHO_WINDOW;
+        assert!(focus.is_remote_change(4, later));
+        for pane in 0..(FocusAdvisories::MAX_IN_FLIGHT + 8) {
+            focus.advised(pane, t0);
+        }
+        assert_eq!(focus.in_flight.len(), FocusAdvisories::MAX_IN_FLIGHT);
     }
 
     #[test]
@@ -6072,6 +6668,444 @@ mod tests {
             assert_eq!(mappings.get_remote(&local), Some(&remote));
         }
         assert_eq!(mappings.len(), 3);
+    }
+
+    #[test]
+    fn ready_connection_asks_about_every_pane_four_at_a_time() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_041), config);
+        let inner = Arc::new(ClientInner::new(91_041, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        // The pass asks by remote pane id. None of these panes is ever painted.
+        for index in 0..50 {
+            lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+                .insert(10_000 + index, 20_000 + index);
+        }
+
+        peer.replace_ready_generation(&inner.client, codec::LEGACY46_CODEC_VERSION)
+            .unwrap();
+        ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+        pump();
+        assert!(
+            peer.is_empty(),
+            "a codec 46 server is not asked about panes that are not painted"
+        );
+
+        // The initial attachment, then a reconnect: the new server session
+        // tracks nothing until it is asked again.
+        for _ in 0..2 {
+            peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                .unwrap();
+            ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+            assert!(
+                peer.is_empty(),
+                "starting the pass must enqueue one worker, not one task per pane"
+            );
+            pump();
+            let mut asked = HashSet::new();
+            for _ in 0..50 {
+                assert!(
+                    (1..=4).contains(&peer.queued_len()),
+                    "at most four requests may be outstanding: {}",
+                    peer.queued_len()
+                );
+                let request =
+                    promise::spawn::block_on(peer.respond_next_registration_request()).unwrap();
+                let codec::Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }) =
+                    request
+                else {
+                    panic!("the pass sends only pane polls, got {:?}", request);
+                };
+                assert!(
+                    asked.insert(pane_id),
+                    "pane {} was asked about twice",
+                    pane_id
+                );
+                pump();
+            }
+            assert_eq!(asked, (10_000..10_050).collect());
+            assert!(peer.is_empty());
+        }
+    }
+
+    #[test]
+    fn background_user_variable_hydration_covers_large_population_and_reconnection_with_four_slots()
+    {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_038), config);
+        let inner = Arc::new(ClientInner::new(91_038, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        for index in 0..600 {
+            let remote = 10_000 + index;
+            let local = 20_000 + index;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            // Pane registration independently sends the initial palette and
+            // the pane's bootstrap poll. Drain that setup one pane at a time
+            // before measuring census traffic.
+            let requests = peer.answer_pane_registration(&pump);
+            assert!(requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))));
+        }
+        assert!(peer.is_empty());
+        for reconnect in [false, true] {
+            if reconnect {
+                peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                    .unwrap();
+            }
+            let rpc = inner.client.rpc_scope();
+            let first = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            let coalesced = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            assert!(
+                rpc.is_ready(),
+                "background hydration must not revoke attachment readiness"
+            );
+            assert!(
+                first.try_recv().is_err(),
+                "the completion receipt must await the census"
+            );
+            assert!(
+                peer.is_empty(),
+                "starting a census must enqueue one worker, not one task per pane"
+            );
+            pump();
+            assert_eq!(peer.queued_len(), 4);
+            let mut observed = HashSet::new();
+            for _ in 0..600 {
+                assert!(
+                    peer.queued_len() <= 4,
+                    "census RPC concurrency must stay bounded as population grows"
+                );
+                let pane_id = promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new(),
+                    },
+                ))
+                .unwrap();
+                assert!(
+                    observed.insert(pane_id),
+                    "coalescing before worker start must not repeat initial snapshots"
+                );
+                pump();
+            }
+            assert_eq!(observed, (10_000..10_600).collect());
+            first.try_recv().unwrap().unwrap();
+            coalesced.try_recv().unwrap().unwrap();
+            assert!(peer.is_empty());
+            assert!(!lock_or_recover(&inner.user_var_hydration, "test metadata worker").running);
+            for _ in 0..1000 {
+                ClientDomain::request_pane_user_var_hydration(
+                    Arc::clone(&mux),
+                    Arc::clone(&inner),
+                    rpc.clone(),
+                    10_023,
+                )
+                .unwrap();
+            }
+            pump();
+            assert_eq!(
+                peer.queued_len(),
+                1,
+                "a burst of new keys in one pane must not rescan the other 599 panes"
+            );
+            assert_eq!(
+                promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new()
+                    },
+                ))
+                .unwrap(),
+                10_023
+            );
+            pump();
+            assert!(peer.is_empty());
+        }
+    }
+
+    /// ft-ypblq: a pane printing continuously can keep its user-variable
+    /// snapshot busy through every attempt. It is asked again on the next
+    /// pass; the other panes are not failed with it, nor asked again.
+    #[test]
+    fn busy_user_variable_snapshot_is_asked_again_without_failing_the_census() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_040), config);
+        let inner = Arc::new(ClientInner::new(91_040, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        let (flooding, quiet) = (10_000, 10_001);
+        for remote in [flooding, quiet] {
+            let local = remote + 10_000;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            peer.answer_pane_registration(&pump);
+        }
+        assert!(peer.is_empty());
+        let rpc = inner.client.rpc_scope();
+        let census =
+            ClientDomain::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&inner), rpc)
+                .unwrap();
+        // The backoff sleeps are real: one pass of 8 attempts takes ~5 s.
+        let next_request = || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while peer.is_empty() {
+                assert!(Instant::now() < deadline, "no user-variable request");
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The flooding pane is refused for one full pass of 8 attempts, then
+        // answered on the next pass.
+        let mut flooding_asks = 0;
+        let mut quiet_asks = 0;
+        while flooding_asks < 9 {
+            next_request();
+            let refuse = flooding_asks < 8;
+            let (pane, _) = promise::spawn::block_on(
+                peer.answer_next_user_vars(move |pane| refuse && pane == flooding),
+            )
+            .unwrap();
+            if pane == flooding {
+                flooding_asks += 1;
+            } else {
+                assert_eq!(pane, quiet);
+                quiet_asks += 1;
+            }
+            pump();
+            if flooding_asks < 9 {
+                assert!(
+                    census.try_recv().is_err(),
+                    "the census waits for every pane, and a busy one does not fail it"
+                );
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_or_recover(&inner.user_var_hydration, "test metadata worker").running {
+            assert!(Instant::now() < deadline, "census did not complete");
+            pump();
+        }
+        assert_eq!(quiet_asks, 1, "the quiet pane is not asked again");
+        census.try_recv().unwrap().unwrap();
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn user_variable_refresh_targets_coalesce_and_overflow_to_one_complete_census() {
+        let mut state = UserVarHydrationState::default();
+        for pane in 0..4096 {
+            state.request(Some(pane));
+        }
+        state.request(Some(0));
+        assert_eq!(state.pending_panes.len(), 4096);
+        assert!(!state.census_requested);
+        state.request(Some(4096));
+        assert!(state.census_requested);
+        assert!(
+            state.pending_panes.is_empty(),
+            "overflow must retain a full census obligation without an unbounded ID set"
+        );
+        state.request(Some(4097));
+        assert!(
+            state.pending_panes.is_empty(),
+            "a pending census subsumes later targeted requests"
+        );
+        state.census_requested = false;
+        state.request(Some(3));
+        state.request(None);
+        assert!(state.census_requested);
+        assert!(state.pending_panes.is_empty());
+    }
+
+    #[test]
+    fn user_variable_hydration_skips_old_codecs_and_only_retries_typed_safe_rejections() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(91_039),
+            ClientDomainConfig::Unix(UnixDomain::default()),
+        );
+        peer.replace_ready_generation(&client, codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION - 1)
+            .unwrap();
+        let inner = Arc::new(ClientInner::new(91_039, client, None, None, false));
+        ClientDomain::request_user_var_hydration(
+            Arc::clone(&mux),
+            Arc::clone(&inner),
+            inner.client.rpc_scope(),
+        )
+        .unwrap()
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        assert!(
+            peer.is_empty(),
+            "older codecs must never receive the additive metadata PDU"
+        );
+        let rejection = |response: codec::ErrorResponse| {
+            crate::client::remote_rejection_error(
+                "get_pane_user_vars_v1",
+                codec::GetPaneUserVarsV1::IDENT,
+                &response,
+            )
+        };
+        assert!(user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::invalid_request(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::ListPanes::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&anyhow!(
+            "unclassified transport failure"
+        )));
+    }
+
+    /// A registered domain with a durable layout binding whose attachment has
+    /// published no layout receipt, so typed input is fenced on its restore.
+    fn layout_fenced_test_domain(
+        mux: &Arc<Mux>,
+        local_domain_id: DomainId,
+    ) -> (Arc<ClientInner>, Arc<ClientDomain>) {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x45; 16])) })
+        }
+        let inner = test_client_inner(local_domain_id);
+        let domain = register_test_client_domain(mux, &inner);
+        asupersync_block_on(domain.resolve_layout_binding_with(ready))
+            .expect("durable layout binding");
+        assert!(
+            domain.layout_restore_pending(),
+            "an unpublished restore fences typed input"
+        );
+        (inner, domain)
+    }
+
+    /// GitHub #132: a refresh that could not publish a layout receipt (here the
+    /// attachment has no topology session) left the restore pending for good,
+    /// so the GUI dropped every key typed into the domain's panes.
+    #[test]
+    fn layout_refresh_that_cannot_publish_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_101);
+
+        assert!(matches!(
+            domain.publish_layout_snapshot(&mux, &inner),
+            Ok(LayoutPublication::Unavailable(_))
+        ));
+        assert!(domain.layout_restore_pending());
+        domain.refresh_layout_snapshot(&mux, &inner);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
+    }
+
+    /// GitHub #132: a topology resync withdraws the layout receipt before it
+    /// applies the topology, and used to republish it only on full success. Any
+    /// exit in between must end the restore instead of fencing input forever.
+    #[test]
+    fn topology_resync_that_exits_before_republishing_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_102);
+
+        // An exit before the withdrawal, or after the caller republished,
+        // leaves the restore state alone.
+        drop(LayoutRestoreSettlement::new(&domain, &inner));
+        let republished = LayoutRestoreSettlement::new(&domain, &inner);
+        republished.receipt_withdrawn();
+        republished.disarm();
+        assert!(!inner.layout_failed.load(Ordering::Acquire));
+        assert!(domain.layout_restore_pending());
+
+        let interrupted = LayoutRestoreSettlement::new(&domain, &inner);
+        interrupted.receipt_withdrawn();
+        drop(interrupted);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
@@ -6874,6 +7908,37 @@ mod tests {
         );
         assert_eq!(mux.iter_windows().len(), 2);
         assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn layout_session_scopes_legacy_tabs_to_their_binding() {
+        let binding = |byte| DurableClientBinding {
+            fingerprint: ClientEndpointFingerprint([byte; 32]),
+            binding_id: codec::DomainBindingId::from_bytes([byte; 16]),
+        };
+        let legacy = ClientTopologySessionState::Bound(ClientTopologySession::Legacy46);
+        let first = layout_session(&legacy, binding(0x21)).expect("legacy tabs get a session");
+        // Stable across GUI restarts: the same binding derives the same session.
+        assert_eq!(layout_session(&legacy, binding(0x21)), Some(first));
+        // Two legacy hosts never alias each other's numeric tab IDs.
+        assert_ne!(layout_session(&legacy, binding(0x22)), Some(first));
+        assert_ne!(first.as_bytes(), [0; 16]);
+
+        let incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
+        let current =
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(incarnation));
+        assert_eq!(layout_session(&current, binding(0x21)), Some(incarnation));
+        assert_eq!(
+            layout_session(&ClientTopologySessionState::Unbound, binding(0x21)),
+            None
+        );
+        assert_eq!(
+            layout_session(
+                &ClientTopologySessionState::Revoked(ClientTopologySessionError::Changed),
+                binding(0x21)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7685,6 +8750,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_different_server_session_needs_a_fresh_attachment() {
+        // As the reconnect loop sees it: the typed error under the snapshot
+        // application context.
+        for fresh in [
+            ClientTopologySessionError::Changed,
+            ClientTopologySessionError::DialectChanged,
+        ] {
+            let error = anyhow::Error::new(fresh).context("applying coherent topology snapshot");
+            assert!(reattach_needs_fresh_attachment(&error), "{:#}", error);
+        }
+        let reserved = anyhow::Error::new(ClientTopologySessionError::ReservedIdentity)
+            .context("applying coherent topology snapshot");
+        assert!(!reattach_needs_fresh_attachment(&reserved));
+        assert!(!reattach_needs_fresh_attachment(&anyhow!(
+            "remote mux session identity changed; a fresh domain attachment is required"
+        )));
+    }
+
+    #[test]
     fn topology_session_dialect_change_cannot_promote_legacy_numeric_ids() {
         let current = ClientTopologySession::Current(MuxSessionIncarnation::from_bytes([0xa4; 16]));
         for (first, next) in [
@@ -7768,12 +8852,23 @@ mod tests {
         // Registration separately schedules the initial palette update. Drain
         // and identify that request before measuring resize traffic; otherwise
         // a later executor tick can mistake palette setup for a resize echo.
-        while executor.try_tick().unwrap() {}
-        for _ in 0..tab_count {
-            let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-            assert!(matches!(request, codec::Pdu::SetPalette(_)));
-        }
-        while executor.try_tick().unwrap() {}
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            tab_count
+        );
+        // Each pane the snapshot created polls without being painted: only
+        // then does the server push its later title and output changes.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::GetPaneRenderChanges(_)))
+                .count(),
+            tab_count
+        );
         assert!(peer.is_empty(), "pane registration setup must be settled");
         let tab = mux
             .get_tab(inner.remote_to_local_tab_id(51).unwrap())
@@ -7938,14 +9033,14 @@ mod tests {
         }
         mux.activate_tab_exact_in_window(window_id, &tabs[2], false)
             .expect("activate third attached tab");
-        while executor.try_tick().unwrap() {}
-        for _ in 0..3 {
-            assert!(matches!(
-                promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
-                codec::Pdu::SetPalette(_)
-            ));
-        }
-        while executor.try_tick().unwrap() {}
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            3
+        );
         assert!(peer.is_empty());
 
         // The observed bridge changed B's pixels and DPI, keeping 80x24 cells.

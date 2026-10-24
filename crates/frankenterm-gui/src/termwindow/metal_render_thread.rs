@@ -587,6 +587,31 @@ impl TermWindow {
         Ok(())
     }
 
+    /// The selection share of a Metal frame, which the WebGpu pane painter
+    /// does while drawing: reconcile each visible pane's selection with its
+    /// changed rows, and stage the coordinates the frame shows, so that mouse
+    /// selection resolves against them once the frame is presented. Runs
+    /// before the frame's damage generation is captured: reconciling can mark
+    /// rows dirty.
+    pub(super) fn stage_metal_selection_frames(&mut self) {
+        for state in self.pane_state.borrow_mut().values_mut() {
+            state.selection_frame.begin_attempt();
+        }
+        for pos in self.get_panes_to_render() {
+            if let Err(err) = self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, None) {
+                log::debug!(
+                    "Metal selection reconcile for pane {}: {err:#}",
+                    pos.pane.pane_id()
+                );
+                continue;
+            }
+            let stamp = self.selection_frame_stamp_for_position(&pos.pane, &pos);
+            if let Some(mut state) = self.pane_state(pos.pane.pane_id()) {
+                state.selection_frame.stage(stamp, stamp, true);
+            }
+        }
+    }
+
     /// What the render thread's next frame needs from this window.
     pub(super) fn metal_frame_request(&mut self) -> MetalFrameRequest {
         let (mut panes, splits) = self.metal_window_panes();
@@ -612,8 +637,7 @@ impl TermWindow {
             clear,
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
             font_scale: self.fonts.get_font_scale(),
-            opaque: self.window_background.is_empty()
-                && self.config.window_background_opacity >= 1.0,
+            opaque: self.config.window_content_is_opaque(),
         }
     }
 
@@ -624,7 +648,7 @@ impl TermWindow {
             pixel_width: pixels(self.dimensions.pixel_width),
             pixel_height: pixels(self.dimensions.pixel_height),
             dpi: pixels(self.dimensions.dpi),
-            occluded: false,
+            occluded: self.occluded,
             focused: self.focused.is_some(),
         }
     }
@@ -640,6 +664,7 @@ impl TermWindow {
     /// draws: publish what the frame needs and wake the thread. The damage up
     /// to here is the render thread's to draw.
     pub(super) fn publish_metal_frame(&mut self) -> bool {
+        self.stage_metal_selection_frames();
         let captured_generation = self.damage_generation;
         self.begin_metal_font_read();
         let request = self.metal_frame_request();
@@ -648,6 +673,9 @@ impl TermWindow {
         };
         render.post_surface(self.metal_surface());
         render.publish(request);
+        // The render thread draws this request next: mouse selection resolves
+        // against the coordinates staged for it.
+        self.settle_presented_selection_frames(captured_generation.value, 0);
         let settlement = super::apply_presented_render_attempt(
             &mut self.dirty_lines,
             self.damage_generation,
@@ -815,6 +843,49 @@ mod tests {
             Arc::clone(output),
         )
         .unwrap()
+    }
+
+    /// ft-yccm0.2.5, the cache_gpu_handle fence on `MetalPanes.frames`: a
+    /// draw keeps only the frames of the panes it drew, so a pane no longer
+    /// drawn (a hidden tab, a closed split) drops its frame and the glyph
+    /// sources and image slices the frame held.
+    #[test]
+    fn a_pane_no_longer_drawn_drops_its_frame() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config), 144).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let (left, right) = (TestPane::new(9101), TestPane::new(9102));
+        let both = [
+            pane_request(&left, PixelRect::new(0, 0, 640, 768), true),
+            pane_request(&right, PixelRect::new(640, 0, 640, 768), false),
+        ];
+        let mut panes = MetalPanes::default();
+        let mut draw = |requests: &[MetalPaneRequest]| {
+            panes.draw(
+                requests,
+                &[],
+                None,
+                ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+                &fonts,
+                &metrics,
+                &renderer,
+                |frame, _| frame.is_some(),
+            );
+            panes.kept_frames()
+        };
+        assert_eq!(draw(&both), vec![9101, 9102]);
+        assert_eq!(
+            draw(&both[..1]),
+            vec![9101],
+            "the hidden pane's frame is dropped"
+        );
+        assert_eq!(
+            draw(&both),
+            vec![9101, 9102],
+            "and rebuilt when drawn again"
+        );
     }
 
     /// Waits up to 20 s for `done`.

@@ -137,11 +137,16 @@ Columns:
   FrankenTerm config schema has diverged from upstream wezterm's
   Lua-based config model. Lua removal lives in this crate and
   `lua-api-crates` / `luahelper`.
-- **`lua-api-crates`** — workspace member; the inner crates are
-  per-Lua-API-surface stubs. The package field is omitted from the
-  top-level `Cargo.toml`. Classified `forked-light` because the
-  directory structure is preserved but most Lua APIs are
-  stubbed/disabled.
+- **`lua-api-crates`** — workspace member; one crate per Lua API surface.
+  The package field is omitted from the top-level `Cargo.toml`. Classified
+  `forked-light`. mux-lua, termwiz-funcs, url-funcs and window-funcs came
+  with the initial import. On 2026-10-14 color-funcs, filesystem,
+  procinfo-funcs, serde-funcs, share-data, spawn-funcs and ssh-funcs were
+  ported from upstream `68529642c` (2026-09-21) to mlua 0.12, along with the
+  `wezterm.time` value type, `strftime` and `sleep_ms` in `config/src/lua.rs`.
+  They run their blocking work on `promise` worker threads instead of smol.
+  The battery, plugin (git2) and logging crates and `time:sun_times` are
+  not ported; FrankenTerm's own `log_*` functions cover logging.
 - **Home-grown crates** — `gui-subcommands` and `scripting` are
   FrankenTerm-original. They are not derived from wezterm sources.
 

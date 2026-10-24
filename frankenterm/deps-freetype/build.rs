@@ -132,34 +132,30 @@ fn freetype() {
 
     let target = env::var("TARGET").unwrap();
 
+    // Each option must be found exactly once: a silent no-op after a FreeType
+    // update would quietly drop, for example, PNG color glyphs. The former
+    // `TT_CONFIG_OPTION_SUBPIXEL_HINTING  2` -> `3` edit is gone: FreeType
+    // 2.13 removed the numeric modes, so it had stopped matching, and the
+    // option is defined (v40 interpreter) by default.
+    let mut ftoption = fs::read_to_string("freetype2/include/freetype/config/ftoption.h").unwrap();
+    for option in [
+        "FT_CONFIG_OPTION_ERROR_STRINGS",
+        "FT_CONFIG_OPTION_SYSTEM_ZLIB",
+        "FT_CONFIG_OPTION_USE_PNG",
+        "PCF_CONFIG_OPTION_LONG_FAMILY_NAMES",
+        "FT_CONFIG_OPTION_SUBPIXEL_RENDERING",
+    ] {
+        let disabled = format!("/* #define {option} */");
+        assert_eq!(
+            ftoption.matches(&disabled).count(),
+            1,
+            "ftoption.h no longer has exactly one `{disabled}`"
+        );
+        ftoption = ftoption.replace(&disabled, &format!("#define {option}"));
+    }
     fs::write(
         build_dir.join("freetype2/include/freetype/config/ftoption.h"),
-        fs::read_to_string("freetype2/include/freetype/config/ftoption.h")
-            .unwrap()
-            .replace(
-                "/* #define FT_CONFIG_OPTION_ERROR_STRINGS */",
-                "#define FT_CONFIG_OPTION_ERROR_STRINGS",
-            )
-            .replace(
-                "/* #define FT_CONFIG_OPTION_SYSTEM_ZLIB */",
-                "#define FT_CONFIG_OPTION_SYSTEM_ZLIB",
-            )
-            .replace(
-                "/* #define FT_CONFIG_OPTION_USE_PNG */",
-                "#define FT_CONFIG_OPTION_USE_PNG",
-            )
-            .replace(
-                "#define TT_CONFIG_OPTION_SUBPIXEL_HINTING  2",
-                "#define TT_CONFIG_OPTION_SUBPIXEL_HINTING  3",
-            )
-            .replace(
-                "/* #define PCF_CONFIG_OPTION_LONG_FAMILY_NAMES */",
-                "#define PCF_CONFIG_OPTION_LONG_FAMILY_NAMES",
-            )
-            .replace(
-                "/* #define FT_CONFIG_OPTION_SUBPIXEL_RENDERING */",
-                "#define FT_CONFIG_OPTION_SUBPIXEL_RENDERING",
-            ),
+        ftoption,
     )
     .unwrap();
 

@@ -64,6 +64,16 @@ const TRIPWIRE_PATTERNS: &[&str] = &[
     "prune_chunks_through_ordinal",
 ];
 
+/// Tracked symlinks the scan deliberately leaves out, each with its reason.
+/// Every other symlink still fails the scan, so coverage cannot be lost
+/// silently and a directory cycle cannot be followed.
+const SYMLINK_SCOPE_EXCLUSIONS: &[&str] = &[
+    // Upstream HarfBuzz ships CLAUDE.md as a link to its AGENTS.md; it came in
+    // with the HarfBuzz 14.6.0 import (267710265). A documentation alias, not
+    // Rust source.
+    "frankenterm/deps-harfbuzz/harfbuzz/CLAUDE.md",
+];
+
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -90,8 +100,9 @@ fn is_test_path(path: &Path) -> bool {
 }
 
 /// Walk `root` recursively, return every `.rs` file path that is
-/// not under `target/` / `legacy_*` / `.beads/`. Reject symlinks rather
-/// than silently losing coverage or following a directory cycle.
+/// not under `target/` / `legacy_*` / `.beads/`. Reject symlinks other than
+/// `SYMLINK_SCOPE_EXCLUSIONS` rather than silently losing coverage or
+/// following a directory cycle.
 fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(root)
         .unwrap_or_else(|error| panic!("cannot scan {}: {error}", root.display()));
@@ -101,11 +112,18 @@ fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
         let file_type = entry
             .file_type()
             .unwrap_or_else(|error| panic!("cannot inspect {}: {error}", p.display()));
-        assert!(
-            !file_type.is_symlink(),
-            "source scan requires an explicit scope decision for symlink {}",
-            p.display()
-        );
+        if file_type.is_symlink() {
+            let workspace = workspace_root();
+            let rel = p.strip_prefix(&workspace).unwrap_or(p.as_path());
+            assert!(
+                SYMLINK_SCOPE_EXCLUSIONS
+                    .iter()
+                    .any(|excluded| rel == Path::new(excluded)),
+                "source scan requires an explicit scope decision for symlink {}",
+                p.display()
+            );
+            continue;
+        }
         if file_type.is_dir() {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if name == "target" || name == ".beads" || name == ".git" || name.starts_with("legacy_")
@@ -343,6 +361,25 @@ fn unreadable_traversal_root_fails_closed() {
         outcome.is_err(),
         "failed traversal must not become an empty scan"
     );
+}
+
+#[test]
+fn symlink_scope_exclusions_name_existing_non_rust_symlinks() {
+    let root = workspace_root();
+    for excluded in SYMLINK_SCOPE_EXCLUSIONS {
+        let path = root.join(excluded);
+        let metadata = fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("excluded symlink {excluded} is missing: {error}"));
+        assert!(
+            metadata.file_type().is_symlink(),
+            "{excluded} is no longer a symlink; drop its scope exclusion"
+        );
+        assert_ne!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("rs"),
+            "a Rust source symlink cannot be excluded from the scan: {excluded}"
+        );
+    }
 }
 
 #[test]

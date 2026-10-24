@@ -3,7 +3,11 @@ resolver = "2"
 members = [
     "crates/frankenterm",
     "crates/frankenterm-build-identity",
+    "crates/frankenterm-machines",
+    "crates/frankenterm-mobile-attach",
+    "crates/frankenterm-mobile-mux",
     "crates/frankenterm-core",
+    "crates/frankenterm-browser-ui",
     "crates/frankenterm-redactor",
     "crates/frankenterm-core-ars",
     "crates/frankenterm-core-tantivy",
@@ -90,12 +94,23 @@ members = [
     "frankenterm/tabout",
     "frankenterm/lua-api-crates/mux-lua",
     "frankenterm/lua-api-crates/url-funcs",
+    "frankenterm/lua-api-crates/window-funcs",
+    # The rest of WezTerm's Lua API (wezterm.run_child_process, json_parse,
+    # GLOBAL, read_dir, procinfo, ssh hosts), ported to mlua 0.12.
+    "frankenterm/lua-api-crates/color-funcs",
+    "frankenterm/lua-api-crates/filesystem",
+    "frankenterm/lua-api-crates/procinfo-funcs",
+    "frankenterm/lua-api-crates/serde-funcs",
+    "frankenterm/lua-api-crates/share-data",
+    "frankenterm/lua-api-crates/spawn-funcs",
+    "frankenterm/lua-api-crates/ssh-funcs",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
     "frankenterm/bidi/generate",
     "vendor/libssh-rs-sys",
     "vendor/block",
+    "vendor/cairo-sys-rs",
 ]
 
 # Limit default workspace operations (check/clippy/test) to the ft crates.
@@ -313,6 +328,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false }
 hmac = { version = "0.13.0", features = ["zeroize"] }
 rand = "0.10.1"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
+sha1 = "0.11.0"
 x509-parser = "0.18.1"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
@@ -556,6 +572,14 @@ wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface
 tabout = { path = "frankenterm/tabout" }
 mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
+window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
+color-funcs = { path = "frankenterm/lua-api-crates/color-funcs" }
+filesystem = { path = "frankenterm/lua-api-crates/filesystem" }
+procinfo-funcs = { path = "frankenterm/lua-api-crates/procinfo-funcs" }
+serde-funcs = { path = "frankenterm/lua-api-crates/serde-funcs" }
+share-data = { path = "frankenterm/lua-api-crates/share-data" }
+spawn-funcs = { path = "frankenterm/lua-api-crates/spawn-funcs" }
+ssh-funcs = { path = "frankenterm/lua-api-crates/ssh-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
 frankenterm-renderer-metal = { path = "crates/frankenterm-renderer-metal" }
@@ -574,10 +598,12 @@ crossterm = "0.29.0"
 
 # FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
 # Git dep; use .cargo/config.toml for local path overrides during development.
-ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime"] }
+# `crossterm` is the backend `AppBuilder::run()` needs: without it `ft tui` exits
+# before its first frame (ft-utjx0). The native ftui-tty backend is Unix-only.
+ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime", "crossterm"] }
 
 # ZIP archives (for .ftx extension packages)
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
 wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
@@ -717,6 +743,9 @@ libssh-rs-sys = { path = "vendor/libssh-rs-sys" }
 # Preserve Cocoa's block API while correcting its opaque runtime-class ABI.
 # Published archive identity and native proof boundary: vendor/block/README.md.
 block = { path = "vendor/block" }
+# Static cairo + pixman from vendored sources (upstream WezTerm deps/cairo), so
+# macOS bundles carry no Homebrew dylib closure: vendor/cairo-sys-rs/README.md.
+cairo-sys-rs = { path = "vendor/cairo-sys-rs" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.

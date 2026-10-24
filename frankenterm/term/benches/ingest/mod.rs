@@ -59,4 +59,5 @@
 pub mod cache;
 pub mod cli;
 pub mod corpus;
+pub mod deferred;
 pub mod lanes;

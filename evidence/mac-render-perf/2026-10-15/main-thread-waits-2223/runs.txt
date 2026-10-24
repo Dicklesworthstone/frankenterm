@@ -1,0 +1,39 @@
+# hold_ab.py T1 (first 100 MB of ~/color-random.bin), 240x30, 20 s, mac-mini-max,
+# symbolized release-perf frankenterm-gui (ad-hoc signed into bundle fad26a2),
+# RUST_LOG=warn,mux::localpane=debug. Columns: run, parser hold max (ms),
+# paint wait p99 (ms), paint wait max (ms), main-thread waits >= 2 ms logged,
+# parser stretches >= 20 ms logged, any-holder holds >= 20 ms logged.
+# perf2 (load 13-14), with "applied one batch" still at debug
+rg11yyy1 3.9 0.328 10.0 5 0 0
+jc5j2gop 5.2 0.098 3.3 1 0 0
+4zufntx8 4.5 0.918 10.0 5 0 0
+71ywaimt 4.9 0.082 10.0 2 0 0
+_p2395b8 9.8 0.328 1.1 0 0 0
+zcimajw7 13.3 0.328 10.0 1 0 0
+# perf3 (load 13-15), same build
+t2uuh2f_ 10.5 0.164 10.0 2 0 0
+3dg15wwu 33.2 0.115 2.1 1 0 1
+dfjrpw6o 6.0 0.164 10.0 1 0 0
+o6tqjmko 12.5 0.197 10.0 1 0 0
+j6cn932w 4.1 1.049 10.0 4 0 0
+0pw8gw5t 96.8 2.097 10.0 6 0 1
+6627pq5y 15.0 6.291 10.0 15 0 0
+11ma_r6w 10.3 10.016 10.0 19 0 0
+# perf4 (load 19 -> 46: another tenant started work), per-batch log at trace
+movkdeqs 5.3 10.486 20.0 88 0 0
+3ge7rkz2 8.7 10.486 10.7 77 0 0
+to6w2802 6.0 10.017 10.0 71 0 0
+sywjwe_p 5.1 10.016 10.0 44 0 0
+j8zcgw2g 18.4 10.311 10.3 45 0 0
+kqjrn28t 66.9 10.048 10.0 65 4 4
+wcsgu5nb 48.5 10.052 10.1 88 2 2
+kcrcyc5l 47.1 10.016 10.0 43 4 5
+# perf5 (load 6 -> 11), thread CPU time in the stretch log
+1jvvq9rl 1.9 0.066 0.6 0 0 0
+1vg4vca7 2.0 0.041 0.5 0 0 0
+t012h05w 2.0 0.057 0.9 0 0 0
+ajc4iekz 2.1 0.057 1.6 0 0 0
+_2cpzb_s 3.9 0.066 0.4 0 0 0
+n3fpiq4z 3.0 0.197 0.8 0 0 0
+gpcjb3bz 5.7 0.524 7.9 2 0 0
+e48p8t2h 3.4 0.393 1.3 0 0 0

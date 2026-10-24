@@ -92,7 +92,7 @@ match result {
 | `poll_max` | 1 s | Maximum poll interval |
 | `max_polls` | 10,000 | Safety limit |
 
-The CLI equivalent is `ft send --wait-for`:
+The CLI equivalent is `ft send <pane-id> <text> --wait-for <pattern>`:
 
 ```bash
 ft send 3 "ls -la" --wait-for "\\$" --timeout-secs 30

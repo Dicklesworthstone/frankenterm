@@ -257,8 +257,15 @@ mod tests {
     }
 
     fn arb_attrs() -> impl Strategy<Value = CellAttributes> {
-        (0u8..4, 0u16..300, any::<bool>(), 0u8..3, any::<bool>()).prop_map(
-            |(intensity, colour, link, semantic, wrapped)| {
+        (
+            0u8..4,
+            0u16..300,
+            any::<bool>(),
+            0u8..3,
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(intensity, colour, link, semantic, wrapped, protected)| {
                 let mut attrs = CellAttributes::default();
                 attrs.set_intensity(match intensity {
                     0 => Intensity::Normal,
@@ -286,9 +293,9 @@ mod tests {
                     _ => SemanticType::Prompt,
                 });
                 attrs.set_wrapped(wrapped);
+                attrs.set_protected(protected);
                 attrs
-            },
-        )
+            })
     }
 
     /// A vector-storage row as legacy can hold one: narrow cells, wide

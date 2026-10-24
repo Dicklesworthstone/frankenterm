@@ -76,7 +76,7 @@ Use this for unhandled events or workflows that need intervention.
 
 ```bash
 ft triage --severity warning
-ft events --unhandled --pane <pane_id>
+ft events --unhandled --pane-id <pane_id>
 ```
 
 2) Explain the detection:
@@ -454,7 +454,7 @@ ft approve <approval_code> --pane <pane_id> --dry-run
 ft commit plan:<plan_id> --text "ls"
 
 # event and workflow inspection
-ft events --unhandled --pane <pane_id>
+ft events --unhandled --pane-id <pane_id>
 ft workflow status <execution_id>
 
 # mission control

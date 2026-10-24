@@ -804,7 +804,22 @@ impl TerminalLockLedger {
     /// One acquisition: `wait_ns` is zero when the mutex was free.
     pub fn record_wait(&self, holder: TerminalLockHolder, wait_ns: u64, on_main_thread: bool) {
         self.wait[holder.index()].record(wait_ns);
-        if on_main_thread && wait_ns > 0 {
+        if on_main_thread {
+            self.record_main_thread_block(wait_ns);
+        }
+    }
+
+    /// A bounded wait that gave up without the mutex, such as a paint's
+    /// capture budget. It is no acquisition, so the holder histograms skip
+    /// it, but the waiting thread was blocked all the same.
+    pub fn record_abandoned_wait(&self, wait_ns: u64, on_main_thread: bool) {
+        if on_main_thread {
+            self.record_main_thread_block(wait_ns);
+        }
+    }
+
+    fn record_main_thread_block(&self, wait_ns: u64) {
+        if wait_ns > 0 {
             self.main_thread_blocked_ns
                 .fetch_add(wait_ns, Ordering::Relaxed);
             self.main_thread_blocked_waits
@@ -854,9 +869,11 @@ pub struct TerminalLockHolderSnapshot {
 pub struct TerminalLocksSnapshot {
     /// Keyed by [`TerminalLockHolder::as_str`]; kinds never seen are absent.
     pub holders: BTreeMap<String, TerminalLockHolderSnapshot>,
-    /// Total time the main thread spent waiting for a terminal mutex.
+    /// Total time the main thread spent waiting for a terminal mutex,
+    /// including bounded waits that gave up.
     pub main_thread_blocked_ns: u64,
-    /// Main-thread acquisitions that had to wait.
+    /// Main-thread waits for a terminal mutex: acquisitions that had to
+    /// wait, and bounded waits that gave up.
     pub main_thread_blocked_waits: u64,
     pub main_thread_max_wait_ns: u64,
 }
@@ -2207,6 +2224,19 @@ mod tests {
             lines[0]
         );
         assert!(lines[0].contains("parser hold p99 2.00 ms"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn an_abandoned_main_thread_wait_is_blocking_but_no_acquisition() {
+        let ledger: &'static TerminalLockLedger = Box::leak(Box::new(TerminalLockLedger::new()));
+        ledger.record_abandoned_wait(4_000_000, true);
+        ledger.record_abandoned_wait(9_000_000, false);
+        ledger.record_abandoned_wait(0, true);
+        let snapshot = ledger.snapshot();
+        assert!(snapshot.holders.is_empty(), "no holder acquired the lock");
+        assert_eq!(snapshot.main_thread_blocked_waits, 1);
+        assert_eq!(snapshot.main_thread_blocked_ns, 4_000_000);
+        assert_eq!(snapshot.main_thread_max_wait_ns, 4_000_000);
     }
 
     #[test]

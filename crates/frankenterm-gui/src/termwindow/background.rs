@@ -1269,6 +1269,29 @@ fn resolve_generated_background_size(
     (width, height)
 }
 
+/// Longest side, in pixels, of a generated gradient image. A layer's quad is
+/// sized from its own width/height spec, not from the texture, and background
+/// quads sample linearly, so a smooth gradient generated smaller is stretched
+/// to fit. At full window size a maximized 5K window's gradient
+/// (6144x3200 px) is larger than a 4096^2 glyph atlas, so it forced each
+/// window's atlas to 8192^2 (256 MiB) and kept 78 MB per size in the
+/// gradient cache. 2040 still fits a 2048^2 atlas (16 MiB) with the
+/// allocator's padding; 2048 itself grew the atlas to 4096^2. Measured on that
+/// window: every pixel within 1-2 levels of the full-size gradient.
+const MAX_GENERATED_GRADIENT_SIDE: u32 = 2040;
+
+/// `width` x `height` scaled down, keeping its aspect ratio, so that neither
+/// side exceeds `max_side`.
+fn cap_generated_gradient_size(width: u32, height: u32, max_side: u32) -> (u32, u32) {
+    let longer = width.max(height);
+    if longer <= max_side || max_side == 0 {
+        return (width, height);
+    }
+    let scale = f64::from(max_side) / f64::from(longer);
+    let side = |value: u32| ((f64::from(value) * scale).round() as u32).clamp(1, max_side);
+    (side(width), side(height))
+}
+
 fn load_background_layer(
     layer: &BackgroundLayer,
     dimensions: &Dimensions,
@@ -1297,6 +1320,8 @@ fn load_background_layer(
                 v_context,
                 matches!(g.orientation, GradientOrientation::Radial { .. }),
             );
+            let (width, height) =
+                cap_generated_gradient_size(width, height, MAX_GENERATED_GRADIENT_SIDE);
 
             CachedGradient::load(g, width, height, max_decoded_bytes, is_cancelled)?
         }
@@ -2050,6 +2075,20 @@ impl crate::TermWindow {
         }
 
         let mut emitted = false;
+        // Background quads sample linearly. When the sprite is scaled, a
+        // sample at its edge blends in the atlas texel next to it: a 1 px
+        // seam of foreign atlas content around the window. Keep samples half
+        // a texel inside the sprite then; an unscaled sprite samples texel
+        // centers and needs no inset.
+        let scaled = (width - tex_width).abs() > 0.5 || (height - tex_height).abs() > 0.5;
+        let (inset_x, inset_y) = if scaled {
+            (
+                0.5 / sprite.texture.width().max(1) as f32,
+                0.5 / sprite.texture.height().max(1) as f32,
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         chrome.draw_in_layer(layer_index, &mut |layers| {
             for y_offset in 0..y_count {
@@ -2071,10 +2110,10 @@ impl crate::TermWindow {
                     quad.set_position(origin_x, origin_y, origin_x + width, origin_y + height);
 
                     let coords = sprite.texture_coords();
-                    let mut x1 = coords.min_x();
-                    let mut x2 = coords.max_x();
-                    let mut y1 = coords.min_y();
-                    let mut y2 = coords.max_y();
+                    let mut x1 = coords.min_x() + inset_x;
+                    let mut x2 = coords.max_x() - inset_x;
+                    let mut y1 = coords.min_y() + inset_y;
+                    let mut y2 = coords.max_y() - inset_y;
                     if layer.def.repeat_x == BackgroundRepeat::Mirror
                         && (first_x_mirrored ^ (x_step % 2 == 1))
                     {
@@ -2104,6 +2143,21 @@ mod tests {
     use super::*;
     use config::Dimension;
     use std::time::Duration;
+
+    #[test]
+    fn generated_gradients_are_capped_keeping_their_aspect() {
+        let cap = MAX_GENERATED_GRADIENT_SIDE;
+        // A maximized 5K window.
+        assert_eq!(cap_generated_gradient_size(6144, 3200, cap), (2040, 1063));
+        assert_eq!(cap_generated_gradient_size(3200, 6144, cap), (1063, 2040));
+        // Radial gradients are square.
+        assert_eq!(cap_generated_gradient_size(3200, 3200, cap), (2040, 2040));
+        // Within the cap: unchanged.
+        assert_eq!(cap_generated_gradient_size(2040, 1500, cap), (2040, 1500));
+        assert_eq!(cap_generated_gradient_size(800, 600, cap), (800, 600));
+        // A sliver never rounds to zero.
+        assert_eq!(cap_generated_gradient_size(100_000, 1, cap), (2040, 1));
+    }
 
     /// ft-yccm0.6: each background pool's threads start at an explicit
     /// class, the priority they actually run at on macOS: image decodes at

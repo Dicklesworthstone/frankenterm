@@ -1,0 +1,1 @@
+[BENCH] ingest_throughput lane=term corpus=file:tui_repaint-67108864-000000000135288d.bin bytes=67108864 secs=0.441 MiB/s=145.0 load_avg_1m=2.10 sanity=ok

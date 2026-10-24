@@ -34068,16 +34068,6 @@ fn query_latest_secret_scan_report_backend(
 // sites in `StorageHandle::export_*` use the `export::` qualifier;
 // they are not re-exported publicly because the production surface
 // is the async `StorageHandle` methods, not the raw query fns.
-// `u64_to_i64_unchecked` stays here — it is also used by the audit
-// and stream-page where-clause builders in `storage.rs`.
-
-/// Unchecked u64→i64 cast for query params (SQLite stores as i64).
-fn u64_to_i64_unchecked(val: u64) -> i64 {
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        val as i64
-    }
-}
 
 #[cfg(test)]
 mod policy_decision_tests;

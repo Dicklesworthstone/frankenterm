@@ -33,7 +33,13 @@ struct Cluster {
 /// U+3099-U+309A), CJK ideographs, Hangul syllables, fullwidth forms (minus
 /// U+FF9E-U+FF9F) and the emoji blocks minus the skin-tone modifiers
 /// U+1F3FB-U+1F3FF. Anything else is treated as able to cluster.
+#[inline]
 pub(crate) fn is_cluster_inert(c: char) -> bool {
+    // ASCII first: the range table below compiles to a vector compare of
+    // every range, which the page engine ran for each ASCII run it appended.
+    if c.is_ascii() {
+        return matches!(u32::from(c), 0x20..=0x7E);
+    }
     matches!(
         u32::from(c),
         0x20..=0x7E
@@ -62,8 +68,38 @@ pub(crate) fn is_cluster_inert(c: char) -> bool {
 
 /// Whether a grapheme boundary is guaranteed between a cell whose text ends
 /// in `prev` (`None` for the start of the line) and one starting with `next`.
+#[inline]
 fn breaks_between(prev: Option<char>, next: char) -> bool {
     prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
+}
+
+/// The longest pair of neighbouring cells [`segments_apart`] checks; longer
+/// pairs (long ZWJ sequences) take the whole-line check.
+const SEGMENTS_APART_MAX_BYTES: usize = 64;
+
+/// Whether re-segmenting a line's text, as clustered storage reads it back,
+/// reads a cell holding `prev` as exactly that grapheme when a cell holding
+/// `next` follows it. `None` when the pair is too long to check here.
+///
+/// Exact for a boundary [`breaks_between`] cannot vouch for (ft-yccm0.3.2.6
+/// follow-up): `Graphemes` is a state machine that starts afresh after each
+/// break, so once every earlier boundary of the line is a break, its state
+/// at the end of `prev` depends on `prev` alone, and segmenting the pair
+/// decides this boundary as segmenting the whole line does. Rows of mixed
+/// scripts (a combining mark, a variation selector or RTL letters at a cell
+/// edge) almost never cluster across cells, but failed the char test at
+/// such a boundary, and their compression re-segmented and compared the
+/// whole line instead.
+/// `pair` is the caller's scratch for the two cells' text; keep it in
+/// `Zeroizing`, as terminal text is wiped wherever this crate holds it.
+fn segments_apart(prev: &str, next: &str, pair: &mut String) -> Option<bool> {
+    if prev.len() + next.len() > SEGMENTS_APART_MAX_BYTES {
+        return None;
+    }
+    pair.clear();
+    pair.push_str(prev);
+    pair.push_str(next);
+    Some(Graphemes::new(pair).next() == Some(prev))
 }
 
 /// The rule clustered storage appends by: whether a cell starting with
@@ -71,6 +107,7 @@ fn breaks_between(prev: Option<char>, next: char) -> bool {
 /// without the two clustering into one grapheme. The PageGrid engine
 /// mirrors which rows stay clustered with it (ft-yccm0.3.3.4).
 #[doc(hidden)]
+#[inline]
 pub fn clustered_append_breaks(prev: Option<char>, next: char) -> bool {
     breaks_between(prev, next)
 }
@@ -81,7 +118,9 @@ pub fn clustered_append_breaks(prev: Option<char>, next: char) -> bool {
 #[cfg_attr(feature = "use_serde", derive(Serialize))]
 #[derive(PartialEq)]
 pub(crate) struct ClusteredLine {
-    pub text: String,
+    /// Private: [`wipe_text_in_use`] relies on this text changing only
+    /// through this module's appends, trailing-space pops and wipes.
+    text: String,
     #[cfg_attr(
         feature = "use_serde",
         serde(
@@ -108,6 +147,36 @@ impl core::fmt::Debug for ClusteredLine {
     }
 }
 
+/// Whether every byte of `text` is printable ASCII (`b' '..=b'~'`), eight
+/// bytes at a time. Every row of plain output that scrolls into the durable
+/// store is checked on the parse thread (ft-yccm0.2.1.8), where a branch per
+/// byte was a large part of capturing its wrap geometry, and every printed
+/// ASCII run is checked before it is appended (ft-yccm0.3.2.6).
+pub(crate) fn printable_ascii(text: &[u8]) -> bool {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    let (words, rest) = text.as_chunks::<8>();
+    // The last few bytes, first byte lowest, shifted into a word of spaces.
+    // Copying them into one instead made 1-7 byte rows slower than the byte
+    // loop this replaces.
+    let tail = rest
+        .iter()
+        .rev()
+        .fold(0x20 * ONES, |word, &byte| word << 8 | u64::from(byte));
+    // A byte below 0x80 is below b' ' exactly when adding 0x60 leaves its
+    // high bit clear, and is 0x7f exactly when adding 1 sets it; neither sum
+    // carries into the next byte. A byte from 0x80 up sets its own high bit,
+    // which marks the word whatever its sums carry.
+    words
+        .iter()
+        .map(|&word| u64::from_le_bytes(word))
+        .chain(core::iter::once(tail))
+        .fold(0, |bad, word| {
+            bad | word | word.wrapping_add(ONES) | !word.wrapping_add(0x60 * ONES)
+        })
+        & (0x80 * ONES)
+        == 0
+}
+
 fn guarded_reserve_text(target: &mut String, additional: usize) {
     let required = target
         .len()
@@ -117,9 +186,61 @@ fn guarded_reserve_text(target: &mut String, additional: usize) {
         let grown_capacity = target.capacity().saturating_mul(2).max(required);
         let mut replacement = Zeroizing::new(String::with_capacity(grown_capacity));
         replacement.push_str(target);
-        target.zeroize();
         core::mem::swap(target, &mut *replacement);
+        // The guard now holds the old buffer. Wipe it here rather than in the
+        // guard's drop, which would store one byte at a time.
+        let mut old = core::mem::take(&mut *replacement);
+        wipe_text_allocation(&mut old);
     }
+}
+
+/// Zero every byte of `text`'s allocation with volatile stores and leave it
+/// empty with the same capacity.
+///
+/// The guarantee is `String::zeroize`'s: each byte of the capacity, used or
+/// spare, receives a volatile zero store. `String::zeroize` stores one byte
+/// at a time with a fence per byte, which made dropping evicted scrollback
+/// rows about 30% of the parser lane's CPU under a flood (ft-3floy); this
+/// stores eight bytes at a time.
+fn wipe_text_allocation(text: &mut String) {
+    let mut bytes = core::mem::take(text).into_bytes();
+    zero_whole_allocation(&mut bytes);
+    bytes.clear();
+    *text = String::from_utf8(bytes).unwrap_or_default();
+}
+
+/// Extend `bytes` to its capacity (no reallocation) and volatile-zero all of
+/// it, eight bytes per store where alignment allows.
+fn zero_whole_allocation(bytes: &mut Vec<u8>) {
+    bytes.resize(bytes.capacity(), 0);
+    let (head, words, tail) = bytemuck::pod_align_to_mut::<u8, u64>(bytes);
+    head.zeroize();
+    words.zeroize();
+    tail.zeroize();
+}
+
+/// Volatile-zero `bytes`, eight bytes per store where alignment allows.
+fn zero_bytes(bytes: &mut [u8]) {
+    let (head, words, tail) = bytemuck::pod_align_to_mut::<u8, u64>(bytes);
+    head.zeroize();
+    words.zeroize();
+    tail.zeroize();
+}
+
+/// Zero the bytes `text` holds with volatile stores and leave it empty with
+/// the same allocation, for a row that is reused (see
+/// [`ClusteredLine::reset_for_reuse`]). The spare capacity of a row's text
+/// never held that row's text: the text only grows by appending, its one
+/// shrink pops a trailing space, and growing wipes the buffer it leaves.
+/// Dropping the row still zeroes the whole allocation
+/// ([`wipe_text_allocation`]). Zeroing only the bytes in use skips filling
+/// the spare capacity and then storing zeros over it again, which was about
+/// a sixth of a `seq` flood's parse time (ft-yccm0.3.2.6).
+fn wipe_text_in_use(text: &mut String) {
+    let mut bytes = core::mem::take(text).into_bytes();
+    zero_bytes(&mut bytes);
+    bytes.clear();
+    *text = String::from_utf8(bytes).unwrap_or_default();
 }
 
 fn guarded_push_str(target: &mut String, fragment: &str) {
@@ -180,7 +301,7 @@ where
             D::Error::custom("clustered line wide-cell bitset length overflowed usize")
         })?;
         if bit_capacity > MAX_DESERIALIZED_WIDE_CELL_BITS {
-            return Err(D::Error::custom(format!(
+            return Err(D::Error::custom(alloc::format!(
                 "clustered line wide-cell bitset length {bit_capacity} exceeds maximum {MAX_DESERIALIZED_WIDE_CELL_BITS}"
             )));
         }
@@ -464,8 +585,11 @@ impl ClusteredLine {
         let mut len = 0usize;
         let mut last_cell_width = None;
         // Whether the last char so far is inert (None at the line's start),
-        // and whether every boundary so far is.
+        // the previous cell's text, and whether every boundary so far is
+        // known to break.
         let mut prev_inert: Option<bool> = None;
+        let mut prev_text = "";
+        let mut pair = Zeroizing::new(String::new());
         let mut inert = true;
 
         let mut index = 0;
@@ -488,13 +612,16 @@ impl ClusteredLine {
                 match chars.next() {
                     Some(first) => {
                         let first_inert = is_cluster_inert(first);
-                        if prev_inert.is_some_and(|prev| !(prev && first_inert)) {
+                        if prev_inert.is_some_and(|prev| !(prev && first_inert))
+                            && segments_apart(prev_text, cell_text, &mut pair) != Some(true)
+                        {
                             inert = false;
                         } else {
                             prev_inert = Some(match chars.next_back() {
                                 Some(last) => is_cluster_inert(last),
                                 None => first_inert,
                             });
+                            prev_text = cell_text;
                         }
                     }
                     None => inert = false,
@@ -554,6 +681,35 @@ impl ClusteredLine {
 
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// The row's text, read-only: writes stay in this module.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The text, when it is non-empty and every cell is one printable ASCII
+    /// byte of width 1, so cell `i` is byte `i`.
+    pub(crate) fn single_width_printable_ascii(&self) -> Option<&str> {
+        (!self.text.is_empty()
+            && self.text.len() == self.len()
+            && self.is_double_wide.is_none()
+            && printable_ascii(self.text.as_bytes()))
+        .then_some(self.text.as_str())
+    }
+
+    /// The attribute runs, as (cells, attributes), of a row that
+    /// [`Self::single_width_printable_ascii`] accepts. There each cluster's
+    /// width is its number of cells.
+    pub(crate) fn single_width_ascii_runs(
+        &self,
+    ) -> Option<impl Iterator<Item = (usize, &CellAttributes)> + '_> {
+        self.single_width_printable_ascii()?;
+        Some(
+            self.clusters
+                .iter()
+                .map(|cluster| (usize::from(cluster.cell_width), &cluster.attrs)),
+        )
     }
 
     /// Whether the clusters hold no spare capacity.
@@ -642,7 +798,7 @@ impl ClusteredLine {
         let mut clusters = self.clusters.iter();
         let cluster = clusters.next();
         ClusterLineCellIter {
-            graphemes: Graphemes::new(&self.text),
+            graphemes: ClusterGraphemes::new(&self.text),
             clusters,
             cluster,
             idx: 0,
@@ -716,9 +872,17 @@ impl ClusteredLine {
         if count == 0 {
             return;
         }
+        // A gap filled one char at a time was the largest single cost of a
+        // raw `seq` flood, whose lines start where the last one ended.
+        const SPACES: &str = "                                                                ";
         guarded_reserve_text(&mut self.text, count);
         self.extend_clusters(count, &CellAttributes::blank());
-        self.text.extend(core::iter::repeat_n(' ', count));
+        let mut left = count;
+        while left > 0 {
+            let take = left.min(SPACES.len());
+            self.text.push_str(&SPACES[..take]);
+            left -= take;
+        }
         self.last_cell_width = NonZeroU8::new(1);
         self.len = self.len.saturating_add(count.min(u32::MAX as usize) as u32);
     }
@@ -897,7 +1061,23 @@ impl ClusteredLine {
     }
 
     fn wipe_owned_text(&mut self) {
-        self.text.zeroize();
+        wipe_text_allocation(&mut self.text);
+    }
+
+    /// Return this row to the state of [`ClusteredLine::new`] while keeping
+    /// its text and cluster allocations. Every byte of the old text is wiped
+    /// first; the spare capacity, which never held it, is left to the wipe
+    /// that dropping the row does ([`wipe_text_in_use`]).
+    pub(crate) fn reset_for_reuse(&mut self) {
+        wipe_text_in_use(&mut self.text);
+        self.is_double_wide = None;
+        self.clusters.clear();
+        self.len = 0;
+        self.last_cell_width = None;
+    }
+
+    pub(crate) fn text_capacity(&self) -> usize {
+        self.text.capacity()
     }
 }
 
@@ -964,8 +1144,62 @@ impl ClusteredLine {
     }
 }
 
+/// A clustered line's graphemes, in order (ft-y0gy9). When every char of
+/// the text is cluster-inert, `breaks_between` guarantees a grapheme
+/// boundary between every two of them, so the graphemes are exactly the
+/// chars and are read without segmentation. Any other text is segmented by
+/// `Graphemes`, as before.
+enum ClusterGraphemes<'a> {
+    Chars(&'a str),
+    Segmented(Graphemes<'a>),
+}
+
+/// Whether clustered lines read an all-inert text char by char (ft-y0gy9):
+/// on unless FT_CLUSTER_CHAR_GRAPHEMES=0, read once per process. Both paths
+/// read the same graphemes; only segmentation's cost differs. Builds
+/// without `std` always read char by char.
+fn char_graphemes_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FT_CLUSTER_CHAR_GRAPHEMES").is_none_or(|value| value != "0")
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+impl<'a> ClusterGraphemes<'a> {
+    fn new(text: &'a str) -> Self {
+        if char_graphemes_enabled() && text.chars().all(is_cluster_inert) {
+            Self::Chars(text)
+        } else {
+            Self::Segmented(Graphemes::new(text))
+        }
+    }
+}
+
+impl<'a> Iterator for ClusterGraphemes<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match self {
+            Self::Chars(rest) => {
+                let first = rest.chars().next()?;
+                let (grapheme, tail) = rest.split_at(first.len_utf8());
+                *rest = tail;
+                Some(grapheme)
+            }
+            Self::Segmented(graphemes) => graphemes.next(),
+        }
+    }
+}
+
 pub(crate) struct ClusterLineCellIter<'a> {
-    graphemes: Graphemes<'a>,
+    graphemes: ClusterGraphemes<'a>,
     clusters: core::slice::Iter<'a, Cluster>,
     cluster: Option<&'a Cluster>,
     idx: usize,
@@ -1200,6 +1434,91 @@ mod test {
     }
 
     #[test]
+    fn whole_allocation_zeroing_covers_used_and_spare_bytes() {
+        // Lengths and capacities around the 8-byte word boundary. The spare
+        // capacity still holds text from before the truncate.
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+            let mut bytes = Vec::with_capacity(len * 2 + 3);
+            bytes.extend(core::iter::repeat_n(b'x', len * 2 + 3));
+            bytes.truncate(len);
+            let capacity = bytes.capacity();
+            let address = bytes.as_ptr();
+
+            zero_whole_allocation(&mut bytes);
+
+            assert_eq!(
+                bytes.len(),
+                capacity,
+                "len {len}: whole allocation addressed"
+            );
+            assert_eq!(bytes.as_ptr(), address, "len {len}: zeroed in place");
+            assert!(
+                bytes.iter().all(|byte| *byte == 0),
+                "len {}: text survived",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn in_use_zeroing_covers_every_used_byte_at_any_alignment() {
+        // Lengths around the 8-byte word boundary, from offsets 0..8 so the
+        // unaligned head and tail are both exercised.
+        let mut backing = vec![b'x'; 300];
+        for offset in 0..8 {
+            for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+                backing.fill(b'x');
+                zero_bytes(&mut backing[offset..offset + len]);
+                assert!(
+                    backing[offset..offset + len].iter().all(|byte| *byte == 0),
+                    "offset {} len {}: text survived",
+                    offset,
+                    len
+                );
+                assert!(
+                    backing[..offset].iter().all(|byte| *byte == b'x')
+                        && backing[offset + len..].iter().all(|byte| *byte == b'x'),
+                    "offset {} len {}: wrote outside the bytes in use",
+                    offset,
+                    len
+                );
+            }
+        }
+        let mut text = String::with_capacity(37);
+        text.push_str("semantic terminal text");
+        let (capacity, address) = (text.capacity(), text.as_ptr());
+        wipe_text_in_use(&mut text);
+        assert!(text.is_empty());
+        assert_eq!(text.capacity(), capacity);
+        assert_eq!(text.as_ptr(), address);
+    }
+
+    #[test]
+    fn text_wipe_leaves_an_empty_string_with_the_same_allocation() {
+        let mut text = String::with_capacity(37);
+        text.push_str("semantic terminal text");
+        let capacity = text.capacity();
+        let address = text.as_ptr();
+
+        wipe_text_allocation(&mut text);
+
+        assert!(text.is_empty());
+        assert_eq!(text.capacity(), capacity);
+        assert_eq!(text.as_ptr(), address);
+    }
+
+    #[test]
+    fn growing_line_text_wipes_the_buffer_it_leaves() {
+        let mut text = String::new();
+        guarded_reserve_text(&mut text, 4);
+        text.push_str("abcd");
+        let before = text.capacity();
+        guarded_reserve_text(&mut text, before + 1);
+        assert!(text.capacity() > before);
+        assert_eq!(text, "abcd", "the content moves to the grown buffer");
+    }
+
+    #[test]
     fn clustered_line_clone_owns_an_independent_text_allocation() {
         let mut line = ClusteredLine::new();
         line.append_ascii_run("semantic terminal text", CellAttributes::default());
@@ -1268,5 +1587,250 @@ mod test {
                 );
             }
         }
+    }
+
+    /// `ClusterGraphemes` yields exactly what segmentation yields, and reads
+    /// an all-inert text char by char.
+    fn assert_cluster_graphemes_segment(text: &str) {
+        let fast: Vec<&str> = ClusterGraphemes::new(text).collect();
+        let segmented: Vec<&str> = Graphemes::new(text).collect();
+        assert_eq!(fast, segmented, "{:?}", text);
+        if text.chars().all(is_cluster_inert) {
+            assert!(matches!(
+                ClusterGraphemes::new(text),
+                ClusterGraphemes::Chars(_)
+            ));
+            assert_eq!(fast.len(), text.chars().count(), "{:?}", text);
+        }
+    }
+
+    /// ft-y0gy9: on T0's emoji and ASCII, CJK, Hangul syllables and the
+    /// other inert ranges, the graphemes are the chars; with anything that
+    /// joins (ZWJ, VS16, skin tones, regional indicators, combining marks,
+    /// Hangul jamo, Devanagari) the text is segmented, exactly as before.
+    #[test]
+    fn cluster_graphemes_equal_segmentation_on_inert_and_joining_text() {
+        for text in [
+            "",
+            "plain ascii, punctuation ~!",
+            "\u{1f600}\u{1f680}\u{1f916}\u{1f389}A7\u{1f9ff}\u{1fa70}",
+            "\u{4e2d}\u{6587}\u{3042}\u{30ab}\u{ac00}\u{d7a3}\u{ac00}",
+            "\u{e9}\u{3a9}\u{416}\u{2192}\u{2800}",
+            "\u{1f469}\u{200d}\u{1f4bb}",
+            "\u{2764}\u{fe0f}",
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f1fa}\u{1f1f8}\u{1f1eb}\u{1f1f7}\u{1f1e9}",
+            "e\u{301}",
+            "\u{1100}\u{1161}\u{11a8}",
+            "\u{915}\u{94d}\u{937}",
+            "a\r\nb",
+        ] {
+            assert_cluster_graphemes_segment(text);
+        }
+    }
+
+    fn graphemes_test_char() -> impl proptest::strategy::Strategy<Value = char> {
+        use proptest::prelude::*;
+        prop_oneof![
+            0x20u32..0x7f,
+            0xa0u32..0x300,
+            0x300u32..0x370,
+            0x1f300u32..0x1f400,
+            0x1f400u32..0x1f650,
+            0x1f680u32..0x1f700,
+            0x1f900u32..0x1fa00,
+            0x1fa70u32..0x1fb00,
+            0x1f1e6u32..0x1f200,
+            Just(0x200du32),
+            Just(0xfe0fu32),
+            Just(0x0du32),
+            Just(0x0au32),
+            0xac00u32..0xac20,
+            0x1100u32..0x1120,
+            0x1160u32..0x1170,
+            0x4e00u32..0x4e40,
+            0x900u32..0x980,
+        ]
+        .prop_map(|value| char::from_u32(value).unwrap())
+    }
+
+    fn inert_test_char() -> impl proptest::strategy::Strategy<Value = char> {
+        use proptest::prelude::*;
+        prop_oneof![
+            0x20u32..0x7f,
+            0x1f300u32..0x1f3fb,
+            0x1f400u32..0x1f650,
+            0x1f680u32..0x1f700,
+            0x1f900u32..0x1fa00,
+            0x1fa70u32..0x1fb00,
+            0x4e00u32..0x9fff,
+            0xac00u32..0xd7a4,
+        ]
+        .prop_map(|value| char::from_u32(value).unwrap())
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.2.1.8: the word-at-a-time check agrees with a byte-by-byte
+        /// one, on mostly printable text with the bytes at either edge of the
+        /// range, at every length across the eight-byte words.
+        #[test]
+        fn printable_ascii_matches_a_byte_by_byte_check(
+            bytes in proptest::collection::vec(
+                proptest::prop_oneof![
+                    12 => 0x20u8..=0x7e,
+                    1 => proptest::sample::select(vec![0x00u8, 0x1f, 0x7f, 0x80, 0x9f, 0xa0, 0xdf, 0xe0, 0xff]),
+                    1 => proptest::num::u8::ANY,
+                ],
+                0..40,
+            ),
+        ) {
+            proptest::prop_assert_eq!(
+                printable_ascii(&bytes),
+                bytes.iter().all(|byte| matches!(byte, b' '..=b'~'))
+            );
+        }
+
+        /// ft-y0gy9: random texts mixing inert chars with every kind that
+        /// joins segment exactly as `Graphemes` segments them.
+        #[test]
+        fn cluster_graphemes_equal_segmentation_on_random_text(
+            chars in proptest::collection::vec(graphemes_test_char(), 0..32),
+        ) {
+            let text: String = chars.into_iter().collect();
+            assert_cluster_graphemes_segment(&text);
+        }
+
+        /// ft-y0gy9: random all-inert texts, as T0 rows are, take the char
+        /// path and still equal segmentation.
+        #[test]
+        fn cluster_graphemes_read_inert_text_char_by_char(
+            chars in proptest::collection::vec(inert_test_char(), 0..64),
+        ) {
+            let text: String = chars.into_iter().collect();
+            assert_cluster_graphemes_segment(&text);
+        }
+    }
+
+    /// ft-yccm0.3.2.6 follow-up: a pair of cells reads back apart exactly
+    /// when segmentation breaks between them.
+    #[test]
+    fn segments_apart_follows_grapheme_segmentation() {
+        let mut pair = String::new();
+        // A combining mark, a regional-indicator partner, a ZWJ emoji tail
+        // and a lone ZWJ all join the cell before them.
+        assert_eq!(segments_apart("e", "\u{301}", &mut pair), Some(false));
+        assert_eq!(
+            segments_apart("\u{1F1FA}", "\u{1F1F8}", &mut pair),
+            Some(false)
+        );
+        assert_eq!(
+            segments_apart("\u{1F468}\u{200d}", "\u{1F469}", &mut pair),
+            Some(false)
+        );
+        assert_eq!(segments_apart("a", "\u{200d}", &mut pair), Some(false));
+        assert_eq!(
+            segments_apart("\u{1F600}", "\u{1F3FB}", &mut pair),
+            Some(false)
+        );
+        // Whole graphemes with a non-inert char at the edge stay apart.
+        assert_eq!(segments_apart("e\u{301}", "x", &mut pair), Some(true));
+        assert_eq!(
+            segments_apart("\u{1F1FA}\u{1F1F8}", "\u{1F1EC}", &mut pair),
+            Some(true)
+        );
+        assert_eq!(
+            segments_apart("\u{2764}\u{FE0F}", "a", &mut pair),
+            Some(true)
+        );
+        assert_eq!(segments_apart("\u{644}", "\u{627}", &mut pair), Some(true));
+        assert_eq!(segments_apart("\u{5E9}", "\u{5DC}", &mut pair), Some(true));
+        // A cell that is itself more than one grapheme does not read back.
+        assert_eq!(segments_apart("ab", "c", &mut pair), Some(false));
+        // Too long to check here: the whole-line check decides.
+        let long = "\u{1F468}\u{200d}".repeat(10);
+        assert_eq!(segments_apart(&long, "a", &mut pair), None);
+    }
+
+    /// ft-yccm0.3.2.6 follow-up: the slice builder vouches for a row only
+    /// when re-reading the clustered text yields exactly its cells, and,
+    /// with every neighbouring pair short enough to check, whenever it does.
+    #[test]
+    fn slice_builder_vouches_exactly_when_the_row_reads_back() {
+        let texts = [
+            "a",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F3FB}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "\u{1F600}\u{FE0F}",
+            "\u{644}",
+            "\u{627}",
+            "\u{915}\u{94D}",
+            "\u{915}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{AC00}",
+            "\u{600}",
+        ];
+        let mut seed = 0x326f_0001_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let (mut vouched, mut refused) = (0, 0);
+        for _ in 0..20_000 {
+            let cells: Vec<Cell> = (0..1 + next(12))
+                .map(|_| {
+                    Cell::new_grapheme(texts[next(texts.len())], CellAttributes::blank(), None)
+                })
+                .collect();
+            // Visible cells as the slice builder steps over them: wide
+            // cells are followed by the columns they cover.
+            let mut row = Vec::new();
+            for cell in &cells {
+                let width = cell.width().max(1);
+                row.push(cell.clone());
+                for _ in 1..width {
+                    row.push(Cell::blank());
+                }
+            }
+            let (line, inert) = ClusteredLine::from_cell_slice_checked(row.len(), &row);
+            let reads_back = {
+                let mut own = line.iter();
+                cells.iter().all(|cell| {
+                    own.next().is_some_and(|mine| {
+                        mine.str() == cell.str()
+                            && mine.width()
+                                == usize::from(ClusteredLine::normalize_cell_width(cell.width()))
+                    })
+                }) && own.next().is_none()
+            };
+            if inert {
+                vouched += 1;
+                assert!(
+                    reads_back,
+                    "vouched for a row that does not read back: {:?}",
+                    cells
+                );
+            } else {
+                refused += 1;
+                assert!(!reads_back, "refused a row that reads back: {:?}", cells);
+            }
+        }
+        assert!(
+            vouched > 1000 && refused > 1000,
+            "{} vouched, {} refused",
+            vouched,
+            refused
+        );
     }
 }

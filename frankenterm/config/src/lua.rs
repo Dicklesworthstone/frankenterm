@@ -381,6 +381,48 @@ end
             lua.create_function(|_, ()| Ok(crate::running_under_wsl()))?,
         )?;
 
+        // The machine inventory beside this config (machines.toml) as plain
+        // tables, or nil when there is none; a path argument reads another
+        // file. Editing the inventory reloads the config like the file itself.
+        let inventory_dir = config_dir.to_path_buf();
+        wezterm_mod.set(
+            "machines",
+            lua.create_function(move |lua, path: Option<String>| {
+                // A named file resolves like a scheme file: `~` is HOME and a
+                // relative path is beside the config. Unnamed, the inventory
+                // beside the config wins, else the one `ft mobile` reads.
+                let names = crate::machines::InventoryContext {
+                    directory: inventory_dir.clone(),
+                    home: crate::HOME_DIR.clone(),
+                };
+                let path = match path {
+                    Some(path) => names.expand(&path),
+                    None => {
+                        let beside = inventory_dir.join(crate::machines::FILE_NAME);
+                        if beside.exists() {
+                            beside
+                        } else {
+                            crate::machines::default_path()
+                        }
+                    }
+                };
+                if !path.exists() {
+                    return Ok(Value::Nil);
+                }
+                add_to_config_reload_watch_list(
+                    lua,
+                    std::iter::once(path.to_string_lossy().into_owned()).collect(),
+                )?;
+                let inventory = crate::machines::MachineInventory::load(&path)
+                    .map_err(|err| mlua::Error::external(format!("{:#}", err)))?;
+                let context = crate::machines::InventoryContext {
+                    directory: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                    home: crate::HOME_DIR.clone(),
+                };
+                Ok(Value::Table(machines_table(lua, &inventory, &context)?))
+            })?,
+        )?;
+
         wezterm_mod.set(
             "default_wsl_domains",
             lua.create_function(|_, ()| Ok(crate::WslDomain::default_domains()))?,
@@ -435,6 +477,14 @@ end
         let time_mod = get_or_create_sub_module(&lua, "time")?;
         time_mod.set("call_after", lua.create_function(lua_time_call_after)?)?;
         time_mod.set("now", lua.create_function(lua_time_now)?)?;
+        time_mod.set("parse", lua.create_function(lua_time_parse)?)?;
+        time_mod.set(
+            "parse_rfc3339",
+            lua.create_function(lua_time_parse_rfc3339)?,
+        )?;
+        wezterm_mod.set("strftime", lua.create_function(lua_strftime)?)?;
+        wezterm_mod.set("strftime_utc", lua.create_function(lua_strftime_utc)?)?;
+        wezterm_mod.set("sleep_ms", lua.create_async_function(lua_sleep_ms)?)?;
 
         wezterm_mod.set(
             "default_hyperlink_rules",
@@ -716,13 +766,98 @@ async fn dispatch_lua_timer_callback(callback: LuaTimerCallback) {
     }
 }
 
-/// `wezterm.time.now()` — returns seconds since UNIX epoch as a float.
-fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    Ok(secs)
+/// A point in time, as WezTerm's `wezterm.time` returns it: `:format(fmt)`
+/// in local time, `:format_utc(fmt)` (strftime formats), comparisons, and
+/// `tostring`. Status bars use `wezterm.time.now():format('%H:%M')`.
+#[derive(Clone, Copy, Debug)]
+pub struct LuaTime {
+    utc: chrono::DateTime<chrono::Utc>,
+}
+
+impl mlua::UserData for LuaTime {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| {
+            Ok(format!("Time(utc: {})", this.utc.to_rfc3339()))
+        });
+        methods.add_meta_method(
+            mlua::MetaMethod::Eq,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc == other.utc),
+        );
+        methods.add_meta_method(
+            mlua::MetaMethod::Lt,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc < other.utc),
+        );
+        methods.add_meta_method(
+            mlua::MetaMethod::Le,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc <= other.utc),
+        );
+        methods.add_method("format", |_, this, format: String| {
+            let local: chrono::DateTime<chrono::Local> = this.utc.into();
+            strftime_checked(&local, &format)
+        });
+        methods.add_method("format_utc", |_, this, format: String| {
+            strftime_checked(&this.utc, &format)
+        });
+    }
+}
+
+/// `format` with strftime syntax. An invalid specifier is an error rather
+/// than the panic chrono's `Display` raises for it.
+fn strftime_checked<Tz: chrono::TimeZone>(
+    time: &chrono::DateTime<Tz>,
+    format: &str,
+) -> mlua::Result<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use std::fmt::Write;
+    let mut out = String::new();
+    write!(out, "{}", time.format(format))
+        .map_err(|_| mlua::Error::external(format!("invalid strftime format {format:?}")))?;
+    Ok(out)
+}
+
+/// `wezterm.time.now()`: the current time.
+fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<LuaTime> {
+    Ok(LuaTime {
+        utc: chrono::Utc::now(),
+    })
+}
+
+/// `wezterm.time.parse(text, format)`: `text` read with a strftime format
+/// that includes an offset.
+fn lua_time_parse(_: &Lua, (text, format): (String, String)) -> mlua::Result<LuaTime> {
+    let time = chrono::DateTime::parse_from_str(&text, &format).map_err(|err| {
+        mlua::Error::external(format!(
+            "{err:#} while parsing {text} using format {format}"
+        ))
+    })?;
+    Ok(LuaTime { utc: time.into() })
+}
+
+/// `wezterm.time.parse_rfc3339(text)`.
+fn lua_time_parse_rfc3339(_: &Lua, text: String) -> mlua::Result<LuaTime> {
+    let time = chrono::DateTime::parse_from_rfc3339(&text).map_err(|err| {
+        mlua::Error::external(format!("{err:#} while parsing {text} as an RFC3339 time"))
+    })?;
+    Ok(LuaTime { utc: time.into() })
+}
+
+/// `wezterm.strftime(format)`: the local time now, formatted.
+fn lua_strftime(_: &Lua, format: String) -> mlua::Result<String> {
+    strftime_checked(&chrono::Local::now(), &format)
+}
+
+/// `wezterm.strftime_utc(format)`: the UTC time now, formatted.
+fn lua_strftime_utc(_: &Lua, format: String) -> mlua::Result<String> {
+    strftime_checked(&chrono::Utc::now(), &format)
+}
+
+/// `wezterm.sleep_ms(ms)`: suspends the calling coroutine for `ms`
+/// milliseconds on the project's timer.
+async fn lua_sleep_ms(_: Lua, milliseconds: u64) -> mlua::Result<()> {
+    promise::spawn::sleep(std::time::Duration::from_millis(milliseconds)).await;
+    Ok(())
 }
 
 /// `wezterm.time.call_after(seconds, function)` — schedules `function` to be
@@ -1191,21 +1326,24 @@ pub async fn emit_event(lua: Lua, (name, args): (String, mlua::MultiValue)) -> m
     }
 }
 
+/// The handler [`emit_sync_callback`] calls for event `name`: the first one
+/// registered with `wezterm.on`, or `None` when there is none. Lets a caller
+/// skip building expensive arguments for an event nobody handles.
+pub fn registered_sync_callback(lua: &Lua, name: &str) -> mlua::Result<Option<mlua::Function>> {
+    let decorated_name = format!("wezterm-event-{}", name);
+    match lua.named_registry_value::<mlua::Value>(&decorated_name)? {
+        mlua::Value::Table(tbl) => tbl.sequence_values::<mlua::Function>().next().transpose(),
+        _ => Ok(None),
+    }
+}
+
 pub fn emit_sync_callback<A>(lua: &Lua, (name, args): (String, A)) -> mlua::Result<mlua::Value>
 where
     A: IntoLuaMulti,
 {
-    let decorated_name = format!("wezterm-event-{}", name);
-    let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
-    match tbl {
-        mlua::Value::Table(tbl) => {
-            if let Some(func) = tbl.sequence_values::<mlua::Function>().next() {
-                let func = func?;
-                return func.call(args);
-            }
-            Ok(mlua::Value::Nil)
-        }
-        _ => Ok(mlua::Value::Nil),
+    match registered_sync_callback(lua, &name)? {
+        Some(func) => func.call(args),
+        None => Ok(mlua::Value::Nil),
     }
 }
 
@@ -1251,6 +1389,151 @@ fn utf16_to_utf8(_: &Lua, text: mlua::LuaString) -> mlua::Result<String> {
     )
     .collect::<Result<String, _>>()
     .map_err(mlua::Error::external)
+}
+
+/// `frankenterm.machines()`: the inventory in the shapes a config uses —
+/// `colors` is a WezTerm `colors` table, `routes` keep their order, and each
+/// mux route carries the `proxy_command` argv for a unix domain.
+fn machines_table(
+    lua: &Lua,
+    inventory: &crate::machines::MachineInventory,
+    context: &crate::machines::InventoryContext,
+) -> mlua::Result<Table> {
+    use crate::machines::{MachineRoute, RouteTarget};
+    let strings = |values: &[String]| -> mlua::Result<Table> {
+        let table = lua.create_table()?;
+        for (index, value) in values.iter().enumerate() {
+            table.set(index + 1, value.as_str())?;
+        }
+        Ok(table)
+    };
+    let hexes = |values: &[crate::machines::Rgba]| -> mlua::Result<Table> {
+        let table = lua.create_table()?;
+        for (index, value) in values.iter().enumerate() {
+            table.set(index + 1, value.hex())?;
+        }
+        Ok(table)
+    };
+
+    let result = lua.create_table()?;
+    let workspace = lua.create_table()?;
+    workspace.set("id", inventory.workspace_id.as_str())?;
+    workspace.set("name", inventory.workspace_name.as_str())?;
+    result.set("workspace", workspace)?;
+    result.set("default_group", inventory.default_group.as_str())?;
+    let groups = lua.create_table()?;
+    for (index, group) in inventory.groups.iter().enumerate() {
+        let table = lua.create_table()?;
+        table.set("id", group.id.as_str())?;
+        table.set("name", group.name.as_str())?;
+        table.set("machines", strings(&group.machines)?)?;
+        groups.set(index + 1, table)?;
+    }
+    result.set("groups", groups)?;
+    let order: Vec<String> = inventory.machines.iter().map(|m| m.id.clone()).collect();
+    result.set("order", strings(&order)?)?;
+
+    let machines = lua.create_table()?;
+    for machine in &inventory.machines {
+        let table = lua.create_table()?;
+        table.set("id", machine.id.as_str())?;
+        table.set("name", machine.name.as_str())?;
+        table.set("short_label", machine.short_label.as_deref())?;
+        table.set("icon", machine.icon.as_deref())?;
+        table.set("cwd", machine.cwd.as_deref())?;
+        table.set("tags", strings(&machine.tags)?)?;
+        let theme = &machine.theme;
+        table.set("accent", theme.accent.hex())?;
+        let theme_table = lua.create_table()?;
+        theme_table.set("name", theme.name.as_str())?;
+        theme_table.set("automatic", theme.automatic)?;
+        table.set("theme", theme_table)?;
+
+        let palette = &theme.palette;
+        let colors = lua.create_table()?;
+        colors.set("foreground", palette.foreground.hex())?;
+        colors.set("background", palette.background.hex())?;
+        colors.set("cursor_fg", palette.cursor_fg.hex())?;
+        colors.set("cursor_bg", palette.cursor_bg.hex())?;
+        colors.set("cursor_border", palette.cursor_border.hex())?;
+        colors.set("selection_fg", palette.selection_fg.hex())?;
+        colors.set("selection_bg", palette.selection_bg.hex())?;
+        colors.set("ansi", hexes(&palette.ansi[..8])?)?;
+        colors.set("brights", hexes(&palette.ansi[8..])?)?;
+        if !palette.indexed.is_empty() {
+            let indexed = lua.create_table()?;
+            for (index, color) in &palette.indexed {
+                indexed.set(*index, color.hex())?;
+            }
+            colors.set("indexed", indexed)?;
+        }
+        table.set("colors", colors)?;
+        if let Some(gradient) = &theme.background_gradient {
+            let value = lua.create_table()?;
+            value.set("colors", hexes(&gradient.colors)?)?;
+            value.set("angle", gradient.angle)?;
+            value.set("opacity", gradient.opacity)?;
+            table.set("background_gradient", value)?;
+        }
+        if let Some(font) = &theme.font {
+            let value = lua.create_table()?;
+            value.set("family", font.family.as_str())?;
+            value.set("size", font.size)?;
+            table.set("font", value)?;
+        }
+
+        let routes = lua.create_table()?;
+        for (index, route) in machine.routes.iter().enumerate() {
+            let value = lua.create_table()?;
+            value.set("id", route.id())?;
+            match route {
+                MachineRoute::Ssh { target, .. } => {
+                    value.set("kind", "ssh")?;
+                    match target {
+                        RouteTarget::Alias(alias) => value.set("alias", alias.as_str())?,
+                        RouteTarget::Direct {
+                            host,
+                            user,
+                            port,
+                            identity_files,
+                        } => {
+                            value.set("host", host.as_str())?;
+                            value.set("user", user.as_str())?;
+                            value.set("port", *port)?;
+                            let expanded: Vec<String> = identity_files
+                                .iter()
+                                .map(|file| context.expand(file).to_string_lossy().into_owned())
+                                .collect();
+                            value.set("identity_files", strings(&expanded)?)?;
+                        }
+                    }
+                }
+                MachineRoute::FrankenTermMux {
+                    id,
+                    via,
+                    socket,
+                    relay,
+                } => {
+                    value.set("kind", "frankenterm_mux")?;
+                    value.set("via", strings(via)?)?;
+                    value.set("socket", socket.as_deref())?;
+                    value.set("relay", relay.as_deref())?;
+                    if let Some(argv) = machine.mux_proxy_command(id, context) {
+                        let argv = strings(&argv)?;
+                        if table.get::<Value>("mux_proxy_command")?.is_nil() {
+                            table.set("mux_proxy_command", argv.clone())?;
+                        }
+                        value.set("proxy_command", argv)?;
+                    }
+                }
+            }
+            routes.set(index + 1, value)?;
+        }
+        table.set("routes", routes)?;
+        machines.set(machine.id.as_str(), table)?;
+    }
+    result.set("machines", machines)?;
+    Ok(result)
 }
 
 pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlua::Result<()> {
@@ -1330,6 +1613,146 @@ mod test {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn machines_reads_the_inventory_beside_the_config_and_watches_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_file = dir.path().join("frankenterm.lua");
+        let lua = make_lua_context(&config_file)?;
+        // Named explicitly: unnamed, a missing neighbour falls back to the
+        // user's real inventory, which a test must not read.
+        let missing: Value = lua
+            .load("return frankenterm.machines('absent.toml')")
+            .eval()?;
+        assert!(
+            missing.is_nil(),
+            "no inventory is nil, so a config can fall back"
+        );
+
+        std::fs::write(
+            dir.path().join(crate::machines::FILE_NAME),
+            r##"
+version = 1
+[machines.trj]
+name = "Threadripper"
+[machines.trj.theme.colors]
+background = "#0a0e14"
+ansi = ["#000000","#ff0000","#00ff00","#ffff00","#0000ff","#ff00ff","#00ffff","#ffffff"]
+[machines.trj.theme.colors.indexed]
+"16" = "#123456"
+[[machines.trj.routes]]
+id = "ts"
+host = "100.91.120.17"
+user = "ubuntu"
+identity_file = "/keys/trj"
+[[machines.trj.routes]]
+id = "mux"
+kind = "frankenterm_mux"
+via = "ts"
+socket = "/run/user/1000/frankenterm/sock"
+[machines.css]
+[[machines.css.routes]]
+id = "ssh"
+ssh = "css"
+"##,
+        )?;
+        let (name, background, red, indexed, order, theme, mux, alias, automatic): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+        ) = lua
+            .load(
+                r#"
+                local m = frankenterm.machines()
+                local trj = m.machines.trj
+                return trj.name, trj.colors.background, trj.colors.ansi[2], trj.colors.indexed[16],
+                    table.concat(m.order, ','), trj.theme.name, table.concat(trj.mux_proxy_command, ' '),
+                    m.machines.css.routes[1].alias, m.machines.css.theme.automatic
+            "#,
+            )
+            .eval()?;
+        assert_eq!(name, "Threadripper");
+        assert_eq!(background, "#0A0E14");
+        assert_eq!(red, "#FF0000");
+        assert_eq!(indexed, "#123456");
+        assert_eq!(order, "css,trj", "with no groups, machines read by id");
+        assert_eq!(theme, "trj");
+        assert!(
+            mux.ends_with("ubuntu@100.91.120.17 nc -N -U /run/user/1000/frankenterm/sock"),
+            "{}",
+            mux
+        );
+        assert!(
+            mux.starts_with("ssh -i /keys/trj -o ConnectTimeout=10"),
+            "{}",
+            mux
+        );
+        assert_eq!(alias, "css");
+        assert!(automatic);
+        let named: String = lua
+            .load("return frankenterm.machines('machines.toml').machines.trj.name")
+            .eval()?;
+        assert_eq!(
+            named, "Threadripper",
+            "a relative name is beside the config"
+        );
+        let watched: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
+        assert!(
+            watched
+                .iter()
+                .any(|p| p.ends_with(crate::machines::FILE_NAME)),
+            "{:?}",
+            watched
+        );
+
+        std::fs::write(
+            dir.path().join(crate::machines::FILE_NAME),
+            "version = 1\n[machines.a]\n",
+        )?;
+        let err = lua
+            .load("return frankenterm.machines()")
+            .exec()
+            .expect_err("no routes");
+        assert!(err.to_string().contains("machines.a.routes"), "{}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn time_values_format_parse_and_compare_like_wezterm() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        let (utc, iso, ordered, clock_len): (String, String, bool, usize) = lua
+            .load(
+                r#"
+                local w = require('wezterm')
+                local t = w.time.parse_rfc3339('2026-10-14T12:34:56Z')
+                local later = w.time.parse('2026-10-14 13:00:00 +0000', '%Y-%m-%d %H:%M:%S %z')
+                return t:format_utc('%H:%M:%S'), tostring(t), t < later and later > t and t == t,
+                    #w.strftime('%H:%M') + #w.time.now():format('%H:%M') + #w.strftime_utc('%H')
+            "#,
+            )
+            .eval()?;
+        assert_eq!(utc, "12:34:56");
+        assert_eq!(iso, "Time(utc: 2026-10-14T12:34:56+00:00)");
+        assert!(ordered);
+        assert_eq!(clock_len, 5 + 5 + 2);
+
+        let bad_format = lua
+            .load("return require('wezterm').strftime('%Q')")
+            .exec()
+            .expect_err("an invalid strftime specifier");
+        assert!(
+            bad_format.to_string().contains("invalid strftime format"),
+            "{}",
+            bad_format
+        );
+        Ok(())
     }
 
     #[test]

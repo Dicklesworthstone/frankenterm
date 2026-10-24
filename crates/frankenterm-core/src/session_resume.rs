@@ -29,6 +29,7 @@ use crate::runtime_async::process::{
     CommandProcessCleanupIncomplete, CommandTimedOut, DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
     DEFAULT_COMMAND_STDOUT_LIMIT_BYTES, decode_captured_bytes_lossy,
 };
+use crate::system_symlinks::resolve_system_symlinks;
 
 // =============================================================================
 // Agent provider enum
@@ -1907,7 +1908,14 @@ pub fn discover_antigravity_conversations_in_dir(
     discover_antigravity_conversations_in_dir_with_checkpoint(conversations_dir, || Ok(()))
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    open_resolved_session_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -1928,7 +1936,7 @@ fn open_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std:
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_session_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_session_directory_tree_nofollow(parent_path)?;
     open_session_child_directory_nofollow(&parent, Path::new(leaf))
 }
 
@@ -4279,17 +4287,23 @@ mod tests {
             .clone()
             .with_output_limits(2, 64)
             .expect("limits are below hard admission ceilings");
+        // `exec` for the same reason as the stderr twin below: a `sleep`
+        // forked by a shell loop while the tree is being signalled can
+        // outlive the settle window (seen on macOS).
         let error = over
-            .run_casr(&["-c", "printf 'abc'; while :; do sleep 1; done"])
+            .run_casr(&["-c", "printf 'abc'; exec sleep 600"])
             .expect_err("first byte beyond stdout cap must fail closed");
-        assert!(matches!(
-            &error,
-            SessionResumeError::CaptureLimitExceeded {
-                stream: CommandOutputStream::Stdout,
-                observed: 3,
-                limit: 2,
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                SessionResumeError::CaptureLimitExceeded {
+                    stream: CommandOutputStream::Stdout,
+                    observed: 3,
+                    limit: 2,
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("abc"));
     }
 
@@ -4313,17 +4327,23 @@ mod tests {
         let over = exact
             .with_output_limits(64, 2)
             .expect("limits are below hard admission ceilings");
+        // `exec` keeps the process alive without forking: a `sleep` forked
+        // while the tree is being signalled can outlive the settle window and
+        // turn the expected cap error into CleanupIncomplete (seen on macOS).
         let error = over
-            .run_casr(&["-c", "printf 'abc' >&2; while :; do sleep 1; done"])
+            .run_casr(&["-c", "printf 'abc' >&2; exec sleep 600"])
             .expect_err("first byte beyond stderr cap must fail closed");
-        assert!(matches!(
-            &error,
-            SessionResumeError::CaptureLimitExceeded {
-                stream: CommandOutputStream::Stderr,
-                observed: 3,
-                limit: 2,
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                SessionResumeError::CaptureLimitExceeded {
+                    stream: CommandOutputStream::Stderr,
+                    observed: 3,
+                    limit: 2,
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("abc"));
     }
 
