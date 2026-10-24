@@ -3,7 +3,6 @@
 use super::error::json_err;
 use super::extractors::{
     parse_u64, redact_json_value, request_runtime_limits, require_event_bus,
-    require_storage_and_event_bus,
 };
 use super::{
     STREAM_CHANNEL_BUFFER, STREAM_MAX_CONSECUTIVE_DROPS, STREAM_SCHEMA_VERSION, WebRuntimeLimits,
@@ -12,7 +11,7 @@ use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
 use crate::runtime_async::stream::Stream;
 use crate::runtime_async::{mpsc, sleep, task};
-use crate::storage::{EventStreamQuery, SegmentScanQuery, StorageHandle, StoredEvent};
+use crate::storage::{EventStreamQuery, StoredEvent};
 use crate::web_framework::{
     QueryString, Request, Response, StatusCode, WebStreamLifecycle, sse_stream_response,
 };
@@ -22,6 +21,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[path = "sse_delta.rs"]
+mod delta;
+pub(super) use delta::handle_stream_deltas;
 
 // ============================================================================
 // br-ft-95fd3: SSE drop observability counters
@@ -127,13 +130,6 @@ pub(super) enum EventStreamChannel {
     Deltas,
     Detections,
     Signals,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeltaCatchup {
-    Complete,
-    MoreAvailable,
-    Stop,
 }
 
 pub(super) fn parse_stream_max_hz(qs: &QueryString<'_>, runtime_limits: WebRuntimeLimits) -> u64 {
@@ -715,145 +711,6 @@ pub(super) fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> boo
     pane_filter.is_none_or(|pane_id| event.pane_id() == Some(pane_id))
 }
 
-// Segment-frame SSE emission keeps storage, filters, cursor, and backpressure knobs explicit.
-#[allow(clippy::too_many_arguments)]
-async fn emit_new_segment_frames(
-    storage: &StorageHandle,
-    pane_filter: Option<u64>,
-    started_at_ms: i64,
-    after_id: &mut Option<i64>,
-    runtime_limits: WebRuntimeLimits,
-    redactor: &Redactor,
-    tx: &mpsc::Sender<SseEvent>,
-    seq: &mut u64,
-    next_emit_at: &mut Instant,
-    min_interval: Duration,
-    consecutive_drops: &mut u64,
-) -> DeltaCatchup {
-    for page_index in 0..runtime_limits.stream_scan_max_pages {
-        let query = SegmentScanQuery {
-            after_id: *after_id,
-            pane_id: pane_filter,
-            since: Some(started_at_ms),
-            until: None,
-            limit: runtime_limits.stream_scan_limit,
-        };
-
-        // ft-xbnl0.2.3 tick 257: cx-first SSE delta-stream scan.
-        let scan_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let segments = match storage.scan_segments_with_cx(&scan_cx, query).await {
-            Ok(segments) => segments,
-            Err(err) => {
-                if !advance_stream_sequence(seq) {
-                    return DeltaCatchup::Stop;
-                }
-                let frame = make_stream_frame(
-                    "deltas",
-                    "error",
-                    *seq,
-                    json!({
-                        "code": "storage_error",
-                        "message": redactor.redact(&err.to_string())
-                    }),
-                );
-                if let Some(event) = frame_to_sse("error", *seq, frame) {
-                    let _ = send_rate_limited_sse(
-                        tx,
-                        event,
-                        next_emit_at,
-                        min_interval,
-                        consecutive_drops,
-                    )
-                    .await;
-                }
-                return DeltaCatchup::Stop;
-            }
-        };
-
-        if segments.is_empty() {
-            return DeltaCatchup::Complete;
-        }
-
-        let page_len = segments.len();
-        for segment in segments {
-            *after_id = Some(segment.id);
-
-            if !advance_stream_sequence(seq) {
-                return DeltaCatchup::Stop;
-            }
-            let frame = make_stream_frame(
-                "deltas",
-                "delta",
-                *seq,
-                json!({
-                    "segment_id": segment.id,
-                    "pane_id": segment.pane_id,
-                    "seq": segment.seq,
-                    "captured_at": segment.captured_at,
-                    "content_len": segment.content_len,
-                    "content": redactor.redact(&segment.content),
-                }),
-            );
-
-            if let Some(event) = frame_to_sse("delta", *seq, frame) {
-                if !send_rate_limited_sse(tx, event, next_emit_at, min_interval, consecutive_drops)
-                    .await
-                {
-                    return DeltaCatchup::Stop;
-                }
-            }
-        }
-
-        if page_len < runtime_limits.stream_scan_limit {
-            return DeltaCatchup::Complete;
-        }
-
-        if page_index + 1 == runtime_limits.stream_scan_max_pages {
-            return DeltaCatchup::MoreAvailable;
-        }
-    }
-
-    DeltaCatchup::Complete
-}
-
-// Segment-frame draining mirrors emission inputs while updating the caller's stream cursor.
-#[allow(clippy::too_many_arguments)]
-async fn drain_new_segment_frames(
-    storage: &StorageHandle,
-    pane_filter: Option<u64>,
-    started_at_ms: i64,
-    after_id: &mut Option<i64>,
-    runtime_limits: WebRuntimeLimits,
-    redactor: &Redactor,
-    tx: &mpsc::Sender<SseEvent>,
-    seq: &mut u64,
-    next_emit_at: &mut Instant,
-    min_interval: Duration,
-    consecutive_drops: &mut u64,
-) -> bool {
-    loop {
-        match emit_new_segment_frames(
-            storage,
-            pane_filter,
-            started_at_ms,
-            after_id,
-            runtime_limits,
-            redactor,
-            tx,
-            seq,
-            next_emit_at,
-            min_interval,
-            consecutive_drops,
-        )
-        .await
-        {
-            DeltaCatchup::Complete => return true,
-            DeltaCatchup::MoreAvailable => task::yield_now().await,
-            DeltaCatchup::Stop => return false,
-        }
-    }
-}
-
 pub(super) fn handle_stream_events(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
@@ -1146,242 +1003,6 @@ pub(super) fn handle_stream_events(
                         {
                             Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                             Err(mpsc::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                }
-            }
-        };
-
-        SseResponse::new(SseByteStream::new(
-            recv_cx,
-            rx,
-            Box::pin(producer),
-            shutdown,
-        ))
-        .into_response()
-    })
-}
-
-pub(super) fn handle_stream_deltas(
-    req: &Request,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    // br-ft-x2oyy: function-level delta SSE keepalive contract. The body-owned
-    // producer may opportunistically enqueue comments while waiting for
-    // runtime events; dropped keepalives are acceptable when the client is
-    // already backpressured or disconnected.
-    let qs_raw = req.query().unwrap_or("").to_string();
-    let qs = QueryString::parse(&qs_raw);
-    let pane_filter = parse_u64(&qs, "pane_id");
-    let runtime_limits = request_runtime_limits(req);
-    let max_hz = parse_stream_max_hz(&qs, runtime_limits);
-    let result = require_storage_and_event_bus(req);
-    let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
-
-    Box::pin(async move {
-        let (storage, event_bus, redactor) = match result {
-            Ok(r) => r,
-            Err(resp) => return resp,
-        };
-
-        let Some(lifecycle) = lifecycle else {
-            return json_err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "stream_lifecycle_unavailable",
-                "Stream lifecycle is unavailable",
-            );
-        };
-        let Some(stream_cx) = crate::cx::Cx::current() else {
-            return json_err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "stream_context_unavailable",
-                "Stream runtime context is unavailable",
-            );
-        };
-        let shutdown = lifecycle.shutdown_waiter(&stream_cx);
-        let recv_cx = stream_cx.clone();
-
-        let mut subscriber = event_bus.subscribe_deltas();
-        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        let started_at_ms = epoch_ms_now();
-        let producer = async move {
-            let child_cx = stream_cx;
-            let min_interval = stream_min_interval(max_hz);
-            let mut next_emit_at = Instant::now();
-            let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
-            let mut after_id: Option<i64> = None;
-
-            if !advance_stream_sequence(&mut seq) {
-                return;
-            }
-            let ready = make_stream_frame(
-                "deltas",
-                "ready",
-                seq,
-                json!({
-                    "max_hz": max_hz,
-                    "pane_id": pane_filter
-                }),
-            );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
-                if !send_rate_limited_sse(
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                    &mut consecutive_drops,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            loop {
-                if child_cx.checkpoint().is_err() {
-                    break;
-                }
-                let recv_result = crate::runtime_async::timeout_with_cx(
-                    &child_cx,
-                    Duration::from_secs(runtime_limits.stream_keepalive_secs),
-                    subscriber.recv_cx(&child_cx),
-                )
-                .await;
-
-                match recv_result {
-                    Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-                        if !drain_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            runtime_limits,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Ok(Event::GapDetected {
-                        pane_id,
-                        seq_before,
-                        seq_after,
-                        reason,
-                        detected_at_ms,
-                    })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-
-                        if !advance_stream_sequence(&mut seq) {
-                            break;
-                        }
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "gap",
-                            seq,
-                            json!({
-                                "pane_id": pane_id,
-                                "seq_before": seq_before,
-                                "seq_after": seq_after,
-                                "reason": redactor.redact(&reason),
-                                "detected_at_ms": detected_at_ms,
-                            }),
-                        );
-                        if let Some(event) = frame_to_sse("gap", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(RecvError::Lagged { missed_count })) => {
-                        if !advance_stream_sequence(&mut seq) {
-                            break;
-                        }
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "lag",
-                            seq,
-                            json!({ "missed_count": missed_count }),
-                        );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-
-                        if !drain_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            runtime_limits,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Err(RecvError::Cancelled)) => break,
-                    Ok(Err(RecvError::Closed)) => break,
-                    Err(_) => {
-                        // br-ft-x2oyy: intentional best-effort keepalive;
-                        // try_send failure means the SSE client is backpressured or gone.
-                        match tx
-                            .try_send(SseEvent::comment("keepalive"))
-                            .map_err(mpsc::TrySendError::from)
-                        {
-                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                            Err(mpsc::TrySendError::Closed(_)) => break,
-                        }
-                        if !drain_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            runtime_limits,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
                         }
                     }
                 }
