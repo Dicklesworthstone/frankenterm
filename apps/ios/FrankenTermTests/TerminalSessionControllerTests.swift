@@ -491,6 +491,10 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTAssertEqual(session.phase, .live)
+        // A session goes live before the machine on screen gets its view.
+        for _ in 0..<400 where session.terminal == nil && scene.shows(machineID: "alpha") {
+            try await Task.sleep(for: .milliseconds(25))
+        }
         let terminal = try shown(session)
         defer { terminal.removeFromSuperview() }
         try await type("echo RELAUNCHED-$((40+2)) > \(live.outPath)", into: terminal)
