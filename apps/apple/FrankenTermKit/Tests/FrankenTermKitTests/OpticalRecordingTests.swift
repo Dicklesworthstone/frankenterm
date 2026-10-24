@@ -213,6 +213,7 @@ final class OpticalRecordingTests: XCTestCase {
 
     #if canImport(AVFoundation) && canImport(ImageIO) && canImport(Vision) && canImport(CryptoKit) && canImport(Darwin)
     func testNativeMP4AndAPNGRoundTripIntoTheActualOfflineRestore() async throws {
+        try skipIfSimulatorLacksVisionBarcodeInference()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ft-recording-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
