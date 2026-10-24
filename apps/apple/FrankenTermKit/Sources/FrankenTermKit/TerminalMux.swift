@@ -164,7 +164,12 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 public final class TerminalMuxShownPane: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
+        /// The connection ended before the server confirmed input sent to it.
+        public var inputUnconfirmed = false
         public init(_ pane: TerminalMuxPane) { paneId = pane.paneId; tabId = pane.tabId; windowId = pane.windowId }
+        func names(_ pane: TerminalMuxPane) -> Bool {
+            pane.paneId == paneId && pane.tabId == tabId && pane.windowId == windowId
+        }
     }
     private let lock = NSLock()
     private let defaults: UserDefaults
@@ -190,14 +195,27 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
         }
     }
 
+    /// The connection is ending before the server confirmed input sent to the
+    /// remembered pane; the next connection that shows it says so.
+    public func markInputUnconfirmed() {
+        lock.withLock {
+            guard var stored = defaults.data(forKey: key).flatMap({ try? JSONDecoder().decode(Record.self, from: $0) }),
+                  !stored.inputUnconfirmed else { return }
+            stored.inputUnconfirmed = true
+            if let data = try? JSONEncoder().encode(stored) { defaults.set(data, forKey: key) }
+        }
+    }
+
     /// The pane a new connection shows from the server's list: the remembered
     /// one while it is still there, else the desktop's active pane. `lost`
-    /// says a remembered pane is gone, which the screen should tell.
-    public func choose(from panes: [TerminalMuxPane]) -> (pane: TerminalMuxPane?, lost: Bool) {
+    /// says a remembered pane is gone, and `inputUnconfirmed` that the last
+    /// connection ended before the pane confirmed input; the screen should
+    /// tell either.
+    public func choose(from panes: [TerminalMuxPane]) -> (pane: TerminalMuxPane?, lost: Bool, inputUnconfirmed: Bool) {
         let fallback = panes.first(where: \.isActive) ?? panes.first
-        guard let record else { return (fallback, false) }
-        if let same = panes.first(where: { Record($0) == record }) { return (same, false) }
-        return (fallback, true)
+        guard let record else { return (fallback, false, false) }
+        if let same = panes.first(where: record.names) { return (same, false, record.inputUnconfirmed) }
+        return (fallback, true, false)
     }
 }
 
@@ -222,6 +240,10 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// A size `restoreSize` gave back is not answered yet: the server may not
     /// have applied it, and closing the channel now can lose it on the way.
     func restoring() throws -> Bool
+    /// Input sent to the pane is not answered yet: the server may not have
+    /// written it, and closing the channel now can lose it on the way. After
+    /// the connection ended, some of it may never have arrived.
+    func unansweredInput(pane: Int) throws -> Bool
     /// Searches the pane's scrollback on the server, newest rows first; a
     /// `.searchResults` event with the returned id answers.
     func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64
@@ -250,6 +272,8 @@ extension TerminalMuxClient {
     public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool { false }
     /// A client that keeps no sizes waits on no restore.
     public func restoring() throws -> Bool { false }
+    /// A client that tracks no answers waits on none.
+    public func unansweredInput(pane: Int) throws -> Bool { false }
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {

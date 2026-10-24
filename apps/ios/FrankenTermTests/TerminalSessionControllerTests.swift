@@ -940,6 +940,63 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(third, connections: live.connections)
     }
 
+    /// Plan 2.2, "lose Wi-Fi after pressing Enter", against a real mux. The
+    /// pane's program freezes its mux server, so what is typed next goes
+    /// unanswered, and then the phone's relay dies. The next connection comes
+    /// back to the same pane and program and says its last input was not
+    /// confirmed; one after an ordinary close says nothing. Needs a disposable
+    /// mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this test stops and resumes its
+    /// server and kills the relay processes running that command.
+    func testAMuxConnectionLostBeforeInputWasAnsweredSaysSoOnReturn() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
+        let run = UUID().uuidString.prefix(8)
+        let first = try await connect(scene, "alpha")
+        let view = try shown(first)
+        let pane = try XCTUnwrap(first.muxState?.shown)
+        try await type("echo PID-\(run)-$$ > \(out)", into: view)
+        let typed = try await hostFile(out, containing: "PID-\(run)-")
+        let pid = try XCTUnwrap(typed.split(separator: "\n").first { $0.hasPrefix("PID-\(run)-") }, typed)
+            .dropFirst("PID-\(run)-".count)
+        // The pane's shell is the server's child: it stops the server, and a
+        // background job kills the relay and resumes the server after.
+        try await type("(sleep 2; pkill -f '\(command)'; sleep 2; kill -CONT $PPID) & kill -STOP $PPID", into: view)
+        try await Task.sleep(for: .milliseconds(500))
+        try await type("echo LATE-\(run) >> \(out)", into: view)
+        for _ in 0..<300 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.disconnected)))
+        XCTAssertTrue(first.dropped)
+        view.removeFromSuperview()
+        await assertReleased(first, connections: live.connections)
+        try await Task.sleep(for: .seconds(3))
+
+        let unconfirmed = "The connection ended before the machine confirmed your last input to this pane. Check whether it arrived before typing it again."
+        let second = try await connect(scene, "alpha")
+        for _ in 0..<200 where second.muxState?.shown == nil || second.interactionProblem == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(second.muxState?.shown, pane, "the phone came back to the same pane")
+        XCTAssertEqual(second.interactionProblem, unconfirmed)
+        let again = try shown(second)
+        try await type("echo AGAIN-\(run)-$$ >> \(out)", into: again)
+        let text = try await hostFile(out, containing: "AGAIN-\(run)-")
+        XCTAssertTrue(text.contains("AGAIN-\(run)-\(pid)"), "the same program answered (\(text))")
+        again.removeFromSuperview()
+        await second.stop()
+        await assertReleased(second, connections: live.connections)
+
+        // Closed on purpose after its input was answered: nothing to tell.
+        let third = try await connect(scene, "alpha")
+        for _ in 0..<200 where third.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(third.muxState?.shown, pane)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(third.interactionProblem)
+        await scene.close()
+        await assertReleased(third, connections: live.connections)
+    }
+
     /// A direct route first tries the machine's mux. The loopback host has none,
     /// so that attempt leaves an acknowledged record with no input before the
     /// shell's own record. These are the records of terminals that ran.

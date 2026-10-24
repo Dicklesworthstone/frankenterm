@@ -456,6 +456,38 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(control.current.notice, "The pane you were viewing closed while you were away.")
     }
 
+    func testInputAConnectionLeftUnconfirmedIsToldOnceOnlyForThatPane() throws {
+        let suite = "frankenterm.tests.unconfirmedInput.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func pane(_ id: Int, tab: Int) -> TerminalMuxPane {
+            TerminalMuxPane(paneId: id, tabId: tab, windowId: 0, tabTitle: "", title: "p\(id)", workspace: "default",
+                            workingDir: nil, size: .init(rows: 24, cols: 80), isActive: id == 1, isZoomed: false)
+        }
+        let listed = [pane(1, tab: 0), pane(4, tab: 2)]
+        let ending = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
+        // Nothing remembered: nothing to mark.
+        ending.markInputUnconfirmed()
+        XCTAssertNil(ending.record)
+        ending.set(listed[1])
+        XCTAssertFalse(ending.choose(from: listed).inputUnconfirmed)
+        ending.markInputUnconfirmed()
+
+        // The next connection comes back to that pane and is told; showing it
+        // clears the mark, so the one after is not.
+        let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
+        let choice = next.choose(from: listed)
+        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertTrue(choice.inputUnconfirmed)
+        // Gone, or its number in another tab: only that it closed.
+        for panes in [[listed[0]], [listed[0], pane(4, tab: 9)]] {
+            let other = next.choose(from: panes)
+            XCTAssertTrue(other.lost); XCTAssertFalse(other.inputUnconfirmed)
+        }
+        next.set(listed[1])
+        XCTAssertFalse(TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
+            .choose(from: listed).inputUnconfirmed)
+    }
+
     func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {
         let control = TerminalMuxControl()
         final class Seen: @unchecked Sendable { let lock = NSLock(); var failures: [String?] = [] }

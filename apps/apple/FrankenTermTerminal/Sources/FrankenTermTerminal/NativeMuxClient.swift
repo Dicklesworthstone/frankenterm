@@ -168,6 +168,13 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         return restoring == 1
     }
 
+    public func unansweredInput(pane: Int) throws -> Bool {
+        let pane = try Self.paneID(pane)
+        var unanswered: UInt32 = 0
+        try call { ft_mux_v1_unanswered_input($0, pane, &unanswered) }
+        return unanswered == 1
+    }
+
     public func click(pane: Int, column: Int, row: Int) throws {
         let pane = try Self.paneID(pane)
         guard (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }

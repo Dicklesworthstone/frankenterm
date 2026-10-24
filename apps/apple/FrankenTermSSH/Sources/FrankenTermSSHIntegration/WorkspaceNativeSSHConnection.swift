@@ -547,10 +547,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try await validateForeground()
             }
             // Back to the pane this phone was showing when it is still there.
-            let (chosen, lost) = state.shownPane.choose(from: state.panes)
+            let (chosen, lost, unconfirmed) = state.shownPane.choose(from: state.panes)
             guard let first = chosen else { throw TerminalMuxError.noPanes }
             if lost {
                 control.recordNotice("The pane you were viewing closed while you were away. This is the desktop's active pane.")
+            } else if unconfirmed {
+                control.recordNotice("The connection ended before the machine confirmed your last input to this pane. Check whether it arrived before typing it again.")
             }
             // Panes an earlier connection left at the phone's size get the
             // desktop's back; the one about to be shown is resized anyway, and
@@ -952,7 +954,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
         let task = Task<Void, Never> {
-            if let state = self.mux, let driver = self.driver { await self.giveSizesBack(state, driver: driver) }
+            if let state = self.mux, let driver = self.driver { await self.settleBeforeClose(state, driver: driver) }
             await session.close()
             withExtendedLifetime(lease) {}
         }
@@ -964,16 +966,22 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         mux = nil; driver = nil
     }
 
-    /// The desktop gets its size back before the channel closes: this pane's,
-    /// and any an earlier hide gave back. Reads until the server has answered,
-    /// since a relay like `nc -U` drops what it has not forwarded when the
-    /// channel closes. The pump may be in its own service turn (ours is then
-    /// busy); it writes what we admit. Bounded: a dead server must not hold
-    /// teardown, and an unanswered restore keeps its record for the next
-    /// connection to give back.
-    private func giveSizesBack(_ state: MuxAttachment, driver: NativeSSHDriver) async {
+    /// Before the channel closes, what was typed reaches the pane and the
+    /// desktop gets its size back: this pane's, and any an earlier hide gave
+    /// back. Reads until the server has answered both, since a relay like
+    /// `nc -U` drops what it has not forwarded when the channel closes. The
+    /// pump may be in its own service turn (ours is then busy); it writes what
+    /// we admit. Bounded: a dead server must not hold teardown. An unanswered
+    /// restore keeps its record for the next connection to give back, and
+    /// unanswered input is marked for the next connection to tell.
+    private func settleBeforeClose(_ state: MuxAttachment, driver: NativeSSHDriver) async {
         if let pane = state.shown, state.showing {
             try? state.client.hide(pane: pane); try? state.client.restoreSize(pane: pane)
+        }
+        let typedTo = state.shownPane.record?.paneId
+        func inputAnswered() -> Bool {
+            guard let typedTo else { return true }
+            return (try? state.client.unansweredInput(pane: typedTo)) == false
         }
         var restored: [Int] = [], failed = false
         // Nothing is on screen now; only sizes and the session's end matter.
@@ -992,8 +1000,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         while ContinuousClock.now < deadline {
             let drained = (try? await flushMux(driver: driver)) ?? false
             settle()
-            if failed { return }
-            if drained, (try? state.client.restoring()) == false,
+            if failed { break }
+            if drained, (try? state.client.restoring()) == false, inputAnswered(),
                (try? await session.accounting().pendingWriteBytes) == 0 { break }
             do {
                 let event = try await session.service(timeout: .milliseconds(100), driver: driver)
@@ -1003,6 +1011,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             catch { break }
         }
         settle()
+        if !inputAnswered() { state.shownPane.markInputUnconfirmed() }
         guard !failed, (try? state.client.restoring()) == false else { return }
         for pane in restored { state.sizes.set(pane: pane, desktop: nil, rows: 0, columns: 0) }
     }
