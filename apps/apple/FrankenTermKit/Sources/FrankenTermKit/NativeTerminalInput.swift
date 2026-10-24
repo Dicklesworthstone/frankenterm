@@ -270,13 +270,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
     /// Typing while no rendered projection exists (for example while history
     /// is shown) is still not sent; the owner may bring the live screen back.
-    /// While the live screen is only being redrawn, committed text and keys
-    /// are sent: they need no caret geometry. Composition still waits for it.
-    private func typed(composing: Bool = false, _ operation: () throws -> Void) {
+    /// While the live screen is only being redrawn, text, keys and an input
+    /// method's composition are taken as usual: none needs caret geometry, and
+    /// the candidate is drawn again at the next caret. UIKit's calls stay
+    /// authoritative; a dropped commit would lose text it considers sent.
+    private func typed(_ operation: () throws -> Void) {
         guard !ordinaryInputBlocked else { return }
         if !retiring, !hasGeometry {
-            let live = onInputWithoutProjection?() == true
-            guard live, !composing, !session.document.isMarked else { return }
+            guard onInputWithoutProjection?() == true else { return }
             do { try operation(); refreshComposition() }
             catch { onFailure?(error) }
             return
@@ -292,17 +293,17 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         if !session.document.isMarked, range == NSRange(location: 0, length: 0) {
             insertText(text); return
         }
-        mutate { try session.replace(range, with: text) }
+        typed { try session.replace(range, with: text) }
     }
     public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
         // Helper modifiers never silently transform a native language candidate.
         // Starting IME returns them to the visibly inactive state.
-        typed(composing: true) {
+        typed {
             try session.setMarkedText(markedText, selectedRange: selectedRange)
             accessoryModifiers.clear()
         }
     }
-    public func unmarkText() { mutate { try session.unmarkText() } }
+    public func unmarkText() { typed { try session.unmarkText() } }
     public func insertText(_ text: String) {
         typed {
             if !session.document.isMarked,

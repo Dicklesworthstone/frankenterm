@@ -411,6 +411,38 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(record.inputEvidence.mayHaveRemoteEffect)
     }
 
+    /// An input method composes on the phone and the shell receives only what
+    /// it commits, as UTF-8: a Japanese conversion committed with its chosen
+    /// text, a dead key replaced by its letter, and a candidate committed as
+    /// it stands. The calls are UIKit's, in the order a keyboard makes them.
+    func testComposedTextReachesTheShellOnlyWhenCommitted() async throws {
+        let live = try await liveScene()
+        let session = try await connect(live.scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        let input = terminal.input
+        for _ in 0..<200 where !input.isEditable { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertTrue(input.isEditable, "the native input view never became editable")
+        let run = UUID().uuidString.prefix(8)
+        input.insertText("printf '%s\\n' IME-\(run) ")
+        for candidate in ["k", "か", "かn", "かん", "かんj", "かんじ", "漢字"] {
+            input.setMarkedText(candidate, selectedRange: NSRange(location: (candidate as NSString).length, length: 0))
+        }
+        input.insertText("漢字")
+        input.insertText(" ")
+        input.setMarkedText("´", selectedRange: NSRange(location: 1, length: 0))
+        input.insertText("é")
+        input.insertText(" ")
+        input.setMarkedText("ü", selectedRange: NSRange(location: 1, length: 0))
+        input.unmarkText()
+        input.insertText(" END-\(run) > \(live.outPath)"); input.insertText("\n")
+        let output = try await hostFile(live.outPath, containing: "END-\(run)")
+        XCTAssertEqual(output.split(separator: "\n").map(String.init), ["IME-\(run)", "漢字", "é", "ü", "END-\(run)"],
+                       "only committed text reaches the shell (output: \(output))")
+        await live.scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// An iPad on a large display at the smallest text size has room for more
     /// cells than the terminal can keep both screens of. The grid takes the
     /// full width and as many rows as fit; it used to give up columns to keep

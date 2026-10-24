@@ -186,8 +186,8 @@ final class NativeTerminalInputTests: XCTestCase {
         await view.session.waitUntilSuspended(); await other.session.waitUntilSuspended()
     }
     /// A resize or new text size redraws the live screen: keys typed meanwhile
-    /// still reach the shell. Composition waits for the drawn caret, and with
-    /// history shown nothing is sent.
+    /// still reach the shell, and so does what an input method commits. With
+    /// history shown nothing is sent, composition included.
     func testTypingWhileTheLiveScreenIsRedrawnIsSent() async throws {
         let (coordinator, transport, source, view) = try await setup()
         var live = true
@@ -201,17 +201,26 @@ final class NativeTerminalInputTests: XCTestCase {
         let left = try XCTUnwrap(accessoryButton(view, "Left arrow"))
         XCTAssertTrue(left.isEnabled, "the key row stays usable while the screen is redrawn")
         left.sendActions(for: .touchUpInside)
+        // A conversion the input method commits with its own text, then a
+        // candidate committed as it stands; only the committed text is sent.
         view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+        view.setMarkedText("かん", selectedRange: NSRange(location: 2, length: 0))
+        XCTAssertTrue(view.session.document.isMarked, "the candidate is kept while the caret is redrawn")
+        view.insertText("漢")
+        view.setMarkedText("ü", selectedRange: NSRange(location: 1, length: 0))
+        view.unmarkText()
         await view.session.waitUntilSettled(); try await drain(coordinator, source)
         let sent = await transport.bytes()
-        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "lsx<key:42><key:40><key:80>")
-        XCTAssertFalse(view.session.document.isMarked, "composition waits for a drawn caret")
+        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "lsx<key:42><key:40><key:80>漢ü")
+        XCTAssertFalse(view.session.document.isMarked)
 
         live = false
         view.insertText("pwd\n"); left.sendActions(for: .touchUpInside)
+        view.setMarkedText("ä", selectedRange: NSRange(location: 1, length: 0)); view.unmarkText()
         await view.session.waitUntilSettled(); try await drain(coordinator, source)
         let after = await transport.bytes()
         XCTAssertEqual(after, sent, "with history shown, typing is not sent")
+        XCTAssertFalse(view.session.document.isMarked, "nor is a candidate kept")
         view.retire()
         await view.session.waitUntilSuspended()
     }
