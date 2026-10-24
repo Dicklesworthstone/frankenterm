@@ -886,13 +886,14 @@ final class TerminalSessionController {
             let pump: TerminalSessionPump
             do { pump = try await attempt.openTerminal(geometry: geometry) }
             catch let failure as TerminalMuxError {
-                // An existing-only mux route never grants permission to create
-                // a shell on another route. Opportunistic mux discovery on a
-                // direct SSH route retains that route's creation policy.
-                guard !route.mux else { throw failure }
                 // No mux answered, it speaks a protocol this app does not (a
                 // newer desktop's), or it has no panes: the machine gets a
-                // shell of its own instead, as before there was a mux.
+                // shell of its own on one of its direct SSH routes instead, as
+                // before there was a mux. That shell opens only under the
+                // direct route's own creation policy (shouldOpenTerminal); an
+                // existing-only mux route grants nothing, and a machine with
+                // no direct route keeps the mux's answer.
+                guard target.routes.contains(where: { !$0.mux }) else { throw failure }
                 Self.log.info("no usable mux on \(self.target.machineID, privacy: .public) (\(String(describing: failure), privacy: .public)); opening a shell")
                 // A failed cleanup retains this exact owner; it may not be
                 // hidden by opening another key, route, or shell.

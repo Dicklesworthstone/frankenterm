@@ -87,8 +87,12 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(WorkspaceTerminalScreen.via(direct), "on the local network · 192.168.1.8")
     }
 
+    /// With `muxCommand`, each machine's route is a mux route; with
+    /// `directAfterMux` too, a direct route (`creation`) follows it, as the
+    /// Mac's export orders them.
     private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
-                          creation: TerminalSessionCreation = .onSelect, muxCommand: String? = nil) throws -> WorkspaceDocument {
+                          creation: TerminalSessionCreation = .onSelect, muxCommand: String? = nil,
+                          directAfterMux: Bool = false) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
             "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF",
@@ -97,19 +101,23 @@ final class TerminalSessionControllerTests: XCTestCase {
         // each gets its own SSH connection, shell and journal record.
         let workspace: [String: Any] = [
             "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["alpha", "beta"]]],
-            "machines": ["alpha", "beta"].map { ["id": $0, "name": $0.capitalized, "theme_ref": "theme", "route_refs": ["route-\($0)"],
-                                                 "preferred_route_ref": "route-\($0)", "auto_connect": false] as [String: Any] },
-            "routes": ["alpha", "beta"].map { machine -> [String: Any] in
-                var route: [String: Any] = ["id": "route-\(machine)", "host": "127.0.0.1", "port": Int(port), "user": user,
-                                            "credential_refs": ["key"], "authentication_methods": ["publickey"],
-                                            "host_trust_ref": "trust", "jump_routes": []]
-                if let muxCommand {
-                    route["mode"] = "frankenterm_mux"; route["attach_policy"] = "existing_only"
-                    route["remote_command"] = muxCommand
-                } else {
-                    route["mode"] = "direct_ssh"; route["session_creation"] = creation.rawValue
+            "machines": ["alpha", "beta"].map { machine -> [String: Any] in
+                let refs = muxCommand != nil && directAfterMux ? ["route-\(machine)-mux", "route-\(machine)"] : ["route-\(machine)"]
+                return ["id": machine, "name": machine.capitalized, "theme_ref": "theme", "route_refs": refs,
+                        "preferred_route_ref": refs[0], "auto_connect": false]
+            },
+            "routes": ["alpha", "beta"].flatMap { machine -> [[String: Any]] in
+                func route(_ id: String) -> [String: Any] {
+                    ["id": id, "host": "127.0.0.1", "port": Int(port), "user": user, "credential_refs": ["key"],
+                     "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": []]
                 }
-                return route
+                var direct = route("route-\(machine)")
+                direct["mode"] = "direct_ssh"; direct["session_creation"] = creation.rawValue
+                guard let muxCommand else { return [direct] }
+                var mux = route(directAfterMux ? "route-\(machine)-mux" : "route-\(machine)")
+                mux["mode"] = "frankenterm_mux"; mux["attach_policy"] = "existing_only"
+                mux["remote_command"] = muxCommand
+                return directAfterMux ? [mux, direct] : [mux]
             },
             "credentials": [["id": "key", "algorithm": identity.algorithm, "public_fingerprint": identity.fingerprint,
                              "requirement": "matching_private_key", "private_material": "not_included"]],
@@ -131,7 +139,7 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
                            creation: TerminalSessionCreation = .onSelect,
-                           muxCommand: String? = nil) async throws -> LiveScene {
+                           muxCommand: String? = nil, directAfterMux: Bool = false) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -143,7 +151,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let key = try PrivateKeyRecord.fromPEM(pem, credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
         let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user,
-                                                            creation: creation, muxCommand: muxCommand),
+                                                            creation: creation, muxCommand: muxCommand,
+                                                            directAfterMux: directAfterMux),
                                         keys: [key], using: crypto)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-" + UUID().uuidString)
         let vault = SceneMemoryVault()
@@ -153,11 +162,13 @@ final class TerminalSessionControllerTests: XCTestCase {
             transferID: Data(repeating: 9, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let journalIdentifier = "scene-test-" + UUID().uuidString
         let machines = ["alpha", "beta"].map { id in
-            SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
-                machineID: id, machineName: id.capitalized,
-                routes: [.init(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port,
-                               mux: muxCommand != nil, sessionCreation: muxCommand != nil ? .existingOnly : creation)]),
-                unavailable: "", theme: nil)
+            let direct = TerminalSessionRoute(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port,
+                                              sessionCreation: creation)
+            let mux = TerminalSessionRoute(id: directAfterMux ? "route-\(id)-mux" : "route-\(id)", credentialIDs: ["key"],
+                                           host: "127.0.0.1", port: port, mux: true, sessionCreation: .existingOnly)
+            let routes = muxCommand == nil ? [direct] : directAfterMux ? [mux, direct] : [mux]
+            return SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
+                machineID: id, machineName: id.capitalized, routes: routes), unavailable: "", theme: nil)
         }
         func launch() async throws -> LiveScene {
             let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
@@ -921,6 +932,66 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
         await assertReleased(session, connections: live.connections)
         await scene.close()
+    }
+
+    /// The Mac's export lists a machine's mux route before its direct routes.
+    /// When no mux answers there, the machine gets a shell on its direct route,
+    /// as a direct route alone gives one; a machine with only a mux route
+    /// keeps the mux's answer. Needs only the loopback sshd: the mux command
+    /// fails at once.
+    func testAMuxRouteWithNoMuxOpensAShellOnTheMachinesDirectRoute() async throws {
+        let noMux = "nc -U /nonexistent/frankenterm-test.sock"
+        let live = try await liveScene(muxCommand: noMux, directAfterMux: true), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        XCTAssertEqual(session.phase, .live)
+        XCTAssertTrue(session.shellOnly)
+        XCTAssertEqual(session.route.id, "route-alpha", "the shell runs on the direct route")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        let run = UUID().uuidString.prefix(8)
+        try await type("echo FALLBACK-\(run)-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "FALLBACK-\(run)-42")
+        XCTAssertTrue(output.contains("FALLBACK-\(run)-42"), "the shell runs commands (output: \(output))")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+
+        let only = try await liveScene(muxCommand: noMux)
+        let refused = try await connect(only.scene, "alpha")
+        XCTAssertEqual(refused.phase, .failed(TerminalSessionController.describe(TerminalMuxError.unavailable)))
+        XCTAssertFalse(refused.shellOnly, "a machine with only a mux route never gets a new shell")
+        await only.scene.close()
+        await assertReleased(refused, connections: only.connections)
+    }
+
+    /// The direct route's own creation policy decides that fallback: selecting
+    /// the machine tries its existing-only mux route, and when no mux answers
+    /// a manual direct route signs in but opens a shell only when asked.
+    func testAMuxRouteWithNoMuxKeepsAManualDirectRouteManual() async throws {
+        let live = try await liveScene(creation: .manual, muxCommand: "nc -U /nonexistent/frankenterm-test.sock",
+                                       directAfterMux: true), scene = live.scene
+        scene.connect("alpha")
+        let session = try XCTUnwrap(scene.sessions["alpha"])
+        // Ready comes twice: signed in on the mux route, then on the direct one.
+        for _ in 0..<400 where !(session.phase == .ready && session.shellOnly) && !session.settled {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(session.phase, .ready, "signed in on the manual route without opening a shell")
+        XCTAssertTrue(session.shellOnly)
+        XCTAssertEqual(session.route.id, "route-alpha")
+        XCTAssertNil(session.terminal)
+
+        await session.activateTerminal(explicit: true)
+        for _ in 0..<400 where session.phase != .live && !session.settled {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        let run = UUID().uuidString.prefix(8)
+        try await type("echo ASKED-\(run)-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "ASKED-\(run)-42")
+        XCTAssertTrue(output.contains("ASKED-\(run)-42"), "the shell asked for runs commands (output: \(output))")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     /// M2 against a real FrankenTerm mux server. The phone attaches to the pane
