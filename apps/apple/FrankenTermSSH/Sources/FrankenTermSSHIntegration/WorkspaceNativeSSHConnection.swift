@@ -648,10 +648,14 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.publish(panes: panes, shown: state.shown)
             case .output(let pane, let rows, let columns, let bytes):
                 guard pane == state.shown, state.showing else { continue }
-                // The phone's terminal holds what fits its cell budget. A pane
-                // someone else made larger is asked back to the phone's size.
+                // The phone draws its own size (at most maximumShownCells), and
+                // a size someone else gave the pane while 256 history rows
+                // still fit beside both screens. A pane someone else made
+                // larger is asked back to the phone's size.
+                let own = UInt32(rows) == state.geometry.rows && UInt32(columns) == state.geometry.columns
                 guard (1...512).contains(rows), (1...512).contains(columns),
-                      rows * columns <= TerminalSessionGeometry.maximumShownCells else {
+                      rows * columns <= TerminalSessionGeometry.maximumShownCells,
+                      own || (rows * 2 + 256) * columns <= 65536 else {
                     // The mirror counts this output as drawn; draw the pane
                     // again from scratch once it is back at the phone's size.
                     try state.client.resize(pane: pane, rows: Int(state.geometry.rows),

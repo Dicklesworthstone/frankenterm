@@ -1096,6 +1096,46 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// While the phone shows a pane, a larger size someone else gives it (the
+    /// desktop; here a second device on a large screen) is asked back to the
+    /// phone's size once 256 history rows would no longer fit beside it.
+    func testAMuxPaneSomeoneElseMadeLargerIsAskedBackToThePhonesSize() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let phone = try await liveScene(muxCommand: command), out = phone.outPath
+        let session = try await connect(phone.scene, "alpha")
+        let view = try shown(session)
+        let run = UUID().uuidString.prefix(8)
+        try await type("trap 'stty size >> \(out)' WINCH; echo READY-\(run)-$((6*7)) > \(out)", into: view)
+        _ = try await hostFile(out, containing: "READY-\(run)-42")
+        let small = try XCTUnwrap(view.renderer.admittedFrame)
+
+        let other = try await liveScene(muxCommand: command)
+        let tablet = try await connect(other.scene, "alpha")
+        let large = try shown(tablet)
+        large.frame = CGRect(x: 0, y: 0, width: 1376, height: 1032)
+        large.setFontPointSize(NativeTerminalView.fontSizes.lowerBound)
+        func sizes() -> [[Int]] {
+            ((try? String(contentsOfFile: out, encoding: .utf8)) ?? "").split(separator: "\n")
+                .map { $0.split(separator: " ").compactMap { Int($0) } }.filter { $0.count == 2 }
+        }
+        let phoneSize = [small.rows, small.columns]
+        for _ in 0..<200 where !(sizes().contains { $0[1] > 250 } && sizes().last == phoneSize) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(sizes().contains { $0[1] > 250 }, "the second device gave the pane its size (\(sizes()))")
+        XCTAssertEqual(sizes().last, phoneSize, "the phone asked its pane back (\(sizes()))")
+
+        // The scene that appeared last has the input.
+        try await type("trap - WINCH", into: large)
+        large.removeFromSuperview(); view.removeFromSuperview()
+        await other.scene.close()
+        await assertReleased(tablet, connections: other.connections)
+        await phone.scene.close()
+        await assertReleased(session, connections: phone.connections)
+    }
+
     /// A direct route first tries the machine's mux. The loopback host has none,
     /// so that attempt leaves an acknowledged record with no input before the
     /// shell's own record. These are the records of terminals that ran.
