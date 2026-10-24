@@ -847,8 +847,10 @@ public struct SSHWorkspaceSource: Sendable {
             if emittedTrusts.insert(trustID).inserted { trusts.append(.object(trust)) }
             if item.key.context == .destination {
                 let machineID = try workingRegistry.id("machine", alias)
+                // Every machine signs in once the workspace opens, so switching
+                // to one is instant; its terminal still opens only when chosen.
                 machines.append(.object(["id": .string(machineID), "name": .string(alias), "theme_ref": .string(registry.themeID),
-                    "route_refs": .array([.string(routeID)]), "preferred_route_ref": .string(routeID), "auto_connect": .boolean(false),
+                    "route_refs": .array([.string(routeID)]), "preferred_route_ref": .string(routeID), "auto_connect": .boolean(true),
                     "pane_selection": .string("last_surviving")]))
                 order.append(.string(machineID))
             }
@@ -858,7 +860,7 @@ public struct SSHWorkspaceSource: Sendable {
             "source": .object(["exporter_id": .string(registry.exporterID), "kind": .string("ssh_config"), "configuration_revision": .string(revision)]),
             "required_capabilities": .array([]), "workspace": .object([
                 "id": .string(registry.workspaceID), "name": .string(workspaceName),
-                "groups": .array([.object(["id": .string(registry.groupID), "name": .string(workspaceName), "machine_order": .array(order), "auto_connect": .boolean(false)])]),
+                "groups": .array([.object(["id": .string(registry.groupID), "name": .string(workspaceName), "machine_order": .array(order), "auto_connect": .boolean(true)])]),
                 "machines": .array(machines), "routes": .array(routes), "credentials": .array(credentials), "host_trust": .array(trusts),
                 "themes": .array([Self.theme(id: registry.themeID)]),
                 "preferences": .object(["initial_group_ref": .string(registry.groupID), "initial_machine_ref": first, "connect_on_open": .boolean(false)])])])

@@ -476,7 +476,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertEqual(result.workspace.routes.map(\.port), [2200, 2222])
         XCTAssertEqual(result.workspace.routes.map(\.user), ["global-first", "global-first"])
         XCTAssertEqual(result.workspace.groups[0].machineOrder, result.workspace.machines.map(\.id))
-        XCTAssertFalse(result.workspace.machines.contains(where: \.autoConnect))
+        XCTAssertTrue(result.workspace.machines.allSatisfy(\.autoConnect), "every machine signs in in the background")
+        XCTAssertTrue(result.workspace.groups[0].autoConnect)
         XCTAssertThrowsError(try input.identityFileReferences(for: ["*.invalid"]))
         XCTAssertThrowsError(try input.identityFileReferences(for: ["build", "build"]))
     }
@@ -549,7 +550,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertEqual(trust["revoked_keys"], .array([]))
         XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.credentials" })
         XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.host_trust" })
-        XCTAssertFalse(result.workspace.machines[0].autoConnect)
+        // A key added on the phone later lets it sign in like the others.
+        XCTAssertTrue(result.workspace.machines[0].autoConnect)
     }
 
     func testDefaultIdentityPolicyIsExplicitAndNoneOrDisabledPublicKeyPreventsReads() throws {
