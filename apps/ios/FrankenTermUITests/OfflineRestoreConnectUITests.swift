@@ -359,6 +359,9 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         }
         XCTAssertTrue(list.exists, "Back twice leads from the terminal to the list")
         XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
+        // Sessions keep running off screen; an offline restore ends them first.
+        let disconnect = app.buttons["Disconnect Sessions and Restore"]
+        if disconnect.waitForExistence(timeout: 10) { disconnect.tap() }
         let field = app.secureTextFields["Transfer code"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
         field.tap(); field.typeText(code)

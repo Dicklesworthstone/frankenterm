@@ -33,18 +33,16 @@ struct FrankenTermMobileApp: App {
     }
 }
 
-/// Confirmation names the exact retained owners it may close. A workspace
-/// reopened or replaced while the dialog is visible requires a fresh review.
+/// The exact retained owners a disconnect may close, taken when it is asked
+/// for. A workspace reopened or replaced before it runs requires a new one.
 @MainActor
 struct RestoreSessionDisconnectReview {
     let id = UUID()
-    let workspaceNames: [String]
     fileprivate let epoch: UUID
     fileprivate let owners: [WorkspaceTerminalScene]
 
     fileprivate init(epoch: UUID, owners: [WorkspaceTerminalScene]) {
         self.epoch = epoch; self.owners = owners
-        workspaceNames = owners.map(\.workspaceName)
     }
 }
 
@@ -234,7 +232,6 @@ final class MobileWorkspaceModel {
             }
             try await refreshWorkspaces(using: created, epoch: epoch)
             if active, pendingImport != nil { showRestore = true }
-            restoreLiveScreen()
             updateLifecycle()
             Task { await Self.connectSelfTestIfRequested(using: created) }
         } catch { report(error); bootstrapStarted = false }
@@ -905,6 +902,7 @@ final class MobileWorkspaceModel {
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
         locallyRevokedFingerprints = revoked
+        restoreLiveScreen()
         if let importing = credentialImport, !importing.isCommitting, !importing.isFinished,
            !credentialImportIsCurrent(importing) {
             importing.cancel(message: "The workspace or key changed. Select its current key reference again.")
@@ -1149,13 +1147,22 @@ final class MobileWorkspaceModel {
     var returning: LiveScreen?
     /// The terminal screen reports what it shows, nil once the user leaves it
     /// or disconnects that machine, so a relaunch returns only to a terminal
-    /// the user was still using (plan 12.1: navigation is persisted).
+    /// the user was still using (plan 12.1: navigation is persisted). Only
+    /// reports while the app is active count: going inactive suspends
+    /// navigation and can rebuild the screen, and the app switcher, where it
+    /// may then be ended, is inactive too.
     func showing(_ screen: LiveScreen?) {
+        guard active else { return }
         if let screen, let data = try? JSONEncoder().encode(screen) {
             UserDefaults.standard.set(data, forKey: Self.liveScreenKey)
         } else { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
     }
+    @ObservationIgnored private var liveScreenChecked = false
+    /// Once per launch, with the first workspaces loaded: a launch that is
+    /// not yet active loads them only after activation.
     private func restoreLiveScreen() {
+        guard !liveScreenChecked else { return }
+        liveScreenChecked = true
         guard returning == nil, pendingImport == nil,
               let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
               let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
@@ -1651,18 +1658,10 @@ struct OfflineRestoreSheet: View {
     private enum RestoreDecision {
         case save(generation: UUID, identity: OpticalFrame.Identity, replacing: OpticalDecoderRecoveryReview?)
         case discard(SavedOpticalScan)
-        case disconnect(RestoreSessionDisconnectReview)
         var title: String {
             switch self {
             case .save: "Save Scan Progress?"
             case .discard: "Discard Saved Scan?"
-            case .disconnect: "Disconnect Sessions and Restore?"
-            }
-        }
-        var cancelTitle: String {
-            switch self {
-            case .disconnect: "Keep Sessions"
-            case .save, .discard: "Cancel"
             }
         }
     }
@@ -1679,9 +1678,11 @@ struct OfflineRestoreSheet: View {
                     } actions: {
                         if model.busy { ProgressView("Preparing offline restore…") }
                         if model.canReviewSessionsForRestore {
+                            // The screen already says what this ends; the
+                            // button does it, with no second confirmation.
                             Button("Disconnect Sessions and Restore", role: .destructive) {
                                 if let reviewed = model.reviewSessionsForRestore() {
-                                    restoreDecision = .disconnect(reviewed)
+                                    model.disconnectSessionsAndRestore(reviewed)
                                 }
                             }
                         }
@@ -1800,11 +1801,8 @@ struct OfflineRestoreSheet: View {
             case .discard(let saved):
                 Button("Discard Saved Scan", role: .destructive) { model.discardSavedScan(saved) }
                     .disabled(model.busy || !model.active)
-            case .disconnect(let reviewed):
-                Button("Disconnect Sessions and Restore", role: .destructive) { model.disconnectSessionsAndRestore(reviewed) }
-                    .disabled(model.busy || !model.active)
             }
-            Button(decision.cancelTitle, role: .cancel) { restoreDecision = nil }
+            Button("Cancel", role: .cancel) { restoreDecision = nil }
         } message: { decision in
             switch decision {
             case .save(_, _, let reviewed):
@@ -1813,10 +1811,6 @@ struct OfflineRestoreSheet: View {
                      + " Saving stops when you leave restore or the app becomes inactive; a sudden interruption can lose progress since the last save.")
             case .discard(let saved):
                 Text("Discard the saved pages and unfinished progress for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further progress will stop.")
-            case .disconnect(let reviewed):
-                Text(verbatim: "Disconnect sessions in these workspaces:\n\n"
-                    + reviewed.workspaceNames.joined(separator: "\n")
-                    + "\n\nDirect SSH disconnection can terminate remote shells and programs. Input already sent may have executed. Other network activity may still prevent offline restore.")
             }
         }
         .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data, .movie, .png], allowsMultipleSelection: false) { result in
@@ -2801,7 +2795,17 @@ private struct MachineWorkspaceView: View {
     @Bindable var model: MobileWorkspaceModel
     /// A relaunch's return: this machine's terminal opens, as Connect would.
     var returningMachineID: String? = nil
-    @State private var returned: String?
+    /// The returned terminal carries the local state it opened with, as a
+    /// Connect link's destination does: deactivation clears
+    /// model.localPolicies, and the pushed terminal must not be rebuilt for it.
+    private struct ReturnedTerminal: Hashable {
+        let machineID: String, local: WorkspaceLocalState
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.machineID == rhs.machineID && lhs.local.workspace.revision == rhs.local.workspace.revision
+        }
+        func hash(into hasher: inout Hasher) { hasher.combine(machineID) }
+    }
+    @State private var returned: ReturnedTerminal?
     @State private var returnHandled = false
     @State private var selection = ""
     @State private var groupID = ""
@@ -2881,9 +2885,9 @@ private struct MachineWorkspaceView: View {
                 }
             }
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(item: $returned) { id in
-                if let connections = model.connections, let local = model.localPolicies[workspaceID] {
-                    liveWorkspace(connections: connections, local: local, initial: id)
+            .navigationDestination(item: $returned) { terminal in
+                if let connections = model.connections {
+                    liveWorkspace(connections: connections, local: terminal.local, initial: terminal.machineID)
                 }
             }
             .onAppear {
@@ -2964,7 +2968,7 @@ private struct MachineWorkspaceView: View {
               model.connections != nil, let local = model.localPolicies[workspaceID],
               sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { return }
         returnHandled = true
-        returned = id
+        returned = ReturnedTerminal(machineID: id, local: local)
     }
 
     /// A saved route: where it goes and anything this phone still needs for it.
