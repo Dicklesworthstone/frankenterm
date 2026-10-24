@@ -45,7 +45,10 @@ impl FtxPackage {
             let file = archive
                 .by_index(i)
                 .with_context(|| format!("failed to read archive entry {i}"))?;
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .with_context(|| format!("failed to decode archive entry {i} name"))?
+                .into_owned();
             validate_archive_entry_name(&name)?;
             entries.push(name);
         }
@@ -140,7 +143,10 @@ impl FtxPackage {
                 .by_index(i)
                 .with_context(|| format!("failed to read archive entry {i}"))?;
 
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .with_context(|| format!("failed to decode archive entry {i} name"))?
+                .into_owned();
 
             validate_archive_entry_name(&name)?;
 
