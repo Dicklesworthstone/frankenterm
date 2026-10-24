@@ -51,9 +51,12 @@ export function createFleetStream(viewer, {
   let generation = 0;
 
   function resync() {
+    const expectedGeneration = generation;
     try {
       Promise.resolve(onResync()).catch(() => {
-        if (!stopped) viewer.reportError("stream: snapshot recovery failed");
+        if (!stopped && generation === expectedGeneration) {
+          viewer.reportError("stream: snapshot recovery failed");
+        }
       });
     } catch (_) {
       viewer.reportError("stream: snapshot recovery failed");
@@ -152,16 +155,201 @@ export function createFleetStream(viewer, {
   };
 }
 
-async function fetchText(path, apiRoot) {
-  const response = await fetch(new URL(path, apiRoot), {
-    cache: "no-store",
-    credentials: "same-origin",
+// Read incrementally: checking a Rust decoder's limit after response.text()
+// is too late to bound a hostile or accidentally unbounded HTTP body.
+async function readSnapshot(path, apiRoot, fetchImpl, signal, bodyLimitBytes) {
+  let reader;
+  let abortListener;
+  const aborted = new Promise((_, reject) => {
+    abortListener = () => {
+      if (reader) void reader.cancel().catch(() => {});
+      reject(new Error("request cancelled or timed out"));
+    };
+    if (signal.aborted) abortListener();
+    else signal.addEventListener("abort", abortListener, { once: true });
   });
-  const body = await response.text();
-  if (!response.ok && !body.trimStart().startsWith("{")) {
-    throw new Error(`${path}: HTTP ${response.status}`);
+  const work = (async () => {
+    if (signal.aborted) throw new Error("request cancelled or timed out");
+    let response;
+    try {
+      response = await fetchImpl(new URL(path, apiRoot), {
+        cache: "no-store", credentials: "same-origin", signal,
+      });
+    } catch (_) {
+      throw new Error("network request failed");
+    }
+    try {
+      if (signal.aborted) throw new Error("request cancelled or timed out");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const declared = response.headers.get("content-length");
+      if (declared && /^[0-9]+$/.test(declared) && Number(declared) > bodyLimitBytes) {
+        throw new Error("response exceeds byte limit");
+      }
+      if (!response.body) throw new Error("response has no readable body");
+      reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let bytes = 0;
+      let text = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (signal.aborted) throw new Error("request cancelled or timed out");
+        if (done) return text + decoder.decode();
+        if (value.byteLength > bodyLimitBytes - bytes) {
+          throw new Error("response exceeds byte limit");
+        }
+        bytes += value.byteLength;
+        text += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      // Cancellation is best effort, not another unbounded wait. A late
+      // response after stop is disposed here and never reaches the model.
+      if (reader) {
+        void reader.cancel().catch(() => {});
+        reader.releaseLock();
+      } else if (response.body) {
+        void response.body.cancel().catch(() => {});
+      }
+    }
+  })();
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", abortListener);
   }
-  return body;
+}
+
+// Snapshot and stream responses have no shared network ordering. Keep only
+// accepted, surface-specific live frames that arrived during a refresh, then
+// reapply them after that surface's replacement snapshot. Failed or overflowed
+// snapshots leave the live model intact. Lag/gap counters are never replayed.
+export function createFleetRefresh(viewer, {
+  apiRoot,
+  fetchImpl = globalThis.fetch,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+  timeoutMs = 10_000,
+  bodyLimitBytes = 8 * 1024 * 1024,
+  journalLimitBytes = 2 * 1024 * 1024,
+  journalLimitFrames = 512,
+} = {}) {
+  for (const limit of [timeoutMs, bodyLimitBytes, journalLimitBytes, journalLimitFrames]) {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("invalid snapshot limit");
+  }
+  let stopped = true;
+  let flight = null;
+  let streamError = null;
+  const newJournal = () => ({ frames: [], bytes: 0, overflow: false });
+
+  async function run(batch) {
+    const deadline = setTimer(() => batch.controller.abort(), timeoutMs);
+    try {
+      const results = await Promise.allSettled([
+        readSnapshot("panes", apiRoot, fetchImpl, batch.controller.signal, bodyLimitBytes),
+        readSnapshot("events?limit=200", apiRoot, fetchImpl, batch.controller.signal, bodyLimitBytes),
+      ]);
+      if (stopped || flight !== batch) return false;
+      const failures = [];
+      for (const [index, surface] of ["panes", "events"].entries()) {
+        const result = results[index];
+        const journal = batch[surface];
+        if (result.status === "rejected") {
+          // Only our own finite diagnostics escape; decoder/transport errors
+          // can otherwise contain arbitrary response text or proxy details.
+          const reason = result.reason?.message;
+          const safe = typeof reason === "string" &&
+            /^(HTTP [0-9]{3}|network request failed|request cancelled or timed out|response exceeds byte limit|response has no readable body)$/.test(reason);
+          failures.push(`${surface}: ${safe ? reason : "response could not be read"}`);
+        } else if (journal.overflow) {
+          failures.push(`${surface}: snapshot superseded by live traffic`);
+        } else {
+          let replaced = false;
+          try {
+            if (surface === "panes") viewer.ingestPanes(result.value);
+            else viewer.ingestEvents(result.value);
+            replaced = true;
+          } catch (_) {
+            failures.push(`${surface}: snapshot rejected`);
+          }
+          if (replaced) {
+            try {
+              for (const payload of journal.frames) viewer.ingestStreamFrame(payload);
+            } catch (_) {
+              failures.push(`${surface}: live reconciliation failed`);
+            }
+          }
+        }
+      }
+      // A successful second endpoint must not hide the first one's failure,
+      // nor may a background refresh erase a still-unrecovered stream error.
+      if (streamError) failures.push(streamError);
+      if (failures.length) viewer.reportError(failures.join("; "));
+      return failures.length === 0;
+    } finally {
+      clearTimer(deadline);
+    }
+  }
+
+  function refresh() {
+    if (stopped) return Promise.resolve(false);
+    if (flight) {
+      flight.again = true;
+      return flight.promise;
+    }
+    const batch = {
+      controller: new AbortController(), panes: newJournal(), events: newJournal(),
+      again: false, promise: null,
+    };
+    flight = batch;
+    batch.promise = run(batch).finally(() => {
+      if (flight !== batch) return;
+      flight = null;
+      if (!stopped && batch.again) void refresh();
+    });
+    return batch.promise;
+  }
+
+  return {
+    refresh,
+    start() { stopped = false; },
+    stop() {
+      stopped = true;
+      const previous = flight;
+      flight = null;
+      if (previous) previous.controller.abort();
+    },
+    // This facade is passed to createFleetStream. The model admits a frame
+    // before we journal it or allow the stream owner to acknowledge its ID.
+    ingestStreamFrame(payload) {
+      if (stopped) throw new Error("snapshot owner stopped");
+      viewer.ingestStreamFrame(payload);
+      const frame = JSON.parse(payload);
+      if (frame.kind === "ready" || frame.kind === "event") streamError = null;
+      if (!flight || frame.kind !== "event") return;
+      const type = frame.data?.event?.type;
+      const surface = type === "pattern_detected" ? "events"
+        : ["pane_discovered", "pane_disappeared"].includes(type) ? "panes" : null;
+      if (!surface) return;
+      const journal = flight[surface];
+      if (journal.overflow) return;
+      // JS strings use UTF-16 storage. Charge two bytes per code unit, not
+      // UTF-8 wire length, so the retained journal has a conservative bound.
+      const bytes = payload.length * 2;
+      if (journal.frames.length >= journalLimitFrames || bytes > journalLimitBytes - journal.bytes) {
+        journal.overflow = true;
+        journal.frames = [];
+        journal.bytes = 0;
+      } else {
+        journal.frames.push(payload);
+        journal.bytes += bytes;
+      }
+    },
+    reportError(message) {
+      if (stopped) return;
+      streamError = String(message).slice(0, 200);
+      viewer.reportError(streamError);
+    },
+    setStreamState(state) { viewer.setStreamState(state); },
+  };
 }
 
 function keyInput(event, phase) {
@@ -211,21 +399,9 @@ async function main() {
   }
   present();
 
-  async function refresh() {
-    let panes;
-    let events;
-    try {
-      [panes, events] = await Promise.all([
-        fetchText("panes", apiRoot), fetchText("events?limit=200", apiRoot),
-      ]);
-    } catch (error) {
-      viewer.reportError(`refresh failed: ${error.message}`);
-      return;
-    }
-    try { viewer.ingestPanes(panes); } catch (_) { /* reported by the viewer */ }
-    try { viewer.ingestEvents(events); } catch (_) { /* reported by the viewer */ }
-  }
-  const stream = createFleetStream(viewer, { apiRoot, onResync: refresh });
+  const snapshots = createFleetRefresh(viewer, { apiRoot });
+  const refresh = snapshots.refresh;
+  const stream = createFleetStream(snapshots, { apiRoot, onResync: refresh });
 
   window.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey) return;
@@ -265,6 +441,7 @@ async function main() {
   function resume() {
     if (active) return;
     active = true;
+    snapshots.start();
     stream.start();
     refresh();
     refreshTimer = setInterval(refresh, REFRESH_MS);
@@ -273,6 +450,7 @@ async function main() {
   function suspend() {
     active = false;
     stream.stop();
+    snapshots.stop();
     if (refreshTimer !== null) clearInterval(refreshTimer);
     if (frameHandle !== null) cancelAnimationFrame(frameHandle);
     refreshTimer = frameHandle = null;
