@@ -91,6 +91,26 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         return terminal
     }
 
+    /// A new launch returns to the terminal the last one showed and connects
+    /// it again, without a tap. A test run on its own, with nothing saved
+    /// yet, imports and connects first.
+    @MainActor
+    private func reopen(_ app: XCUIApplication, _ inputs: Inputs) -> XCUIElement {
+        let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
+        guard terminal.waitForExistence(timeout: 20) else {
+            if savedWorkspace(app, inputs).exists {
+                XCTFail("a relaunch must return to the terminal the last launch showed")
+            } else { restore(app, inputs) }
+            return connect(app, inputs)
+        }
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["OK"]
+        if allow.waitForExistence(timeout: 3) { allow.tap() }
+        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
+                      "the terminal a relaunch returns to connects again")
+        snapshot("4r-returned")
+        return terminal
+    }
+
     /// A machine's chip in the strip, by name and state.
     @MainActor
     private func chip(_ app: XCUIApplication, _ machine: String, _ state: String) -> XCUIElement {
@@ -187,8 +207,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     func test2TerminalKeysFullScreenRotationAndBackground() throws {
         let inputs = try inputs()
         let app = launch()
-        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
-        let terminal = connect(app, inputs)
+        let terminal = reopen(app, inputs)
         app.typeText("echo READY-$((40+2))\n")
         guard waitFor("READY-42", in: terminal, timeout: 30, "the shell must accept input") else { return }
 
@@ -293,8 +312,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
             throw XCTSkip("Set TEST_RUNNER_FT_UI_SECOND_MACHINE_NAME for a package with a second machine")
         }
         let app = launch()
-        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
-        let terminal = connect(app, inputs)
+        let terminal = reopen(app, inputs)
         app.typeText("export FT_WHO=first; echo WHO-$FT_WHO-$((1+1))\n")
         waitFor("WHO-first-2", in: terminal, timeout: 30, "the first machine's shell must run")
 
@@ -331,7 +349,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
             throw XCTSkip("Set TEST_RUNNER_FT_UI_REIMPORT_{PATH,CODE} to a newer export of the same workspace")
         }
         let app = launch()
-        if !savedWorkspace(app, inputs).waitForExistence(timeout: 5) { restore(app, inputs) }
+        _ = reopen(app, inputs)
+        // Back to the list (the only screen with Add machines), where the
+        // operator scans a new export.
+        let list = app.buttons["Add machines"]
+        for _ in 0..<2 where !list.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = list.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(list.exists, "Back twice leads from the terminal to the list")
         XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
         let field = app.secureTextFields["Transfer code"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")

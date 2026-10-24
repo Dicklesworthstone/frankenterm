@@ -1124,6 +1124,7 @@ struct LiveWorkspaceView: View {
     var themes: SceneThemeSource? = nil
     var group: TerminalConnectionIntent.Group? = nil
     var connectOnOpen = false
+    var onShowing: (@MainActor (_ machineID: String?) -> Void)? = nil
     let makeScene: @MainActor () throws -> WorkspaceTerminalScene
     @State private var scene: WorkspaceTerminalScene?
     @State private var failed = false
@@ -1132,7 +1133,7 @@ struct LiveWorkspaceView: View {
         Group {
             if let scene {
                 WorkspaceTerminalScreen(scene: scene, initialMachineID: initialMachineID, themes: themes,
-                                        group: group, connectOnOpen: connectOnOpen)
+                                        group: group, connectOnOpen: connectOnOpen, onShowing: onShowing)
             }
             else if failed { Text("These machines could not be opened together.").padding() }
             else { Color.black.ignoresSafeArea() }
@@ -1152,6 +1153,12 @@ struct WorkspaceTerminalScreen: View {
     var themes: SceneThemeSource? = nil
     var group: TerminalConnectionIntent.Group? = nil
     var connectOnOpen = false
+    /// Told the machine on screen, unless the user disconnected it, and nil
+    /// on leaving: a relaunch returns there (MobileWorkspaceModel.showing).
+    var onShowing: (@MainActor (_ machineID: String?) -> Void)? = nil
+    private var returnableMachineID: String? {
+        scene.selectedMachineID.flatMap { scene.disconnected.contains($0) ? nil : $0 }
+    }
     @Environment(\.scenePhase) private var scenePhase
     /// A presentation returning to this screen is not another Connect action.
     @State private var initialConnectionConsumed = false
@@ -1223,9 +1230,11 @@ struct WorkspaceTerminalScreen: View {
             scene.appear(selecting: initialMachineID, active: scenePhase == .active,
                          group: group, connectOnOpen: connect)
         }
+        .onChange(of: returnableMachineID, initial: true) { _, id in onShowing?(id) }
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             scene.disappear()
+            onShowing?(nil)
         }
         .onChange(of: scenePhase) { _, phase in
             // The app forwards its phase to the scene (MobileWorkspaceModel).

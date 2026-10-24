@@ -234,6 +234,7 @@ final class MobileWorkspaceModel {
             }
             try await refreshWorkspaces(using: created, epoch: epoch)
             if active, pendingImport != nil { showRestore = true }
+            restoreLiveScreen()
             updateLifecycle()
             Task { await Self.connectSelfTestIfRequested(using: created) }
         } catch { report(error); bootstrapStarted = false }
@@ -1137,6 +1138,30 @@ final class MobileWorkspaceModel {
         UserDefaults.standard.set(data, forKey: Self.themeKey(workspaceID))
         themeRevision += 1
     }
+
+    /// A live terminal on screen: its workspace and machine.
+    struct LiveScreen: Codable, Hashable {
+        let workspaceID: UUID, machineID: String
+    }
+    private static let liveScreenKey = "live-screen"
+    /// Where this launch returns: the live terminal the last one showed. The
+    /// root opens it once, and popping it clears this (plan 2.1, return later).
+    var returning: LiveScreen?
+    /// The terminal screen reports what it shows, nil once the user leaves it
+    /// or disconnects that machine, so a relaunch returns only to a terminal
+    /// the user was still using (plan 12.1: navigation is persisted).
+    func showing(_ screen: LiveScreen?) {
+        if let screen, let data = try? JSONEncoder().encode(screen) {
+            UserDefaults.standard.set(data, forKey: Self.liveScreenKey)
+        } else { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
+    }
+    private func restoreLiveScreen() {
+        guard returning == nil, pendingImport == nil,
+              let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+              let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
+              workspaces.contains(where: { $0.id == screen.workspaceID }) else { return }
+        returning = screen
+    }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
         let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
         observations = channel.continuation
@@ -1525,6 +1550,13 @@ struct MobileWorkspaceRoot: View {
             NavigationStack {
                 Group {
                     if model.workspaces.isEmpty { firstRun } else { savedWorkspaces }
+                }
+                .navigationDestination(item: $model.returning) { screen in
+                    if let saved = model.workspaces.first(where: { $0.id == screen.workspaceID }),
+                       let document = try? saved.document() {
+                        MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model,
+                                             returningMachineID: screen.machineID)
+                    }
                 }
                 .navigationTitle("FrankenTerm")
                 .toolbar {
@@ -2767,6 +2799,10 @@ private struct MachineWorkspaceView: View {
     let initialDocument: WorkspaceDocument
     let workspaceID: UUID
     @Bindable var model: MobileWorkspaceModel
+    /// A relaunch's return: this machine's terminal opens, as Connect would.
+    var returningMachineID: String? = nil
+    @State private var returned: String?
+    @State private var returnHandled = false
     @State private var selection = ""
     @State private var groupID = ""
     @State private var themeMachineID: String?
@@ -2845,10 +2881,21 @@ private struct MachineWorkspaceView: View {
                 }
             }
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
-            .onAppear { if selection.isEmpty { selection = document.initialMachineID } }
+            .navigationDestination(item: $returned) { id in
+                if let connections = model.connections, let local = model.localPolicies[workspaceID] {
+                    liveWorkspace(connections: connections, local: local, initial: id)
+                }
+            }
+            .onAppear {
+                if selection.isEmpty {
+                    selection = machines.first(where: { $0.id == returningMachineID })?.id ?? document.initialMachineID
+                }
+                returnToTerminal()
+            }
             .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in
                 if !document.groups.contains(where: { $0.id == groupID }) { groupID = document.initialGroupID }
                 if !machines.contains(where: { $0.id == selection }) { selection = machines.first?.id ?? document.initialMachineID }
+                returnToTerminal()
             }
             .toolbar {
                 if !document.credentials.isEmpty {
@@ -2908,6 +2955,18 @@ private struct MachineWorkspaceView: View {
         }
     }
 
+    /// Opens the returning machine's terminal once, when Connect would be
+    /// offered for it; until then this page shows what it still needs.
+    private func returnToTerminal() {
+        guard !returnHandled, let id = returningMachineID else { return }
+        guard let machine = document.machines.first(where: { $0.id == id }) else { returnHandled = true; return }
+        guard !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+              model.connections != nil, let local = model.localPolicies[workspaceID],
+              sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { return }
+        returnHandled = true
+        returned = id
+    }
+
     /// A saved route: where it goes and anything this phone still needs for it.
     @ViewBuilder private func routeRow(_ route: WorkspaceDocument.Route, preferred: Bool) -> some View {
         let hop = route.jumpRoutes.first.flatMap { id in document.routes.first(where: { $0.id == id }) }
@@ -2952,7 +3011,10 @@ private struct MachineWorkspaceView: View {
         let group = document.groups.first(where: { $0.id == selectedGroupID }).map {
             TerminalConnectionIntent.Group(id: $0.id, machineIDs: $0.machineOrder, autoConnect: $0.autoConnect)
         }
-        return LiveWorkspaceView(initialMachineID: initial, themes: themes, group: group, connectOnOpen: true) { [model, workspaceID, document] in
+        return LiveWorkspaceView(initialMachineID: initial, themes: themes, group: group, connectOnOpen: true,
+                                 onShowing: { [model, workspaceID] machineID in
+            model.showing(machineID.map { .init(workspaceID: workspaceID, machineID: $0) })
+        }) { [model, workspaceID, document] in
             try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision) {
                 try WorkspaceTerminalScene(workspaceID: workspaceID, revision: local.workspace.revision,
                     workspaceName: document.name, machines: ordered.map { sceneMachine($0, local: local) },
