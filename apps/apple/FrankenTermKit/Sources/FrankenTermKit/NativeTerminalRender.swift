@@ -380,18 +380,20 @@ public final class NativeTerminalRenderView: MTKView {
               latest?.revision == frame.revision, (latest?.flags ?? 0) & 8 == 0,
               (configuration.cursorBlink && frame.cursor.visible && frame.cursor.blinks)
                 || frame.lines.contains(where: { $0.cells.contains(where: { $0.blink != 0 }) }) else { return }
-        // A discrete 250 ms clock supports rapid and slow blinking; it never
-        // runs a continuous draw loop for a steady terminal.
+        // A discrete clock: 250 ms while text blinks rapidly, otherwise 500 ms,
+        // the half period of slow blinking and the cursor, so no tick redraws
+        // an unchanged screen. It never runs a continuous draw loop.
+        let rapid = frame.lines.contains(where: { $0.cells.contains(where: { $0.blink == 2 }) })
         let generation = preparationGeneration, revision = frame.revision
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: rapid ? 0.25 : 0.5, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.preparationGeneration == generation,
                       self.latest?.revision == revision else { return }
                 self.blinkTimer = nil
-                guard self.active, !self.retired, self.blinkPhase < UInt64.max,
+                guard self.active, !self.retired, self.blinkPhase < UInt64.max - 1,
                       let latest = self.latest, latest.flags & 8 == 0,
                       self.failedRevision != latest.revision else { return }
-                self.blinkPhase += 1; self.requestPreparation()
+                self.blinkPhase += rapid ? 1 : 2; self.requestPreparation()
             }
         }
     }
@@ -683,6 +685,9 @@ private final class NativeTerminalFrameBuilder {
     private let cellWidth: Double, cellHeight: Double, ascent: Double
     private var instances = [UInt8]()
     private var fonts = [CTFont]()
+    /// Each cell's face by bold, italic and small (raised or lowered) size: a
+    /// full screen shares a few fonts rather than creating one per cell.
+    private var cellFonts: [UInt8: CTFont] = [:]
     private var glyphs: [GlyphKey: PlacedGlyph] = [:]
     private var grayShelf = Shelf(), colorShelf = Shelf()
     private struct GlyphKey: Hashable { let font: Int; let glyph: CGGlyph }
@@ -841,6 +846,8 @@ private final class NativeTerminalFrameBuilder {
     }
 
     private func font(for cell: TerminalRenderCell) throws -> CTFont {
+        let key: UInt8 = (cell.intensity == 1 ? 1 : 0) | (cell.italic ? 2 : 0) | (cell.verticalAlignment == 0 ? 0 : 4)
+        if let font = cellFonts[key] { return font }
         var traits: CTFontSymbolicTraits = []
         if cell.intensity == 1 { traits.insert(.traitBold) }
         if cell.italic { traits.insert(.traitItalic) }
@@ -852,7 +859,9 @@ private final class NativeTerminalFrameBuilder {
             guard traits.isEmpty else { throw TerminalRenderError.unsupported }
             derived = CTFontCreateCopyWithAttributes(baseFont, size, nil, nil)
         }
-        return cascade.map { CTFontCreateCopyWithAttributes(derived, size, nil, $0) } ?? derived
+        let font = cascade.map { CTFontCreateCopyWithAttributes(derived, size, nil, $0) } ?? derived
+        cellFonts[key] = font
+        return font
     }
 
     private func shape(_ row: TerminalRenderRow, rowIndex: Int) throws {
