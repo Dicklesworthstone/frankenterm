@@ -433,9 +433,9 @@ mod tests {
         }
         let output = InputSplitter::default().split(&bytes);
         assert_eq!(output.len(), 20_000);
-        for pair in output.chunks_exact(2) {
+        for pair in output.as_chunks::<2>().0 {
             assert_eq!(
-                pair,
+                *pair,
                 [Piece::Bytes(b"x".to_vec()), Piece::Paste("y".into())]
             );
         }
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(input.retained_capacity, 0);
         input.split(3, b"\x1b[200~x").unwrap();
         assert!(input.retained_capacity > 0);
-        input.remove(3);
+        input.remove(3).unwrap();
         assert_eq!(input.retained_capacity, 0);
     }
 

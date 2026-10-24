@@ -363,12 +363,14 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
                          Data([0, 3]), Data([0, 0x7F]), Data([0, 0, 0x81]), Data(repeating: 1, count: 9)] {
             XCTAssertThrowsError(try SSHPublicIdentity(blob: rsaPublicBlob(exponent: exponent, modulus: modulus)))
         }
-        for invalid in [Data(), Data([0]), Data(repeating: 0xA5, count: 256),
-                        Data([0, 0]) + Data(repeating: 0xA5, count: 256),
-                        Data([0x7F]) + Data(repeating: 0xA5, count: 255),
-                        Data([0]) + Data(repeating: 0xA5, count: 255),
-                        Data([0]) + Data(repeating: 0xA4, count: 256),
-                        Data([1]) + Data(repeating: 0xA5, count: 1024)] {
+        // Typed up front: Swift 6.4 cannot infer this literal's `+` overloads in time.
+        let invalidModuli: [Data] = [Data(), Data([0]), Data(repeating: 0xA5, count: 256),
+                                     Data([0, 0]) + Data(repeating: 0xA5, count: 256),
+                                     Data([0x7F]) + Data(repeating: 0xA5, count: 255),
+                                     Data([0]) + Data(repeating: 0xA5, count: 255),
+                                     Data([0]) + Data(repeating: 0xA4, count: 256),
+                                     Data([1]) + Data(repeating: 0xA5, count: 1024)]
+        for invalid in invalidModuli {
             XCTAssertThrowsError(try SSHPublicIdentity(blob: rsaPublicBlob(modulus: invalid)))
         }
         let valid = rsaPublicBlob(modulus: modulus)

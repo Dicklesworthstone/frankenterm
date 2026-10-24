@@ -51,8 +51,8 @@ public final class TerminalDiagnosticExcerpt: CustomDebugStringConvertible {
         public var debugDescription: String { "TerminalDiagnosticExcerpt.Review([redacted])" }
     }
     public enum Phase: Equatable, Sendable { case editing, reviewing, retired }
-    public static let maximumUTF8Bytes = 131_072
-    public static let maximumSharedUTF8Bytes = maximumUTF8Bytes + 2048
+    nonisolated public static let maximumUTF8Bytes = 131_072
+    nonisolated public static let maximumSharedUTF8Bytes = maximumUTF8Bytes + 2048
     public static let redactionMarker = "[redacted]"
     public let id = UUID(), context: Context
     public private(set) var text: String
