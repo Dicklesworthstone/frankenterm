@@ -289,7 +289,8 @@ impl Session {
         let pieces = match self.input.split(pane_id, data) {
             Ok(pieces) => pieces,
             Err(reason) => {
-                // Resource failure is explicit. Never flush an incomplete
+                // Running out of room, or the rest of a paste for a pane
+                // that closed, ends the connection. Never flush an incomplete
                 // command, emit a prefix from this call, or retry the bytes.
                 self.fail(reason.to_owned());
                 return;
@@ -675,8 +676,13 @@ impl Session {
     /// A new pane list, asked for with `serial`.
     fn listed(&mut self, list: &PaneList, serial: u64) {
         self.panes = pane_infos(list);
-        self.input
+        let retained = self
+            .input
             .retain(|pane_id| self.panes.iter().any(|pane| pane.pane_id == pane_id));
+        if let Err(reason) = retained {
+            self.fail(reason.to_owned());
+            return;
+        }
         // A listed size is the desktop's unless the phone's may still be in
         // effect: after a resize, until a list asked for after the restore.
         self.sizing
@@ -934,7 +940,9 @@ impl Session {
     }
 
     fn pane_gone(&mut self, pane_id: usize) {
-        self.input.remove(pane_id);
+        if let Err(reason) = self.input.remove(pane_id) {
+            self.fail(reason.to_owned());
+        }
         self.mirrors.remove(&pane_id);
         self.grabs.remove(&pane_id);
         let phone_sized = self
@@ -1128,60 +1136,88 @@ mod paste_routing_tests {
             session.write(10, b"\x1b[200~first ");
             assert!(writes(&mut session).is_empty());
             session.write(20, b"x");
-            assert_eq!(writes(&mut session), [(ident::WRITE_TO_PANE, 20, b"x".to_vec())]);
+            assert_eq!(
+                writes(&mut session),
+                [(ident::WRITE_TO_PANE, 20, b"x".to_vec())]
+            );
             session.write(20, b"\x1b[200~second ");
             assert!(writes(&mut session).is_empty());
             session.write(10, b"pane\x1b[201~");
             session.write(20, b"pane\x1b[201~");
-            assert_eq!(writes(&mut session), [
-                (ident::SEND_PASTE, 10, b"first pane".to_vec()),
-                (ident::SEND_PASTE, 20, b"second pane".to_vec()),
-            ]);
+            assert_eq!(
+                writes(&mut session),
+                [
+                    (ident::SEND_PASTE, 10, b"first pane".to_vec()),
+                    (ident::SEND_PASTE, 20, b"second pane".to_vec()),
+                ]
+            );
         }
     }
 
     #[test]
     fn hiding_a_pane_does_not_terminate_its_paste() {
         let mut session = ready(Dialect::Legacy);
+        session.show(1);
+        session.take_outgoing();
         session.write(1, b"\x1b[200~before ");
         session.hide(1);
         session.write(2, b"other");
-        assert_eq!(writes(&mut session), [(ident::WRITE_TO_PANE, 2, b"other".to_vec())]);
+        assert_eq!(
+            writes(&mut session),
+            [(ident::WRITE_TO_PANE, 2, b"other".to_vec())]
+        );
         session.write(1, b"after\x1b[201~");
-        assert_eq!(writes(&mut session), [(ident::SEND_PASTE, 1, b"before after".to_vec())]);
+        assert_eq!(
+            writes(&mut session),
+            [(ident::SEND_PASTE, 1, b"before after".to_vec())]
+        );
+    }
+
+    fn failed(session: &mut Session) -> bool {
+        std::iter::from_fn(|| session.next_event())
+            .any(|event| matches!(event, Event::Failed { .. }))
     }
 
     #[test]
-    fn removed_pane_cannot_carry_its_paste_into_an_observed_successor() {
+    fn the_rest_of_a_removed_panes_paste_ends_the_connection_unsent() {
         let mut session = ready(Dialect::Current);
-        session.write(1, b"\x1b[200~discard me");
+        session.write(1, b"\x1b[200~make ");
         session.write(2, b"\x1b[200~keep me");
         session.pane_gone(1);
         assert!(writes(&mut session).is_empty());
-        // The actual transport independently validates the new registration.
-        // Its fresh input must not continue the removed registration's paste.
-        session.write(1, b"fresh");
+        // Another pane's paste is unaffected.
         session.write(2, b"\x1b[201~");
-        assert_eq!(writes(&mut session), [
-            (ident::WRITE_TO_PANE, 1, b"fresh".to_vec()),
-            (ident::SEND_PASTE, 2, b"keep me".to_vec()),
-        ]);
+        assert_eq!(
+            writes(&mut session),
+            [(ident::SEND_PASTE, 2, b"keep me".to_vec())]
+        );
+        assert!(!failed(&mut session));
+        // Pane numbers are never reused, so this is the rest of pane 1's
+        // paste. Typed, its Return would run it.
+        session.write(1, b"install\r\x1b[201~");
+        assert!(writes(&mut session).is_empty());
+        assert!(!session.is_ready());
+        assert!(failed(&mut session));
     }
 
     #[test]
     fn inventory_removal_discards_a_paste_without_sending_it() {
         let mut session = ready(Dialect::Legacy);
-        session.write(1, b"\x1b[200~old registration");
-        session.listed(&PaneList {
-            tabs: Vec::new(),
-            tab_titles: Vec::new(),
-            window_titles: HashMap::new(),
-        }, 1);
+        session.write(1, b"\x1b[200~make ");
+        session.listed(
+            &PaneList {
+                tabs: Vec::new(),
+                tab_titles: Vec::new(),
+                window_titles: HashMap::new(),
+            },
+            1,
+        );
         assert!(writes(&mut session).is_empty());
-        session.write(1, b"new registration");
-        assert_eq!(writes(&mut session), [
-            (ident::WRITE_TO_PANE, 1, b"new registration".to_vec()),
-        ]);
+        assert!(session.is_ready());
+        session.write(1, b"install\r\x1b[201~");
+        assert!(writes(&mut session).is_empty());
+        assert!(!session.is_ready());
+        assert!(failed(&mut session));
     }
 
     #[test]
@@ -1210,9 +1246,10 @@ mod paste_routing_tests {
             let mut session = ready(dialect);
             session.write(1, b"\x1b[200~first");
             session.paste(2, "independent");
-            assert_eq!(writes(&mut session), [
-                (ident::SEND_PASTE, 2, b"independent".to_vec()),
-            ]);
+            assert_eq!(
+                writes(&mut session),
+                [(ident::SEND_PASTE, 2, b"independent".to_vec()),]
+            );
             session.paste(1, "must not overtake");
             assert!(!session.is_ready());
             assert!(writes(&mut session).is_empty());

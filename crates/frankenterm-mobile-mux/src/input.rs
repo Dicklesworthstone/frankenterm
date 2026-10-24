@@ -7,7 +7,7 @@
 //! key must arrive in one write; this is not an arbitrary ANSI stream parser.
 //! Once a paste starts, its text and closing marker may span arbitrary writes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
 const PASTE_START: &[u8] = b"\x1b[200~";
@@ -18,6 +18,7 @@ const MAX_PASTE_BYTES: usize = 1 << 20;
 const MAX_PASTE_BUFFER: usize = MAX_PASTE_BYTES + PASTE_END.len();
 const MAX_PENDING_PANES: usize = 16;
 const MAX_PENDING_CAPACITY: usize = 2 * MAX_PASTE_BUFFER;
+const MAX_ABANDONED_PANES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
@@ -62,7 +63,9 @@ impl InputSplitter {
                     while end > MAX_PASTE_BYTES - 3 && paste[end] & 0xc0 == 0x80 {
                         end -= 1;
                     }
-                    pieces.push(Piece::Paste(String::from_utf8_lossy(&paste[..end]).into_owned()));
+                    pieces.push(Piece::Paste(
+                        String::from_utf8_lossy(&paste[..end]).into_owned(),
+                    ));
                     paste.drain(..end);
                 }
                 continue;
@@ -105,14 +108,20 @@ impl std::fmt::Debug for InputSplitter {
     }
 }
 
-/// Separate unfinished pastes for separate pane registrations. Switching focus
-/// is not an end-of-paste marker. Removing a pane or closing the connection
-/// discards its unfinished local fragment; neither action sends more commands.
-/// This tracks observed registrations, not a server-supplied incarnation.
+/// Separate unfinished pastes for separate panes. Switching focus is not an
+/// end-of-paste marker. Removing a pane or closing the connection discards its
+/// unfinished local fragment; neither action sends more commands.
+///
+/// The server never gives a removed pane's number to another pane (its pane
+/// ids come from one counter that only goes up), so input that arrives later
+/// for a pane removed mid-paste is the rest of that paste. Sent as typing, its
+/// Returns would run the pasted text, so it is refused and the caller must
+/// fail the connection.
 #[derive(Default)]
 pub struct PaneInput {
     pending: HashMap<usize, InputSplitter>,
     retained_capacity: usize,
+    abandoned: HashSet<usize>,
 }
 
 impl std::fmt::Debug for PaneInput {
@@ -121,6 +130,7 @@ impl std::fmt::Debug for PaneInput {
             .debug_struct("PaneInput")
             .field("pending_panes", &self.pending.len())
             .field("retained_capacity", &self.retained_capacity)
+            .field("abandoned_panes", &self.abandoned.len())
             .finish()
     }
 }
@@ -131,6 +141,10 @@ impl PaneInput {
     }
 
     pub fn split(&mut self, pane: usize, data: &[u8]) -> Result<Vec<Piece>, &'static str> {
+        if self.abandoned.contains(&pane) {
+            self.clear();
+            return Err("input arrived for a pane that closed in the middle of a paste");
+        }
         let mut input = self.pending.remove(&pane).unwrap_or_default();
         self.retained_capacity -= input.retained_capacity();
         let pieces = input.split(data);
@@ -150,28 +164,49 @@ impl PaneInput {
         Ok(pieces)
     }
 
-    pub fn remove(&mut self, pane: usize) {
+    /// Forgets a removed pane. An error means the caller must fail the
+    /// connection: too many panes closed mid-paste to remember them all.
+    pub fn remove(&mut self, pane: usize) -> Result<(), &'static str> {
         if let Some(input) = self.pending.remove(&pane) {
             self.retained_capacity -= input.retained_capacity();
+            self.abandon(pane)?;
         }
+        Ok(())
     }
 
-    pub fn retain(&mut self, mut is_live: impl FnMut(usize) -> bool) {
+    /// Forgets every pane the inventory no longer lists, as [`Self::remove`].
+    pub fn retain(&mut self, mut is_live: impl FnMut(usize) -> bool) -> Result<(), &'static str> {
         let mut released = 0;
+        let mut gone = Vec::new();
         self.pending.retain(|pane, input| {
             if is_live(*pane) {
                 true
             } else {
                 released += input.retained_capacity();
+                gone.push(*pane);
                 false
             }
         });
         self.retained_capacity -= released;
+        for pane in gone {
+            self.abandon(pane)?;
+        }
+        Ok(())
     }
 
     pub fn clear(&mut self) {
         self.pending.clear();
         self.retained_capacity = 0;
+        self.abandoned.clear();
+    }
+
+    fn abandon(&mut self, pane: usize) -> Result<(), &'static str> {
+        if self.abandoned.len() >= MAX_ABANDONED_PANES {
+            self.clear();
+            return Err("too many panes closed in the middle of a paste");
+        }
+        self.abandoned.insert(pane);
+        Ok(())
     }
 }
 
@@ -379,7 +414,11 @@ mod tests {
                         output.extend(input.split(bytes));
                     }
                     output.extend(input.split(PASTE_END));
-                    assert_eq!(pasted(output), text, "{scalar:?}, offset {offset}, chunk {chunk}");
+                    assert_eq!(
+                        pasted(output),
+                        text,
+                        "{scalar:?}, offset {offset}, chunk {chunk}"
+                    );
                     assert!(!input.in_paste());
                 }
             }
@@ -395,7 +434,10 @@ mod tests {
         let output = InputSplitter::default().split(&bytes);
         assert_eq!(output.len(), 20_000);
         for pair in output.chunks_exact(2) {
-            assert_eq!(pair, [Piece::Bytes(b"x".to_vec()), Piece::Paste("y".into())]);
+            assert_eq!(
+                pair,
+                [Piece::Bytes(b"x".to_vec()), Piece::Paste("y".into())]
+            );
         }
     }
 
@@ -406,7 +448,9 @@ mod tests {
         let output = input.split(&vec![b'x'; MAX_PASTE_BYTES * 4]);
         assert!(input.retained_capacity() <= MAX_PASTE_BUFFER);
         for piece in &output {
-            let Piece::Paste(text) = piece else { panic!("expected paste") };
+            let Piece::Paste(text) = piece else {
+                panic!("expected paste")
+            };
             assert!(text.len() <= MAX_PASTE_BYTES);
         }
         let mut complete = output;
@@ -454,17 +498,55 @@ mod tests {
         let mut input = PaneInput::default();
         input.split(1, b"\x1b[200~discard").unwrap();
         input.split(2, b"\x1b[200~retain").unwrap();
-        input.remove(1);
-        assert_eq!(input.split(1, b"new").unwrap(), [Piece::Bytes(b"new".to_vec())]);
-        assert_eq!(input.split(2, PASTE_END).unwrap(), [Piece::Paste("retain".into())]);
-        input.split(1, b"\x1b[200~old").unwrap();
-        input.split(2, b"\x1b[200~old").unwrap();
-        input.retain(|pane| pane == 2);
-        assert!(!input.pending.contains_key(&1));
-        assert!(input.pending.contains_key(&2));
-        input.clear();
+        input.split(3, b"\x1b[200~unlisted").unwrap();
+        input.remove(1).unwrap();
+        input.retain(|pane| pane != 3).unwrap();
+        assert_eq!(
+            input.split(2, PASTE_END).unwrap(),
+            [Piece::Paste("retain".into())]
+        );
         assert!(input.pending.is_empty());
         assert_eq!(input.retained_capacity, 0);
+        // A removed pane without a paste in progress is simply forgotten.
+        input.remove(4).unwrap();
+        assert_eq!(input.split(4, b"x").unwrap(), [Piece::Bytes(b"x".to_vec())]);
+        input.split(5, b"\x1b[200~old").unwrap();
+        input.clear();
+        assert!(input.pending.is_empty());
+        assert!(input.abandoned.is_empty());
+        assert_eq!(input.retained_capacity, 0);
+    }
+
+    #[test]
+    fn the_rest_of_a_removed_panes_paste_is_refused_not_typed() {
+        for unlisted in [false, true] {
+            let mut input = PaneInput::default();
+            input.split(1, b"\x1b[200~make ").unwrap();
+            input.split(2, b"\x1b[200~other").unwrap();
+            if unlisted {
+                input.retain(|pane| pane != 1).unwrap();
+            } else {
+                input.remove(1).unwrap();
+            }
+            assert!(input.split(1, b"install\r\x1b[201~").is_err());
+            // The refusal discards everything; the caller ends the connection.
+            assert!(input.pending.is_empty());
+            assert!(input.abandoned.is_empty());
+            assert_eq!(input.retained_capacity, 0);
+        }
+    }
+
+    #[test]
+    fn panes_abandoned_mid_paste_are_bounded() {
+        let mut input = PaneInput::default();
+        for pane in 0..MAX_ABANDONED_PANES {
+            input.split(pane, PASTE_START).unwrap();
+            input.remove(pane).unwrap();
+        }
+        input.split(1000, PASTE_START).unwrap();
+        assert!(input.remove(1000).is_err());
+        assert!(input.abandoned.is_empty());
+        assert!(input.pending.is_empty());
     }
 
     #[test]
@@ -473,7 +555,10 @@ mod tests {
         for pane in 0..MAX_PENDING_PANES {
             input.split(pane, PASTE_START).unwrap();
         }
-        assert_eq!(input.split(100, b"x").unwrap(), [Piece::Bytes(b"x".to_vec())]);
+        assert_eq!(
+            input.split(100, b"x").unwrap(),
+            [Piece::Bytes(b"x".to_vec())]
+        );
         assert!(input.split(100, PASTE_START).is_err());
         assert!(input.pending.is_empty());
         assert_eq!(input.retained_capacity, 0);

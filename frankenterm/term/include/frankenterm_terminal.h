@@ -238,9 +238,13 @@ uint32_t ft_mux_v1_hide(uint64_t session, uint64_t pane_id);
 /* What the pane's terminal typed. Cursor, editing and function key
  * sequences go to the server as key presses, encoded in the modes the
  * pane's program set; a bracketed paste (OUTPUT turns bracketed paste on in
- * the phone's terminal) goes as one paste; everything else as is. */
+ * the phone's terminal) goes as one paste; everything else as is. A paste
+ * may span writes and waits on its own pane for its end. The rest of a
+ * paste for a pane that closed ends the session with FAILED, unsent. */
 uint32_t ft_mux_v1_write(uint64_t session, uint64_t pane_id, const uint8_t *bytes, uint32_t length);
-/* UTF-8 text the server pastes, bracketed when the program asked for it. */
+/* UTF-8 text the server pastes, bracketed when the program asked for it.
+ * While a paste written to the pane is unfinished this ends the session
+ * with FAILED instead of jumping ahead of it. */
 uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length);
 /* Resizes the remote pane (1..512 each), remembering the size the desktop
  * gave it; restore_size puts that size back. */

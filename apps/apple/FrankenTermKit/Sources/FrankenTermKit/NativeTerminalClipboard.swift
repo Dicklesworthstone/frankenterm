@@ -657,8 +657,10 @@ public final class NativeTerminalDiagnosticTextView: UITextView, UITextViewDeleg
 /// UIKit requests this bounded in-memory string only after explicit local
 /// review. Nothing is written to a file or clipboard. Retirement prevents late
 /// provider requests; it cannot retract a copy already accepted by a service.
-@MainActor
-final class NativeTerminalDiagnosticShareItem: NSObject, UIActivityItemSource {
+/// UIKit's item-source protocol is not main-actor isolated (a share service
+/// may ask from another thread), so the text sits behind a lock instead.
+final class NativeTerminalDiagnosticShareItem: NSObject, UIActivityItemSource, @unchecked Sendable {
+    private let lock = NSLock()
     private var text: String?
     init(text: String) throws {
         guard !text.isEmpty, text.utf8.count <= TerminalDiagnosticExcerpt.maximumSharedUTF8Bytes else {
@@ -669,11 +671,14 @@ final class NativeTerminalDiagnosticShareItem: NSObject, UIActivityItemSource {
     }
     func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any { "" }
     func activityViewController(_ activityViewController: UIActivityViewController,
-                                itemForActivityType activityType: UIActivity.ActivityType?) -> Any? { text }
+                                itemForActivityType activityType: UIActivity.ActivityType?) -> Any? {
+        lock.withLock { text }
+    }
     func activityViewController(_ activityViewController: UIActivityViewController,
                                 dataTypeIdentifierForActivityType activityType: UIActivity.ActivityType?) -> String {
         "public.utf8-plain-text"
     }
+    @MainActor
     func makeActivityController(anchor: UIView) -> UIActivityViewController {
         let activity = UIActivityViewController(activityItems: [self], applicationActivities: nil)
         // Keep copying on the original device-local, expiring path. The exact
@@ -683,7 +688,7 @@ final class NativeTerminalDiagnosticShareItem: NSObject, UIActivityItemSource {
         activity.popoverPresentationController?.sourceRect = anchor.bounds
         return activity
     }
-    func retire() { text = nil }
+    func retire() { lock.withLock { text = nil } }
 }
 
 /// The preview must not replace/resign the responder whose exact paste request

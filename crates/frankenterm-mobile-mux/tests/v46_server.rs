@@ -715,7 +715,7 @@ fn a_programs_hold_on_the_mouse_is_reported_and_a_click_reaches_it() {
 }
 
 #[test]
-fn an_unfinished_paste_is_sent_when_input_moves_to_another_pane() {
+fn an_unfinished_paste_waits_on_its_pane_while_input_goes_to_another() {
     let mut harness = Harness::new(4, 20);
     harness.attach();
     let pane = harness.server.pane_id;
@@ -727,8 +727,39 @@ fn an_unfinished_paste_is_sent_when_input_moves_to_another_pane() {
     );
     harness.session.write(pane + 1, b"x");
     harness.pump();
-    assert_eq!(harness.server.pastes, ["half a paste"]);
+    assert!(
+        harness.server.pastes.is_empty(),
+        "typing elsewhere does not end it"
+    );
     assert_eq!(harness.server.written, b"x");
+    harness.session.write(pane, b", then the rest\x1b[201~");
+    harness.pump();
+    assert_eq!(harness.server.pastes, ["half a paste, then the rest"]);
+    assert_eq!(harness.server.written, b"x");
+}
+
+#[test]
+fn the_rest_of_a_paste_into_a_pane_that_closed_ends_the_connection_unsent() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"\x1b[200~make ");
+    harness.pump();
+    harness.server.remove_pane();
+    harness.pump();
+    assert!(harness.events.contains(&Event::PaneGone { pane_id: pane }));
+    assert!(harness.session.is_ready());
+    harness.session.write(pane, b"install\r\x1b[201~");
+    harness.pump();
+    assert!(harness.server.pastes.is_empty());
+    assert!(harness.server.written.is_empty());
+    assert!(!harness.session.is_ready());
+    assert!(
+        harness
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Failed { .. }))
+    );
 }
 
 #[test]
