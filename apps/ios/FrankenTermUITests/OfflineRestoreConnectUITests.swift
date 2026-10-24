@@ -335,6 +335,25 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("echo AGAIN-$FT_WHO-$((3+3))\n")
         waitFor("AGAIN-first-6", in: screen, timeout: 30, "typing after the switch reaches the first machine's shell")
         snapshot("13-back-to-first")
+
+        // A hardware keyboard switches too: ⇧⌘] and ⇧⌘[ step through the strip.
+        app.typeKey("]", modifierFlags: [.command, .shift])
+        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the next machine")
+        XCTAssertFalse(self.screen(screen).contains("AGAIN-first-6"), "the next machine has its own screen")
+        app.typeKey("[", modifierFlags: [.command, .shift])
+        waitFor("AGAIN-first-6", in: screen, timeout: 10, "⇧⌘[ comes back to the first machine")
+        app.typeText("echo KEYS-$FT_WHO-$((4+4))\n")
+        waitFor("KEYS-first-8", in: screen, timeout: 30, "typing after a keyboard switch reaches the machine on screen")
+        snapshot("14-keyboard-switch")
+        app.typeKey("k", modifierFlags: .command)
+        let overview = app.navigationBars["Fleet Overview"]
+        XCTAssertTrue(overview.waitForExistence(timeout: 10), "⌘K opens the fleet overview")
+        if overview.exists { overview.buttons["Done"].tap() }
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "closing the overview gives the keyboard back")
+        app.typeKey("d", modifierFlags: [.command, .shift])
+        let discard = app.buttons["Discard Draft"]
+        XCTAssertTrue(discard.waitForExistence(timeout: 10), "⇧⌘D opens Compose Command")
+        if discard.exists { discard.tap() }
     }
 
     /// A newer export of the saved workspace replaces it in one tap, as when

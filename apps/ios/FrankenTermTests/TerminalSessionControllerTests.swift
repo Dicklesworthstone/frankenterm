@@ -1084,6 +1084,52 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(second, connections: again.connections)
     }
 
+    /// ⌘] and ⌘[ step through the shown machine's mux panes, wrapping at
+    /// either end. A second press while a switch is still settling is
+    /// ignored, not reported as a failed switch. Needs a disposable mux with
+    /// two panes (TEST_RUNNER_FT_LIVE_MUX_COMMAND).
+    func testAMuxHardwareKeyboardStepsThroughItsPanesAndWraps() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        var view = try shown(session)
+        let state = try XCTUnwrap(session.muxState)
+        let start = try XCTUnwrap(state.shown)
+        guard state.panes.count > 1 else {
+            view.removeFromSuperview(); await scene.close()
+            throw XCTSkip("The mux needs a second pane")
+        }
+        /// Presses the shortcut's action `times` at once and waits for the switch.
+        func step(forward: Bool, times: Int = 1) async throws -> Int? {
+            let before = session.muxState?.shown
+            for _ in 0..<times { scene.stepPane(forward: forward) }
+            for _ in 0..<400 where session.muxState?.shown == before || session.paneNavigationBusy || session.terminal === view {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertNil(session.interactionProblem, "a step is not reported as a failed switch")
+            view.removeFromSuperview()
+            view = try shown(session)
+            return session.muxState?.shown
+        }
+        var visited = [start]
+        for _ in 1..<state.panes.count {
+            let next = try await step(forward: true)
+            visited.append(try XCTUnwrap(next))
+        }
+        XCTAssertEqual(Set(visited), Set(state.panes.map(\.paneId)), "forward visits every pane once")
+        let wrapped = try await step(forward: true)
+        XCTAssertEqual(wrapped, start, "after the last pane comes the first")
+        let back = try await step(forward: false)
+        XCTAssertEqual(back, visited.last, "back from the first pane is the last")
+        let once = try await step(forward: false, times: 2)
+        XCTAssertEqual(once, visited[visited.count - 2], "two quick presses step once while the first settles")
+        view.removeFromSuperview()
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// M2: a new connection (the phone is back after its connection ended)
     /// shows the pane the phone was showing, with the same program in it, not
     /// whichever pane the desktop has active. When that pane closed meanwhile

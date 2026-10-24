@@ -558,11 +558,33 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
     }
 
+    /// The strip's next or previous machine, wrapping at either end, as a
+    /// swipe across the strip does. Hardware-keyboard shortcuts use it.
+    func stepMachine(forward: Bool) {
+        guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput else { return }
+        let appearance = appearanceGeneration
+        Task {
+            do {
+                try await whileBusy {
+                    guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput else {
+                        throw TerminalNavigationError.stale
+                    }
+                    guard let plan = try self.navigation.navigation.plan(axis: .machine,
+                                                                         direction: forward ? .next : .previous) else { return }
+                    try await self.navigation.perform(plan)
+                }
+            } catch { report(error) }
+        }
+    }
+
     /// Pane traversal is a separate ring. At either end it wraps within this
     /// machine; zero or one pane never falls through to another machine.
+    /// A press while the last switch is still settling, or over a paste review,
+    /// is ignored, as a swipe is.
     func stepPane(forward: Bool) {
         guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
               let session = selectedSession, session.phase == .live,
+              !session.paneNavigationBusy, !session.clipboardIsPresenting,
               let control = session.muxControl else { return }
         do {
             if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
@@ -1265,9 +1287,10 @@ struct WorkspaceTerminalScreen: View {
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
+                    // ⇧⌘D is the canvas's key command: SwiftUI never registers
+                    // a shortcut on a button inside a menu.
                     Button("Compose Command", systemImage: "square.and.pencil") { session.composeCommand() }
                         .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
-                        .keyboardShortcut("d", modifiers: [.command, .shift])
                         .accessibilityIdentifier("terminal.command.open")
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
                         .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
@@ -1793,6 +1816,40 @@ private final class WorkspaceCanvasView: UIView {
     }
 
     func retireNavigation() { controls?.retire(suspendNavigation: false); controls = nil }
+
+    /// A hardware keyboard switches as the strips and swipes do: ⇧⌘] ⇧⌘[ for
+    /// machines, ⌘] ⌘[ for a mux's panes; ⇧⌘D composes a command. UIKit asks
+    /// the terminal's ancestors, so these work while a terminal has the
+    /// keyboard. The untitled shifted spellings match a keyboard that reports
+    /// ⇧] as "}".
+    override var keyCommands: [UIKeyCommand]? {
+        guard let scene else { return nil }
+        var commands: [UIKeyCommand] = []
+        if let session = scene.selectedSession, session.phase == .live, session.terminal != nil {
+            commands.append(UIKeyCommand(title: "Compose Command", action: #selector(composeCommand),
+                                         input: "d", modifierFlags: [.command, .shift]))
+        }
+        if scene.navigationMachineIDs.count > 1 {
+            commands += [
+                UIKeyCommand(title: "Next Machine", action: #selector(nextMachine), input: "]", modifierFlags: [.command, .shift]),
+                UIKeyCommand(title: "Previous Machine", action: #selector(previousMachine), input: "[", modifierFlags: [.command, .shift]),
+                UIKeyCommand(input: "}", modifierFlags: [.command, .shift], action: #selector(nextMachine)),
+                UIKeyCommand(input: "{", modifierFlags: [.command, .shift], action: #selector(previousMachine))
+            ]
+        }
+        if let session = scene.selectedSession, session.phase == .live, (session.muxState?.panes.count ?? 0) > 1 {
+            commands += [
+                UIKeyCommand(title: "Next Pane", action: #selector(nextPane), input: "]", modifierFlags: .command),
+                UIKeyCommand(title: "Previous Pane", action: #selector(previousPane), input: "[", modifierFlags: .command)
+            ]
+        }
+        return commands
+    }
+    @objc private func composeCommand() { scene?.selectedSession?.composeCommand() }
+    @objc private func nextMachine() { scene?.stepMachine(forward: true) }
+    @objc private func previousMachine() { scene?.stepMachine(forward: false) }
+    @objc private func nextPane() { scene?.stepPane(forward: true) }
+    @objc private func previousPane() { scene?.stepPane(forward: false) }
 
     /// Switching machines cross-fades between their terminals.
     func show(_ terminal: NativeTerminalView?) {
