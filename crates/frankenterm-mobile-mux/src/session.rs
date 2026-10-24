@@ -130,6 +130,11 @@ enum Request {
         pane_id: usize,
         rows: Range<StableRowIndex>,
     },
+    /// Typed, pasted, clicked or scrolled input for the pane; the server
+    /// answers once it has written it to the pane.
+    Input {
+        pane_id: usize,
+    },
     Action,
 }
 
@@ -302,7 +307,7 @@ impl Session {
                     self.send(
                         ident::WRITE_TO_PANE,
                         &WriteToPane { pane_id, data },
-                        Request::Action,
+                        Request::Input { pane_id },
                     );
                 }
                 Piece::Key(event) => {
@@ -311,7 +316,7 @@ impl Session {
                         event,
                         input_serial: 0,
                     };
-                    self.send(ident::SEND_KEY_DOWN, &press, Request::Action);
+                    self.send(ident::SEND_KEY_DOWN, &press, Request::Input { pane_id });
                 }
                 Piece::Paste(text) => self.send_paste(pane_id, &text),
             }
@@ -342,7 +347,7 @@ impl Session {
                     pane_id,
                     data: text,
                 };
-                self.send(ident::SEND_PASTE, &request, Request::Action);
+                self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
             }
             Dialect::Current => {
                 let request = SendPasteCurrent {
@@ -350,7 +355,7 @@ impl Session {
                     data: text,
                     input_serial: 0,
                 };
-                self.send(ident::SEND_PASTE, &request, Request::Action);
+                self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
             }
         }
     }
@@ -382,7 +387,7 @@ impl Session {
             self.send(
                 ident::SEND_MOUSE_EVENT,
                 &SendMouseEvent { pane_id, event },
-                Request::Action,
+                Request::Input { pane_id },
             );
         }
     }
@@ -407,7 +412,7 @@ impl Session {
             self.send(
                 ident::SEND_MOUSE_EVENT,
                 &SendMouseEvent { pane_id, event },
-                Request::Action,
+                Request::Input { pane_id },
             );
         }
     }
@@ -660,6 +665,17 @@ impl Session {
             })
     }
 
+    /// Whether input sent to the pane ([`Session::write`], [`Session::paste`],
+    /// [`Session::click`], [`Session::wheel`]) is still unanswered, so the
+    /// server may not have written it to the pane. Once the connection has
+    /// failed, true means some of it may never have arrived; an error reply
+    /// answers it too (the server wrote nothing).
+    pub fn unanswered_input(&self, pane_id: usize) -> bool {
+        self.requests
+            .values()
+            .any(|request| matches!(request, Request::Input { pane_id: id } if *id == pane_id))
+    }
+
     fn send_resize(&mut self, tab_id: usize, pane_id: usize, size: TerminalSize, request: Request) {
         let resize = Resize {
             containing_tab_id: tab_id,
@@ -910,7 +926,7 @@ impl Session {
                             lines: Vec::new(),
                         });
                     }
-                    Some(Request::Action) | None => {}
+                    Some(Request::Input { .. } | Request::Action) | None => {}
                 }
             }
             // Unit replies, palettes, alerts and title notices need nothing.

@@ -633,6 +633,25 @@ pub unsafe extern "C" fn ft_mux_v1_restoring(session: u64, restoring: *mut u32) 
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_unanswered_input(
+    session: u64,
+    pane_id: u64,
+    unanswered: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(unanswered, 0)?;
+        }
+        let pane_id = pane(pane_id)?;
+        let pending = registry.session(session)?.unanswered_input(pane_id);
+        unsafe {
+            output_scalar(unanswered, u32::from(pending))?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,7 +805,24 @@ mod tests {
             unsafe { ft_mux_v1_restoring(session, std::ptr::null_mut()) },
             Error::Invalid as u32
         );
+        let mut unanswered = 7u32;
+        // SAFETY: a live local scalar.
+        assert_eq!(
+            unsafe { ft_mux_v1_unanswered_input(session, 1, &mut unanswered) },
+            0
+        );
+        assert_eq!(unanswered, 0, "nothing sent, nothing to wait for");
+        // SAFETY: deliberately null output; refused before use.
+        assert_eq!(
+            unsafe { ft_mux_v1_unanswered_input(session, 1, std::ptr::null_mut()) },
+            Error::Invalid as u32
+        );
         assert_eq!(ft_mux_v1_release(session), 0);
+        // SAFETY: a live local scalar.
+        assert_eq!(
+            unsafe { ft_mux_v1_unanswered_input(session, 1, &mut unanswered) },
+            Error::Stale as u32
+        );
         // SAFETY: a live local scalar.
         assert_eq!(
             unsafe { ft_mux_v1_restoring(session, &mut restoring) },
