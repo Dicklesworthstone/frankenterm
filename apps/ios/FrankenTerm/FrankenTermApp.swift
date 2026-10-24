@@ -323,7 +323,8 @@ final class MobileWorkspaceModel {
     func liveStatus(_ workspaceID: UUID, machineID: String) -> WorkspaceTerminalScene.Status? {
         liveScenes[workspaceID].flatMap { $0.closed ? nil : $0.status(of: machineID) }
     }
-    /// False once a restore disconnected or replaced the workspace's scene.
+    /// The workspace's scene is open: false before its first terminal, and
+    /// once a restore disconnected or replaced it.
     func hasOpenScene(_ workspaceID: UUID) -> Bool {
         liveScenes[workspaceID].map { !$0.closed } ?? false
     }
@@ -2786,7 +2787,8 @@ private struct MachineWorkspaceView: View {
     var returningMachineID: String? = nil
     /// The open terminal carries the local state it opened with: deactivation
     /// clears model.localPolicies, and the pushed terminal must not be rebuilt
-    /// for it. Each opening is a new terminal view with its own scene.
+    /// for it. Each opening is a new terminal view; it shows the workspace's
+    /// open scene, or a new one once a restore closed it.
     private struct OpenTerminal: Hashable {
         let machineID: String, local: WorkspaceLocalState, id = UUID()
         static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
