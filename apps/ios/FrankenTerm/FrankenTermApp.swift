@@ -337,6 +337,10 @@ final class MobileWorkspaceModel {
     func liveStatus(_ workspaceID: UUID, machineID: String) -> WorkspaceTerminalScene.Status? {
         liveScenes[workspaceID].flatMap { $0.closed ? nil : $0.status(of: machineID) }
     }
+    /// False once a restore disconnected or replaced the workspace's scene.
+    func hasOpenScene(_ workspaceID: UUID) -> Bool {
+        liveScenes[workspaceID].map { !$0.closed } ?? false
+    }
     private func retire(_ scene: WorkspaceTerminalScene) {
         scene.requestClose()
         Task { await scene.close() }
@@ -2795,17 +2799,15 @@ private struct MachineWorkspaceView: View {
     @Bindable var model: MobileWorkspaceModel
     /// A relaunch's return: this machine's terminal opens, as Connect would.
     var returningMachineID: String? = nil
-    /// The returned terminal carries the local state it opened with, as a
-    /// Connect link's destination does: deactivation clears
-    /// model.localPolicies, and the pushed terminal must not be rebuilt for it.
-    private struct ReturnedTerminal: Hashable {
-        let machineID: String, local: WorkspaceLocalState
-        static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.machineID == rhs.machineID && lhs.local.workspace.revision == rhs.local.workspace.revision
-        }
-        func hash(into hasher: inout Hasher) { hasher.combine(machineID) }
+    /// The open terminal carries the local state it opened with: deactivation
+    /// clears model.localPolicies, and the pushed terminal must not be rebuilt
+    /// for it. Each opening is a new terminal view with its own scene.
+    private struct OpenTerminal: Hashable {
+        let machineID: String, local: WorkspaceLocalState, id = UUID()
+        static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
     }
-    @State private var returned: ReturnedTerminal?
+    @State private var terminal: OpenTerminal?
     @State private var returnHandled = false
     @State private var selection = ""
     @State private var groupID = ""
@@ -2885,9 +2887,13 @@ private struct MachineWorkspaceView: View {
                 }
             }
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(item: $returned) { terminal in
+            .navigationDestination(item: $terminal) { open in
                 if let connections = model.connections {
-                    liveWorkspace(connections: connections, local: terminal.local, initial: terminal.machineID)
+                    // Watched here: this page is not updated while the
+                    // terminal covers it.
+                    liveWorkspace(connections: connections, local: open.local, initial: open.machineID).id(open.id)
+                        .onChange(of: model.showRestore) { _, _ in reopenClosedTerminal() }
+                        .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in reopenClosedTerminal() }
                 }
             }
             .onAppear {
@@ -2930,8 +2936,8 @@ private struct MachineWorkspaceView: View {
         } else if let connections = model.connections, let local = model.localPolicies[workspaceID],
            let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
             VStack(alignment: .leading, spacing: 10) {
-                NavigationLink {
-                    liveWorkspace(connections: connections, local: local, initial: machine.id)
+                Button {
+                    terminal = OpenTerminal(machineID: machine.id, local: local)
                 } label: {
                     // A session that is already running opens where it is.
                     let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
@@ -2968,7 +2974,20 @@ private struct MachineWorkspaceView: View {
               model.connections != nil, let local = model.localPolicies[workspaceID],
               sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { return }
         returnHandled = true
-        returned = ReturnedTerminal(machineID: id, local: local)
+        terminal = OpenTerminal(machineID: id, local: local)
+    }
+
+    /// A restore closes every session under its sheet, and a replacement
+    /// retires the scene. Once the sheet is gone, the terminal left showing
+    /// opens again on the saved workspace, as a relaunch's return does, or
+    /// gives way to this page if its machine can no longer connect.
+    private func reopenClosedTerminal() {
+        guard let open = terminal, !model.showRestore, !model.hasOpenScene(workspaceID),
+              let local = model.localPolicies[workspaceID] else { return }
+        guard let machine = document.machines.first(where: { $0.id == open.machineID }), model.connections != nil,
+              !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+              sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { terminal = nil; return }
+        terminal = OpenTerminal(machineID: open.machineID, local: local)
     }
 
     /// A saved route: where it goes and anything this phone still needs for it.

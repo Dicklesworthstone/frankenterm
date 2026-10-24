@@ -350,18 +350,12 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         }
         let app = launch()
         _ = reopen(app, inputs)
-        // Back to the list (the only screen with Add machines), where the
-        // operator scans a new export.
-        let list = app.buttons["Add machines"]
-        for _ in 0..<2 where !list.exists {
-            app.navigationBars.buttons.element(boundBy: 0).tap()
-            _ = list.waitForExistence(timeout: 5)
-        }
-        XCTAssertTrue(list.exists, "Back twice leads from the terminal to the list")
+        // Opened from Files or AirDrop over the live terminal: an offline
+        // restore ends its sessions first, in one tap.
         XCUIDevice.shared.system.open(URL(fileURLWithPath: path))
-        // Sessions keep running off screen; an offline restore ends them first.
         let disconnect = app.buttons["Disconnect Sessions and Restore"]
-        if disconnect.waitForExistence(timeout: 10) { disconnect.tap() }
+        XCTAssertTrue(disconnect.waitForExistence(timeout: 10), "live sessions pause the restore until disconnected")
+        disconnect.tap()
         let field = app.secureTextFields["Transfer code"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
         field.tap(); field.typeText(code)
@@ -382,11 +376,22 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         snapshot("r2-replaced")
         done.tap()
 
+        // The terminal the restore closed opens again on the replaced workspace.
+        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
+                      "the terminal left showing reconnects after the replacement")
+        let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
+        XCTAssertTrue(terminal.exists, "the terminal surface is back")
+        snapshot("r3-reconnected")
+        app.typeText("echo AFTER-$((40+2))\n")
+        waitFor("AFTER-42", in: terminal, timeout: 30, "the replaced workspace's machine must run commands")
+
+        let list = app.buttons["Add machines"]
+        for _ in 0..<2 where !list.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = list.waitForExistence(timeout: 5)
+        }
         XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20), "the replaced workspace must be listed")
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", inputs.workspace)).count, 1,
                        "the saved workspace is replaced, not added")
-        let terminal = connect(app, inputs)
-        app.typeText("echo AFTER-$((40+2))\n")
-        waitFor("AFTER-42", in: terminal, timeout: 30, "the replaced workspace's machine must connect and run commands")
     }
 }

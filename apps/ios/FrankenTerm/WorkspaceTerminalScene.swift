@@ -1155,6 +1155,8 @@ struct WorkspaceTerminalScreen: View {
     var connectOnOpen = false
     /// Told the machine on screen, unless the user disconnected it, and nil
     /// on leaving: a relaunch returns there (MobileWorkspaceModel.showing).
+    /// A screen whose scene a restore closed keeps the record on leaving: its
+    /// page opens that terminal again when the machine can connect.
     var onShowing: (@MainActor (_ machineID: String?) -> Void)? = nil
     private var returnableMachineID: String? {
         scene.selectedMachineID.flatMap { scene.disconnected.contains($0) ? nil : $0 }
@@ -1234,7 +1236,7 @@ struct WorkspaceTerminalScreen: View {
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             scene.disappear()
-            onShowing?(nil)
+            if !scene.closed { onShowing?(nil) }
         }
         .onChange(of: scenePhase) { _, phase in
             // The app forwards its phase to the scene (MobileWorkspaceModel).
