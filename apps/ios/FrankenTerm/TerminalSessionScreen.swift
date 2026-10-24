@@ -874,9 +874,10 @@ final class TerminalSessionController {
         do {
             try checkStarting()
             let prepared: WorkspaceSSHConnection
+            // Preparing acknowledges an ended session too (disconnected, or cut
+            // off when iOS ended the app), or Connect could never reach it.
             if let connection { prepared = connection }
-            else if shouldOpenTerminal { prepared = try await connectAcknowledgingEarlierSessions() }
-            else { prepared = try await connectFirstReachable() }
+            else { prepared = try await connectAcknowledgingEarlierSessions() }
             var attempt = prepared
             self.connection = attempt
             try checkStarting()
@@ -1113,10 +1114,17 @@ final class TerminalSessionController {
     private func connectAcknowledgingEarlierSessions() async throws -> WorkspaceSSHConnection {
         for attempt in 0..<20 {
             for record in try await connections.journal.records()
-                where record.requiresReview && record.canResolve
+                where record.requiresReview
                     && record.scope.workspaceID == target.workspaceID && record.scope.machineID == target.machineID {
                 try checkStarting()
-                try? await connections.journal.resolve(record)
+                guard record.canResolve else {
+                    Self.log.info("earlier session on \(self.target.machineID, privacy: .public) (\(record.state.rawValue, privacy: .public)) is still open")
+                    continue
+                }
+                do { try await connections.journal.resolve(record) }
+                catch {
+                    Self.log.error("earlier session on \(self.target.machineID, privacy: .public) not acknowledged: \(String(describing: error), privacy: .public)")
+                }
             }
             do { return try await connectFirstReachable() }
             catch TerminalSessionJournalError.reviewRequired where attempt < 19 {

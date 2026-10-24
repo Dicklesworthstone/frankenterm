@@ -124,6 +124,9 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     private struct LiveScene {
         let connections: MobileConnections, scene: WorkspaceTerminalScene, outPath: String
+        /// The app launched again: new connections and scene over the same
+        /// installed workspace and session journal.
+        let relaunch: () async throws -> LiveScene
     }
 
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
@@ -148,10 +151,7 @@ final class TerminalSessionControllerTests: XCTestCase {
                                    vault: vault)
         let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
             transferID: Data(repeating: 9, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
-        let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
-                                                journalIdentifier: "scene-test-" + UUID().uuidString,
-                                                signer: SceneMemorySigner(vault: vault), liveness: liveness)
-        await connections.activate()
+        let journalIdentifier = "scene-test-" + UUID().uuidString
         let machines = ["alpha", "beta"].map { id in
             SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized,
@@ -159,11 +159,18 @@ final class TerminalSessionControllerTests: XCTestCase {
                                mux: muxCommand != nil, sessionCreation: muxCommand != nil ? .existingOnly : creation)]),
                 unavailable: "", theme: nil)
         }
-        let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision, workspaceName: "Scene",
-                                               machines: machines, initialMachineID: "alpha", connections: connections,
-                                               autoConnect: false)
-        try await appear(scene, selecting: "alpha")
-        return LiveScene(connections: connections, scene: scene, outPath: outPath)
+        func launch() async throws -> LiveScene {
+            let connections = try MobileConnections(store: store, journalDirectory: root.appendingPathComponent("journal"),
+                                                    journalIdentifier: journalIdentifier,
+                                                    signer: SceneMemorySigner(vault: vault), liveness: liveness)
+            await connections.activate()
+            let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision,
+                                                   workspaceName: "Scene", machines: machines, initialMachineID: "alpha",
+                                                   connections: connections, autoConnect: false)
+            try await appear(scene, selecting: "alpha")
+            return LiveScene(connections: connections, scene: scene, outPath: outPath, relaunch: launch)
+        }
+        return try await launch()
     }
 
     /// Appearing commits its group and selection asynchronously, and the scene
@@ -463,6 +470,34 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
         XCTAssertTrue(second.settled)
         await assertReleased(second, connections: connections)
+    }
+
+    /// After the app launches again, the machine page's Connect opens a new
+    /// shell: the earlier launch's session (cut off when iOS ended the app)
+    /// is acknowledged, not reported as still closing.
+    func testConnectAfterRelaunchOpensANewShell() async throws {
+        let first = try await liveScene()
+        let earlier = try await connect(first.scene, "alpha")
+        XCTAssertEqual(earlier.phase, .live)
+        await first.scene.close()
+        await assertReleased(earlier, connections: first.connections)
+        let ended = try await first.connections.journal.records().filter(\.requiresReview)
+        XCTAssertFalse(ended.isEmpty, "the earlier session's outcome is not yet acknowledged")
+
+        let live = try await first.relaunch(), scene = live.scene
+        scene.connect("alpha")
+        let session = try XCTUnwrap(scene.sessions["alpha"])
+        for _ in 0..<400 where session.phase != .live && !session.settled {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(session.phase, .live)
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo RELAUNCHED-$((40+2)) > \(live.outPath)", into: terminal)
+        let output = try await hostFile(live.outPath, containing: "RELAUNCHED-42")
+        XCTAssertTrue(output.contains("RELAUNCHED-42"), "the new shell must run commands")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     /// M1: two machines stay connected while the scene switches between them,
