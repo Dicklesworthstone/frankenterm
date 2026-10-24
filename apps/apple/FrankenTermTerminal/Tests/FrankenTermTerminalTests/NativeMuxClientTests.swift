@@ -66,6 +66,16 @@ final class NativeMuxClientTests: XCTestCase {
         XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: desktop, rows: 40, columns: 54)])
         try client.restoreSize(pane: 7)
         XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: nil, rows: 0, columns: 0)])
+        // Until the server answers the restore (the last Resize, 14), it may
+        // not have applied it. These frames are short: one-byte lengths.
+        XCTAssertTrue(try client.restoring())
+        var sent = Array(try client.outgoing(limit: 4096)), restore: UInt8?
+        while let length = sent.first.map(Int.init), sent.count > length {
+            if sent[2] == 14 { restore = sent[1] }
+            sent.removeFirst(length + 1)
+        }
+        try client.receive(frame(ident: 10, serial: UInt64(try XCTUnwrap(restore)), body: []))
+        XCTAssertFalse(try client.restoring())
         // The listed pane is 24 x 80, not a phone size left behind.
         XCTAssertFalse(try client.adoptPhoneSize(pane: 7, desktop: desktop, rows: 40, columns: 54))
 
