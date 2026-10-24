@@ -484,6 +484,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         let shownPane: TerminalMuxShownPane
         /// Which panes' programs have asked for the mouse.
         var grabs: [Int: Bool] = [:]
+        /// When to ask for the pane list again. The server pushes changes only
+        /// for panes this connection has shown, so the titles and directories
+        /// of the others come from the list alone.
+        var nextListing = ContinuousClock.now + MuxAttachment.listingInterval(visible: false)
+        /// Often while the machine is on screen (its pane strip), rarely while
+        /// it is not (the fleet overview).
+        static func listingInterval(visible: Bool) -> Duration { visible ? .seconds(5) : .seconds(30) }
         init(client: any TerminalMuxClient, control: TerminalMuxControl, geometry: TerminalSessionGeometry,
              sizes: TerminalMuxPhoneSizes, shownPane: TerminalMuxShownPane) {
             self.client = client; self.control = control; self.geometry = geometry; self.sizes = sizes
@@ -741,6 +748,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
             try state.client.show(pane: pane)
             state.showing = true
+            // Back on screen: its pane strip may be a hidden interval old.
+            state.nextListing = .now
         } else if !visible, state.showing {
             try state.client.hide(pane: pane); try state.client.restoreSize(pane: pane)
             state.showing = false
@@ -810,7 +819,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // A bounded control-only turn yields to input/cancellation. Only an
         // observed-empty event queue permits the next receive/decode operation.
         guard drained else { return TerminalSessionUpdate(output: Data()) }
-        let event = try await pumpMux(timeout: serviceTimeout(), driver: driver)
+        let now = ContinuousClock.now
+        if let state = mux, now >= state.nextListing {
+            try state.client.refreshPanes()
+            state.nextListing = now + MuxAttachment.listingInterval(visible: state.showing)
+        }
+        let untilListing = max(.milliseconds(1), now.duration(to: mux?.nextListing ?? now + serviceTimeout()))
+        let event = try await pumpMux(timeout: min(serviceTimeout(), untilListing), driver: driver)
         try await validateForeground()
         try await checkLiveness(event, driver: driver)
         try reconcileMux()

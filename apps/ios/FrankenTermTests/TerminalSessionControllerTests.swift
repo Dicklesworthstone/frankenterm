@@ -997,6 +997,36 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(third, connections: live.connections)
     }
 
+    /// The server pushes changes only for panes a connection has shown, so a
+    /// pane the phone has not shown would keep the title it had at attach (an
+    /// agent's status, say) unless the phone asks for the pane list again.
+    /// Needs a disposable mux with two panes (TEST_RUNNER_FT_LIVE_MUX_COMMAND):
+    /// the shown pane's shell retitles its sibling through the sibling's tty.
+    func testAMuxPaneNotShownKeepsItsTitleCurrent() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene
+        let run = UUID().uuidString.prefix(8)
+        let session = try await connect(scene, "alpha")
+        let view = try shown(session)
+        let state = try XCTUnwrap(session.muxState)
+        guard let other = state.panes.first(where: { $0.paneId != state.shown }) else {
+            view.removeFromSuperview(); await scene.close()
+            throw XCTSkip("The mux needs a second pane")
+        }
+        func title() -> String? { session.muxState?.panes.first { $0.paneId == other.paneId }?.title }
+        XCTAssertNotEqual(title(), "TITLE-\(run)")
+        // The server's other children are the other panes' shells.
+        try await type("for p in $(pgrep -P $PPID); do t=$(ps -o tty= -p $p | tr -d ' '); [ /dev/$t = $(tty) ] || printf '\\033]2;TITLE-\(run)\\007' > /dev/$t; done",
+                       into: view)
+        for _ in 0..<240 where title() != "TITLE-\(run)" { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(title(), "TITLE-\(run)", "the pane strip shows the unshown pane's new title")
+        view.removeFromSuperview()
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// A direct route first tries the machine's mux. The loopback host has none,
     /// so that attempt leaves an acknowledged record with no input before the
     /// shell's own record. These are the records of terminals that ran.
