@@ -1287,8 +1287,8 @@ struct WorkspaceTerminalScreen: View {
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
-                    // ⇧⌘D is the canvas's key command: SwiftUI never registers
-                    // a shortcut on a button inside a menu.
+                    // ⇧⌘D is the canvas's key command: a SwiftUI shortcut on a
+                    // button inside this menu never fired (UI test 3).
                     Button("Compose Command", systemImage: "square.and.pencil") { session.composeCommand() }
                         .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                         .accessibilityIdentifier("terminal.command.open")
