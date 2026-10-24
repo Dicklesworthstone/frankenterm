@@ -1325,13 +1325,15 @@ pub fn export(
         }
         let theme_id = format!("t.{}", machine.id);
         themes.push(theme_json(&theme_id, &machine.theme));
+        // The phone signs every machine in once the workspace opens, so
+        // switching to one is instant; its terminal opens only when chosen.
         let mut record = json!({
             "id": format!("m.{}", machine.id),
             "name": machine.name,
             "theme_ref": theme_id,
             "route_refs": route_ids,
             "preferred_route_ref": route_ids[0],
-            "auto_connect": false,
+            "auto_connect": true,
             "tags": machine.tags,
         });
         if let Some(label) = &machine.short_label {
@@ -1380,7 +1382,7 @@ pub fn export(
             if order.is_empty() {
                 None
             } else {
-                Some(json!({"id": format!("g.{}", group.id), "name": group.name, "machine_order": order, "auto_connect": false}))
+                Some(json!({"id": format!("g.{}", group.id), "name": group.name, "machine_order": order, "auto_connect": true}))
             }
         })
         .collect();
@@ -1656,6 +1658,11 @@ ssh = "jumped"
             workspace["groups"][0]["machine_order"],
             json!(["m.trj", "m.css"])
         );
+        // Opening the workspace on the phone signs every machine in.
+        assert_eq!(workspace["groups"][0]["auto_connect"], true);
+        for machine in workspace["machines"].as_array().unwrap() {
+            assert_eq!(machine["auto_connect"], true, "{}", machine["id"]);
+        }
         assert_eq!(workspace["preferences"]["initial_machine_ref"], "m.trj");
 
         let routes = workspace["routes"].as_array().unwrap();

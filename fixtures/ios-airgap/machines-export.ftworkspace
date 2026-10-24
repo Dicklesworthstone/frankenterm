@@ -20,7 +20,7 @@
     ],
     "groups": [
       {
-        "auto_connect": false,
+        "auto_connect": true,
         "id": "g.fleet",
         "machine_order": [
           "m.trj",
@@ -69,7 +69,7 @@
     "id": "w.machines",
     "machines": [
       {
-        "auto_connect": false,
+        "auto_connect": true,
         "id": "m.trj",
         "name": "Threadripper",
         "preferred_route_ref": "r.trj.mux",
@@ -81,7 +81,7 @@
         "theme_ref": "t.trj"
       },
       {
-        "auto_connect": false,
+        "auto_connect": true,
         "id": "m.css",
         "name": "css",
         "preferred_route_ref": "r.css.ssh",
@@ -92,7 +92,7 @@
         "theme_ref": "t.css"
       },
       {
-        "auto_connect": false,
+        "auto_connect": true,
         "id": "m.dark",
         "name": "dark",
         "preferred_route_ref": "r.dark.mux",
