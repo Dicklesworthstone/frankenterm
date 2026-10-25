@@ -344,12 +344,16 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("AGAIN-first-6", in: screen, timeout: 10, "⇧⌘[ comes back to the first machine")
         app.typeText("echo KEYS-$FT_WHO-$((4+4))\n")
         waitFor("KEYS-first-8", in: screen, timeout: 30, "typing after a keyboard switch reaches the machine on screen")
+        // Leaving resizes the machine's terminal as its keyboard goes, and its
+        // shell redraws the prompt. That is not news.
+        XCTAssertFalse(chip(app, second, "connected, new output").waitForExistence(timeout: 2),
+                       "a machine just left is not marked for its redraw")
         snapshot("14-keyboard-switch")
 
         // A machine that prints while another is on screen is marked on the
         // strip until it is on screen again.
-        app.typeText("sleep 4; echo AWAY-$FT_WHO-$((5+5))\n")
-        waitFor("sleep 4; echo AWAY", in: screen, timeout: 10, "the command is running before the switch")
+        app.typeText("sleep 6; echo AWAY-$FT_WHO-$((5+5))\n")
+        waitFor("sleep 6; echo AWAY", in: screen, timeout: 10, "the command is running before the switch")
         app.typeKey("]", modifierFlags: [.command, .shift])
         waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the next machine")
         let marked = chip(app, inputs.machine, "connected, new output")

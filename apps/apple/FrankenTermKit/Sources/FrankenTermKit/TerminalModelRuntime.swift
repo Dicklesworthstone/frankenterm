@@ -95,9 +95,13 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private var visible = true
     /// Called the first time output arrives while the terminal is hidden after
     /// it was on screen, and again only after it is shown again. Output before
-    /// the terminal was ever shown (a new shell's greeting) is not news.
+    /// the terminal was ever shown (a new shell's greeting) is not news, nor is
+    /// output within `hiddenOutputSettle` of hiding: the keyboard leaving with
+    /// the machine resizes its terminal, and the shell's redraw follows.
     private let hiddenOutput: (@Sendable () -> Void)?
+    private let hiddenOutputSettle: Duration
     private var shownOnce = false, hiddenOutputReported = false
+    private var hiddenAt: ContinuousClock.Instant?
     private var visibilityGeneration = UUID()
     private var viewportTop: Int64?
     private let historyOwner = UUID()
@@ -106,11 +110,11 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
 
     public init(model: any TerminalSessionModel, coordinator: TerminalInputCoordinator,
                 delivery: any TerminalModelDelivery, initiallyVisible: Bool = true,
-                hiddenOutput: (@Sendable () -> Void)? = nil) {
+                hiddenOutput: (@Sendable () -> Void)? = nil, hiddenOutputSettle: Duration = .seconds(3)) {
         self.model = model; source = model.source
         self.coordinator = coordinator; self.delivery = delivery
         visible = initiallyVisible; shownOnce = initiallyVisible
-        self.hiddenOutput = hiddenOutput
+        self.hiddenOutput = hiddenOutput; self.hiddenOutputSettle = hiddenOutputSettle
     }
 
     public func accounting() -> TerminalModelAccounting {
@@ -215,7 +219,10 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         if let geometry = update.resized { try model.resize(geometry) }
         if !update.output.isEmpty {
             try model.feed(update.output)
-            if !visible, shownOnce, !hiddenOutputReported { hiddenOutputReported = true; hiddenOutput?() }
+            if !visible, shownOnce, !hiddenOutputReported,
+               hiddenAt.map({ ContinuousClock.now - $0 >= hiddenOutputSettle }) ?? true {
+                hiddenOutputReported = true; hiddenOutput?()
+            }
         }
         if update.endOfOutput { endOfOutput = true }
         try await transferReplies()
@@ -321,6 +328,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
             // Hiding is a lifecycle state change, not a model mutation. It must
             // take effect even while the already-owned frame is being delivered.
             visibilityGeneration = UUID()
+            if self.visible { hiddenAt = ContinuousClock.now }
             self.visible = false
             return
         }

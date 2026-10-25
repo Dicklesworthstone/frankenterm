@@ -1201,7 +1201,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(scene.hasUnseenOutput("alpha"))
         XCTAssertFalse(scene.hasUnseenOutput("beta"), "beta printed nothing since it was on screen")
 
-        try await type("echo STARTED-\(run) > \(out); sleep 3; echo AWAY-\(run)", into: alpha)
+        // Later than the 3 s after leaving that are taken for the redraw.
+        try await type("echo STARTED-\(run) > \(out); sleep 5; echo AWAY-\(run)", into: alpha)
         _ = try await hostFile(out, containing: "STARTED-\(run)")
         try await select(scene, "beta")
         XCTAssertFalse(scene.hasUnseenOutput("alpha"), "nothing printed yet")
