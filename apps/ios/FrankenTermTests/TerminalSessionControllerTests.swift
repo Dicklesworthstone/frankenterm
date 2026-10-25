@@ -614,6 +614,24 @@ final class TerminalSessionControllerTests: XCTestCase {
         return text
     }
 
+    /// The app's memory as the system counts it against its limit.
+    private func footprint() -> UInt64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info.phys_footprint : 0
+    }
+
+    private func button(_ identifier: String, in view: UIView?) -> UIButton? {
+        guard let view else { return nil }
+        if let button = view as? UIButton, button.accessibilityIdentifier == identifier { return button }
+        return view.subviews.lazy.compactMap { self.button(identifier, in: $0) }.first
+    }
+
     /// Lays the terminal out at `size` points with the smallest text, as an
     /// iPad on a large display can, and returns the first frame drawn wider
     /// than `columns`.
@@ -1221,6 +1239,72 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(scene.hasUnseenOutput("beta"))
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A noisy neighbor: while a machine off screen floods output, commands
+    /// typed on the one on screen show their output promptly, the flood is
+    /// read through to its end, and the app does not grow with what it reads.
+    func testAMachineFloodingOffScreenLeavesTheOneOnScreenResponsive() async throws {
+        let live = try await liveScene(), scene = live.scene, marks = live.outPath + ".flood"
+        let run = UUID().uuidString.prefix(8)
+        func halves() -> Int { ((try? String(contentsOfFile: marks, encoding: .utf8)) ?? "").split(separator: "\n").count }
+        let alphaSession = try await connect(scene, "alpha")
+        let alpha = try shown(alphaSession)
+        defer { alpha.removeFromSuperview() }
+        let betaSession = try await connect(scene, "beta")
+        let beta = try await shownAfterSelecting(scene, "beta", connected: betaSession)
+        defer { beta.removeFromSuperview() }
+        // Two halves of 75 MB in 10 KB writes, as fast as the phone reads
+        // them, and a mark after each. A phone that stopped reading would
+        // hold the writer, and the marks would never come.
+        try await type("perl -e '$l = (\"x\" x 199 . \"\\n\") x 50; for (1, 2) { print $l for 1 .. 7500; "
+            + "open F, \">>\", $ARGV[0]; print F \"HALF\\n\"; close F }' \(marks)", into: beta)
+        try await select(scene, "alpha")
+        let start = footprint()
+        var slowest = Duration.zero
+        for ping in 100..<108 {
+            let sent = ContinuousClock.now
+            try await type("echo PING-\(run)-$((\(ping) + 0))", into: alpha)
+            let text = try await screen(alpha, containing: "PING-\(run)-\(ping)")
+            XCTAssertTrue(text.contains("PING-\(run)-\(ping)"), "ping \(ping) never showed")
+            slowest = max(slowest, ContinuousClock.now - sent)
+        }
+        XCTAssertEqual(halves(), 0, "every ping ran while beta still flooded")
+        XCTAssertLessThan(slowest, .seconds(1), "the machine on screen answered slowly beside the flood")
+
+        // The first half grows the app once (buffers, allocator caches); the
+        // second must not grow it again, as anything kept per byte read would.
+        for _ in 0..<1200 where halves() < 1 { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(halves(), 1, "beta's first 75 MB were not read within a minute off screen")
+        let half = footprint()
+        for _ in 0..<1200 where halves() < 2 { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(halves(), 2, "beta's second 75 MB were not read within a minute off screen")
+        let first = (Int64(half) - Int64(start)) >> 20, second = (Int64(footprint()) - Int64(half)) >> 20
+        XCTAssertLessThan(first, 96, "the app grew \(first) MB reading beta's first 75 MB")
+        XCTAssertLessThan(second, 16, "the app grew \(second) MB more reading the next 75 MB")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// Ctrl+C from the key row stops a flood on the machine on screen: the
+    /// key is not held behind the output, and the next command runs.
+    func testCtrlCStopsAFloodOnTheMachineOnScreen() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("perl -e '$l = (\"y\" x 199 . \"\\n\") x 50; $e = time + 60; print $l while time < $e'", into: terminal)
+        _ = try await screen(terminal, containing: String(repeating: "y", count: 40))
+        let control = try XCTUnwrap(button("terminal.key.Control modifier", in: terminal.input.inputAccessoryView))
+        let sent = ContinuousClock.now
+        control.sendActions(for: .touchUpInside)
+        terminal.input.insertText("c")
+        try await type("echo STOPPED-$((40 + 2))", into: terminal)
+        let text = try await screen(terminal, containing: "STOPPED-42")
+        XCTAssertTrue(text.contains("STOPPED-42"), "Ctrl+C did not stop the flood")
+        XCTAssertLessThan(ContinuousClock.now - sent, .seconds(3), "the flood went on after Ctrl+C")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     /// M2: a new connection (the phone is back after its connection ended)
