@@ -1201,11 +1201,17 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(scene.hasUnseenOutput("alpha"))
         XCTAssertFalse(scene.hasUnseenOutput("beta"), "beta printed nothing since it was on screen")
 
-        // Later than the 3 s after leaving that are taken for the redraw.
-        try await type("echo STARTED-\(run) > \(out); sleep 5; echo AWAY-\(run)", into: alpha)
+        // SOON lands within the 3 s after leaving that are taken for the redraw
+        // of a terminal resized as its keyboard went; AWAY lands after them.
+        try await type("echo STARTED-\(run) > \(out); sleep 1; echo SOON-\(run) | tee -a \(out); sleep 5; echo AWAY-\(run)",
+                       into: alpha)
         _ = try await hostFile(out, containing: "STARTED-\(run)")
         try await select(scene, "beta")
         XCTAssertFalse(scene.hasUnseenOutput("alpha"), "nothing printed yet")
+        let soon = try await hostFile(out, containing: "SOON-\(run)")
+        XCTAssertTrue(soon.contains("SOON-\(run)"))
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertFalse(scene.hasUnseenOutput("alpha"), "output just after leaving, as a redraw is, is not news")
         for _ in 0..<400 where !scene.hasUnseenOutput("alpha") { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertTrue(scene.hasUnseenOutput("alpha"), "alpha printed while beta was on screen")
         XCTAssertFalse(scene.hasUnseenOutput("beta"), "the machine on screen is never marked")
