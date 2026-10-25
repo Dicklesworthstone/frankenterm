@@ -1130,6 +1130,92 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// Unread marks: a mux pane that prints while another pane is on screen is
+    /// marked until it is shown again. A pane that just left the screen redraws
+    /// at the size it gets back, which is not news. Types into the disposable
+    /// mux's panes.
+    func testAMuxPaneThatPrintsWhileAnotherIsShownIsUnreadUntilShown() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath + ".unread"
+        let run = UUID().uuidString.prefix(8)
+        let session = try await connect(scene, "alpha")
+        var view = try shown(session)
+        let state = try XCTUnwrap(session.muxState)
+        let first = try XCTUnwrap(state.shown)
+        guard let other = state.panes.first(where: { $0.paneId != first })?.paneId else {
+            view.removeFromSuperview(); await scene.close()
+            throw XCTSkip("The mux needs a second pane")
+        }
+        func show(_ pane: Int) async throws {
+            session.showPane(pane)
+            for _ in 0..<400 where session.muxState?.shown != pane || session.paneNavigationBusy || session.terminal === view {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertEqual(session.muxState?.shown, pane)
+            view.removeFromSuperview()
+            view = try shown(session)
+        }
+        // The first pane leaves the screen idle at its prompt and gets its own
+        // size back; its shell redraws.
+        try await show(other)
+        try await Task.sleep(for: .milliseconds(2_500))
+        XCTAssertEqual(session.muxState?.unread, [], "a redraw at the size a pane got back is not news")
+
+        // The other pane starts a command that prints once it is off screen and
+        // settled.
+        try await type("echo STARTED-\(run) > \(out); sleep 8; echo LATER-\(run)", into: view)
+        _ = try await hostFile(out, containing: "STARTED-\(run)")
+        try await show(first)
+        XCTAssertEqual(session.muxState?.unread, [], "nothing printed yet")
+        for _ in 0..<600 where session.muxState?.unread.contains(other) != true {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(session.muxState?.unread, [other], "the pane that printed off screen is unread; the one shown is not")
+        for _ in 0..<200 where !session.hasUnseenOutput { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(session.hasUnseenOutput, "the machine's strip mark follows its unread panes")
+        XCTAssertFalse(scene.hasUnseenOutput("alpha"), "the machine on screen shows its panes' marks, not its own")
+
+        try await show(other)
+        XCTAssertEqual(session.muxState?.unread, [], "showing the pane reads it")
+        for _ in 0..<200 where session.hasUnseenOutput { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertFalse(session.hasUnseenOutput)
+        view.removeFromSuperview()
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    /// Unread marks: a machine whose shell prints while another machine is on
+    /// screen is marked until it is on screen again; the one on screen never is.
+    func testAMachineWhoseShellPrintsWhileAwayIsMarkedUntilShownAgain() async throws {
+        let live = try await liveScene(), scene = live.scene, out = live.outPath + ".unseen"
+        let run = UUID().uuidString.prefix(8)
+        let alphaSession = try await connect(scene, "alpha")
+        let alpha = try shown(alphaSession)
+        defer { alpha.removeFromSuperview() }
+        let betaSession = try await connect(scene, "beta")
+        let beta = try await shownAfterSelecting(scene, "beta", connected: betaSession)
+        defer { beta.removeFromSuperview() }
+        try await select(scene, "alpha")
+        XCTAssertFalse(scene.hasUnseenOutput("alpha"))
+        XCTAssertFalse(scene.hasUnseenOutput("beta"), "beta printed nothing since it was on screen")
+
+        try await type("echo STARTED-\(run) > \(out); sleep 3; echo AWAY-\(run)", into: alpha)
+        _ = try await hostFile(out, containing: "STARTED-\(run)")
+        try await select(scene, "beta")
+        XCTAssertFalse(scene.hasUnseenOutput("alpha"), "nothing printed yet")
+        for _ in 0..<400 where !scene.hasUnseenOutput("alpha") { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(scene.hasUnseenOutput("alpha"), "alpha printed while beta was on screen")
+        XCTAssertFalse(scene.hasUnseenOutput("beta"), "the machine on screen is never marked")
+
+        try await select(scene, "alpha")
+        XCTAssertFalse(alphaSession.hasUnseenOutput, "being on screen reads it")
+        XCTAssertFalse(scene.hasUnseenOutput("beta"))
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
     /// M2: a new connection (the phone is back after its connection ended)
     /// shows the pane the phone was showing, with the same program in it, not
     /// whichever pane the desktop has active. When that pane closed meanwhile
