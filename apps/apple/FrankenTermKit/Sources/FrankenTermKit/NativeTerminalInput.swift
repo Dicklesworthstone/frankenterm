@@ -895,6 +895,9 @@ public final class NativeTerminalView: UIView {
     /// keyboard.
     public var remoteMouseGrabbed = false
     public var onRemoteClick: (@MainActor (_ column: Int, _ row: Int) -> Void)?
+    /// The rows do not record their soft wraps (a mux pane's are redrawn one
+    /// by one), so a link that reaches the last column goes on to the next row.
+    public var softWrapsUnknown = false
     /// Rows of drag per wheel notch: a notch scrolls a program about three rows.
     private static let rowsPerNotch = 3
 
@@ -1198,6 +1201,8 @@ public final class NativeTerminalView: UIView {
                           min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)))
             return
         }
+        // A link shows where it goes, with Open and Copy Link, instead.
+        if showLink(at: tap.location(in: self)) { return }
         if !input.isFirstResponder { onKeyboardRequest?() }
         // With a hardware keyboard there is no on-screen keyboard to put
         // away, and resigning would only stop the typing.
@@ -1434,6 +1439,42 @@ public final class NativeTerminalView: UIView {
     private func drawSelection() {
         selectionOverlay.show(selection, frame: renderer.admittedFrame, cell: renderer.cellSize,
                               tint: theme?.accent ?? tintColor)
+    }
+
+    /// Shows the link under `point`, if there is one: where it goes, then
+    /// Open and Copy Link. Nothing opens without a second, deliberate tap.
+    func showLink(at point: CGPoint) -> Bool {
+        guard let grid = gridPoint(at: point), let frame = renderer.admittedFrame, let cell = renderer.cellSize,
+              let link = TerminalLink.at(grid, in: frame, softWrapsUnknown: softWrapsUnknown) else { return false }
+        // This terminal's own controller: a key-window lookup could show it
+        // in another scene.
+        var responder: UIResponder? = self
+        while responder != nil && !(responder is UIViewController) { responder = responder?.next }
+        guard let presenter = responder as? UIViewController, presenter.viewIfLoaded?.window === window,
+              presenter.presentedViewController == nil else { return false }
+        let origin = CGPoint(x: floor(point.x / cell.width) * cell.width, y: floor(point.y / cell.height) * cell.height)
+        presenter.present(linkSheet(for: link, from: CGRect(origin: origin, size: cell)), animated: true)
+        return true
+    }
+
+    /// The link's destination, exactly as the terminal holds it, with Open
+    /// (web and mail addresses only), Copy Link and Cancel.
+    func linkSheet(for link: TerminalLink, from cell: CGRect) -> UIAlertController {
+        let sheet = UIAlertController(title: nil, message: link.destination, preferredStyle: .actionSheet)
+        if let url = link.openableURL {
+            sheet.addAction(UIAlertAction(title: "Open", style: .default) { [weak self] _ in
+                self?.window?.windowScene?.open(url, options: nil)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Copy Link", style: .default) { _ in
+            UIPasteboard.general.setItems([["public.utf8-plain-text": link.destination]],
+                options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        sheet.popoverPresentationController?.sourceView = self
+        sheet.popoverPresentationController?.sourceRect = cell
+        return sheet
     }
 
     private func showEditMenu() {

@@ -120,3 +120,92 @@ public struct TerminalTextSelection: Equatable, Sendable {
         return result
     }
 }
+
+/// A link under a cell: one the program attached to its text (OSC 8), or a
+/// `scheme://` address written in it, found by the desktop's default rules.
+/// Its destination is shown before anything opens; only web and mail
+/// addresses open, others (files, settings, other apps) can be copied.
+public struct TerminalLink: Equatable, Sendable {
+    public let destination: String
+    /// The first and last cells it covers.
+    public let start: TerminalGridPoint, end: TerminalGridPoint
+
+    public var openableURL: URL? {
+        guard let url = URL(string: destination, encodingInvalidCharacters: true),
+              let scheme = url.scheme?.lowercased(), ["http", "https", "mailto"].contains(scheme) else { return nil }
+        return url
+    }
+
+    /// The desktop's default rules (frankenterm-config `default_hyperlink_rules`)
+    /// with the capture each one links, minus the bare e-mail rule: a prompt's
+    /// user@host would take the tap that brings up the keyboard.
+    private static let rules: [(NSRegularExpression, Int)] = [
+        (#"\((\w+://\S+)\)"#, 1), (#"\[(\w+://\S+)\]"#, 1), (#"<(\w+://\S+)>"#, 1),
+        (#"\b\w+://[^\s()]*\(\S*\)(?=\s|$|[^_/a-zA-Z0-9-])"#, 0), (#"\b\w+://\S+[_/a-zA-Z0-9-]"#, 0),
+    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
+    /// Rows joined on each side of the tapped one when looking for an address.
+    static let maximumJoinedRows = 8
+
+    /// The link at `point`, if any. A row continues into the next when the
+    /// terminal recorded the wrap or, with `softWrapsUnknown` (a mux pane's
+    /// rows are redrawn one by one and keep no wraps), when its text reaches
+    /// the last column; the destination shown first makes a wrong join plain.
+    public static func at(_ point: TerminalGridPoint, in frame: TerminalRenderFrame,
+                          softWrapsUnknown: Bool = false) -> TerminalLink? {
+        let columns = frame.columns
+        guard columns > 0, let index = frame.lines.firstIndex(where: { $0.stableIndex == point.row }) else { return nil }
+        let row = frame.lines[index]
+        let owners = TerminalTextSelection.cellOwners(row, columns: columns)
+        guard owners.indices.contains(point.column) else { return nil }
+        if let owner = owners[point.column], row.cells[owner].linkID > 0,
+           frame.links.indices.contains(row.cells[owner].linkID - 1) {
+            let id = row.cells[owner].linkID
+            var first = point.column, last = point.column
+            func linked(_ column: Int) -> Bool {
+                owners.indices.contains(column) && owners[column].map { row.cells[$0].linkID == id } == true
+            }
+            while linked(first - 1) { first -= 1 }
+            while linked(last + 1) { last += 1 }
+            return TerminalLink(destination: frame.links[id - 1],
+                                start: .init(row: row.stableIndex, column: first),
+                                end: .init(row: row.stableIndex, column: last))
+        }
+        func continues(_ at: Int) -> Bool {
+            guard at + 1 < frame.lines.count, frame.lines[at + 1].stableIndex == frame.lines[at].stableIndex + 1
+            else { return false }
+            if frame.lines[at].wrapsToNext { return true }
+            guard softWrapsUnknown,
+                  let last = frame.lines[at].cells.last(where: { !$0.text.allSatisfy(\.isWhitespace) }) else { return false }
+            return last.column + max(last.width, 1) >= columns
+        }
+        var first = index, last = index
+        while first > 0, index - first < maximumJoinedRows, continues(first - 1) { first -= 1 }
+        while last - index < maximumJoinedRows, continues(last) { last += 1 }
+        // The joined text, with the cell each UTF-16 unit came from.
+        var text = "", cells = [TerminalGridPoint]()
+        for line in frame.lines[first...last] {
+            var column = 0
+            for cell in line.cells where cell.column >= column && cell.column < columns {
+                let gap = cell.column - column
+                text += String(repeating: " ", count: gap)
+                cells += (column..<cell.column).map { TerminalGridPoint(row: line.stableIndex, column: $0) }
+                let shown = cell.invisible || cell.text.isEmpty ? " " : cell.text
+                text += shown
+                cells += repeatElement(TerminalGridPoint(row: line.stableIndex, column: cell.column), count: shown.utf16.count)
+                column = cell.column + max(cell.width, 1)
+            }
+        }
+        let tapped = TerminalGridPoint(row: point.row, column: owners[point.column].map { row.cells[$0].column } ?? point.column)
+        guard let at = cells.firstIndex(of: tapped) else { return nil }
+        let whole = NSRange(location: 0, length: (text as NSString).length)
+        for (rule, capture) in rules {
+            for match in rule.matches(in: text, range: whole) {
+                let range = match.range(at: capture)
+                guard range.location != NSNotFound, NSLocationInRange(at, range) else { continue }
+                return TerminalLink(destination: (text as NSString).substring(with: range),
+                                    start: cells[range.location], end: cells[NSMaxRange(range) - 1])
+            }
+        }
+        return nil
+    }
+}
