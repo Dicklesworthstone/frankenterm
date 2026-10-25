@@ -533,6 +533,58 @@ fn render_changes_decode_like_the_desktop_v46_decoder() {
     }
 }
 
+/// Each cell's link address, in column order.
+fn link_addresses(line: &termwiz::surface::Line) -> Vec<Option<String>> {
+    line.visible_cells()
+        .map(|cell| cell.attrs().hyperlink().map(|link| link.uri().to_owned()))
+        .collect()
+}
+
+#[test]
+fn links_come_back_on_the_cells_the_desktop_puts_them_on() {
+    let mut term = terminal(5, 30);
+    term.advance_bytes(
+        "see \x1b]8;id=pr;https://example.com/pr/1\x1b\\PR #1\x1b]8;;\x1b\\ and \
+         \x1b]8;;https://example.com/ci\x1b\\CI\x1b]8;;\x1b\\\r\n\
+         \x1b]8;;https://example.com/pr/1\x1b\\again\x1b]8;;\x1b\\\r\n$ "
+            .as_bytes(),
+    );
+    let response = render_changes(&mut term);
+    let body = varbincode::serialize(&response).expect("serialize");
+    let bytes = server_frame(25, 0, &body, false);
+    let dialects = [
+        MuxWireDialect::LEGACY46,
+        MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
+    ];
+    for dialect in dialects {
+        let decoded = Pdu::decode_for_dialect(bytes.as_slice(), dialect).expect("the desktop decodes it");
+        let MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(desktop)) = decoded.payload()
+        else {
+            panic!("desktop decoded {:?}", decoded.payload());
+        };
+        let (desktop_lines, _) = desktop.bonus_lines.clone().extract_data();
+
+        let mut reader = frame::FrameReader::default();
+        reader.push(&bytes);
+        let frame = reader.next_frame().expect("frame").expect("complete");
+        let ours: wire::RenderChanges = wire::decode(&frame.body).expect("the phone decodes it");
+        let ours = ours.bonus_lines.linked_lines();
+
+        assert_eq!(ours.len(), desktop_lines.len());
+        for ((row, line), (desktop_row, desktop_line)) in ours.iter().zip(&desktop_lines) {
+            assert_eq!(row, desktop_row);
+            assert_eq!(link_addresses(line), link_addresses(desktop_line), "row {row}");
+        }
+        let first = link_addresses(&ours[0].1);
+        let pr = Some("https://example.com/pr/1".to_owned());
+        let ci = Some("https://example.com/ci".to_owned());
+        assert_eq!(first[..4], [None, None, None, None]);
+        assert_eq!(first[4..9], [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr.clone()]);
+        assert_eq!(first[14..16], [ci.clone(), ci]);
+        assert_eq!(link_addresses(&ours[1].1)[..5], [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr]);
+    }
+}
+
 #[test]
 fn a_pane_tree_decodes_like_the_desktop_v46_decoder() {
     let cursor = terminal_get_cursor_position(&mut terminal(3, 10));

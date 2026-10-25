@@ -6,12 +6,14 @@
 //! desktop codec's own encoding and decoding in both dialects.
 //!
 //! A reply struct may stop before the reply's last field: decoding reads a
-//! prefix and ignores the rest (hyperlink spans, image references, input
-//! serials and sequence numbers, which the phone does not use).
+//! prefix and ignores the rest (image references, input serials and
+//! sequence numbers, which the phone does not use).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
+use termwiz::hyperlink::Hyperlink;
 use termwiz::input::KeyEvent;
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 
@@ -269,10 +271,48 @@ pub struct TieredScrollbackStatus {
     cold_worker_cancellation_count: u64,
 }
 
-/// The `lines` field that opens codec's `SerializedLines`.
+/// The `lines` and `hyperlinks` fields that open codec's `SerializedLines`.
+/// The server takes each link out of the cells it covers and sends it once,
+/// with those cells; `linked_lines` puts it back.
 #[derive(Deserialize, Debug, Default)]
 pub struct LineEntries {
     pub lines: Vec<(StableRowIndex, Line)>,
+    hyperlinks: Vec<LineHyperlink>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LineHyperlink {
+    link: Hyperlink,
+    coords: Vec<CellCoordinates>,
+}
+
+/// Cells `cols` of the `line_idx`th entry in `lines`.
+#[derive(Deserialize, Debug)]
+struct CellCoordinates {
+    line_idx: usize,
+    cols: Range<usize>,
+}
+
+impl LineEntries {
+    /// The lines with their links back on their cells, as the desktop's
+    /// `SerializedLines::extract_data` does: a span past its line is skipped.
+    pub fn linked_lines(self) -> Vec<(StableRowIndex, Line)> {
+        let mut lines = self.lines;
+        for hyperlink in self.hyperlinks {
+            let link = Arc::new(hyperlink.link);
+            for coord in hyperlink.coords {
+                let Some((_, line)) = lines.get_mut(coord.line_idx) else {
+                    continue;
+                };
+                if let Some(cells) = line.cells_mut_for_attr_changes_only().get_mut(coord.cols) {
+                    for cell in cells {
+                        cell.attrs_mut().set_hyperlink(Some(Arc::clone(&link)));
+                    }
+                }
+            }
+        }
+        lines
+    }
 }
 
 /// PDU 25 up to its lines, which still decodes when the lines do not.

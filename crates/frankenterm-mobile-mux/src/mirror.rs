@@ -208,7 +208,7 @@ impl PaneMirror {
                 self.dirty.extend(start..end);
                 self.lines.retain(|row, _| !(start..end).contains(row));
             }
-            for (row, line) in lines.map(|entries| entries.lines).unwrap_or_default() {
+            for (row, line) in lines.map(LineEntries::linked_lines).unwrap_or_default() {
                 self.dirty.insert(row);
                 self.absent.remove(&row);
                 self.lines.insert(row, line);
@@ -226,7 +226,7 @@ impl PaneMirror {
             return;
         }
         let mut returned = BTreeSet::new();
-        for (row, line) in entries.lines {
+        for (row, line) in entries.linked_lines() {
             returned.insert(row);
             self.lines.insert(row, line);
         }

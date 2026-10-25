@@ -5,12 +5,14 @@
 //! state that produces its attributes and colors.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
+use termwiz::hyperlink::Hyperlink;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 
-/// The attributes an SGR sequence can express; everything else a cell
-/// carries (hyperlinks, images, semantic zones) is not drawn.
+/// The attributes an SGR sequence can express. Links are written with
+/// OSC 8 beside them; images and semantic zones are not drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Style {
     intensity: Intensity,
@@ -143,12 +145,16 @@ fn drawable(text: &str) -> impl Iterator<Item = char> + '_ {
 }
 
 /// Draws `line` on the row the cursor is on, from the first column; cells
-/// past `cols` are dropped. Leaves the cursor on that row with SGR reset.
+/// past `cols` are dropped. Leaves the cursor on that row with SGR reset and
+/// no link open.
 pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
     out.push_str("\r\x1b[0m\x1b[2K");
     let Some(line) = line else { return };
     let plain = Style::plain();
     let mut current = plain;
+    // The link the phone's terminal is writing cells under. SGR does not
+    // end it, so it is opened and closed on its own.
+    let mut link: Option<&Arc<Hyperlink>> = None;
     // Where the phone's cursor is, when it is known: after a wide or
     // non-ASCII cell the phone's width tables decide, so the next cell is
     // placed with an absolute column instead.
@@ -171,6 +177,16 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
             style.write_sgr(out);
             current = style;
         }
+        let cell_link = cell.attrs().hyperlink();
+        if cell_link.map(|l| &**l) != link.map(|l| &**l) {
+            if link.is_some() {
+                out.push_str("\x1b]8;;\x1b\\");
+            }
+            if let Some(next) = cell_link {
+                open_link(out, next);
+            }
+            link = cell_link;
+        }
         if text.is_empty() {
             out.push(' ');
         } else {
@@ -178,9 +194,20 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
         }
         column = (width == 1 && text.is_ascii()).then_some(index + 1);
     }
+    if link.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
     if current != plain {
         out.push_str("\x1b[0m");
     }
+}
+
+/// Opens an OSC 8 link to the remote cell's address, without its
+/// parameters. Characters that would end or redirect the sequence go.
+fn open_link(out: &mut String, link: &Hyperlink) {
+    out.push_str("\x1b]8;;");
+    out.extend(link.uri().chars().filter(|c| !is_control(*c)));
+    out.push_str("\x1b\\");
 }
 
 /// Moves the cursor to a zero-based row and column.
@@ -307,5 +334,59 @@ mod tests {
         let mut out = String::new();
         title(&mut out, "vim\x07 x\x1b]");
         assert_eq!(out, "\x1b]2;vim x]\x1b\\");
+    }
+
+    fn linked(uri: &str, attrs: &CellAttributes) -> CellAttributes {
+        let mut attrs = attrs.clone();
+        let mut params = std::collections::HashMap::new();
+        params.insert("id".to_owned(), "7".to_owned());
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_with_params(uri, params))));
+        attrs
+    }
+
+    #[test]
+    fn a_link_is_written_around_its_cells_and_closed_before_the_row_ends() {
+        let mut bold = CellAttributes::default();
+        bold.set_intensity(Intensity::Bold);
+        let link = linked("https://example.com/pr/1", &CellAttributes::default());
+        let line = line_of(&[
+            ("a", CellAttributes::default()),
+            ("P", link.clone()),
+            ("R", linked("https://example.com/pr/1", &bold)),
+            ("b", CellAttributes::default()),
+            ("Q", link),
+        ]);
+        // One link across a style change; the same address after plain
+        // text opens again; the row never ends inside a link.
+        assert_eq!(
+            painted(&line, 80),
+            "\r\x1b[0m\x1b[2Ka\x1b]8;;https://example.com/pr/1\x1b\\P\x1b[0;1mR\
+             \x1b[0m\x1b]8;;\x1b\\b\x1b]8;;https://example.com/pr/1\x1b\\Q\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn adjacent_links_to_different_addresses_each_get_their_own() {
+        let line = line_of(&[
+            ("x", linked("https://a.example/", &CellAttributes::default())),
+            ("y", linked("https://b.example/", &CellAttributes::default())),
+        ]);
+        assert_eq!(
+            painted(&line, 80),
+            "\r\x1b[0m\x1b[2K\x1b]8;;https://a.example/\x1b\\x\x1b]8;;\x1b\\\
+             \x1b]8;;https://b.example/\x1b\\y\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_link_address_cannot_end_or_redirect_its_sequence() {
+        let line = line_of(&[(
+            "x",
+            linked("https://e.example/\x1b\\\x1b]2;pwned\x07\u{9c}a", &CellAttributes::default()),
+        )]);
+        assert_eq!(
+            painted(&line, 80),
+            "\r\x1b[0m\x1b[2K\x1b]8;;https://e.example/\\]2;pwneda\x1b\\x\x1b]8;;\x1b\\"
+        );
     }
 }
