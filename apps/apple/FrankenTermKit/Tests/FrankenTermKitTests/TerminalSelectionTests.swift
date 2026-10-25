@@ -75,3 +75,86 @@ final class TerminalSelectionTests: XCTestCase {
         XCTAssertEqual(mismatched.text(rows: [0: row(1, "echo")], columns: 4), "")
     }
 }
+
+private actor LinkTestTransport: TerminalByteTransport {
+    nonisolated let identity: TerminalConnectionIdentity
+    init() throws {
+        identity = try TerminalConnectionIdentity(workspaceID: "w", machineID: "m", routeID: "r", routeRevision: 1,
+                                                  transportID: UUID(), channelID: UUID())
+    }
+    func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite { .failed }
+    func close() async {}
+}
+
+final class TerminalLinkTests: XCTestCase {
+    /// One cell per character of `text` from column 0, spaces as gaps; the
+    /// characters at `linked` columns carry link 1.
+    private func row(_ stable: Int64, _ text: String, linked: Range<Int> = 0..<0,
+                     wraps: Bool = false) -> TerminalRenderRow {
+        let cells = text.enumerated().compactMap { index, character -> TerminalRenderCell? in
+            character == " " ? nil : .init(column: index, width: 1, text: String(character), flags: 0,
+                foreground: .default, background: .default, underline: .default, linkID: linked.contains(index) ? 1 : 0)
+        }
+        return TerminalRenderRow(stableIndex: stable, sequence: 1, cells: cells, wrapsToNext: wraps)
+    }
+    private func frame(_ rows: [TerminalRenderRow], columns: Int, links: [String] = []) async throws -> TerminalRenderFrame {
+        let source = try await TerminalInputCoordinator().attach(LinkTestTransport())
+        return TerminalRenderFrame(source: source, sequence: 1, geometryRevision: 1, paletteRevision: 1, fontRevision: 1,
+            revision: 1, rows: rows.count, columns: columns, viewportFirst: rows.first?.stableIndex ?? 0, flags: 0,
+            cursor: .init(stableRow: 0, column: 0, shape: 0, width: 1, visible: true), lines: rows,
+            palette: Array(repeating: .init(0, 0, 0, 255), count: 265), links: links, history: nil)
+    }
+    private func point(_ row: Int64, _ column: Int) -> TerminalGridPoint { .init(row: row, column: column) }
+
+    func testAProgramsLinkIsFoundOnEachOfItsCells() async throws {
+        let shown = try await frame([row(3, "see PR #1 now", linked: 4..<9)], columns: 40,
+                                    links: ["https://example.com/pr/1"])
+        for column in 4..<9 {
+            let link = TerminalLink.at(point(3, column), in: shown)
+            XCTAssertEqual(link, .init(destination: "https://example.com/pr/1", start: point(3, 4), end: point(3, 8)))
+        }
+        XCTAssertNil(TerminalLink.at(point(3, 1), in: shown), "plain text around it is not the link")
+        XCTAssertNil(TerminalLink.at(point(3, 11), in: shown))
+    }
+
+    func testAnAddressInTheTextIsFoundByTheDesktopsRules() async throws {
+        let shown = try await frame([
+            row(0, "open https://ex.com/a?b=1, then (https://ex.com/x) now"),
+            row(1, "cargo test -p main.rs; ubuntu@ip-10-0-0-1.ec2.internal:~$"),
+        ], columns: 80)
+        // Trailing punctuation and wrapping brackets are not part of it.
+        XCTAssertEqual(TerminalLink.at(point(0, 9), in: shown)?.destination, "https://ex.com/a?b=1")
+        XCTAssertEqual(TerminalLink.at(point(0, 9), in: shown)?.start, point(0, 5))
+        XCTAssertEqual(TerminalLink.at(point(0, 9), in: shown)?.end, point(0, 24))
+        XCTAssertNil(TerminalLink.at(point(0, 25), in: shown), "the comma after it")
+        XCTAssertEqual(TerminalLink.at(point(0, 40), in: shown)?.destination, "https://ex.com/x")
+        XCTAssertNil(TerminalLink.at(point(0, 32), in: shown), "the bracket before it")
+        // A file name or a prompt's user@host is not taken for an address.
+        for column in [15, 30, 40] { XCTAssertNil(TerminalLink.at(point(1, column), in: shown), "column \(column)") }
+    }
+
+    func testAWrappedAddressContinuesOnlyWhereTheRowContinues() async throws {
+        let wrapped = try await frame([row(0, "go https://example.co", wraps: true), row(1, "m/pull/42 now")], columns: 21)
+        let whole = TerminalLink(destination: "https://example.com/pull/42", start: point(0, 3), end: point(1, 8))
+        XCTAssertEqual(TerminalLink.at(point(0, 6), in: wrapped), whole)
+        XCTAssertEqual(TerminalLink.at(point(1, 2), in: wrapped), whole)
+        // A hard break ends it, unless the rows' wraps are unknown and the
+        // text reaches the last column (a mux pane's redrawn rows).
+        let broken = try await frame([row(0, "go https://example.co"), row(1, "m/pull/42 now")], columns: 21)
+        XCTAssertEqual(TerminalLink.at(point(0, 6), in: broken)?.destination, "https://example.co")
+        XCTAssertEqual(TerminalLink.at(point(1, 2), in: broken, softWrapsUnknown: true), whole)
+        let short = try await frame([row(0, "go https://example.co"), row(1, "m/pull/42 now")], columns: 30)
+        XCTAssertEqual(TerminalLink.at(point(0, 6), in: short, softWrapsUnknown: true)?.destination, "https://example.co",
+                       "a row that stops short of the last column does not continue")
+    }
+
+    func testOnlyWebAndMailAddressesOpen() {
+        func link(_ destination: String) -> TerminalLink { .init(destination: destination, start: point(0, 0), end: point(0, 0)) }
+        XCTAssertEqual(link("https://example.com/a b").openableURL?.scheme, "https")
+        XCTAssertNotNil(link("http://example.com").openableURL)
+        XCTAssertNotNil(link("mailto:ops@example.com").openableURL)
+        for other in ["file:///etc/passwd", "prefs:root=General", "x-apple-reminder://1", "ssh://host", "javascript:alert(1)"] {
+            XCTAssertNil(link(other).openableURL, other)
+        }
+    }
+}
