@@ -92,7 +92,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// Mac's export orders them.
     private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
                           creation: TerminalSessionCreation = .onSelect, muxCommand: String? = nil,
-                          directAfterMux: Bool = false) throws -> WorkspaceDocument {
+                          directAfterMux: Bool = false, machineIDs: [String] = ["alpha", "beta"]) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
             "cursor_background": "#FFFFFF", "cursor_border": "#FFFFFF", "selection_foreground": "#FFFFFF",
@@ -100,13 +100,13 @@ final class TerminalSessionControllerTests: XCTestCase {
         // Two machines on the same loopback host, each with its own route, so
         // each gets its own SSH connection, shell and journal record.
         let workspace: [String: Any] = [
-            "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": ["alpha", "beta"]]],
-            "machines": ["alpha", "beta"].map { machine -> [String: Any] in
+            "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": machineIDs]],
+            "machines": machineIDs.map { machine -> [String: Any] in
                 let refs = muxCommand != nil && directAfterMux ? ["route-\(machine)-mux", "route-\(machine)"] : ["route-\(machine)"]
                 return ["id": machine, "name": machine.capitalized, "theme_ref": "theme", "route_refs": refs,
                         "preferred_route_ref": refs[0], "auto_connect": false]
             },
-            "routes": ["alpha", "beta"].flatMap { machine -> [[String: Any]] in
+            "routes": machineIDs.flatMap { machine -> [[String: Any]] in
                 func route(_ id: String) -> [String: Any] {
                     ["id": id, "host": "127.0.0.1", "port": Int(port), "user": user, "credential_refs": ["key"],
                      "authentication_methods": ["publickey"], "host_trust_ref": "trust", "jump_routes": []]
@@ -139,7 +139,8 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
                            creation: TerminalSessionCreation = .onSelect,
-                           muxCommand: String? = nil, directAfterMux: Bool = false) async throws -> LiveScene {
+                           muxCommand: String? = nil, directAfterMux: Bool = false,
+                           machineIDs: [String] = ["alpha", "beta"]) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -152,7 +153,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
         let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user,
                                                             creation: creation, muxCommand: muxCommand,
-                                                            directAfterMux: directAfterMux),
+                                                            directAfterMux: directAfterMux, machineIDs: machineIDs),
                                         keys: [key], using: crypto)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-" + UUID().uuidString)
         let vault = SceneMemoryVault()
@@ -161,7 +162,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
             transferID: Data(repeating: 9, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let journalIdentifier = "scene-test-" + UUID().uuidString
-        let machines = ["alpha", "beta"].map { id in
+        let machines = machineIDs.map { id in
             let direct = TerminalSessionRoute(id: "route-\(id)", credentialIDs: ["key"], host: "127.0.0.1", port: port,
                                               sessionCreation: creation)
             let mux = TerminalSessionRoute(id: directAfterMux ? "route-\(id)-mux" : "route-\(id)", credentialIDs: ["key"],
@@ -1305,6 +1306,32 @@ final class TerminalSessionControllerTests: XCTestCase {
         let first = (Int64(half) - Int64(start)) >> 20, second = (Int64(footprint()) - Int64(half)) >> 20
         XCTAssertLessThan(first, 96, "the app grew \(first) MB reading beta's first 75 MB")
         XCTAssertLessThan(second, 16, "the app grew \(second) MB more reading the next 75 MB")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// Plan 18: a group of twenty machines must not cost twenty full
+    /// terminals. Each machine visited and left keeps its session and screen
+    /// at a small cost: twelve here, each shown, used and left in turn.
+    func testEachMachineVisitedAndLeftCostsLittleMemory() async throws {
+        let ids = ["alpha"] + (1...11).map { String(format: "m%02d", $0) }
+        let live = try await liveScene(machineIDs: ids), scene = live.scene
+        var previous = try shown(try await connect(scene, "alpha"))
+        try await type("echo READY-$((40+2))", into: previous)
+        _ = try await screen(previous, containing: "READY-42")
+        let first = footprint()
+        for id in ids.dropFirst() {
+            let view = try await shownAfterSelecting(scene, id, connected: try await connect(scene, id))
+            previous.removeFromSuperview()
+            try await type("echo READY-\(id)-$((40+2))", into: view)
+            let text = try await screen(view, containing: "READY-\(id)-42")
+            XCTAssertTrue(text.contains("READY-\(id)-42"), "\(id) never ran its command")
+            previous = view
+        }
+        let each = ((Int64(footprint()) - Int64(first)) / Int64(ids.count - 1)) >> 10
+        XCTAssertLessThan(each, 4096, "each machine visited and left kept \(each) KB")
+        XCTAssertEqual(scene.sessions.values.filter { $0.phase == .live }.count, ids.count, "every machine stays connected")
+        previous.removeFromSuperview()
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
