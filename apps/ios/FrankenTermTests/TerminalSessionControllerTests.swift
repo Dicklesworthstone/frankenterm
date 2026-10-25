@@ -614,6 +614,26 @@ final class TerminalSessionControllerTests: XCTestCase {
         return text
     }
 
+    /// How long one key typed at the shell's prompt takes to show on the
+    /// rendered screen as the shell echoes it.
+    private func echo(into terminal: NativeTerminalView) async throws -> Duration {
+        func shown() -> Int { (terminal.renderer.accessibilityValue ?? "").filter { $0 == "Q" }.count }
+        let before = shown(), sent = ContinuousClock.now
+        terminal.input.insertText("Q")
+        while shown() <= before, ContinuousClock.now - sent < .seconds(2) { try await Task.sleep(for: .milliseconds(2)) }
+        let elapsed = ContinuousClock.now - sent
+        try await Task.sleep(for: .milliseconds(100))
+        return elapsed
+    }
+
+    /// Plan 23.2 asks for an echo within the round trip (loopback here) plus
+    /// 50 ms at p95; this shared simulator holds the median to that.
+    private func assertPromptEcho(_ samples: [Duration], _ context: String) {
+        let sorted = samples.sorted(), median = sorted[sorted.count / 2], p95 = sorted[sorted.count * 95 / 100]
+        XCTAssertLessThan(median, .milliseconds(50), "keys echoed slowly \(context): median \(median), p95 \(p95)")
+        XCTAssertLessThan(p95, .milliseconds(100), "keys echoed slowly \(context): median \(median), p95 \(p95)")
+    }
+
     /// The app's memory as the system counts it against its limit.
     private func footprint() -> UInt64 {
         var info = task_vm_info_data_t()
@@ -1269,7 +1289,10 @@ final class TerminalSessionControllerTests: XCTestCase {
             XCTAssertTrue(text.contains("PING-\(run)-\(ping)"), "ping \(ping) never showed")
             slowest = max(slowest, ContinuousClock.now - sent)
         }
-        XCTAssertEqual(halves(), 0, "every ping ran while beta still flooded")
+        var echoes: [Duration] = []
+        for _ in 0..<20 { echoes.append(try await echo(into: alpha)) }
+        assertPromptEcho(echoes, "beside the flood")
+        XCTAssertEqual(halves(), 0, "every ping and key ran while beta still flooded")
         XCTAssertLessThan(slowest, .seconds(1), "the machine on screen answered slowly beside the flood")
 
         // The first half grows the app once (buffers, allocator caches); the
@@ -1284,6 +1307,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertLessThan(second, 16, "the app grew \(second) MB more reading the next 75 MB")
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A key typed at the shell's prompt shows on screen promptly.
+    func testATypedKeyShowsOnScreenPromptly() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo READY-$((40+2))", into: terminal)
+        _ = try await screen(terminal, containing: "READY-42")
+        var echoes: [Duration] = []
+        for _ in 0..<30 { echoes.append(try await echo(into: terminal)) }
+        assertPromptEcho(echoes, "at an idle prompt")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     /// Ctrl+C from the key row stops a flood on the machine on screen: the
