@@ -33,9 +33,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::{
@@ -1729,12 +1727,18 @@ fn storage_env_flag_enabled(name: &str) -> bool {
 /// The park re-checks the shared `queued_depth` counter under the lock before
 /// sleeping, which closes the classic enqueue/park lost-wakeup race: any command
 /// made visible (depth incremented) before the writer parks is observed and the
-/// park is skipped. Even if a wake were somehow lost, the bounded `wait_timeout`
+/// park is skipped. The same applies to the last sender's drop, through
+/// `senders_gone`. Even if a wake were somehow lost, the bounded `wait_timeout`
 /// guarantees the writer re-polls, so durability/ordering never depend on the
 /// signal — only latency does.
 struct WriterWakeup {
     lock: Mutex<()>,
     condvar: std::sync::Condvar,
+    /// Set by [`WriterDisconnectWake`] once the last sender is gone. The last
+    /// sender can drop after the writer's empty `try_recv` but before it takes
+    /// `lock`; that notification finds no waiter, so `park_for_work` re-checks
+    /// this flag under the lock rather than sleeping out its ceiling.
+    senders_gone: AtomicBool,
     /// `park_for_work` calls, so tests can prove an idle writer stays parked.
     #[cfg(test)]
     parks: AtomicUsize,
@@ -1745,6 +1749,7 @@ impl WriterWakeup {
         Self {
             lock: Mutex::new(()),
             condvar: std::sync::Condvar::new(),
+            senders_gone: AtomicBool::new(false),
             #[cfg(test)]
             parks: AtomicUsize::new(0),
         }
@@ -1761,8 +1766,14 @@ impl WriterWakeup {
         self.condvar.notify_one();
     }
 
+    /// Record that the last sender is gone, then wake the writer.
+    fn notify_senders_gone(&self) {
+        self.senders_gone.store(true, AtomicOrdering::Release);
+        self.notify();
+    }
+
     /// Park until notified or `timeout` elapses, skipping the sleep entirely if
-    /// `queued_depth` already shows pending work.
+    /// `queued_depth` already shows pending work or every sender is gone.
     fn park_for_work(&self, timeout: std::time::Duration, queued_depth: &AtomicUsize) {
         #[cfg(test)]
         self.parks.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1770,7 +1781,9 @@ impl WriterWakeup {
             .lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if queued_depth.load(AtomicOrdering::Acquire) > 0 {
+        if queued_depth.load(AtomicOrdering::Acquire) > 0
+            || self.senders_gone.load(AtomicOrdering::Acquire)
+        {
             return;
         }
         let _ = self.condvar.wait_timeout(guard, timeout);
@@ -1809,7 +1822,7 @@ struct WriterDisconnectWake {
 
 impl Drop for WriterDisconnectWake {
     fn drop(&mut self) {
-        self.wakeup.notify();
+        self.wakeup.notify_senders_gone();
     }
 }
 
@@ -18137,6 +18150,25 @@ mod writer_io_scheduler_tests {
             dropped_at.elapsed() < WRITER_IDLE_PARK_CEILING / 2,
             "dropping the last sender must wake the parked writer, took {:?}",
             dropped_at.elapsed()
+        );
+    }
+
+    /// The last sender can drop after the writer's empty `try_recv` but before
+    /// it parks. That notification finds no waiter, so the park itself has to
+    /// see the disconnect instead of sleeping out its ceiling.
+    #[test]
+    fn disconnect_between_empty_poll_and_park_does_not_strand_the_writer() {
+        let wakeup = Arc::new(WriterWakeup::new());
+        drop(WriterDisconnectWake {
+            wakeup: Arc::clone(&wakeup),
+        });
+        let queued_depth = AtomicUsize::new(0);
+        let started = Instant::now();
+        wakeup.park_for_work(std::time::Duration::from_secs(5), &queued_depth);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a disconnect before the park must not be a lost wakeup; parked {:?}",
+            started.elapsed()
         );
     }
 
