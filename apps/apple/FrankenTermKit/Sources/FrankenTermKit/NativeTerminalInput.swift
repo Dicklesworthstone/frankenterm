@@ -54,6 +54,8 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)?
     public var onRetired: (@MainActor () -> Void)?
+    /// Keeps the keyboard up while a handoff moves its input to another terminal.
+    public weak var keyboardHolder: TerminalKeyboardHolder?
     /// Asked when a key arrives while no caret is drawn: true while the live
     /// screen is still the one shown, only being redrawn (a resize or new
     /// text size), so typing still reaches it.
@@ -204,7 +206,12 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         if let token = stateObservation { session.removeStateObserver(token); stateObservation = nil }
         refreshComposition()
         inputDelegate?.selectionDidChange(self); inputDelegate?.textDidChange(self)
-        _ = super.resignFirstResponder()
+        // A handoff's next terminal takes the keyboard from the holder. Without
+        // it the keyboard drops and rises between them, and both terminals are
+        // resized for a keyboard that is gone for a moment.
+        if !(session.handedOff && isFirstResponder && keyboardHolder?.hold(from: self, accessory: accessory) == true) {
+            _ = super.resignFirstResponder()
+        }
         onRetired?()
     }
     public override func resignFirstResponder() -> Bool {
@@ -774,6 +781,87 @@ public final class NativeTerminalInputContainer: UIView {
     }
 }
 
+/// Holds the keyboard while focus moves from one terminal to the next. A
+/// handoff retires the old responder before the new one exists; in between
+/// this view is first responder, with the old one's keyboard traits and a
+/// picture of its key row, so the keyboard does not move. It takes no input:
+/// keys typed meanwhile are dropped, as they would be with no responder. The
+/// next terminal takes the keyboard from it. If none does before `deadline`,
+/// or on `release`, the keyboard goes down.
+@MainActor
+public final class TerminalKeyboardHolder: UIView, UIKeyInput {
+    public var autocapitalizationType: UITextAutocapitalizationType = .none
+    public var autocorrectionType: UITextAutocorrectionType = .no
+    public var spellCheckingType: UITextSpellCheckingType = .no
+    public var smartQuotesType: UITextSmartQuotesType = .no
+    public var smartDashesType: UITextSmartDashesType = .no
+    public var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
+    public var keyboardType: UIKeyboardType = .default
+    public var keyboardAppearance: UIKeyboardAppearance = .default
+    public var returnKeyType: UIReturnKeyType = .default
+    private let row = UIView()
+    private let deadline: Duration
+    private var holding = false, generation = 0
+
+    public init(deadline: Duration = .milliseconds(1500)) {
+        self.deadline = deadline
+        super.init(frame: .zero)
+        accessibilityElementsHidden = true
+        row.autoresizingMask = [.flexibleWidth]
+        NotificationCenter.default.addObserver(self, selector: #selector(deactivated),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
+    }
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) { nil }
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    public var isHolding: Bool { holding && isFirstResponder }
+    public override var canBecomeFirstResponder: Bool { holding }
+    public override var inputAccessoryView: UIView? { row.bounds.height > 0 ? row : nil }
+    public var hasText: Bool { false }
+    public func insertText(_ text: String) {}
+    public func deleteBackward() {}
+
+    func hold(from input: NativeTerminalInputView, accessory: UIView?) -> Bool {
+        guard window != nil, window === input.window else { return false }
+        autocapitalizationType = input.autocapitalizationType; autocorrectionType = input.autocorrectionType
+        spellCheckingType = input.spellCheckingType; smartQuotesType = input.smartQuotesType
+        smartDashesType = input.smartDashesType; smartInsertDeleteType = input.smartInsertDeleteType
+        keyboardType = input.keyboardType; keyboardAppearance = input.keyboardAppearance
+        returnKeyType = input.returnKeyType
+        row.subviews.forEach { $0.removeFromSuperview() }
+        row.frame = .zero
+        if let accessory, accessory.window != nil, accessory.bounds.height > 0 {
+            row.frame = CGRect(origin: .zero, size: accessory.bounds.size)
+            if let picture = accessory.snapshotView(afterScreenUpdates: false) {
+                picture.frame = row.bounds; picture.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                row.addSubview(picture)
+            }
+        }
+        holding = true; generation += 1
+        guard becomeFirstResponder() else { holding = false; return false }
+        let held = generation
+        Task { [weak self, deadline] in
+            try? await Task.sleep(for: deadline)
+            guard let self, self.generation == held else { return }
+            self.release()
+        }
+        return true
+    }
+    /// Lets the keyboard go down now, unless a terminal already took it.
+    public func release() {
+        guard holding else { return }
+        holding = false
+        if isFirstResponder { _ = super.resignFirstResponder() }
+    }
+    public override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { holding = false }
+        return resigned
+    }
+    @objc private func deactivated() { release() }
+}
+
 #if canImport(MetalKit)
 /// A real terminal display and text responder for one authenticated source.
 /// The session driver feeds canonical FTSF snapshots through `submit`; this
@@ -784,6 +872,10 @@ public final class NativeTerminalView: UIView {
     public let source: TerminalSource
     public let renderer: NativeTerminalRenderView
     public private(set) var input: NativeTerminalInputView
+    /// Keeps the keyboard up while a handoff moves input to another terminal.
+    public weak var keyboardHolder: TerminalKeyboardHolder? {
+        didSet { input.keyboardHolder = keyboardHolder }
+    }
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)? {
         didSet { bindPasteReview() }
@@ -1448,7 +1540,7 @@ public final class NativeTerminalView: UIView {
         do { if let lastCaret { try replacement.updateCaret(lastCaret) } }
         catch { replacement.retire(); throw error }
         replacement.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        replacement.frame = bounds
+        replacement.frame = bounds; replacement.keyboardHolder = keyboardHolder
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
         input.removeFromSuperview(); input = replacement
         bindInput(); insertSubview(replacement, aboveSubview: renderer)

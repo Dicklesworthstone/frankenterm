@@ -354,5 +354,61 @@ final class NativeTerminalInputTests: XCTestCase {
         XCTAssertEqual(reviews, 0); XCTAssertEqual(failures, 2); XCTAssertNil(view.pendingPaste)
         view.retire(); await view.session.waitUntilSuspended()
     }
+
+    /// One window holding the terminal that has the keyboard and a holder.
+    private func keyboardWindow(_ view: NativeTerminalInputView,
+                                deadline: Duration = .seconds(5)) -> (UIWindow, TerminalKeyboardHolder) {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 480))
+        window.makeKeyAndVisible()
+        let holder = TerminalKeyboardHolder(deadline: deadline)
+        window.addSubview(holder); window.addSubview(view)
+        view.keyboardHolder = holder
+        XCTAssertTrue(view.becomeFirstResponder())
+        return (window, holder)
+    }
+
+    func testAHandoffKeepsTheKeyboardUpUntilTheNextTerminalTakesIt() async throws {
+        let (coordinator, transport, source, first) = try await setup()
+        let (window, holder) = keyboardWindow(first)
+        defer { window.isHidden = true }
+        let between = try await first.session.handoff(to: nil)
+        XCTAssertTrue(holder.isHolding, "between terminals the keyboard stays up")
+        XCTAssertFalse(first.isFirstResponder)
+        holder.insertText("x"); holder.deleteBackward()
+
+        let focus = try await coordinator.changeFocus(between, to: source)
+        let session = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: UIKitInputEncoder())
+        let second = try NativeTerminalInputView(session: session)
+        second.frame = window.bounds
+        try second.updateCaret(NativeTerminalCaret(source: source, revision: 1, rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        window.addSubview(second)
+        XCTAssertTrue(second.becomeFirstResponder())
+        XCTAssertFalse(holder.isHolding, "the next terminal took the keyboard")
+        XCTAssertFalse(holder.canBecomeFirstResponder)
+        second.insertText("y")
+        await session.waitUntilSettled(); try await drain(coordinator, source)
+        let sent = await transport.bytes()
+        XCTAssertEqual(sent, Data("y".utf8), "keys typed into the holder reach no terminal")
+        second.retire(); await session.waitUntilSuspended()
+    }
+
+    func testASuspendedTerminalLetsTheKeyboardGoAndAnUnclaimedHoldEnds() async throws {
+        let (_, _, _, first) = try await setup()
+        let (window, holder) = keyboardWindow(first)
+        defer { window.isHidden = true }
+        first.session.suspend()
+        await first.session.waitUntilSuspended()
+        XCTAssertFalse(holder.isHolding, "a suspension is not a handoff: the keyboard goes down")
+        XCTAssertFalse(first.isFirstResponder)
+
+        let (_, _, _, other) = try await setup()
+        let (otherWindow, shortHolder) = keyboardWindow(other, deadline: .milliseconds(100))
+        defer { otherWindow.isHidden = true }
+        _ = try await other.session.handoff(to: nil)
+        XCTAssertTrue(shortHolder.isHolding)
+        for _ in 0..<100 where shortHolder.isHolding { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertFalse(shortHolder.isHolding, "no terminal took it: the keyboard goes down at the deadline")
+        XCTAssertFalse(shortHolder.isFirstResponder)
+    }
 }
 #endif

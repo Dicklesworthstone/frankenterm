@@ -1798,6 +1798,8 @@ private struct WorkspaceCanvasHost: UIViewRepresentable {
 
 private final class WorkspaceCanvasView: UIView {
     private let canvas = UIView()
+    /// Keeps the keyboard up between machines, so switching resizes neither.
+    private let keyboardHolder = TerminalKeyboardHolder()
     private var controls: NativeTerminalNavigationControls?
     private weak var scene: WorkspaceTerminalScene?
 
@@ -1805,6 +1807,7 @@ private final class WorkspaceCanvasView: UIView {
         self.scene = scene
         super.init(frame: .zero)
         canvas.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(keyboardHolder)
         addSubview(canvas)
         NSLayoutConstraint.activate([
             canvas.topAnchor.constraint(equalTo: topAnchor), canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -1874,6 +1877,10 @@ private final class WorkspaceCanvasView: UIView {
 
     /// Switching machines cross-fades between their terminals.
     func show(_ terminal: NativeTerminalView?) {
+        terminal?.keyboardHolder = keyboardHolder
+        // A machine whose terminal is on its way takes the keyboard when it
+        // comes (or the holder's deadline lets it go); its page takes none.
+        if terminal == nil, scene?.selectedSession.map({ $0.phase == .idle }) ?? true { keyboardHolder.release() }
         if let terminal, terminal.superview === canvas, canvas.subviews.count == 1 { return }
         let replacing = !canvas.subviews.isEmpty
         let swap = { [canvas] in

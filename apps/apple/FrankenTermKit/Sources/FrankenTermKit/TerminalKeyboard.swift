@@ -161,6 +161,9 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     public let originalFocus: TerminalFocus
     public private(set) var document: TerminalMarkedText
     public private(set) var phase: TerminalKeyboardPhase = .active
+    /// Retired by a completed handoff: the focus went on to another terminal
+    /// (or none), rather than this session being suspended.
+    public private(set) var handedOff = false
     public private(set) var lastFailure: TerminalKeyboardError?
     public private(set) var recovery: TerminalKeyboardRecovery?
     /// Content-free receipts; consuming these must not discard the downstream
@@ -450,7 +453,7 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
                 }
                 throw TerminalKeyboardError.unavailable
             }
-            ownsFocus = false; phase = .retired; notifyStateChange()
+            ownsFocus = false; handedOff = true; phase = .retired; notifyStateChange()
             return next
         }
         transition = job

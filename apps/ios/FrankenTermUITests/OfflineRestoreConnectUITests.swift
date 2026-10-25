@@ -129,6 +129,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         return completed
     }
 
+    /// Fails if `marker` shows up within `timeout`.
+    private func never(_ marker: String, in terminal: XCUIElement, timeout: TimeInterval = 2, _ message: String) {
+        let shown = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", marker), object: terminal)
+        let appeared = XCTWaiter().wait(for: [shown], timeout: timeout) == .completed
+        XCTAssertFalse(appeared, "\(message); screen:\n\(screen(terminal))")
+    }
+
     /// The last `SZ-<rows>x<columns>` the shell printed.
     private func reportedSize(_ terminal: XCUIElement) -> (rows: Int, columns: Int)? {
         let text = screen(terminal)
@@ -324,7 +331,9 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         secondChip.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "the second session must take the keyboard")
         let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
-        app.typeText("export FT_WHO=second; echo WHO-$FT_WHO-$((2+2))\n")
+        // Each shell says when its terminal is resized: switching machines
+        // with the keyboard up must not resize either of them.
+        app.typeText("export FT_WHO=second; trap 'echo WINCH-$FT_WHO' WINCH; echo WHO-$FT_WHO-$((2+2))\n")
         waitFor("WHO-second-4", in: screen, timeout: 30, "the second machine's shell must run")
         XCTAssertFalse(self.screen(screen).contains("WHO-first-2"), "the second machine has its own screen")
         snapshot("12-second-terminal")
@@ -332,9 +341,19 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         chip(app, inputs.machine, "connected").tap()
         waitFor("WHO-first-2", in: screen, timeout: 10, "returning keeps the first machine's screen")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
-        app.typeText("echo AGAIN-$FT_WHO-$((3+3))\n")
+        app.typeText("trap 'echo WINCH-$FT_WHO' WINCH; echo AGAIN-$FT_WHO-$((3+3))\n")
         waitFor("AGAIN-first-6", in: screen, timeout: 30, "typing after the switch reaches the first machine's shell")
         snapshot("13-back-to-first")
+
+        // The keyboard stays up from one machine to the next, so switching
+        // on the strip resizes neither terminal.
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "\(second), connected")).firstMatch.tap()
+        waitFor("WHO-second-4", in: screen, timeout: 10, "the strip shows the second machine again")
+        never("WINCH-second", in: screen, "switching resized the second machine's terminal")
+        chip(app, inputs.machine, "connected").tap()
+        waitFor("AGAIN-first-6", in: screen, timeout: 10, "the strip shows the first machine again")
+        never("WINCH-first", in: screen, "switching resized the first machine's terminal")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "the keyboard stayed up")
 
         // A hardware keyboard switches too: ⇧⌘] and ⇧⌘[ step through the strip.
         app.typeKey("]", modifierFlags: [.command, .shift])
@@ -344,8 +363,9 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("AGAIN-first-6", in: screen, timeout: 10, "⇧⌘[ comes back to the first machine")
         app.typeText("echo KEYS-$FT_WHO-$((4+4))\n")
         waitFor("KEYS-first-8", in: screen, timeout: 30, "typing after a keyboard switch reaches the machine on screen")
-        // Leaving resizes the machine's terminal as its keyboard goes, and its
-        // shell redraws the prompt. That is not news.
+        // A hardware key hides the software keyboard, which resizes the
+        // terminal just before the switch; the machine left redraws. That is
+        // not news.
         XCTAssertFalse(chip(app, second, "connected, new output").waitForExistence(timeout: 2),
                        "a machine just left is not marked for its redraw")
         snapshot("14-keyboard-switch")
