@@ -679,4 +679,46 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
         XCTAssertNil(control.takeRequest())
         XCTAssertEqual(control.current.shown, 10)
     }
+
+    func testOutputOffScreenIsUnreadUntilShownAndARedrawJustAfterLeavingIsNot() {
+        let control = TerminalMuxControl(settle: .milliseconds(200))
+        final class Flips: @unchecked Sendable { let lock = NSLock(); var values: [Bool] = [] }
+        let flips = Flips()
+        control.observeUnread { value in flips.lock.withLock { flips.values.append(value) } }
+        control.publish(panes: [queryPane(1), queryPane(2), queryPane(3)], shown: 1)
+        control.setVisible(true)
+        control.noteActivity(pane: 1)
+        XCTAssertEqual(control.current.unread, [], "the pane on screen is read as it comes")
+        control.noteActivity(pane: 2)
+        control.noteActivity(pane: 9)
+        XCTAssertEqual(control.current.unread, [2], "a pane not listed is ignored")
+        control.noteActivity(pane: 3)
+        XCTAssertEqual(control.current.unread, [2, 3])
+
+        // Pane 1 leaves the screen: its redraw at its own size is not news.
+        control.publish(shown: 2)
+        XCTAssertEqual(control.current.unread, [3], "the pane put on screen is read")
+        control.noteActivity(pane: 1)
+        XCTAssertEqual(control.current.unread, [3])
+        Thread.sleep(forTimeInterval: 0.3)
+        control.noteActivity(pane: 1)
+        XCTAssertEqual(control.current.unread, [1, 3])
+
+        // The machine leaves the screen: its shown pane settles the same way.
+        control.setVisible(false)
+        control.noteActivity(pane: 2)
+        XCTAssertEqual(control.current.unread, [1, 3])
+        Thread.sleep(forTimeInterval: 0.3)
+        control.noteActivity(pane: 2)
+        XCTAssertEqual(control.current.unread, [1, 2, 3])
+        control.setVisible(true)
+        XCTAssertEqual(control.current.unread, [1, 3], "back on screen, its shown pane is read")
+
+        control.remove(pane: 3)
+        XCTAssertEqual(control.current.unread, [1])
+        control.publish(panes: [queryPane(1), queryPane(2)], shown: 1)
+        XCTAssertEqual(control.current.unread, [])
+        XCTAssertEqual(flips.lock.withLock { flips.values }, [false, true, false],
+                       "the off-screen signal changes only when the first pane turns unread and the last is read")
+    }
 }

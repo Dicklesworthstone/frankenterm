@@ -91,12 +91,13 @@ final class TerminalModelVisibilityTests: XCTestCase {
         let delivery: VisibilityDelivery
         let runtime: TerminalModelRuntime
     }
-    private func fixture(visible: Bool = false) async throws -> Fixture {
+    private func fixture(visible: Bool = false,
+                         hiddenOutput: (@Sendable () -> Void)? = nil) async throws -> Fixture {
         let coordinator = try TerminalInputCoordinator(), transport = try VisibilityTransport()
         let source = try await coordinator.attach(transport)
         let model = VisibilityModel(source: source), delivery = VisibilityDelivery()
         let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery,
-                                           initiallyVisible: visible)
+                                           initiallyVisible: visible, hiddenOutput: hiddenOutput)
         return .init(coordinator: coordinator, transport: transport, source: source,
                      model: model, delivery: delivery, runtime: runtime)
     }
@@ -133,6 +134,29 @@ final class TerminalModelVisibilityTests: XCTestCase {
         try await f.runtime.setVisible(true, source: f.source)
         let after = await f.delivery.values()
         XCTAssertEqual(after, [Data("opaque-frame-200".utf8)])
+        try await cleanup(f)
+    }
+
+    func testOutputWhileHiddenAfterBeingShownIsReportedOnceUntilShownAgain() async throws {
+        final class Reports: @unchecked Sendable { let lock = NSLock(); var count = 0 }
+        let reports = Reports()
+        let f = try await fixture(hiddenOutput: { reports.lock.withLock { reports.count += 1 } })
+        func reported() -> Int { reports.lock.withLock { reports.count } }
+        try await f.runtime.receive(.init(output: Data([1])), source: f.source)
+        XCTAssertEqual(reported(), 0, "a terminal never on screen (a new shell's greeting) has no news")
+        try await f.runtime.setVisible(true, source: f.source)
+        try await f.runtime.receive(.init(output: Data([1])), source: f.source)
+        XCTAssertEqual(reported(), 0, "output on screen is seen")
+        try await f.runtime.setVisible(false, source: f.source)
+        try await f.runtime.receive(.init(output: Data()), source: f.source)
+        XCTAssertEqual(reported(), 0, "an update without output is not news")
+        try await f.runtime.receive(.init(output: Data([1])), source: f.source)
+        try await f.runtime.receive(.init(output: Data([1])), source: f.source)
+        XCTAssertEqual(reported(), 1, "reported once while it stays hidden")
+        try await f.runtime.setVisible(true, source: f.source)
+        try await f.runtime.setVisible(false, source: f.source)
+        try await f.runtime.receive(.init(output: Data([1])), source: f.source)
+        XCTAssertEqual(reported(), 2, "shown again, later output is news again")
         try await cleanup(f)
     }
 
