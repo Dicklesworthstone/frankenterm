@@ -88,11 +88,11 @@ private actor LinkTestTransport: TerminalByteTransport {
 
 final class TerminalLinkTests: XCTestCase {
     /// One cell per character of `text` from column 0, spaces as gaps; the
-    /// characters at `linked` columns carry link 1.
+    /// characters at `linked` columns, spaces included, carry link 1.
     private func row(_ stable: Int64, _ text: String, linked: Range<Int> = 0..<0,
                      wraps: Bool = false) -> TerminalRenderRow {
         let cells = text.enumerated().compactMap { index, character -> TerminalRenderCell? in
-            character == " " ? nil : .init(column: index, width: 1, text: String(character), flags: 0,
+            character == " " && !linked.contains(index) ? nil : .init(column: index, width: 1, text: String(character), flags: 0,
                 foreground: .default, background: .default, underline: .default, linkID: linked.contains(index) ? 1 : 0)
         }
         return TerminalRenderRow(stableIndex: stable, sequence: 1, cells: cells, wrapsToNext: wraps)

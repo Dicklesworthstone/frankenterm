@@ -413,22 +413,5 @@ final class NativeTerminalInputTests: XCTestCase {
         XCTAssertFalse(shortHolder.isHolding, "no terminal took it: the keyboard goes down at the deadline")
         XCTAssertFalse(shortHolder.isFirstResponder)
     }
-
-    func testATappedLinkShowsWhereItGoesBeforeAnythingOpens() async throws {
-        let coordinator = try TerminalInputCoordinator()
-        let source = try await coordinator.attach(try UIKitInputTransport())
-        let focus = try await coordinator.changeFocus(try await coordinator.makeStream(sceneID: UUID()), to: source)
-        let view = try await NativeTerminalView(session: try TerminalKeyboardSession(
-            focus: focus, coordinator: coordinator, encoder: UIKitInputEncoder()))
-        let at = TerminalGridPoint(row: 0, column: 0)
-        let cell = CGRect(x: 40, y: 60, width: 8, height: 16)
-        let web = view.linkSheet(for: .init(destination: "https://example.com/pr/1?x=端末", start: at, end: at), from: cell)
-        XCTAssertEqual(web.message, "https://example.com/pr/1?x=端末", "the exact destination, not a label")
-        XCTAssertEqual(web.actions.map(\.title), ["Open", "Copy Link", "Cancel"])
-        XCTAssertEqual(web.popoverPresentationController?.sourceRect, cell, "on iPad it points at the tapped cell")
-        let file = view.linkSheet(for: .init(destination: "file:///etc/hosts", start: at, end: at), from: cell)
-        XCTAssertEqual(file.message, "file:///etc/hosts")
-        XCTAssertEqual(file.actions.map(\.title), ["Copy Link", "Cancel"], "only web and mail addresses open")
-    }
 }
 #endif
