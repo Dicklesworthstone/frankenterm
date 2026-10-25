@@ -1,0 +1,26 @@
+#history-search {
+  width: min(58rem, calc(100vw - 3rem));
+  max-height: calc(100vh - 3rem);
+  box-sizing: border-box;
+  overflow: auto;
+  color: #ccc;
+  background: #0a0a0a;
+  border: 1px solid #808080;
+  border-radius: 5px;
+  padding: 1rem;
+}
+#history-search::backdrop { background: #000b; }
+#history-search h1 { font-size: 1.25rem; flex: 1; margin: 0; }
+#history-search-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin-top: 1rem; }
+#history-search-form label { display: flex; flex-direction: column; gap: .25rem; }
+#history-search-form .history-wide { grid-column: 1 / -1; }
+#history-search input, #history-search select { min-width: 0; box-sizing: border-box; font: inherit; padding: .35rem; background: #20242c; color: #eee; border: 1px solid #808080; }
+#history-search :focus-visible { outline: 2px solid #5fafff; outline-offset: 2px; }
+#history-results { padding-left: 1.5rem; }
+#history-results li { padding: .75rem 0; border-bottom: 1px solid #444; }
+#history-results p { overflow-wrap: anywhere; }
+#history-results pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.4 "Pragmasevka NF", ui-monospace, monospace; unicode-bidi: plaintext; }
+#history-help, #history-note { font-size: .85rem; }
+@media (max-width: 600px) {
+  #history-search-form { grid-template-columns: minmax(0, 1fr); }
+}
