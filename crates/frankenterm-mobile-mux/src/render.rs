@@ -154,7 +154,7 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
     let mut current = plain;
     // The link the phone's terminal is writing cells under. SGR does not
     // end it, so it is opened and closed on its own.
-    let mut link: Option<&Arc<Hyperlink>> = None;
+    let mut link: Option<Arc<Hyperlink>> = None;
     // Where the phone's cursor is, when it is known: after a wide or
     // non-ASCII cell the phone's width tables decide, so the next cell is
     // placed with an absolute column instead.
@@ -178,14 +178,14 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
             current = style;
         }
         let cell_link = cell.attrs().hyperlink();
-        if cell_link.map(|l| &**l) != link.map(|l| &**l) {
+        if cell_link.map(|l| &**l) != link.as_deref() {
             if link.is_some() {
                 out.push_str("\x1b]8;;\x1b\\");
             }
             if let Some(next) = cell_link {
                 open_link(out, next);
             }
-            link = cell_link;
+            link = cell_link.cloned();
         }
         if text.is_empty() {
             out.push(' ');
