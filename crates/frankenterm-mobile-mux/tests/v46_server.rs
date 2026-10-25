@@ -1047,3 +1047,76 @@ fn a_search_reply_too_large_fails_only_the_search() {
     harness.output(b"still here");
     assert_mirrored(&mut harness);
 }
+
+fn activity(harness: &Harness) -> usize {
+    harness
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::Activity { .. }))
+        .count()
+}
+
+#[test]
+fn a_hidden_pane_that_changes_is_reported_and_one_on_screen_is_not() {
+    let mut harness = Harness::new(5, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.output(b"on screen\r\n");
+    harness.session.refresh_panes();
+    harness.pump();
+    assert_eq!(activity(&harness), 0, "output on screen is not news");
+
+    harness.session.hide(pane);
+    harness.server.title = "renamed".to_owned();
+    harness.push();
+    assert_eq!(activity(&harness), 0, "a new title alone is not output");
+
+    harness.output(b"while away");
+    assert!(harness.events.contains(&Event::Activity { pane_id: pane }));
+
+    // Two updates that arrive together are one report.
+    let before = activity(&harness);
+    harness.hold = true;
+    harness.output(b" more");
+    harness.output(b"\r\nand more");
+    harness.hold = false;
+    harness.pump();
+    assert_eq!(activity(&harness), before + 1);
+
+    harness.phone = support::terminal(5, 20);
+    harness.session.show(pane);
+    harness.pump();
+    let shown = activity(&harness);
+    harness.output(b"\r\nback on screen");
+    assert_eq!(activity(&harness), shown, "a shown pane's output is not news");
+    assert_mirrored(&mut harness);
+}
+
+#[test]
+fn a_pane_never_shown_that_scrolls_or_moves_its_cursor_between_lists_is_reported() {
+    let mut harness = Harness::new(5, 20);
+    harness.pump();
+    assert!(harness.session.is_ready(), "events: {:?}", harness.events);
+    let pane = harness.server.pane_id;
+    harness.session.refresh_panes();
+    harness.pump();
+    assert_eq!(activity(&harness), 0, "lists alike say nothing happened");
+
+    harness.quiet_output(b"working\r\n");
+    harness.session.refresh_panes();
+    harness.pump();
+    assert_eq!(activity(&harness), 1);
+    assert!(harness.events.contains(&Event::Activity { pane_id: pane }));
+
+    // A new size makes programs redraw, which is not news; the next list
+    // compares from the new size.
+    harness.server.term.resize(support::size(6, 20));
+    harness.quiet_output(b"redrawn\r\n");
+    harness.session.refresh_panes();
+    harness.pump();
+    assert_eq!(activity(&harness), 1);
+    harness.quiet_output(b"done\r\n");
+    harness.session.refresh_panes();
+    harness.pump();
+    assert_eq!(activity(&harness), 2);
+}

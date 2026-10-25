@@ -705,6 +705,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
                 state.grabs[pane] = grabbed ? true : nil
                 state.control.setMouseGrabbed(state.shown.flatMap { state.grabs[$0] } ?? false)
+            case .activity(let pane):
+                state.control.noteActivity(pane: pane)
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
                 // be reconnected), but its reason reaches the screen.

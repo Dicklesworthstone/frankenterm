@@ -107,6 +107,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
             case UInt32(FT_MUX_EVENT_MOUSE_GRAB):
                 guard payload.count == 1, payload[payload.startIndex] <= 1 else { throw TerminalModelError.invalid }
                 return .mouseGrab(paneID: paneID, grabbed: payload[payload.startIndex] == 1)
+            case UInt32(FT_MUX_EVENT_ACTIVITY):
+                guard payload.isEmpty else { throw TerminalModelError.invalid }
+                return .activity(paneID: paneID)
             case UInt32(FT_MUX_EVENT_PHONE_SIZE):
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase

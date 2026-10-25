@@ -153,11 +153,13 @@ impl PaneMirror {
 
     /// A pushed update. Without its lines (they did not decode) every row
     /// of the screen is fetched again. A size no terminal has is refused.
+    /// True when the pane is hidden and what it shows changed: anything but
+    /// a new title alone, which the server sends with the cursor's row.
     pub fn apply_changes(
         &mut self,
         head: RenderHead,
         lines: Option<LineEntries>,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<bool, crate::Error> {
         let dims = head.dimensions;
         let sane = 1..=MAX_PANE_CELLS_EACH_WAY;
         if !sane.contains(&dims.viewport_rows) || !sane.contains(&dims.cols) {
@@ -169,6 +171,17 @@ impl PaneMirror {
             alt: head.alt_screen_active,
             title: head.title,
         };
+        let changed_hidden = !self.visible
+            && self.target.as_ref().is_none_or(|previous| {
+                previous.title == target.title
+                    || previous.dims != target.dims
+                    || previous.cursor != target.cursor
+                    || previous.alt != target.alt
+                    || !head.dirty_lines.is_empty()
+                    || lines.as_ref().is_none_or(|entries| {
+                        entries.lines.iter().any(|(row, _)| *row != target.cursor.y)
+                    })
+            });
         if self.visible {
             let viewport = target.viewport();
             if let Some(previous) = &self.target {
@@ -202,7 +215,7 @@ impl PaneMirror {
             }
         }
         self.target = Some(target);
-        Ok(())
+        Ok(changed_hidden)
     }
 
     /// Stores a GetLines reply; rows asked for and not returned are gone

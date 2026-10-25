@@ -364,6 +364,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
     }
 
+    /// A live machine off screen with output the phone has not shown since.
+    func hasUnseenOutput(_ machineID: String) -> Bool {
+        machineID != selectedMachineID && status(of: machineID) == .live && sessions[machineID]?.hasUnseenOutput == true
+    }
+
     func requiresNewSession(_ machineID: String) -> Bool { connectionIntent.requiresNewSession.contains(machineID) }
 
     // MARK: Screen lifecycle
@@ -1617,6 +1622,7 @@ private struct MachineStrip: View {
         let accent = Color(ftHex: theme?.accent ?? "#8E8E93")
         let selected = machine.id == scene.selectedMachineID
         let status = scene.status(of: machine.id)
+        let unseen = scene.hasUnseenOutput(machine.id)
         return Button { withAnimation(.snappy) { scene.select(machine.id) } } label: {
             HStack(spacing: 7) {
                 StatusDot(status: status, accent: accent)
@@ -1634,10 +1640,11 @@ private struct MachineStrip: View {
                     Capsule().fill(Color.primary.opacity(0.07))
                 }
             }
+            .overlay(alignment: .topTrailing) { if unseen { UnseenBadge() } }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(machine.name), \(Self.describe(status))")
+        .accessibilityLabel("\(machine.name), \(Self.describe(status))\(unseen ? ", new output" : "")")
         .accessibilityHint("Changes machines. One-finger horizontal swipes on the terminal do the same when mouse interaction is inactive.")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -1698,6 +1705,7 @@ private struct PaneStrip: View {
 
     private func chip(_ pane: TerminalMuxPane) -> some View {
         let shown = pane.paneId == state.shown
+        let unseen = !shown && state.unread.contains(pane.paneId)
         let names = Self.names(pane)
         return Button { withAnimation(.snappy) { session.showPane(pane.paneId) } } label: {
             VStack(alignment: .leading, spacing: 1) {
@@ -1714,10 +1722,11 @@ private struct PaneStrip: View {
                     .fill(shown ? accent.opacity(0.22) : Color.primary.opacity(0.06))
                     .overlay(RoundedRectangle(cornerRadius: 9).stroke(shown ? accent : .clear, lineWidth: 1.2))
             }
+            .overlay(alignment: .topTrailing) { if unseen { UnseenBadge() } }
             .contentShape(RoundedRectangle(cornerRadius: 9))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(names.detail.map { "\(names.place), \($0)" } ?? names.place)
+        .accessibilityLabel((names.detail.map { "\(names.place), \($0)" } ?? names.place) + (unseen ? ", new output" : ""))
         .accessibilityHint("Changes panes within this machine. Two-finger horizontal swipes wrap through this machine's panes.")
         .accessibilityAddTraits(shown ? .isSelected : [])
     }
@@ -1729,6 +1738,18 @@ private struct PaneStrip: View {
         let directory = pane.workingDir.flatMap { URL(string: $0)?.lastPathComponent }.flatMap { $0.isEmpty || $0 == "/" ? nil : $0 }
         guard let directory else { return (title.isEmpty ? "Pane \(pane.paneId)" : title, nil) }
         return (directory, title.isEmpty || title == directory ? nil : title)
+    }
+}
+
+/// Marks a machine or pane with output the phone has not shown since it
+/// arrived, in the system's tint so it reads apart from the machine's accent.
+private struct UnseenBadge: View {
+    var body: some View {
+        Circle().fill(Color.accentColor).frame(width: 7, height: 7)
+            .overlay(Circle().stroke(.background, lineWidth: 1.5))
+            .offset(x: 2, y: -2)
+            .transition(.scale.combined(with: .opacity))
+            .accessibilityHidden(true)
     }
 }
 

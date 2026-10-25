@@ -91,6 +91,12 @@ pub enum Event {
         pane_id: usize,
         grabbed: bool,
     },
+    /// A pane not on screen has new output: a hidden pane this session has
+    /// shown changed what it shows, or one it never showed scrolled or moved
+    /// its cursor between two pane lists. Not repeated while one is queued.
+    Activity {
+        pane_id: usize,
+    },
     /// The session is over; close the channel.
     Failed {
         reason: String,
@@ -168,6 +174,9 @@ pub struct Session {
     failed: bool,
     requests: HashMap<u64, Request>,
     panes: Vec<PaneInfo>,
+    /// Where each pane's screen and cursor were at the last list: the only
+    /// sign of output from a pane this session never showed (no pushes).
+    listed_marks: HashMap<usize, ListedMark>,
     mirrors: HashMap<usize, PaneMirror>,
     sizing: HashMap<usize, PaneSizing>,
     /// Whether each mirrored pane's program has asked for the mouse.
@@ -704,6 +713,7 @@ impl Session {
     /// A new pane list, asked for with `serial`.
     fn listed(&mut self, list: &PaneList, serial: u64) {
         self.panes = pane_infos(list);
+        let marks = listed_marks(list);
         let retained = self
             .input
             .retain(|pane_id| self.panes.iter().any(|pane| pane.pane_id == pane_id));
@@ -729,7 +739,29 @@ impl Session {
             }
         }
         self.events.push_back(Event::Panes(self.panes.clone()));
+        // A new size is the program redrawing (perhaps for a size this phone
+        // gave back), not output; the next list compares from there.
+        for (pane_id, mark) in &marks {
+            if !self.mirrors.contains_key(pane_id)
+                && self.listed_marks.get(pane_id).is_some_and(|old| {
+                    old.size == mark.size && (old.top != mark.top || old.cursor != mark.cursor)
+                })
+            {
+                self.note_activity(*pane_id);
+            }
+        }
+        self.listed_marks = marks;
         self.start_searches(serial);
+    }
+
+    fn note_activity(&mut self, pane_id: usize) {
+        let queued = self
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Activity { pane_id: queued } if *queued == pane_id));
+        if !queued {
+            self.events.push_back(Event::Activity { pane_id });
+        }
     }
 
     fn handle(&mut self, frame: Frame) -> Result<(), crate::Error> {
@@ -808,8 +840,10 @@ impl Session {
                     if self.grabs.insert(pane_id, grabbed) != Some(grabbed) {
                         self.events.push_back(Event::MouseGrab { pane_id, grabbed });
                     }
-                    if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
-                        mirror.apply_changes(head, lines)?;
+                    if let Some(mirror) = self.mirrors.get_mut(&pane_id)
+                        && mirror.apply_changes(head, lines)?
+                    {
+                        self.note_activity(pane_id);
                     }
                     self.advance(pane_id);
                 }
@@ -1083,6 +1117,33 @@ fn row_texts(lines: Vec<(StableRowIndex, Line)>) -> HashMap<StableRowIndex, RowT
     lines
         .into_iter()
         .map(|(row, line)| (row, RowText::of(&line)))
+        .collect()
+}
+
+/// What a pane list says about a pane's output: its screen's top row (which
+/// moves as output scrolls), its cursor, and the size they are measured at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListedMark {
+    top: StableRowIndex,
+    cursor: (usize, StableRowIndex),
+    size: (usize, usize),
+}
+
+fn listed_marks(list: &PaneList) -> HashMap<usize, ListedMark> {
+    let mut entries = Vec::new();
+    for tab in &list.tabs {
+        tab.leaves(&mut entries);
+    }
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mark = ListedMark {
+                top: entry.physical_top,
+                cursor: (entry.cursor_pos.x, entry.cursor_pos.y),
+                size: (entry.size.rows, entry.size.cols),
+            };
+            (entry.pane_id, mark)
+        })
         .collect()
 }
 

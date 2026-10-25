@@ -220,6 +220,12 @@ final class TerminalSessionController {
     /// The machine's mux panes and the one on screen, when this session is
     /// attached to its FrankenTerm mux rather than a shell of its own.
     private(set) var muxState: TerminalMuxControl.State?
+    /// Output arrived that this machine has not had on screen since: the
+    /// shell's while it was away, or any of its mux panes'. Read from the
+    /// machine strip, which updates while the machine is off screen.
+    var hasUnseenOutput: Bool { unseenShellOutput || unreadMuxPanes }
+    private var unseenShellOutput = false
+    private var unreadMuxPanes = false
     /// The attachment whose notice the screen has shown; each says it once.
     @ObservationIgnored private weak var noticedMux: TerminalMuxControl?
     /// No mux answered on this machine, so this session is a new shell.
@@ -726,6 +732,15 @@ final class TerminalSessionController {
             }
             self.muxInputChanged(routing, control: control)
         }
+        // The observation above sleeps while the machine is off screen; this
+        // wakes only when the machine gains its first unread pane or reads
+        // its last, and reads the current answer rather than a stale one.
+        control.observeUnread { [weak self, weak control] _ in
+            Task { @MainActor [weak self, weak control] in
+                guard let self, let control, !self.stopped, self.connection?.muxControl === control else { return }
+                self.unreadMuxPanes = !control.current.unread.isEmpty
+            }
+        }
     }
 
     /// The machine's mux, which searches its panes' scrollback on the server;
@@ -752,6 +767,7 @@ final class TerminalSessionController {
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
+        if visible { unseenShellOutput = false }
         muxObservation?.setActive(visible)
         // Only the machine on screen sizes its mux pane to the phone; the
         // others give their panes back to the desktop's layout.
@@ -924,8 +940,17 @@ final class TerminalSessionController {
             unadoptedModel = model
             if let palette = basePalette { try model.setBasePalette(palette); appliedPalette = palette }
             let coordinator = connections.coordinator
+            // A mux pane's output is the mux's to report: output still on its
+            // way when the machine leaves the screen was already seen.
+            let hiddenOutput: (@Sendable () -> Void)? = connection.muxControl != nil ? nil : { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.stopped, !self.presentationVisible else { return }
+                    self.unseenShellOutput = true
+                }
+            }
             let runtime = TerminalModelRuntime(model: model, coordinator: coordinator,
-                                               delivery: presenter, initiallyVisible: false)
+                                               delivery: presenter, initiallyVisible: false,
+                                               hiddenOutput: hiddenOutput)
             self.runtime = runtime; unadoptedModel = nil
             let source = pump.source
             let resize = TerminalViewportResize(source: source, initial: geometry) { geometry in

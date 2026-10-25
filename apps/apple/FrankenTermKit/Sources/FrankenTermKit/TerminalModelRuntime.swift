@@ -93,6 +93,11 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private var closeTask: Task<Void, Error>?
     private var closing = false, closed = false, endOfOutput = false
     private var visible = true
+    /// Called the first time output arrives while the terminal is hidden after
+    /// it was on screen, and again only after it is shown again. Output before
+    /// the terminal was ever shown (a new shell's greeting) is not news.
+    private let hiddenOutput: (@Sendable () -> Void)?
+    private var shownOnce = false, hiddenOutputReported = false
     private var visibilityGeneration = UUID()
     private var viewportTop: Int64?
     private let historyOwner = UUID()
@@ -100,10 +105,12 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private var publishedFrames: UInt64 = 0, unavailableFrames: UInt64 = 0
 
     public init(model: any TerminalSessionModel, coordinator: TerminalInputCoordinator,
-                delivery: any TerminalModelDelivery, initiallyVisible: Bool = true) {
+                delivery: any TerminalModelDelivery, initiallyVisible: Bool = true,
+                hiddenOutput: (@Sendable () -> Void)? = nil) {
         self.model = model; source = model.source
         self.coordinator = coordinator; self.delivery = delivery
-        visible = initiallyVisible
+        visible = initiallyVisible; shownOnce = initiallyVisible
+        self.hiddenOutput = hiddenOutput
     }
 
     public func accounting() -> TerminalModelAccounting {
@@ -206,7 +213,10 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         // SSH service reports its completed window change with the output read
         // after it. Apply that geometry before advancing the same ordered bytes.
         if let geometry = update.resized { try model.resize(geometry) }
-        if !update.output.isEmpty { try model.feed(update.output) }
+        if !update.output.isEmpty {
+            try model.feed(update.output)
+            if !visible, shownOnce, !hiddenOutputReported { hiddenOutputReported = true; hiddenOutput?() }
+        }
         if update.endOfOutput { endOfOutput = true }
         try await transferReplies()
         try Task.checkCancellation()
@@ -321,6 +331,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         try await acquireOperation(.presentation); defer { finishOperation() }
         guard visibilityGeneration == generation else { return }
         self.visible = true
+        shownOnce = true; hiddenOutputReported = false
         try await publishFrame()
     }
     public func refresh(source: TerminalSource) async throws {

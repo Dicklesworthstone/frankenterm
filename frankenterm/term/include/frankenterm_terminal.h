@@ -200,6 +200,11 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              connections for ft_mux_v1_adopt_phone_size.
  *   MOUSE_GRAB pane_id; payload: one byte, 1 when the pane's program has
  *              asked for the mouse (a tap is then a click), 0 when not
+ *   ACTIVITY   pane_id: a pane not on screen has new output. A hidden pane
+ *              this session has shown changed what it shows (a new title
+ *              alone does not count), or a pane it never showed scrolled or
+ *              moved its cursor between two PANES lists at the same size.
+ *              Not repeated while an earlier one is still undrained.
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -212,6 +217,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_CONTEXT 8u
 #define FT_MUX_EVENT_PHONE_SIZE 9u
 #define FT_MUX_EVENT_MOUSE_GRAB 10u
+#define FT_MUX_EVENT_ACTIVITY 11u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u

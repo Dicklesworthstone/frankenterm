@@ -102,6 +102,8 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case phoneSize(paneID: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int)
     /// The pane's program asked for the mouse (a tap is then a click), or stopped.
     case mouseGrab(paneID: Int, grabbed: Bool)
+    /// A pane not on screen has new output.
+    case activity(paneID: Int)
     /// The session is over; the channel must close.
     case failed(String)
 }
@@ -345,6 +347,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var notice: String?
         /// The shown pane's program has asked for the mouse: a tap clicks.
         public var mouseGrabbed = false
+        /// Panes with output the phone has not had on screen since it arrived.
+        /// One leaves this set when it comes on screen.
+        public var unread: Set<Int> = []
         /// A captured request expired before the transport could apply it. The
         /// original presenter can stop waiting without selecting a substitute.
         public var rejectedNavigation: TerminalMuxInputRouting.NavigationPlan?
@@ -356,6 +361,11 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
     private var waker: (@Sendable () -> Void)?
     private var observer: (@Sendable (State) -> Void)?
+    private var unreadObserver: (@Sendable (Bool) -> Void)?
+    /// When each pane last left the screen. Giving it its own size back makes
+    /// its program redraw, which is not new output.
+    private var leftScreen: [Int: ContinuousClock.Instant] = [:]
+    private let settle: Duration
     private var queriesEnded = false
 
     public static let maximumSearchPanes = 128
@@ -366,7 +376,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public static let maximumContextTextBytes = 128 * 1024
     private static let maximumLineBytes = 16 * 1024
 
-    public init() {}
+    /// `settle`: how long after a pane leaves the screen its output is taken
+    /// for the redraw at its own size rather than news.
+    public init(settle: Duration = .seconds(3)) { self.settle = settle }
 
     public var current: State { lock.withLock { state } }
 
@@ -374,6 +386,38 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func observe(_ handler: @escaping @Sendable (State) -> Void) {
         let snapshot = lock.withLock { observer = handler; return state }
         handler(snapshot)
+    }
+
+    /// Called with whether any pane is unread, each time that changes. Unlike
+    /// `observe`, it is for a machine off screen: it changes at most twice for
+    /// each time a pane comes on screen or closes.
+    public func observeUnread(_ handler: @escaping @Sendable (Bool) -> Void) {
+        let unread = lock.withLock { unreadObserver = handler; return !state.unread.isEmpty }
+        handler(unread)
+    }
+
+    /// The transport saw output on a pane. It is unread unless it is on
+    /// screen or only just left it.
+    public func noteActivity(pane: Int) {
+        let (notify, snapshot, flipped) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
+            guard !(state.visible && state.shown == pane), !state.unread.contains(pane),
+                  state.panes.contains(where: { $0.paneId == pane }),
+                  leftScreen[pane].map({ ContinuousClock.now - $0 >= settle }) ?? true else { return (nil, state, nil) }
+            state.unread.insert(pane); state.revision = UUID()
+            return (observer, state, state.unread.count == 1 ? unreadObserver : nil)
+        }
+        notify?(snapshot); flipped?(true)
+    }
+
+    /// Under lock: the pane on screen (`shown` while `visible`) is read; one
+    /// that leaves the screen starts settling. Returns the unread observer
+    /// when the last unread pane was read.
+    private func moveScreen(shown: Int?, visible: Bool) -> (@Sendable (Bool) -> Void)? {
+        let old = state.visible ? state.shown : nil
+        let new = visible ? shown : nil
+        if let old, old != new { leftScreen[old] = .now }
+        guard let new, state.unread.remove(new) != nil, state.unread.isEmpty else { return nil }
+        return unreadObserver
     }
 
     /// Capture an immediate picker request. Gesture callers capture earlier and
@@ -430,15 +474,17 @@ public final class TerminalMuxControl: @unchecked Sendable {
     /// Whether the machine is on screen. Only a visible machine's pane is
     /// sized to the phone and drawn; a hidden one returns to its own size.
     public func setVisible(_ visible: Bool) {
-        let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
-            guard state.visible != visible else { return (nil, nil, state) }
+        let (wake, notify, snapshot, read) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
+            guard state.visible != visible else { return (nil, nil, state, nil) }
             if !visible {
                 inputRouting.discardPointers()
                 if let requested { state.rejectedNavigation = requested; self.requested = nil }
             }
-            state.visible = visible; state.revision = UUID(); return (waker, observer, state)
+            let read = moveScreen(shown: state.shown, visible: visible)
+            state.visible = visible; state.revision = UUID(); return (waker, observer, state, read)
         }
         notify?(snapshot)
+        read?(false)
         wake?()
     }
 
@@ -689,17 +735,22 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     public func publish(panes: [TerminalMuxPane]? = nil, shown: Int?) {
-        let (notify, snapshot) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State) in
+        let (notify, snapshot, read) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
+            let hadUnread = !state.unread.isEmpty
             if let panes {
                 let existing = Set(panes.map(\.paneId))
                 for old in state.panes where !existing.contains(old.paneId) { removeQueryPane(old.paneId) }
                 state.panes = panes
+                state.unread.formIntersection(existing)
+                leftScreen = leftScreen.filter { existing.contains($0.key) }
             }
+            _ = moveScreen(shown: shown, visible: state.visible)
             state.shown = shown
             state.revision = UUID()
-            return (observer, state)
+            return (observer, state, hadUnread && state.unread.isEmpty ? unreadObserver : nil)
         }
         notify?(snapshot)
+        read?(false)
     }
 
     public func retitle(pane: Int, title: String) {
@@ -716,17 +767,20 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     public func remove(pane: Int) {
-        let (notify, snapshot) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State) in
+        let (notify, snapshot, read) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
             state.panes.removeAll { $0.paneId == pane }
             if state.shown == pane { state.shown = nil }
             removeQueryPane(pane)
             if requested?.paneID == pane {
                 state.rejectedNavigation = requested; requested = nil
             }
+            let read = state.unread.remove(pane) != nil && state.unread.isEmpty
+            leftScreen[pane] = nil
             state.revision = UUID()
-            return (observer, state)
+            return (observer, state, read ? unreadObserver : nil)
         }
         notify?(snapshot)
+        read?(false)
     }
 
     /// Called under lock; removal permanently expires this search's reference,
