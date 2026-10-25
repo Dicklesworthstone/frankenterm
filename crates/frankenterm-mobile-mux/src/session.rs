@@ -755,10 +755,9 @@ impl Session {
     }
 
     fn note_activity(&mut self, pane_id: usize) {
-        let queued = self
-            .events
-            .iter()
-            .any(|event| matches!(event, Event::Activity { pane_id: queued } if *queued == pane_id));
+        let queued = self.events.iter().any(
+            |event| matches!(event, Event::Activity { pane_id: queued } if *queued == pane_id),
+        );
         if !queued {
             self.events.push_back(Event::Activity { pane_id });
         }

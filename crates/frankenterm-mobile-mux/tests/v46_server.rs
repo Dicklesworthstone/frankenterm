@@ -1088,7 +1088,11 @@ fn a_hidden_pane_that_changes_is_reported_and_one_on_screen_is_not() {
     harness.pump();
     let shown = activity(&harness);
     harness.output(b"\r\nback on screen");
-    assert_eq!(activity(&harness), shown, "a shown pane's output is not news");
+    assert_eq!(
+        activity(&harness),
+        shown,
+        "a shown pane's output is not news"
+    );
     assert_mirrored(&mut harness);
 }
 

@@ -942,7 +942,7 @@ final class TerminalSessionController {
             let coordinator = connections.coordinator
             // A mux pane's output is the mux's to report: output still on its
             // way when the machine leaves the screen was already seen.
-            let hiddenOutput: (@Sendable () -> Void)? = connection.muxControl != nil ? nil : { [weak self] in
+            let hiddenOutput: (@Sendable () -> Void)? = connection.muxControl != nil ? nil : { @Sendable [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self, !self.stopped, !self.presentationVisible else { return }
                     self.unseenShellOutput = true
