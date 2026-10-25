@@ -1742,6 +1742,10 @@ struct WriterWakeup {
     /// `park_for_work` calls, so tests can prove an idle writer stays parked.
     #[cfg(test)]
     parks: AtomicUsize,
+    /// When the writer loop saw the closed channel, so tests can time the
+    /// writer's wake itself rather than the thread's teardown after it.
+    #[cfg(test)]
+    disconnect_observed_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl WriterWakeup {
@@ -1752,7 +1756,18 @@ impl WriterWakeup {
             senders_gone: AtomicBool::new(false),
             #[cfg(test)]
             parks: AtomicUsize::new(0),
+            #[cfg(test)]
+            disconnect_observed_at: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn record_disconnect_observed(&self) {
+        let mut observed = self
+            .disconnect_observed_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        observed.get_or_insert_with(std::time::Instant::now);
     }
 
     /// Signal the parked writer. Lock-then-signal so a concurrent
@@ -14137,6 +14152,8 @@ fn writer_loop(
                 writer_wakeup.park_for_work(WRITER_IDLE_PARK_CEILING, queued_depth);
             }
             Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
+                #[cfg(test)]
+                writer_wakeup.record_disconnect_observed();
                 break 'main;
             }
         }
@@ -18118,6 +18135,12 @@ mod writer_io_scheduler_tests {
     /// Dropping the last handle without a `Shutdown` command wakes the parked
     /// writer, which then sees the closed channel and exits instead of
     /// sleeping out its safety ceiling.
+    ///
+    /// The bound times the writer's own wake: from the drop to the moment the
+    /// writer loop sees the closed channel. Runtime teardown, the SQLite close
+    /// and the join that follow are not part of it, so a loaded machine slowing
+    /// those down cannot fail the test, while a writer that is not woken still
+    /// sleeps out the ceiling and fails it.
     #[test]
     fn dropping_the_last_handle_wakes_the_parked_writer() {
         let mut dropped = None;
@@ -18135,21 +18158,27 @@ mod writer_io_scheduler_tests {
             // Let the writer finish its batch and park.
             std::thread::sleep(std::time::Duration::from_millis(50));
             let join_state = Arc::clone(&storage.writer_join_state);
+            let wakeup = Arc::clone(&storage.write_tx.wakeup);
             let dropped_at = Instant::now();
             drop(storage);
-            dropped = Some((join_state, dropped_at));
+            dropped = Some((join_state, wakeup, dropped_at));
         });
 
-        let (join_state, dropped_at) = dropped.expect("storage was opened and dropped");
+        let (join_state, wakeup, dropped_at) = dropped.expect("storage was opened and dropped");
         assert_eq!(
             join_state.drive(std::time::Duration::from_secs(10)),
             WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Joined),
             "the writer thread exits cleanly once every handle is gone"
         );
+        let observed_at = wakeup
+            .disconnect_observed_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .expect("the writer exits through the closed channel");
+        let woke_after = observed_at.saturating_duration_since(dropped_at);
         assert!(
-            dropped_at.elapsed() < WRITER_IDLE_PARK_CEILING / 2,
-            "dropping the last sender must wake the parked writer, took {:?}",
-            dropped_at.elapsed()
+            woke_after < WRITER_IDLE_PARK_CEILING / 2,
+            "dropping the last sender must wake the parked writer; it saw the closed channel {woke_after:?} after the drop"
         );
     }
 
