@@ -787,26 +787,19 @@ public final class NativeTerminalInputContainer: UIView {
 /// picture of its key row, so the keyboard does not move. It takes no input:
 /// keys typed meanwhile are dropped, as they would be with no responder. The
 /// next terminal takes the keyboard from it. If none does before `deadline`,
-/// or on `release`, the keyboard goes down.
+/// or on `release`, the keyboard goes down. It is a text view because iPad
+/// gives a view that only takes keys a shorter keyboard than a terminal's.
 @MainActor
-public final class TerminalKeyboardHolder: UIView, UIKeyInput {
-    public var autocapitalizationType: UITextAutocapitalizationType = .none
-    public var autocorrectionType: UITextAutocorrectionType = .no
-    public var spellCheckingType: UITextSpellCheckingType = .no
-    public var smartQuotesType: UITextSmartQuotesType = .no
-    public var smartDashesType: UITextSmartDashesType = .no
-    public var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
-    public var keyboardType: UIKeyboardType = .default
-    public var keyboardAppearance: UIKeyboardAppearance = .default
-    public var returnKeyType: UIReturnKeyType = .default
+public final class TerminalKeyboardHolder: UITextView {
     private let row = UIView()
     private let deadline: Duration
     private var holding = false, generation = 0
 
     public init(deadline: Duration = .milliseconds(1500)) {
         self.deadline = deadline
-        super.init(frame: .zero)
+        super.init(frame: .zero, textContainer: nil)
         accessibilityElementsHidden = true
+        backgroundColor = .clear; isScrollEnabled = false; writingToolsBehavior = .none
         row.autoresizingMask = [.flexibleWidth]
         NotificationCenter.default.addObserver(self, selector: #selector(deactivated),
                                                name: UIApplication.willResignActiveNotification, object: nil)
@@ -816,11 +809,11 @@ public final class TerminalKeyboardHolder: UIView, UIKeyInput {
     deinit { NotificationCenter.default.removeObserver(self) }
 
     public var isHolding: Bool { holding && isFirstResponder }
-    public override var canBecomeFirstResponder: Bool { holding }
-    public override var inputAccessoryView: UIView? { row.bounds.height > 0 ? row : nil }
-    public var hasText: Bool { false }
-    public func insertText(_ text: String) {}
-    public func deleteBackward() {}
+    public override var canBecomeFirstResponder: Bool { holding && super.canBecomeFirstResponder }
+    public override func insertText(_ text: String) {}
+    public override func deleteBackward() {}
+    public override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {}
+    public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
 
     func hold(from input: NativeTerminalInputView, accessory: UIView?) -> Bool {
         guard window != nil, window === input.window else { return false }
@@ -838,6 +831,7 @@ public final class TerminalKeyboardHolder: UIView, UIKeyInput {
                 row.addSubview(picture)
             }
         }
+        inputAccessoryView = row.bounds.height > 0 ? row : nil
         holding = true; generation += 1
         guard becomeFirstResponder() else { holding = false; return false }
         let held = generation

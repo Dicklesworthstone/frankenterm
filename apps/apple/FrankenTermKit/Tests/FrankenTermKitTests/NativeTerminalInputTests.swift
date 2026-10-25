@@ -375,6 +375,9 @@ final class NativeTerminalInputTests: XCTestCase {
         XCTAssertTrue(holder.isHolding, "between terminals the keyboard stays up")
         XCTAssertFalse(first.isFirstResponder)
         holder.insertText("x"); holder.deleteBackward()
+        holder.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+        XCTAssertEqual(holder.text, "", "the holder keeps no keys, composed or not")
+        XCTAssertNil(holder.markedTextRange)
 
         let focus = try await coordinator.changeFocus(between, to: source)
         let session = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: UIKitInputEncoder())
