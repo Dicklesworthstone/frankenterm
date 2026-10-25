@@ -4,6 +4,7 @@
 // state and renders frames; FrankenTermWeb paints their patches. The viewer is
 // read-only: nothing here writes to a pane.
 import { mountPaneOutput } from "./pane-output.mjs";
+import { mountHistorySearch } from "./history-panel.mjs";
 
 const REFRESH_MS = 15_000;
 const CLOCK_MS = 1_000;
@@ -431,6 +432,15 @@ async function main() {
       return viewer.selectedPaneId();
     },
   });
+  const historySearch = mountHistorySearch({
+    readBody: (path, signal) => readSnapshot(path, apiRoot, globalThis.fetch, signal, 8 * 1024 * 1024),
+    inspectPane: (paneId) => {
+      // Route the exact captured identity through the same validated native
+      // form as a manual Open action, never through the mutable fleet row.
+      document.getElementById("pane-output-id").value = paneId;
+      document.getElementById("pane-output-form").requestSubmit();
+    },
+  });
 
   window.addEventListener("keydown", (event) => {
     handleFleetKey(event, { canvas, term, viewer, inspector });
@@ -475,6 +485,7 @@ async function main() {
     stream.stop();
     snapshots.stop();
     inspector.suspend();
+    historySearch.suspend();
     if (refreshTimer !== null) clearInterval(refreshTimer);
     if (frameHandle !== null) cancelAnimationFrame(frameHandle);
     refreshTimer = frameHandle = null;

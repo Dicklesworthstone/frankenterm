@@ -7,9 +7,11 @@
 <link rel="icon" href="data:,">
 <link rel="preload" href="./fonts/pragmasevka-nf-subset.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="./app.css">
+<link rel="stylesheet" href="./history-panel.css">
 </head>
 <body>
 <header id="inspect-toolbar">
+  <button id="history-search-open" type="button" disabled>Search captured history</button>
   <button id="pane-output-open" type="button" disabled>Inspect selected pane (Enter)</button>
   <form id="pane-output-form">
     <label for="pane-output-id">Pane ID</label>
@@ -46,6 +48,33 @@
     <p class="output-note">Bounded captured text, not a terminal emulator. Select text to copy. Escape closes this view. Deleted history and database replacement cannot be recovered here.</p>
   </section>
 </main>
+<dialog id="history-search" aria-labelledby="history-title" aria-describedby="history-help">
+  <div class="output-toolbar">
+    <h1 id="history-title">Search captured history</h1>
+    <button id="history-close" type="button">Close</button>
+  </div>
+  <p id="history-help">Search the stored full-text index across panes, not just the loaded transcript. Phrase mode matches tokenized words; choose FTS syntax for operators such as OR. Times below are local.</p>
+  <form id="history-search-form">
+    <label class="history-wide" for="history-query">Query
+      <input id="history-query" type="search" maxlength="2048" autocomplete="off" required>
+    </label>
+    <label for="history-mode">Query mode
+      <select id="history-mode"><option value="phrase">Phrase</option><option value="fts">FTS syntax</option></select>
+    </label>
+    <label for="history-pane">Pane ID (blank = all retained panes)
+      <input id="history-pane" type="text" inputmode="numeric" maxlength="20" pattern="[0-9]{1,20}" autocomplete="off">
+    </label>
+    <label for="history-since">From local time<input id="history-since" type="datetime-local"></label>
+    <label for="history-until">Through local time<input id="history-until" type="datetime-local"></label>
+    <label for="history-limit">Maximum results
+      <select id="history-limit"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select>
+    </label>
+    <div class="output-toolbar"><button type="submit">Search</button><button id="history-cancel" type="button" disabled>Cancel request</button></div>
+  </form>
+  <p id="history-status" role="status" aria-live="polite"></p>
+  <p id="history-note">Ranked snippets are captured evidence, not current pane state. A historical pane may no longer exist or its ID may have been reused. Live output is read-only. Results are capped, not paginated; narrow the query for older matches. Closing clears this view.</p>
+  <ol id="history-results" aria-label="Ranked captured-history matches"></ol>
+</dialog>
 <!-- The rendered fleet frame as text: for screen readers and browser tests. -->
 <pre id="screen-text" class="visually-hidden" aria-live="polite"></pre>
 <div id="error" role="alert" hidden></div>

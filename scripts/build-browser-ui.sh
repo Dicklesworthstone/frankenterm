@@ -74,6 +74,7 @@ wasm-bindgen --target web --no-typescript --out-name ft_fleet_viewer --out-dir "
   "$target/viewer/wasm32-unknown-unknown/release/frankenterm_browser_ui.wasm"
 
 cp "$crate_dir/web/index.html" "$crate_dir/web/app.mjs" "$crate_dir/web/pane-output.mjs" "$crate_dir/web/app.css" "$out/site/"
+cp "$crate_dir/web/history-search.mjs" "$crate_dir/web/history-panel.mjs" "$crate_dir/web/history-panel.css" "$out/site/"
 cp "$out/renderer-source/fonts/pragmasevka-nf-subset.woff2" "$out/site/fonts/"
 cp "$out/renderer-source/LICENSE" "$out/site/RENDERER-LICENSE"
 cp "$repo/LICENSE" "$out/site/LICENSE"
