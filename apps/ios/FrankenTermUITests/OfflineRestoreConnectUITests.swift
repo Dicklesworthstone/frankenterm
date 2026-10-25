@@ -345,6 +345,21 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("echo KEYS-$FT_WHO-$((4+4))\n")
         waitFor("KEYS-first-8", in: screen, timeout: 30, "typing after a keyboard switch reaches the machine on screen")
         snapshot("14-keyboard-switch")
+
+        // A machine that prints while another is on screen is marked on the
+        // strip until it is on screen again.
+        app.typeText("sleep 4; echo AWAY-$FT_WHO-$((5+5))\n")
+        waitFor("sleep 4; echo AWAY", in: screen, timeout: 10, "the command is running before the switch")
+        app.typeKey("]", modifierFlags: [.command, .shift])
+        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the next machine")
+        let marked = chip(app, inputs.machine, "connected, new output")
+        XCTAssertTrue(marked.waitForExistence(timeout: 20), "the first machine printed while away and is marked")
+        XCTAssertFalse(chip(app, second, "connected, new output").exists, "the machine on screen is never marked")
+        snapshot("15-unread-mark")
+        marked.tap()
+        waitFor("AWAY-first-10", in: screen, timeout: 10, "the mark leads to the new output")
+        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 5), "being on screen clears the mark")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
         app.typeKey("k", modifierFlags: .command)
         let overview = app.navigationBars["Fleet Overview"]
         XCTAssertTrue(overview.waitForExistence(timeout: 10), "⌘K opens the fleet overview")
