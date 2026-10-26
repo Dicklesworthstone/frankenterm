@@ -259,4 +259,8 @@ impl MetalRenderer {
     pub fn touch_glyph(&self, _slot: &AtlasSlot) -> bool {
         match *self {}
     }
+
+    pub fn touch_glyphs<'a>(&self, _slots: impl IntoIterator<Item = &'a AtlasSlot>) -> bool {
+        match *self {}
+    }
 }

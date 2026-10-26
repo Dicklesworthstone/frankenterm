@@ -348,6 +348,47 @@ pub struct AtlasSlot {
     pub height: u32,
 }
 
+/// The page lifetimes referenced by an append-only glyph cache.
+///
+/// A page is the atlas's unit of validity and in-flight protection, so one
+/// representative slot protects every cached glyph on that page. Keep this
+/// set alongside a cache, inserting each placed glyph and clearing it when
+/// the cache is cleared. Iterating it then costs one touch per page instead
+/// of one per glyph, without rebuilding a set on every frame.
+///
+/// The epoch is part of the key: a slot from a reused page must not replace
+/// an older cached slot and hide that the older glyphs are stale. Transient
+/// image slices that age out individually must not accumulate in this set.
+#[derive(Debug, Default)]
+pub struct AtlasPageSet {
+    slots: Vec<AtlasSlot>,
+}
+
+impl AtlasPageSet {
+    /// Records the page lifetime of `slot`, keeping just one representative
+    /// for each `(kind, page, epoch)` regardless of the glyph's rectangle.
+    pub fn insert(&mut self, slot: AtlasSlot) {
+        let key = (slot.kind, slot.page, slot.epoch);
+        if let Err(index) = self
+            .slots
+            .binary_search_by_key(&key, |saved| (saved.kind, saved.page, saved.epoch))
+        {
+            self.slots.insert(index, slot);
+        }
+    }
+
+    /// Forgets every page when the owning glyph cache is cleared.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// One slot per referenced page lifetime. Each must still be touched on
+    /// every frame that can draw the cache, even if atlas generation is flat.
+    pub fn slots(&self) -> impl ExactSizeIterator<Item = &AtlasSlot> {
+        self.slots.iter()
+    }
+}
+
 /// What an allocation did to the atlas besides placing the glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtlasChange {
@@ -787,6 +828,122 @@ mod tests {
             padding: 0,
             max_bytes: texture_bytes(kind, 256, 64 * max_pages),
         }
+    }
+
+    #[test]
+    fn page_sets_deduplicate_glyph_rectangles_but_keep_every_page_lifetime() {
+        let first = AtlasSlot {
+            kind: AtlasKind::Grayscale,
+            page: 2,
+            epoch: 7,
+            x: 0,
+            y: 128,
+            width: 8,
+            height: 8,
+        };
+        let mut pages = AtlasPageSet::default();
+        for x in 0..100 {
+            pages.insert(AtlasSlot { x, ..first });
+        }
+        assert_eq!(pages.slots().copied().collect::<Vec<_>>(), vec![first]);
+        pages.insert(AtlasSlot {
+            kind: AtlasKind::Color,
+            ..first
+        });
+        pages.insert(AtlasSlot { page: 3, ..first });
+        pages.insert(AtlasSlot { epoch: 8, ..first });
+        let keys: Vec<_> = pages
+            .slots()
+            .map(|slot| (slot.kind, slot.page, slot.epoch))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (AtlasKind::Grayscale, 2, 7),
+                (AtlasKind::Grayscale, 2, 8),
+                (AtlasKind::Grayscale, 3, 7),
+                (AtlasKind::Color, 2, 7),
+            ]
+        );
+        pages.clear();
+        assert_eq!(pages.slots().len(), 0);
+        pages.insert(first);
+        assert_eq!(pages.slots().copied().collect::<Vec<_>>(), vec![first]);
+    }
+
+    #[test]
+    fn a_new_page_epoch_does_not_hide_stale_cached_glyphs() {
+        let mut atlas =
+            GlyphAtlas::new(AtlasKind::Grayscale, small_config(AtlasKind::Grayscale, 2)).unwrap();
+        let first = atlas.allocate(256, 64, fence(0)).unwrap().slot;
+        let second = atlas.allocate(256, 64, fence(1)).unwrap().slot;
+        let mut pages = AtlasPageSet::default();
+        pages.insert(first);
+        pages.insert(second);
+        let reused = atlas
+            .allocate(
+                256,
+                64,
+                FrameFence {
+                    current: 2,
+                    retired_before: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            reused.change,
+            Some(AtlasChange::Evicted { page: first.page })
+        );
+        pages.insert(reused.slot);
+        assert_eq!(
+            pages.slots().len(),
+            3,
+            "both page epochs must remain visible"
+        );
+        assert!(atlas.is_live(&reused.slot));
+        assert!(!atlas.is_live(&first));
+        assert!(
+            !pages.slots().all(|slot| atlas.touch(slot, 3)),
+            "stale cached glyphs still require a scene rebuild"
+        );
+        pages.clear();
+        pages.insert(second);
+        pages.insert(reused.slot);
+        assert!(pages.slots().all(|slot| atlas.touch(slot, 3)));
+    }
+
+    #[test]
+    fn touching_page_representatives_preserves_the_per_glyph_in_flight_fence() {
+        let mut atlas =
+            GlyphAtlas::new(AtlasKind::Grayscale, small_config(AtlasKind::Grayscale, 2)).unwrap();
+        let mut glyphs = Vec::new();
+        let mut pages = AtlasPageSet::default();
+        for _ in 0..16 {
+            let slot = atlas.allocate(32, 64, fence(0)).unwrap().slot;
+            glyphs.push(slot);
+            pages.insert(slot);
+        }
+        assert_eq!(pages.slots().len(), 2);
+        let mut per_glyph = atlas.clone();
+        for frame in 1..=4 {
+            assert!(glyphs.iter().all(|slot| per_glyph.touch(slot, frame)));
+            assert!(pages.slots().all(|slot| atlas.touch(slot, frame)));
+            let still_reading = FrameFence {
+                current: frame + 1,
+                retired_before: frame,
+            };
+            let expected = per_glyph.allocate(256, 64, still_reading);
+            assert_eq!(expected, Err(AtlasFull::AllPagesInFlight));
+            assert_eq!(atlas.allocate(256, 64, still_reading), expected);
+        }
+        let retired = FrameFence {
+            current: 5,
+            retired_before: 5,
+        };
+        let expected = per_glyph.allocate(256, 64, retired).unwrap();
+        assert_eq!(expected.change, Some(AtlasChange::Evicted { page: 0 }));
+        assert_eq!(atlas.allocate(256, 64, retired).unwrap(), expected);
+        assert_eq!(atlas.stats(), per_glyph.stats());
     }
 
     #[test]

@@ -649,8 +649,21 @@ impl MetalRenderer {
     /// Records that the next frame draws the glyph in `slot`. False when the
     /// atlas evicted it: insert the glyph again.
     pub fn touch_glyph(&self, slot: &AtlasSlot) -> bool {
+        self.touch_glyphs(std::iter::once(slot))
+    }
+
+    /// Keeps `slots` live for the next frame with one frame-fence lookup and
+    /// atlas borrow. False at the first stale slot, as with repeated calls to
+    /// [`Self::touch_glyph`]. Page representatives from [`crate::AtlasPageSet`]
+    /// can stand for every glyph cached on those pages.
+    pub fn touch_glyphs<'a>(&self, slots: impl IntoIterator<Item = &'a AtlasSlot>) -> bool {
+        let mut slots = slots.into_iter();
+        let Some(first) = slots.next() else {
+            return true;
+        };
         let frame = self.atlas_fence().current;
-        self.atlases.borrow_mut().touch(slot, frame)
+        let mut atlases = self.atlases.borrow_mut();
+        atlases.touch(first, frame) && slots.all(|slot| atlases.touch(slot, frame))
     }
 
     /// The frame being prepared, and the frames the GPU has finished.

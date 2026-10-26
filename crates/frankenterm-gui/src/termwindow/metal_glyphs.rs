@@ -42,7 +42,8 @@
 //!   follows it. As in WebGpu, the first layout of a key (with its shaper
 //!   offsets) serves every later use of it.
 //!
-//! Every frame touches the cached atlas slots, so the atlases keep them.
+//! Every frame touches one representative per cached atlas page lifetime,
+//! so the atlases keep the glyphs without scanning the whole glyph cache.
 //! - A fallback font resolving asynchronously (a completion from the shaper)
 //!   drops the kept shaper output and asks for a full scene rebuild, as
 //!   WebGpu drops its shape cache.
@@ -65,7 +66,7 @@ use frankenterm_gui::line_shaping::{cluster_shaping_context, line_paragraph_cont
 use frankenterm_gui::metal_scene::{
     CursorSprite, GlyphSource, LineSprite, PlacedGlyph, ShapedGlyph,
 };
-use frankenterm_renderer_metal::{AtlasKind, AtlasSlot, MetalRenderer};
+use frankenterm_renderer_metal::{AtlasKind, AtlasPageSet, AtlasSlot, MetalRenderer};
 use lfucache::LfuCache;
 use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow};
 use std::collections::HashMap;
@@ -153,6 +154,9 @@ pub(crate) struct FontGlyphs {
     lines: HashMap<LineSprite, PlacedGlyph>,
     /// Cursor sprites by shape and width in cells (ft-yccm0.4.7.3).
     cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
+    /// Page lifetimes referenced by the append-only glyph and sprite caches.
+    /// Image slices age out independently, so their slots are not included.
+    cached_pages: AtlasPageSet,
     /// Image cells' slices, from the first image cell on (ft-yccm0.4.7.2).
     images: Option<ImageSlices>,
     /// Set by the shaper when a fallback font finishes resolving.
@@ -220,6 +224,7 @@ impl FontGlyphs {
             blocks: HashMap::new(),
             lines: HashMap::new(),
             cursors: HashMap::new(),
+            cached_pages: AtlasPageSet::default(),
             images: None,
             fallback_resolved: Arc::new(AtomicBool::new(false)),
             fallback_ready: None,
@@ -285,19 +290,11 @@ impl FontGlyphs {
         }
         let mut rebuild = std::mem::take(&mut self.reset);
         if !rebuild {
-            let renderer = &self.renderer;
-            let alive = self
-                .glyphs
-                .values()
-                .filter_map(|laid| match laid {
-                    Some(LaidGlyph::Font { slot, .. }) => Some(slot),
-                    _ => None,
-                })
-                .chain(self.blocks.values().map(|placed| &placed.slot))
-                .chain(self.lines.values().map(|placed| &placed.slot))
-                .chain(self.cursors.values().map(|placed| &placed.slot))
-                .chain(self.images.iter().flat_map(ImageSlices::slots))
-                .all(|slot| renderer.touch_glyph(slot));
+            let alive = self.renderer.touch_glyphs(
+                self.cached_pages
+                    .slots()
+                    .chain(self.images.iter().flat_map(ImageSlices::slots)),
+            );
             rebuild = !alive;
         }
         if rebuild {
@@ -305,6 +302,7 @@ impl FontGlyphs {
             self.blocks.clear();
             self.lines.clear();
             self.cursors.clear();
+            self.cached_pages.clear();
             if let Some(images) = &mut self.images {
                 images.forget_placed();
             }
@@ -410,6 +408,7 @@ impl FontGlyphs {
         let image = GlyphCache::block_sprite_image(&self.metrics, block);
         let placed = self.place_sprite(&image, "a block glyph")?;
         self.blocks.insert(block, placed);
+        self.cached_pages.insert(placed.slot);
         Some(placed)
     }
 
@@ -526,6 +525,9 @@ impl FontGlyphs {
             None => None,
         };
         self.glyphs.insert(key, laid);
+        if let Some(LaidGlyph::Font { slot, .. }) = laid {
+            self.cached_pages.insert(slot);
+        }
         laid
     }
 
@@ -692,6 +694,7 @@ impl GlyphSource for FontGlyphs {
         }
         let placed = self.place_line(lines)?;
         self.lines.insert(lines, placed);
+        self.cached_pages.insert(placed.slot);
         Some(placed)
     }
 
@@ -701,6 +704,7 @@ impl GlyphSource for FontGlyphs {
         }
         let placed = self.place_cursor(shape, width_cells)?;
         self.cursors.insert((shape, width_cells), placed);
+        self.cached_pages.insert(placed.slot);
         Some(placed)
     }
 
@@ -738,6 +742,79 @@ impl GlyphSource for FontGlyphs {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_cache_pages_cover_glyphs_and_sprites_but_not_transient_images() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, renderer, &metrics);
+
+        let line = Line::from_text("ABCDE", &CellAttributes::blank(), 0, None);
+        assert!(!glyphs.shape_row(&line.cluster(None)).is_empty());
+        glyphs
+            .block(BlockKey::from_char('\u{2588}').unwrap())
+            .expect("a block glyph");
+        glyphs
+            .line_sprite(LineSprite {
+                underline: termwiz::cell::Underline::Single,
+                strikethrough: false,
+                overline: false,
+            })
+            .expect("an underline sprite");
+        glyphs
+            .cursor_sprite(CursorSprite::Bar, 1)
+            .expect("a cursor sprite");
+        assert!(!glyphs.glyphs.is_empty());
+        assert!(!glyphs.blocks.is_empty());
+        assert!(!glyphs.lines.is_empty());
+        assert!(!glyphs.cursors.is_empty());
+
+        // The old per-glyph walk is the independent oracle for which page
+        // lifetimes the persistent caches own.
+        let slots: Vec<_> = glyphs
+            .glyphs
+            .values()
+            .filter_map(|laid| match laid {
+                Some(LaidGlyph::Font { slot, .. }) => Some(slot),
+                _ => None,
+            })
+            .chain(glyphs.blocks.values().map(|placed| &placed.slot))
+            .chain(glyphs.lines.values().map(|placed| &placed.slot))
+            .chain(glyphs.cursors.values().map(|placed| &placed.slot))
+            .copied()
+            .collect();
+        let keys = |slots: &[AtlasSlot]| {
+            slots
+                .iter()
+                .map(|slot| (slot.kind, slot.page, slot.epoch))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let tracked: Vec<_> = glyphs.cached_pages.slots().copied().collect();
+        assert_eq!(keys(&slots), keys(&tracked));
+        assert!(tracked.len() < slots.len(), "glyphs share atlas pages");
+        assert!(!glyphs.begin_frame(), "the cached pages are all still live");
+
+        // Image cells use the same bitmap-placement helper but have their
+        // own per-frame retention. They must not pin a persistent page.
+        let bitmap = Image::from_raw(1, 1, vec![255; 4]);
+        let image = glyphs.place_image(&bitmap, true, "an image cell").unwrap();
+        assert_eq!(image.kind, AtlasKind::Color);
+        assert_eq!(
+            glyphs.cached_pages.slots().copied().collect::<Vec<_>>(),
+            tracked
+        );
+
+        glyphs.reset = true;
+        assert!(glyphs.begin_frame());
+        assert_eq!(glyphs.cached_pages.slots().len(), 0);
+        assert!(glyphs.glyphs.is_empty());
+        assert!(glyphs.blocks.is_empty());
+        assert!(glyphs.lines.is_empty());
+        assert!(glyphs.cursors.is_empty());
+    }
 
     /// ft-yccm0.4.7.3: the password lock is the glyph U+F023 shapes to in
     /// the default font style, placed as text in that style places it in a
