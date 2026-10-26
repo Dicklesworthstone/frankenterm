@@ -655,7 +655,7 @@ impl GlyphSource for FontGlyphs {
                 Some(glyphs) => glyphs,
                 None => {
                     let context = cluster_shaping_context(paragraph_context.as_ref(), cluster, idx);
-                    self.shape(styles[idx], cluster, context)
+                    self.shape(styles[idx], cluster, context).into()
                 }
             };
             let valign = cluster.attrs.vertical_align();

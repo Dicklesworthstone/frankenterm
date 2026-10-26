@@ -950,6 +950,7 @@ impl crate::TermWindow {
                         &self.render_metrics,
                         cluster_paragraph_context,
                     )?
+                    .into()
                 }
             };
             let pixel_width = glyph_info

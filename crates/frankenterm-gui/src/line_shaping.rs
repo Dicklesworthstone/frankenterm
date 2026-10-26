@@ -11,7 +11,7 @@
 //!   [`cluster_shaping_context`].
 
 use config::TextStyle;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::rc::Rc;
 use termwiz::cellcluster::CellCluster;
 use wezterm_bidi::Direction;
@@ -158,13 +158,50 @@ pub fn split_glyph_cells(cells: &[u8], parts: &[(usize, usize)]) -> Option<Vec<R
         .then_some(ranges)
 }
 
+/// A cluster's glyphs in an immutable, shared shaping result.
+///
+/// Paint boundaries partition a shaped run without copying its glyphs or
+/// allocating another vector for each cluster. A standalone cluster uses the
+/// whole result by converting its `Rc<Vec<G>>` with [`From`]. The backing run
+/// lives until the last cluster using it is released, just like an unsplit
+/// cached shape.
+#[derive(Debug)]
+pub struct GlyphSlice<G> {
+    glyphs: Rc<Vec<G>>,
+    range: Range<usize>,
+}
+
+impl<G> Clone for GlyphSlice<G> {
+    fn clone(&self) -> Self {
+        Self {
+            glyphs: Rc::clone(&self.glyphs),
+            range: self.range.clone(),
+        }
+    }
+}
+
+impl<G> From<Rc<Vec<G>>> for GlyphSlice<G> {
+    fn from(glyphs: Rc<Vec<G>>) -> Self {
+        let range = 0..glyphs.len();
+        Self { glyphs, range }
+    }
+}
+
+impl<G> Deref for GlyphSlice<G> {
+    type Target = [G];
+
+    fn deref(&self) -> &Self::Target {
+        &self.glyphs[self.range.clone()]
+    }
+}
+
 /// The glyphs [`shape_runs`] got for a line's clusters.
 #[derive(Debug)]
 pub struct RunGlyphs<G> {
     /// Per cluster: its glyphs from its run, or `None` when the caller shapes
     /// it alone (with [`cluster_shaping_context`]) because its run has one
     /// cluster or did not split at its cluster boundaries.
-    pub glyphs: Vec<Option<Rc<Vec<G>>>>,
+    pub glyphs: Vec<Option<GlyphSlice<G>>>,
     /// Shaper calls made: one per run of two or more clusters.
     pub runs: u64,
     /// Runs shaped but not split, whose clusters are shaped again alone.
@@ -178,7 +215,7 @@ pub struct RunGlyphs<G> {
 /// range when its clusters take paragraph context. `num_cells` gives a
 /// glyph's shaper cell count; `shape` shapes a cluster with that style and
 /// context.
-pub fn shape_runs<G: Clone, E>(
+pub fn shape_runs<G, E>(
     clusters: &[CellCluster],
     styles: &[&TextStyle],
     paragraph_context: Option<&ClusterParagraphContext>,
@@ -220,7 +257,10 @@ pub fn shape_runs<G: Clone, E>(
         match split_glyph_cells(&cells, &extents) {
             Some(ranges) => {
                 for (offset, range) in ranges.into_iter().enumerate() {
-                    shaped.glyphs[run.start + offset] = Some(Rc::new(shaped_run[range].to_vec()));
+                    shaped.glyphs[run.start + offset] = Some(GlyphSlice {
+                        glyphs: Rc::clone(&shaped_run),
+                        range,
+                    });
                 }
             }
             None => shaped.unsplit_runs += 1,
@@ -450,7 +490,7 @@ mod tests {
         (shaped, calls)
     }
 
-    fn texts(glyphs: &Option<Rc<Vec<(String, u8)>>>) -> Option<Vec<&str>> {
+    fn texts(glyphs: &Option<GlyphSlice<(String, u8)>>) -> Option<Vec<&str>> {
         glyphs
             .as_ref()
             .map(|glyphs| glyphs.iter().map(|(text, _)| text.as_str()).collect())
@@ -481,8 +521,101 @@ mod tests {
         assert_eq!(shaped.glyphs.len(), 3);
         assert_eq!(texts(&shaped.glyphs[0]), Some(vec!["a"]));
         assert_eq!(texts(&shaped.glyphs[1]), Some(vec!["b", "c", " "]));
-        assert_eq!(shaped.glyphs[2], None);
+        assert!(shaped.glyphs[2].is_none());
         assert_eq!((shaped.runs, shaped.unsplit_runs), (1, 0));
+    }
+
+    /// A color boundary does not copy a glyph or allocate another glyph
+    /// vector. Marks stay with their base and a two-cell glyph stays inside
+    /// its paint cluster; every view refers to the original shaper output.
+    #[test]
+    fn shape_runs_share_glyphs_and_keep_them_alive_until_the_last_cluster() {
+        struct Glyph {
+            id: u32,
+            cells: u8,
+            dropped: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Drop for Glyph {
+            fn drop(&mut self) {
+                self.dropped.set(self.dropped.get() + 1);
+            }
+        }
+
+        let clusters = Line::from_cells(
+            vec![
+                Cell::new('a', colored(1)),
+                Cell::new('b', colored(2)),
+                Cell::new('c', colored(2)),
+                Cell::new('d', colored(3)),
+                Cell::new('e', colored(4)),
+            ],
+            SEQ_ZERO,
+        )
+        .cluster(None);
+        assert_eq!(clusters.len(), 4);
+        let style = TextStyle::default();
+        let styles = vec![&style; clusters.len()];
+        let context = line_paragraph_context(&clusters);
+        let dropped = Rc::new(std::cell::Cell::new(0));
+        // Deliberately not Clone: sharing must work without copying glyphs.
+        let source = Rc::new(
+            [(10, 1), (11, 0), (20, 2), (30, 1), (40, 1)]
+                .into_iter()
+                .map(|(id, cells)| Glyph {
+                    id,
+                    cells,
+                    dropped: Rc::clone(&dropped),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let weak = Rc::downgrade(&source);
+        let mut shaped = shape_runs(
+            &clusters,
+            &styles,
+            context.as_ref(),
+            |glyph: &Glyph| glyph.cells,
+            |_, cluster, _| {
+                assert_eq!(cluster.text, "abcde");
+                Ok::<_, ()>(Rc::clone(&source))
+            },
+        )
+        .unwrap();
+        assert_eq!((shaped.runs, shaped.unsplit_runs), (1, 0));
+        assert_eq!(shaped.glyphs.len(), 4);
+        let expected: &[&[u32]] = &[&[10, 11], &[20], &[30], &[40]];
+        let mut offset = 0;
+        for (view, ids) in shaped.glyphs.iter().zip(expected) {
+            let view = view.as_ref().unwrap();
+            let observed: Vec<_> = view.iter().map(|glyph| glyph.id).collect();
+            assert_eq!(observed.as_slice(), *ids);
+            assert!(Rc::ptr_eq(&view.glyphs, &source));
+            assert!(std::ptr::eq(view.as_ptr(), source[offset..].as_ptr()));
+            offset += ids.len();
+        }
+        assert_eq!(offset, source.len());
+
+        let survivor = shaped.glyphs[0].take().unwrap().clone();
+        drop(shaped);
+        drop(source);
+        assert_eq!(dropped.get(), 0, "the last view still owns the glyphs");
+        assert!(weak.upgrade().is_some());
+        assert_eq!(survivor[1].id, 11, "the mark remains with its base");
+        drop(survivor);
+        assert_eq!(dropped.get(), 5, "every glyph is released exactly once");
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn standalone_glyph_slice_keeps_the_whole_cached_shape() {
+        let source = Rc::new(vec![3, 1, 4]);
+        let view = GlyphSlice::from(Rc::clone(&source));
+        assert_eq!(&*view, &[3, 1, 4]);
+        assert!(Rc::ptr_eq(&view.glyphs, &source));
+        assert_eq!(&*view.clone(), &[3, 1, 4]);
+
+        let empty = GlyphSlice::from(Rc::new(Vec::<u8>::new()));
+        assert!(empty.is_empty());
     }
 
     /// A ligature across a paint boundary does not split, so the run's
@@ -498,7 +631,8 @@ mod tests {
         let (shaped, calls) = shape_line_runs(cells);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].text, "a->b");
-        assert_eq!(shaped.glyphs, vec![None, None]);
+        assert_eq!(shaped.glyphs.len(), 2);
+        assert!(shaped.glyphs.iter().all(Option::is_none));
         assert_eq!((shaped.runs, shaped.unsplit_runs), (1, 1));
     }
 

@@ -22,6 +22,7 @@ use frankenterm_alloc::resource_ledger::CacheGauge;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
 use frankenterm_font::{GlyphInfo, LoadedFont};
+use frankenterm_gui::line_shaping::GlyphSlice;
 use lfucache::LfuCache;
 use mux::pane::{Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -176,7 +177,7 @@ pub struct LineToElementShape {
     pub underline_color: LinearRgba,
     pub x_pos: f32,
     pub pixel_width: f32,
-    pub glyph_info: Rc<Vec<ShapedInfo>>,
+    pub glyph_info: GlyphSlice<ShapedInfo>,
     pub cluster: CellCluster,
 }
 

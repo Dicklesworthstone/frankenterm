@@ -1444,7 +1444,7 @@ mod tests {
                     .iter()
                     .map(|glyph| glyph.glyph.x_advance.get() as f32)
                     .sum(),
-                glyph_info: glyphs,
+                glyph_info: glyphs.into(),
                 cluster,
             }]),
             current_highlight: None,
