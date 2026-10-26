@@ -76,6 +76,30 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try catalog.search(.init(scope: .panes, filter: .attention)).matchingCount, 0)
     }
 
+    func testNewOutputFilterKeepsTheMarkedMachinesAndPanesInOrder() throws {
+        let routing = TerminalMuxInputRouting(), session = UUID()
+        try routing.replaceInventory([10, 20, 30])
+        routing.didApplyOutput(try routing.select(pane: 10))
+        let panes = try [10, 20, 30].map { id in
+            TerminalFleetOverview.Pane(plan: try routing.navigation(pane: id), title: "Pane \(id)", newOutput: id != 20)
+        }
+        let mux = TerminalFleetOverview.Machine(id: "mux", name: "Mux", endpoint: "mux:22", status: .live,
+                                                sessionID: session, panes: panes, selectedPaneID: 10, newOutput: true)
+        let direct = TerminalFleetOverview.Machine(id: "direct", name: "Direct", endpoint: "direct:22", status: .live,
+                                                   newOutput: true)
+        let quiet = TerminalFleetOverview.Machine(id: "quiet", name: "Quiet", endpoint: "quiet:22", status: .live)
+        let catalog = try TerminalFleetOverview(machines: [quiet, mux, direct])
+        let marked = try catalog.search(.init(filter: .newOutput)).rows
+        XCTAssertEqual(marked.map(\.machineID), ["mux", "mux", "mux", "direct"])
+        XCTAssertEqual(marked.map(\.paneID), [nil, 10, 30, nil])
+        XCTAssertTrue(marked.allSatisfy(\.newOutput))
+        XCTAssertEqual(try catalog.search(.init(scope: .panes, filter: .newOutput)).rows.map(\.paneID), [10, 30])
+        XCTAssertEqual(try catalog.search(.init(text: "direct", filter: .newOutput)).rows.map(\.machineID), ["direct"])
+        let all = try catalog.search().rows
+        XCTAssertEqual(all.filter(\.newOutput).count, 4, "every row carries its own mark")
+        XCTAssertFalse(try XCTUnwrap(all.first { $0.machineID == "quiet" }).newOutput)
+    }
+
     func testResultsLimitReportsTheFullMatchCountAndKeepsStablePrefix() throws {
         let catalog = try TerminalFleetOverview(machines: [try machine().0])
         let result = try catalog.search(limit: 2)

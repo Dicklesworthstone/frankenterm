@@ -427,6 +427,19 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(marked.waitForExistence(timeout: 20), "the first machine printed while away and is marked")
         XCTAssertFalse(chip(app, second, "connected, new output").exists, "the machine on screen is never marked")
         snapshot("15-unread-mark")
+        // The fleet overview's New output filter lists the marked machine alone.
+        app.buttons["terminal.fleet.open"].tap()
+        XCTAssertTrue(app.navigationBars["Fleet Overview"].waitForExistence(timeout: 10), "the fleet overview opens")
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Status at refresh")).firstMatch.tap()
+        app.buttons["New output"].firstMatch.tap()
+        func overviewRow(_ machine: String) -> XCUIElement {
+            app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", machine, "New output")).firstMatch
+        }
+        XCTAssertTrue(overviewRow(inputs.machine).waitForExistence(timeout: 10), "the overview marks the machine that printed")
+        XCTAssertFalse(overviewRow(second).exists, "the machine on screen is not listed as new output")
+        snapshot("15a-overview-new-output")
+        app.navigationBars["Fleet Overview"].buttons["Done"].tap()
+        XCTAssertTrue(app.navigationBars["Fleet Overview"].waitForNonExistence(timeout: 10), "the overview closes")
         // The strip then ends in Next New Output, which goes to it.
         let nextNew = app.buttons["terminal.unseen.next"]
         XCTAssertTrue(nextNew.waitForExistence(timeout: 5), "Next New Output is offered while a machine is marked")
@@ -453,10 +466,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         snapshot("15b-next-new-output")
         app.typeText("echo STAY-$FT_WHO-$((7+7))\n")
         waitFor("STAY-second-14", in: screen, timeout: 30, "typing after ⌘J reaches the machine it showed")
-        // Later tests relaunch into the first machine.
+        // Later tests relaunch into the first machine. (Its screen may have
+        // scrolled: hardware keys hide the keyboard, and its shell traps the
+        // resize, so a fresh line proves the switch.)
         chip(app, inputs.machine, "connected").tap()
-        waitFor("AWAY-first-10", in: screen, timeout: 10, "the strip shows the first machine again")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
+        app.typeText("echo BACK-$FT_WHO-$((8+8))\n")
+        waitFor("BACK-first-16", in: screen, timeout: 30, "the strip shows the first machine again")
         app.typeKey("k", modifierFlags: .command)
         let overview = app.navigationBars["Fleet Overview"]
         XCTAssertTrue(overview.waitForExistence(timeout: 10), "⌘K opens the fleet overview")

@@ -18,7 +18,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         }
     }
     public enum Scope: String, CaseIterable, Sendable { case all, machines, panes }
-    public enum Filter: String, CaseIterable, Sendable { case all, connected, attention }
+    /// `newOutput` keeps the rows marked with output not yet shown at refresh.
+    public enum Filter: String, CaseIterable, Sendable { case all, connected, attention, newOutput }
     public enum Failure: Error, Equatable, Sendable, LocalizedError {
         case capacity, invalidInventory, invalidQuery, stale
         public var errorDescription: String? {
@@ -33,9 +34,12 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
     public struct Pane: Sendable {
         public let plan: TerminalMuxInputRouting.NavigationPlan
         public let title: String, tabTitle: String, workingDirectory: String
+        /// The pane printed while not on screen, as its chip marks it.
+        public let newOutput: Bool
         public init(plan: TerminalMuxInputRouting.NavigationPlan, title: String,
-                    tabTitle: String = "", workingDirectory: String = "") {
+                    tabTitle: String = "", workingDirectory: String = "", newOutput: Bool = false) {
             self.plan = plan; self.title = title; self.tabTitle = tabTitle; self.workingDirectory = workingDirectory
+            self.newOutput = newOutput
         }
     }
     public struct Machine: Sendable {
@@ -44,10 +48,13 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let sessionID: UUID?
         public let panes: [Pane]
         public let selectedPaneID: Int?
+        /// The machine printed while off screen, as its strip chip marks it.
+        public let newOutput: Bool
         public init(id: String, name: String, endpoint: String, status: Status,
-                    sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil) {
+                    sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil, newOutput: Bool = false) {
             self.id = id; self.name = name; self.endpoint = endpoint; self.status = status
             self.sessionID = sessionID; self.panes = panes; self.selectedPaneID = selectedPaneID
+            self.newOutput = newOutput
         }
     }
     public struct Query: Hashable, Sendable {
@@ -73,6 +80,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let status: Status
         public let paneID: Int?
         public let selected: Bool
+        public let newOutput: Bool
     }
     public struct Results: Sendable {
         public let rows: [Row]
@@ -121,7 +129,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             let machineSearch = try index(machine.id + "\n" + machine.name + "\n" + machine.endpoint)
             let machineRow = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                 machineName: machine.name, title: machine.name, detail: machine.endpoint,
-                status: machine.status, paneID: nil, selected: machine.id == selectedMachineID)
+                status: machine.status, paneID: nil, selected: machine.id == selectedMachineID,
+                newOutput: machine.newOutput)
             entries.append(IndexedRow(row: machineRow, target: .machine(machine.id),
                 machineSearch: machineSearch, paneSearch: ""))
             var paneIDs = Set<Int>()
@@ -139,7 +148,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
                 let row = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                     machineName: machine.name, title: title.isEmpty ? fallback : title, detail: detail,
                     status: machine.status, paneID: pane.plan.paneID,
-                    selected: machine.id == selectedMachineID && machine.selectedPaneID == pane.plan.paneID)
+                    selected: machine.id == selectedMachineID && machine.selectedPaneID == pane.plan.paneID,
+                    newOutput: pane.newOutput)
                 entries.append(IndexedRow(row: row,
                     target: .pane(machineID: machine.id, sessionID: sessionID, plan: pane.plan),
                     machineSearch: machineSearch, paneSearch: paneSearch))
@@ -167,6 +177,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             if query.scope == .panes && row.paneID == nil { continue }
             if query.filter == .connected && row.status != .live && row.status != .ready { continue }
             if query.filter == .attention && row.status != .attention { continue }
+            if query.filter == .newOutput && !row.newOutput { continue }
             guard terms.allSatisfy({ entry.machineSearch.contains($0) || entry.paneSearch.contains($0) }) else { continue }
             count += 1
             if rows.count < limit { rows.append(row) }

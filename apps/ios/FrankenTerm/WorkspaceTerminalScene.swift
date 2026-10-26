@@ -204,14 +204,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 guard state.panes.count <= TerminalFleetOverview.maximumPanes - paneCount else {
                     throw TerminalFleetOverview.Failure.capacity
                 }
+                let onScreen = machine.id == selectedMachineID ? state.shown : nil
                 panes = try state.panes.map { pane in
                     .init(plan: try control.inputRouting.navigation(pane: pane.paneId), title: pane.title,
-                          tabTitle: pane.tabTitle, workingDirectory: pane.workingDir ?? "")
+                          tabTitle: pane.tabTitle, workingDirectory: pane.workingDir ?? "",
+                          newOutput: pane.paneId != onScreen && state.unread.contains(pane.paneId))
                 }
                 shown = state.shown; paneCount += panes.count
             }
             inventory.append(.init(id: machine.id, name: machine.name, endpoint: endpoint, status: status,
-                sessionID: session?.id, panes: panes, selectedPaneID: shown))
+                sessionID: session?.id, panes: panes, selectedPaneID: shown, newOutput: hasUnseenOutput(machine.id)))
         }
         let selected = selectedMachineID
         let frozenInventory = inventory
@@ -2026,6 +2028,7 @@ private struct WorkspaceFleetOverviewScreen: View {
                         Text("Any status").tag(TerminalFleetOverview.Filter.all)
                         Text("Connected or signed in").tag(TerminalFleetOverview.Filter.connected)
                         Text("Needs attention").tag(TerminalFleetOverview.Filter.attention)
+                        Text("New output").tag(TerminalFleetOverview.Filter.newOutput)
                     }
                 }
                 if let selectionFailure {
@@ -2141,7 +2144,10 @@ private struct WorkspaceFleetOverviewScreen: View {
                 }
                 Text(verbatim: row.title).font(.body.weight(row.selected ? .semibold : .regular)).lineLimit(2)
                 if !row.detail.isEmpty { Text(verbatim: row.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
-                Text(verbatim: row.status.label).font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(verbatim: row.status.label).foregroundStyle(.secondary)
+                    if row.newOutput { Text("New output").foregroundStyle(Color.accentColor) }
+                }.font(.caption2)
             }
             Spacer(minLength: 0)
             if row.selected { Image(systemName: "checkmark.circle.fill").accessibilityLabel("Selected at refresh") }

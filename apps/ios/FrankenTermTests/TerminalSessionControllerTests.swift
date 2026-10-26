@@ -1351,7 +1351,8 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     /// Next New Output: when a mux pane prints on a machine off screen, one
     /// action shows that machine and then that pane, not the pane the machine
-    /// last showed. Both machines attach to the disposable mux; beta shows
+    /// last showed; the fleet overview's New output filter lists the same
+    /// two. Both machines attach to the disposable mux; beta shows
     /// the pane that prints, so for beta it is not news. (Named to run before
     /// the test that ends a pane of the disposable mux.)
     func testAMuxPaneThatPrintsOnAMachineOffScreenIsWhereNextNewOutputGoes() async throws {
@@ -1397,6 +1398,19 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(alphaControl.current.shown, first, "alpha still shows its first pane")
         for _ in 0..<200 where !scene.hasUnseenOutputElsewhere { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertTrue(scene.hasUnseenOutputElsewhere, "Next New Output is offered")
+        // The fleet overview's New output filter lists alpha and that pane.
+        scene.beginOverview()
+        let visit = try XCTUnwrap(scene.overviewSessionID, "the fleet overview opens")
+        let marked = try await scene.makeOverview().search(.init(filter: .newOutput)).rows
+            .map { "\($0.machineID)/\($0.paneID.map(String.init) ?? "machine")" }
+        XCTAssertTrue(marked.contains("alpha/machine"), "the overview marks alpha: \(marked)")
+        XCTAssertTrue(marked.contains("alpha/\(other)"), "and its pane that printed: \(marked)")
+        XCTAssertFalse(marked.contains("alpha/\(first)"), "not the pane alpha last showed: \(marked)")
+        XCTAssertFalse(marked.contains("beta/machine") || marked.contains("beta/\(other)"),
+                       "nor beta or its pane, on screen: \(marked)")
+        scene.dismissOverview(); scene.finishOverviewDismissal(visit)
+        for _ in 0..<200 where !scene.permitsTerminalCreation { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(scene.permitsTerminalCreation, "closing the overview hands navigation back")
 
         scene.showNextUnseenOutput()
         for _ in 0..<400 where scene.selectedMachineID != "alpha" || alphaSession.muxState?.shown != other
