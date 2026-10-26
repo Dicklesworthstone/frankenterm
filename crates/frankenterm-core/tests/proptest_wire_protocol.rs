@@ -100,10 +100,14 @@ fn arb_gap_notice() -> impl Strategy<Value = GapNotice> {
 }
 
 fn arb_invalid_gap_notice() -> impl Strategy<Value = GapNotice> {
+    // ft-5yi36: `seq_after == seq_before` is now a valid leading gap, so only a
+    // strictly decreasing pair (`seq_after < seq_before`) is invalid. Keep
+    // `seq_before >= 1` and `backstep >= 1` so `saturating_sub` always lands
+    // strictly below `seq_before`.
     (
         0..1000u64,
-        0..10000u64,
-        0..10000u64,
+        1..10000u64,
+        1..10000u64,
         "[a-z_]{1,30}",
         1_000_000_000_000i64..2_000_000_000_000i64,
     )
@@ -966,18 +970,20 @@ fn decoded_envelope_matrix_fails_closed_before_sender_state_mutation() {
         matches!(err, WireProtocolError::InvalidJson(_))
     });
 
+    // ft-5yi36: equal bounds now encode a valid leading gap, so the fail-closed
+    // case must be strictly decreasing (seq_after < seq_before).
     let bad_gap = WireEnvelope::new(
         1,
         "agent-a",
         WirePayload::Gap(GapNotice {
             pane_id: 7,
-            seq_before: 8,
+            seq_before: 9,
             seq_after: 8,
-            reason: "non-advancing".to_string(),
+            reason: "decreasing-bounds".to_string(),
             detected_at_ms: 1_700_000_000_200,
         }),
     );
-    assert_decoded_envelope_fails_closed("non-advancing gap", bad_gap, |err| {
+    assert_decoded_envelope_fails_closed("decreasing-bounds gap", bad_gap, |err| {
         matches!(err, WireProtocolError::InvalidJson(_))
     });
 }

@@ -948,10 +948,13 @@ fn validate_envelope_protocol_with_limits(
                 ),
             )));
         }
-        if gap.seq_after <= gap.seq_before {
+        // ft-5yi36: a leading gap is carried on the wire as
+        // `seq_after == seq_before` (content missing before `seq_after`, nothing
+        // before it). Only a strictly decreasing pair is a protocol violation.
+        if gap.seq_after < gap.seq_before {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
                 format!(
-                    "GapNotice seq_after ({}) must be greater than seq_before ({})",
+                    "GapNotice seq_after ({}) must be greater than or equal to seq_before ({})",
                     gap.seq_after, gap.seq_before
                 ),
             )));
@@ -2122,14 +2125,16 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_ingest_envelope_rejects_gap_notice_with_non_increasing_bounds() {
+    fn aggregator_ingest_envelope_rejects_gap_notice_with_decreasing_bounds() {
         let mut agg = Aggregator::new(10);
+        // ft-5yi36: equal bounds are now a valid leading gap, so only a strictly
+        // decreasing pair (seq_after < seq_before) is still a protocol violation.
         let envelope = WireEnvelope::new(
             1,
             "agent-valid",
             WirePayload::Gap(GapNotice {
                 pane_id: 7,
-                seq_before: 8,
+                seq_before: 9,
                 seq_after: 8,
                 reason: "invalid-gap".to_string(),
                 detected_at_ms: 123,
@@ -2141,6 +2146,31 @@ mod tests {
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
         assert_eq!(agg.total_rejected(), 1);
         assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
+    fn aggregator_accepts_gap_notice_with_equal_bounds_as_leading_gap() {
+        let mut agg = Aggregator::new(10);
+        // ft-5yi36: a leading gap (content missing before seq 0, nothing before
+        // it) is carried as `seq_before == seq_after` and must be accepted.
+        let envelope = WireEnvelope::new(
+            1,
+            "agent-valid",
+            WirePayload::Gap(GapNotice {
+                pane_id: 7,
+                seq_before: 0,
+                seq_after: 0,
+                reason: "overlap_not_found".to_string(),
+                detected_at_ms: 123,
+            }),
+        );
+        assert!(matches!(
+            agg.ingest_envelope(envelope)
+                .expect("a leading gap with equal bounds is a valid wire gap"),
+            IngestResult::Accepted(WirePayload::Gap(_))
+        ));
+        assert_eq!(agg.total_accepted(), 1);
+        assert_eq!(agg.total_rejected(), 0);
     }
 
     #[test]

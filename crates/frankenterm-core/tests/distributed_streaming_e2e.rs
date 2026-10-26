@@ -1244,13 +1244,16 @@ fn distributed_streaming_e2e_rejects_invalid_gap_bounds_and_recovers_with_valid_
             .await
             .expect("bridge");
 
+        // ft-5yi36: equal bounds (seq_before == seq_after) are now a valid
+        // leading-gap encoding, so the invalid case must be strictly decreasing
+        // (seq_after < seq_before) to remain a protocol violation.
         let invalid_err = bridge
             .ingest_envelope(WireEnvelope::new(
                 1,
                 "agent-gap-invalid",
                 WirePayload::Gap(GapNotice {
                     pane_id: 33,
-                    seq_before: 4,
+                    seq_before: 5,
                     seq_after: 4,
                     reason: "bad-gap".to_string(),
                     detected_at_ms: now_ms(),

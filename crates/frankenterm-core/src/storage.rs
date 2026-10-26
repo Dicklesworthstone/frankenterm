@@ -936,6 +936,13 @@ enum WriteCommand {
     RecordGap {
         pane_id: u64,
         reason: String,
+        /// Caller-supplied `(seq_before, seq_after)` bounds. When `Some`, the
+        /// backend writes these verbatim (with `reason` stored unmodified)
+        /// instead of deriving bounds from `MAX(seq)` or parsing the reason.
+        /// ft-5yi36: the ingest path uses `Some((seq, seq))` to encode a
+        /// leading gap — content missing immediately before segment `seq`,
+        /// with nothing before it.
+        explicit_bounds: Option<(u64, u64)>,
         /// Delegated capture hold retained through durable writer completion.
         capture_hold: Option<CapturePersistenceHold>,
         respond: oneshot::Sender<Result<Option<Gap>>>,
@@ -4235,8 +4242,31 @@ impl StorageHandle {
         pane_id: u64,
         reason: &str,
     ) -> Result<Option<Gap>> {
-        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, None)
+        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, None, None)
             .await
+    }
+
+    /// ft-5yi36: record a gap with caller-supplied `(seq_before, seq_after)`
+    /// bounds, bypassing the `MAX(seq)` derivation. Used by the ingest persist
+    /// path to encode a leading gap as `(seq, seq)` after the first segment of
+    /// an otherwise-empty pane has been appended. The `reason` is stored
+    /// verbatim.
+    pub async fn record_gap_with_bounds_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        reason: &str,
+        seq_before: u64,
+        seq_after: u64,
+    ) -> Result<Option<Gap>> {
+        self.record_gap_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            reason,
+            Some((seq_before, seq_after)),
+            None,
+        )
+        .await
     }
 
     /// Capture-authorized writer handoff for a continuity gap.
@@ -4247,8 +4277,29 @@ impl StorageHandle {
         reason: &str,
         capture_hold: CapturePersistenceHold,
     ) -> Result<Option<Gap>> {
-        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, Some(capture_hold))
+        self.record_gap_and_capture_hold_with_cx(cx, pane_id, reason, None, Some(capture_hold))
             .await
+    }
+
+    /// Capture-authorized writer handoff for a gap with explicit bounds
+    /// (ft-5yi36 leading gap). See [`Self::record_gap_with_bounds_with_cx`].
+    pub(crate) async fn record_capture_gap_with_bounds_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        reason: &str,
+        seq_before: u64,
+        seq_after: u64,
+        capture_hold: CapturePersistenceHold,
+    ) -> Result<Option<Gap>> {
+        self.record_gap_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            reason,
+            Some((seq_before, seq_after)),
+            Some(capture_hold),
+        )
+        .await
     }
 
     async fn record_gap_and_capture_hold_with_cx(
@@ -4256,6 +4307,7 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         pane_id: u64,
         reason: &str,
+        explicit_bounds: Option<(u64, u64)>,
         capture_hold: Option<CapturePersistenceHold>,
     ) -> Result<Option<Gap>> {
         Self::checkpoint_storage_operation(cx, "record_gap")?;
@@ -4266,6 +4318,7 @@ impl StorageHandle {
                 WriteCommand::RecordGap {
                     pane_id,
                     reason: reason.to_string(),
+                    explicit_bounds,
                     capture_hold,
                     respond: tx,
                 },
@@ -12900,6 +12953,7 @@ enum PendingEventOrGap {
     Gap {
         pane_id: u64,
         reason: String,
+        explicit_bounds: Option<(u64, u64)>,
         capture_hold: Option<CapturePersistenceHold>,
         respond: WriterResultResponder<Option<Gap>>,
     },
@@ -12920,11 +12974,13 @@ impl PendingEventOrGap {
             PendingEventOrGap::Gap {
                 pane_id,
                 reason,
+                explicit_bounds,
                 capture_hold,
                 respond,
             } => WriteCommand::RecordGap {
                 pane_id,
                 reason,
+                explicit_bounds,
                 capture_hold,
                 respond: respond.into_sender(),
             },
@@ -12948,11 +13004,13 @@ fn pending_event_or_gap_from_command(
         WriteCommand::RecordGap {
             pane_id,
             reason,
+            explicit_bounds,
             capture_hold,
             respond,
         } => Ok(PendingEventOrGap::Gap {
             pane_id,
             reason,
+            explicit_bounds,
             capture_hold,
             respond: WriterResultResponder::new(respond),
         }),
@@ -13093,12 +13151,15 @@ fn event_gap_group_commit_inner(
                 results.push(EventGapCommitResult::Event(outcome));
             }
             PendingEventOrGap::Gap {
-                pane_id, reason, ..
+                pane_id,
+                reason,
+                explicit_bounds,
+                ..
             } => {
                 // Same pre-step the raw gap path runs (in-memory redactor drop,
                 // no DB write); keeps the persisted statement stream identical.
                 flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, *pane_id)?;
-                let gap = record_gap_backend(backend, *pane_id, reason)?;
+                let gap = record_gap_backend(backend, *pane_id, reason, *explicit_bounds)?;
                 results.push(EventGapCommitResult::Gap(gap));
             }
         }
@@ -15631,6 +15692,7 @@ mod writer_io_scheduler_tests {
         WriteCommand::RecordGap {
             pane_id,
             reason: reason.to_string(),
+            explicit_bounds: None,
             capture_hold: None,
             respond: tx,
         }
@@ -17500,6 +17562,7 @@ mod writer_io_scheduler_tests {
                 PendingEventOrGap::Gap {
                     pane_id: 7,
                     reason: "capture gap".to_string(),
+                    explicit_bounds: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(gtx),
                 },
@@ -17611,6 +17674,7 @@ mod writer_io_scheduler_tests {
             PendingEventOrGap::Gap {
                 pane_id: 7,
                 reason: "capture gap before later failure".to_string(),
+                explicit_bounds: None,
                 capture_hold: None,
                 respond: WriterResultResponder::new(gap_tx),
             },
@@ -18378,6 +18442,7 @@ mod writer_io_scheduler_tests {
             !is_linger_eligible(&WriteCommand::RecordGap {
                 pane_id: 1,
                 reason: "gap".to_string(),
+                explicit_bounds: None,
                 capture_hold: None,
                 respond: tx,
             }),
@@ -18832,13 +18897,14 @@ fn dispatch_write_command_raw(
         WriteCommand::RecordGap {
             pane_id,
             reason,
+            explicit_bounds,
             capture_hold,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
             let result =
                 flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, pane_id)
-                    .and_then(|()| record_gap_backend(backend, pane_id, &reason));
+                    .and_then(|()| record_gap_backend(backend, pane_id, &reason, explicit_bounds));
             respond_oneshot_best_effort(respond, result);
             drop(capture_hold);
         }
@@ -21255,11 +21321,26 @@ fn record_gap_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
     reason: &str,
+    explicit_bounds: Option<(u64, u64)>,
 ) -> Result<Option<Gap>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
-    let explicit_bounds = parse_distributed_gap_reason(reason);
-    let (seq_before, seq_after) = if let Some((seq_before, seq_after)) = explicit_bounds {
+    // Bound-source precedence (ft-5yi36):
+    //   1. caller-supplied `explicit_bounds` (e.g. the ingest leading-gap path);
+    //   2. bounds parsed from a `distributed_gap:<reason>:<before>:<after>` reason;
+    //   3. `MAX(seq)`-derived `(last_seq, last_seq + 1)` for an ordinary local gap.
+    // In cases (1) and (2) the `reason` column is stored verbatim.
+    let resolved_bounds = explicit_bounds.or_else(|| parse_distributed_gap_reason(reason));
+    let (seq_before, seq_after) = if let Some((seq_before, seq_after)) = resolved_bounds {
+        // A leading gap encodes "content missing immediately before `seq_after`,
+        // with nothing before it" as `seq_before == seq_after`. Only a strictly
+        // decreasing pair is malformed (ft-5yi36 relaxed `>` to `>=`).
+        if seq_after < seq_before {
+            return Err(StorageError::Database(format!(
+                "output_gaps bounds out of order: seq_before={seq_before} > seq_after={seq_after}"
+            ))
+            .into());
+        }
         (seq_before, seq_after)
     } else {
         // Get the last sequence for this pane
@@ -21330,7 +21411,9 @@ fn parse_distributed_gap_reason(reason: &str) -> Option<(u64, u64)> {
     let (reason_text, seq_before_raw) = prefix_with_reason.rsplit_once(':')?;
     let seq_before = seq_before_raw.parse::<u64>().ok()?;
     let seq_after = seq_after_raw.parse::<u64>().ok()?;
-    if reason_text.is_empty() || seq_after <= seq_before {
+    // ft-5yi36: `seq_after == seq_before` is a valid leading-gap encoding; only a
+    // strictly decreasing pair is rejected (was `seq_after <= seq_before`).
+    if reason_text.is_empty() || seq_after < seq_before {
         return None;
     }
     Some((seq_before, seq_after))

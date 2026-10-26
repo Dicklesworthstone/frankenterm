@@ -2429,40 +2429,36 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
     )
     .await?;
 
-    // ft-5yi36 (open, analysis recorded here so it is not re-litigated): this
-    // retry fires only when the pre-append call returned `None`, which happens
-    // only when the pane had no prior segment. The bounds it then produces are
-    // imprecise — `append_segment` has just assigned seq 0, so `MAX(seq)` is 0
-    // and the row lands as (seq_before=0, seq_after=1), which reads as "content
-    // is missing between segments 0 and 1" when the discontinuity actually
-    // precedes segment 0.
+    // ft-5yi36 (fixed): the pre-append `record_gap` returns `None` only when the
+    // pane had no prior segment, i.e. this gap *is* the pane's first segment.
+    // `append_segment` has just assigned it a sequence (`stored.seq`), so there
+    // is nothing before it — the discontinuity precedes `stored.seq` rather than
+    // lying between two stored segments.
     //
-    // Dropping the retry to avoid the imprecise row was tried and REVERTED: it
-    // makes a pane's first-ever gap, and the truncation gap of a pane's first
-    // oversized segment, record nothing at all — no `output_gaps` row and no
-    // `GapDetected` event, since the runtime publishes that event only when this
-    // field is `Some`. Silently losing the only durable record of a
-    // discontinuity is the exact failure class the capture pipeline exists to
-    // prevent, and three tests pin it deliberately
-    // (`fresh_eyes_persist_initial_gap_records_gap_after_first_segment_exists`,
-    // its `_with_cx` sibling, and
-    // `persist_captured_oversized_delta_records_truncation_gap`).
+    // Record it with EXPLICIT leading-gap bounds `(stored.seq, stored.seq)`: the
+    // approved encoding where `seq_before == seq_after` means "content is missing
+    // immediately before `seq_after`, with nothing before it". This replaces the
+    // earlier retry that re-derived bounds from `MAX(seq)` and produced the
+    // dishonest `(0, 1)` ("missing between segments 0 and 1"). Dropping the retry
+    // entirely was previously tried and reverted because it recorded no row and
+    // emitted no `GapDetected` event at all (the runtime publishes that event
+    // only when this field is `Some`); the explicit-bounds path keeps the durable
+    // record and the signal while making the bounds honest.
     //
-    // A correct fix needs an honest encoding for a leading gap, which
-    // `output_gaps` cannot express today: `seq_before` and `seq_after` are both
-    // NOT NULL and the explicit-bounds path requires `seq_after > seq_before`,
-    // so "nothing precedes this" has no representation. That is a schema and
-    // consumer-contract decision, not a local edit.
+    // Non-leading gaps are unaffected: the pre-append call already returned
+    // `Some((seq_before, seq_before + 1))` for them, so `gap.is_none()` is false
+    // and this block is skipped.
     let mut gap = gap;
 
     if gap.is_none()
         && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
     {
-        gap = record_gap_with_optional_capture_hold(
+        gap = record_leading_gap_with_optional_capture_hold(
             cx,
             storage,
             bounded_segment.pane_id,
             reason,
+            stored.seq,
             guard,
         )
         .await?;
@@ -2507,6 +2503,38 @@ async fn record_gap_with_optional_capture_hold(
                 .await
         }
         None => storage.record_gap_with_cx(cx, pane_id, reason).await,
+    }
+}
+
+/// ft-5yi36: record a leading gap with explicit `(seq, seq)` bounds — content
+/// missing immediately before segment `seq`, with nothing before it. Routes
+/// through the capture-authorized writer when a persistence guard is held.
+async fn record_leading_gap_with_optional_capture_hold(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    reason: &str,
+    seq: u64,
+    guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+) -> Result<Option<Gap>> {
+    match guard {
+        Some(guard) => {
+            storage
+                .record_capture_gap_with_bounds_with_cx(
+                    cx,
+                    pane_id,
+                    reason,
+                    seq,
+                    seq,
+                    guard.delegate_storage()?,
+                )
+                .await
+        }
+        None => {
+            storage
+                .record_gap_with_bounds_with_cx(cx, pane_id, reason, seq, seq)
+                .await
+        }
     }
 }
 
@@ -5609,8 +5637,11 @@ mod tests {
                 .expect("initial gap should be recorded after first segment insert");
             assert_eq!(persisted.segment.seq, 0);
             assert_eq!(gap.pane_id, 1);
+            // ft-5yi36: a pane's first-ever segment being a gap is a leading gap
+            // — encoded `seq_before == seq_after == stored.seq` (nothing precedes
+            // segment 0), not the old dishonest `(0, 1)`.
             assert_eq!(gap.seq_before, 0);
-            assert_eq!(gap.seq_after, 1);
+            assert_eq!(gap.seq_after, 0);
             assert_eq!(gap.reason, "overlap_not_found");
 
             handle.shutdown().await.unwrap();
@@ -5651,9 +5682,79 @@ mod tests {
                 .expect("initial cx gap should be recorded after first segment insert");
             assert_eq!(persisted.segment.seq, 0);
             assert_eq!(gap.pane_id, 1);
+            // ft-5yi36: leading-gap encoding (see the non-cx sibling test).
             assert_eq!(gap.seq_before, 0);
-            assert_eq!(gap.seq_after, 1);
+            assert_eq!(gap.seq_after, 0);
             assert_eq!(gap.reason, "stream_overflow");
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    /// ft-5yi36: a pane whose FIRST captured segment is a gap records an honest
+    /// leading gap (`seq_before == seq_after == 0`), not the old `(0, 1)`, and
+    /// still surfaces a `Some(gap)` — the exact field the runtime keys off to
+    /// publish `GapDetected` (see `runtime.rs`: it publishes only when
+    /// `persisted.gap` is `Some`).
+    #[test]
+    fn persist_first_segment_gap_records_leading_gap_and_signals_gap_detected() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let gap_segment = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                seq_correction: 0,
+                content: "snapshot with no captured history before it\n".to_string(),
+                kind: CapturedSegmentKind::Gap {
+                    reason: "backpressure_overflow".to_string(),
+                },
+                captured_at: 0,
+            };
+
+            let persisted =
+                persist_captured_segment(&handle, &gap_segment, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                    .await
+                    .unwrap();
+
+            // The GapDetected signal: the runtime publishes the event iff this is
+            // `Some`. A leading gap must therefore not be silently dropped.
+            let gap = persisted
+                .gap
+                .expect("a pane's first-ever gap must still produce a durable gap signal");
+            assert_eq!(persisted.segment.seq, 0);
+            assert_eq!(gap.pane_id, 1);
+            assert_eq!(gap.reason, "backpressure_overflow");
+            // Honest leading-gap bounds: missing content precedes segment 0 with
+            // nothing before it — NOT `(0, 1)` ("missing between 0 and 1").
+            assert_eq!(gap.seq_before, 0);
+            assert_eq!(gap.seq_after, 0);
+
+            // The durable row carries the same honest bounds.
+            let gaps = handle.get_gaps().await.unwrap();
+            assert_eq!(gaps.len(), 1);
+            assert_eq!((gaps[0].seq_before, gaps[0].seq_after), (0, 0));
+            assert_eq!(gaps[0].reason, "backpressure_overflow");
+
+            // The signal round-trips into the event the runtime would publish.
+            let event = crate::events::Event::GapDetected {
+                pane_id: gap.pane_id,
+                seq_before: gap.seq_before,
+                seq_after: gap.seq_after,
+                reason: gap.reason.clone(),
+                detected_at_ms: gap.detected_at,
+            };
+            assert!(matches!(
+                event,
+                crate::events::Event::GapDetected {
+                    seq_before: 0,
+                    seq_after: 0,
+                    ..
+                }
+            ));
 
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
@@ -6008,6 +6109,12 @@ mod tests {
                 gap.reason
             );
             assert!(gap.reason.contains("max_bytes=32"));
+            // ft-5yi36: the first oversized segment of an empty pane is promoted
+            // to a gap and recorded as a leading gap — honest `(0, 0)` bounds
+            // rather than the old `(0, 1)`.
+            assert_eq!(persisted.segment.seq, 0);
+            assert_eq!(gap.seq_before, 0);
+            assert_eq!(gap.seq_after, 0);
             assert_eq!(persisted.segment.content, expected_tail);
             assert_eq!(persisted.segment.content.len(), max_segment_bytes);
 

@@ -77,8 +77,14 @@ pub struct Gap {
     /// Pane where gap occurred.
     pub pane_id: u64,
     /// Sequence number before gap.
+    ///
+    /// ft-5yi36: `seq_before == seq_after` denotes a *leading gap* — content is
+    /// missing immediately before `seq_after`, with nothing before it (the gap
+    /// precedes the pane's first segment). Otherwise `seq_after > seq_before`
+    /// and the missing content lies strictly between the two sequences.
     pub seq_before: u64,
-    /// Sequence number after gap.
+    /// Sequence number after gap. See [`Self::seq_before`] for the leading-gap
+    /// (`seq_before == seq_after`) encoding.
     pub seq_after: u64,
     /// Reason for gap.
     pub reason: String,

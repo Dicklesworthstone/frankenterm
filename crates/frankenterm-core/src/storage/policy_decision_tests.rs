@@ -3340,7 +3340,7 @@ fn can_record_gap_on_discontinuity() {
     let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     // Record a gap (simulating a discontinuity detected)
-    let gap = record_gap_backend(&backend, 1, "sequence_jump")
+    let gap = record_gap_backend(&backend, 1, "sequence_jump", None)
         .unwrap()
         .expect("should return gap");
 
@@ -3409,7 +3409,7 @@ fn gap_reasons_are_stable() {
     ];
 
     for reason in &reasons {
-        record_gap_backend(&backend, 1, reason).unwrap();
+        record_gap_backend(&backend, 1, reason, None).unwrap();
     }
 
     let conn = backend
@@ -3448,7 +3448,7 @@ fn distributed_explicit_gap_reason_preserves_reported_bounds() {
 
     let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
-    let gap = record_gap_backend(&backend, 1, "distributed_gap:timeout:1:4")
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:timeout:1:4", None)
         .unwrap()
         .expect("distributed explicit gap should be recorded");
 
@@ -3471,7 +3471,7 @@ fn distributed_explicit_gap_reason_records_start_of_stream_gap() {
 
     let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
-    let gap = record_gap_backend(&backend, 1, "distributed_gap:startup_replay:0:3")
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:startup_replay:0:3", None)
         .unwrap()
         .expect("explicit distributed gaps must not be dropped at stream start");
 
@@ -3494,13 +3494,81 @@ fn distributed_explicit_gap_reason_allows_colons_in_reason_text() {
 
     let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
-    let gap = record_gap_backend(&backend, 1, "distributed_gap:session:restart:4:9")
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:session:restart:4:9", None)
         .unwrap()
         .expect("colon-bearing distributed gap reason should still parse bounds");
 
     assert_eq!(gap.seq_before, 4);
     assert_eq!(gap.seq_after, 9);
     assert_eq!(gap.reason, "distributed_gap:session:restart:4:9");
+}
+
+#[test]
+fn explicit_bounds_record_leading_gap_with_equal_seqs_and_verbatim_reason() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+    // The pane's first segment (seq 0) has already been appended.
+    conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 0i64, "post-gap snapshot", 17, now_ms],
+        )
+        .unwrap();
+
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
+
+    // ft-5yi36: an explicit `(0, 0)` leading gap must be stored verbatim rather
+    // than deriving `(0, 1)` from MAX(seq). The reason stays unmangled.
+    let gap = record_gap_backend(&backend, 1, "overlap_not_found", Some((0, 0)))
+        .unwrap()
+        .expect("leading gap with explicit bounds must be recorded");
+
+    assert_eq!(gap.seq_before, 0);
+    assert_eq!(gap.seq_after, 0);
+    assert_eq!(gap.reason, "overlap_not_found");
+
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
+    let (seq_before, seq_after, reason): (i64, i64, String) = conn
+        .query_row(
+            "SELECT seq_before, seq_after, reason FROM output_gaps WHERE pane_id = ?1",
+            [1i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(seq_before, 0);
+    assert_eq!(seq_after, 0);
+    assert_eq!(reason, "overlap_not_found");
+}
+
+#[test]
+fn explicit_bounds_reject_strictly_decreasing_seqs() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
+
+    // `seq_after < seq_before` is still malformed after the ft-5yi36 relaxation.
+    let err = record_gap_backend(&backend, 1, "overlap_not_found", Some((3, 2)))
+        .expect_err("strictly decreasing explicit bounds must be rejected");
+    assert!(
+        err.to_string().contains("out of order"),
+        "unexpected error for decreasing bounds: {err}"
+    );
 }
 
 // =========================================================================

@@ -270,23 +270,18 @@ fn gaps_are_recorded_for_gap_segments() {
     });
 }
 
-/// ft-5yi36 (open): a gap that is a pane's FIRST segment must still be recorded.
+/// ft-5yi36 (fixed): a gap that is a pane's FIRST segment is recorded as an
+/// honest *leading gap*.
 ///
-/// The bounds such a row gets today are imprecise — `record_gap` derives them
-/// from `MAX(seq)`, so a post-append retry yields (seq_before=0, seq_after=1),
-/// which reads as "content is missing between segments 0 and 1" when the
-/// discontinuity actually precedes segment 0. Removing that retry to avoid the
-/// imprecise row was tried under ft-5yi36 and reverted: it makes this case (and
-/// the first-oversized-segment truncation case) record nothing at all, and the
-/// runtime publishes `GapDetected` only when a gap row comes back — so the only
-/// durable trace of the discontinuity disappears. Silent loss is strictly worse
-/// than imprecise bounds.
-///
-/// This test therefore pins the part that is settled: the record must exist.
-/// It deliberately does NOT assert the exact bounds, so the eventual fix (an
-/// honest encoding for a leading gap, which `output_gaps` cannot express while
-/// both columns are NOT NULL and the explicit-bounds path demands
-/// seq_after > seq_before) is free to change them.
+/// Such a discontinuity precedes the pane's first segment, so it is encoded with
+/// `seq_before == seq_after == stored.seq` — "content missing immediately before
+/// `seq_after`, with nothing before it". This replaces the earlier post-append
+/// retry that re-derived bounds from `MAX(seq)` and produced the dishonest
+/// `(0, 1)` ("missing between segments 0 and 1"). Dropping the gap entirely was
+/// tried and reverted (it recorded no row and emitted no `GapDetected` event —
+/// the runtime publishes that event only when a gap row comes back), so the
+/// leading-gap encoding keeps the durable record and the signal while making the
+/// bounds truthful.
 ///
 /// Reachable in production via `emit_overflow_gap("backpressure_overflow")`
 /// before any successful capture, and via `StreamIngester::process_output`'s
@@ -315,6 +310,9 @@ fn ft_5yi36_first_segment_gap_is_still_recorded() {
             .expect("a discontinuity must leave a durable record even as a pane's first segment");
         assert_eq!(gap.reason, "backpressure_overflow");
         assert_eq!(gap.pane_id, 5);
+        // Honest leading-gap bounds: the discontinuity precedes segment 0, so
+        // `seq_before == seq_after == 0` (not the old `(0, 1)`).
+        assert_eq!((gap.seq_before, gap.seq_after), (0, 0));
 
         // The segment itself carries the post-discontinuity snapshot.
         let segments = storage.get_segments(5, 10).await.expect("read segments");

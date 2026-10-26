@@ -10973,7 +10973,7 @@ fn load_checkpoint_capture_gaps(
          FROM output_gaps
          WHERE pane_id = ?1
            AND (typeof(seq_before) != 'integer' OR seq_before < 0
-             OR typeof(seq_after) != 'integer' OR seq_after <= seq_before
+             OR typeof(seq_after) != 'integer' OR seq_after < seq_before
              OR typeof(reason) != 'text'
              OR length(CAST(reason AS BLOB)) > ?2
              OR typeof(detected_at) != 'integer' OR detected_at < 0)",
@@ -11876,7 +11876,10 @@ fn validate_checkpoint_scrollback_prefix(
     }
     let mut prior_capture_gap = None;
     for gap in &prefix.capture_gaps {
-        if gap.seq_after <= gap.seq_before
+        // ft-5yi36: `seq_after == seq_before` is a valid leading gap (content
+        // missing before `seq_after`); only strictly decreasing bounds are
+        // malformed.
+        if gap.seq_after < gap.seq_before
             || prefix
                 .checkpoint_seq
                 .is_none_or(|checkpoint_seq| gap.seq_after > checkpoint_seq)
