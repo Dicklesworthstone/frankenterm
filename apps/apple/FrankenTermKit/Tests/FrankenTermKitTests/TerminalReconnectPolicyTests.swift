@@ -76,6 +76,35 @@ final class TerminalReconnectPolicyTests: XCTestCase {
         XCTAssertNil(policy.nextDelay)
     }
 
+    func testANewNetworkPathStartsANewBudgetOnlyForADroppedTerminal() {
+        var policy = TerminalReconnectPolicy()
+        for _ in 0..<3 { XCTAssertTrue(policy.beginRetry()) }
+        XCTAssertNil(policy.nextDelay)
+        policy.networkChanged()
+        XCTAssertEqual(policy.nextDelay, .seconds(1))
+        XCTAssertTrue(policy.beginRetry())
+        let start = ContinuousClock.now
+        policy.recordLive(at: start)
+        policy.networkChanged()
+        XCTAssertEqual(policy.attemptsUsed, 1, "a live terminal keeps its accounting")
+        policy.recordEnd(at: start.advanced(by: .seconds(1)))
+        XCTAssertEqual(policy.nextDelay, .seconds(2))
+    }
+
+    func testOnlyAUsablePathThatChangedIsANewRoute() {
+        let wifi = TerminalNetworkPath(usable: true, interfaces: ["en0"])
+        let none = TerminalNetworkPath(usable: false, interfaces: [])
+        let vpn = TerminalNetworkPath(usable: true, interfaces: ["utun4", "en0"])
+        XCTAssertFalse(wifi.isNewRoute(after: nil), "the first path is a baseline")
+        XCTAssertFalse(none.isNewRoute(after: wifi))
+        XCTAssertTrue(wifi.isNewRoute(after: none), "the network came back")
+        XCTAssertFalse(wifi.isNewRoute(after: wifi))
+        XCTAssertTrue(vpn.isNewRoute(after: wifi), "a VPN came up")
+        XCTAssertFalse(TerminalNetworkPath(usable: true, interfaces: ["en0", "utun4", "en0"]).isNewRoute(after: vpn),
+                       "the same interfaces in another order")
+        XCTAssertTrue(TerminalNetworkPath(usable: true, interfaces: ["pdp_ip0"]).isNewRoute(after: wifi), "Wi-Fi to cellular")
+    }
+
     func testMissingOrEarlierLiveTimeCannotReplenishBudget() {
         var policy = TerminalReconnectPolicy()
         XCTAssertTrue(policy.beginRetry())

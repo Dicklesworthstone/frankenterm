@@ -101,10 +101,13 @@ public struct TerminalConnectionIntent: Sendable {
 
     /// A lost or normally ended terminal is not a request for another PTY.
     /// Reauthentication may prepare a transport, but only New Session removes
-    /// this gate. Merely returning to its selected chip never does.
-    public mutating func terminalEnded(_ machineID: String) throws {
+    /// this gate. Merely returning to its selected chip never does. A lost
+    /// attachment to existing mux panes is different: reattaching creates no
+    /// PTY, so its machine comes back to those panes without New Session.
+    public mutating func terminalEnded(_ machineID: String, reattachesExistingPanes: Bool = false) throws {
         try check(machineID)
-        explicitTerminals.remove(machineID); requiresNewSession.insert(machineID)
+        explicitTerminals.remove(machineID)
+        if reattachesExistingPanes { requiresNewSession.remove(machineID) } else { requiresNewSession.insert(machineID) }
     }
 
     public mutating func disconnect(_ machineID: String) throws {

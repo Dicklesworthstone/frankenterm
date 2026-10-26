@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Network
 import Observation
 import FrankenTermKit
 import FrankenTermSSHIntegration
@@ -18,7 +19,8 @@ struct SceneMachine: Identifiable {
 /// single keyboard to exactly the selected machine. Only the active group's
 /// opted-in machines prepare in the background. Selection may open a prepared
 /// on-select route; a manual route waits for Open Terminal. A lost terminal's
-/// replacement waits for New Session, even after bounded reauthentication.
+/// replacement waits for New Session, even after bounded reauthentication; a
+/// lost attachment to existing mux panes reattaches to them on its own.
 ///
 /// Every switch, from the machine strip, a menu, a one-finger swipe or a new
 /// connection, goes through Kit's navigation coordinator: the old source's
@@ -107,6 +109,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// One retained timer per machine. Cancelled timers stay owned until their
     /// callback joins; a ready timer stays queued behind normal attempt limits.
     @ObservationIgnored private var reconnectJobs: [String: ReconnectJob] = [:]
+    /// The device's network path as last reported, and the monitor reporting it.
+    @ObservationIgnored private var networkPath: TerminalNetworkPath?
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
     private struct ControllerJob {
         let id: UUID, controllerID: UUID
         let task: Task<Void, Never>
@@ -121,10 +126,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// still use the same bounded scheduler (also useful to hosted tests).
     @ObservationIgnored private let autoConnect: Bool
 
+    /// `watchesNetworkPath` false leaves network hints to the caller (hosted
+    /// tests deliver their own).
     init(workspaceID: UUID, revision: UUID, workspaceName: String, machines: [SceneMachine],
          initialMachineID: String, connections: MobileConnections,
          initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true,
-         maximumRetainedConnections: Int = 16) throws {
+         maximumRetainedConnections: Int = 16, watchesNetworkPath: Bool = true) throws {
         self.workspaceID = workspaceID; self.revision = revision; self.autoConnect = autoConnect
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
         residency = try .init(limit: maximumRetainedConnections)
@@ -144,6 +151,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         selectedMachineID = navigation.navigation.selection?.machineID
         navigationMachineIDs = navigation.navigation.machines.map(\.id)
         navigation.onChange = { [weak self] in self?.navigationChanged() }
+        if watchesNetworkPath {
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { [weak self] path in
+                let update = TerminalNetworkPath(usable: path.status == .satisfied,
+                                                 interfaces: path.availableInterfaces.map(\.name))
+                MainActor.assumeIsolated { self?.networkPathChanged(update) }
+            }
+            monitor.start(queue: .main)
+            pathMonitor = monitor
+        }
     }
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
@@ -358,8 +375,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         case .idle, .connecting: return .connecting
         case .ready: return .ready
         case .live: return .live
-        case .couldNotConnect: return .attention
-        case .ended, .failed:
+        case .ended, .failed, .couldNotConnect:
             return autoConnect && session.dropped && connectionIntent.permitsReconnect(machineID)
                 && reconnectPolicies[machineID, default: .init()].nextDelay != nil
                 ? .connecting : .attention
@@ -537,6 +553,20 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for id in Array(reconnectPolicies.keys) { reconnectPolicies[id]?.recordEnd() }
         cancelReconnects()
         for controller in sessions.values { controller.suspendPendingTerminalCreation() }
+    }
+
+    /// A hint from the device's network path, never proof that a transport
+    /// survived. When the network comes back or changes interfaces, each
+    /// dropped machine that may reconnect gets a new retry budget; every
+    /// retry still verifies the host and signs in again.
+    func networkPathChanged(_ path: TerminalNetworkPath) {
+        let previous = networkPath
+        networkPath = path
+        guard !closed, path.isNewRoute(after: previous) else { return }
+        for (id, session) in sessions where session.dropped && connectionIntent.permitsReconnect(id) {
+            reconnectPolicies[id, default: .init()].networkChanged()
+        }
+        reconcile()
     }
 
     private func needsTailscale(_ machineID: String) -> Bool {
@@ -769,7 +799,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 try? self.connectionIntent.terminalOpened(machineID)
                 if !self.inBackground { self.reconnectPolicies[machineID, default: .init()].recordLive() }
             case .ended, .failed:
-                try? self.connectionIntent.terminalEnded(machineID)
+                let route = controller.route
+                try? self.connectionIntent.terminalEnded(machineID, reattachesExistingPanes: controller.dropped
+                    && route.mux && route.sessionCreation == .existingOnly)
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
             case .couldNotConnect:
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
@@ -1043,6 +1075,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         cancelOverview()
         cancelGroupAppearance()
         canvasGeneration = UUID()
+        pathMonitor?.cancel(); pathMonitor = nil
         cancelReconnects()
         for job in controllerJobs.values { job.task.cancel() }
         navigation.suspend()
@@ -1489,7 +1522,11 @@ struct WorkspaceTerminalScreen: View {
             case .live:
                 if session.terminal == nil { ProgressView().controlSize(.large).tint(accent) }
             case let .couldNotConnect(help):
-                connectionHelp(help, settled: session.settled) { scene.connect(machine.id) }
+                if scene.status(of: machine.id) == .connecting {
+                    connecting(machine, accent: accent, detail: "Reconnecting…")
+                } else {
+                    connectionHelp(help, settled: session.settled) { scene.connect(machine.id) }
+                }
             case let .ended(message), let .failed(message):
                 switch scene.status(of: machine.id) {
                 case .disconnected:

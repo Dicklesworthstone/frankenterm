@@ -50,4 +50,31 @@ public struct TerminalReconnectPolicy: Sendable {
         attemptsUsed = 0
         liveSince = nil
     }
+
+    /// The network came back or changed interfaces (another Wi-Fi, cellular,
+    /// a VPN coming up). Attempts on the old path say nothing about this one,
+    /// so a dropped terminal gets a new budget. A live one is unaffected.
+    public mutating func networkChanged() {
+        guard liveSince == nil else { return }
+        attemptsUsed = 0
+    }
+}
+
+/// The device's network path, reduced to what decides reconnecting: whether
+/// it is usable, and through which interfaces.
+public struct TerminalNetworkPath: Equatable, Sendable {
+    public let usable: Bool
+    public let interfaces: [String]
+
+    public init(usable: Bool, interfaces: [String]) {
+        self.usable = usable; self.interfaces = Set(interfaces).sorted()
+    }
+
+    /// A hint to retry, never proof that a transport survived: usable now,
+    /// and unusable before or through other interfaces. The first path seen
+    /// is only a baseline.
+    public func isNewRoute(after previous: TerminalNetworkPath?) -> Bool {
+        guard usable, let previous else { return false }
+        return !previous.usable || previous.interfaces != interfaces
+    }
 }

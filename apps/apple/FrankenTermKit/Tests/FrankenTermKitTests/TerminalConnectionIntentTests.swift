@@ -103,6 +103,24 @@ final class TerminalConnectionIntentTests: XCTestCase {
         }
     }
 
+    func testALostMuxAttachmentReattachesOnSelectionWithoutNewSession() throws {
+        var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "build", group: work)
+        try intent.connectionStarted("build")
+        try intent.terminalOpened("build")
+        try intent.terminalEnded("build")
+        try intent.terminalOpened("build")
+        try intent.terminalEnded("build", reattachesExistingPanes: true)
+        XCTAssertFalse(intent.requiresNewSession.contains("build"), "an earlier normal end does not linger")
+        XCTAssertTrue(intent.permitsReconnect("build"))
+        try intent.connectionStarted("build")
+        XCTAssertEqual(intent.opening("build", creation: .existingOnly), .onSelect)
+        try intent.select("gpu")
+        XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "only the machine on screen opens")
+        try intent.disconnect("build")
+        try intent.select("build")
+        XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "a disconnect still holds")
+    }
+
     func testExplicitTerminalActionKeepsItsTargetAndDisconnectRetiresIt() throws {
         var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "manual", group: work)
         try intent.requestTerminal("manual")

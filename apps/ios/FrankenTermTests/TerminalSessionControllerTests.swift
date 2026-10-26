@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import CoreText
+import Network
 import FrankenTermKit
 import FrankenTermSSH
 import FrankenTermSSHIntegration
@@ -47,6 +48,73 @@ private final class SceneMemorySigner: WorkspaceSSHSigning, @unchecked Sendable 
         try SSHUserAuthenticationSigner.sign(challenge, privateContainer: vault.item(authorization).container)
     }
     func cancel(requestID: UUID) {}
+}
+
+/// A loopback TCP relay to the live sshd, standing in for the phone's
+/// network. Taken down, it drops every relayed connection and refuses new
+/// ones; brought back, it listens on the same port again.
+private final class LoopbackRelay: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "loopback-relay")
+    private let target: NWEndpoint.Port
+    private var listener: NWListener?
+    private var connections: [NWConnection] = []
+    private(set) var port: UInt16 = 0
+
+    init(to target: UInt16) throws {
+        guard let target = NWEndpoint.Port(rawValue: target) else { throw TerminalModelError.invalid }
+        self.target = target
+    }
+
+    func up() async throws {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port) ?? .any)
+        let listener = try NWListener(using: parameters)
+        listener.newConnectionHandler = { [weak self] inbound in self?.relay(inbound) }
+        port = try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(returning: listener.port?.rawValue ?? 0)
+                case .failed(let error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            listener.start(queue: queue)
+        }
+        queue.sync { self.listener = listener }
+    }
+
+    func down() {
+        queue.sync {
+            listener?.cancel(); listener = nil
+            for connection in connections { connection.cancel() }
+            connections = []
+        }
+    }
+
+    /// Runs on the relay's queue.
+    private func relay(_ inbound: NWConnection) {
+        let outbound = NWConnection(host: .ipv4(.loopback), port: target, using: .tcp)
+        connections += [inbound, outbound]
+        for connection in [inbound, outbound] {
+            connection.stateUpdateHandler = { state in
+                if case .failed = state { inbound.cancel(); outbound.cancel() }
+            }
+            connection.start(queue: queue)
+        }
+        pipe(inbound, to: outbound); pipe(outbound, to: inbound)
+    }
+
+    private func pipe(_ from: NWConnection, to: NWConnection) {
+        from.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
+            if let data, !data.isEmpty { to.send(content: data, completion: .contentProcessed { _ in }) }
+            if complete || error != nil { from.cancel(); to.cancel() } else { self?.pipe(from, to: to) }
+        }
+    }
 }
 
 @MainActor
@@ -137,17 +205,20 @@ final class TerminalSessionControllerTests: XCTestCase {
         let relaunch: () async throws -> LiveScene
     }
 
+    /// `relayPort` routes the machines through a relay to the live sshd.
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
                            creation: TerminalSessionCreation = .onSelect,
                            muxCommand: String? = nil, directAfterMux: Bool = false,
-                           machineIDs: [String] = ["alpha", "beta"]) async throws -> LiveScene {
+                           machineIDs: [String] = ["alpha", "beta"],
+                           autoConnect: Bool = false, relayPort: UInt16? = nil) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
-        guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
+        guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
               let hostBlob = environment["FT_LIVE_SSH_HOST_KEY_B64"].flatMap({ Data(base64Encoded: $0) }),
               let outPath = environment["FT_LIVE_SSH_OUT"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_{PORT,USER,KEY_PEM_B64,HOST_KEY_B64,OUT} to run against a live sshd")
         }
+        let port = relayPort ?? sshPort
         let crypto = AppleCryptography()
         let key = try PrivateKeyRecord.fromPEM(pem, credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
@@ -178,7 +249,8 @@ final class TerminalSessionControllerTests: XCTestCase {
             await connections.activate()
             let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision,
                                                    workspaceName: "Scene", machines: machines, initialMachineID: "alpha",
-                                                   connections: connections, autoConnect: false)
+                                                   connections: connections, autoConnect: autoConnect,
+                                                   watchesNetworkPath: false)
             try await appear(scene, selecting: "alpha")
             return LiveScene(connections: connections, scene: scene, outPath: outPath, relaunch: launch)
         }
@@ -1090,6 +1162,83 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
         await assertReleased(session, connections: live.connections)
         await scene.close()
+    }
+
+    /// A dropped machine keeps retrying, and one the network stays away from
+    /// longer than its retries last comes back when the network does, with no
+    /// tap. A relay to the loopback sshd stands in for the network. A direct
+    /// shell comes back signed in, waiting for New Session (a new shell is
+    /// not the old one); through the disposable mux, when set, the machine
+    /// reattaches to the pane it was showing.
+    func testADroppedMachineComesBackWhenTheNetworkDoes() async throws {
+        try await dropAndReturn(muxCommand: nil)
+        if let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] {
+            try await dropAndReturn(muxCommand: command)
+        }
+    }
+
+    private func dropAndReturn(muxCommand: String?) async throws {
+        guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(muxCommand: muxCommand, machineIDs: ["alpha"], autoConnect: true,
+                                       relayPort: relay.port)
+        let scene = live.scene, run = UUID().uuidString.prefix(8)
+        let wifi = TerminalNetworkPath(usable: true, interfaces: ["en0"])
+        scene.networkPathChanged(wifi)
+        let first = try await connect(scene, "alpha")
+        XCTAssertEqual(first.phase, .live)
+        for _ in 0..<200 where muxCommand != nil && first.muxState?.shown == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let pane = first.muxState?.shown
+
+        // The network goes away: the connection drops and every retry is refused.
+        relay.down()
+        scene.networkPathChanged(.init(usable: false, interfaces: []))
+        var retries = Set<UUID>(), retrying = false
+        func noteRetry() { if let session = scene.sessions["alpha"], session !== first { retries.insert(session.id) } }
+        for _ in 0..<600 where scene.status(of: "alpha") != .attention {
+            noteRetry()
+            if scene.status(of: "alpha") == .connecting { retrying = true }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        noteRetry()
+        XCTAssertTrue(retrying, "while retries remain it says it is connecting")
+        XCTAssertEqual(retries.count, TerminalReconnectPolicy.maximumAttempts, "a retry that cannot connect is followed by the next")
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+
+        // The network is back but nothing has said so: with its retries spent, it waits.
+        try await relay.up()
+        let spent = scene.sessions["alpha"]
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertTrue(scene.sessions["alpha"] === spent)
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+
+        // The device reports the network back, and the machine comes back.
+        scene.networkPathChanged(wifi)
+        let expected: TerminalSessionController.Phase = muxCommand == nil ? .ready : .live
+        for _ in 0..<600 where scene.sessions["alpha"] === spent || scene.sessions["alpha"]?.phase != expected {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let back = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertEqual(back.phase, expected, "the machine came back when the network did")
+        if muxCommand == nil {
+            XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
+        } else {
+            for _ in 0..<200 where back.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertEqual(back.muxState?.shown, pane, "back to the pane it was showing")
+            let view = try shown(back)
+            try await type("echo BACK-\(run) > \(live.outPath).back", into: view)
+            let output = try await hostFile(live.outPath + ".back", containing: "BACK-\(run)")
+            XCTAssertTrue(output.contains("BACK-\(run)"), "typing reaches the pane (output: \(output))")
+            view.removeFromSuperview()
+        }
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
     /// The Mac's export lists a machine's mux route before its direct routes.

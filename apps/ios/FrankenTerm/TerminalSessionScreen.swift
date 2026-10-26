@@ -205,8 +205,10 @@ final class TerminalSessionController {
     private(set) var settled = false { didSet { if settled != oldValue { onChange?() } } }
     /// The connection went away underneath a live session (lost, failed, or
     /// the server stopped answering): worth reconnecting. A remote exit or a
-    /// close on this phone is not a drop.
+    /// close on this phone is not a drop. A retry of a drop that cannot reach
+    /// the machine is still one: the network may be back for the next try.
     private(set) var dropped = false
+    @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
     private(set) var interruptedInput = false
     private(set) var interactionProblem: String?
@@ -288,6 +290,7 @@ final class TerminalSessionController {
         self.target = target; self.connections = connections; self.focus = focus
         basePalette = target.basePalette
         route = target.routes[0]
+        retriesDrop = previous?.dropped == true
         if let previous, previous.target.workspaceID == target.workspaceID,
            previous.target.revision == target.revision, previous.target.machineID == target.machineID,
            let selected = previous.authenticatedSelection ?? previous.reconnectSelection,
@@ -1003,7 +1006,7 @@ final class TerminalSessionController {
         } catch TerminalSessionJournalError.reviewRequired {
             if !stopped { phase = .failed("The previous session on this machine is still closing. Try again in a moment.") }
         } catch let failure as ConnectFailure {
-            if !stopped { phase = .couldNotConnect(failure.help) }
+            if !stopped { dropped = retriesDrop; phase = .couldNotConnect(failure.help) }
         } catch {
             if !stopped { phase = .failed(Self.describe(error)) }
         }
