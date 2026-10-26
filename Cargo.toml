@@ -298,7 +298,7 @@ duration_suboptimal_units = "allow"
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 semver = "1.0.28"
-tantivy = "0.26.1"
+tantivy = "0.27.0"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 tracing = "0.1.44"
@@ -435,7 +435,7 @@ lazy_static = "1.5.0"
 leb128 = "0.2.6"
 libc = "0.2.186"
 libssh-rs = "0.3.6"
-lru = "0.18.0"
+lru = "0.19.0"
 maplit = "1.0.2"
 memmem = "0.1.1"
 metrics = "0.24.6"
@@ -449,7 +449,7 @@ num-derive = "0.5.1"
 num-traits = { version = "0.2", default-features = false }
 openssl = "0.10.81"
 ordered-float = { version = "5.3.0", default-features = false }
-parking_lot = "0.12"
+parking_lot = "0.13"
 passfd = "0.1.6"
 percent-encoding = "2.3.2"
 pest = "2.8.6"
@@ -459,7 +459,7 @@ predicates = "3.1.4"
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 roaring = "0.11.4"
-rstest = "0.27.0"
+rstest = "0.28.0"
 serial2 = "0.2.37"
 shared_library = "0.1.9"
 shell-words = "1.1.1"
@@ -606,8 +606,8 @@ ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankent
 zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
-wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "49.0.1", default-features = false, features = ["p1"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "50.0.0", default-features = false, features = ["p1"] }
 
 # Benchmarking
 criterion = "0.8.2"
