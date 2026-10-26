@@ -137,7 +137,10 @@ libssh2 binds a partly sent packet to its caller's buffer and refuses all other
 packets until that buffer is resent, and its keepalive buffer is a stack frame.
 So the probe is sent only when no write, resize or library packet is pending and
 the socket buffer has room for the whole packet (`SO_NWRITE`, or `SIOCOUTQ` on
-Linux); otherwise it is deferred. If a packet is still pending afterward, the
+Linux); otherwise it is deferred. libssh2 also reports success for a keepalive
+it skips because the last one left under 2 seconds before, so the session counts
+the bytes handed to the socket and reports a probe that sent nothing as deferred;
+no reply is then due. If a packet is still pending afterward, the
 session fails rather than block later input. `WorkspaceSSHLiveness` is the
 connection policy: after each quiet interval (10 s standard) it probes, and after
 two further silent intervals it closes the connection and the session ends as
