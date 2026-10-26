@@ -65,6 +65,11 @@ impl LinkUpdate {
     pub fn target_presentation_timestamp(&self) -> f64 {
         match *self {}
     }
+
+    #[must_use]
+    pub fn render_deadline(&self) -> Option<std::time::Instant> {
+        match *self {}
+    }
 }
 
 impl MetalDisplayLink {

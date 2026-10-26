@@ -16,11 +16,12 @@
 //! font scale, since a `FontConfiguration` cannot leave the main thread.
 //!
 //! On macOS 14 and later the render thread is paced by the window's
-//! `CAMetalDisplayLink` (ft-yccm0.4.1.3): frames are encoded only in its
-//! refresh callbacks, into the drawable each callback hands over, on the
-//! ticks `render_thread::VsyncCadence` picks under `max_fps`; the link is
-//! paused while nothing changes. Earlier macOS paces to the `max_fps`
-//! interval instead.
+//! `CAMetalDisplayLink` (ft-yccm0.4.1.3): active frames use the drawable each
+//! callback hands over, on the ticks `render_thread::VsyncCadence` picks
+//! under `max_fps`, and latch terminal state near its CPU submit deadline.
+//! The link pauses while nothing changes; an idle output/input wake draws
+//! once immediately before resuming it. Earlier macOS paces to the
+//! `max_fps` interval instead.
 
 use super::TermWindow;
 use super::metal_chrome::ChromeFrame;
@@ -142,9 +143,11 @@ impl VsyncSource for LinkSource {
                     }
                 }
                 self.last_target = Some(target);
+                let render_deadline = update.render_deadline();
                 *self.update.borrow_mut() = Some(update);
                 VsyncWait::Tick(VsyncTick {
                     interval: self.period(),
+                    render_deadline,
                 })
             }
             LinkWait::Interrupted => VsyncWait::Interrupted,
@@ -232,8 +235,9 @@ struct MetalDriver {
     /// The drawable size of the last presented frame, width in the high 32
     /// bits: what the window shows now.
     presented_size: Arc<AtomicU64>,
-    /// The display link's latest update, when the link paces this thread:
-    /// its drawable is the only one a frame is drawn into.
+    /// The display link's latest update, when the link paces this thread.
+    /// Active frames use this drawable; the first idle wake acquires one
+    /// directly while the display link is still paused.
     link_update: Rc<RefCell<Option<LinkUpdate>>>,
     paced_by_link: bool,
     /// The layer opacity last applied.
@@ -317,13 +321,31 @@ impl FrameDriver for MetalDriver {
     }
 
     fn frame(&mut self, surface: &Surface) -> FrameReport {
+        self.draw(surface, self.paced_by_link)
+    }
+
+    fn can_draw_on_idle_wake(&self) -> bool {
+        true
+    }
+
+    fn frame_on_idle_wake(&mut self, surface: &Surface) -> FrameReport {
+        // The scheduler calls this only while the display link is paused.
+        // Acquire a drawable directly so the first output/input does not
+        // wait for the link to start delivering callbacks again.
+        self.link_update.borrow_mut().take();
+        self.draw(surface, false)
+    }
+}
+
+impl MetalDriver {
+    fn draw(&mut self, surface: &Surface, require_link_update: bool) -> FrameReport {
         let request = Arc::clone(&self.request.lock().unwrap_or_else(PoisonError::into_inner));
         let (width, height, dpi) = surface.state.geometry();
         if self.opaque != Some(request.opaque) {
             self.renderer.configure_surface(width, request.opaque);
             self.opaque = Some(request.opaque);
         }
-        let update = if self.paced_by_link {
+        let update = if require_link_update {
             // Paced by the link, a frame is drawn only into the drawable of
             // the refresh that called for it.
             match self.link_update.borrow_mut().take() {
@@ -1056,9 +1078,9 @@ mod tests {
         assert!(!output.wake_for(pane_id), "a stopped thread is not woken");
     }
 
-    /// ft-yccm0.4.1.3 acceptance: paced by the real `CAMetalDisplayLink`,
-    /// every frame is built on a link callback, into that callback's
-    /// drawable, and an idle window pauses its link.
+    /// ft-yccm0.4.1.3/.4 acceptance: active frames use real display-link
+    /// callbacks, with at most one immediate frame per idle-to-active
+    /// transition, and an idle window pauses its link.
     ///
     /// Ignored: the link calls back only for a layer on a display, and the
     /// offscreen test layer is in no window. Its first native run
@@ -1066,7 +1088,7 @@ mod tests {
     /// belongs in the dev-GUI end-to-end run, not in a unit test.
     #[test]
     #[ignore = "CAMetalDisplayLink needs a layer on a display; the offscreen test layer gets no callbacks"]
-    fn frames_are_presented_only_from_display_link_callbacks() {
+    fn active_frames_follow_display_link_callbacks_with_one_immediate_frame_per_resume() {
         use frankenterm_gui::render_thread::IDLE_TICKS_BEFORE_PAUSE;
 
         let pane = TestPane::new(9_412_004);
@@ -1086,12 +1108,6 @@ mod tests {
             "the display link never ticked (is the test layer on a display?)"
         );
         assert!(busy.frames_presented > 0, "no frame was presented");
-        assert!(
-            busy.frames_built <= busy.vsync_ticks,
-            "{} frames from {} link callbacks: a frame was built off a callback",
-            busy.frames_built,
-            busy.vsync_ticks
-        );
 
         // Quiet: within a few ticks the link pauses and stops ticking.
         std::thread::sleep(Duration::from_millis(200));
@@ -1106,6 +1122,32 @@ mod tests {
         assert_eq!(
             idle.frames_built, paused.frames_built,
             "an idle window drew"
+        );
+
+        // Stats use independent atomics. After checking natural idle
+        // behavior above, occlusion provides a render-thread barrier: the
+        // preceding frame and link start have finished, and no new frame
+        // can begin while these cross-counter relationships are checked.
+        render.post_surface(SurfaceState {
+            occluded: true,
+            ..surface(1280, 768)
+        });
+        assert!(eventually(|| render.stats().pauses > idle.pauses));
+        let quiescent = render.stats();
+        let callback_frames = quiescent
+            .frames_built
+            .checked_sub(quiescent.immediate_frames)
+            .expect("every immediate frame was built before the thread paused");
+        assert!(
+            callback_frames <= quiescent.vsync_ticks,
+            "{} frames ({} immediate) from {} link callbacks",
+            quiescent.frames_built,
+            quiescent.immediate_frames,
+            quiescent.vsync_ticks
+        );
+        assert!(
+            quiescent.immediate_frames <= quiescent.link_starts,
+            "an immediate frame is allowed only once before each link start"
         );
     }
 

@@ -19,11 +19,11 @@ use objc2_core_foundation::{
 };
 use objc2_foundation::{NSObjectProtocol, NSRunLoop, NSString};
 use objc2_quartz_core::{
-    CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate,
-    CAMetalDrawable, CAMetalLayer,
+    CACurrentMediaTime, CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate,
+    CAMetalDisplayLinkUpdate, CAMetalDrawable, CAMetalLayer,
 };
 use std::cell::RefCell;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The run loop mode the link is scheduled in: the render thread's own.
 const RUN_LOOP_MODE: &str = "FrankenTermRenderThread";
@@ -36,6 +36,7 @@ const FOREVER: f64 = 86_400.0;
 pub struct LinkUpdate {
     pub(crate) drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     target_presentation: f64,
+    render_deadline: Option<Instant>,
 }
 
 impl LinkUpdate {
@@ -45,12 +46,30 @@ impl LinkUpdate {
     pub fn target_presentation_timestamp(&self) -> f64 {
         self.target_presentation
     }
+
+    /// The CPU submission deadline (`targetTimestamp`), converted to the
+    /// monotonic clock when the callback arrived. This precedes the target
+    /// presentation time: the drawable must be presented by this deadline,
+    /// while GPU execution may finish afterwards.
+    #[must_use]
+    pub fn render_deadline(&self) -> Option<Instant> {
+        self.render_deadline
+    }
+}
+
+fn monotonic_deadline(target: f64, host_now: f64, now: Instant) -> Option<Instant> {
+    if !target.is_finite() || !host_now.is_finite() || target <= 0.0 || host_now < 0.0 {
+        return None;
+    }
+    let remaining = (target - host_now).max(0.0);
+    now.checked_add(Duration::try_from_secs_f64(remaining).ok()?)
 }
 
 impl std::fmt::Debug for LinkUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkUpdate")
             .field("target_presentation", &self.target_presentation)
+            .field("render_deadline", &self.render_deadline)
             .finish_non_exhaustive()
     }
 }
@@ -73,8 +92,9 @@ struct DelegateIvars {
 #[allow(unsafe_code)]
 mod delegate {
     use super::{
-        CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CFRunLoop,
-        DefinedClass, DelegateIvars, LinkUpdate, NSObject, NSObjectProtocol, define_class,
+        CACurrentMediaTime, CAMetalDisplayLink, CAMetalDisplayLinkDelegate,
+        CAMetalDisplayLinkUpdate, CFRunLoop, DefinedClass, DelegateIvars, Instant, LinkUpdate,
+        NSObject, NSObjectProtocol, define_class, monotonic_deadline,
     };
 
     define_class!(
@@ -95,9 +115,15 @@ mod delegate {
                 _link: &CAMetalDisplayLink,
                 update: &CAMetalDisplayLinkUpdate,
             ) {
+                // Sample Instant first, so time spent reading the host clock
+                // can only make the converted deadline conservatively early.
+                let now = Instant::now();
+                let render_deadline =
+                    monotonic_deadline(update.targetTimestamp(), CACurrentMediaTime(), now);
                 *self.ivars().update.borrow_mut() = Some(LinkUpdate {
                     drawable: update.drawable(),
                     target_presentation: update.targetPresentationTimestamp(),
+                    render_deadline,
                 });
                 // The callback runs inside the render thread's wait: end it,
                 // whatever kind of run loop source delivered the callback.
@@ -268,5 +294,31 @@ impl RunLoopInterrupter {
 impl std::fmt::Debug for RunLoopInterrupter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunLoopInterrupter").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_deadline_conversion_preserves_remaining_time_and_rejects_invalid_clocks() {
+        let now = Instant::now();
+        assert_eq!(
+            monotonic_deadline(1024.125, 1024.0, now),
+            Some(now + Duration::from_millis(125))
+        );
+        assert_eq!(monotonic_deadline(1023.0, 1024.0, now), Some(now));
+        for (target, host) in [
+            (f64::NAN, 1.0),
+            (f64::INFINITY, 1.0),
+            (1.0, f64::NEG_INFINITY),
+            (1.0, f64::NAN),
+            (0.0, 1.0),
+            (1.0, -1.0),
+            (f64::MAX, 1.0),
+        ] {
+            assert_eq!(monotonic_deadline(target, host, now), None);
+        }
     }
 }

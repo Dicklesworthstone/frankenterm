@@ -196,6 +196,20 @@ pub trait FrameDriver {
     /// something from the tick (a display link's drawable) releases it.
     fn tick_skipped(&mut self) {}
 
+    /// Whether an idle-to-active wake can draw once before restarting the
+    /// display link. Drivers that require a callback's drawable stay tick
+    /// paced; Metal can acquire one directly while its link is paused.
+    fn can_draw_on_idle_wake(&self) -> bool {
+        false
+    }
+
+    /// Draws the first requested frame while the display link is paused.
+    /// Called only when [`Self::can_draw_on_idle_wake`] opts in and the
+    /// frame interval permits it. Subsequent frames use [`Self::frame`].
+    fn frame_on_idle_wake(&mut self, surface: &Surface) -> FrameReport {
+        self.frame(surface)
+    }
+
     /// How long the window must stay occluded before parking its surface.
     /// Frames and display ticks pause immediately; this grace period avoids
     /// reallocating drawable pools while briefly switching between windows.
@@ -276,6 +290,50 @@ pub enum VsyncWait {
 pub struct VsyncTick {
     /// The display's current refresh period.
     pub interval: Duration,
+    /// The CPU submission deadline for this drawable, when available.
+    /// This is distinct from the later target presentation timestamp.
+    pub render_deadline: Option<Instant>,
+}
+
+/// Predicts how much CPU time a frame needs before its drawable's submit
+/// deadline. The EWMA smooths cheap frames; the latest sample immediately
+/// raises the budget after a costly reshape, resize or allocation.
+#[derive(Debug, Clone, Copy, Default)]
+struct EncodeBudget {
+    average: Option<Duration>,
+    last: Duration,
+}
+
+impl EncodeBudget {
+    fn observe(&mut self, elapsed: Duration) {
+        self.average = Some(match self.average {
+            Some(average) => average
+                .saturating_sub(average / 8)
+                .saturating_add(elapsed / 8),
+            None => elapsed,
+        });
+        self.last = elapsed;
+    }
+
+    fn latch_at(&self, now: Instant, tick: VsyncTick) -> Instant {
+        let Some(average) = self.average else {
+            // Font loading and initial scene construction have no sample.
+            return now;
+        };
+        let Some(deadline) = tick.render_deadline else {
+            return now;
+        };
+        let lead = deadline.saturating_duration_since(now);
+        // A clock discontinuity or malformed timestamp must not hold a
+        // drawable indefinitely. Normal deadlines fit within two periods.
+        if lead > tick.interval.saturating_mul(2) {
+            return now;
+        }
+        let estimate = average.max(self.last);
+        let margin = (estimate / 4).max(Duration::from_micros(250));
+        let budget = estimate.saturating_add(margin);
+        deadline.checked_sub(budget).unwrap_or(now).max(now)
+    }
 }
 
 /// A refresh rate range to ask of the display, in frames per second
@@ -421,6 +479,14 @@ pub struct RenderThreadStats {
     pub vsync_ticks: u64,
     /// Times a [`VsyncSource`] was started after a pause.
     pub link_starts: u64,
+    /// Frames built immediately on an idle-to-active wake, before the link
+    /// resumes. A wake while the link is running never uses this path.
+    pub immediate_frames: u64,
+    /// Drawable updates deferred toward a display-link deadline, including
+    /// waits cancelled by occlusion or shutdown.
+    pub late_latches: u64,
+    /// Frame attempts whose CPU build/submission returned after the deadline.
+    pub submit_deadline_misses: u64,
 }
 
 #[derive(Default)]
@@ -440,6 +506,9 @@ struct Shared {
     pauses: AtomicU64,
     vsync_ticks: AtomicU64,
     link_starts: AtomicU64,
+    immediate_frames: AtomicU64,
+    late_latches: AtomicU64,
+    submit_deadline_misses: AtomicU64,
 }
 
 impl Shared {
@@ -509,8 +578,9 @@ impl RenderThread {
     }
 
     /// Like [`Self::spawn`], but `make` may also return a [`VsyncSource`]
-    /// (ft-yccm0.4.1.3): frames are then built only on its refresh ticks.
-    /// Without one the thread paces to the frame interval on its own.
+    /// (ft-yccm0.4.1.3): active frames follow its refresh ticks, with an
+    /// optional immediate frame on an idle wake. Without one the thread
+    /// paces to the frame interval on its own.
     pub fn spawn_paced<D, F>(
         name: String,
         surface: SurfaceState,
@@ -589,6 +659,9 @@ impl RenderThread {
             pauses: shared.pauses.load(Ordering::Relaxed),
             vsync_ticks: shared.vsync_ticks.load(Ordering::Relaxed),
             link_starts: shared.link_starts.load(Ordering::Relaxed),
+            immediate_frames: shared.immediate_frames.load(Ordering::Relaxed),
+            late_latches: shared.late_latches.load(Ordering::Relaxed),
+            submit_deadline_misses: shared.submit_deadline_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -636,6 +709,7 @@ fn build_frame<D: FrameDriver>(
     driver: &mut D,
     configured: &mut Option<(u32, u32, u32)>,
     surface: &Surface,
+    idle_wake: bool,
 ) -> FrameReport {
     if *configured != Some(surface.state.geometry()) {
         let (width, height, dpi) = surface.state.geometry();
@@ -644,12 +718,38 @@ fn build_frame<D: FrameDriver>(
         *configured = Some(surface.state.geometry());
         shared.reconfigures.fetch_add(1, Ordering::Relaxed);
     }
-    let report = driver.frame(surface);
+    let report = if idle_wake {
+        shared.immediate_frames.fetch_add(1, Ordering::Relaxed);
+        driver.frame_on_idle_wake(surface)
+    } else {
+        driver.frame(surface)
+    };
     shared.frames_built.fetch_add(1, Ordering::Relaxed);
     if report.presented {
         shared.frames_presented.fetch_add(1, Ordering::Relaxed);
     }
     report
+}
+
+/// Hold the callback's drawable without reentering the source's run loop:
+/// another callback must not replace it while it is waiting to be encoded.
+/// Surface changes and shutdown always unpark this wait. Ordinary output
+/// wakes coalesce, and their latest content is sampled after the wait.
+fn wait_to_latch(shared: &Shared, at: Instant, geometry: (u32, u32, u32)) -> bool {
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let surface = shared.mailbox.read();
+        if surface.state.occluded {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= at || surface.state.geometry() != geometry {
+            return true;
+        }
+        std::thread::park_timeout(at - now);
+    }
 }
 
 fn run<D: FrameDriver>(shared: &Shared, driver: D, vsync: Option<Box<dyn VsyncSource>>) {
@@ -661,12 +761,11 @@ fn run<D: FrameDriver>(shared: &Shared, driver: D, vsync: Option<Box<dyn VsyncSo
 
 /// The loop of a thread paced by a [`VsyncSource`] (ft-yccm0.4.1.3).
 ///
-/// Frames are built only on display refresh ticks, on the ticks
-/// [`VsyncCadence`] picks: at most one per `max_fps` interval, always a whole
-/// number of refresh periods apart. A wake or post starts the source and
-/// marks the next frame due; a few clean ticks pause it again, so an idle
-/// window draws nothing. The rate asked of the display follows
-/// [`preferred_frame_rate`].
+/// While active, frames use the ticks [`VsyncCadence`] picks under
+/// `max_fps`, with snapshots latched near the drawable's submit deadline.
+/// An opted-in driver may draw once on an idle wake before restarting the
+/// source. A few clean ticks pause it again, so an idle window draws
+/// nothing. The rate asked of the display follows [`preferred_frame_rate`].
 fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn VsyncSource>) {
     let _ = shared.interrupt.set(source.interrupter());
     let mut configured: Option<(u32, u32, u32)> = None;
@@ -678,6 +777,11 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
     let mut cadence = VsyncCadence::default();
     let mut activity = Activity::default();
     let mut rate: Option<FrameRateRange> = None;
+    let mut budget = EncodeBudget::default();
+    let mut last_frame: Option<Instant> = None;
+    // An immediate frame is not aligned to a tick. Bound the first tick
+    // after it by wall time, then return to the normal whole-tick cadence.
+    let mut immediate_frame_at: Option<Instant> = None;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             return;
@@ -704,6 +808,7 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
             // can make the window visible again.
             shared.pending.store(true, Ordering::Release);
             redraw_at = None;
+            budget = EncodeBudget::default();
             let timeout = occlusion.time_until_park(Instant::now());
             if matches!(source.wait(timeout), VsyncWait::Tick(_)) {
                 // A callback already queued when the link paused may still
@@ -723,6 +828,37 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
         let due = |redraw_at: Option<Instant>, now: Instant| redraw_at.is_some_and(|at| at <= now);
         let requested = shared.pending.load(Ordering::Acquire) || due(redraw_at, now);
         if requested && !running {
+            let interval = shared.min_frame_interval();
+            let paced =
+                last_frame.is_none_or(|last| now.saturating_duration_since(last) >= interval);
+            if shared.pending.load(Ordering::Acquire) && paced && driver.can_draw_on_idle_wake() {
+                // Clear before the final surface/content reads: a post or
+                // wake racing those reads must remain pending for later.
+                shared.pending.store(false, Ordering::Release);
+                let surface = shared.mailbox.read();
+                if surface.state.occluded || shared.stop.load(Ordering::Acquire) {
+                    continue;
+                }
+                if due(redraw_at, now) {
+                    redraw_at = None;
+                }
+                let started = Instant::now();
+                let report = build_frame(shared, &mut driver, &mut configured, &surface, true);
+                let finished = Instant::now();
+                budget.observe(finished.saturating_duration_since(started));
+                last_frame = Some(finished);
+                immediate_frame_at = Some(finished);
+                cadence = VsyncCadence::default();
+                if let Some(at) = report.redraw_at {
+                    redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
+                }
+                activity.record(started);
+                let wanted = preferred_frame_rate(interval, activity.busy(started));
+                if rate != Some(wanted) {
+                    source.set_rate_range(wanted);
+                    rate = Some(wanted);
+                }
+            }
             source.set_running(true);
             running = true;
             shared.link_starts.fetch_add(1, Ordering::Relaxed);
@@ -739,6 +875,15 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
         shared.vsync_ticks.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let dirty = shared.pending.load(Ordering::Acquire) || due(redraw_at, now);
+        if immediate_frame_at
+            .is_some_and(|at| now.saturating_duration_since(at) < shared.min_frame_interval())
+        {
+            // Do not turn a burst of output after the immediate frame into
+            // an extra frame inside the configured max_fps interval.
+            driver.tick_skipped();
+            continue;
+        }
+        immediate_frame_at = None;
         let ticks = ticks_per_frame(tick.interval, shared.min_frame_interval());
         match cadence.on_tick(dirty, ticks) {
             TickDecision::Frame => {}
@@ -754,19 +899,46 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
                 continue;
             }
         }
-        // The surface may have changed while waiting for the tick.
+        // A resize is unpredictable work; start it now instead of applying
+        // an old size's timing sample. Otherwise sample the newest pane
+        // output as late as the measured CPU budget permits.
         let surface = shared.mailbox.read();
-        if surface.state.occluded {
+        let latch_at = if configured == Some(surface.state.geometry()) {
+            budget.latch_at(now, tick)
+        } else {
+            now
+        };
+        if latch_at > now {
+            shared.late_latches.fetch_add(1, Ordering::Relaxed);
+        }
+        if !wait_to_latch(shared, latch_at, surface.state.geometry()) {
             driver.tick_skipped();
             continue;
         }
-        // The frame shows everything before this point; a wake after it
-        // asks for the next frame.
+        // A wake after this point asks for the next frame. Read the surface
+        // afterwards, so a post racing the latch cannot be lost.
         shared.pending.store(false, Ordering::Release);
+        let surface = shared.mailbox.read();
+        if surface.state.occluded || shared.stop.load(Ordering::Acquire) {
+            driver.tick_skipped();
+            continue;
+        }
+        let now = Instant::now();
         if due(redraw_at, now) {
             redraw_at = None;
         }
-        let report = build_frame(shared, &mut driver, &mut configured, &surface);
+        let report = build_frame(shared, &mut driver, &mut configured, &surface, false);
+        let finished = Instant::now();
+        budget.observe(finished.saturating_duration_since(now));
+        last_frame = Some(finished);
+        if tick
+            .render_deadline
+            .is_some_and(|deadline| finished > deadline)
+        {
+            shared
+                .submit_deadline_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(at) = report.redraw_at {
             redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
         }
@@ -826,6 +998,9 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
             }
         }
 
+        // Clear before the surface read, as in the display-link path. A
+        // post after this read must request another frame for its geometry.
+        shared.pending.store(false, Ordering::Release);
         let surface = shared.mailbox.read();
         follow_qos(&mut qos, &surface);
         if surface.state.occluded {
@@ -851,14 +1026,11 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
             }
             log::debug!("render thread: resumed");
         }
-        // The frame below shows everything that happened before this point;
-        // a wake after it asks for the next frame.
-        shared.pending.store(false, Ordering::Release);
         if redraw_at.is_some_and(|due| due <= Instant::now()) {
             redraw_at = None;
         }
 
-        let report = build_frame(shared, &mut driver, &mut configured, &surface);
+        let report = build_frame(shared, &mut driver, &mut configured, &surface, false);
         last_frame = Some(Instant::now());
         if let Some(at) = report.redraw_at {
             redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
@@ -1288,6 +1460,80 @@ mod tests {
     }
 
     #[test]
+    fn deadline_budget_draws_cold_late_or_invalid_ticks_without_waiting() {
+        let now = Instant::now();
+        let mut budget = EncodeBudget::default();
+        let tick = VsyncTick {
+            interval: Duration::from_millis(16),
+            render_deadline: Some(now + Duration::from_millis(16)),
+        };
+        assert_eq!(budget.latch_at(now, tick), now, "cold frames start now");
+        budget.observe(Duration::from_millis(2));
+        assert_eq!(
+            budget.latch_at(
+                now,
+                VsyncTick {
+                    render_deadline: None,
+                    ..tick
+                }
+            ),
+            now
+        );
+        for deadline in [now - Duration::from_millis(1), now + Duration::from_secs(1)] {
+            assert_eq!(
+                budget.latch_at(
+                    now,
+                    VsyncTick {
+                        render_deadline: Some(deadline),
+                        ..tick
+                    }
+                ),
+                now,
+                "past deadlines and clock discontinuities cannot defer work"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_budget_latches_late_and_recovers_after_a_costly_frame() {
+        let start = Instant::now();
+        let period = Duration::from_millis(16);
+        let mut budget = EncodeBudget::default();
+        budget.observe(Duration::from_millis(2));
+        // A simulated 2 ms frame starts 2.5 ms before the deadline: the
+        // newest input arriving during the first 13.5 ms is included.
+        let tick = VsyncTick {
+            interval: period,
+            render_deadline: Some(start + period),
+        };
+        let latch = budget.latch_at(start, tick);
+        assert_eq!(latch, start + Duration::from_micros(13_500));
+        assert!(latch + Duration::from_millis(2) < tick.render_deadline.unwrap());
+
+        // An unexpected 12 ms reshape misses once. The next frame must
+        // reserve that full cost immediately, not wait for the EWMA to rise.
+        assert!(latch + Duration::from_millis(12) > tick.render_deadline.unwrap());
+        budget.observe(Duration::from_millis(12));
+        let next = start + period;
+        let tick = VsyncTick {
+            interval: period,
+            render_deadline: Some(next + period),
+        };
+        let latch = budget.latch_at(next, tick);
+        assert_eq!(latch, next + Duration::from_millis(1));
+        assert!(latch + Duration::from_millis(12) < tick.render_deadline.unwrap());
+
+        // Cheap frames decay toward the steady budget rather than leaving
+        // the renderer permanently at the expensive sample's early latch.
+        for _ in 0..64 {
+            budget.observe(Duration::from_millis(2));
+        }
+        let latch = budget.latch_at(next, tick);
+        assert!(latch > next + Duration::from_millis(13));
+        assert!(latch + Duration::from_millis(2) < tick.render_deadline.unwrap());
+    }
+
+    #[test]
     fn ticks_per_frame_is_the_whole_number_of_refresh_periods_max_fps_allows() {
         for (refresh, max_fps, ticks) in [
             (60.0, 30.0, 2),
@@ -1350,6 +1596,7 @@ mod tests {
 
     enum LinkMessage {
         Tick(Duration),
+        DeadlineTick(VsyncTick),
         /// A callback queued before the display link was paused.
         QueuedTick(Duration),
         Interrupt,
@@ -1400,10 +1647,19 @@ mod tests {
                 };
                 match message {
                     LinkMessage::Interrupt => return VsyncWait::Interrupted,
-                    LinkMessage::Tick(_) if !self.running => continue,
+                    LinkMessage::Tick(_) | LinkMessage::DeadlineTick(_) if !self.running => {
+                        continue;
+                    }
                     LinkMessage::Tick(interval) | LinkMessage::QueuedTick(interval) => {
                         self.returned += 1;
-                        return VsyncWait::Tick(VsyncTick { interval });
+                        return VsyncWait::Tick(VsyncTick {
+                            interval,
+                            render_deadline: None,
+                        });
+                    }
+                    LinkMessage::DeadlineTick(tick) => {
+                        self.returned += 1;
+                        return VsyncWait::Tick(tick);
                     }
                 }
             }
@@ -1442,6 +1698,17 @@ mod tests {
     }
 
     impl LinkHandle {
+        /// Starts a tick without waiting for its deferred frame to finish.
+        fn deadline_tick(&self, interval: Duration, deadline: Instant) {
+            self.expected.set(self.expected.get() + 1);
+            self.tx
+                .send(LinkMessage::DeadlineTick(VsyncTick {
+                    interval,
+                    render_deadline: Some(deadline),
+                }))
+                .unwrap();
+        }
+
         /// A tick of a running link; returns once the thread has drawn or
         /// skipped it and is waiting again.
         fn tick(&self, interval: Duration) {
@@ -1486,7 +1753,11 @@ mod tests {
         }
     }
 
-    fn spawn_with_fake_link(max_fps: f64, always_dirty: bool) -> (RenderThread, LinkHandle) {
+    fn spawn_fake_link<D, F>(max_fps: f64, make_driver: F) -> (RenderThread, LinkHandle)
+    where
+        D: FrameDriver,
+        F: FnOnce(Arc<Mutex<LinkLog>>) -> D + Send + 'static,
+    {
         let (tx, rx) = std::sync::mpsc::channel();
         let settled = Arc::new(AtomicU64::new(0));
         let log = Arc::new(Mutex::new(LinkLog::default()));
@@ -1499,13 +1770,14 @@ mod tests {
             log: Arc::clone(&log),
             record: None,
         };
+        let driver_log = Arc::clone(&log);
         let thread = RenderThread::spawn_paced(
             "ft-render-link-test".to_string(),
             correlated(0),
             hz(max_fps),
             move || {
                 (
-                    DirtyDriver(always_dirty),
+                    make_driver(driver_log),
                     Some(Box::new(link) as Box<dyn VsyncSource>),
                 )
             },
@@ -1520,6 +1792,224 @@ mod tests {
         // The first frame is due at once, so the thread starts its link.
         assert!(eventually(|| handle.running() == [true]));
         (thread, handle)
+    }
+
+    fn spawn_with_fake_link(max_fps: f64, always_dirty: bool) -> (RenderThread, LinkHandle) {
+        spawn_fake_link(max_fps, move |_| DirtyDriver(always_dirty))
+    }
+
+    struct SnapshotDriver {
+        content: Arc<AtomicU64>,
+        frames: Arc<Mutex<Vec<u64>>>,
+        skipped: Arc<AtomicU64>,
+    }
+
+    impl FrameDriver for SnapshotDriver {
+        fn reconfigure(&mut self, _surface: &Surface) {}
+
+        fn frame(&mut self, _surface: &Surface) -> FrameReport {
+            self.frames
+                .lock()
+                .unwrap()
+                .push(self.content.load(Ordering::Acquire));
+            FrameReport {
+                presented: true,
+                redraw_at: None,
+            }
+        }
+
+        fn tick_skipped(&mut self) {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct SnapshotFixture {
+        thread: RenderThread,
+        link: LinkHandle,
+        content: Arc<AtomicU64>,
+        frames: Arc<Mutex<Vec<u64>>>,
+        skipped: Arc<AtomicU64>,
+    }
+
+    fn spawn_snapshot_link() -> SnapshotFixture {
+        let content = Arc::new(AtomicU64::new(1));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let skipped = Arc::new(AtomicU64::new(0));
+        let driver = SnapshotDriver {
+            content: Arc::clone(&content),
+            frames: Arc::clone(&frames),
+            skipped: Arc::clone(&skipped),
+        };
+        let (thread, link) = spawn_fake_link(120.0, move |_| driver);
+        link.tick(hz(60.0));
+        assert_eq!(*frames.lock().unwrap(), [1]);
+        SnapshotFixture {
+            thread,
+            link,
+            content,
+            frames,
+            skipped,
+        }
+    }
+
+    #[test]
+    fn a_late_latched_frame_samples_output_received_after_its_callback() {
+        let SnapshotFixture {
+            thread,
+            link,
+            content,
+            frames,
+            ..
+        } = spawn_snapshot_link();
+        thread.waker().wake();
+        link.deadline_tick(
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(eventually(|| thread.stats().late_latches == 1));
+        assert_eq!(
+            *frames.lock().unwrap(),
+            [1],
+            "the callback did not snapshot early"
+        );
+        content.store(2, Ordering::Release);
+        // All these wakes coalesce while the drawable is held. They must
+        // neither lose the new content nor cause extra frames before a tick.
+        for _ in 0..1000 {
+            thread.waker().wake();
+        }
+        assert!(eventually(|| frames.lock().unwrap().len() == 2));
+        assert_eq!(*frames.lock().unwrap(), [1, 2]);
+        assert_eq!(thread.stats().vsync_ticks, 2);
+        assert_eq!(thread.stats().immediate_frames, 0);
+    }
+
+    #[test]
+    fn occlusion_interrupts_a_late_latch_and_releases_its_drawable() {
+        let SnapshotFixture {
+            thread,
+            link,
+            frames,
+            skipped,
+            ..
+        } = spawn_snapshot_link();
+        thread.waker().wake();
+        link.deadline_tick(
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(eventually(|| thread.stats().late_latches == 1));
+        thread.post_surface(SurfaceState {
+            occluded: true,
+            ..correlated(0)
+        });
+        assert!(eventually(|| thread.stats().pauses == 1));
+        assert_eq!(*frames.lock().unwrap(), [1]);
+        assert_eq!(skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(link.running(), [true, false]);
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_late_latch_and_releases_its_drawable() {
+        let SnapshotFixture {
+            thread,
+            link,
+            frames,
+            skipped,
+            ..
+        } = spawn_snapshot_link();
+        thread.waker().wake();
+        link.deadline_tick(
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(eventually(|| thread.stats().late_latches == 1));
+        drop(thread);
+        assert_eq!(*frames.lock().unwrap(), [1]);
+        assert_eq!(skipped.load(Ordering::Relaxed), 1);
+    }
+
+    struct ImmediateDriver {
+        log: Arc<Mutex<LinkLog>>,
+    }
+
+    impl FrameDriver for ImmediateDriver {
+        fn reconfigure(&mut self, _surface: &Surface) {}
+
+        fn frame(&mut self, _surface: &Surface) -> FrameReport {
+            assert_eq!(self.log.lock().unwrap().running.last(), Some(&true));
+            FrameReport {
+                presented: true,
+                redraw_at: None,
+            }
+        }
+
+        fn can_draw_on_idle_wake(&self) -> bool {
+            true
+        }
+
+        fn frame_on_idle_wake(&mut self, _surface: &Surface) -> FrameReport {
+            assert_ne!(
+                self.log.lock().unwrap().running.last(),
+                Some(&true),
+                "direct drawable acquisition requires a paused link"
+            );
+            FrameReport {
+                presented: true,
+                redraw_at: None,
+            }
+        }
+    }
+
+    #[test]
+    fn idle_wakes_draw_immediately_but_running_wake_bursts_stay_tick_paced() {
+        let (thread, link) = spawn_fake_link(f64::INFINITY, |log| ImmediateDriver { log });
+        assert_eq!(
+            thread.stats().frames_built,
+            1,
+            "the first frame did not need a tick"
+        );
+        assert_eq!(thread.stats().immediate_frames, 1);
+        for _ in 0..IDLE_TICKS_BEFORE_PAUSE {
+            link.tick(hz(60.0));
+        }
+        assert_eq!(link.running(), [true, false]);
+        thread.waker().wake();
+        assert!(eventually(|| link.running() == [true, false, true]));
+        assert_eq!(thread.stats().frames_built, 2);
+        assert_eq!(thread.stats().immediate_frames, 2);
+        for _ in 0..1000 {
+            thread.waker().wake();
+        }
+        assert_eq!(
+            thread.stats().frames_built,
+            2,
+            "running output waits for a callback"
+        );
+        link.tick(hz(60.0));
+        assert_eq!(thread.stats().frames_built, 3);
+        assert_eq!(thread.stats().immediate_frames, 2);
+    }
+
+    #[test]
+    fn an_immediate_frame_cannot_bypass_max_fps_on_the_next_tick() {
+        let (thread, link) = spawn_fake_link(1.0, |log| ImmediateDriver { log });
+        assert_eq!(thread.stats().frames_built, 1);
+        thread.waker().wake();
+        for _ in 0..5 {
+            link.tick(hz(60.0));
+        }
+        assert_eq!(
+            thread.stats().frames_built,
+            1,
+            "early callbacks must release their drawables"
+        );
+        // Raising the cap must take effect without keeping a stale one-second
+        // immediate-frame deadline. This callback is now permitted to draw.
+        thread.set_min_frame_interval(Duration::ZERO);
+        link.tick(hz(60.0));
+        assert_eq!(thread.stats().frames_built, 2);
+        assert_eq!(thread.stats().immediate_frames, 1);
     }
 
     /// The ticks, numbered from 1, on which frames were built while the

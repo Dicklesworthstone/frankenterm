@@ -90,6 +90,8 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
     "std",
     "objc2-core-foundation",
     "objc2-metal",
+    # Convert display-link CPU submission deadlines to monotonic time.
+    "CABase",
     "CALayer",
     "CAMetalLayer",
     # Drawable resizes on the render thread commit explicitly (ft-yccm0.4.1.2).
