@@ -144,6 +144,20 @@ final class TerminalLinkTests: XCTestCase {
         XCTAssertNil(TerminalLink.at(point(1, 2), in: broken))
     }
 
+    func testAnAddressCutAtTheFramesEdgeIsNotOffered() async throws {
+        // Scrolled back: the row it wraps on into is below the frame.
+        let edge = try await frame([row(0, "see below"), row(1, "go https://example.co", wraps: true)], columns: 21)
+        XCTAssertNil(TerminalLink.at(point(1, 6), in: edge), "it may go on in the row below")
+        // Even cut just after punctuation the rules leave off its end.
+        let dotted = try await frame([row(1, "go https://ex.com/a.", wraps: true)], columns: 20)
+        XCTAssertNil(TerminalLink.at(point(1, 6), in: dotted))
+        // One that ends before the edge, or on a row that does not wrap, is whole.
+        let ended = try await frame([row(1, "go https://ex.com/ to", wraps: true)], columns: 21)
+        XCTAssertEqual(TerminalLink.at(point(1, 6), in: ended)?.destination, "https://ex.com/")
+        let unwrapped = try await frame([row(1, "go https://example.co")], columns: 21)
+        XCTAssertEqual(TerminalLink.at(point(1, 6), in: unwrapped)?.destination, "https://example.co")
+    }
+
     func testOnlyWebAndMailAddressesOpen() {
         func link(_ destination: String) -> TerminalLink { .init(destination: destination, start: point(0, 0), end: point(0, 0)) }
         XCTAssertEqual(link("https://example.com/a b").openableURL?.scheme, "https")

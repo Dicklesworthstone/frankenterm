@@ -112,7 +112,9 @@ final class TerminalConnectionIntentTests: XCTestCase {
         XCTAssertTrue(intent.permitsReconnect("build"))
         try intent.connectionStarted("build")
         XCTAssertEqual(intent.opening("build", creation: .existingOnly), .onSelect)
-        XCTAssertEqual(intent.opening("build", creation: .onSelect), .none, "a route that would start a shell waits")
+        XCTAssertEqual(intent.opening("build", creation: .onSelect), .onSelect,
+                       "a direct route reattaches to its default mux; the session opens no shell in its place")
+        XCTAssertEqual(intent.opening("build", creation: .manual), .none, "a manual route waits")
         try intent.select("gpu")
         XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "only the machine on screen opens")
         try intent.select("build")

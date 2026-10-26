@@ -106,9 +106,10 @@ public struct TerminalConnectionIntent: Sendable {
     /// A lost or normally ended terminal is not a request for another PTY.
     /// Reauthentication may prepare a transport, but only New Session removes
     /// this gate. Merely returning to its selected chip never does. A lost
-    /// attachment to existing mux panes may also attach to those panes again
-    /// on selection, since that creates no PTY; the gate still holds for any
-    /// route that would start a shell.
+    /// attachment to existing mux panes, on a mux route or a direct route's
+    /// default mux, may also attach to those panes again on selection, since
+    /// that creates no PTY; the session itself still opens no shell until
+    /// New Session clears the gate.
     public mutating func terminalEnded(_ machineID: String, reattachesExistingPanes: Bool = false) throws {
         try check(machineID)
         explicitTerminals.remove(machineID); requiresNewSession.insert(machineID)
@@ -139,8 +140,7 @@ public struct TerminalConnectionIntent: Sendable {
               startedConnections.contains(machineID) || shouldPrepare(machineID) else { return .none }
         if explicitTerminals.contains(machineID), creation.permitsOpening(explicit: true) { return .explicit }
         guard selectedMachineID == machineID, creation.permitsOpening(explicit: false),
-              !requiresNewSession.contains(machineID)
-                || (creation == .existingOnly && reattachable.contains(machineID)) else { return .none }
+              !requiresNewSession.contains(machineID) || reattachable.contains(machineID) else { return .none }
         return .onSelect
     }
 

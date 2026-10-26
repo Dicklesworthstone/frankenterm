@@ -192,10 +192,17 @@ public struct TerminalLink: Equatable, Sendable {
         let tapped = TerminalGridPoint(row: point.row, column: owners[point.column].map { row.cells[$0].column } ?? point.column)
         guard let at = cells.firstIndex(of: tapped) else { return nil }
         let whole = NSRange(location: 0, length: (text as NSString).length)
+        // The last row joined wraps on into one not joined (below the frame,
+        // or past the rows joined): an address whose text runs to its end
+        // may go on there, and a cut one is never offered.
+        let cut = frame.lines[last].wrapsToNext
         for (rule, capture) in rules {
             for match in rule.matches(in: text, range: whole) {
                 let range = match.range(at: capture)
                 guard range.location != NSNotFound, NSLocationInRange(at, range) else { continue }
+                if cut, !(text as NSString).substring(from: NSMaxRange(range)).contains(where: \.isWhitespace) {
+                    return nil
+                }
                 return TerminalLink(destination: (text as NSString).substring(with: range),
                                     start: cells[range.location], end: cells[NSMaxRange(range) - 1])
             }
