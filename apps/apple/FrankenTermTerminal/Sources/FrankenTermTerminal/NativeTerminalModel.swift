@@ -16,6 +16,9 @@ public final class NativeTerminalModel: TerminalSessionModel, @unchecked Sendabl
     private var handle: UInt64
     private var closing = false
 
+    /// Keeps at most `scrollbackRows` of history, fewer beside a grid too
+    /// large for them. A mux pane's mirror sends no more history than the
+    /// default keeps (`frankenterm_mobile_mux::mirror::history_rows`).
     public init(source: TerminalSource, geometry: TerminalSessionGeometry,
                 scrollbackRows: UInt32 = 256, fontRevision: UInt64 = 1) throws {
         guard MemoryLayout<ft_terminal_v1_config>.size == 80 else { throw TerminalModelError.unsupported }

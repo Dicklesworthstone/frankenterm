@@ -40,13 +40,13 @@ struct Config {
 }
 
 impl Config {
-    /// The phone's model keeps at most 4096 history rows
-    /// (`NativeTerminalConfig`), and only those that fit beside both
-    /// screens in `native::MAX_RESIDENT_CELLS` (`retained_scrollback_rows`).
+    /// The phone's model keeps the history the app gives it (256 rows,
+    /// `NativeTerminalModel`), and only those that fit beside both screens
+    /// in `native::MAX_RESIDENT_CELLS` (`retained_scrollback_rows`).
     fn phone(rows: usize, cols: usize) -> Self {
         Self {
             profile: TerminalFeatureProfile::NativeText,
-            scrollback: 4096.min(65_536usize.saturating_sub(2 * rows * cols) / cols.max(1)),
+            scrollback: 256.min(65_536usize.saturating_sub(2 * rows * cols) / cols.max(1)),
         }
     }
 }
@@ -214,6 +214,8 @@ pub struct Server {
     pub requests: Vec<&'static str>,
     /// GetLines requests still to answer with an ErrorResponse.
     pub refuse_lines: usize,
+    /// The row ranges GetLines asked for, in order.
+    pub line_ranges: Vec<std::ops::Range<StableRowIndex>>,
     /// The row ranges searches asked for, in order.
     pub search_ranges: Vec<std::ops::Range<StableRowIndex>>,
     /// No push follows a resize (the v0.13 handler pushes nothing itself;
@@ -244,6 +246,7 @@ impl Server {
             mouse_grabbed: false,
             requests: Vec::new(),
             refuse_lines: 0,
+            line_ranges: Vec::new(),
             search_ranges: Vec::new(),
             quiet_resize: false,
             subscribed: false,
@@ -317,6 +320,7 @@ impl Server {
             }
             MuxWireDecodedPayload::Pdu(Pdu::GetLines(GetLines { pane_id, lines })) => {
                 self.requests.push("GetLines");
+                self.line_ranges.extend(lines.iter().cloned());
                 assert_eq!(pane_id, self.pane_id);
                 if self.refuse_lines > 0 {
                     self.refuse_lines -= 1;

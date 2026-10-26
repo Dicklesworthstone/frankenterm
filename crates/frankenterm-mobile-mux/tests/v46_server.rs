@@ -4,7 +4,7 @@
 mod support;
 
 use frankenterm_mobile_mux::Event;
-use frankenterm_mobile_mux::mirror::HISTORY_ROWS;
+use frankenterm_mobile_mux::mirror::history_rows;
 use support::{Harness, all_text, assert_kept, assert_mirrored, text, wraps};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
@@ -111,19 +111,27 @@ fn a_burst_longer_than_the_catch_up_keeps_its_last_rows() {
     harness.attach();
     assert_eq!(all_text(&mut harness.phone).len(), rows);
 
-    let burst = HISTORY_ROWS + 200;
-    harness.quiet_output(&numbered(0, burst));
+    // As much history as the phone keeps: 256 rows at this size.
+    let history = history_rows(rows, 20);
+    assert_eq!(history, 256);
+    let asked = harness.server.line_ranges.len();
+    harness.quiet_output(&numbered(0, history + 200));
     harness.push();
     assert_mirrored(&mut harness);
 
-    // The rows the phone showed scroll away in their final form, then the
-    // last HISTORY_ROWS rows above the new screen follow; the rows between
-    // were never fetched.
+    // The phone holds the last `history` rows above the new screen; the
+    // rows between them and the screen it showed were never fetched.
     let remote = all_text(&mut harness.server.term);
-    let mut expected = remote_rows(&mut harness, 0, rows);
-    assert_eq!(expected, ["start", "line 0", "line 1", "line 2"]);
-    expected.extend_from_slice(&remote[remote.len() - rows - HISTORY_ROWS..]);
-    assert_eq!(all_text(&mut harness.phone), expected);
+    let replayed = remote.len() - rows - history;
+    assert_eq!(all_text(&mut harness.phone), remote[replayed..]);
+    let skipped = isize::try_from(rows).unwrap()..isize::try_from(replayed).unwrap();
+    assert!(skipped.len() > 100);
+    for range in &harness.server.line_ranges[asked..] {
+        assert!(
+            range.end <= skipped.start || range.start >= skipped.end,
+            "{range:?} reaches into {skipped:?}"
+        );
+    }
 }
 
 #[test]
@@ -227,9 +235,9 @@ fn a_wide_screen_is_drawn_within_the_phones_work_budget() {
     assert_kept(&mut harness);
 }
 
-/// A burst of short lines on a wide screen scrolls a thousand rows in at
-/// once. They enter blank and are not erased, which would cost the width
-/// each (206,000 here).
+/// A burst of short lines on a wide screen scrolls in, at once, as much
+/// history as the phone keeps (256 rows here) and the screen below it.
+/// They enter blank and are not erased.
 #[test]
 fn a_burst_of_short_lines_on_a_wide_screen_stays_within_the_budget() {
     let mut harness = Harness::new(30, 200);

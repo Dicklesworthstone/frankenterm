@@ -14,9 +14,19 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use termwiz::surface::{CursorVisibility, Line};
 
-/// Remote history the phone's scrollback receives when a pane is first
-/// drawn, and the most rows one catch-up after a burst of output replays.
-pub const HISTORY_ROWS: usize = 1000;
+/// The most history the phone's terminal keeps (`NativeTerminalModel`'s
+/// `scrollbackRows`).
+const PHONE_HISTORY_ROWS: usize = 256;
+/// The cells the phone's terminal holds: both screens and the history
+/// beside them (`native::MAX_RESIDENT_CELLS`).
+const PHONE_RESIDENT_CELLS: usize = 65_536;
+
+/// Remote history the phone's scrollback receives when a `rows` by `cols`
+/// pane is first drawn, and the most rows one catch-up after a burst of
+/// output replays: what the phone's terminal keeps, no more.
+pub fn history_rows(rows: usize, cols: usize) -> usize {
+    PHONE_HISTORY_ROWS.min(PHONE_RESIDENT_CELLS.saturating_sub(2 * rows * cols) / cols.max(1))
+}
 /// The largest pane, either way, a server may report; anything bigger is a
 /// broken or hostile server, whose rows the mirror would walk one by one.
 pub const MAX_PANE_CELLS_EACH_WAY: usize = 4096;
@@ -287,10 +297,11 @@ impl PaneMirror {
             };
         }
         let returning = self.shown.alt.is_some();
+        let history = history_rows(target.rows(), target.dims.cols);
         match self.shown.primary {
             None => Plan::Stream {
                 from: top
-                    .saturating_sub(offset(0, HISTORY_ROWS))
+                    .saturating_sub(offset(0, history))
                     .max(target.dims.scrollback_top)
                     .min(top),
             },
@@ -300,10 +311,10 @@ impl PaneMirror {
             Some(old_top) if top == old_top => Plan::Dirty,
             Some(old_top) => {
                 let rows = target.rows();
-                let entering = if distance(old_top, top) <= rows + HISTORY_ROWS {
+                let entering = if distance(old_top, top) <= rows + history {
                     offset(old_top, rows)
                 } else {
-                    top.saturating_sub(offset(0, HISTORY_ROWS))
+                    top.saturating_sub(offset(0, history))
                 };
                 Plan::Scroll {
                     old_top,
