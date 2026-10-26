@@ -145,4 +145,102 @@ final class WorkspaceCredentialRevocationTests: XCTestCase {
         let available = try await fixture.store.loadWithCredentialAvailability()
         XCTAssertEqual(try XCTUnwrap(available.first).credentialIDs, ["key"])
     }
+
+    private func refuses(_ store: WorkspaceStore, _ workspaceID: UUID, _ key: WorkspaceDocument.HostKey) async throws -> Bool {
+        try await store.revokedHostKeys(workspaceID: workspaceID).values.contains { $0.contains(key) }
+    }
+
+    func testOneConfirmedHostKeyRefusalCoversItsEndpointInEveryWorkspace() async throws {
+        let fixture = try await SSHWorkspaceTestFixture.make()
+        let alias = try await SSHWorkspaceTestFixture.make { $0["id"] = "alias-workspace" }
+        // The same pinned key at another host stays trusted there.
+        let other = try await SSHWorkspaceTestFixture.make(hostname: "example.net") { $0["id"] = "unrelated-workspace" }
+        XCTAssertEqual(other.host, fixture.host)
+        let aliasInstalled = try await importDistinct(alias, into: fixture.store, bundle: "alias-bundle", digest: 2)
+        let otherInstalled = try await importDistinct(other, into: fixture.store, bundle: "other-bundle", digest: 3)
+        let manager = try manager(fixture)
+        await manager.resume()
+        let receipt = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
+            key: fixture.host, confirmedByUser: true)
+        XCTAssertEqual(receipt.host, "localhost")
+        XCTAssertEqual(receipt.port, 22)
+        XCTAssertEqual(receipt.key, fixture.host)
+        XCTAssertEqual(receipt.affectedWorkspaceIDs, [fixture.installed.id, aliasInstalled.id])
+        XCTAssertTrue(receipt.retainedConnectionIDs.isEmpty)
+        let refusedHere = try await refuses(fixture.store, fixture.installed.id, fixture.host)
+        let refusedByAlias = try await refuses(fixture.store, aliasInstalled.id, fixture.host)
+        let refusedElsewhere = try await refuses(fixture.store, otherInstalled.id, fixture.host)
+        XCTAssertTrue(refusedHere)
+        XCTAssertTrue(refusedByAlias)
+        XCTAssertFalse(refusedElsewhere)
+        let readiness = try await fixture.store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
+        for entry in readiness {
+            XCTAssertEqual(entry.routes.first?.issues == [.hostIdentityRevoked], entry.workspace.id != otherInstalled.id)
+        }
+        do {
+            _ = try await fixture.broker.authorization(workspaceID: aliasInstalled.id,
+                expectedRevision: aliasInstalled.revision, routeID: "route", credentialID: "key",
+                presentedHostKey: alias.host)
+            XCTFail("The alias workspace still trusted the refused host key")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        let authorization = try await fixture.broker.authorization(workspaceID: otherInstalled.id,
+            expectedRevision: otherInstalled.revision, routeID: "route", credentialID: "key",
+            presentedHostKey: other.host)
+        XCTAssertEqual(authorization.host, "example.net")
+        // Route readiness refuses before dialing: localhost:22 would fail
+        // with a socket error or a pin mismatch, never this denial.
+        do {
+            _ = try await manager.connect(workspaceID: fixture.installed.id, expectedRevision: fixture.installed.revision,
+                machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true)
+            XCTFail("A refused host key admitted a connection")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        let permitted = await manager.permitsConnections
+        XCTAssertTrue(permitted)
+        XCTAssertEqual(fixture.vault.counts.signatures, 0)
+    }
+
+    func testAFailedHostKeyRefusalWriteIsReportedAndARetrySavesIt() async throws {
+        for afterPublication in [false, true] {
+            let persistence = RevocationFaultPersistence()
+            let fixture = try await SSHWorkspaceTestFixture.make(persistence: persistence)
+            let manager = try manager(fixture)
+            await manager.resume()
+            persistence.failNextWrite(afterPublication: afterPublication)
+            do {
+                _ = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
+                    key: fixture.host, confirmedByUser: true)
+                XCTFail("A failed write was reported as a saved refusal")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let observed = try await refuses(fixture.store, fixture.installed.id, fixture.host)
+            XCTAssertEqual(observed, afterPublication)
+            let receipt = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
+                key: fixture.host, confirmedByUser: true)
+            XCTAssertEqual(receipt.affectedWorkspaceIDs, [fixture.installed.id])
+            let reopened = WorkspaceStore(persistence: persistence, vault: fixture.vault)
+            let saved = try await refuses(reopened, fixture.installed.id, fixture.host)
+            XCTAssertTrue(saved)
+        }
+    }
+
+    func testHostKeyRefusalNeedsConfirmationAndAKeyTheWorkspacePins() async throws {
+        let fixture = try await SSHWorkspaceTestFixture.make(), manager = try manager(fixture)
+        do {
+            _ = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
+                key: fixture.host, confirmedByUser: false)
+            XCTFail("A host-key refusal omitted its explicit confirmation")
+        } catch { XCTAssertEqual(error as? WorkspaceNetworkError, .confirmationRequired) }
+        let unpinned = try WorkspaceDocument.HostKey(algorithm: fixture.host.algorithm,
+            fingerprint: "SHA256:" + Data(repeating: 255, count: 32).base64EncodedString().dropLast())
+        for (trustID, key, workspaceID) in [("trust", unpinned, fixture.installed.id),
+                                            ("missing", fixture.host, fixture.installed.id),
+                                            ("trust", fixture.host, UUID())] {
+            do {
+                _ = try await manager.revokeHostLocally(workspaceID: workspaceID, trustID: trustID, key: key,
+                    confirmedByUser: true)
+                XCTFail("An unpinned key or unknown trust consumed the saved refusal inventory")
+            } catch { XCTAssertEqual(error as? FTError, .stale) }
+        }
+        let saved = try await fixture.store.revokedHostKeys(workspaceID: fixture.installed.id)
+        XCTAssertTrue(saved.values.allSatisfy(\.isEmpty))
+    }
 }

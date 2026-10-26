@@ -402,7 +402,7 @@ public struct WorkspaceDocument: Sendable {
             case .credentialAlgorithmUnavailable: "The available credential needs an SSH key algorithm not supported by this build."
             case .hostTrustMissing: "This route needs a verified host identity."
             case .hostTrustNeedsReview: "Review the imported host identity before authentication."
-            case .hostIdentityRevoked: "All imported host identities for this route are revoked."
+            case .hostIdentityRevoked: "Every host key this route trusts is revoked or blocked on this phone."
             case .hostAlgorithmUnavailable: "No accepted host-key algorithm is supported by this build."
             case .locallyRejectedTrust: "A local host-trust rejection blocks this route."
             case .sessionPolicyMissing: "This route needs an explicit session-creation or existing-mux attachment policy."

@@ -27,6 +27,18 @@ public struct WorkspaceCredentialRevocationReceipt: Sendable {
     public let retainedConnectionIDs: Set<UUID>
 }
 
+/// Local refusal of one host key at one host and port. Every installed or later
+/// imported workspace naming that endpoint refuses the key, whatever its pins
+/// say. It changes nothing on the server or on the exporting Mac.
+public struct WorkspaceHostRevocationReceipt: Sendable {
+    public let host: String, port: UInt16
+    public let key: WorkspaceDocument.HostKey
+    public let affectedWorkspaceIDs: Set<UUID>
+    /// Native I/O is closed, but these exact owners still need input/journal
+    /// settlement. Their admission slots remain retained for an explicit retry.
+    public let retainedConnectionIDs: Set<UUID>
+}
+
 /// How a live connection notices that its server stopped answering: a dropped
 /// or changed network, a sleeping or hung host. After each `interval` with no
 /// bytes from the server the connection sends one keepalive that asks for a
@@ -211,6 +223,47 @@ public actor WorkspaceSSHConnectionManager {
         await settle(attempts: attempts, connections: connections)
         return .init(fingerprint: fingerprint, affectedWorkspaceIDs: affected,
             durableDenialConfirmed: persisted,
+            retainedConnectionIDs: Set(live.values.filter { affected.contains($0.scope.workspaceID) }.map(\.id)))
+    }
+
+    /// Confirm the exact host, port and fingerprint and disclose workspace-wide
+    /// disconnection before calling. The refusal is saved for the endpoint, so
+    /// every workspace naming the same host and port is affected. Attempts and
+    /// connections in those workspaces end even when saving fails: the error
+    /// then means the refusal may not be saved, and a retry reaffirms it.
+    public func revokeHostLocally(workspaceID: UUID, trustID: String, key: WorkspaceDocument.HostKey,
+                                  confirmedByUser: Bool) async throws -> WorkspaceHostRevocationReceipt {
+        guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+        try Task.checkCancellation()
+        let workspaces = try await store.load()
+        // Only a key the workspace pins can be refused, so arbitrary input
+        // cannot consume the bounded saved revocation inventory.
+        guard let trust = try workspaces.first(where: { $0.id == workspaceID })?.document().hostTrust
+            .first(where: { $0.id == trustID }), trust.pins.contains(key) else { throw FTError.stale }
+        var affected: Set<UUID> = [workspaceID]
+        for workspace in workspaces {
+            if try workspace.document().hostTrust.contains(where: { $0.host == trust.host && $0.port == trust.port }) {
+                affected.insert(workspace.id)
+            }
+        }
+        for id in affected { retiringWorkspaces[id, default: 0] += 1 }
+        defer {
+            for id in affected {
+                if retiringWorkspaces[id] == 1 { retiringWorkspaces.removeValue(forKey: id) }
+                else { retiringWorkspaces[id, default: 1] -= 1 }
+            }
+        }
+        let saving: Error?
+        do { try await store.revokeHostLocally(workspaceID: workspaceID, trustID: trustID, key: key); saving = nil }
+        catch { saving = error }
+
+        let attempts = pending.filter { affected.contains($0.key.workspaceID) }.map(\.value)
+        let connections = live.filter { affected.contains($0.key.workspaceID) }.map { ($0.key, $0.value) }
+        for attempt in attempts { attempt.task.cancel() }
+        for (_, connection) in connections { await connection.sealAdmission() }
+        await settle(attempts: attempts, connections: connections)
+        if let saving { throw saving }
+        return .init(host: trust.host, port: trust.port, key: key, affectedWorkspaceIDs: affected,
             retainedConnectionIDs: Set(live.values.filter { affected.contains($0.scope.workspaceID) }.map(\.id)))
     }
 

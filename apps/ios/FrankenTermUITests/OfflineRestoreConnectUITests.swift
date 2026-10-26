@@ -514,4 +514,63 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", inputs.workspace)).count, 1,
                        "the saved workspace is replaced, not added")
     }
+
+    /// Stop trusting the server's host key from Keys while connected: the
+    /// session ends, the key shows as blocked, and the machine no longer
+    /// offers Connect. Runs last: the block stays saved in this simulator.
+    @MainActor
+    func test5BlockingTheHostKeyEndsTheSessionAndKeepsItBlocked() throws {
+        let inputs = try inputs()
+        let app = launch()
+        // The previous test leaves the workspace list on screen.
+        let terminal = connect(app, inputs)
+        app.typeText("echo BLOCK-$((40+2))\n")
+        waitFor("BLOCK-42", in: terminal, timeout: 30, "the session runs before its host key is blocked")
+
+        let keys = app.buttons["Keys"]
+        for _ in 0..<2 where !keys.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = keys.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(keys.exists, "the machine page offers Keys")
+        keys.tap()
+        let block = app.buttons["Stop Trusting on This Phone"].firstMatch
+        for _ in 0..<4 where !block.isHittable { app.swipeUp() }
+        XCTAssertTrue(block.waitForExistence(timeout: 10), "Keys lists the host's trusted key")
+        // The replacement gives each route its own trust record for the one
+        // loopback host and key; Keys shows that host and key once.
+        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Stop Trusting on This Phone")).count, 1,
+                       "one row per host and port, each key once")
+        snapshot("h1-host-keys")
+        // Every trusted host key the workspace lists is blocked in turn.
+        var blocked = 0
+        while block.exists, blocked < 4 {
+            for _ in 0..<4 where !block.isHittable { app.swipeUp() }
+            block.tap()
+            let confirm = app.buttons["Stop Trusting and Disconnect"]
+            XCTAssertTrue(confirm.waitForExistence(timeout: 10), "blocking asks once, naming what disconnects")
+            if blocked == 0 { snapshot("h2-confirm") }
+            confirm.tap()
+            let saved = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@",
+                                                             "This host key is blocked on this phone")).firstMatch
+            XCTAssertTrue(saved.waitForExistence(timeout: 30), "the block is saved and reported")
+            blocked += 1
+            _ = app.staticTexts["Blocked on this phone"].waitForExistence(timeout: 10)
+            sleep(1)
+        }
+        XCTAssertFalse(block.exists, "no host key is still trusted")
+        XCTAssertTrue(app.staticTexts["Blocked on this phone"].exists, "the key shows as blocked")
+        snapshot("h3-blocked")
+        app.navigationBars["SSH Keys"].buttons["Done"].tap()
+
+        let unready = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@",
+                                                           "No route to this machine is ready")).firstMatch
+        XCTAssertTrue(unready.waitForExistence(timeout: 10), "the machine page says no route is ready")
+        XCTAssertFalse(app.buttons["Connect"].exists, "the machine no longer offers Connect")
+        XCTAssertFalse(chip(app, inputs.machine, "connected").exists, "the session to the blocked host ended")
+        app.buttons["Routes"].firstMatch.tap()
+        let why = app.staticTexts["Every host key this route trusts is revoked or blocked on this phone."].firstMatch
+        XCTAssertTrue(why.waitForExistence(timeout: 10), "the route says why it cannot connect")
+        snapshot("h4-machine-unready")
+    }
 }

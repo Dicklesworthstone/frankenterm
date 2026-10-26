@@ -134,7 +134,20 @@ final class LiveSSHTerminalTests: XCTestCase {
             "workspace": workspace], options: [.sortedKeys]))
     }
 
-    func testRestoredWorkspaceRunsARealShellRenderedThroughMetal() async throws {
+    private struct Live {
+        let installed: InstalledWorkspace, host: SSHPublicIdentity
+        let manager: WorkspaceSSHConnectionManager
+        let journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator
+        func connect() async throws -> WorkspaceSSHConnection {
+            try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
+                machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true,
+                connectionTimeout: .seconds(10), authenticationTimeout: .seconds(20))
+        }
+    }
+
+    /// The restored workspace and production connection manager for the
+    /// operator's live sshd.
+    private func live() async throws -> Live {
         let environment = ProcessInfo.processInfo.environment
         guard let port = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -161,11 +174,14 @@ final class LiveSSHTerminalTests: XCTestCase {
         let coordinator = try TerminalInputCoordinator()
         let manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal, coordinator: coordinator)
         await manager.resume()
+        return Live(installed: installed, host: host, manager: manager, journal: journal, coordinator: coordinator)
+    }
 
-        let connection = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
-            machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true,
-            connectionTimeout: .seconds(10), authenticationTimeout: .seconds(20))
-        XCTAssertEqual(connection.peer.hostKey, hostBlob, "authenticated only after the pinned host key verified")
+    func testRestoredWorkspaceRunsARealShellRenderedThroughMetal() async throws {
+        let live = try await live()
+        let manager = live.manager, journal = live.journal, coordinator = live.coordinator
+        let connection = try await live.connect()
+        XCTAssertEqual(connection.peer.hostKey, live.host.blob, "authenticated only after the pinned host key verified")
         let geometry = try TerminalSessionGeometry(columns: 64, rows: 16)
         let pump = try await connection.openTerminal(geometry: geometry)
         let model = try NativeTerminalModel(source: pump.source, geometry: geometry, scrollbackRows: 256)
@@ -213,5 +229,27 @@ final class LiveSSHTerminalTests: XCTestCase {
         let history = try await journal.records()
         XCTAssertTrue(history.first?.inputEvidence.contains(.transportAccepted) == true)
         XCTAssertTrue(history.first?.canResolve == true)
+    }
+
+    /// Stop trusting the server's key on this phone while connected: the live
+    /// connection ends, and the next connect is refused.
+    func testBlockingTheHostKeyEndsTheLiveConnectionAndRefusesTheNext() async throws {
+        let live = try await live()
+        let connection = try await live.connect()
+        let openBefore = await connection.isClosed
+        XCTAssertFalse(openBefore)
+        let key = try WorkspaceDocument.HostKey(algorithm: live.host.algorithm, fingerprint: live.host.fingerprint)
+        let receipt = try await live.manager.revokeHostLocally(workspaceID: live.installed.id, trustID: "trust",
+            key: key, confirmedByUser: true)
+        XCTAssertEqual(receipt.affectedWorkspaceIDs, [live.installed.id])
+        XCTAssertTrue(receipt.retainedConnectionIDs.isEmpty)
+        let closed = await connection.isClosed
+        XCTAssertTrue(closed, "the connection to the blocked host stayed open")
+        let remaining = await live.manager.connections()
+        XCTAssertTrue(remaining.isEmpty)
+        do {
+            _ = try await live.connect()
+            XCTFail("a blocked host key admitted a new connection")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
     }
 }

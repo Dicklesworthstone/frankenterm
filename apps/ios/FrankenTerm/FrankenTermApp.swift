@@ -41,6 +41,15 @@ struct LocalCredentialRevocationReview: Identifiable {
     fileprivate let epoch: UUID
 }
 
+struct LocalHostRevocationReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let trustID: String, displayHost: String, host: String, port: UInt16
+    let key: WorkspaceDocument.HostKey
+    let workspaceNames: [String]
+    fileprivate let epoch: UUID
+}
+
 /// Existing verified-page saves remain available alongside the current partial
 /// decoder cache. Each action keeps the original store's exact review witness.
 enum SavedOpticalScan: Identifiable, Sendable {
@@ -108,8 +117,10 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
     @ObservationIgnored private var bootstrapStarted = false
     @ObservationIgnored private var restoreDisconnection: (id: UUID, task: Task<Void, Never>)?
-    @ObservationIgnored private var credentialReviewID: UUID?
-    @ObservationIgnored private var credentialRevocation: (id: UUID, task: Task<Void, Never>)?
+    /// The latest reviewed SSH-key or host-key revocation, and the one admitted;
+    /// at most one runs at a time, and it owns its cleanup.
+    @ObservationIgnored private var keyReviewID: UUID?
+    @ObservationIgnored private var keyRevocation: (id: UUID, task: Task<Void, Never>)?
     private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
@@ -308,7 +319,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
-        guard credentialRevocation == nil, credentialImportOperation == nil else { throw WorkspaceSSHConnectionError.busy }
+        guard keyRevocation == nil, credentialImportOperation == nil else { throw WorkspaceSSHConnectionError.busy }
         if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
            document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             throw SSHAuthenticationError.denied
@@ -443,7 +454,7 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
-        credentialReviewID = nil
+        keyReviewID = nil
         workspaceRefreshEpoch = UUID()
         workspaceRefresh?.cancel()
         observations?.finish(); observations = nil
@@ -907,7 +918,7 @@ final class MobileWorkspaceModel {
               let reference = document.credentials.first(where: { $0.id == credentialID }),
               !locallyRevokedFingerprints.contains(reference.fingerprint),
               !unconfirmedCredentialRevocations.contains(reference.fingerprint) else { return }
-        credentialReviewID = nil; credentialMessage = nil
+        keyReviewID = nil; credentialMessage = nil
         credentialImport = WorkspaceKeyImportController(model: self, store: store,
             workspaceID: saved.id, revision: saved.revision, credential: reference, epoch: epoch)
     }
@@ -934,7 +945,7 @@ final class MobileWorkspaceModel {
         guard credentialImportIsCurrent(importing), !busy, credentialImportOperation == nil else {
             throw WorkspaceStoreError.staleReview
         }
-        credentialImportOperation = importing.id; busy = true; credentialReviewID = nil
+        credentialImportOperation = importing.id; busy = true; keyReviewID = nil
         workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
         let owner = liveScenes[importing.workspaceID]
         owner?.requestClose()
@@ -1011,7 +1022,7 @@ final class MobileWorkspaceModel {
         let reviewed = LocalCredentialRevocationReview(workspaceID: workspaceID, revision: saved.revision,
             credentialID: key.id, algorithm: key.algorithm, fingerprint: key.fingerprint,
             workspaceNames: names, epoch: epoch)
-        credentialReviewID = reviewed.id
+        keyReviewID = reviewed.id
         return reviewed
     }
 
@@ -1019,8 +1030,8 @@ final class MobileWorkspaceModel {
     /// Once admitted, this task owns cleanup through suspension or sheet closure.
     func revokeCredentialLocally(_ reviewed: LocalCredentialRevocationReview) {
         guard active, !busy, !showRestore, credentialImportOperation == nil,
-              credentialRevocation == nil, let store, let connections else { return }
-        guard credentialReviewID == reviewed.id, epoch == reviewed.epoch,
+              keyRevocation == nil, let store, let connections else { return }
+        guard keyReviewID == reviewed.id, epoch == reviewed.epoch,
               let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
               let document = try? saved.document(), document.credentials.contains(where: {
                   $0.id == reviewed.credentialID && $0.fingerprint == reviewed.fingerprint && $0.algorithm == reviewed.algorithm
@@ -1028,7 +1039,7 @@ final class MobileWorkspaceModel {
             credentialMessage = "This key or workspace changed. Review the key again before revoking it."
             return
         }
-        credentialReviewID = nil; credentialMessage = nil
+        keyReviewID = nil; credentialMessage = nil
         busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
         // Seal native attempt loops before the first actor hop. A refusal
         // already returned by the manager must not authorize the next key
@@ -1044,8 +1055,8 @@ final class MobileWorkspaceModel {
         // finishes, including when the review sheet or app scene disappears.
         let job = Task { [self] in
             defer {
-                if self.credentialRevocation?.id == reviewed.id {
-                    self.credentialRevocation = nil; self.busy = false
+                if self.keyRevocation?.id == reviewed.id {
+                    self.keyRevocation = nil; self.busy = false
                 }
             }
             do {
@@ -1089,7 +1100,88 @@ final class MobileWorkspaceModel {
                 self.credentialMessage = "Revocation could not be started. \(error.localizedDescription)"
             }
         }
-        credentialRevocation = (reviewed.id, job)
+        keyRevocation = (reviewed.id, job)
+    }
+
+    /// The workspaces a host-key refusal reaches: it is saved for the host
+    /// and port, so every workspace naming that endpoint refuses the key.
+    private func workspacesNaming(host: String, port: UInt16) -> [InstalledWorkspace] {
+        workspaces.filter { saved in
+            (try? saved.document())?.hostTrust.contains { $0.host == host && $0.port == port } == true
+        }
+    }
+
+    func reviewHostRevocation(workspaceID: UUID, trustID: String,
+                              key: WorkspaceDocument.HostKey) -> LocalHostRevocationReview? {
+        guard active, !busy, !showRestore, credentialImportOperation == nil, store != nil, connections != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let trust = document.hostTrust.first(where: { $0.id == trustID }),
+              trust.pins.contains(key) else { return nil }
+        let names = workspacesNaming(host: trust.host, port: trust.port).compactMap { try? $0.document().name }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        let reviewed = LocalHostRevocationReview(workspaceID: workspaceID, revision: saved.revision,
+            trustID: trust.id, displayHost: trust.displayHost, host: trust.host, port: trust.port, key: key,
+            workspaceNames: names, epoch: epoch)
+        keyReviewID = reviewed.id
+        return reviewed
+    }
+
+    /// Stop trusting one pinned host key on this phone. Sessions in every
+    /// workspace naming the host and port end first, as for a revoked key.
+    func revokeHostLocally(_ reviewed: LocalHostRevocationReview) {
+        guard active, !busy, !showRestore, credentialImportOperation == nil,
+              keyRevocation == nil, let store, let connections else { return }
+        guard keyReviewID == reviewed.id, epoch == reviewed.epoch,
+              let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
+              let document = try? saved.document(), document.hostTrust.contains(where: {
+                  $0.id == reviewed.trustID && $0.host == reviewed.host && $0.port == reviewed.port
+                      && $0.pins.contains(reviewed.key)
+              }) else {
+            credentialMessage = "This host or workspace changed. Review the host key again before blocking it."
+            return
+        }
+        keyReviewID = nil; credentialMessage = nil
+        busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        // Seal the sessions before the first actor hop: none may send input
+        // or reconnect to this host while the refusal is being saved.
+        let affectedBeforeWrite = Set(workspacesNaming(host: reviewed.host, port: reviewed.port).map(\.id))
+        let sealedOwners = liveScenes.values.filter { affectedBeforeWrite.contains($0.workspaceID) }
+        for owner in sealedOwners { owner.requestClose() }
+        let job = Task { [self] in
+            defer {
+                if self.keyRevocation?.id == reviewed.id {
+                    self.keyRevocation = nil; self.busy = false
+                }
+            }
+            do {
+                let receipt = try await connections.manager.revokeHostLocally(workspaceID: reviewed.workspaceID,
+                    trustID: reviewed.trustID, key: reviewed.key, confirmedByUser: true)
+                self.workspaceRefreshEpoch = UUID(); self.workspaceRefresh?.cancel()
+                for id in receipt.affectedWorkspaceIDs { self.localPolicies.removeValue(forKey: id) }
+                var owners = sealedOwners
+                for owner in self.liveScenes.values where receipt.affectedWorkspaceIDs.contains(owner.workspaceID)
+                    && !owners.contains(where: { $0 === owner }) { owners.append(owner) }
+                for owner in owners { owner.requestClose() }
+                for owner in owners { await owner.close() }
+                let retained = await connections.manager.connections()
+                let cleanupPending = owners.contains { $0.sessions.values.contains { !$0.settled } }
+                    || retained.contains { receipt.retainedConnectionIDs.contains($0.id) }
+                self.credentialMessage = cleanupPending
+                    ? "This host key is blocked on this phone. Affected sessions are stopped; local cleanup remains pending and will be retried when the app becomes active."
+                    : "This host key is blocked on this phone, and affected workspace sessions have been disconnected. Imported pins cannot restore trust in it."
+            } catch {
+                for owner in sealedOwners { await owner.close() }
+                // A failed write may still have landed; the refresh below
+                // shows the saved state beside the key.
+                self.credentialMessage = "Blocking this host key could not be confirmed. Affected sessions have been stopped. If the key is not shown as blocked, try again. \(error.localizedDescription)"
+            }
+            if self.active {
+                do { try await self.refreshWorkspaces(using: store, epoch: self.epoch) }
+                catch { self.credentialMessage = (self.credentialMessage ?? "") + " Device status could not be refreshed: \(error.localizedDescription)" }
+            }
+        }
+        keyRevocation = (reviewed.id, job)
     }
 
     /// Every theme a machine can wear, bundled from `ft mobile themes`.
@@ -2688,6 +2780,7 @@ private struct WorkspaceKeysSheet: View {
     @Bindable var model: MobileWorkspaceModel
     @Environment(\.dismiss) private var dismiss
     @State private var reviewed: LocalCredentialRevocationReview?
+    @State private var hostReview: LocalHostRevocationReview?
 
     private var document: WorkspaceDocument? {
         try? model.workspaces.first(where: { $0.id == workspaceID })?.document()
@@ -2735,6 +2828,7 @@ private struct WorkspaceKeysSheet: View {
                                     }.disabled(revoked || pending || model.credentialImport != nil)
                                         .accessibilityIdentifier("keys.import.\(key.id)")
                                     Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                                        hostReview = nil
                                         reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
                                     }.disabled(revoked && !pending)
                                 }.padding(.vertical, 6)
@@ -2744,7 +2838,30 @@ private struct WorkspaceKeysSheet: View {
                         } footer: {
                             Text("Revocation blocks this fingerprint in every workspace on this phone, including later imports. It does not erase stored key material or revoke access on your Mac or SSH servers.")
                         }
+                        if !document.hostTrust.isEmpty {
+                            Section {
+                                ForEach(Self.endpoints(document)) { endpoint in
+                                    hostRow(endpoint)
+                                }
+                            } header: {
+                                Text("Host Keys")
+                            } footer: {
+                                Text("Blocking a host key stops every workspace on this phone from accepting it from that host and port, including later imports. Your Mac and the server are unchanged.")
+                            }
+                        }
                     }.disabled(model.busy)
+                    .confirmationDialog("Stop Trusting This Host Key?",
+                                        isPresented: Binding(get: { hostReview != nil }, set: { if !$0 { hostReview = nil } }),
+                                        titleVisibility: .visible, presenting: hostReview) { review in
+                        Button("Stop Trusting and Disconnect", role: .destructive) { model.revokeHostLocally(review) }
+                            .disabled(model.busy || !model.active)
+                        Button("Keep Trusting", role: .cancel) { hostReview = nil }
+                    } message: { review in
+                        Text(verbatim: "\(review.displayHost) port \(review.port)\n" + review.key.algorithm + "\n" + review.key.fingerprint
+                            + "\n\nRefuse this key from this host on this phone. All sessions in these workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
+                            + review.workspaceNames.joined(separator: "\n")
+                            + "\n\nImported pins cannot restore trust in it. Your Mac and the server are unchanged.")
+                    }
                 } else {
                     ContentUnavailableView("Workspace Unavailable", systemImage: "key",
                         description: Text("Open a saved workspace to manage its key references."))
@@ -2773,8 +2890,60 @@ private struct WorkspaceKeysSheet: View {
                 + review.workspaceNames.joined(separator: "\n")
                 + "\n\nFuture imports cannot restore permission. Your Mac and SSH servers are unchanged.")
         }
-        .onChange(of: model.active) { _, active in if !active { reviewed = nil } }
-        .onDisappear { reviewed = nil }
+        .onChange(of: model.active) { _, active in if !active { reviewed = nil; hostReview = nil } }
+        .onDisappear { reviewed = nil; hostReview = nil }
+    }
+
+    /// One host and port, and each key its trust records pin there, once.
+    private struct HostEndpoint: Identifiable {
+        struct Pin: Identifiable { let trustID: String, key: WorkspaceDocument.HostKey; var id: String { key.fingerprint } }
+        let trusts: [WorkspaceDocument.HostTrust], pins: [Pin]
+        var id: String { trusts[0].id }
+    }
+
+    /// A block covers the host and port, and an export can give each route
+    /// its own trust record for the same host, so one row per endpoint.
+    private static func endpoints(_ document: WorkspaceDocument) -> [HostEndpoint] {
+        var order: [String] = [], groups: [String: [WorkspaceDocument.HostTrust]] = [:]
+        for trust in document.hostTrust {
+            let endpoint = "\(trust.port):\(trust.host)"
+            if groups[endpoint] == nil { order.append(endpoint) }
+            groups[endpoint, default: []].append(trust)
+        }
+        return order.compactMap { groups[$0] }.map { trusts in
+            var seen = Set<String>()
+            let pins = trusts.flatMap { trust in trust.pins.map { HostEndpoint.Pin(trustID: trust.id, key: $0) } }
+                .filter { seen.insert($0.key.fingerprint).inserted }
+            return HostEndpoint(trusts: trusts, pins: pins)
+        }
+    }
+
+    private func hostRow(_ endpoint: HostEndpoint) -> some View {
+        let scopes = model.localPolicies[workspaceID]?.revokedHostKeysByTrustScope ?? [:]
+        let blocked = Set(endpoint.trusts.flatMap { (scopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
+        let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
+        return VStack(alignment: .leading, spacing: 10) {
+            Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
+            ForEach(endpoint.pins) { pin in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(verbatim: pin.key.algorithm).font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: pin.key.fingerprint).font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    if blocked.contains(pin.key.fingerprint) {
+                        Label("Blocked on this phone", systemImage: "xmark.shield").font(.callout)
+                    } else if revoked.contains(pin.key.fingerprint) {
+                        Label("Revoked by this workspace", systemImage: "xmark.shield").font(.callout)
+                    } else {
+                        Label("Trusted for this host", systemImage: "checkmark.shield").font(.callout)
+                        Button("Stop Trusting on This Phone", role: .destructive) {
+                            reviewed = nil
+                            hostReview = model.reviewHostRevocation(workspaceID: workspaceID, trustID: pin.trustID,
+                                                                    key: pin.key)
+                        }.accessibilityIdentifier("hostkeys.block.\(pin.trustID)")
+                    }
+                }
+            }
+        }.padding(.vertical, 6)
     }
 }
 
@@ -2895,7 +3064,7 @@ private struct MachineWorkspaceView: View {
                 returnToTerminal()
             }
             .toolbar {
-                if !document.credentials.isEmpty {
+                if !document.credentials.isEmpty || !document.hostTrust.isEmpty {
                     Button("Keys", systemImage: "key") { showKeys = true }.disabled(model.busy)
                 }
                 Menu("Groups", systemImage: "rectangle.3.group") {
