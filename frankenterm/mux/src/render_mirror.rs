@@ -40,6 +40,7 @@ pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorR
 use frankenterm_term::render::{PackedMirrorRow, RenderRowRef};
 use frankenterm_term::screen::ScreenCoordinateWitness;
 use frankenterm_term::{Line, StableRowIndex, Terminal};
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ops::Range;
 use termwiz::hyperlink::Rule;
@@ -73,6 +74,16 @@ pub struct CaptureRequest<'a> {
     pub rules_generation: usize,
 }
 
+/// A complete native logical line had no rule matches. Exact row sequences
+/// include continuations outside the viewport; certificates belong to one
+/// mirror/rule epoch and are pruned after each capture.
+#[derive(Debug, Clone, Default)]
+struct NativeNoMatch {
+    end: StableRowIndex,
+    seqnos: Vec<SequenceNo>,
+    generation: u64,
+}
+
 /// The mirror of a pane's viewport, refreshed by [`capture_terminal_rows`].
 #[derive(Debug, Clone, Default)]
 pub struct RenderMirror {
@@ -83,6 +94,9 @@ pub struct RenderMirror {
     /// reused by viewport position; only pending rows are decoded after lock.
     packed: Vec<PackedMirrorRow>,
     pending: Vec<usize>,
+    native_no_matches: HashMap<StableRowIndex, NativeNoMatch>,
+    scan_text: String,
+    scan_seqnos: Vec<SequenceNo>,
     first: StableRowIndex,
     dimensions: Option<RenderableDimensions>,
     cursor: StableCursorPosition,
@@ -170,6 +184,7 @@ impl RenderMirror {
         for row in self.pending.drain(..) {
             self.packed[row].clear();
         }
+        self.native_no_matches.clear();
         self.witness = None;
     }
 
@@ -184,6 +199,84 @@ impl RenderMirror {
             );
             self.packed[row].clear();
         }
+    }
+
+    /// Proves that scanning an entirely native, unlinked logical line would
+    /// change no cells. Cached proofs read only row metadata on idle captures.
+    /// Anything uncertain uses the existing mutable-Line scanner instead.
+    fn native_no_match(
+        &mut self,
+        screen: &frankenterm_term::screen::Screen,
+        logical: &Range<StableRowIndex>,
+        rules: &[Rule],
+        generation: u64,
+    ) -> bool {
+        let phys = screen.stable_range(logical);
+        if phys.is_empty()
+            || screen.phys_to_stable_row_index(phys.start) != logical.start
+            || screen.phys_to_stable_row_index(phys.end) != logical.end
+        {
+            return false;
+        }
+        if phys.start > 0 {
+            if screen
+                .render_row(phys.start - 1)
+                .is_none_or(|row| row.last_cell_was_wrapped())
+            {
+                return false;
+            }
+        }
+        if screen
+            .render_row(phys.end - 1)
+            .is_none_or(|row| row.last_cell_was_wrapped())
+        {
+            // The 1,024-cell cap can split a logical line; the mutable
+            // scanner walks backward again, possibly changing that grouping.
+            // Only complete natural lines are safe to certify here.
+            return false;
+        }
+        self.scan_seqnos.clear();
+        for physical in phys.clone() {
+            let Some(row) = screen.render_row(physical) else {
+                return false;
+            };
+            if physical + 1 < phys.end && !row.last_cell_was_wrapped() {
+                return false;
+            }
+            match row {
+                RenderRowRef::Page { seqno, .. } if seqno != SEQ_ZERO => {
+                    self.scan_seqnos.push(seqno);
+                }
+                _ => return false,
+            }
+        }
+        if let Some(known) = self.native_no_matches.get_mut(&logical.start) {
+            if known.end == logical.end && known.seqnos == self.scan_seqnos {
+                known.generation = generation;
+                return true;
+            }
+        }
+
+        self.scan_text.clear();
+        let mut previous = None;
+        for physical in phys {
+            let Some(row) = screen.render_row(physical) else {
+                return false;
+            };
+            if !row.append_unlinked_native_scan_text(&mut self.scan_text, &mut previous) {
+                return false;
+            }
+        }
+        // This is a conservative proof: even an empty or non-cell-aligned
+        // RuleMatch falls back to the production scanner's exact semantics.
+        if !Rule::match_hyperlinks(&self.scan_text, rules).is_empty() {
+            return false;
+        }
+        let known = self.native_no_matches.entry(logical.start).or_default();
+        known.end = logical.end;
+        known.generation = generation;
+        std::mem::swap(&mut known.seqnos, &mut self.scan_seqnos);
+        true
     }
 
     /// The mirror's row at `stable`, if it holds one.
@@ -319,6 +412,11 @@ fn capture_rows_deferred(
         }
     }
 
+    let generation = mirror.generation.wrapping_add(1);
+    if full {
+        mirror.native_no_matches.clear();
+    }
+
     // Implicit hyperlinks: rescanning a logical line that holds a link
     // rewrites every row of it (with the line's highest seqno), so rescan
     // each logical line touching the viewport that holds a row being copied
@@ -327,6 +425,9 @@ fn capture_rows_deferred(
     // rows.
     if !request.rules.is_empty() {
         for range in logical_lines_to_rescan(term.screen(), first..end, &mirror.dirty) {
+            if mirror.native_no_match(term.screen(), &range, request.rules, generation) {
+                continue;
+            }
             let mut widened: Vec<Range<StableRowIndex>> = Vec::new();
             term.screen_mut()
                 .for_each_logical_line_in_stable_range_mut(range, |logical, lines| {
@@ -341,10 +442,12 @@ fn capture_rows_deferred(
             }
         }
     }
+    mirror
+        .native_no_matches
+        .retain(|_, known| known.generation == generation);
 
     // Refresh only dirty rows in their existing buffers. Clean rows stay at
     // their aligned position, with no placeholder or replacement row table.
-    let generation = mirror.generation.wrapping_add(1);
     let mut stats = CaptureStats {
         rows_examined: rows,
         full,
@@ -578,6 +681,7 @@ pub fn capture_pane_rows(
     mirror: &mut RenderMirror,
     request: &CaptureRequest<'_>,
 ) -> CaptureStats {
+    mirror.native_no_matches.clear();
     let dimensions = pane.get_dimensions();
     let seqno = pane.get_current_seqno();
     let alt_screen = pane.render_facts().alt_screen_active;
@@ -1177,8 +1281,8 @@ mod tests {
         };
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert_eq!(
-            stats.packed_rows, 0,
-            "scanned Line views stay authoritative"
+            stats.packed_rows, 2,
+            "only matching logical lines need authoritative Line views"
         );
         assert!(!mirror.rows()[0].hyperlinks().is_empty());
         assert!(!mirror.rows()[1].hyperlinks().is_empty());
@@ -1204,6 +1308,242 @@ mod tests {
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert_eq!(stats.packed_rows, 1);
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+    }
+
+    #[test]
+    fn default_rules_keep_native_no_match_rows_packed_and_mirrors_independent() {
+        let rules = config::default_hyperlink_rules();
+        assert_eq!(rules.len(), 6);
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        let mut term = terminal_with_engine(4, 64, GridEngine::Page);
+        term.advance_bytes("first ordinary log row\r\n界面 ready 🚀\r\nthird row\r\nfourth row");
+        let mut first = RenderMirror::new();
+        let mut second = RenderMirror::new();
+        for mirror in [&mut first, &mut second] {
+            let stats = capture_terminal_rows(&mut term, mirror, &request).unwrap();
+            assert_eq!((stats.rows_captured, stats.packed_rows), (4, 4));
+            assert_eq!(mirror.native_no_matches.len(), 4);
+            let row_storage: Vec<_> = mirror
+                .rows()
+                .iter()
+                .map(|row| (row.cells().as_ptr(), row.all_text().as_ptr()))
+                .collect();
+            mirror.scan_text.clear();
+            mirror.scan_text.push_str("already scanned");
+            let stats = capture_terminal_rows(&mut term, mirror, &request).unwrap();
+            assert_eq!((stats.rows_captured, stats.packed_rows), (0, 0));
+            assert_eq!(
+                mirror.scan_text, "already scanned",
+                "idle certificate hits must not rebuild text or run regexes"
+            );
+            assert_eq!(
+                mirror
+                    .rows()
+                    .iter()
+                    .map(|row| (row.cells().as_ptr(), row.all_text().as_ptr()))
+                    .collect::<Vec<_>>(),
+                row_storage
+            );
+        }
+        assert!((0..4).all(|physical| matches!(
+            term.screen().render_row(physical),
+            Some(RenderRowRef::Page { .. })
+        )));
+        term.advance_bytes("\x1b[3;1Hchanged third row");
+        for mirror in [&mut first, &mut second] {
+            let stats = capture_terminal_rows(&mut term, mirror, &request).unwrap();
+            assert_eq!((stats.rows_captured, stats.packed_rows), (1, 1));
+        }
+        assert_eq!(difference(&first, &second), None);
+        assert_eq!(difference(&first, &fresh(&mut term, &request)), None);
+    }
+
+    #[test]
+    fn native_no_match_certificates_are_pruned_as_output_scrolls() {
+        let rules = config::default_hyperlink_rules();
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        let mut term = terminal_with_engine(4, 40, GridEngine::Page);
+        let mut mirror = RenderMirror::new();
+        for step in 0..80 {
+            term.advance_bytes(format!("ordinary log row {step}\r\n"));
+            capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+            let end = mirror.first() + 4;
+            assert!(mirror.native_no_matches.len() <= 4);
+            assert!(mirror
+                .native_no_matches
+                .iter()
+                .all(|(start, known)| *start >= mirror.first() && known.end <= end));
+        }
+        mirror.invalidate();
+        assert!(mirror.native_no_matches.is_empty());
+    }
+
+    #[test]
+    fn native_negative_proof_is_invalidated_when_new_rules_match_unchanged_text() {
+        let defaults = config::default_hyperlink_rules();
+        let mut term = terminal_with_engine(1, 40, GridEngine::Page);
+        term.advance_bytes("issue-17");
+        let mut mirror = RenderMirror::new();
+        let initial = CaptureRequest {
+            rules: &defaults,
+            ..LIVE
+        };
+        assert_eq!(
+            capture_terminal_rows(&mut term, &mut mirror, &initial)
+                .unwrap()
+                .packed_rows,
+            1
+        );
+        assert_eq!(mirror.native_no_matches.len(), 1);
+        let seqno = term.current_seqno();
+        let changed = [Rule::new(r"issue-\d+", "https://tracker.test/$0").unwrap()];
+        let request = CaptureRequest {
+            rules: &changed,
+            rules_generation: 1,
+            ..LIVE
+        };
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert!(stats.full);
+        assert_eq!(stats.packed_rows, 0);
+        assert_eq!(term.current_seqno(), seqno, "no output forced the rescan");
+        assert!(mirror.native_no_matches.is_empty());
+        assert_eq!(
+            mirror.rows()[0].hyperlinks()[0].uri(),
+            "https://tracker.test/issue-17"
+        );
+    }
+
+    #[test]
+    fn native_link_matches_fall_back_for_wrapped_urls_wide_padding_and_email() {
+        let rules = config::default_hyperlink_rules();
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        for (rows, cols, text) in [
+            (4, 12, "see https://example.com/a_long_path"),
+            (1, 48, "界https://example.com"),
+            (1, 48, "mail user@example.com"),
+        ] {
+            let mut term = terminal_with_engine(rows, cols, GridEngine::Page);
+            term.advance_bytes(text);
+            let mut mirror = RenderMirror::new();
+            capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+            assert!(mirror.rows().iter().any(|row| !row.hyperlinks().is_empty()));
+            assert!(matches!(
+                term.screen().render_row(0),
+                Some(RenderRowRef::Line(_))
+            ));
+            if text.starts_with('界') {
+                let row = &mirror.rows()[0];
+                assert!(row.hyperlink(&row.cells()[0]).is_none());
+                assert_eq!(
+                    row.hyperlink(&row.cells()[1]).unwrap().uri(),
+                    "https://example.com"
+                );
+            }
+            assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+        }
+    }
+
+    #[test]
+    fn native_negative_proof_includes_a_continuation_below_the_viewport() {
+        let rules = config::default_hyperlink_rules();
+        let mut term = terminal_with_engine(4, 10, GridEngine::Page);
+        term.advance_bytes("a\r\nb\r\nc\r\nsee https:zzzz\r\n\r\n\r\n");
+        assert_eq!(terminal_get_dimensions(&mut term).physical_top, 4);
+        let request = CaptureRequest {
+            viewport_top: Some(0),
+            rules: &rules,
+            rules_generation: 0,
+        };
+        let mut mirror = RenderMirror::new();
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!(stats.packed_rows, 4);
+        let proof = mirror.native_no_matches.get(&3).unwrap();
+        assert_eq!((proof.end, proof.seqnos.len()), (5, 2));
+        assert!(mirror.rows()[3].hyperlinks().is_empty());
+        let unchanged = mirror.rows()[3].seqno();
+
+        term.advance_bytes("\x1b[1;1H//ab.cd");
+        assert_eq!(term.screen().render_row(3).unwrap().seqno(), unchanged);
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!((stats.rows_captured, stats.packed_rows), (1, 0));
+        assert_eq!(mirror.rows()[3].hyperlinks()[0].uri(), "https://ab.cd");
+        assert!(!mirror.native_no_matches.contains_key(&3));
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+    }
+
+    #[test]
+    fn native_no_match_proofs_refuse_cap_split_lines_and_authoritative_edits() {
+        let rules = config::default_hyperlink_rules();
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        let mut term = terminal_with_engine(4, 600, GridEngine::Page);
+        term.advance_bytes("x".repeat(1500));
+        let mut mirror = RenderMirror::new();
+        capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        for row in 0..3 {
+            assert!(!mirror
+                .native_no_matches
+                .contains_key(&(row as StableRowIndex)));
+            assert!(matches!(
+                term.screen().render_row(row),
+                Some(RenderRowRef::Line(_))
+            ));
+        }
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+
+        let mut term = terminal_with_engine(1, 40, GridEngine::Page);
+        term.advance_bytes("ordinary text");
+        let mut mirror = RenderMirror::new();
+        capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        let seqno = term.current_seqno();
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://explicit.test"))));
+        term.screen_mut()
+            .line_mut(0)
+            .set_cell(0, Cell::new('x', attrs), seqno);
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!((stats.rows_captured, stats.packed_rows), (1, 0));
+        assert_eq!(
+            mirror.rows()[0].hyperlinks()[0].uri(),
+            "https://explicit.test"
+        );
+        assert!(mirror.native_no_matches.is_empty());
+    }
+
+    #[test]
+    fn the_line_oracle_catches_a_forged_native_no_match_certificate() {
+        let rules = config::default_hyperlink_rules();
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        let mut term = terminal_with_engine(1, 64, GridEngine::Page);
+        let mut oracle = terminal_with_engine(1, 64, GridEngine::Page);
+        term.advance_bytes("ordinary text");
+        oracle.advance_bytes("ordinary text");
+        let mut mirror = RenderMirror::new();
+        capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        let output = "\x1b[1;1Hhttps://example.com\x1b[K";
+        term.advance_bytes(output);
+        oracle.advance_bytes(output);
+        // Planted fault: falsely claim the old negative scan covered the
+        // new contents. The independent Line scanner must expose the error.
+        mirror.native_no_matches.get_mut(&0).unwrap().seqnos[0] =
+            term.screen().render_row(0).unwrap().seqno();
+        capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert!(mirror.rows()[0].hyperlinks().is_empty());
+        assert!(difference(&mirror, &fresh(&mut oracle, &request)).is_some());
     }
 
     #[test]
