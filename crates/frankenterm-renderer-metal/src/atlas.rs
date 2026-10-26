@@ -196,6 +196,12 @@ impl std::fmt::Display for AtlasError {
 
 impl std::error::Error for AtlasError {}
 
+impl From<AtlasFull> for AtlasError {
+    fn from(full: AtlasFull) -> Self {
+        Self::Full(full)
+    }
+}
+
 /// Bytes of a `width x height` texture of `kind`.
 #[must_use]
 pub fn texture_bytes(kind: AtlasKind, width: u32, height: u32) -> u64 {
@@ -483,6 +489,21 @@ impl GlyphAtlas {
         height: u32,
         fence: FrameFence,
     ) -> Result<Allocation, AtlasFull> {
+        self.allocate_with_growth(width, height, fence, |_, _| Ok(()))
+    }
+
+    /// Like [`Self::allocate`], but prepares the backing texture before
+    /// publishing newly addressable pages. A failed preparation leaves all
+    /// allocation state unchanged, so a retry cannot place a glyph outside
+    /// the old texture. Existing-page placements and evictions never call
+    /// `grow`, and do not copy or stage allocator state.
+    pub(crate) fn allocate_with_growth<E: From<AtlasFull>>(
+        &mut self,
+        width: u32,
+        height: u32,
+        fence: FrameFence,
+        grow: impl FnOnce(u32, u32) -> Result<(), E>,
+    ) -> Result<Allocation, E> {
         let padded = (
             width.saturating_add(self.config.padding),
             height.saturating_add(self.config.padding),
@@ -493,7 +514,7 @@ impl GlyphAtlas {
             || padded.1 > self.config.page_height
         {
             self.stats.refusals += 1;
-            return Err(AtlasFull::TooLarge { width, height });
+            return Err(AtlasFull::TooLarge { width, height }.into());
         }
         let pages = self.pages.len();
         for offset in 0..pages {
@@ -504,6 +525,7 @@ impl GlyphAtlas {
         }
         if let Some(new_height) = self.grown_height() {
             let old_height = self.height;
+            grow(old_height, new_height)?;
             self.add_pages(new_height);
             self.generation += 1;
             self.stats.growths += 1;
@@ -530,7 +552,7 @@ impl GlyphAtlas {
             .map(|(index, _)| index);
         let Some(victim) = victim else {
             self.stats.refusals += 1;
-            return Err(AtlasFull::AllPagesInFlight);
+            return Err(AtlasFull::AllPagesInFlight.into());
         };
         let page = &mut self.pages[victim];
         page.skyline.reset();
@@ -1016,6 +1038,82 @@ mod tests {
         assert_eq!(atlas.stats().growths, 1);
         assert_eq!(atlas.stats().evictions, 1);
         assert_eq!(atlas.stats().refusals, 1);
+    }
+
+    #[test]
+    fn failed_backing_growth_leaves_pages_and_allocation_order_unchanged() {
+        for kind in AtlasKind::ALL {
+            let mut atlas = GlyphAtlas::new(kind, small_config(kind, 4)).unwrap();
+            let slots: Vec<_> = (0..8)
+                .map(|frame| atlas.allocate(64, 64, fence(frame)).unwrap().slot)
+                .collect();
+            let mut uninterrupted = atlas.clone();
+            let original_stats = atlas.stats();
+            let original_cursor = atlas.cursor;
+            for _ in 0..3 {
+                let failure = atlas.allocate_with_growth(64, 64, fence(8), |old, new| {
+                    assert_eq!((old, new), (128, 256));
+                    Err(AtlasError::Gpu(crate::FrameError::AllocationFailed {
+                        what: "test atlas backing",
+                        bytes: 256 * 256,
+                    }))
+                });
+                assert!(matches!(failure, Err(AtlasError::Gpu(_))));
+                assert_eq!(atlas.extent(), (256, 128));
+                assert_eq!(atlas.pages(), 2);
+                assert_eq!(atlas.generation(), 0);
+                assert_eq!(atlas.stats(), original_stats);
+                assert_eq!(atlas.cursor, original_cursor);
+                for slot in &slots {
+                    assert!(atlas.is_live(slot));
+                }
+                for (page, before) in atlas.pages.iter().zip(&uninterrupted.pages) {
+                    assert_eq!(page.skyline.segments, before.skyline.segments);
+                    assert_eq!(page.last_used, before.last_used);
+                    assert_eq!(page.epoch, before.epoch);
+                }
+            }
+            // The retry, subsequent placements and eventual eviction must
+            // have exactly the same slot identities and aging as if growth
+            // had succeeded on the first attempt.
+            for frame in 8..24 {
+                assert_eq!(
+                    atlas.allocate(64, 64, fence(frame)),
+                    uninterrupted.allocate(64, 64, fence(frame)),
+                );
+            }
+            assert_eq!(atlas.stats(), uninterrupted.stats());
+        }
+    }
+
+    #[test]
+    fn backing_growth_runs_only_when_a_new_page_is_required() {
+        let kind = AtlasKind::Grayscale;
+        let mut atlas = GlyphAtlas::new(kind, small_config(kind, 2)).unwrap();
+        for frame in 0..4 {
+            let allocation = atlas
+                .allocate_with_growth(
+                    256,
+                    64,
+                    FrameFence {
+                        current: frame,
+                        retired_before: frame,
+                    },
+                    |_, _| panic!("existing placements and retired-page reuse do not grow"),
+                )
+                .unwrap_or_else(|error: AtlasFull| panic!("{error:?}"));
+            assert_eq!(allocation.change.is_some(), frame >= 2);
+        }
+        let oversized = atlas.allocate_with_growth(257, 64, fence(4), |_, _| {
+            panic!("an oversized glyph cannot request backing growth")
+        });
+        assert_eq!(
+            oversized,
+            Err(AtlasFull::TooLarge {
+                width: 257,
+                height: 64
+            })
+        );
     }
 
     #[test]
