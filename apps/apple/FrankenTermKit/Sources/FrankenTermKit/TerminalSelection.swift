@@ -159,8 +159,13 @@ public struct TerminalLink: Equatable, Sendable {
            frame.links.indices.contains(row.cells[owner].linkID - 1) {
             let id = row.cells[owner].linkID
             var first = point.column, last = point.column
+            // The capture gives each linked cell its own entry: neighbors are
+            // the same link where they lead to the same place.
             func linked(_ column: Int) -> Bool {
-                owners.indices.contains(column) && owners[column].map { row.cells[$0].linkID == id } == true
+                owners.indices.contains(column) && owners[column].map { neighbor in
+                    let other = row.cells[neighbor].linkID
+                    return other == id || (frame.links.indices.contains(other - 1) && frame.links[other - 1] == frame.links[id - 1])
+                } == true
             }
             while linked(first - 1) { first -= 1 }
             while linked(last + 1) { last += 1 }

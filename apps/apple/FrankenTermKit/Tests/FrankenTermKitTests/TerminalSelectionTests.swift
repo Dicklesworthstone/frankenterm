@@ -117,6 +117,21 @@ final class TerminalLinkTests: XCTestCase {
         XCTAssertNil(TerminalLink.at(point(3, 11), in: shown))
     }
 
+    func testAProgramsLinkSpansItsCellsAsTheCaptureListsThemEachOnTheirOwn() async throws {
+        // The capture writes one entry per linked cell; the last cell leads elsewhere.
+        let cells = "PR #1!".enumerated().map { index, character in
+            TerminalRenderCell(column: 4 + index, width: 1, text: String(character), flags: 0, foreground: .default,
+                               background: .default, underline: .default, linkID: index + 1)
+        }
+        let shown = try await frame([TerminalRenderRow(stableIndex: 3, sequence: 1, cells: cells)], columns: 40,
+                                    links: Array(repeating: "https://example.com/pr/1", count: 5) + ["https://other.example/"])
+        let whole = TerminalLink(destination: "https://example.com/pr/1", start: point(3, 4), end: point(3, 8))
+        XCTAssertEqual(TerminalLink.at(point(3, 4), in: shown), whole)
+        XCTAssertEqual(TerminalLink.at(point(3, 6), in: shown), whole)
+        XCTAssertEqual(TerminalLink.at(point(3, 9), in: shown),
+                       .init(destination: "https://other.example/", start: point(3, 9), end: point(3, 9)))
+    }
+
     func testAnAddressInTheTextIsFoundByTheDesktopsRules() async throws {
         let shown = try await frame([
             row(0, "open https://ex.com/a?b=1, then (https://ex.com/x) now"),
