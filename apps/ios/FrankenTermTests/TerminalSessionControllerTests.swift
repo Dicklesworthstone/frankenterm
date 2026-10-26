@@ -58,6 +58,9 @@ private final class LoopbackRelay: @unchecked Sendable {
     private let target: NWEndpoint.Port
     private var listener: NWListener?
     private var connections: [NWConnection] = []
+    /// Bytes reach the relay and go no further, with no reset: a connection
+    /// stranded on a route the device left looks like this to the phone.
+    private var stalled = false
     private(set) var port: UInt16 = 0
 
     init(to target: UInt16) throws {
@@ -92,9 +95,11 @@ private final class LoopbackRelay: @unchecked Sendable {
         queue.sync {
             listener?.cancel(); listener = nil
             for connection in connections { connection.cancel() }
-            connections = []
+            connections = []; stalled = false
         }
     }
+
+    func stall() { queue.sync { stalled = true } }
 
     /// Runs on the relay's queue.
     private func relay(_ inbound: NWConnection) {
@@ -111,7 +116,7 @@ private final class LoopbackRelay: @unchecked Sendable {
 
     private func pipe(_ from: NWConnection, to: NWConnection) {
         from.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
-            if let data, !data.isEmpty { to.send(content: data, completion: .contentProcessed { _ in }) }
+            if let data, !data.isEmpty, self?.stalled == false { to.send(content: data, completion: .contentProcessed { _ in }) }
             if complete || error != nil { from.cancel(); to.cancel() } else { self?.pipe(from, to: to) }
         }
     }
@@ -1229,7 +1234,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         if muxCommand == nil {
             XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
         } else {
-            for _ in 0..<200 where back.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
+            // Showing the pane rebuilds the terminal view.
+            for _ in 0..<200 where back.muxState?.shown == nil || back.terminal == nil {
+                try await Task.sleep(for: .milliseconds(25))
+            }
             XCTAssertEqual(back.muxState?.shown, pane, "back to the pane it was showing")
             let view = try shown(back)
             try await type("echo BACK-\(run) > \(live.outPath).back", into: view)
@@ -1239,6 +1247,57 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A new network route is only a hint. A connection that survived it
+    /// answers the probe it prompts and stays; one stranded on the old route
+    /// (a relay that stops forwarding, as a vanished Wi-Fi address looks to
+    /// the phone) is reported lost one liveness interval after the change,
+    /// not the usual three after its last byte. Direct, then through the
+    /// disposable mux when set.
+    func testANewRouteFindsAStrandedConnectionWithinOneInterval() async throws {
+        try await strandOnNewRoute(muxCommand: nil)
+        if let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] {
+            try await strandOnNewRoute(muxCommand: command)
+        }
+    }
+
+    private func strandOnNewRoute(muxCommand: String?) async throws {
+        guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(muxCommand: muxCommand, machineIDs: ["alpha"], relayPort: relay.port)
+        let scene = live.scene
+        let wifi = TerminalNetworkPath(usable: true, interfaces: ["en0"])
+        let cellular = TerminalNetworkPath(usable: true, interfaces: ["pdp_ip0"])
+        scene.networkPathChanged(wifi)
+        let session = try await connect(scene, "alpha")
+        XCTAssertEqual(session.phase, .live)
+        for _ in 0..<200 where muxCommand != nil && session.muxState?.shown == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        // The connection survives the change: the probe is answered within its
+        // interval. After the shell's first prompt, nothing else would answer.
+        try await Task.sleep(for: .seconds(3))
+        scene.networkPathChanged(cellular)
+        try await Task.sleep(for: .seconds(13))
+        XCTAssertEqual(session.phase, .live, "a connection that survived a new route answers its probe and stays")
+
+        // Stranded on the route the device left.
+        relay.stall()
+        scene.networkPathChanged(wifi)
+        let changed = ContinuousClock.now
+        for _ in 0..<400 where !session.settled { try await Task.sleep(for: .milliseconds(50)) }
+        let detected = ContinuousClock.now - changed
+        XCTAssertEqual(session.phase, .ended(TerminalSessionController.describe(.disconnected)))
+        XCTAssertTrue(session.dropped)
+        XCTAssertLessThan(detected, .seconds(14), "one 10 s interval after the change, not three after the last byte")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
     }
 
     /// The Mac's export lists a machine's mux route before its direct routes.

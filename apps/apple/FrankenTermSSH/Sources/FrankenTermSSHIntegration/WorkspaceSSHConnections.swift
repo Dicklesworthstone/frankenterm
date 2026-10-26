@@ -44,7 +44,9 @@ public struct WorkspaceHostRevocationReceipt: Sendable {
 /// bytes from the server the connection sends one keepalive that asks for a
 /// reply; once `missedReplies` further intervals pass in silence it closes and
 /// its session ends as disconnected (about interval x (missedReplies + 1)).
-/// A live server answers every probe, so an idle terminal is never ended.
+/// After the device takes a new network route, a probe sent then has one
+/// interval to be answered. A live server answers every probe, so an idle
+/// terminal is never ended.
 public struct WorkspaceSSHLiveness: Sendable, Equatable {
     public let interval: Duration, missedReplies: Int
     /// About 30 seconds from the last byte to a reported loss.
@@ -447,6 +449,9 @@ public final class WorkspaceSSHConnection: Sendable {
         try await native.requestResize(NativeSSHGeometry(columns: geometry.columns, rows: geometry.rows,
             pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight), source: source)
     }
+
+    /// See WorkspaceNativeSSHConnection.networkRouteChanged.
+    public func networkRouteChanged() async { await native.networkRouteChanged() }
 
     /// Durably record the exact content-free outcome batch before acknowledging
     /// it to the pump. This never accepts, retries, or replays terminal bytes.

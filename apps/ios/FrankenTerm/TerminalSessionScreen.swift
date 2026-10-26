@@ -750,6 +750,14 @@ final class TerminalSessionController {
     /// nil for a session that is a shell of its own.
     var muxControl: TerminalMuxControl? { stopped ? nil : connection?.muxControl }
 
+    /// The device's network took a new route. A live session probes its
+    /// server now and is reported lost if one liveness interval passes
+    /// unanswered, instead of the usual several.
+    func networkRouteChanged() {
+        guard !stopped, phase == .live, let connection else { return }
+        Task { await connection.networkRouteChanged() }
+    }
+
     /// A prepared transport is disposable only before any terminal-opening
     /// intent or resource exists. MainActor callers reserve the exact owner and
     /// seal it in the same turn; a stale Ready snapshot is not permission.

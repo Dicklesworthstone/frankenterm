@@ -286,6 +286,14 @@ public actor WorkspaceNativeSSHConnection {
         return pump
     }
 
+    /// A hint that the device's network took a new route: an open terminal
+    /// probes its server now and is reported lost if one interval passes
+    /// unanswered. A connection that survived the change answers and stays.
+    public func networkRouteChanged() async {
+        guard !closed, attached != nil else { return }
+        await transport.networkRouteChanged()
+    }
+
     public func requestResize(_ geometry: NativeSSHGeometry) async throws {
         do {
             try await validateCurrent()
@@ -459,6 +467,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private let liveness: WorkspaceSSHLiveness
     private var probing = true, lastReceived: UInt64 = 0, silentIntervals = 0
     private var nextLivenessProbe: ContinuousClock.Instant?
+    /// The device took a new network route since the last liveness check.
+    private var routeChanged = false
     private var mux: MuxAttachment?
 
     /// One attachment to the machine's mux over this SSH command channel.
@@ -906,9 +916,31 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         return max(.nanoseconds(1), min(liveness.interval, now.duration(to: nextLivenessProbe)))
     }
 
+    /// The device took a new network route (another interface, or the network
+    /// back): a hint that this connection may be stranded on the old one, never
+    /// proof either way. The next service turn probes at once.
+    func networkRouteChanged() {
+        guard !closed, probing else { return }
+        routeChanged = true
+        inputSignal.notify()
+    }
+
     private func checkLiveness(_ event: NativeSSHServiceEvent, driver: NativeSSHDriver,
                                now: ContinuousClock.Instant = .now) async throws {
         guard probing else { return }
+        // After a new route the server must answer a probe sent now within one
+        // interval. Bytes counted so far may predate the change, so they only
+        // make this the last probe. A last probe already out keeps its earlier
+        // deadline: the hint never delays reporting a loss.
+        if routeChanged {
+            routeChanged = false
+            if event.accounting.receivedBytes != lastReceived || silentIntervals < liveness.missedReplies {
+                lastReceived = event.accounting.receivedBytes; silentIntervals = liveness.missedReplies
+                nextLivenessProbe = now + liveness.interval
+                if try await session.keepalive(driver: driver) == .unavailable { probing = false }
+                return
+            }
+        }
         if event.accounting.receivedBytes != lastReceived {
             lastReceived = event.accounting.receivedBytes; silentIntervals = 0
             nextLivenessProbe = now + liveness.interval
