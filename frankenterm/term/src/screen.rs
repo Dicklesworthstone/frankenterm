@@ -9640,6 +9640,32 @@ impl Screen {
         &self.lines[idx]
     }
 
+    /// A row for snapshot capture and change inspection. Native page rows
+    /// stay packed; an edited legacy view remains the authoritative content
+    /// until a native write has stored it back into its page.
+    pub fn render_row(&self, idx: PhysRowIndex) -> Option<crate::render::RenderRowRef<'_>> {
+        if idx >= self.lines.len() {
+            return None;
+        }
+        if let Some(rows) = self.lines.page() {
+            if let Some((page, row)) = rows.page_row_ref(idx) {
+                return Some(crate::render::RenderRowRef::Page {
+                    page,
+                    row,
+                    seqno: rows
+                        .effective_seqno(idx)
+                        .expect("a retained row has a sequence"),
+                });
+            }
+        }
+        Some(crate::render::RenderRowRef::Line(&self.lines[idx]))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_page_views(&self) -> usize {
+        self.lines.page().map_or(0, PageRows::cached_view_count)
+    }
+
     /// Raises every row's seqno to at least `seqno`, as a selection redraw
     /// does. On page-engine rows this is one floor for the whole list
     /// (ft-yccm0.3.3.4).

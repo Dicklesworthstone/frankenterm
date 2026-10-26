@@ -33,16 +33,17 @@
 
 use crate::pane::Pane;
 use crate::renderable::{
-    RenderableDimensions, StableCursorPosition, terminal_get_cursor_position,
-    terminal_get_dimensions,
+    terminal_get_cursor_position, terminal_get_dimensions, RenderableDimensions,
+    StableCursorPosition,
 };
 pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorRow};
+use frankenterm_term::render::{PackedMirrorRow, RenderRowRef};
 use frankenterm_term::screen::ScreenCoordinateWitness;
 use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::convert::TryFrom;
 use std::ops::Range;
 use termwiz::hyperlink::Rule;
-use termwiz::surface::{SEQ_ZERO, SequenceNo};
+use termwiz::surface::{SequenceNo, SEQ_ZERO};
 
 /// What a capture copied: the counters prove that a capture does work
 /// proportional to the rows that changed.
@@ -54,6 +55,8 @@ pub struct CaptureStats {
     pub rows_captured: usize,
     /// Cells copied into the mirror.
     pub cells_captured: usize,
+    /// Rows copied as packed page cells and resolved after the terminal lock.
+    pub packed_rows: usize,
     /// Every row was copied (first capture, or an invalidation).
     pub full: bool,
 }
@@ -76,6 +79,10 @@ pub struct RenderMirror {
     rows: Vec<MirrorRow>,
     /// Scratch damage flags retained across captures; never part of row data.
     dirty: Vec<bool>,
+    /// Native snapshots and their pending row indexes. Packed scratch is
+    /// reused by viewport position; only pending rows are decoded after lock.
+    packed: Vec<PackedMirrorRow>,
+    pending: Vec<usize>,
     first: StableRowIndex,
     dimensions: Option<RenderableDimensions>,
     cursor: StableCursorPosition,
@@ -160,7 +167,23 @@ impl RenderMirror {
     /// Forgets every row, so the next capture copies all of them.
     pub fn invalidate(&mut self) {
         self.rows.clear();
+        for row in self.pending.drain(..) {
+            self.packed[row].clear();
+        }
         self.witness = None;
+    }
+
+    /// Finishes native capture once its caller has released the terminal
+    /// lock. Only owned raw cells and referenced side entries are read here.
+    pub(crate) fn resolve_pending(&mut self) {
+        for row in self.pending.drain(..) {
+            self.rows[row].update_from_packed(
+                self.first + row as StableRowIndex,
+                &self.packed[row],
+                self.generation,
+            );
+            self.packed[row].clear();
+        }
     }
 
     /// The mirror's row at `stable`, if it holds one.
@@ -184,6 +207,7 @@ impl RenderMirror {
             }
         }
         self.rows.resize_with(rows, || MirrorRow::empty(0, 0));
+        self.packed.truncate(rows);
         self.first = first;
         self.dirty.resize(rows, false);
     }
@@ -201,6 +225,19 @@ pub fn capture_terminal_rows(
     capture_rows(term, mirror, request, None)
 }
 
+/// The lock-held phase used by `LocalPane`: native rows are copied as packed
+/// cells, with only referenced style/grapheme/link/image entries. The caller
+/// must release its terminal lock and call `RenderMirror::resolve_pending`
+/// before exposing the mirror to rendering. Legacy edited rows still copy
+/// through their authoritative Line, including implicit hyperlink mutations.
+pub(crate) fn capture_terminal_rows_deferred(
+    term: &mut Terminal,
+    mirror: &mut RenderMirror,
+    request: &CaptureRequest<'_>,
+) -> Option<CaptureStats> {
+    capture_rows_deferred(term, mirror, request, None)
+}
+
 /// [`capture_terminal_rows`], optionally failing to copy one changed row:
 /// the planted fault that proves the equality tests can fail.
 fn capture_rows(
@@ -209,6 +246,21 @@ fn capture_rows(
     request: &CaptureRequest<'_>,
     planted_skip: Option<StableRowIndex>,
 ) -> Option<CaptureStats> {
+    let stats = capture_rows_deferred(term, mirror, request, planted_skip)?;
+    mirror.resolve_pending();
+    Some(stats)
+}
+
+fn capture_rows_deferred(
+    term: &mut Terminal,
+    mirror: &mut RenderMirror,
+    request: &CaptureRequest<'_>,
+    planted_skip: Option<StableRowIndex>,
+) -> Option<CaptureStats> {
+    assert!(
+        mirror.pending.is_empty(),
+        "finish the preceding capture first"
+    );
     let dimensions = terminal_get_dimensions(term);
     let seqno = term.current_seqno();
     let alt_screen = term.is_alt_screen_active();
@@ -247,10 +299,9 @@ fn capture_rows(
     if !full {
         let screen = term.screen();
         let phys = screen.stable_range(&(first..end));
-        let phys_first = screen.phys_to_stable_row_index(phys.start);
-        screen.with_phys_lines(phys, |lines| {
-            for (offset, line) in lines.iter().enumerate() {
-                let stable = phys_first + offset as StableRowIndex;
+        for physical in phys {
+            if let Some(line) = screen.render_row(physical) {
+                let stable = screen.phys_to_stable_row_index(physical);
                 let Some(row) = usize::try_from(stable - first).ok() else {
                     continue;
                 };
@@ -259,13 +310,13 @@ fn capture_rows(
                 };
                 *flag = match mirror.rows.get(row) {
                     Some(held) if held.stable() == stable => {
-                        let current = line.current_seqno();
+                        let current = line.seqno();
                         current == SEQ_ZERO || current > held.seqno() || held.always_recapture()
                     }
                     _ => true,
                 };
             }
-        });
+        }
     }
 
     // Implicit hyperlinks: rescanning a logical line that holds a link
@@ -302,10 +353,9 @@ fn capture_rows(
     {
         let screen = term.screen();
         let phys = screen.stable_range(&(first..end));
-        let phys_first = screen.phys_to_stable_row_index(phys.start);
-        screen.with_phys_lines(phys, |lines| {
-            for (offset, line) in lines.iter().enumerate() {
-                let stable = phys_first + offset as StableRowIndex;
+        for physical in phys {
+            if let Some(line) = screen.render_row(physical) {
+                let stable = screen.phys_to_stable_row_index(physical);
                 let Some(row) = usize::try_from(stable - first).ok() else {
                     continue;
                 };
@@ -324,11 +374,29 @@ fn capture_rows(
                     }
                     continue;
                 }
-                slot.update_from_line(stable, line, generation);
+                let cells = match line {
+                    RenderRowRef::Line(line) => {
+                        slot.update_from_line(stable, line, generation);
+                        slot.cells().len()
+                    }
+                    RenderRowRef::Page {
+                        page,
+                        row: native,
+                        seqno,
+                    } => {
+                        if mirror.packed.len() <= row {
+                            mirror.packed.resize_with(row + 1, PackedMirrorRow::default);
+                        }
+                        let cells = mirror.packed[row].capture(page, native, seqno);
+                        mirror.pending.push(row);
+                        stats.packed_rows += 1;
+                        cells
+                    }
+                };
                 stats.rows_captured += 1;
-                stats.cells_captured += slot.cells().len();
+                stats.cells_captured += cells;
             }
-        });
+        }
     }
     // Rows the screen does not have (none for a resident viewport) stay
     // blank rather than leaving the mirror short.
@@ -390,13 +458,15 @@ impl<'a> RowReader<'a> {
 
     fn read(&self, phys: Range<usize>) -> Vec<RowFacts> {
         let mut rows = Vec::with_capacity(phys.len());
-        self.screen.with_phys_lines(phys, |lines| {
-            rows.extend(lines.iter().map(|line| RowFacts {
-                wrapped: line.last_cell_was_wrapped(),
-                len: line.len(),
-                scanned: line.implicit_hyperlinks_are_scanned(),
-            }));
-        });
+        for physical in phys {
+            if let Some(line) = self.screen.render_row(physical) {
+                rows.push(RowFacts {
+                    wrapped: line.last_cell_was_wrapped(),
+                    len: line.len(),
+                    scanned: line.implicit_hyperlinks_are_scanned(),
+                });
+            }
+        }
         rows
     }
 
@@ -610,6 +680,7 @@ fn apply_rules_by_logical_line(rules: &[Rule], lines: &mut [Line]) {
 mod tests {
     use super::*;
     use frankenterm_term::color::ColorPalette;
+    use frankenterm_term::config::GridEngine;
     use frankenterm_term::{TerminalConfiguration, TerminalSize};
     use std::sync::Arc;
     use termwiz::cell::{
@@ -625,11 +696,15 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestConfig;
+    struct TestConfig(GridEngine);
 
     impl TerminalConfiguration for TestConfig {
         fn color_palette(&self) -> ColorPalette {
             ColorPalette::default()
+        }
+
+        fn grid_engine(&self) -> GridEngine {
+            self.0
         }
     }
 
@@ -644,9 +719,13 @@ mod tests {
     }
 
     fn terminal(rows: usize, cols: usize) -> Terminal {
+        terminal_with_engine(rows, cols, GridEngine::Legacy)
+    }
+
+    fn terminal_with_engine(rows: usize, cols: usize, engine: GridEngine) -> Terminal {
         Terminal::new(
             size(rows, cols),
-            Arc::new(TestConfig),
+            Arc::new(TestConfig(engine)),
             "FrankenTerm",
             "render-mirror-test",
             Box::new(Vec::<u8>::new()),
@@ -665,9 +744,37 @@ mod tests {
 
     /// The Line-based reference: every viewport row copied afresh.
     fn fresh(term: &mut Terminal, request: &CaptureRequest<'_>) -> RenderMirror {
+        let dimensions = terminal_get_dimensions(term);
+        let first = request
+            .viewport_top
+            .unwrap_or(dimensions.physical_top)
+            .max(dimensions.scrollback_top)
+            .min(dimensions.physical_top);
+        let end = first + dimensions.viewport_rows as StableRowIndex;
+        if !request.rules.is_empty() {
+            term.screen_mut()
+                .for_each_logical_line_in_stable_range_mut(first..end, |_, lines| {
+                    Line::apply_hyperlink_rules(request.rules, lines);
+                    true
+                });
+        }
         let mut mirror = RenderMirror::new();
-        let stats = capture_terminal_rows(term, &mut mirror, request).expect("resident viewport");
-        assert!(stats.full);
+        mirror.first = first;
+        mirror.dimensions = Some(dimensions);
+        mirror.cursor = terminal_get_cursor_position(term);
+        let screen = term.screen();
+        let phys = screen.stable_range(&(first..end));
+        screen.with_phys_lines(phys.clone(), |lines| {
+            mirror
+                .rows
+                .extend(lines.iter().enumerate().map(|(index, line)| {
+                    MirrorRow::from_line(
+                        screen.phys_to_stable_row_index(phys.start + index),
+                        line,
+                        0,
+                    )
+                }));
+        });
         mirror
     }
 
@@ -932,10 +1039,10 @@ mod tests {
     /// sometimes into a scrolled-back viewport, and after a planted fault
     /// when `plant` is set. Returns how many captures differed from a fresh
     /// full capture.
-    fn random_session(seed: u64, rules: &[Rule], plant: bool) -> usize {
+    fn random_session(seed: u64, rules: &[Rule], plant: bool, engine: GridEngine) -> usize {
         let mut rng = Rng::new(seed);
         let (mut rows, mut cols) = (8, 24);
-        let mut term = terminal(rows, cols);
+        let mut term = terminal_with_engine(rows, cols, engine);
         let mut mirror = RenderMirror::new();
         let mut differences = 0;
         for step in 0..400 {
@@ -979,9 +1086,11 @@ mod tests {
     #[test]
     fn incremental_captures_equal_full_captures_under_random_output() {
         let rules = [Rule::new(r"https?://\S+", "$0").expect("rule")];
-        for seed in 0..12 {
-            let rules: &[Rule] = if seed % 2 == 0 { &[] } else { &rules };
-            assert_eq!(random_session(seed, rules, false), 0);
+        for engine in [GridEngine::Legacy, GridEngine::Page] {
+            for seed in 0..12 {
+                let rules: &[Rule] = if seed % 2 == 0 { &[] } else { &rules };
+                assert_eq!(random_session(seed, rules, false, engine), 0);
+            }
         }
     }
 
@@ -989,8 +1098,112 @@ mod tests {
     fn the_randomized_check_catches_a_capture_that_misses_changed_rows() {
         // Planted negative: each capture skips the cursor's row, the row
         // output most often changes; the check must notice.
-        let caught: usize = (0..4).map(|seed| random_session(seed, &[], true)).sum();
-        assert!(caught > 0, "a missed dirty row went unnoticed");
+        for engine in [GridEngine::Legacy, GridEngine::Page] {
+            let caught: usize = (0..4)
+                .map(|seed| random_session(seed, &[], true, engine))
+                .sum();
+            assert!(caught > 0, "a missed dirty row went unnoticed");
+        }
+    }
+
+    #[test]
+    fn native_rows_resolve_after_the_terminal_has_changed() {
+        let mut term = terminal_with_engine(3, 24, GridEngine::Page);
+        term.advance_bytes(
+            "\x1b[38;2;17;34;51m界e\u{301}\r\n\x1b]8;;https://example.test/old\x1b\\linked\x1b]8;;\x1b\\\r\nlast",
+        );
+        let mut mirror = RenderMirror::new();
+        let stats = capture_terminal_rows_deferred(&mut term, &mut mirror, &LIVE).unwrap();
+        assert_eq!((stats.rows_captured, stats.packed_rows), (3, 3));
+        assert_eq!(mirror.pending.len(), 3);
+        assert!(mirror.rows.iter().all(|row| row.cells().is_empty()));
+        let reference = fresh(&mut term, &LIVE);
+
+        // The parser is free to replace page side tables before rendering
+        // finishes: the first phase must own all its referenced payloads.
+        term.advance_bytes("\x1bc\x1b[38;2;200;100;0mreplacement");
+        mirror.resolve_pending();
+        assert!(mirror.pending.is_empty());
+        assert_eq!(difference(&mirror, &reference), None);
+        assert_eq!(mirror.rows()[0].text(&mirror.rows()[0].cells()[0]), "界");
+        assert_eq!(
+            mirror.rows()[1].hyperlinks()[0].uri(),
+            "https://example.test/old"
+        );
+        capture(&mut term, &mut mirror);
+        assert_eq!(difference(&mirror, &fresh(&mut term, &LIVE)), None);
+    }
+
+    #[test]
+    fn native_damage_is_independent_for_each_mirror_and_includes_selection_floors() {
+        let mut term = terminal_with_engine(4, 20, GridEngine::Page);
+        term.advance_bytes("one\r\ntwo\r\nthree\r\nfour");
+        let mut first = RenderMirror::new();
+        let mut second = RenderMirror::new();
+        assert_eq!(capture(&mut term, &mut first).packed_rows, 4);
+        assert_eq!(capture(&mut term, &mut second).packed_rows, 4);
+
+        term.advance_bytes("\x1b[1;1HONE\x1b[3;1HTHREE");
+        assert_eq!(capture(&mut term, &mut first).packed_rows, 2);
+        assert_eq!(capture(&mut term, &mut second).packed_rows, 2);
+        assert_eq!(difference(&first, &second), None);
+
+        term.increment_seqno();
+        let selection_seqno = term.current_seqno();
+        term.screen_mut().touch_all_rows(selection_seqno);
+        assert_eq!(capture(&mut term, &mut first).packed_rows, 4);
+        assert_eq!(capture(&mut term, &mut second).packed_rows, 4);
+        assert!(first
+            .rows()
+            .iter()
+            .all(|row| row.seqno() == selection_seqno));
+        assert_eq!(difference(&first, &fresh(&mut term, &LIVE)), None);
+        assert_eq!(difference(&first, &second), None);
+        assert_eq!(capture(&mut term, &mut first).rows_captured, 0);
+        assert_eq!(capture(&mut term, &mut second).rows_captured, 0);
+    }
+
+    #[test]
+    fn native_capture_preserves_edited_lines_and_implicit_link_rescans() {
+        let mut term = terminal_with_engine(4, 20, GridEngine::Page);
+        term.advance_bytes("https://example.com/abcdefghijklmnop\r\nthird\r\nfourth");
+        let mut mirror = RenderMirror::new();
+        assert_eq!(capture(&mut term, &mut mirror).packed_rows, 4);
+        let rules = [Rule::new(r"https?://\S+", "$0").expect("rule")];
+        let request = CaptureRequest {
+            rules: &rules,
+            rules_generation: 1,
+            ..LIVE
+        };
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!(
+            stats.packed_rows, 0,
+            "scanned Line views stay authoritative"
+        );
+        assert!(!mirror.rows()[0].hyperlinks().is_empty());
+        assert!(!mirror.rows()[1].hyperlinks().is_empty());
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+
+        term.advance_bytes("\x1b[1;1Hhttp ");
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!(
+            stats.rows_captured, 2,
+            "the unchanged wrapped continuation also changes"
+        );
+        assert!(mirror.rows()[0].hyperlinks().is_empty());
+        assert!(mirror.rows()[1].hyperlinks().is_empty());
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+
+        // Disabling scanning cannot resurrect a stale packed page behind an
+        // edited Line. Both row sources can coexist in the same capture.
+        term.advance_bytes("\x1b[4;1Hnative");
+        let request = CaptureRequest {
+            rules_generation: 2,
+            ..LIVE
+        };
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!(stats.packed_rows, 1);
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
     }
 
     #[test]

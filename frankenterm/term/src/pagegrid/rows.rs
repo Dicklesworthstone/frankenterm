@@ -158,6 +158,24 @@ impl PageRows {
         Some((row.page, row.row))
     }
 
+    /// The effective change sequence without constructing a legacy view.
+    /// List-wide floors (selection damage, for example) are included.
+    pub fn effective_seqno(&self, index: usize) -> Option<SequenceNo> {
+        let view = self.views.get(index)?;
+        if view.edited {
+            return view.line.get().map(|line| line.current_seqno());
+        }
+        self.list.effective_seqno(self.stable(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_view_count(&self) -> usize {
+        self.views
+            .iter()
+            .filter(|view| view.line.get().is_some())
+            .count()
+    }
+
     /// Row `index` for a native write. A view edited through
     /// [`Self::line_mut`] is stored back into the page first, and the cached
     /// view is dropped, since the write changes the row. Returns `None`,
