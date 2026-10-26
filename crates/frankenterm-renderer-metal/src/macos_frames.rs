@@ -115,6 +115,9 @@ pub(crate) struct FrameSlots {
     /// Bytes the last frame uploaded into its slot, and since creation.
     upload_bytes_last: u64,
     upload_bytes_total: u64,
+    /// Reused by the single-grid and sequential pane uploads. Keeping the
+    /// row lists across frames avoids CPU allocation for recurring damage.
+    upload_plan: UploadPlan,
     /// Each pane's own buffers in every slot, by pane key (ft-yccm0.4.6).
     panes: HashMap<u64, PaneBuffers>,
     /// Per slot: the window frame's uniform blocks and fill cell.
@@ -201,6 +204,7 @@ impl FrameSlots {
             fail_allocation_at: None,
             upload_bytes_last: 0,
             upload_bytes_total: 0,
+            upload_plan: UploadPlan::default(),
             panes: HashMap::new(),
             window: (0..FRAME_SLOTS).map(|_| WindowSlot::default()).collect(),
         };
@@ -418,6 +422,58 @@ impl FrameSlots {
         Ok(())
     }
 
+    /// Serializes fixed-size records straight into shared GPU memory. The
+    /// whole destination is checked once before any record is written, and
+    /// only one record's byte array is materialized at a time. Window draws
+    /// and chrome therefore need no frame-sized staging allocation or copy.
+    fn write_records<T, const BYTES: usize>(
+        &self,
+        lease: &SlotLease,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        label: &'static str,
+        offset: usize,
+        records: &[T],
+        mut encode: impl FnMut(&T) -> [u8; BYTES],
+    ) -> Result<(), FrameError> {
+        assert!(
+            lease.is_from(&self.ring),
+            "a slot lease from another renderer's ring"
+        );
+        let capacity = buffer.length();
+        let len = records.len().checked_mul(BYTES);
+        if len
+            .and_then(|len| offset.checked_add(len))
+            .is_none_or(|end| end > capacity)
+        {
+            return Err(FrameError::SlotWriteOutOfBounds {
+                buffer: label,
+                offset,
+                len: len.unwrap_or(usize::MAX),
+                capacity,
+            });
+        }
+        let destination = buffer.contents().cast::<u8>().as_ptr().wrapping_add(offset);
+        for (index, record) in records.iter().enumerate() {
+            let bytes = encode(record);
+            #[allow(unsafe_code)]
+            // SAFETY: BUFFER-WRITE. The same-ring lease excludes previous
+            // GPU readers. Every caller passes this slot's shared buffer,
+            // and the full records.len() * BYTES region was checked above,
+            // including both arithmetic overflows. The slice iterator
+            // bounds index, so each fixed-size write fits that region.
+            // The encoded array is initialized Rust stack memory and cannot
+            // overlap the Metal allocation; no borrowed GPU memory escapes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    destination.wrapping_add(index * BYTES),
+                    BYTES,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Uploads into the leased slot what `cells` and `text` changed since
     /// the slot last held them (ft-yccm0.4.2.4): only their dirty ring rows,
     /// or everything when the slot is laid out afresh. Fits the slot's
@@ -436,30 +492,41 @@ impl FrameSlots {
             "a slot lease from another renderer's ring"
         );
         let slot = lease.slot();
-        let generation = self.slots[slot].generation;
-        let mut plan = self.slots[slot].uploads.plan(cells, text, generation);
-        let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
-            .ok_or(FrameError::GridTooLarge {
-                rows: grid.rows,
-                cols: grid.cols,
-            })
-            .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
-        self.fit_slot(slot, &sizes)
-            .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
-        let fitted = self.slots[slot].generation;
-        if fitted != generation {
-            // The buffers were replaced: they hold nothing yet.
-            self.slots[slot].uploads.invalidate();
-            plan = self.slots[slot].uploads.plan(cells, text, fitted);
-        }
-        if let Err(err) = self.write_plan(lease, &plan, cells, text) {
-            self.slots[slot].uploads.invalidate();
-            return Err(err);
-        }
-        let bytes = plan.bytes(grid);
-        self.upload_bytes_last = bytes;
-        self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
-        Ok(text.map_or(0, |text| plan.draw_instances(text)))
+        let mut plan = std::mem::take(&mut self.upload_plan);
+        let result = (|| {
+            let generation = self.slots[slot].generation;
+            self.slots[slot]
+                .uploads
+                .plan_into(cells, text, generation, &mut plan);
+            let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
+                .ok_or(FrameError::GridTooLarge {
+                    rows: grid.rows,
+                    cols: grid.cols,
+                })
+                .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
+            self.fit_slot(slot, &sizes)
+                .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
+            let fitted = self.slots[slot].generation;
+            if fitted != generation {
+                // The buffers were replaced: they hold nothing yet.
+                self.slots[slot].uploads.invalidate();
+                self.slots[slot]
+                    .uploads
+                    .plan_into(cells, text, fitted, &mut plan);
+            }
+            if let Err(err) = self.write_plan(lease, &plan, cells, text) {
+                self.slots[slot].uploads.invalidate();
+                return Err(err);
+            }
+            let bytes = plan.bytes(grid);
+            self.upload_bytes_last = bytes;
+            self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
+            Ok(text.map_or(0, |text| plan.draw_instances(text)))
+        })();
+        // Even a rejected frame keeps the scratch allocation for retry;
+        // upload history was invalidated above independently of this list.
+        self.upload_plan = plan;
+        result
     }
 
     /// Copies `plan`'s rows into the leased slot: cell background rows at
@@ -578,33 +645,38 @@ impl FrameSlots {
         let Some(pane_slot) = pane.slots[slot].as_mut() else {
             unreachable!("the pane's slot was just filled");
         };
-        let mut plan = pane_slot
-            .uploads
-            .plan(Some(cells), text, pane_slot.generation);
-        let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
-            .ok_or(FrameError::GridTooLarge {
-                rows: grid.rows,
-                cols: grid.cols,
-            })
-            .inspect_err(|_| pane_slot.uploads.invalidate())?;
-        if self
-            .fit_pane_slot(pane_slot, &sizes, slot)
-            .inspect_err(|_| pane_slot.uploads.invalidate())?
-        {
-            // The buffers were replaced: they hold nothing yet.
-            pane_slot.uploads.invalidate();
-            plan = pane_slot
+        let mut plan = std::mem::take(&mut self.upload_plan);
+        let result = (|| {
+            pane_slot
                 .uploads
-                .plan(Some(cells), text, pane_slot.generation);
-        }
-        if let Err(err) = self.write_pane_plan(lease, pane_slot, &plan, cells, text) {
-            pane_slot.uploads.invalidate();
-            return Err(err);
-        }
-        let bytes = plan.bytes(grid);
-        self.upload_bytes_last = self.upload_bytes_last.saturating_add(bytes);
-        self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
-        Ok(text.map_or(0, |text| plan.draw_instances(text)))
+                .plan_into(Some(cells), text, pane_slot.generation, &mut plan);
+            let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
+                .ok_or(FrameError::GridTooLarge {
+                    rows: grid.rows,
+                    cols: grid.cols,
+                })
+                .inspect_err(|_| pane_slot.uploads.invalidate())?;
+            if self
+                .fit_pane_slot(pane_slot, &sizes, slot)
+                .inspect_err(|_| pane_slot.uploads.invalidate())?
+            {
+                // The buffers were replaced: they hold nothing yet.
+                pane_slot.uploads.invalidate();
+                pane_slot
+                    .uploads
+                    .plan_into(Some(cells), text, pane_slot.generation, &mut plan);
+            }
+            if let Err(err) = self.write_pane_plan(lease, pane_slot, &plan, cells, text) {
+                pane_slot.uploads.invalidate();
+                return Err(err);
+            }
+            let bytes = plan.bytes(grid);
+            self.upload_bytes_last = self.upload_bytes_last.saturating_add(bytes);
+            self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
+            Ok(text.map_or(0, |text| plan.draw_instances(text)))
+        })();
+        self.upload_plan = plan;
+        result
     }
 
     /// A slot buffer added to the residency set (committed by the caller).
@@ -719,17 +791,23 @@ impl FrameSlots {
     /// Writes a window frame's uniform blocks, one per draw, into the leased
     /// slot's window uniforms, growing them as needed, and readies the
     /// slot's fill cell (ft-yccm0.4.6).
-    pub(crate) fn write_window(
+    pub(crate) fn write_window<T>(
         &mut self,
         lease: &SlotLease,
-        blocks: &[[u8; UNIFORMS_BYTES]],
+        blocks: &[T],
+        encode: impl FnMut(&T) -> [u8; UNIFORMS_BYTES],
     ) -> Result<(), FrameError> {
         assert!(
             lease.is_from(&self.ring),
             "a slot lease from another renderer's ring"
         );
         let slot = lease.slot();
-        let needed = blocks.len().max(1) * UNIFORMS_BYTES;
+        let needed = blocks.len().max(1).checked_mul(UNIFORMS_BYTES).ok_or(
+            FrameError::AllocationFailed {
+                what: "window uniforms",
+                bytes: usize::MAX,
+            },
+        )?;
         let current = self.window[slot]
             .uniforms
             .as_ref()
@@ -757,16 +835,14 @@ impl FrameSlots {
         };
         // An uncolored cell: a fill shows its uniforms' clear color.
         self.write_into(lease, &fill.buffer, "window fill", 0, &[0; 4])?;
-        for (index, block) in blocks.iter().enumerate() {
-            self.write_into(
-                lease,
-                &uniforms.buffer,
-                "window uniforms",
-                index * UNIFORMS_BYTES,
-                block,
-            )?;
-        }
-        Ok(())
+        self.write_records(
+            lease,
+            &uniforms.buffer,
+            "window uniforms",
+            0,
+            blocks,
+            encode,
+        )
     }
 
     /// Writes `layer`'s uniforms and quads into the leased slot's chrome
@@ -788,7 +864,15 @@ impl FrameSlots {
         }
         let slot = lease.slot();
         self.write_ui_atlas(lease, layer.atlas)?;
-        let needed = UI_UNIFORMS_BYTES + layer.quads.len() * UI_QUAD_BYTES;
+        let needed = layer
+            .quads
+            .len()
+            .checked_mul(UI_QUAD_BYTES)
+            .and_then(|bytes| bytes.checked_add(UI_UNIFORMS_BYTES))
+            .ok_or(FrameError::AllocationFailed {
+                what: "window chrome",
+                bytes: usize::MAX,
+            })?;
         let current = self.window[slot]
             .ui
             .as_ref()
@@ -803,15 +887,24 @@ impl FrameSlots {
             }
             self.commit_residency();
         }
-        let mut bytes = Vec::with_capacity(needed);
-        bytes.extend_from_slice(&ui_uniforms_bytes(viewport, layer.foreground_text_hsb));
-        for quad in layer.quads {
-            bytes.extend_from_slice(&quad.to_bytes());
-        }
         let Some(ui) = self.window[slot].ui.as_ref() else {
             unreachable!("the chrome buffer was just allocated");
         };
-        self.write_into(lease, &ui.buffer, "window chrome", 0, &bytes)?;
+        self.write_into(
+            lease,
+            &ui.buffer,
+            "window chrome",
+            0,
+            &ui_uniforms_bytes(viewport, layer.foreground_text_hsb),
+        )?;
+        self.write_records(
+            lease,
+            &ui.buffer,
+            "window chrome",
+            UI_UNIFORMS_BYTES,
+            layer.quads,
+            crate::UiQuad::to_bytes,
+        )?;
         Ok(layer.quads.len())
     }
 
@@ -2534,6 +2627,62 @@ mod tests {
     }
 
     #[test]
+    fn dirty_uploads_share_plan_storage_across_panes_slots_and_failed_frames() {
+        use crate::cell_bg::CellBg;
+
+        let grid = GridExtent::new(130, 4);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let mut cells = CellBgGrid::new(grid);
+        let mut text = CellTextGrid::new(grid);
+        let mut storage = None;
+        for frame in 0..15_u8 {
+            let row = [0, 63, 64, 127, 129][usize::from(frame) % 5];
+            cells.set(row, 1, CellBg::rgb(frame + 1, 2, 3));
+            text.clear_row(row);
+            text.push(row, CellText::new(1, [frame + 1, 2, 3, 255]));
+            let lease = frames.begin(grid, LONG).unwrap();
+            if frame == 12 {
+                let oversized = GridExtent {
+                    rows: u32::MAX,
+                    cols: u32::MAX,
+                };
+                assert!(matches!(
+                    frames.upload(&lease, oversized, Some(&cells), Some(&text)),
+                    Err(FrameError::GridTooLarge { .. })
+                ));
+            }
+            frames
+                .upload(&lease, grid, Some(&cells), Some(&text))
+                .unwrap();
+            for pane in [7, 11] {
+                frames
+                    .upload_pane(&lease, pane, &cells, Some(&text))
+                    .unwrap();
+            }
+            let current = (
+                frames.upload_plan.cell_rows.as_ptr(),
+                frames.upload_plan.cell_rows.capacity(),
+                frames.upload_plan.text_rows.as_ptr(),
+                frames.upload_plan.text_rows.capacity(),
+            );
+            if let Some(storage) = storage {
+                assert_eq!(current, storage, "frame {frame} replaced upload scratch");
+            } else {
+                storage = Some(current);
+            }
+            let (_, expected, _) =
+                crate::uploads::full_layout(&cells, &text, frames.upload_plan.capacity);
+            let slot = lease.slot();
+            drop(lease);
+            assert_eq!(
+                frames.read(slot, SlotBuffer::CellText, expected.len()),
+                expected,
+                "single-grid catch-up still matches the full layout"
+            );
+        }
+    }
+
+    #[test]
     // One lifecycle exercises all three slot histories, in-flight exclusion,
     // malformed input and replacement without losing its resource identities.
     #[allow(clippy::too_many_lines)]
@@ -3102,6 +3251,83 @@ mod tests {
             frames
                 .write(&lease, SlotBuffer::Uniforms, usize::MAX, &[1])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn record_writes_stream_only_the_checked_destination_range() {
+        let grid = GridExtent::new(2, 2);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let lease = frames.begin(grid, LONG).unwrap();
+        let slot = lease.slot();
+        let buffer = frames.buffer(slot, SlotBuffer::Uniforms);
+        let capacity = buffer.length();
+        frames
+            .write(&lease, SlotBuffer::Uniforms, 0, &vec![0xa5; capacity])
+            .unwrap();
+        let records = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
+        frames
+            .write_records(&lease, buffer, "uniforms", 7, &records, |record| *record)
+            .unwrap();
+        frames
+            .write_records(
+                &lease,
+                buffer,
+                "uniforms",
+                capacity,
+                &[] as &[[u8; 4]],
+                |record| *record,
+            )
+            .unwrap();
+        drop(lease);
+        let bytes = frames.read(slot, SlotBuffer::Uniforms, capacity);
+        assert_eq!(&bytes[..7], &[0xa5; 7]);
+        assert_eq!(&bytes[7..19], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert!(bytes[19..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn record_writes_reject_the_entire_batch_before_encoding() {
+        let grid = GridExtent::new(2, 2);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let lease = frames.begin(grid, LONG).unwrap();
+        let slot = lease.slot();
+        let buffer = frames.buffer(slot, SlotBuffer::Uniforms);
+        let capacity = buffer.length();
+        frames
+            .write(&lease, SlotBuffer::Uniforms, 0, &vec![0xa5; capacity])
+            .unwrap();
+        let calls = Cell::new(0);
+        let encode = |record: &[u8; 4]| {
+            calls.set(calls.get() + 1);
+            *record
+        };
+        let records = [[1; 4], [2; 4]];
+        assert_eq!(
+            frames.write_records(&lease, buffer, "uniforms", capacity - 4, &records, encode),
+            Err(FrameError::SlotWriteOutOfBounds {
+                buffer: "uniforms",
+                offset: capacity - 4,
+                len: 8,
+                capacity,
+            })
+        );
+        assert!(
+            frames
+                .write_records(&lease, buffer, "uniforms", usize::MAX, &records, encode)
+                .is_err()
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "validation must precede even the first record"
+        );
+        drop(lease);
+        assert!(
+            frames
+                .read(slot, SlotBuffer::Uniforms, capacity)
+                .iter()
+                .all(|byte| *byte == 0xa5)
         );
     }
 

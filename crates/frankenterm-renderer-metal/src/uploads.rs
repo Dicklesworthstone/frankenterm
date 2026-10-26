@@ -36,12 +36,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Dirty-row summaries cover one machine word of rows. A sparse frame
+/// compares one generation per block and only reads individual generations
+/// in blocks that changed since this particular frame slot last caught up.
+const ROW_CHANGE_BLOCK: usize = 64;
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+            epoch.checked_add(1)
+        })
+        .expect("row change epoch exhausted")
+}
+
 /// Per-ring-row change generations of one grid instance.
 #[derive(Debug)]
 pub struct RowChanges {
     epoch: u64,
     latest: u64,
     rows: Vec<u64>,
+    blocks: Vec<u64>,
 }
 
 impl RowChanges {
@@ -49,18 +63,31 @@ impl RowChanges {
     #[must_use]
     pub fn new(rows: usize) -> Self {
         Self {
-            epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            epoch: next_epoch(),
             latest: 1,
             rows: vec![1; rows],
+            blocks: vec![1; rows.div_ceil(ROW_CHANGE_BLOCK)],
         }
     }
 
     /// Ring row `ring_row` changed.
     pub fn touch(&mut self, ring_row: usize) {
-        if let Some(row) = self.rows.get_mut(ring_row) {
-            self.latest += 1;
-            *row = self.latest;
+        if ring_row >= self.rows.len() {
+            return;
         }
+        let Some(latest) = self.latest.checked_add(1) else {
+            // Generations may be compared with `>` only within an epoch.
+            // A new identity forces every lagging slot to initialize in
+            // full, so wrapping can never hide a dirty row.
+            self.epoch = next_epoch();
+            self.latest = 1;
+            self.rows.fill(1);
+            self.blocks.fill(1);
+            return;
+        };
+        self.latest = latest;
+        self.rows[ring_row] = latest;
+        self.blocks[ring_row / ROW_CHANGE_BLOCK] = latest;
     }
 
     /// Names this grid instance; a clone is another instance.
@@ -74,6 +101,32 @@ impl RowChanges {
     pub fn row(&self, ring_row: usize) -> u64 {
         self.rows.get(ring_row).copied().unwrap_or(0)
     }
+
+    /// Changed rows since `written`, which must belong to this epoch.
+    /// Zero means a fresh layout and includes every stored row. Each slot
+    /// keeps its own `written`, so skipped frames require no damage log and
+    /// never discard changes that another slot has not consumed yet.
+    fn since(&self, written: u64) -> impl Iterator<Item = usize> + '_ {
+        let blocks = if self.latest > written {
+            self.blocks.as_slice()
+        } else {
+            &[]
+        };
+        blocks
+            .iter()
+            .enumerate()
+            .filter(move |(_, generation)| **generation > written)
+            .flat_map(move |(block, _)| {
+                let first = block * ROW_CHANGE_BLOCK;
+                let end = first.saturating_add(ROW_CHANGE_BLOCK).min(self.rows.len());
+                self.rows[first..end]
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(row, generation)| {
+                        (*generation > written).then_some(first + row)
+                    })
+            })
+    }
 }
 
 impl Clone for RowChanges {
@@ -81,9 +134,10 @@ impl Clone for RowChanges {
     /// that held the source re-uploads it in full.
     fn clone(&self) -> Self {
         Self {
-            epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            epoch: next_epoch(),
             latest: self.latest,
             rows: self.rows.clone(),
+            blocks: self.blocks.clone(),
         }
     }
 }
@@ -158,8 +212,6 @@ pub struct SlotUploads {
     extent: Option<GridExtent>,
     capacity: u32,
     buffers: Option<u64>,
-    cells_written: Vec<u64>,
-    text_written: Vec<u64>,
     /// Actual row lengths last uploaded to this slot; padding stays zero
     /// until a later upload puts an instance there.
     text_lengths: Vec<u32>,
@@ -193,6 +245,25 @@ impl SlotUploads {
         text: Option<&CellTextGrid>,
         buffers_generation: u64,
     ) -> UploadPlan {
+        let mut plan = UploadPlan::default();
+        self.plan_into(cells, text, buffers_generation, &mut plan);
+        plan
+    }
+
+    /// Plans into reusable storage. The native renderer shares one scratch
+    /// plan across the panes it uploads sequentially, so recurring dirty
+    /// frames do not allocate row lists after reaching their high-water mark.
+    pub fn plan_into(
+        &mut self,
+        cells: Option<&CellBgGrid>,
+        text: Option<&CellTextGrid>,
+        buffers_generation: u64,
+        plan: &mut UploadPlan,
+    ) {
+        plan.full = false;
+        plan.capacity = self.capacity;
+        plan.cell_rows.clear();
+        plan.text_rows.clear();
         let extent = cells
             .map(CellBgGrid::extent)
             .or_else(|| text.map(CellTextGrid::extent));
@@ -211,12 +282,21 @@ impl SlotUploads {
             && self.cells_latest == cells_latest
             && self.text_latest == text_latest
         {
-            return UploadPlan {
-                capacity: self.capacity,
-                ..UploadPlan::default()
-            };
+            return;
         }
-        let needed = text.map_or(1, needed_capacity);
+        let needed = text.map_or(1, |grid| {
+            if same_grids {
+                // The slot's current layout already fits unchanged rows.
+                // Only changed rows can outgrow it; scanning every row for
+                // the fullest one would undo sparse dirty-row planning.
+                grid.changes()
+                    .since(self.text_latest)
+                    .map(|ring| u32::try_from(grid.ring_row_len(ring)).unwrap_or(u32::MAX))
+                    .fold(self.capacity, u32::max)
+            } else {
+                needed_capacity(grid)
+            }
+        });
         let full =
             !same_grids || self.buffers != Some(buffers_generation) || needed > self.capacity;
         if full {
@@ -231,52 +311,41 @@ impl SlotUploads {
             self.text = text.map(|grid| grid.changes().epoch());
             self.extent = extent;
             self.buffers = Some(buffers_generation);
-            self.cells_written.clear();
-            self.text_written.clear();
             self.text_lengths.clear();
         }
-        let mut plan = UploadPlan {
-            full,
-            capacity: self.capacity,
-            ..UploadPlan::default()
-        };
+        plan.full = full;
+        plan.capacity = self.capacity;
         if let Some(grid) = cells {
-            let rows = usize::try_from(grid.extent().rows).unwrap_or(usize::MAX);
-            self.cells_written.resize(rows, 0);
-            for (ring, written) in self.cells_written.iter_mut().enumerate() {
-                let generation = grid.changes().row(ring);
-                if full || *written != generation {
-                    *written = generation;
-                    plan.cell_rows.push(u32::try_from(ring).unwrap_or(u32::MAX));
-                }
+            for ring in grid
+                .changes()
+                .since(if full { 0 } else { self.cells_latest })
+            {
+                plan.cell_rows.push(u32::try_from(ring).unwrap_or(u32::MAX));
             }
         }
         if let Some(grid) = text {
-            self.text_written.resize(grid.ring_rows(), 0);
             self.text_lengths.resize(grid.ring_rows(), 0);
-            for (ring, written) in self.text_written.iter_mut().enumerate() {
-                let generation = grid.changes().row(ring);
-                if full || *written != generation {
-                    let length = u32::try_from(grid.ring_row_len(ring))
-                        .unwrap_or(u32::MAX)
-                        .min(self.capacity);
-                    let instances = if full {
-                        self.capacity
-                    } else {
-                        self.text_lengths[ring].max(length)
-                    };
-                    *written = generation;
-                    self.text_lengths[ring] = length;
-                    plan.text_rows.push(TextRowUpload {
-                        row: u32::try_from(ring).unwrap_or(u32::MAX),
-                        instances,
-                    });
-                }
+            for ring in grid
+                .changes()
+                .since(if full { 0 } else { self.text_latest })
+            {
+                let length = u32::try_from(grid.ring_row_len(ring))
+                    .unwrap_or(u32::MAX)
+                    .min(self.capacity);
+                let instances = if full {
+                    self.capacity
+                } else {
+                    self.text_lengths[ring].max(length)
+                };
+                self.text_lengths[ring] = length;
+                plan.text_rows.push(TextRowUpload {
+                    row: u32::try_from(ring).unwrap_or(u32::MAX),
+                    instances,
+                });
             }
         }
         self.cells_latest = cells_latest;
         self.text_latest = text_latest;
-        plan
     }
 }
 
@@ -428,6 +497,108 @@ mod tests {
         let clone = cells.clone();
         assert_ne!(clone.changes().epoch(), cells.changes().epoch());
         assert_eq!(clone, cells, "equality compares content, not instances");
+    }
+
+    #[test]
+    fn row_change_blocks_keep_sparse_catch_up_across_word_boundaries() {
+        let mut changes = RowChanges::new(130);
+        assert_eq!(
+            changes.since(0).collect::<Vec<_>>(),
+            (0..130).collect::<Vec<_>>()
+        );
+        let initial = changes.latest;
+        for row in [0, 63, 64, 127, 129] {
+            changes.touch(row);
+        }
+        let intermediate = changes.latest;
+        assert_eq!(
+            changes.since(initial).collect::<Vec<_>>(),
+            [0, 63, 64, 127, 129]
+        );
+        changes.touch(63);
+        changes.touch(65);
+        assert_eq!(changes.since(intermediate).collect::<Vec<_>>(), [63, 65]);
+        assert_eq!(
+            changes.since(initial).collect::<Vec<_>>(),
+            [0, 63, 64, 65, 127, 129]
+        );
+        assert_eq!(changes.since(changes.latest).count(), 0);
+        let latest = changes.latest;
+        changes.touch(130);
+        assert_eq!(changes.latest, latest, "out-of-bounds writes are ignored");
+    }
+
+    #[test]
+    fn row_generation_overflow_changes_identity_and_reinitializes_summaries() {
+        let mut changes = RowChanges::new(130);
+        let epoch = changes.epoch();
+        changes.latest = u64::MAX - 1;
+        changes.touch(129);
+        assert_eq!(changes.latest, u64::MAX);
+        assert_eq!(changes.since(u64::MAX - 1).collect::<Vec<_>>(), [129]);
+        changes.touch(64);
+        assert_ne!(
+            changes.epoch(),
+            epoch,
+            "old slot generations belong to another epoch"
+        );
+        assert_eq!(changes.latest, 1);
+        assert!(changes.rows.iter().all(|generation| *generation == 1));
+        assert!(changes.blocks.iter().all(|generation| *generation == 1));
+        assert_eq!(
+            changes.since(0).collect::<Vec<_>>(),
+            (0..130).collect::<Vec<_>>()
+        );
+        changes.touch(63);
+        assert_eq!(changes.since(1).collect::<Vec<_>>(), [63]);
+    }
+
+    #[test]
+    fn reused_plans_keep_row_storage_on_idle_damage_growth_and_invalidated_retry() {
+        let (mut cells, mut text) = grids(130, 2);
+        let mut uploads = SlotUploads::default();
+        let mut plan = UploadPlan::default();
+        uploads.plan_into(Some(&cells), Some(&text), 0, &mut plan);
+        let cell_storage = (plan.cell_rows.as_ptr(), plan.cell_rows.capacity());
+        let text_storage = (plan.text_rows.as_ptr(), plan.text_rows.capacity());
+        for row in [0, 63, 64, 127, 129] {
+            write_row(&mut cells, &mut text, row, 7);
+            uploads.plan_into(Some(&cells), Some(&text), 0, &mut plan);
+            assert_eq!(plan.cell_rows, [row]);
+            assert_eq!(text_rows(&plan), [row]);
+            uploads.plan_into(Some(&cells), Some(&text), 0, &mut plan);
+            assert!(plan.cell_rows.is_empty() && plan.text_rows.is_empty());
+            assert_eq!(
+                (plan.cell_rows.as_ptr(), plan.cell_rows.capacity()),
+                cell_storage
+            );
+            assert_eq!(
+                (plan.text_rows.as_ptr(), plan.text_rows.capacity()),
+                text_storage
+            );
+        }
+        for _ in 0..6 {
+            text.push(129, CellText::new(0, [1, 2, 3, 255]));
+        }
+        uploads.plan_into(Some(&cells), Some(&text), 0, &mut plan);
+        assert!(plan.full);
+        assert!(
+            plan.capacity >= 8,
+            "a changed tail row can grow the entire layout"
+        );
+        assert_eq!(plan.text_rows.len(), 130);
+        uploads.invalidate();
+        uploads.plan_into(Some(&cells), Some(&text), 1, &mut plan);
+        assert!(plan.full);
+        assert_eq!(plan.cell_rows.len(), 130);
+        assert_eq!(
+            (plan.cell_rows.as_ptr(), plan.cell_rows.capacity()),
+            cell_storage
+        );
+        assert_eq!(
+            (plan.text_rows.as_ptr(), plan.text_rows.capacity()),
+            text_storage
+        );
     }
 
     #[test]
@@ -754,7 +925,9 @@ mod tests {
             state ^= state << 17;
             state % bound
         };
-        let (mut rows, mut cols) = (8_usize, 6_usize);
+        // Cross both full summary blocks and the final partial block. Slots
+        // observe different intermediate writes, scrolls and row lengths.
+        let (mut rows, mut cols) = (130_usize, 6_usize);
         let (mut cells, mut text) = grids(rows, cols);
         let mut slots: Vec<SlotModel> = (0..3).map(|_| SlotModel::default()).collect();
         for frame in 0..2000_usize {
@@ -784,7 +957,7 @@ mod tests {
                     }
                     _ => {
                         if next(20) == 0 {
-                            rows = 3 + next(10) as usize;
+                            rows = 3 + next(260) as usize;
                             cols = 2 + next(10) as usize;
                             (cells, text) = grids(rows, cols);
                         }

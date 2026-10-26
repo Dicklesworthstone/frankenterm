@@ -901,8 +901,9 @@ impl MetalRenderer {
             frames.retire_panes(lease.frame());
         }
         let placed = window_blocks(frame, lease.frame(), width, height);
-        let blocks: Vec<[u8; UNIFORMS_BYTES]> = placed.iter().map(|draw| draw.bytes).collect();
-        self.frames.borrow_mut().write_window(&lease, &blocks)?;
+        self.frames
+            .borrow_mut()
+            .write_window(&lease, &placed, |draw| draw.bytes)?;
         // ft-yccm0.4.7.1: the window chrome, drawn over everything else.
         let ui_quads = match &frame.ui {
             Some(ui) => self
