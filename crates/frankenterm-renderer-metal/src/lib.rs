@@ -80,7 +80,8 @@
 //!    (the Apple-family 2D texture limit) before the call; the blit copies
 //!    exactly the texture's own `width x height x 1` region of slice 0, level 0;
 //!    the destination row pitch is `width * 4` bytes for the 4-byte BGRA8
-//!    format, and the destination buffer is allocated with exactly
+//!    format (also RGBA8 for raw chrome-atlas test readback), and the
+//!    destination buffer is allocated with exactly
 //!    `row pitch * height` bytes, so the copy stays in bounds on both sides.
 //!    The glyph atlases (ft-yccm0.4.3.2) also copy texture to texture when
 //!    an atlas grows: the source region is the old texture's whole extent and
@@ -151,6 +152,11 @@
 //!     reads it; the pixel slice was checked to hold exactly width x height x
 //!     bytes-per-pixel bytes at a tight row pitch and is borrowed for the
 //!     call; the texture is in shared storage, which the CPU may write.
+//!     Chrome atlases use the same operation on validated full-width pixel
+//!     stripes. Each chrome texture belongs to one frame slot; a lease from
+//!     that slot's ring is required before changing or replacing it, so all
+//!     earlier GPU reads of those pixels have completed. Every stripe's byte
+//!     length and the complete extent are checked before the first write.
 //! 11. **THREAD-HANDOFF: moving a renderer to its render thread.**
 //!     `MetalRendererHandoff` is `Send` (ft-yccm0.4.1.2). A window's renderer
 //!     is attached on the main thread, as AppKit requires, then moved whole to

@@ -16,7 +16,10 @@ use crate::frame::{
     SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES, grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
-use crate::ui_quads::{UI_QUAD_BYTES, UI_SHADER, UI_UNIFORMS_BYTES, UiLayer, ui_uniforms_bytes};
+use crate::ui_quads::{
+    UI_QUAD_BYTES, UI_SHADER, UI_UNIFORMS_BYTES, UiAtlas, UiAtlasUploads, UiLayer,
+    ui_uniforms_bytes,
+};
 use crate::uploads::{SlotUploads, UploadPlan, row_table_entry};
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
@@ -116,11 +119,6 @@ pub(crate) struct FrameSlots {
     panes: HashMap<u64, PaneBuffers>,
     /// Per slot: the window frame's uniform blocks and fill cell.
     window: Vec<WindowSlot>,
-    /// The chrome atlas, replaced when its version changes.
-    ui_atlas: Option<UiAtlasTexture>,
-    /// Replaced chrome atlases, each with the first frame that no longer
-    /// samples it: freed once every earlier frame has finished.
-    retired_ui_atlases: Vec<(u64, UiAtlasTexture)>,
 }
 
 /// Frames a pane may go undrawn (a tab switched away, say) before its
@@ -169,12 +167,15 @@ struct WindowSlot {
     /// The chrome quads (ft-yccm0.4.7.1): their uniforms, then the quads
     /// from [`UI_UNIFORMS_BYTES`] on.
     ui: Option<SlotAllocation>,
+    /// A persistent chrome atlas. The slot lease guarantees its previous
+    /// readers have completed before pixels are changed or it is replaced.
+    ui_atlas: Option<UiAtlasTexture>,
 }
 
 /// The texture chrome quads sample (ft-yccm0.4.7.1), holding the
 /// [`crate::UiAtlas`] of one version.
 struct UiAtlasTexture {
-    version: u64,
+    uploads: UiAtlasUploads,
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     _ledger: GpuResourceGuard,
 }
@@ -202,8 +203,6 @@ impl FrameSlots {
             upload_bytes_total: 0,
             panes: HashMap::new(),
             window: (0..FRAME_SLOTS).map(|_| WindowSlot::default()).collect(),
-            ui_atlas: None,
-            retired_ui_atlases: Vec::new(),
         };
         for index in 0..FRAME_SLOTS {
             let mut buffers = Vec::with_capacity(SlotBuffer::ALL.len());
@@ -784,21 +783,11 @@ impl FrameSlots {
             lease.is_from(&self.ring),
             "a slot lease from another renderer's ring"
         );
-        self.retire_ui_atlases();
         if layer.quads.is_empty() {
             return Ok(0);
         }
-        if self
-            .ui_atlas
-            .as_ref()
-            .is_none_or(|atlas| atlas.version != layer.atlas.version)
-        {
-            let atlas = self.upload_ui_atlas(layer)?;
-            if let Some(old) = self.ui_atlas.replace(atlas) {
-                self.retired_ui_atlases.push((lease.frame(), old));
-            }
-        }
         let slot = lease.slot();
+        self.write_ui_atlas(lease, layer.atlas)?;
         let needed = UI_UNIFORMS_BYTES + layer.quads.len() * UI_QUAD_BYTES;
         let current = self.window[slot]
             .ui
@@ -826,20 +815,82 @@ impl FrameSlots {
         Ok(layer.quads.len())
     }
 
-    /// A texture holding `layer.atlas`.
-    fn upload_ui_atlas(&mut self, layer: &UiLayer<'_>) -> Result<UiAtlasTexture, FrameError> {
-        let atlas = layer.atlas;
-        let (width, height) = (atlas.width, atlas.height);
-        let bytes_per_row = usize::try_from(width)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(4);
-        let rows = usize::try_from(height).unwrap_or(usize::MAX);
-        if !(1..=MAX_TEXTURE_EXTENT).contains(&width)
-            || !(1..=MAX_TEXTURE_EXTENT).contains(&height)
-            || atlas.rgba.len() != bytes_per_row.saturating_mul(rows)
+    /// Fits and updates only the leased slot's chrome texture. Every slot
+    /// catches up from its own stripe versions, with no in-flight texture
+    /// mutation and no full-atlas allocation on ordinary glyph additions.
+    fn write_ui_atlas(&mut self, lease: &SlotLease, atlas: UiAtlas<'_>) -> Result<u64, FrameError> {
+        assert!(lease.is_from(&self.ring), "a foreign chrome atlas lease");
+        let slot = lease.slot();
+        if self.window[slot]
+            .ui_atlas
+            .as_ref()
+            .is_some_and(|texture| texture.uploads.is_current(atlas))
         {
-            return Err(FrameError::InvalidExtent { width, height });
+            return Ok(0);
         }
+        atlas.validate()?;
+        let replace = self.window[slot].ui_atlas.as_ref().is_none_or(|texture| {
+            texture.texture.width() != atlas.width as usize
+                || texture.texture.height() != atlas.height as usize
+        });
+        if replace {
+            let replacement = self.allocate_ui_atlas(atlas)?;
+            if let Some(set) = &self.residency {
+                set.addAllocation(ProtocolObject::from_ref(&*replacement.texture));
+            }
+            if let Some(old) = self.window[slot].ui_atlas.replace(replacement)
+                && let Some(set) = &self.residency
+            {
+                set.removeAllocation(ProtocolObject::from_ref(&*old.texture));
+            }
+            self.commit_residency();
+        }
+        let Some(texture) = self.window[slot].ui_atlas.as_mut() else {
+            unreachable!("the chrome texture was just allocated");
+        };
+        let bytes_per_row = atlas.width as usize * 4;
+        let UiAtlasTexture {
+            uploads, texture, ..
+        } = texture;
+        uploads.write(atlas, |row, rows, rgba| {
+            let pixels = NonNull::new(rgba.as_ptr().cast_mut().cast::<c_void>())
+                .expect("a validated atlas stripe is nonempty");
+            let region = MTLRegion {
+                origin: MTLOrigin {
+                    x: 0,
+                    y: row as usize,
+                    z: 0,
+                },
+                size: MTLSize {
+                    width: atlas.width as usize,
+                    height: rows as usize,
+                    depth: 1,
+                },
+            };
+            #[allow(unsafe_code)]
+            // SAFETY: ATLAS-UPLOAD. The same-ring lease guarantees every
+            // previous GPU reader of this slot's texture has completed.
+            // All stripes were validated before any write; this full-width
+            // region fits the texture and rgba holds exactly rows * pitch
+            // bytes. Its borrow stays alive for the synchronous copy into
+            // the texture's CPU-visible shared storage.
+            unsafe {
+                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    region,
+                    0,
+                    pixels,
+                    bytes_per_row,
+                );
+            }
+        })
+    }
+
+    /// Allocates a fresh chrome texture. Validation precedes allocation;
+    /// its fresh upload history requires full initialization before use.
+    fn allocate_ui_atlas(&self, atlas: UiAtlas<'_>) -> Result<UiAtlasTexture, FrameError> {
+        atlas.validate()?;
+        let (width, height) = (atlas.width, atlas.height);
+        let bytes = width as usize * height as usize * 4;
         #[allow(unsafe_code)]
         // SAFETY: FFI-EXTENT. RGBA8Unorm_sRGB is an ordinary 2D format and the
         // extent was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes
@@ -857,69 +908,23 @@ impl FrameSlots {
         let texture = self.device.newTextureWithDescriptor(&descriptor).ok_or(
             FrameError::AllocationFailed {
                 what: "window chrome atlas",
-                bytes: atlas.rgba.len(),
+                bytes,
             },
         )?;
-        let Some(pixels) = NonNull::new(atlas.rgba.as_ptr().cast_mut().cast::<c_void>()) else {
-            return Err(FrameError::InvalidExtent { width, height });
-        };
-        let region = MTLRegion {
-            origin: MTLOrigin { x: 0, y: 0, z: 0 },
-            size: MTLSize {
-                width: width as usize,
-                height: height as usize,
-                depth: 1,
-            },
-        };
-        #[allow(unsafe_code)]
-        // SAFETY: ATLAS-UPLOAD. The region is the whole new texture, which no
-        // frame has used yet. `atlas.rgba` was checked to hold exactly
-        // width * height * 4 bytes, rows tightly packed at `bytes_per_row`,
-        // and the borrow keeps it alive for the call. The texture is in shared
-        // storage, which the CPU may write.
-        unsafe {
-            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                region,
-                0,
-                pixels,
-                bytes_per_row,
-            );
-        }
-        if let Some(set) = &self.residency {
-            set.addAllocation(ProtocolObject::from_ref(&*texture));
-        }
-        self.commit_residency();
         Ok(UiAtlasTexture {
-            version: atlas.version,
+            uploads: UiAtlasUploads::default(),
             texture,
             _ledger: self
                 .ledger
-                .track_texture(GpuTexturePurpose::Atlas, atlas.rgba.len() as u64),
+                .track_texture(GpuTexturePurpose::Atlas, bytes as u64),
         })
-    }
-
-    /// Frees the replaced chrome atlases no unfinished frame samples.
-    fn retire_ui_atlases(&mut self) {
-        let retired_before = self.ring.retired_before();
-        let residency = &self.residency;
-        let before = self.retired_ui_atlases.len();
-        self.retired_ui_atlases.retain(|(first_without, atlas)| {
-            let keep = *first_without > retired_before;
-            if !keep && let Some(set) = residency {
-                set.removeAllocation(ProtocolObject::from_ref(&*atlas.texture));
-            }
-            keep
-        });
-        if self.retired_ui_atlases.len() != before {
-            self.commit_residency();
-        }
     }
 
     /// The leased slot's chrome buffer and the chrome atlas, once written.
     pub(crate) fn ui_buffers(&self, slot: usize) -> Option<UiBuffers<'_>> {
         Some(UiBuffers {
             buffer: &self.window[slot].ui.as_ref()?.buffer,
-            atlas: &self.ui_atlas.as_ref()?.texture,
+            atlas: &self.window[slot].ui_atlas.as_ref()?.texture,
         })
     }
 
@@ -1218,7 +1223,7 @@ pub(crate) fn read_texture_bgra(
         .ok_or(FrameError::EncoderUnavailable)?;
     // SAFETY: FFI-EXTENT. The source region is the texture's whole width x
     // height x 1 extent in slice 0, level 0 (the caller's texture has exactly
-    // this extent and the 4-byte BGRA8 format). The destination pitch is
+    // this extent and a 4-byte BGRA8 or RGBA8 format). The destination pitch is
     // width * 4 bytes and `buffer` holds exactly pitch * height bytes.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
@@ -2526,6 +2531,193 @@ mod tests {
 
     fn slots_u64() -> u64 {
         u64::try_from(FRAME_SLOTS).unwrap()
+    }
+
+    #[test]
+    // One lifecycle exercises all three slot histories, in-flight exclusion,
+    // malformed input and replacement without losing its resource identities.
+    #[allow(clippy::too_many_lines)]
+    fn chrome_atlas_slots_reuse_textures_and_catch_up_without_touching_in_flight_pixels() {
+        use crate::ui_quads::{UiAtlasPixels, UiAtlasStripe};
+
+        let device = device();
+        let queue = device.newCommandQueue().unwrap();
+        let ledger = private_ledger();
+        let mut frames = FrameSlots::new(device.clone(), SMALL, ledger).unwrap();
+        let width = 16_u32;
+        let height = 65_u32;
+        let stripe = |version, rows, byte| UiAtlasStripe {
+            version,
+            rgba: Arc::from(vec![byte; width as usize * rows * 4]),
+        };
+        let original = vec![stripe(10, 32, 1), stripe(10, 32, 2), stripe(10, 1, 3)];
+        let flatten = |stripes: &[UiAtlasStripe]| {
+            stripes
+                .iter()
+                .flat_map(|stripe| stripe.rgba.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        let mut tokens = Vec::new();
+        let mut identities = Vec::new();
+        for index in 0..FRAME_SLOTS {
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), index);
+            let atlas = UiAtlas {
+                width,
+                height,
+                version: 10,
+                pixels: UiAtlasPixels::Stripes(&original),
+            };
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas).unwrap(),
+                u64::from(width * height * 4)
+            );
+            assert_eq!(frames.write_ui_atlas(&lease, atlas).unwrap(), 0);
+            identities.push(std::ptr::from_ref(
+                &*frames.window[index].ui_atlas.as_ref().unwrap().texture,
+            ));
+            tokens.push(lease.submit());
+        }
+        assert!(
+            frames.begin(SMALL, Duration::ZERO).is_err(),
+            "all three textures are in flight"
+        );
+        let original_resident = frames.residency().map(MTLResidencySet::allocationCount);
+        let read = |frames: &FrameSlots, index: usize| {
+            // The readback helper copies raw four-byte texels; RGBA chrome
+            // bytes retain their order just as BGRA render targets do.
+            read_texture_bgra(
+                &device,
+                &queue,
+                &frames.window[index].ui_atlas.as_ref().unwrap().texture,
+                width,
+                height,
+            )
+            .unwrap()
+        };
+        let mut changed = original.clone();
+        changed[1] = stripe(11, 32, 7);
+        tokens[0].complete();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 0);
+        let atlas = UiAtlas {
+            width,
+            height,
+            version: 11,
+            pixels: UiAtlasPixels::Stripes(&changed),
+        };
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas).unwrap(),
+            u64::from(width * 32 * 4)
+        );
+        assert_eq!(read(&frames, 0), flatten(&changed));
+        for index in 1..FRAME_SLOTS {
+            assert_eq!(
+                read(&frames, index),
+                flatten(&original),
+                "in-flight pixels stay unchanged"
+            );
+        }
+        drop(lease);
+
+        // Slot 1 missed version 11: it must upload both changed stripes,
+        // including the one-row tail, directly from version 12's snapshot.
+        changed[2] = stripe(12, 1, 9);
+        tokens[1].complete();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 1);
+        let atlas = UiAtlas {
+            width,
+            height,
+            version: 12,
+            pixels: UiAtlasPixels::Stripes(&changed),
+        };
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas).unwrap(),
+            u64::from(width * 33 * 4)
+        );
+        assert_eq!(read(&frames, 1), flatten(&changed));
+        assert_eq!(read(&frames, 2), flatten(&original));
+        for (index, identity) in identities.into_iter().enumerate() {
+            assert!(std::ptr::eq(
+                &*frames.window[index].ui_atlas.as_ref().unwrap().texture,
+                identity
+            ));
+        }
+        let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert_eq!(counter.created_total, slots_u64());
+        assert_eq!(counter.live_count, slots_u64());
+        assert_eq!(
+            counter.live_bytes,
+            u64::from(width * height * 4) * slots_u64()
+        );
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            original_resident
+        );
+
+        // Validate the entire snapshot before any write, including a bad
+        // final stripe after an earlier stripe changed.
+        let mut invalid = changed.clone();
+        invalid[0] = stripe(13, 32, 8);
+        invalid[2].rgba = Arc::from([0_u8; 1]);
+        assert!(
+            frames
+                .write_ui_atlas(
+                    &lease,
+                    UiAtlas {
+                        version: 13,
+                        pixels: UiAtlasPixels::Stripes(&invalid),
+                        ..atlas
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(read(&frames, 1), flatten(&changed));
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas).unwrap(),
+            0,
+            "invalid input did not advance history"
+        );
+
+        // A size change creates and fully initializes one replacement only
+        // after validation. It does not leave a retired texture resident.
+        let resized_pixels = vec![0x5a; 8 * height as usize * 4];
+        let resized = UiAtlas {
+            width: 8,
+            height,
+            version: 14,
+            pixels: UiAtlasPixels::Rgba(&resized_pixels),
+        };
+        assert_eq!(
+            frames.write_ui_atlas(&lease, resized).unwrap(),
+            resized_pixels.len() as u64
+        );
+        assert_eq!(
+            read_texture_bgra(
+                &device,
+                &queue,
+                &frames.window[1].ui_atlas.as_ref().unwrap().texture,
+                8,
+                height
+            )
+            .unwrap(),
+            resized_pixels
+        );
+        assert_eq!(
+            ledger
+                .texture_counter(GpuTexturePurpose::Atlas)
+                .created_total,
+            slots_u64() + 1
+        );
+        assert_eq!(
+            ledger.texture_counter(GpuTexturePurpose::Atlas).live_count,
+            slots_u64()
+        );
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            original_resident
+        );
     }
 
     /// The buffers of one slot that resizing from `from` to `to` reallocates,

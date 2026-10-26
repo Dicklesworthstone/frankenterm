@@ -10,6 +10,9 @@
 //! order. [`shade_ui_quad`] and [`blend_ui`] are the CPU reference.
 
 use crate::cell_bg::{hsv_to_rgb, rgb_to_hsv};
+#[cfg(any(target_os = "macos", test))]
+use crate::{FrameError, MAX_TEXTURE_EXTENT};
+use std::sync::Arc;
 
 /// The Metal source of the chrome quad pass.
 pub const UI_SHADER: &str = include_str!("shaders/ui.metal");
@@ -116,15 +119,137 @@ pub fn ui_uniforms_bytes(
     bytes
 }
 
+/// Rows shared by one immutable chrome-atlas stripe. A changed glyph copies
+/// only the stripes it touches when a new frame snapshot is published.
+pub const UI_ATLAS_STRIPE_ROWS: u32 = 32;
+
+/// One full-width stripe of an immutable chrome-atlas snapshot.
+#[derive(Debug, Clone)]
+pub struct UiAtlasStripe {
+    /// Globally unique snapshot revision that last changed this stripe,
+    /// retained when a newer snapshot shares it at the same row position.
+    /// A recreated atlas must use new versions.
+    pub version: u64,
+    /// Tightly packed RGBA8 sRGB rows. Only the final stripe may be short.
+    pub rgba: Arc<[u8]>,
+}
+
+/// Complete atlas pixels, either contiguous or shared in immutable stripes.
+/// Every snapshot contains the entire atlas, so renderers can skip any
+/// number of intermediate versions without needing a damage history.
+#[derive(Debug, Clone, Copy)]
+pub enum UiAtlasPixels<'a> {
+    Rgba(&'a [u8]),
+    Stripes(&'a [UiAtlasStripe]),
+}
+
 /// The texture chrome quads sample: RGBA8 bytes, sRGB-encoded as WebGpu's
 /// `Rgba8UnormSrgb` glyph atlas holds them, row by row.
 #[derive(Debug, Clone, Copy)]
 pub struct UiAtlas<'a> {
     pub width: u32,
     pub height: u32,
-    /// Changes whenever `rgba` changes; the renderer uploads only then.
+    /// Changes whenever the pixels change; the renderer uploads only then.
     pub version: u64,
-    pub rgba: &'a [u8],
+    pub pixels: UiAtlasPixels<'a>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl UiAtlas<'_> {
+    /// Checks all source ranges before the first GPU write, including every
+    /// stripe even if a renderer already holds some of their versions.
+    // A valid stripe index is below MAX_TEXTURE_EXTENT / stripe rows.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn validate(self) -> Result<(), FrameError> {
+        let invalid = || FrameError::InvalidExtent {
+            width: self.width,
+            height: self.height,
+        };
+        if !(1..=MAX_TEXTURE_EXTENT).contains(&self.width)
+            || !(1..=MAX_TEXTURE_EXTENT).contains(&self.height)
+        {
+            return Err(invalid());
+        }
+        let pitch = self.width as usize * 4;
+        let valid = match self.pixels {
+            UiAtlasPixels::Rgba(rgba) => rgba.len() == pitch * self.height as usize,
+            UiAtlasPixels::Stripes(stripes) => {
+                stripes.len() == self.height.div_ceil(UI_ATLAS_STRIPE_ROWS) as usize
+                    && stripes.iter().enumerate().all(|(index, stripe)| {
+                        let row = index as u32 * UI_ATLAS_STRIPE_ROWS;
+                        let rows = (self.height - row).min(UI_ATLAS_STRIPE_ROWS);
+                        stripe.rgba.len() == pitch * rows as usize
+                    })
+            }
+        };
+        if valid { Ok(()) } else { Err(invalid()) }
+    }
+}
+
+/// What one independently reusable GPU texture currently holds. The native
+/// renderer keeps one alongside each leased frame slot's chrome texture.
+#[derive(Debug, Default)]
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct UiAtlasUploads {
+    width: u32,
+    height: u32,
+    version: Option<u64>,
+    stripes: Vec<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl UiAtlasUploads {
+    pub(crate) fn is_current(&self, atlas: UiAtlas<'_>) -> bool {
+        self.version == Some(atlas.version)
+            && self.width == atlas.width
+            && self.height == atlas.height
+    }
+
+    /// Uploads changed full-width regions and advances the texture's
+    /// history only after all writes. A new texture uses a fresh history.
+    /// The callback receives (first row, row count, tightly packed pixels).
+    // Validation bounds the stripe index by MAX_TEXTURE_EXTENT.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn write(
+        &mut self,
+        atlas: UiAtlas<'_>,
+        mut upload: impl FnMut(u32, u32, &[u8]),
+    ) -> Result<u64, FrameError> {
+        if self.is_current(atlas) {
+            return Ok(0);
+        }
+        atlas.validate()?;
+        let same_extent =
+            self.version.is_some() && self.width == atlas.width && self.height == atlas.height;
+        let bytes = match atlas.pixels {
+            UiAtlasPixels::Rgba(rgba) => {
+                upload(0, atlas.height, rgba);
+                self.stripes.clear();
+                rgba.len() as u64
+            }
+            UiAtlasPixels::Stripes(stripes) => {
+                let can_reuse = same_extent && self.stripes.len() == stripes.len();
+                let mut bytes = 0;
+                for (index, stripe) in stripes.iter().enumerate() {
+                    if can_reuse && self.stripes[index] == stripe.version {
+                        continue;
+                    }
+                    let row = index as u32 * UI_ATLAS_STRIPE_ROWS;
+                    let rows = (atlas.height - row).min(UI_ATLAS_STRIPE_ROWS);
+                    upload(row, rows, &stripe.rgba);
+                    bytes += stripe.rgba.len() as u64;
+                }
+                self.stripes.clear();
+                self.stripes
+                    .extend(stripes.iter().map(|stripe| stripe.version));
+                bytes
+            }
+        };
+        self.width = atlas.width;
+        self.height = atlas.height;
+        self.version = Some(atlas.version);
+        Ok(bytes)
+    }
 }
 
 /// Window chrome drawn over a window frame.
@@ -194,6 +319,201 @@ pub fn blend_ui(source: [f32; 4], destination: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn atlas_stripes(width: u32, height: u32, versions: &[u64]) -> Vec<UiAtlasStripe> {
+        assert_eq!(
+            versions.len(),
+            height.div_ceil(UI_ATLAS_STRIPE_ROWS) as usize
+        );
+        versions
+            .iter()
+            .enumerate()
+            .map(|(index, &version)| {
+                let row = u32::try_from(index).unwrap() * UI_ATLAS_STRIPE_ROWS;
+                let rows = (height - row).min(UI_ATLAS_STRIPE_ROWS);
+                UiAtlasStripe {
+                    version,
+                    rgba: vec![version.to_le_bytes()[0]; (width * rows * 4) as usize].into(),
+                }
+            })
+            .collect()
+    }
+
+    fn stripe_pixels(stripes: &[UiAtlasStripe]) -> Vec<u8> {
+        stripes
+            .iter()
+            .flat_map(|stripe| stripe.rgba.iter().copied())
+            .collect()
+    }
+
+    fn write_atlas(
+        history: &mut UiAtlasUploads,
+        atlas: UiAtlas<'_>,
+        destination: &mut [u8],
+    ) -> (u64, Vec<(u32, u32)>) {
+        let pitch = atlas.width as usize * 4;
+        let mut regions = Vec::new();
+        let bytes = history
+            .write(atlas, |row, rows, rgba| {
+                assert_eq!(rgba.len(), rows as usize * pitch);
+                let first = row as usize * pitch;
+                destination[first..first + rgba.len()].copy_from_slice(rgba);
+                regions.push((row, rows));
+            })
+            .unwrap();
+        (bytes, regions)
+    }
+
+    #[test]
+    fn atlas_uploads_keep_three_lagging_slots_complete_after_skipped_snapshots() {
+        let (width, height) = (3, 70);
+        let snapshots = [
+            atlas_stripes(width, height, &[11, 12, 13]),
+            atlas_stripes(width, height, &[21, 12, 13]),
+            atlas_stripes(width, height, &[21, 22, 13]),
+            atlas_stripes(width, height, &[21, 22, 23]),
+        ];
+        let atlas = |index: usize| UiAtlas {
+            width,
+            height,
+            version: 100 + index as u64,
+            pixels: UiAtlasPixels::Stripes(&snapshots[index]),
+        };
+        let mut slots: [UiAtlasUploads; 3] = std::array::from_fn(|_| UiAtlasUploads::default());
+        let mut textures: [Vec<u8>; 3] = std::array::from_fn(|_| vec![0xcd; 840]);
+        for slot in 0..3 {
+            let (bytes, regions) = write_atlas(&mut slots[slot], atlas(slot), &mut textures[slot]);
+            assert_eq!(bytes, 840, "a newly allocated slot initializes every pixel");
+            assert_eq!(regions, [(0, 32), (32, 32), (64, 6)]);
+            assert_eq!(textures[slot], stripe_pixels(&snapshots[slot]));
+        }
+        let expected_bytes = [840, 456, 72];
+        let expected_regions = [
+            vec![(0, 32), (32, 32), (64, 6)],
+            vec![(32, 32), (64, 6)],
+            vec![(64, 6)],
+        ];
+        for slot in 0..3 {
+            let (bytes, regions) = write_atlas(&mut slots[slot], atlas(3), &mut textures[slot]);
+            assert_eq!(bytes, expected_bytes[slot]);
+            assert_eq!(regions, expected_regions[slot]);
+            assert_eq!(textures[slot], stripe_pixels(&snapshots[3]));
+            assert_eq!(
+                write_atlas(&mut slots[slot], atlas(3), &mut textures[slot]),
+                (0, vec![])
+            );
+            assert!(slots[slot].is_current(atlas(3)));
+        }
+        // A later complete snapshot may share all its stripes. This advances
+        // snapshot identity without any upload and needs no intermediate log.
+        let unchanged = UiAtlas {
+            version: 200,
+            ..atlas(3)
+        };
+        assert_eq!(
+            write_atlas(&mut slots[0], unchanged, &mut textures[0]),
+            (0, vec![])
+        );
+        assert!(slots[0].is_current(unchanged));
+    }
+
+    #[test]
+    fn atlas_uploads_reinitialize_new_textures_and_representation_or_extent_changes() {
+        let stripes = atlas_stripes(3, 70, &[31, 32, 33]);
+        let pixels = stripe_pixels(&stripes);
+        let atlas = UiAtlas {
+            width: 3,
+            height: 70,
+            version: 300,
+            pixels: UiAtlasPixels::Stripes(&stripes),
+        };
+        let mut history = UiAtlasUploads::default();
+        let mut texture = vec![0xcd; pixels.len()];
+        assert_eq!(write_atlas(&mut history, atlas, &mut texture).0, 840);
+        let contiguous = UiAtlas {
+            version: 301,
+            pixels: UiAtlasPixels::Rgba(&pixels),
+            ..atlas
+        };
+        assert_eq!(
+            write_atlas(&mut history, contiguous, &mut texture),
+            (840, vec![(0, 70)])
+        );
+        let striped_again = UiAtlas {
+            version: 302,
+            ..atlas
+        };
+        assert_eq!(
+            write_atlas(&mut history, striped_again, &mut texture).0,
+            840
+        );
+        assert_eq!(texture, pixels);
+
+        for (width, height, version) in [(4, 70, 303), (4, 65, 304)] {
+            // Even the same stripe count and stripe ids cannot authorize
+            // reuse when their row pitch or final stripe extent changes.
+            let stripes = atlas_stripes(width, height, &[31, 32, 33]);
+            let atlas = UiAtlas {
+                width,
+                height,
+                version,
+                pixels: UiAtlasPixels::Stripes(&stripes),
+            };
+            texture = vec![0xcd; (width * height * 4) as usize];
+            let (bytes, regions) = write_atlas(&mut history, atlas, &mut texture);
+            assert_eq!(bytes, u64::from(width * height * 4));
+            assert_eq!(regions, [(0, 32), (32, 32), (64, height - 64)]);
+            assert_eq!(texture, stripe_pixels(&stripes));
+            let mut fresh_history = UiAtlasUploads::default();
+            texture.fill(0xcd);
+            assert_eq!(
+                write_atlas(&mut fresh_history, atlas, &mut texture).0,
+                bytes
+            );
+            assert_eq!(texture, stripe_pixels(&stripes));
+        }
+    }
+
+    #[test]
+    fn malformed_later_stripe_rejects_before_any_write_or_history_change() {
+        let initial = atlas_stripes(3, 70, &[41, 42, 43]);
+        let old = UiAtlas {
+            width: 3,
+            height: 70,
+            version: 400,
+            pixels: UiAtlasPixels::Stripes(&initial),
+        };
+        let mut history = UiAtlasUploads::default();
+        let mut texture = vec![0; 840];
+        write_atlas(&mut history, old, &mut texture);
+        let original_pixels = texture.clone();
+        let mut malformed = atlas_stripes(3, 70, &[51, 42, 43]);
+        // The later stripe even advertises an already uploaded version.
+        // Validation must still inspect it before uploading the changed first.
+        malformed[2].rgba = vec![43; 71].into();
+        let invalid = UiAtlas {
+            version: 401,
+            pixels: UiAtlasPixels::Stripes(&malformed),
+            ..old
+        };
+        let mut callbacks = 0;
+        assert!(history.write(invalid, |_, _, _| callbacks += 1).is_err());
+        assert_eq!(callbacks, 0);
+        assert!(history.is_current(old));
+        assert!(!history.is_current(invalid));
+        assert_eq!(texture, original_pixels);
+
+        let repaired = atlas_stripes(3, 70, &[51, 42, 53]);
+        let retry = UiAtlas {
+            pixels: UiAtlasPixels::Stripes(&repaired),
+            ..invalid
+        };
+        assert_eq!(
+            write_atlas(&mut history, retry, &mut texture),
+            (456, vec![(0, 32), (64, 6)])
+        );
+        assert_eq!(texture, stripe_pixels(&repaired));
+    }
 
     #[test]
     fn a_quad_is_laid_out_as_the_shader_reads_it() {

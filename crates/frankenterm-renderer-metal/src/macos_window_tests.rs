@@ -465,7 +465,7 @@ fn chrome_layer<'a>(
             width: 4,
             height: 4,
             version,
-            rgba,
+            pixels: crate::ui_quads::UiAtlasPixels::Rgba(rgba),
         },
         quads,
         under: 0,
@@ -632,7 +632,12 @@ fn chrome_quads_draw_as_the_webgpu_quad_shader_shades_them() {
         "a glyph shaded as a gray poly went unnoticed"
     );
 
-    // Same version, other bytes: not uploaded again.
+    // Initialize every independently reusable slot with the same snapshot.
+    // The canary below then revisits a slot that already holds version 1.
+    for _ in 1..crate::FRAME_SLOTS {
+        assert_eq!(render(Some(layer(&quads, 1, &first))), drawn);
+    }
+    // Same version, other bytes: not uploaded again into an initialized slot.
     let second = atlas([20, 200, 220, 255]);
     assert_eq!(
         render(Some(layer(&quads, 1, &second))),
