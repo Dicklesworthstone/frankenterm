@@ -118,6 +118,8 @@ impl UploadPlan {
 pub struct SlotUploads {
     cells: Option<u64>,
     text: Option<u64>,
+    cells_latest: u64,
+    text_latest: u64,
     extent: Option<GridExtent>,
     capacity: u32,
     buffers: Option<u64>,
@@ -156,10 +158,27 @@ impl SlotUploads {
         let extent = cells
             .map(CellBgGrid::extent)
             .or_else(|| text.map(CellTextGrid::extent));
-        let needed = text.map_or(1, needed_capacity);
+        let cells_latest = cells.map_or(0, |grid| grid.changes().latest);
+        let text_latest = text.map_or(0, |grid| grid.changes().latest);
         let same_grids = self.cells == cells.map(|grid| grid.changes().epoch())
             && self.text == text.map(|grid| grid.changes().epoch())
             && self.extent == extent;
+        // An idle pane must not scan all its rows just to discover that
+        // nothing changed. The latest generation changes on every row
+        // mutation; epochs also distinguish replacement grids with the
+        // same generation. Scroll offsets are uniforms, so rotating only
+        // empty rows needs no upload even though the offset changed.
+        if same_grids
+            && self.buffers == Some(buffers_generation)
+            && self.cells_latest == cells_latest
+            && self.text_latest == text_latest
+        {
+            return UploadPlan {
+                capacity: self.capacity,
+                ..UploadPlan::default()
+            };
+        }
+        let needed = text.map_or(1, needed_capacity);
         let full =
             !same_grids || self.buffers != Some(buffers_generation) || needed > self.capacity;
         if full {
@@ -203,6 +222,8 @@ impl SlotUploads {
                 }
             }
         }
+        self.cells_latest = cells_latest;
+        self.text_latest = text_latest;
         plan
     }
 }
@@ -371,6 +392,91 @@ mod tests {
             (one.cell_rows.clone(), one.text_rows.clone()),
             (vec![ring], vec![ring])
         );
+    }
+
+    #[test]
+    fn idle_plans_resume_after_independent_background_and_text_changes() {
+        let (mut cells, mut text) = grids(6, 4);
+        let mut slot = SlotModel::default();
+        slot.upload(&cells, &text);
+        for _ in 0..3 {
+            assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
+        }
+
+        cells.set(2, 1, CellBg::rgb(9, 8, 7));
+        let background = slot.upload(&cells, &text);
+        assert_eq!(background.cell_rows, vec![2]);
+        assert!(background.text_rows.is_empty());
+        assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
+
+        text.push(4, CellText::new(1, [1, 2, 3, 255]));
+        let glyph = slot.upload(&cells, &text);
+        assert!(glyph.cell_rows.is_empty());
+        assert_eq!(glyph.text_rows, vec![4]);
+        assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
+
+        text.clear_row(4);
+        let cleared = slot.upload(&cells, &text);
+        assert!(cleared.cell_rows.is_empty());
+        assert_eq!(cleared.text_rows, vec![4]);
+        assert!(slot.text.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn idle_plans_still_reinitialize_replaced_grids_buffers_and_optional_text() {
+        let (cells, text) = grids(6, 4);
+        let mut uploads = SlotUploads::default();
+        assert!(uploads.plan(Some(&cells), Some(&text), 0).full);
+        assert!(!uploads.plan(Some(&cells), Some(&text), 0).full);
+
+        // Clones have identical row generations but distinct grid epochs.
+        let replacement_cells = cells.clone();
+        let replacement_text = text.clone();
+        assert!(uploads.plan(Some(&replacement_cells), Some(&text), 0).full);
+        assert!(
+            uploads
+                .plan(Some(&replacement_cells), Some(&replacement_text), 0)
+                .full
+        );
+        let replaced_buffers = uploads.plan(Some(&replacement_cells), Some(&replacement_text), 1);
+        assert!(replaced_buffers.full);
+        assert_eq!(replaced_buffers.cell_rows.len(), 6);
+        assert_eq!(replaced_buffers.text_rows.len(), 6);
+
+        assert!(uploads.plan(Some(&replacement_cells), None, 1).full);
+        assert!(!uploads.plan(Some(&replacement_cells), None, 1).full);
+        assert!(
+            uploads
+                .plan(Some(&replacement_cells), Some(&replacement_text), 1)
+                .full
+        );
+        uploads.invalidate();
+        assert!(
+            uploads
+                .plan(Some(&replacement_cells), Some(&replacement_text), 1)
+                .full
+        );
+    }
+
+    #[test]
+    fn empty_row_rotation_needs_no_upload_and_later_writes_use_the_new_offset() {
+        let (mut cells, mut text) = grids(6, 4);
+        let mut slot = SlotModel::default();
+        slot.upload(&cells, &text);
+        cells.scroll_up(2);
+        text.scroll_up(2);
+        assert_eq!(cells.row_offset(), 2);
+        assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
+
+        write_row(&mut cells, &mut text, 5, 7);
+        let changed = slot.upload(&cells, &text);
+        assert_eq!(changed.cell_rows, vec![1]);
+        assert_eq!(changed.text_rows, vec![1]);
+        let (expected_cells, expected_text, expected_table) =
+            full_layout(&cells, &text, changed.capacity);
+        assert_eq!(slot.cells, expected_cells);
+        assert_eq!(slot.text, expected_text);
+        assert_eq!(slot.table, expected_table);
     }
 
     #[test]

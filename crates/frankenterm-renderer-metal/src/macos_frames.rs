@@ -17,7 +17,7 @@ use crate::frame::{
 };
 use crate::macos_atlas::GlyphAtlases;
 use crate::ui_quads::{UI_QUAD_BYTES, UI_SHADER, UI_UNIFORMS_BYTES, UiLayer, ui_uniforms_bytes};
-use crate::uploads::{SlotUploads, UploadPlan, row_table_entry, text_region};
+use crate::uploads::{SlotUploads, UploadPlan, row_table_entry};
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{
@@ -341,19 +341,31 @@ impl FrameSlots {
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), FrameError> {
+        self.write_padded_into(lease, buffer, label, offset, bytes, bytes.len())
+    }
+
+    /// Copies `bytes` directly into the leased buffer and clears the rest
+    /// of its `len`-byte region. Glyph rows use this to retire old instances
+    /// without allocating and copying a zero-padded staging Vec first.
+    fn write_padded_into(
+        &self,
+        lease: &SlotLease,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        label: &'static str,
+        offset: usize,
+        bytes: &[u8],
+        len: usize,
+    ) -> Result<(), FrameError> {
         assert!(
             lease.is_from(&self.ring),
             "a slot lease from another renderer's ring"
         );
         let capacity = buffer.length();
-        if offset
-            .checked_add(bytes.len())
-            .is_none_or(|end| end > capacity)
-        {
+        if bytes.len() > len || offset.checked_add(len).is_none_or(|end| end > capacity) {
             return Err(FrameError::SlotWriteOutOfBounds {
                 buffer: label,
                 offset,
-                len: bytes.len(),
+                len: len.max(bytes.len()),
                 capacity,
             });
         }
@@ -369,6 +381,16 @@ impl FrameSlots {
         // memory, which cannot overlap the Metal allocation.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+        }
+        if len > bytes.len() {
+            #[allow(unsafe_code)]
+            // SAFETY: BUFFER-WRITE. The lease and buffer bounds were checked
+            // above for the entire `len`-byte region. The padding starts
+            // after the copied prefix and ends at offset + len, so it is
+            // writable shared memory in the same non-in-flight slot.
+            unsafe {
+                std::ptr::write_bytes(destination.wrapping_add(bytes.len()), 0, len - bytes.len());
+            }
         }
         Ok(())
     }
@@ -438,12 +460,17 @@ impl FrameSlots {
         }
         if let Some(text) = text {
             let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
-            let mut bytes = Vec::with_capacity(region);
             for &ring in &plan.text_rows {
                 let ring = ring as usize;
-                bytes.clear();
-                text_region(text, ring, plan.capacity, &mut bytes);
-                self.write(lease, SlotBuffer::CellText, ring * region, &bytes)?;
+                let bytes = text.ring_row_instances(ring);
+                self.write_padded_into(
+                    lease,
+                    self.buffer(lease.slot(), SlotBuffer::CellText),
+                    SlotBuffer::CellText.as_str(),
+                    ring * region,
+                    &bytes[..bytes.len().min(region)],
+                    region,
+                )?;
                 self.write(
                     lease,
                     SlotBuffer::RowTable,
@@ -620,17 +647,16 @@ impl FrameSlots {
         }
         if let Some(text) = text {
             let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
-            let mut bytes = Vec::with_capacity(region);
             for &ring in &plan.text_rows {
                 let ring = ring as usize;
-                bytes.clear();
-                text_region(text, ring, plan.capacity, &mut bytes);
-                self.write_into(
+                let bytes = text.ring_row_instances(ring);
+                self.write_padded_into(
                     lease,
                     buffer(SlotBuffer::CellText),
                     "pane cell_text",
                     ring * region,
-                    &bytes,
+                    &bytes[..bytes.len().min(region)],
+                    region,
                 )?;
                 self.write_into(
                     lease,
@@ -2625,6 +2651,90 @@ mod tests {
             frames
                 .write(&lease, SlotBuffer::Uniforms, usize::MAX, &[1])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn padded_writes_clear_stale_instances_and_preserve_neighboring_bytes() {
+        let grid = GridExtent::new(2, 2);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let lease = frames.begin(grid, LONG).unwrap();
+        let slot = lease.slot();
+        let buffer = frames.buffer(slot, SlotBuffer::CellText);
+        let capacity = buffer.length();
+        frames
+            .write(&lease, SlotBuffer::CellText, 0, &vec![0xa5; capacity])
+            .unwrap();
+        // A previous longer row must not leave glyphs in the new row's tail.
+        frames
+            .write_padded_into(&lease, buffer, "cell_text", 8, &[9; 16], 16)
+            .unwrap();
+        frames
+            .write_padded_into(&lease, buffer, "cell_text", 8, &[1, 2, 3], 16)
+            .unwrap();
+        // Clearing a row has no source bytes but still clears its region.
+        frames
+            .write_padded_into(&lease, buffer, "cell_text", 32, &[], 8)
+            .unwrap();
+        // An empty write at the end of the allocation touches nothing.
+        frames
+            .write_padded_into(&lease, buffer, "cell_text", capacity, &[], 0)
+            .unwrap();
+        drop(lease);
+
+        let bytes = frames.read(slot, SlotBuffer::CellText, capacity);
+        assert_eq!(&bytes[..8], &[0xa5; 8]);
+        assert_eq!(&bytes[8..11], &[1, 2, 3]);
+        assert_eq!(&bytes[11..24], &[0; 13]);
+        assert_eq!(&bytes[24..32], &[0xa5; 8]);
+        assert_eq!(&bytes[32..40], &[0; 8]);
+        assert!(bytes[40..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn padded_writes_validate_the_entire_region_before_modifying_it() {
+        let grid = GridExtent::new(2, 2);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let lease = frames.begin(grid, LONG).unwrap();
+        let slot = lease.slot();
+        let buffer = frames.buffer(slot, SlotBuffer::CellText);
+        let capacity = buffer.length();
+        frames
+            .write(&lease, SlotBuffer::CellText, 0, &vec![0xa5; capacity])
+            .unwrap();
+        assert_eq!(
+            frames.write_padded_into(&lease, buffer, "cell_text", capacity - 3, &[1], 4),
+            Err(FrameError::SlotWriteOutOfBounds {
+                buffer: "cell_text",
+                offset: capacity - 3,
+                len: 4,
+                capacity,
+            })
+        );
+        assert!(
+            frames
+                .write_padded_into(&lease, buffer, "cell_text", 0, &[1; 4], 3)
+                .is_err(),
+            "a prefix cannot be longer than its destination region"
+        );
+        assert!(
+            frames
+                .write_padded_into(&lease, buffer, "cell_text", usize::MAX, &[], 2)
+                .is_err(),
+            "the padding end must not overflow"
+        );
+        assert!(
+            frames
+                .write_padded_into(&lease, buffer, "cell_text", capacity, &[], 1)
+                .is_err()
+        );
+        drop(lease);
+        assert!(
+            frames
+                .read(slot, SlotBuffer::CellText, capacity)
+                .iter()
+                .all(|byte| *byte == 0xa5),
+            "an invalid region must fail before even its valid prefix is copied"
         );
     }
 

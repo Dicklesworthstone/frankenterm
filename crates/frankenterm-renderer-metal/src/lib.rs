@@ -94,13 +94,14 @@
 //!    the read; the bytes are copied into an owned `Vec` before the buffer is
 //!    released, so no reference outlives the allocation.
 //! 5. **BUFFER-WRITE: writing a frame slot.** Copying a frame's bytes into a
-//!    slot buffer's `-contents`.
+//!    slot buffer's `-contents` and zeroing the unused tail of a glyph region.
 //!    *Invariant:* the write requires a `SlotLease` from the same slot ring
 //!    (asserted), and a lease exists only while its slot is not in flight:
 //!    the GPU finished the last frame that read the slot before the lease was
 //!    granted. The destination range is checked against `-length`, the
 //!    buffer is CPU-visible shared storage, and the source is Rust memory
-//!    that cannot overlap it.
+//!    that cannot overlap it. A padded write checks the entire destination
+//!    region before copying its prefix and clearing its remaining bytes.
 //! 6. **FFI-BLOCK: completion handlers.** `addCompletedHandler:` (Metal 3)
 //!    and `addFeedbackHandler:` (Metal 4) take an Objective-C block, and the
 //!    handler dereferences the command buffer or feedback object Metal passes.
