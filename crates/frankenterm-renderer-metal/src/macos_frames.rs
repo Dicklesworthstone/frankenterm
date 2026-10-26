@@ -399,7 +399,8 @@ impl FrameSlots {
     /// the slot last held them (ft-yccm0.4.2.4): only their dirty ring rows,
     /// or everything when the slot is laid out afresh. Fits the slot's
     /// buffers for the glyph regions first. Returns how many instances the
-    /// text draw covers (`rows * capacity`; zero without text).
+    /// text draw covers (through the last populated ring instance, or zero
+    /// without text), while buffers retain the full row-region layout.
     pub(crate) fn upload(
         &mut self,
         lease: &SlotLease,
@@ -433,7 +434,7 @@ impl FrameSlots {
         let bytes = plan.bytes(grid);
         self.upload_bytes_last = bytes;
         self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
-        Ok(text.map_or(0, |_| plan.instances(grid)))
+        Ok(text.map_or(0, |text| plan.draw_instances(text)))
     }
 
     /// Copies `plan`'s rows into the leased slot: cell background rows at
@@ -570,7 +571,7 @@ impl FrameSlots {
         let bytes = plan.bytes(grid);
         self.upload_bytes_last = self.upload_bytes_last.saturating_add(bytes);
         self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
-        Ok(text.map_or(0, |_| plan.instances(grid)))
+        Ok(text.map_or(0, |text| plan.draw_instances(text)))
     }
 
     /// A slot buffer added to the residency set (committed by the caller).
@@ -1473,8 +1474,9 @@ struct EncodedFrame<'a> {
 
 /// The text pass of one frame (ft-yccm0.4.2.3): the pipeline, the atlases
 /// its glyphs sample, and how many CellText instances the draw covers:
-/// every ring row's region, `rows * capacity`, whose unused instances are
-/// empty quads (ft-yccm0.4.2.4, [`FrameSlots::upload`]).
+/// the fixed ring layout's prefix through the last populated instance,
+/// whose internal unused instances are empty quads (ft-yccm0.4.2.4,
+/// [`FrameSlots::upload`]).
 #[derive(Clone, Copy)]
 pub(crate) struct TextDraw<'a> {
     pub(crate) pipeline: &'a TextPipeline,
@@ -3534,6 +3536,26 @@ mod tests {
                 BG_WIDTH * BG_HEIGHT
             );
         }
+        let mut sparse = CellTextGrid::new(cells.extent());
+        sparse.scroll_up(cells.row_offset());
+        let glyph = fixture.glyph(0);
+        // Exercise a short prefix, an internal empty row, a shrinking
+        // prefix and no text at all, after the slots held the full scene.
+        // Logical rows 4 and 0 occupy physical ring rows 0 and 2.
+        for (row, present) in [(4, true), (0, true), (0, false), (4, false)] {
+            if present {
+                sparse.push(
+                    row,
+                    CellText::new(1, [255, 128, 0, 255]).with_glyph(&glyph, [1, 2]),
+                );
+            } else {
+                sparse.clear_row(row);
+            }
+            assert_eq!(
+                render_text_and_compare(&mut fixture, &sparse, TextUniforms::default(), None),
+                BG_WIDTH * BG_HEIGHT
+            );
+        }
     }
 
     #[test]
@@ -3544,6 +3566,59 @@ mod tests {
     #[test]
     fn metal4_text_pass_matches_the_cpu_reference() {
         check_text_pass(true);
+    }
+
+    #[test]
+    fn sparse_text_uploads_keep_full_buffers_and_clear_old_rows() {
+        let grid = GridExtent::new(6, 10);
+        let cells = CellBgGrid::new(grid);
+        let mut text = CellTextGrid::new(grid);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let pane = 41;
+        let full_bytes = 6 * 10 * CELL_TEXT_INSTANCE_BYTES;
+        let check = |frames: &mut FrameSlots, text: &CellTextGrid, expected: usize| {
+            let (_, instances, _) = crate::uploads::full_layout(&cells, text, grid.cols);
+            // Every slot sees each mutation, including clearing a row it
+            // previously held. Release each lease before reading its bytes.
+            for _ in 0..FRAME_SLOTS {
+                let lease = frames.begin(grid, LONG).unwrap();
+                let slot = lease.slot();
+                assert_eq!(
+                    frames
+                        .upload(&lease, grid, Some(&cells), Some(text))
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    frames
+                        .upload_pane(&lease, pane, &cells, Some(text))
+                        .unwrap(),
+                    expected
+                );
+                assert!(frames.buffer(slot, SlotBuffer::CellText).length() >= full_bytes);
+                assert!(
+                    frames
+                        .pane_buffer(slot, pane, SlotBuffer::CellText)
+                        .unwrap()
+                        .length()
+                        >= full_bytes
+                );
+                drop(lease);
+                assert_eq!(
+                    frames.read(slot, SlotBuffer::CellText, full_bytes),
+                    instances
+                );
+            }
+        };
+        check(&mut frames, &text, 0);
+        text.push(0, CellText::new(1, [255; 4]));
+        check(&mut frames, &text, 1);
+        text.push(5, CellText::new(0, [255; 4]));
+        check(&mut frames, &text, 51);
+        text.clear_row(5);
+        check(&mut frames, &text, 1);
+        text.clear_row(0);
+        check(&mut frames, &text, 0);
     }
 
     /// Every slot ends up holding the grids' region layout (ft-yccm0.4.2.4)
