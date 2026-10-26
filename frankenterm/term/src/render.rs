@@ -237,37 +237,59 @@ impl MirrorRow {
     /// directly, so it never allocates this unrestricted intermediate row.
     pub fn from_line(stable: StableRowIndex, line: &Line, generation: u64) -> Self {
         let mut row = Self::empty(stable, generation);
-        row.seqno = line.current_seqno();
-        row.cells.reserve(line.len());
-        row.text.reserve(line.len());
+        row.update_from_line(stable, line, generation);
+        row
+    }
+
+    /// Replaces this row's contents while retaining its cell and text storage.
+    /// The desktop mirror calls this under the terminal lock, so steady output
+    /// reuses the previous row's allocations instead of freeing and allocating
+    /// them on every frame. Shared image and hyperlink handles are refreshed.
+    pub fn update_from_line(&mut self, stable: StableRowIndex, line: &Line, generation: u64) {
+        self.clear(stable, generation);
+        self.seqno = line.current_seqno();
+        self.cells.reserve(line.len());
+        self.text.reserve(line.len());
         for cell in line.visible_cells() {
             let link = match cell.attrs().hyperlink() {
                 None => 0,
                 Some(link) => {
-                    let index = row
+                    let index = self
                         .links
                         .iter()
                         .position(|known| Arc::ptr_eq(known, link) || **known == **link)
                         .unwrap_or_else(|| {
-                            row.links.push(Arc::clone(link));
-                            row.links.len() - 1
+                            self.links.push(Arc::clone(link));
+                            self.links.len() - 1
                         });
                     index + 1
                 }
             };
-            let converted = MirrorCell::from_cell(cell, row.text.len(), link);
-            row.text.push_str(cell.str());
-            row.has_images |= converted.has_image();
+            let converted = MirrorCell::from_cell(cell, self.text.len(), link);
+            self.text.push_str(cell.str());
+            self.has_images |= converted.has_image();
             if let Some(images) = cell.attrs().images() {
-                row.images
+                self.images
                     .extend(images.into_iter().map(|image| MirrorImage {
                         col: cell.cell_index(),
                         image,
                     }));
             }
-            row.cells.push(converted);
+            self.cells.push(converted);
         }
-        row
+    }
+
+    /// Replaces the contents with an empty row without releasing reusable
+    /// backing storage. Clearing still drops all image and hyperlink handles.
+    pub fn clear(&mut self, stable: StableRowIndex, generation: u64) {
+        self.stable = stable;
+        self.seqno = SEQ_ZERO;
+        self.generation = generation;
+        self.cells.clear();
+        self.text.clear();
+        self.links.clear();
+        self.has_images = false;
+        self.images.clear();
     }
 
     pub fn stable(&self) -> StableRowIndex {

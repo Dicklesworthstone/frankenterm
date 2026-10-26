@@ -33,8 +33,8 @@
 
 use crate::pane::Pane;
 use crate::renderable::{
-    terminal_get_cursor_position, terminal_get_dimensions, RenderableDimensions,
-    StableCursorPosition,
+    RenderableDimensions, StableCursorPosition, terminal_get_cursor_position,
+    terminal_get_dimensions,
 };
 pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorRow};
 use frankenterm_term::screen::ScreenCoordinateWitness;
@@ -42,7 +42,7 @@ use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::convert::TryFrom;
 use std::ops::Range;
 use termwiz::hyperlink::Rule;
-use termwiz::surface::{SequenceNo, SEQ_ZERO};
+use termwiz::surface::{SEQ_ZERO, SequenceNo};
 
 /// What a capture copied: the counters prove that a capture does work
 /// proportional to the rows that changed.
@@ -74,6 +74,8 @@ pub struct CaptureRequest<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct RenderMirror {
     rows: Vec<MirrorRow>,
+    /// Scratch damage flags retained across captures; never part of row data.
+    dirty: Vec<bool>,
     first: StableRowIndex,
     dimensions: Option<RenderableDimensions>,
     cursor: StableCursorPosition,
@@ -166,6 +168,25 @@ impl RenderMirror {
         let offset = usize::try_from(stable.checked_sub(self.first)?).ok()?;
         (self.rows.get(offset)?.stable() == stable).then_some(offset)
     }
+
+    /// Aligns the existing row storage with a new viewport. Scrolling rotates
+    /// the owned rows, so overlap keeps both its contents and allocations;
+    /// exposed slots retain reusable buffers but fail the stable-row check.
+    /// With a stationary viewport this neither moves rows nor allocates.
+    fn prepare_rows(&mut self, first: StableRowIndex, rows: usize) {
+        if self.rows.len() == rows {
+            if let Some(delta) = first.checked_sub(self.first) {
+                if delta > 0 && (delta as usize) < rows {
+                    self.rows.rotate_left(delta as usize);
+                } else if delta < 0 && delta.unsigned_abs() < rows {
+                    self.rows.rotate_right(delta.unsigned_abs());
+                }
+            }
+        }
+        self.rows.resize_with(rows, || MirrorRow::empty(0, 0));
+        self.first = first;
+        self.dirty.resize(rows, false);
+    }
 }
 
 /// Refreshes `mirror` from `term`, which the caller has locked: copies only
@@ -216,8 +237,13 @@ fn capture_rows(
         return None;
     }
 
+    // Keep the row and damage tables in place. In a large pane layout even
+    // unchanged panes are captured when another pane wakes the window.
+    mirror.prepare_rows(first, rows);
+    // Missing screen rows must become blanks rather than retaining an exposed
+    // slot's old contents; only a matched clean row clears its flag.
+    mirror.dirty.fill(true);
     // Which viewport rows need a copy, by seqno, membership and images.
-    let mut dirty = vec![full; rows];
     if !full {
         let screen = term.screen();
         let phys = screen.stable_range(&(first..end));
@@ -228,16 +254,15 @@ fn capture_rows(
                 let Some(row) = usize::try_from(stable - first).ok() else {
                     continue;
                 };
-                let Some(flag) = dirty.get_mut(row) else {
+                let Some(flag) = mirror.dirty.get_mut(row) else {
                     continue;
                 };
-                *flag = match mirror.row_index(stable) {
-                    None => true,
-                    Some(index) => {
-                        let held = &mirror.rows[index];
+                *flag = match mirror.rows.get(row) {
+                    Some(held) if held.stable() == stable => {
                         let current = line.current_seqno();
                         current == SEQ_ZERO || current > held.seqno() || held.always_recapture()
                     }
+                    _ => true,
                 };
             }
         });
@@ -250,7 +275,7 @@ fn capture_rows(
     // wrapped below a scrolled-back viewport), and copy all of its visible
     // rows.
     if !request.rules.is_empty() {
-        for range in logical_lines_to_rescan(term.screen(), first..end, &dirty) {
+        for range in logical_lines_to_rescan(term.screen(), first..end, &mirror.dirty) {
             let mut widened: Vec<Range<StableRowIndex>> = Vec::new();
             term.screen_mut()
                 .for_each_logical_line_in_stable_range_mut(range, |logical, lines| {
@@ -260,27 +285,15 @@ fn capture_rows(
                 });
             for logical in widened {
                 for stable in logical.start.max(first)..logical.end.min(end) {
-                    dirty[(stable - first) as usize] = true;
+                    mirror.dirty[(stable - first) as usize] = true;
                 }
             }
         }
     }
 
-    // Copy the dirty rows; move the clean ones over from the old mirror.
+    // Refresh only dirty rows in their existing buffers. Clean rows stay at
+    // their aligned position, with no placeholder or replacement row table.
     let generation = mirror.generation.wrapping_add(1);
-    let mut old = std::mem::take(&mut mirror.rows);
-    let old_first = mirror.first;
-    let mut next: Vec<Option<MirrorRow>> = (0..rows)
-        .map(|row| {
-            if dirty[row] {
-                return None;
-            }
-            let stable = first + row as StableRowIndex;
-            let offset = usize::try_from(stable.checked_sub(old_first)?).ok()?;
-            let held = old.get_mut(offset)?;
-            (held.stable() == stable).then(|| std::mem::replace(held, placeholder_row()))
-        })
-        .collect();
     let mut stats = CaptureStats {
         rows_examined: rows,
         full,
@@ -296,40 +309,34 @@ fn capture_rows(
                 let Some(row) = usize::try_from(stable - first).ok() else {
                     continue;
                 };
-                let Some(slot) = next.get_mut(row) else {
+                let Some(slot) = mirror.rows.get_mut(row) else {
                     continue;
                 };
-                if slot.is_some() {
+                if !mirror.dirty[row] {
                     continue;
                 }
+                mirror.dirty[row] = false;
                 if planted_skip == Some(stable) {
                     // The planted fault: keep the stale copy, as a capture
                     // that missed this dirty row would.
-                    let stale = usize::try_from(stable - old_first)
-                        .ok()
-                        .and_then(|offset| old.get_mut(offset))
-                        .filter(|held| held.stable() == stable)
-                        .map(|held| std::mem::replace(held, placeholder_row()));
-                    *slot = Some(stale.unwrap_or_else(|| MirrorRow::empty(stable, 0)));
+                    if slot.stable() != stable {
+                        slot.clear(stable, 0);
+                    }
                     continue;
                 }
-                let copied = MirrorRow::from_line(stable, line, generation);
+                slot.update_from_line(stable, line, generation);
                 stats.rows_captured += 1;
-                stats.cells_captured += copied.cells().len();
-                *slot = Some(copied);
+                stats.cells_captured += slot.cells().len();
             }
         });
     }
     // Rows the screen does not have (none for a resident viewport) stay
     // blank rather than leaving the mirror short.
-    mirror.rows = next
-        .into_iter()
-        .enumerate()
-        .map(|(row, slot)| {
-            slot.unwrap_or_else(|| MirrorRow::empty(first + row as StableRowIndex, generation))
-        })
-        .collect();
-    mirror.first = first;
+    for (row, dirty) in mirror.dirty.iter().enumerate() {
+        if *dirty {
+            mirror.rows[row].clear(first + row as StableRowIndex, generation);
+        }
+    }
     mirror.dimensions = Some(dimensions);
     mirror.cursor = terminal_get_cursor_position(term);
     mirror.seqno = seqno;
@@ -490,10 +497,6 @@ fn logical_len_exceeds(current: usize, additional: usize) -> bool {
         .is_none_or(|total| total > MAX_LOGICAL_LINE_LEN)
 }
 
-fn placeholder_row() -> MirrorRow {
-    MirrorRow::empty(0, 0)
-}
-
 /// [`capture_terminal_rows`] for any pane, through its public row API: for a
 /// pane whose terminal this process does not hold (a mux client), and for a
 /// local viewport in cold scrollback, whose rows `Pane::get_lines` hydrates.
@@ -528,31 +531,17 @@ pub fn capture_pane_rows(
     } else {
         pane.get_changed_since(first..end, mirror.seqno)
     };
-    let dirty: Vec<bool> = (0..rows)
-        .map(|row| {
-            let stable = first + row as StableRowIndex;
-            full || changed.contains(stable)
-                || mirror
-                    .row_index(stable)
-                    .is_none_or(|index| mirror.rows[index].always_recapture())
-        })
-        .collect();
+    mirror.prepare_rows(first, rows);
+    for row in 0..rows {
+        let stable = first + row as StableRowIndex;
+        mirror.dirty[row] = full
+            || changed.contains(stable)
+            || mirror
+                .row_index(stable)
+                .is_none_or(|index| mirror.rows[index].always_recapture());
+    }
 
     let generation = mirror.generation.wrapping_add(1);
-    let mut old = std::mem::take(&mut mirror.rows);
-    let old_first = mirror.first;
-    let mut next: Vec<Option<MirrorRow>> = (0..rows)
-        .map(|row| {
-            if dirty[row] {
-                return None;
-            }
-            let stable = first + row as StableRowIndex;
-            let offset = usize::try_from(stable.checked_sub(old_first)?).ok()?;
-            let held = old.get_mut(offset)?;
-            (held.stable() == stable).then(|| std::mem::replace(held, placeholder_row()))
-        })
-        .collect();
-    drop(old);
     let mut stats = CaptureStats {
         rows_examined: rows,
         full,
@@ -560,12 +549,12 @@ pub fn capture_pane_rows(
     };
     let mut row = 0;
     while row < rows {
-        if !dirty[row] {
+        if !mirror.dirty[row] {
             row += 1;
             continue;
         }
         let run_start = row;
-        while row < rows && dirty[row] {
+        while row < rows && mirror.dirty[row] {
             row += 1;
         }
         let run = first + run_start as StableRowIndex..first + row as StableRowIndex;
@@ -575,26 +564,23 @@ pub fn capture_pane_rows(
         }
         for (offset, line) in lines.iter().enumerate() {
             let stable = lines_first + offset as StableRowIndex;
-            let Some(slot) = usize::try_from(stable - first)
-                .ok()
-                .and_then(|index| next.get_mut(index))
-            else {
+            let Some(index) = usize::try_from(stable - first).ok() else {
                 continue;
             };
-            let copied = MirrorRow::from_line(stable, line, generation);
+            let Some(slot) = mirror.rows.get_mut(index) else {
+                continue;
+            };
+            slot.update_from_line(stable, line, generation);
+            mirror.dirty[index] = false;
             stats.rows_captured += 1;
-            stats.cells_captured += copied.cells().len();
-            *slot = Some(copied);
+            stats.cells_captured += slot.cells().len();
         }
     }
-    mirror.rows = next
-        .into_iter()
-        .enumerate()
-        .map(|(row, slot)| {
-            slot.unwrap_or_else(|| MirrorRow::empty(first + row as StableRowIndex, generation))
-        })
-        .collect();
-    mirror.first = first;
+    for (row, dirty) in mirror.dirty.iter().enumerate() {
+        if *dirty {
+            mirror.rows[row].clear(first + row as StableRowIndex, generation);
+        }
+    }
     mirror.dimensions = Some(dimensions);
     mirror.cursor = pane.get_cursor_position();
     mirror.seqno = seqno;
@@ -743,7 +729,7 @@ mod tests {
         under.attach_image(Box::new(slice(0.0, -5)));
         line.set_cell(1, Cell::new('b', under), 1);
 
-        let row = MirrorRow::from_line(0, &line, 1);
+        let mut row = MirrorRow::from_line(0, &line, 1);
         assert!(row.has_images());
         let images: Vec<(usize, i32, f32)> = row
             .images()
@@ -761,9 +747,20 @@ mod tests {
         assert_eq!(row.images()[0].image.padding(), (1, 2, 3, 4));
         assert!(row.cells()[1].has_image() && !row.cells()[2].has_image());
 
-        let plain = Line::from_text("x", &CellAttributes::blank(), 1, None);
-        let plain = MirrorRow::from_line(1, &plain, 1);
-        assert!(!plain.has_images() && plain.images().is_empty());
+        // A changed row reuses its storage but must release every old image,
+        // reset the image flag and expose only its new text and cell count.
+        let cells = row.cells().as_ptr();
+        let text = row.all_text().as_ptr();
+        let plain = Line::from_text("x", &CellAttributes::blank(), 2, None);
+        row.update_from_line(1, &plain, 3);
+        assert_eq!(row, MirrorRow::from_line(1, &plain, 3));
+        assert_eq!(row.cells().as_ptr(), cells);
+        assert_eq!(row.all_text().as_ptr(), text);
+        assert!(!row.has_images() && row.images().is_empty());
+        row.clear(2, 4);
+        assert_eq!(row, MirrorRow::empty(2, 4));
+        assert_eq!(row.cells().as_ptr(), cells);
+        assert_eq!(row.all_text().as_ptr(), text);
     }
 
     /// The first difference between what two mirrors show, if any.
@@ -1053,6 +1050,151 @@ mod tests {
         let stats = capture(&mut term, &mut mirror);
         assert_eq!((stats.full, stats.rows_captured), (true, 10));
         assert_eq!(difference(&mirror, &fresh(&mut term, &LIVE)), None);
+    }
+
+    #[test]
+    fn stationary_capture_reuses_row_tables_and_dirty_row_buffers() {
+        let mut term = terminal(4, 24);
+        for row in 1..=4 {
+            term.advance_bytes(format!("\x1b[{row};1Habcdefghijklmnopqrstuvwx"));
+        }
+        let mut mirror = RenderMirror::new();
+        capture(&mut term, &mut mirror);
+        let table = mirror.rows.as_ptr();
+        let damage = mirror.dirty.as_ptr();
+        let buffers: Vec<_> = mirror
+            .rows()
+            .iter()
+            .map(|row| (row.cells().as_ptr(), row.all_text().as_ptr()))
+            .collect();
+
+        for frame in 0..24 {
+            let changed = frame % 4;
+            term.advance_bytes(format!(
+                "\x1b[{};1Hframe {frame:02}                ",
+                changed + 1
+            ));
+            assert_eq!(capture(&mut term, &mut mirror).rows_captured, 1);
+            assert_eq!(difference(&mirror, &fresh(&mut term, &LIVE)), None);
+            assert_eq!(mirror.rows.as_ptr(), table);
+            assert_eq!(mirror.dirty.as_ptr(), damage);
+            for (row, expected) in mirror.rows().iter().zip(&buffers) {
+                assert_eq!((row.cells().as_ptr(), row.all_text().as_ptr()), *expected);
+            }
+
+            // An idle pane still participates in another pane's window frame.
+            // It neither copies cells nor rebuilds the owned row tables.
+            assert_eq!(capture(&mut term, &mut mirror).rows_captured, 0);
+            assert_eq!(mirror.rows.as_ptr(), table);
+            assert_eq!(mirror.dirty.as_ptr(), damage);
+        }
+    }
+
+    #[test]
+    fn scrolling_rotates_reusable_buffers_with_their_stable_rows() {
+        let mut term = terminal(5, 24);
+        for row in 0..30 {
+            term.advance_bytes(format!("row {row:02} abcdefghijklmnop\r\n"));
+        }
+        let top = terminal_get_dimensions(&mut term).physical_top;
+        let mut mirror = RenderMirror::new();
+        let at = |viewport_top| CaptureRequest {
+            viewport_top: Some(viewport_top),
+            ..LIVE
+        };
+        capture_terminal_rows(&mut term, &mut mirror, &at(top - 10)).expect("resident");
+        let table = mirror.rows.as_ptr();
+        let damage = mirror.dirty.as_ptr();
+
+        for offset in [9, 8, 10, 7, 11, 12, 13, 9, 14, 2, 15, 10] {
+            let previous: Vec<_> = mirror
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.stable(),
+                        row.generation(),
+                        row.cells().as_ptr(),
+                        row.all_text().as_ptr(),
+                    )
+                })
+                .collect();
+            let request = at(top - offset);
+            let stats = capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+            assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+            assert_eq!(mirror.rows.as_ptr(), table);
+            assert_eq!(mirror.dirty.as_ptr(), damage);
+            let mut overlap = 0;
+            for row in mirror.rows() {
+                if let Some((_, generation, cells, text)) =
+                    previous.iter().find(|(stable, ..)| *stable == row.stable())
+                {
+                    overlap += 1;
+                    assert_eq!(row.generation(), *generation);
+                    assert_eq!(row.cells().as_ptr(), *cells);
+                    assert_eq!(row.all_text().as_ptr(), *text);
+                }
+            }
+            assert_eq!(stats.rows_captured, 5 - overlap);
+        }
+    }
+
+    #[test]
+    fn reused_rows_still_recapture_images_and_zero_sequence_contents() {
+        use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
+
+        let mut term = terminal(3, 16);
+        term.advance_bytes(b"ordinary");
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![255, 0, 0, 255],
+        )));
+        let mut attrs = CellAttributes::blank();
+        attrs.attach_image(Box::new(ImageCell::with_z_index(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            data,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        )));
+        let seqno = term.current_seqno();
+        term.screen_mut()
+            .set_cell(0, 1, &Cell::new('x', attrs), seqno);
+        term.screen_mut().with_phys_lines_mut(2..3, |lines| {
+            *lines[0] = Line::from_text("zero 0", &CellAttributes::blank(), SEQ_ZERO, None);
+        });
+        let mut mirror = RenderMirror::new();
+        capture(&mut term, &mut mirror);
+        let ordinary_generation = mirror.rows()[0].generation();
+        let image_cells = mirror.rows()[1].cells().as_ptr();
+        let zero_cells = mirror.rows()[2].cells().as_ptr();
+
+        for frame in 1..=3 {
+            // A SEQ_ZERO producer need not advance the terminal sequence to
+            // force a refresh. Images likewise refresh behind shared handles.
+            term.screen_mut().with_phys_lines_mut(2..3, |lines| {
+                *lines[0] = Line::from_text(
+                    &format!("zero {frame}"),
+                    &CellAttributes::blank(),
+                    SEQ_ZERO,
+                    None,
+                );
+            });
+            assert_eq!(capture(&mut term, &mut mirror).rows_captured, 2);
+            assert_eq!(mirror.rows()[0].generation(), ordinary_generation);
+            assert_eq!(mirror.rows()[1].generation(), mirror.generation());
+            assert_eq!(mirror.rows()[2].generation(), mirror.generation());
+            assert_eq!(mirror.rows()[1].cells().as_ptr(), image_cells);
+            assert_eq!(mirror.rows()[2].cells().as_ptr(), zero_cells);
+            assert_eq!(mirror.rows()[2].all_text(), format!("zero {frame}"));
+            assert_eq!(difference(&mirror, &fresh(&mut term, &LIVE)), None);
+        }
     }
 
     #[test]
