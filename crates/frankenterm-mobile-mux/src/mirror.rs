@@ -5,6 +5,8 @@
 //! The mirror compares that with what the phone last drew and writes the
 //! difference: rows that changed in place, or a scroll that pushes the rows
 //! leaving the top into the phone's own scrollback, each in its final form.
+//! A row that wraps is drawn so the phone's terminal wraps it too: copied
+//! text and addresses run on across the rows as they do on the desktop.
 
 use crate::render;
 use crate::wire::{CursorPosition, Dimensions, LineEntries, RenderHead, StableRowIndex};
@@ -47,6 +49,16 @@ fn offset(row: StableRowIndex, by: usize) -> StableRowIndex {
 
 fn distance(from: StableRowIndex, to: StableRowIndex) -> usize {
     usize::try_from(to.saturating_sub(from)).unwrap_or(0)
+}
+
+/// Draws `line` on screen row `y`, where the cursor is; true when it wraps
+/// (see `render::paint_line`).
+fn paint(out: &mut String, line: Option<&Line>, cols: usize, y: usize) -> bool {
+    if y == 0 {
+        render::paint_top_line(out, line, cols)
+    } else {
+        render::paint_line(out, line, cols)
+    }
 }
 
 /// What the phone's terminal currently shows.
@@ -306,25 +318,46 @@ impl PaneMirror {
                 .map(|row| *row..row + 1)
                 .collect()
         };
-        match plan {
+        let mut needed = match plan {
             Plan::Stream { from } => std::iter::once(from..viewport.end).collect(),
-            Plan::Full => vec![viewport],
+            Plan::Full => vec![viewport.clone()],
             Plan::Scroll {
                 old_top,
                 entering,
                 all,
             } => {
                 let leaving_end = viewport.start.min(offset(old_top, target.rows()));
-                let mut needed = vec![old_top..leaving_end, entering..viewport.end];
+                // With the row above the entering ones while the phone's
+                // bottom row shows it, in case it wraps into them.
+                let from = if entering == offset(old_top, target.rows()) {
+                    entering.saturating_sub(1)
+                } else {
+                    entering
+                };
+                let mut needed = vec![old_top..leaving_end, from..viewport.end];
                 if all {
-                    needed.push(viewport);
+                    needed.push(viewport.clone());
                 } else {
                     needed.extend(dirty());
                 }
                 needed
             }
             Plan::Dirty => dirty(),
+        };
+        // A row drawn in place that wraps carries on into the row below,
+        // whose first cell is then needed as well.
+        if matches!(plan, Plan::Scroll { .. } | Plan::Dirty) {
+            let below: Vec<_> = needed
+                .iter()
+                .flat_map(Clone::clone)
+                .filter(|row| self.lines.get(row).is_some_and(Line::last_cell_was_wrapped))
+                .map(|row| offset(row, 1))
+                .filter(|row| viewport.contains(row))
+                .map(|row| row..offset(row, 1))
+                .collect();
+            needed.extend(below);
         }
+        needed
     }
 
     /// The rows to fetch before the pane can be drawn, as GetLines ranges.
@@ -390,25 +423,40 @@ impl PaneMirror {
         }
         let line = |row: StableRowIndex| self.lines.get(&row);
         let at = |row: StableRowIndex, from: StableRowIndex| distance(from, row);
+        // Draws `row` on screen row `y`. A row that wraps carries on into
+        // the first cell of the row below, so the phone marks the wrap too;
+        // never from the bottom row, where that would scroll.
+        let in_place = |out: &mut String, row: StableRowIndex, y: usize| {
+            render::move_to(out, y, 0);
+            if paint(out, line(row), cols, y) && y + 1 < rows {
+                render::continue_onto(out, line(offset(row, 1)));
+            }
+        };
         match plan {
             Plan::Stream { from } => {
                 out.push_str("\x1b[H");
-                let mut first = true;
+                // The row written last, and whether it wraps.
+                let mut previous: Option<(StableRowIndex, bool)> = None;
+                // The screen row the next one lands on.
+                let mut y = 0;
                 for row in from..viewport.end {
                     if row < top && line(row).is_none() {
                         continue;
                     }
-                    if !first {
-                        out.push_str("\r\n");
+                    match previous {
+                        Some((above, true)) if offset(above, 1) == row => {
+                            render::continue_onto(&mut out, line(row));
+                        }
+                        Some(_) => out.push_str("\r\n"),
+                        None => {}
                     }
-                    first = false;
-                    render::paint_line(&mut out, line(row), cols);
+                    previous = Some((row, paint(&mut out, line(row), cols, y)));
+                    y = (y + 1).min(rows.saturating_sub(1));
                 }
             }
             Plan::Full => {
                 for row in viewport.clone() {
-                    render::move_to(&mut out, at(row, top), 0);
-                    render::paint_line(&mut out, line(row), cols);
+                    in_place(&mut out, row, at(row, top));
                 }
             }
             Plan::Scroll {
@@ -417,25 +465,38 @@ impl PaneMirror {
                 all,
             } => {
                 for row in old_top..top.min(offset(old_top, rows)) {
-                    render::move_to(&mut out, at(row, old_top), 0);
-                    render::paint_line(&mut out, line(row), cols);
+                    in_place(&mut out, row, at(row, old_top));
                 }
-                render::move_to(&mut out, rows.saturating_sub(1), 0);
+                // The phone's bottom row shows the row above the first one
+                // entering. If that row wraps, it is drawn again, so the
+                // first entering row carries it on.
+                let above = entering.saturating_sub(1);
+                let bottom = rows.saturating_sub(1);
+                render::move_to(&mut out, bottom, 0);
+                let mut wraps = if entering == offset(old_top, rows)
+                    && line(above).is_some_and(Line::last_cell_was_wrapped)
+                {
+                    paint(&mut out, line(above), cols, bottom)
+                } else {
+                    false
+                };
                 for row in entering..viewport.end {
-                    out.push('\n');
-                    render::paint_line(&mut out, line(row), cols);
+                    if wraps {
+                        render::continue_onto(&mut out, line(row));
+                    } else {
+                        out.push('\n');
+                    }
+                    wraps = paint(&mut out, line(row), cols, bottom);
                 }
                 for row in top..entering.min(viewport.end) {
                     if all || self.dirty.contains(&row) {
-                        render::move_to(&mut out, at(row, top), 0);
-                        render::paint_line(&mut out, line(row), cols);
+                        in_place(&mut out, row, at(row, top));
                     }
                 }
             }
             Plan::Dirty => {
                 for row in self.dirty.range(viewport.clone()) {
-                    render::move_to(&mut out, at(*row, top), 0);
-                    render::paint_line(&mut out, line(*row), cols);
+                    in_place(&mut out, *row, at(*row, top));
                 }
             }
         }

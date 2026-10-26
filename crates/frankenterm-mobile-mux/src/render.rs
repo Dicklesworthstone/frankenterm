@@ -7,8 +7,9 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
-use termwiz::hyperlink::Hyperlink;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
+use termwiz::hyperlink::Hyperlink;
+use termwiz::surface::line::CellRef;
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 
 /// The attributes an SGR sequence can express. Links are written with
@@ -144,21 +145,84 @@ fn drawable(text: &str) -> impl Iterator<Item = char> + '_ {
         .map(|c| if is_control(c) { '\u{fffd}' } else { c })
 }
 
+/// The SGR state and link the phone's terminal is writing cells under.
+struct Pen {
+    style: Style,
+    /// SGR does not end a link, so it is opened and closed on its own.
+    link: Option<Arc<Hyperlink>>,
+}
+
+impl Pen {
+    fn new() -> Self {
+        Self {
+            style: Style::plain(),
+            link: None,
+        }
+    }
+
+    /// Writes `cell`, whose style is `style`, at the cursor.
+    fn write(&mut self, out: &mut String, style: Style, cell: &CellRef<'_>) {
+        if style != self.style {
+            style.write_sgr(out);
+            self.style = style;
+        }
+        let link = cell.attrs().hyperlink();
+        if link.map(|l| &**l) != self.link.as_deref() {
+            if self.link.is_some() {
+                out.push_str("\x1b]8;;\x1b\\");
+            }
+            if let Some(next) = link {
+                open_link(out, next);
+            }
+            self.link = link.cloned();
+        }
+        let text = cell.str();
+        if text.is_empty() {
+            out.push(' ');
+        } else {
+            out.extend(drawable(text));
+        }
+    }
+
+    /// Closes the link and resets SGR, if either is open.
+    fn finish(self, out: &mut String) {
+        if self.link.is_some() {
+            out.push_str("\x1b]8;;\x1b\\");
+        }
+        if self.style != Style::plain() {
+            out.push_str("\x1b[0m");
+        }
+    }
+}
+
 /// Draws `line` on the row the cursor is on, from the first column; cells
 /// past `cols` are dropped. Leaves the cursor on that row with SGR reset and
-/// no link open.
-pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
+/// no link open. True when the line wraps onto the row below: its last
+/// column is then written last, and the cursor waits past it for
+/// `continue_onto`.
+pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
     out.push_str("\r\x1b[0m\x1b[2K");
-    let Some(line) = line else { return };
-    let plain = Style::plain();
-    let mut current = plain;
-    // The link the phone's terminal is writing cells under. SGR does not
-    // end it, so it is opened and closed on its own.
-    let mut link: Option<Arc<Hyperlink>> = None;
+    paint_cells(out, line, cols)
+}
+
+/// `paint_line` for the screen's top row. Erasing that whole row would end
+/// the wrap of the history row above it in the phone's terminal, which the
+/// remote keeps, so its cells are erased one by one (ECH) instead.
+pub fn paint_top_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+    let _ = write!(out, "\r\x1b[0m\x1b[{cols}X");
+    paint_cells(out, line, cols)
+}
+
+/// Writes `line`'s cells on a row just erased, the cursor on its first column.
+fn paint_cells(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+    let Some(line) = line else { return false };
+    let wraps = line.last_cell_was_wrapped();
+    let mut pen = Pen::new();
     // Where the phone's cursor is, when it is known: after a wide or
     // non-ASCII cell the phone's width tables decide, so the next cell is
     // placed with an absolute column instead.
     let mut column = Some(0usize);
+    let mut end = 0;
     for cell in line.visible_cells() {
         let index = cell.cell_index();
         let width = cell.width().max(1);
@@ -167,38 +231,46 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) {
         }
         let style = Style::of(cell.attrs());
         let text = cell.str();
-        if (text == " " || text.is_empty()) && style.erases_to_blank() {
+        // A wrapping row's last column is written even when blank: the
+        // phone's terminal marks the wrap only after a character there.
+        if (text == " " || text.is_empty())
+            && style.erases_to_blank()
+            && cell.attrs().hyperlink().is_none()
+            && !(wraps && index + width == cols)
+        {
             continue;
         }
         if column != Some(index) {
             let _ = write!(out, "\x1b[{}G", index + 1);
         }
-        if style != current {
-            style.write_sgr(out);
-            current = style;
-        }
-        let cell_link = cell.attrs().hyperlink();
-        if cell_link.map(|l| &**l) != link.as_deref() {
-            if link.is_some() {
-                out.push_str("\x1b]8;;\x1b\\");
-            }
-            if let Some(next) = cell_link {
-                open_link(out, next);
-            }
-            link = cell_link.cloned();
-        }
-        if text.is_empty() {
-            out.push(' ');
-        } else {
-            out.extend(drawable(text));
-        }
+        pen.write(out, style, &cell);
         column = (width == 1 && text.is_ascii()).then_some(index + 1);
+        end = index + width;
     }
-    if link.is_some() {
-        out.push_str("\x1b]8;;\x1b\\");
+    pen.finish(out);
+    if wraps && end != cols {
+        // It wrapped before a wide character that did not fit, or its last
+        // column was never stored: blank there, as on the remote.
+        let _ = write!(out, "\x1b[{cols}G ");
     }
-    if current != plain {
-        out.push_str("\x1b[0m");
+    wraps
+}
+
+/// Writes the first cell of `next`, the row below one `paint_line` left
+/// waiting past its last column. The phone's terminal wraps onto that row
+/// and marks the one above as continuing there; the row below shows what
+/// it did. Leaves the cursor on the row below with SGR reset and no link.
+pub fn continue_onto(out: &mut String, next: Option<&Line>) {
+    let first = next
+        .and_then(|line| line.visible_cells().next())
+        .filter(|cell| cell.cell_index() == 0);
+    match first {
+        Some(cell) => {
+            let mut pen = Pen::new();
+            pen.write(out, Style::of(cell.attrs()), &cell);
+            pen.finish(out);
+        }
+        None => out.push(' '),
     }
 }
 
@@ -348,13 +420,13 @@ mod tests {
     fn a_link_is_written_around_its_cells_and_closed_before_the_row_ends() {
         let mut bold = CellAttributes::default();
         bold.set_intensity(Intensity::Bold);
-        let link = linked("https://example.com/pr/1", &CellAttributes::default());
+        let pr = linked("https://example.com/pr/1", &CellAttributes::default());
         let line = line_of(&[
             ("a", CellAttributes::default()),
-            ("P", link.clone()),
+            ("P", pr.clone()),
             ("R", linked("https://example.com/pr/1", &bold)),
             ("b", CellAttributes::default()),
-            ("Q", link),
+            ("Q", pr),
         ]);
         // One link across a style change; the same address after plain
         // text opens again; the row never ends inside a link.
@@ -368,8 +440,14 @@ mod tests {
     #[test]
     fn adjacent_links_to_different_addresses_each_get_their_own() {
         let line = line_of(&[
-            ("x", linked("https://a.example/", &CellAttributes::default())),
-            ("y", linked("https://b.example/", &CellAttributes::default())),
+            (
+                "x",
+                linked("https://a.example/", &CellAttributes::default()),
+            ),
+            (
+                "y",
+                linked("https://b.example/", &CellAttributes::default()),
+            ),
         ]);
         assert_eq!(
             painted(&line, 80),
@@ -379,10 +457,68 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_inside_a_link_is_written_with_it() {
+        let pr = linked("https://example.com/pr/1", &CellAttributes::default());
+        let line = line_of(&[("P", pr.clone()), (" ", pr.clone()), ("1", pr)]);
+        assert_eq!(
+            painted(&line, 80),
+            "\r\x1b[0m\x1b[2K\x1b]8;;https://example.com/pr/1\x1b\\P 1\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_row_ends_waiting_on_its_last_column() {
+        let mut line = line_of(&[
+            ("a", CellAttributes::default()),
+            ("b", CellAttributes::default()),
+            (" ", CellAttributes::default()),
+        ]);
+        line.set_last_cell_was_wrapped(true, 0);
+        let mut out = String::new();
+        assert!(paint_line(&mut out, Some(&line), 3));
+        assert_eq!(
+            out, "\r\x1b[0m\x1b[2Kab ",
+            "its blank last column is written"
+        );
+        // Wrapped before a wide character that did not fit: the last column
+        // was never stored, and is written blank.
+        let mut early = line_of(&[("a", CellAttributes::default())]);
+        early.set_last_cell_was_wrapped(true, 0);
+        let mut out = String::new();
+        assert!(paint_line(&mut out, Some(&early), 3));
+        assert_eq!(out, "\r\x1b[0m\x1b[2Ka\x1b[3G ");
+        let mut out = String::new();
+        assert!(!paint_line(
+            &mut out,
+            Some(&line_of(&[("a", CellAttributes::default())])),
+            3
+        ));
+    }
+
+    #[test]
+    fn a_wrap_carries_on_with_the_next_rows_first_cell_as_it_looks() {
+        let mut bold = CellAttributes::default();
+        bold.set_intensity(Intensity::Bold);
+        let next = line_of(&[("x", linked("https://a.example/", &bold)), ("y", bold)]);
+        let mut out = String::new();
+        continue_onto(&mut out, Some(&next));
+        assert_eq!(
+            out,
+            "\x1b[0;1m\x1b]8;;https://a.example/\x1b\\x\x1b]8;;\x1b\\\x1b[0m"
+        );
+        let mut out = String::new();
+        continue_onto(&mut out, None);
+        assert_eq!(out, " ", "a row the server no longer has carries on blank");
+    }
+
+    #[test]
     fn a_link_address_cannot_end_or_redirect_its_sequence() {
         let line = line_of(&[(
             "x",
-            linked("https://e.example/\x1b\\\x1b]2;pwned\x07\u{9c}a", &CellAttributes::default()),
+            linked(
+                "https://e.example/\x1b\\\x1b]2;pwned\x07\u{9c}a",
+                &CellAttributes::default(),
+            ),
         )]);
         assert_eq!(
             painted(&line, 80),

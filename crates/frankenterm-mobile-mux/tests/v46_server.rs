@@ -5,7 +5,7 @@ mod support;
 
 use frankenterm_mobile_mux::Event;
 use frankenterm_mobile_mux::mirror::HISTORY_ROWS;
-use support::{Harness, all_text, assert_mirrored, text};
+use support::{Harness, all_text, assert_mirrored, text, wraps};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -145,6 +145,65 @@ fn a_full_screen_program_takes_over_and_gives_the_screen_back() {
     let phone = all_text(&mut harness.phone);
     assert_eq!(phone, all_text(&mut harness.server.term));
     assert_eq!(phone[..history.len() - 6], history[..history.len() - 6]);
+}
+
+/// The phone's rows wrap where the remote's do, on screen and in its
+/// scrollback, however they are drawn: so a copied line or a tapped address
+/// runs on across them, and a row that only fills its width does not.
+#[test]
+fn rows_wrap_on_the_phone_where_they_wrap_on_the_remote() {
+    let mut harness = Harness::new(5, 10);
+    let mirrored = |harness: &mut Harness| {
+        assert_mirrored(harness);
+        let remote = wraps(&mut harness.server.term);
+        assert_eq!(wraps(&mut harness.phone), remote);
+        assert_eq!(
+            all_text(&mut harness.phone),
+            all_text(&mut harness.server.term)
+        );
+        remote
+    };
+    // Into history: two and a half rows; exactly two; a wide character
+    // that does not fit the last column, which wraps a column early.
+    harness.quiet_output(b"abcdefghijklmnopqrstuvwxy\r\n0123456789ABCDEFGHIJ\r\n");
+    harness.quiet_output("123456789\u{754c}x\r\n".as_bytes());
+    harness.quiet_output(&numbered(0, 4));
+    harness.quiet_output(b"$ ");
+    harness.attach();
+    let first = mirrored(&mut harness);
+    assert_eq!(
+        first.iter().filter(|wrapped| **wrapped).count(),
+        4,
+        "{first:?}"
+    );
+
+    // Shown: output wraps as it scrolls in, and a prompt line that fills
+    // the bottom row wraps only when the next key arrives.
+    harness.output(b"echo The quick brown fox\r\nThe quick brown fox\r\n$ ");
+    mirrored(&mut harness);
+    harness.output(b"12345678");
+    mirrored(&mut harness);
+    harness.output(b"9");
+    let typed = mirrored(&mut harness);
+    assert_eq!(
+        typed[typed.len() - 2..],
+        [true, false],
+        "the full prompt row wraps"
+    );
+
+    // A line editor redraws the start of a wrapped line in place, and the
+    // row it wraps onto is left alone; then the line is cut short.
+    harness.output(b"\x1b[A\r$ X");
+    mirrored(&mut harness);
+    harness.output(b"\r\x1b[2K$ short\x1b[B\r\x1b[2K");
+    let cut = mirrored(&mut harness);
+    assert!(!cut[cut.len() - 2], "a line cut short no longer wraps");
+
+    // A full-screen program's own long line.
+    harness.output(b"\x1b[?1049h\x1b[H\x1b[2Jfull screen text that wraps");
+    mirrored(&mut harness);
+    harness.output(b"\x1b[?1049l");
+    mirrored(&mut harness);
 }
 
 #[test]

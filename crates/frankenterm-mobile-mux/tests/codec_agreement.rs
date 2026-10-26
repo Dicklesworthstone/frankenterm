@@ -557,8 +557,10 @@ fn links_come_back_on_the_cells_the_desktop_puts_them_on() {
         MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
     ];
     for dialect in dialects {
-        let decoded = Pdu::decode_for_dialect(bytes.as_slice(), dialect).expect("the desktop decodes it");
-        let MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(desktop)) = decoded.payload()
+        let decoded =
+            Pdu::decode_for_dialect(bytes.as_slice(), dialect).expect("the desktop decodes it");
+        let MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(desktop)) =
+            decoded.payload()
         else {
             panic!("desktop decoded {:?}", decoded.payload());
         };
@@ -573,15 +575,25 @@ fn links_come_back_on_the_cells_the_desktop_puts_them_on() {
         assert_eq!(ours.len(), desktop_lines.len());
         for ((row, line), (desktop_row, desktop_line)) in ours.iter().zip(&desktop_lines) {
             assert_eq!(row, desktop_row);
-            assert_eq!(link_addresses(line), link_addresses(desktop_line), "row {row}");
+            assert_eq!(
+                link_addresses(line),
+                link_addresses(desktop_line),
+                "row {row}"
+            );
         }
         let first = link_addresses(&ours[0].1);
         let pr = Some("https://example.com/pr/1".to_owned());
         let ci = Some("https://example.com/ci".to_owned());
         assert_eq!(first[..4], [None, None, None, None]);
-        assert_eq!(first[4..9], [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr.clone()]);
+        assert_eq!(
+            first[4..9],
+            [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr.clone()]
+        );
         assert_eq!(first[14..16], [ci.clone(), ci]);
-        assert_eq!(link_addresses(&ours[1].1)[..5], [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr]);
+        assert_eq!(
+            link_addresses(&ours[1].1)[..5],
+            [pr.clone(), pr.clone(), pr.clone(), pr.clone(), pr]
+        );
     }
 }
 

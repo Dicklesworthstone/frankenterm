@@ -626,12 +626,25 @@ pub fn looks(line: &Line) -> Vec<CellLook> {
         .collect()
 }
 
-/// Every row on screen, as it looks.
-pub fn screen(term: &mut Terminal) -> Vec<Vec<CellLook>> {
+/// Every row on screen, as it looks, and whether it wraps onto the next.
+pub fn screen(term: &mut Terminal) -> Vec<(Vec<CellLook>, bool)> {
     let dims = terminal_get_dimensions(term);
     let top = dims.physical_top;
     let (_, lines) = terminal_get_lines(term, top..top + dims.viewport_rows as StableRowIndex);
-    lines.iter().map(looks).collect()
+    lines
+        .iter()
+        .map(|line| (looks(line), line.last_cell_was_wrapped()))
+        .collect()
+}
+
+/// Whether each row the terminal holds wraps onto the next, history first.
+pub fn wraps(term: &mut Terminal) -> Vec<bool> {
+    let dims = terminal_get_dimensions(term);
+    let (_, lines) = terminal_get_lines(
+        term,
+        dims.scrollback_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
+    );
+    lines.iter().map(Line::last_cell_was_wrapped).collect()
 }
 
 /// The text of rows `range`, trailing blanks dropped.

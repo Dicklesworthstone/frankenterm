@@ -299,14 +299,14 @@ impl LineEntries {
     pub fn linked_lines(self) -> Vec<(StableRowIndex, Line)> {
         let mut lines = self.lines;
         for hyperlink in self.hyperlinks {
-            let link = Arc::new(hyperlink.link);
+            let shared = Arc::new(hyperlink.link);
             for coord in hyperlink.coords {
                 let Some((_, line)) = lines.get_mut(coord.line_idx) else {
                     continue;
                 };
                 if let Some(cells) = line.cells_mut_for_attr_changes_only().get_mut(coord.cols) {
                     for cell in cells {
-                        cell.attrs_mut().set_hyperlink(Some(Arc::clone(&link)));
+                        cell.attrs_mut().set_hyperlink(Some(Arc::clone(&shared)));
                     }
                 }
             }
