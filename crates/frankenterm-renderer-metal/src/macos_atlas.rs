@@ -31,8 +31,8 @@ use objc2_metal::{
 };
 
 use crate::atlas::{
-    AtlasChange, AtlasConfig, AtlasError, AtlasKind, AtlasSlot, FrameFence, GlyphAtlas,
-    RetireQueue, texture_bytes,
+    AtlasConfig, AtlasError, AtlasFull, AtlasKind, AtlasSlot, FrameFence, GlyphAtlas, RetireQueue,
+    texture_bytes,
 };
 use crate::{FrameError, MetalDevice};
 
@@ -48,6 +48,17 @@ struct MetalAtlas {
     pixel_format: MTLPixelFormat,
     current: AtlasTexture,
     retired: RetireQueue<AtlasTexture>,
+    #[cfg(test)]
+    growth_failure: Option<GrowthFailure>,
+}
+
+/// Exercise failure before allocation and after all fallible copy work,
+/// without relying on the device actually running out of memory.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowthFailure {
+    BeforeAllocation,
+    AfterCopy,
 }
 
 impl MetalAtlas {
@@ -66,22 +77,25 @@ impl MetalAtlas {
             pixel_format,
             current,
             retired: RetireQueue::default(),
+            #[cfg(test)]
+            growth_failure: None,
         })
     }
 
-    /// Replaces the texture with a taller one holding the same rows.
-    fn grow(
-        &mut self,
+    /// Builds a taller texture holding the same rows. Nothing is published
+    /// or registered as resident until every fallible GPU step succeeds.
+    fn grown_texture(
+        current: &AtlasTexture,
         device: &ProtocolObject<dyn MTLDevice>,
         queue: &ProtocolObject<dyn MTLCommandQueue>,
-        old_height: u32,
-        fence: FrameFence,
-        residency: Option<&ProtocolObject<dyn MTLResidencySet>>,
+        kind: AtlasKind,
+        pixel_format: MTLPixelFormat,
+        new_height: u32,
         ledger: &'static GpuResourceLedger,
-    ) -> Result<(), AtlasError> {
-        let kind = self.atlas.kind();
-        let (width, height) = self.atlas.extent();
-        let grown = new_texture(device, kind, self.pixel_format, width, height, ledger)?;
+    ) -> Result<AtlasTexture, AtlasError> {
+        let width = u32::try_from(current.texture.width()).expect("atlas width fits u32");
+        let old_height = current.texture.height();
+        let grown = new_texture(device, kind, pixel_format, width, new_height, ledger)?;
         let commands = queue
             .commandBuffer()
             .ok_or(AtlasError::Gpu(FrameError::CommandBufferUnavailable))?;
@@ -97,13 +111,13 @@ impl MetalAtlas {
         // are retained here until the command buffer has completed below.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                &self.current.texture,
+                &current.texture,
                 0,
                 0,
                 origin,
                 MTLSize {
                     width: width as usize,
-                    height: old_height as usize,
+                    height: old_height,
                     depth: 1,
                 },
                 &grown.texture,
@@ -126,14 +140,7 @@ impl MetalAtlas {
             );
             return Err(AtlasError::Gpu(FrameError::CommandFailed { detail }));
         }
-        if let Some(set) = residency {
-            set.addAllocation(ProtocolObject::from_ref(&*grown.texture));
-            set.commit();
-        }
-        let old = std::mem::replace(&mut self.current, grown);
-        // Frames up to the one being encoded may have sampled the old texture.
-        self.retired.retire(old, fence.current);
-        Ok(())
+        Ok(grown)
     }
 
     /// Writes a glyph's tightly packed pixels into its freshly allocated
@@ -279,7 +286,10 @@ impl GlyphAtlases {
         fence: FrameFence,
     ) -> Result<AtlasSlot, AtlasError> {
         let (queue, device) = (device.raw_queue(), device.raw_device());
-        let expected = width as usize * height as usize * kind.bytes_per_pixel() as usize;
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|area| area.checked_mul(kind.bytes_per_pixel() as usize))
+            .ok_or(AtlasError::Full(AtlasFull::TooLarge { width, height }))?;
         if pixels.len() != expected {
             return Err(AtlasError::PixelBytes {
                 expected,
@@ -289,17 +299,54 @@ impl GlyphAtlases {
         let ledger = self.ledger;
         let residency = self.residency.as_deref();
         let atlas = &mut self.atlases[kind_index(kind)];
-        let allocation = atlas
-            .atlas
-            .allocate(width, height, fence)
-            .map_err(AtlasError::Full)?;
-        match allocation.change {
-            Some(AtlasChange::Grew { old_height, .. }) => {
-                ledger.record_atlas_generation();
-                atlas.grow(&device, queue, old_height, fence, residency, ledger)?;
-            }
-            Some(AtlasChange::Evicted { .. }) => ledger.record_atlas_generation(),
-            None => {}
+        let allocation = {
+            let MetalAtlas {
+                atlas,
+                pixel_format,
+                current,
+                retired,
+                #[cfg(test)]
+                growth_failure,
+            } = atlas;
+            atlas.allocate_with_growth(width, height, fence, |old_height, new_height| {
+                debug_assert_eq!(current.texture.height(), old_height as usize);
+                #[cfg(test)]
+                if *growth_failure == Some(GrowthFailure::BeforeAllocation) {
+                    return Err(AtlasError::Gpu(FrameError::AllocationFailed {
+                        what: "glyph atlas texture",
+                        bytes: current.texture.width()
+                            * new_height as usize
+                            * kind.bytes_per_pixel() as usize,
+                    }));
+                }
+                let grown = MetalAtlas::grown_texture(
+                    current,
+                    &device,
+                    queue,
+                    kind,
+                    *pixel_format,
+                    new_height,
+                    ledger,
+                )?;
+                #[cfg(test)]
+                if *growth_failure == Some(GrowthFailure::AfterCopy) {
+                    return Err(AtlasError::Gpu(FrameError::CommandFailed {
+                        detail: "injected glyph atlas growth failure after copy".into(),
+                    }));
+                }
+                if let Some(set) = residency {
+                    set.addAllocation(ProtocolObject::from_ref(&*grown.texture));
+                    set.commit();
+                }
+                let old = std::mem::replace(current, grown);
+                // Frames up to the one being encoded may have sampled the
+                // old texture. Keep it until their completion fence retires.
+                retired.retire(old, fence.current);
+                Ok::<(), AtlasError>(())
+            })?
+        };
+        if allocation.change.is_some() {
+            ledger.record_atlas_generation();
         }
         atlas.upload(&allocation.slot, pixels);
         Ok(allocation.slot)
@@ -556,6 +603,109 @@ mod tests {
         let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
         assert_eq!(counter.live_count, 2);
         assert_eq!(counter.live_bytes, 256 * 128 + 256 * 256 * 4);
+    }
+
+    #[test]
+    fn failed_texture_growth_preserves_pixels_residency_and_retry_coordinates() {
+        let device = device();
+        for kind in AtlasKind::ALL {
+            for failure in [GrowthFailure::BeforeAllocation, GrowthFailure::AfterCopy] {
+                let ledger = ledger();
+                let mut atlases = GlyphAtlases::new(
+                    &device,
+                    small(AtlasKind::Grayscale, 4),
+                    small(AtlasKind::Color, 4),
+                    true,
+                    ledger,
+                )
+                .unwrap();
+                let mut placed = Vec::new();
+                for frame in 0..8_u8 {
+                    let pixels = glyph(kind, 63, 63, frame);
+                    let slot = atlases
+                        .insert(&device, kind, 63, 63, &pixels, fence(u64::from(frame)))
+                        .unwrap();
+                    placed.push((slot, pixels));
+                }
+                let original_texture = std::ptr::from_ref(atlases.texture(kind));
+                let original_stats = atlases.allocator(kind).stats();
+                let original_counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+                let original_resident = atlases.residency().map(MTLResidencySet::allocationCount);
+                atlases.atlases[kind_index(kind)].growth_failure = Some(failure);
+                let pixels = glyph(kind, 63, 63, 8);
+                for _ in 0..2 {
+                    let result = atlases.insert(&device, kind, 63, 63, &pixels, fence(8));
+                    assert!(matches!(result, Err(AtlasError::Gpu(_))));
+                    assert!(std::ptr::eq(atlases.texture(kind), original_texture));
+                    assert_eq!(atlases.texture(kind).height(), 128);
+                    assert_eq!(atlases.allocator(kind).extent(), (256, 128));
+                    assert_eq!(atlases.allocator(kind).stats(), original_stats);
+                    assert_eq!(atlases.allocator(kind).generation(), 0);
+                    assert_eq!(ledger.snapshot().atlas_generations, 0);
+                    assert_eq!(atlases.retired(), 0);
+                    let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+                    assert_eq!(counter.live_count, original_counter.live_count);
+                    assert_eq!(counter.live_bytes, original_counter.live_bytes);
+                    assert_eq!(
+                        atlases.residency().map(MTLResidencySet::allocationCount),
+                        original_resident,
+                    );
+                    for (slot, expected) in &placed {
+                        assert!(atlases.is_live(slot));
+                        assert_eq!(&read_back(&device, &atlases, slot), expected);
+                    }
+                }
+                atlases.atlases[kind_index(kind)].growth_failure = None;
+                let slot = atlases
+                    .insert(&device, kind, 63, 63, &pixels, fence(8))
+                    .unwrap();
+                assert_eq!((slot.page, slot.x, slot.y), (2, 0, 128));
+                assert_eq!(atlases.texture(kind).height(), 256);
+                assert_eq!(atlases.allocator(kind).stats().allocations, 9);
+                assert_eq!(atlases.allocator(kind).stats().growths, 1);
+                assert_eq!(atlases.allocator(kind).generation(), 1);
+                assert_eq!(ledger.snapshot().atlas_generations, 1);
+                assert_eq!(read_back(&device, &atlases, &slot), pixels);
+                for (slot, expected) in &placed {
+                    assert_eq!(&read_back(&device, &atlases, slot), expected);
+                }
+                assert_eq!(atlases.collect_retired(8), 0);
+                assert_eq!(atlases.collect_retired(9), 1);
+                let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+                assert_eq!(counter.live_count, original_counter.live_count);
+                assert_eq!(
+                    counter.live_bytes,
+                    original_counter.live_bytes + texture_bytes(kind, 256, 128),
+                );
+                assert_eq!(
+                    atlases.residency().map(MTLResidencySet::allocationCount),
+                    original_resident,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_pixel_extents_are_rejected_before_allocation() {
+        let device = device();
+        let ledger = ledger();
+        let mut atlases = GlyphAtlases::new(
+            &device,
+            small(AtlasKind::Grayscale, 2),
+            small(AtlasKind::Color, 2),
+            true,
+            ledger,
+        )
+        .unwrap();
+        let before = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert!(matches!(
+            atlases.insert(&device, AtlasKind::Color, u32::MAX, u32::MAX, &[], fence(0)),
+            Err(AtlasError::Full(AtlasFull::TooLarge { .. }))
+        ));
+        assert_eq!(atlases.allocator(AtlasKind::Color).stats().allocations, 0);
+        let after = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert_eq!(before.created_total, after.created_total);
+        assert_eq!(before.live_bytes, after.live_bytes);
     }
 
     /// ft-yccm0.4.3.2 AC: after 1,000 forced evictions the ledger shows the
