@@ -146,12 +146,10 @@ public struct TerminalLink: Equatable, Sendable {
     /// Rows joined on each side of the tapped one when looking for an address.
     static let maximumJoinedRows = 8
 
-    /// The link at `point`, if any. A row continues into the next when the
-    /// terminal recorded the wrap or, with `softWrapsUnknown` (a mux pane's
-    /// rows are redrawn one by one and keep no wraps), when its text reaches
-    /// the last column; the destination shown first makes a wrong join plain.
-    public static func at(_ point: TerminalGridPoint, in frame: TerminalRenderFrame,
-                          softWrapsUnknown: Bool = false) -> TerminalLink? {
+    /// The link at `point`, if any. An address runs on into the next row
+    /// where the terminal recorded the row's wrap; a row that only fills its
+    /// width ends it.
+    public static func at(_ point: TerminalGridPoint, in frame: TerminalRenderFrame) -> TerminalLink? {
         let columns = frame.columns
         guard columns > 0, let index = frame.lines.firstIndex(where: { $0.stableIndex == point.row }) else { return nil }
         let row = frame.lines[index]
@@ -171,12 +169,8 @@ public struct TerminalLink: Equatable, Sendable {
                                 end: .init(row: row.stableIndex, column: last))
         }
         func continues(_ at: Int) -> Bool {
-            guard at + 1 < frame.lines.count, frame.lines[at + 1].stableIndex == frame.lines[at].stableIndex + 1
-            else { return false }
-            if frame.lines[at].wrapsToNext { return true }
-            guard softWrapsUnknown,
-                  let last = frame.lines[at].cells.last(where: { !$0.text.allSatisfy(\.isWhitespace) }) else { return false }
-            return last.column + max(last.width, 1) >= columns
+            at + 1 < frame.lines.count && frame.lines[at].wrapsToNext
+                && frame.lines[at + 1].stableIndex == frame.lines[at].stableIndex + 1
         }
         var first = index, last = index
         while first > 0, index - first < maximumJoinedRows, continues(first - 1) { first -= 1 }

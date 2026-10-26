@@ -719,6 +719,93 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// Where `marker` starts on the drawn screen, with the frame that shows it,
+    /// waiting up to ~10 s. ASCII only: a character's offset in a row's text
+    /// is its column.
+    private func cell(of marker: String, in terminal: NativeTerminalView) async throws
+        -> (TerminalGridPoint, TerminalRenderFrame) {
+        func find() -> (TerminalGridPoint, TerminalRenderFrame)? {
+            guard let frame = terminal.renderer.admittedFrame else { return nil }
+            for row in frame.lines {
+                let text = row.readableText
+                if let range = text.range(of: marker) {
+                    return (.init(row: row.stableIndex, column: text.distance(from: text.startIndex, to: range.lowerBound)), frame)
+                }
+            }
+            return nil
+        }
+        for _ in 0..<200 {
+            if let found = find() { return found }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return try XCTUnwrap(find(), "the screen never showed \(marker) (screen: \(terminal.renderer.accessibilityValue ?? ""))")
+    }
+
+    /// What a tap finds on a program's link (OSC 8), on an address in plain
+    /// text, and at either end of an address that wraps onto exactly three
+    /// rows, the prompt right below it: each destination whole, and nothing
+    /// of the prompt. Markers carry this run's id; a mux pane keeps the rows
+    /// earlier runs printed.
+    private func assertLinks(in terminal: NativeTerminalView, _ context: String) async throws {
+        let run = UUID().uuidString.prefix(8)
+        try await type(#"printf '\033]8;;https://example.com/pr/%d\033\\LINK-\#(run)-%d\033]8;;\033\\ and\nhttps://example.com/\#(run)/ci/%d\n' $((6*7)) $((6*7)) $((6*7))"#,
+                       into: terminal)
+        func destination(_ at: TerminalGridPoint, in frame: TerminalRenderFrame) -> String? {
+            TerminalLink.at(at, in: frame)?.destination
+        }
+        func destination(at marker: String, offset: Int) async throws -> String? {
+            let (at, frame) = try await cell(of: marker, in: terminal)
+            return destination(.init(row: at.row, column: at.column + offset), in: frame)
+        }
+        let program = try await destination(at: "LINK-\(run)-42", offset: 3)
+        XCTAssertEqual(program, "https://example.com/pr/42", "a program's link \(context)")
+        let between = try await destination(at: "LINK-\(run)-42", offset: 17)
+        XCTAssertNil(between, "the text after a program's link \(context)")
+        let plain = try await destination(at: "https://example.com/\(run)/ci/42", offset: 12)
+        XCTAssertEqual(plain, "https://example.com/\(run)/ci/42", "an address in the text \(context)")
+
+        // 36 characters around the w's: the address fills three rows exactly.
+        let columns = try XCTUnwrap(terminal.renderer.admittedFrame?.columns)
+        let ws = 3 * columns - 36
+        try await type(#"printf 'https://example.com/\#(run)/%s/end-%d\n' $(head -c \#(ws) /dev/zero | tr '\0' w) $((6*7))"#,
+                       into: terminal)
+        let long = "https://example.com/\(run)/\(String(repeating: "w", count: ws))/end-42"
+        let (first, frame) = try await cell(of: "https://example.com/\(run)/w", in: terminal)
+        XCTAssertEqual(first.column, 0)
+        XCTAssertEqual(long.count, 3 * frame.columns)
+        let last = TerminalGridPoint(row: first.row + 2, column: frame.columns - 1)
+        XCTAssertEqual(destination(first, in: frame), long, "the first row of a wrapped address \(context)")
+        XCTAssertEqual(destination(last, in: frame), long, "the last row of a wrapped address \(context)")
+    }
+
+    /// A tap on a link the shell prints, or on an address in its output, finds
+    /// where it goes, over a direct SSH session.
+    func testLinksTheShellPrintsAreFoundWhereTheyAreDrawn() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await assertLinks(in: terminal, "over SSH")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
+    /// The same through a mux pane: the mirror redraws the pane's rows with
+    /// their links and their wraps.
+    func testAMuxPanesLinksAreFoundInTheRowsTheMirrorRedraws() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        XCTAssertNotNil(session.muxControl)
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await assertLinks(in: terminal, "through the mux")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// Paste shows the exact clipboard text bound to this terminal. Cancel sends
     /// nothing; confirmation sends it once, without a Return.
     func testReviewedPasteIsSentOnlyOnConfirmationAndAddsNoReturn() async throws {

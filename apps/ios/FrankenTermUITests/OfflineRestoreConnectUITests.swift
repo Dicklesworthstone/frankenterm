@@ -136,24 +136,31 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertFalse(appeared, "\(message); screen:\n\(screen(terminal))")
     }
 
-    /// The last `SZ-<rows>x<columns>` the shell printed.
-    private func reportedSize(_ terminal: XCUIElement) -> (rows: Int, columns: Int)? {
+    /// The `SZ-<tag>-<rows>x<columns>` the shell printed for `tag` (the
+    /// echoed command never matches).
+    private func reportedSize(_ terminal: XCUIElement, tag: Substring) -> (rows: Int, columns: Int)? {
         let text = screen(terminal)
-        guard let match = text.matches(of: /SZ-(\d+)x(\d+)/).last,
+        guard let start = text.range(of: "SZ-\(tag)-", options: .backwards)?.upperBound,
+              let match = text[start...].prefixMatch(of: /(\d+)x(\d+)/),
               let rows = Int(match.1), let columns = Int(match.2) else { return nil }
         return (rows, columns)
     }
 
-    /// Asks the shell for its size and returns what it prints (the echoed
-    /// command never matches), waiting up to 15 s for an answer other than
-    /// `previous` while the screen still shows the earlier one.
+    /// Asks the shell for its size and returns its answer. Each question has
+    /// its own tag, so an earlier answer still on screen never counts; while
+    /// the answer is still `previous`, it asks again, three times at most.
     private func shellSize(_ app: XCUIApplication, _ terminal: XCUIElement,
                            unlike previous: (rows: Int, columns: Int)? = nil) -> (rows: Int, columns: Int)? {
-        app.typeText("clear; echo SZ-$(stty size | tr ' ' x)\n")
         var size: (rows: Int, columns: Int)?
-        for _ in 0..<15 {
-            size = reportedSize(terminal)
-            if let size, previous.map({ $0 != size }) ?? true { break }
+        for _ in 0..<3 {
+            let tag = UUID().uuidString.prefix(6)
+            app.typeText("clear; echo SZ-\(tag)-$(stty size | tr ' ' x)\n")
+            for _ in 0..<5 {
+                size = reportedSize(terminal, tag: tag)
+                if size != nil { break }
+                sleep(1)
+            }
+            if let size, previous.map({ $0 != size }) ?? true { return size }
             sleep(1)
         }
         return size
@@ -305,6 +312,39 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("echo KEPT-$FT_KEPT\n")
         waitFor("KEPT-yes", in: terminal, timeout: 30, "the same session runs commands after the background trip")
         snapshot("10-kept")
+
+        // A tapped link shows where it goes and opens only on a second tap:
+        // Cancel leaves typing as it was; Open hands the address to Safari,
+        // and the session is still there on return. The link is the top
+        // row's first 15 columns; the shell's size places the tap.
+        let size = try XCTUnwrap(shellSize(app, terminal), "the shell must report its size; screen:\n\(screen(terminal))")
+        app.typeText(#"clear; printf '\033]8;;https://example.com/ft-ui/%d\033\\LINK-%d-LINK-%d\033]8;;\033\\\n' $((6*7)) $((6*7)) $((6*7))"# + "\n")
+        waitFor("LINK-42-LINK-42", in: terminal, "the shell must print the link")
+        let link = terminal.coordinate(withNormalizedOffset: CGVector(dx: 4.5 / Double(size.columns), dy: 0.5 / Double(size.rows)))
+        link.tap()
+        let destination = app.staticTexts["https://example.com/ft-ui/42"]
+        XCTAssertTrue(destination.waitForExistence(timeout: 10), "a tap on the link must show where it goes")
+        XCTAssertTrue(app.buttons["Copy Link"].exists)
+        snapshot("11-link")
+        // The choices show in a popover by the link (iPhone too, on iOS 26),
+        // put away by a tap outside it; a sheet would have Cancel.
+        if app.buttons["Cancel"].exists { app.buttons["Cancel"].tap() } else { app.otherElements["PopoverDismissRegion"].tap() }
+        XCTAssertTrue(destination.waitForNonExistence(timeout: 5), "Cancel puts the choices away")
+        app.typeText("echo AFTER-$((40+2))\n")
+        waitFor("AFTER-42", in: terminal, "typing goes on after the choices are put away")
+
+        link.tap()
+        let open = app.buttons["Open"].firstMatch
+        XCTAssertTrue(open.waitForExistence(timeout: 10), "a web address offers Open")
+        open.tap()
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 20), "Open must hand the address to Safari")
+        snapshot("12-opened")
+        app.activate()
+        terminal.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "the session takes the keyboard again")
+        app.typeText("echo OPENED-$FT_KEPT\n")
+        waitFor("OPENED-yes", in: terminal, timeout: 30, "the same session runs commands after Safari")
     }
 
     /// M1 through the machine strip (numbered to run after the journeys above;

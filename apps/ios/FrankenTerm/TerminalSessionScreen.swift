@@ -1084,7 +1084,6 @@ final class TerminalSessionController {
                         destination: expectedMux, control: control, view: view)
                 }
                 view.remoteMouseGrabbed = control.current.mouseGrabbed
-                view.softWrapsUnknown = true
                 view.onRemoteClick = { [weak self, weak control, weak view] column, row in
                     guard let self, let control, let view else { return }
                     self.submitPointer(.click(column: column, row: row),

@@ -895,9 +895,6 @@ public final class NativeTerminalView: UIView {
     /// keyboard.
     public var remoteMouseGrabbed = false
     public var onRemoteClick: (@MainActor (_ column: Int, _ row: Int) -> Void)?
-    /// The rows do not record their soft wraps (a mux pane's are redrawn one
-    /// by one), so a link that reaches the last column goes on to the next row.
-    public var softWrapsUnknown = false
     /// Rows of drag per wheel notch: a notch scrolls a program about three rows.
     private static let rowsPerNotch = 3
 
@@ -1445,7 +1442,7 @@ public final class NativeTerminalView: UIView {
     /// Open and Copy Link. Nothing opens without a second, deliberate tap.
     func showLink(at point: CGPoint) -> Bool {
         guard let grid = gridPoint(at: point), let frame = renderer.admittedFrame, let cell = renderer.cellSize,
-              let link = TerminalLink.at(grid, in: frame, softWrapsUnknown: softWrapsUnknown) else { return false }
+              let link = TerminalLink.at(grid, in: frame) else { return false }
         // This terminal's own controller: a key-window lookup could show it
         // in another scene.
         var responder: UIResponder? = self

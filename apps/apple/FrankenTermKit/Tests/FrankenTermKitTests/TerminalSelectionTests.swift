@@ -138,14 +138,10 @@ final class TerminalLinkTests: XCTestCase {
         let whole = TerminalLink(destination: "https://example.com/pull/42", start: point(0, 3), end: point(1, 8))
         XCTAssertEqual(TerminalLink.at(point(0, 6), in: wrapped), whole)
         XCTAssertEqual(TerminalLink.at(point(1, 2), in: wrapped), whole)
-        // A hard break ends it, unless the rows' wraps are unknown and the
-        // text reaches the last column (a mux pane's redrawn rows).
+        // A row that only fills its width, with no wrap, ends it.
         let broken = try await frame([row(0, "go https://example.co"), row(1, "m/pull/42 now")], columns: 21)
         XCTAssertEqual(TerminalLink.at(point(0, 6), in: broken)?.destination, "https://example.co")
-        XCTAssertEqual(TerminalLink.at(point(1, 2), in: broken, softWrapsUnknown: true), whole)
-        let short = try await frame([row(0, "go https://example.co"), row(1, "m/pull/42 now")], columns: 30)
-        XCTAssertEqual(TerminalLink.at(point(0, 6), in: short, softWrapsUnknown: true)?.destination, "https://example.co",
-                       "a row that stops short of the last column does not continue")
+        XCTAssertNil(TerminalLink.at(point(1, 2), in: broken))
     }
 
     func testOnlyWebAndMailAddressesOpen() {
