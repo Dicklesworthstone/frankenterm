@@ -57,6 +57,19 @@ impl CellCluster {
         }
     }
 
+    /// Whether every byte is one distinct single-width cell, starting at
+    /// `first_cell_idx`, without inspecting the text or materializing maps.
+    /// Empty maps use saturating indices, so an overflowing range is not the
+    /// canonical one-byte-per-cell mapping used by shaping-cache keys.
+    pub fn has_implicit_cell_mapping(&self) -> bool {
+        self.byte_to_cell_idx.is_empty()
+            && self.byte_to_cell_width.is_empty()
+            && self
+                .first_cell_idx
+                .checked_add(self.text.len().saturating_sub(1))
+                .is_some()
+    }
+
     /// Compute the list of CellClusters from a set of visible cells.
     /// The input is typically the result of calling `Line::visible_cells()`.
     pub fn make_cluster<'a>(
@@ -483,6 +496,20 @@ mod tests {
         assert!(c.byte_to_cell_width.is_empty());
     }
 
+    #[test]
+    fn implicit_cell_mapping_requires_distinct_single_width_bytes() {
+        let mut ascii = make_cluster("a", 17, 1);
+        ascii.add("b", 18, 1);
+        assert!(ascii.has_implicit_cell_mapping());
+        assert!(!make_cluster("é", 17, 1).has_implicit_cell_mapping());
+        assert!(!make_cluster("a", 17, 2).has_implicit_cell_mapping());
+        ascii.first_cell_idx = usize::MAX - 1;
+        assert!(ascii.has_implicit_cell_mapping());
+        ascii.first_cell_idx = usize::MAX;
+        assert!(!ascii.has_implicit_cell_mapping());
+        assert_eq!(ascii.byte_to_cell_idx(0), ascii.byte_to_cell_idx(1));
+    }
+
     // ── byte_to_cell_idx ──────────────────────────────
 
     #[test]
@@ -552,7 +579,7 @@ mod tests {
         // After adding multi-byte, idx map should be extrapolated
         assert_eq!(c.byte_to_cell_idx.len(), "aé".len());
         assert_eq!(c.byte_to_cell_idx[0], 0); // "a" -> cell 0
-                                              // "é" bytes -> cell 1
+        // "é" bytes -> cell 1
         for mapped in &c.byte_to_cell_idx[1..] {
             assert_eq!(*mapped, 1);
         }

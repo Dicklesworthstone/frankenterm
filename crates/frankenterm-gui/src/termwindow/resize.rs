@@ -1122,7 +1122,7 @@ mod tests {
     use crate::glyphcache::GlyphCache;
     use crate::quad::HeapQuadAllocator;
     use crate::renderstate::{LedgeredTexture, replace_glyph_cache_atlas};
-    use crate::shapecache::{CachedShape, ShapeCacheKey, ShapedInfo};
+    use crate::shapecache::{BorrowedShapeCacheKey, CachedShape, ShapeCacheKey, ShapedInfo};
     use crate::termwindow::render::{
         LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShape,
         LineToElementShapeItem, resolve_fg_color_attr,
@@ -1245,10 +1245,8 @@ mod tests {
     }
 
     fn shape_key() -> ShapeCacheKey {
-        ShapeCacheKey {
-            style: TextStyle::default(),
-            text: "AVfi".to_string(),
-        }
+        let clusters = Line::from_text("AVfi", &CellAttributes::default(), 0, None).cluster(None);
+        BorrowedShapeCacheKey::new(&TextStyle::default(), 0, &clusters[0], None).to_owned()
     }
 
     fn quad_key(shape_generation: usize, quad_generation: usize) -> LineQuadCacheKey {
@@ -1646,10 +1644,12 @@ mod tests {
         metrics: &RenderMetrics,
         text: &str,
     ) -> (Rc<CachedShape>, Rc<Vec<ShapedInfo>>) {
-        let key = ShapeCacheKey {
-            style: TextStyle::default(),
-            text: text.to_string(),
-        };
+        let clusters = Line::from_text(text, &CellAttributes::default(), 0, None).cluster(None);
+        let joined =
+            termwiz::cellcluster::CellCluster::concat(&clusters.iter().collect::<Vec<_>>())
+                .unwrap();
+        let key =
+            BorrowedShapeCacheKey::new(&TextStyle::default(), font.id(), &joined, None).to_owned();
         let cached = fixture.shapes.borrow_mut().get(&key).cloned();
         let shape = cached.unwrap_or_else(|| {
             let infos = font
@@ -1781,7 +1781,11 @@ mod tests {
 
         // The surviving hot entry re-resolves its sprites into the current
         // atlas without being shaped again.
-        let hot = Rc::clone(fixture.shapes.borrow_mut().get(&shape_key()).unwrap());
+        let clusters = Line::from_text("AVfi", &CellAttributes::default(), 0, None).cluster(None);
+        let hot_key =
+            BorrowedShapeCacheKey::new(&TextStyle::default(), font.id(), &clusters[0], None)
+                .to_owned();
+        let hot = Rc::clone(fixture.shapes.borrow_mut().get(&hot_key).unwrap());
         let (again, sprites) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
         assert!(Rc::ptr_eq(&again, &hot), "no re-shape after a rebuild");
         let atlas = ledger.texture_counter(GpuTexturePurpose::Atlas);

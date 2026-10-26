@@ -105,6 +105,10 @@ pub(crate) struct FrameSlots {
     residency: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     ledger: &'static GpuResourceLedger,
     allocations: u64,
+    /// Fail before creating the allocation with this counter value, to
+    /// exercise recovery after an earlier allocation in a batch succeeded.
+    #[cfg(test)]
+    fail_allocation_at: Option<u64>,
     /// Bytes the last frame uploaded into its slot, and since creation.
     upload_bytes_last: u64,
     upload_bytes_total: u64,
@@ -192,6 +196,8 @@ impl FrameSlots {
             residency,
             ledger,
             allocations: 0,
+            #[cfg(test)]
+            fail_allocation_at: None,
             upload_bytes_last: 0,
             upload_bytes_total: 0,
             panes: HashMap::new(),
@@ -228,6 +234,13 @@ impl FrameSlots {
         bytes: usize,
         slot: usize,
     ) -> Result<SlotAllocation, FrameError> {
+        #[cfg(test)]
+        if self.fail_allocation_at == Some(self.allocations) {
+            return Err(FrameError::AllocationFailed {
+                what: kind.as_str(),
+                bytes,
+            });
+        }
         let buffer = self
             .device
             .newBufferWithLength_options(bytes, slot_buffer_options())
@@ -288,6 +301,11 @@ impl FrameSlots {
     /// Grows the leased `slot`'s buffers that are too small for `sizes`.
     /// The slot is leased, so no in-flight frame uses the buffers replaced.
     fn fit_slot(&mut self, slot: usize, sizes: &SlotSizes) -> Result<(), FrameError> {
+        // Stage every replacement before changing buffers or residency.
+        // If any allocation fails, the old layout remains intact. The
+        // fixed array keeps steady frames free of staging allocations.
+        let mut replacements: [Option<SlotAllocation>; SlotBuffer::ALL.len()] =
+            std::array::from_fn(|_| None);
         let mut grown = false;
         for kind in SlotBuffer::ALL {
             let current = self.slots[slot].buffers[kind.index()].buffer.length();
@@ -295,7 +313,16 @@ impl FrameSlots {
             if capacity == current {
                 continue;
             }
-            let replacement = self.allocate(kind, capacity, slot)?;
+            replacements[kind.index()] = Some(self.allocate(kind, capacity, slot)?);
+            grown = true;
+        }
+        if !grown {
+            return Ok(());
+        }
+        for (kind, replacement) in SlotBuffer::ALL.into_iter().zip(replacements) {
+            let Some(replacement) = replacement else {
+                continue;
+            };
             if let Some(set) = &self.residency {
                 set.addAllocation(ProtocolObject::from_ref(&*replacement.buffer));
             }
@@ -303,13 +330,10 @@ impl FrameSlots {
             if let Some(set) = &self.residency {
                 set.removeAllocation(ProtocolObject::from_ref(&*old.buffer));
             }
-            grown = true;
         }
-        if grown {
-            self.slots[slot].generation += 1;
-            if let Some(set) = &self.residency {
-                set.commit();
-            }
+        self.slots[slot].generation += 1;
+        if let Some(set) = &self.residency {
+            set.commit();
         }
         Ok(())
     }
@@ -415,12 +439,14 @@ impl FrameSlots {
         let slot = lease.slot();
         let generation = self.slots[slot].generation;
         let mut plan = self.slots[slot].uploads.plan(cells, text, generation);
-        let sizes =
-            SlotSizes::for_frame(grid, plan.instances(grid)).ok_or(FrameError::GridTooLarge {
+        let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
+            .ok_or(FrameError::GridTooLarge {
                 rows: grid.rows,
                 cols: grid.cols,
-            })?;
-        self.fit_slot(slot, &sizes)?;
+            })
+            .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
+        self.fit_slot(slot, &sizes)
+            .inspect_err(|_| self.slots[slot].uploads.invalidate())?;
         let fitted = self.slots[slot].generation;
         if fitted != generation {
             // The buffers were replaced: they hold nothing yet.
@@ -438,8 +464,8 @@ impl FrameSlots {
     }
 
     /// Copies `plan`'s rows into the leased slot: cell background rows at
-    /// their ring offsets, glyph regions zero-padded to the plan's capacity,
-    /// and their row-table entries.
+    /// their ring offsets, glyph prefixes padded through any removed
+    /// instances (the full capacity for new layouts), and row-table entries.
     fn write_plan(
         &self,
         lease: &SlotLease,
@@ -461,16 +487,17 @@ impl FrameSlots {
         }
         if let Some(text) = text {
             let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
-            for &ring in &plan.text_rows {
-                let ring = ring as usize;
+            for upload in &plan.text_rows {
+                let ring = upload.row as usize;
+                let len = upload.instances as usize * CELL_TEXT_INSTANCE_BYTES;
                 let bytes = text.ring_row_instances(ring);
                 self.write_padded_into(
                     lease,
                     self.buffer(lease.slot(), SlotBuffer::CellText),
                     SlotBuffer::CellText.as_str(),
                     ring * region,
-                    &bytes[..bytes.len().min(region)],
-                    region,
+                    &bytes[..bytes.len().min(len)],
+                    len,
                 )?;
                 self.write(
                     lease,
@@ -533,11 +560,14 @@ impl FrameSlots {
             let sizes = sizes_for(grid)?;
             let mut buffers = Vec::with_capacity(PANE_BUFFERS.len());
             for kind in PANE_BUFFERS {
-                buffers.push(self.allocate_resident(
-                    kind,
-                    grown_capacity(0, sizes.bytes(kind)),
-                    slot,
-                )?);
+                buffers.push(self.allocate(kind, grown_capacity(0, sizes.bytes(kind)), slot)?);
+            }
+            // A failed allocation above drops the staged buffers without
+            // leaving retained entries in the residency set.
+            if let Some(set) = &self.residency {
+                for allocation in &buffers {
+                    set.addAllocation(ProtocolObject::from_ref(&*allocation.buffer));
+                }
             }
             self.commit_residency();
             pane.slots[slot] = Some(PaneSlot {
@@ -552,12 +582,16 @@ impl FrameSlots {
         let mut plan = pane_slot
             .uploads
             .plan(Some(cells), text, pane_slot.generation);
-        let sizes =
-            SlotSizes::for_frame(grid, plan.instances(grid)).ok_or(FrameError::GridTooLarge {
+        let sizes = SlotSizes::for_frame(grid, plan.instances(grid))
+            .ok_or(FrameError::GridTooLarge {
                 rows: grid.rows,
                 cols: grid.cols,
-            })?;
-        if self.fit_pane_slot(pane_slot, &sizes, slot)? {
+            })
+            .inspect_err(|_| pane_slot.uploads.invalidate())?;
+        if self
+            .fit_pane_slot(pane_slot, &sizes, slot)
+            .inspect_err(|_| pane_slot.uploads.invalidate())?
+        {
             // The buffers were replaced: they hold nothing yet.
             pane_slot.uploads.invalidate();
             plan = pane_slot
@@ -603,6 +637,8 @@ impl FrameSlots {
         sizes: &SlotSizes,
         slot: usize,
     ) -> Result<bool, FrameError> {
+        let mut replacements: [Option<SlotAllocation>; PANE_BUFFERS.len()] =
+            std::array::from_fn(|_| None);
         let mut grown = false;
         for kind in PANE_BUFFERS {
             let index = pane_buffer_index(kind);
@@ -611,18 +647,27 @@ impl FrameSlots {
             if capacity == current {
                 continue;
             }
-            let replacement = self.allocate_resident(kind, capacity, slot)?;
+            replacements[index] = Some(self.allocate(kind, capacity, slot)?);
+            grown = true;
+        }
+        if !grown {
+            return Ok(false);
+        }
+        for (index, replacement) in replacements.into_iter().enumerate() {
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            if let Some(set) = &self.residency {
+                set.addAllocation(ProtocolObject::from_ref(&*replacement.buffer));
+            }
             let old = std::mem::replace(&mut pane.buffers[index], replacement);
             if let Some(set) = &self.residency {
                 set.removeAllocation(ProtocolObject::from_ref(&*old.buffer));
             }
-            grown = true;
         }
-        if grown {
-            pane.generation += 1;
-            self.commit_residency();
-        }
-        Ok(grown)
+        pane.generation += 1;
+        self.commit_residency();
+        Ok(true)
     }
 
     /// [`Self::write_plan`] into a pane's buffers in the leased slot.
@@ -648,16 +693,17 @@ impl FrameSlots {
         }
         if let Some(text) = text {
             let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
-            for &ring in &plan.text_rows {
-                let ring = ring as usize;
+            for upload in &plan.text_rows {
+                let ring = upload.row as usize;
+                let len = upload.instances as usize * CELL_TEXT_INSTANCE_BYTES;
                 let bytes = text.ring_row_instances(ring);
                 self.write_padded_into(
                     lease,
                     buffer(SlotBuffer::CellText),
                     "pane cell_text",
                     ring * region,
-                    &bytes[..bytes.len().min(region)],
-                    region,
+                    &bytes[..bytes.len().min(len)],
+                    len,
                 )?;
                 self.write_into(
                     lease,
@@ -2629,6 +2675,217 @@ mod tests {
         );
     }
 
+    fn check_failed_buffer_growth(pane: bool) {
+        let ledger = private_ledger();
+        let mut frames = FrameSlots::new(device(), SMALL, ledger).unwrap();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        let slot = lease.slot();
+        let key = 71;
+        let small_cells = CellBgGrid::new(SMALL);
+        let small_text = CellTextGrid::new(SMALL);
+        if pane {
+            frames
+                .upload_pane(&lease, key, &small_cells, Some(&small_text))
+                .unwrap();
+        } else {
+            frames
+                .upload(&lease, SMALL, Some(&small_cells), Some(&small_text))
+                .unwrap();
+        }
+        let kinds: &[SlotBuffer] = if pane {
+            &PANE_BUFFERS
+        } else {
+            &SlotBuffer::ALL
+        };
+        let original: Vec<_> = kinds
+            .iter()
+            .map(|&kind| {
+                let buffer = if pane {
+                    frames.pane_buffer(slot, key, kind).unwrap()
+                } else {
+                    frames.buffer(slot, kind)
+                };
+                (kind, buffer.retain())
+            })
+            .collect();
+        let generation = |frames: &FrameSlots| {
+            if pane {
+                frames.panes[&key].slots[slot].as_ref().unwrap().generation
+            } else {
+                frames.generation(slot)
+            }
+        };
+        let before_generation = generation(&frames);
+        let before_live = ledger.snapshot().buffer_total.live_count;
+        let before_resident = frames.residency().map(MTLResidencySet::allocationCount);
+        let before_allocations = frames.allocations();
+        let cells = CellBgGrid::new(LARGE);
+        let mut text = CellTextGrid::new(LARGE);
+        text.push(0, CellText::new(1, [255; 4]));
+        frames.fail_allocation_at = Some(before_allocations + 1);
+        let failed = if pane {
+            frames.upload_pane(&lease, key, &cells, Some(&text))
+        } else {
+            frames.upload(&lease, LARGE, Some(&cells), Some(&text))
+        };
+        assert!(matches!(failed, Err(FrameError::AllocationFailed { .. })));
+        assert_eq!(
+            frames.allocations(),
+            before_allocations + 1,
+            "one allocation succeeded first"
+        );
+        assert_eq!(generation(&frames), before_generation);
+        assert_eq!(ledger.snapshot().buffer_total.live_count, before_live);
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            before_resident
+        );
+        for (kind, old) in &original {
+            let current = if pane {
+                frames.pane_buffer(slot, key, *kind).unwrap()
+            } else {
+                frames.buffer(slot, *kind)
+            };
+            assert!(
+                std::ptr::eq(current, &**old),
+                "a failed batch retains the old buffer"
+            );
+            if let Some(set) = frames.residency() {
+                assert!(set.containsAllocation(ProtocolObject::from_ref(&**old)));
+            }
+        }
+        let mut retry = if pane {
+            frames.panes[&key].slots[slot]
+                .as_ref()
+                .unwrap()
+                .uploads
+                .clone()
+        } else {
+            frames.slots[slot].uploads.clone()
+        };
+        assert!(
+            retry
+                .plan(Some(&cells), Some(&text), before_generation)
+                .full,
+            "planning before an allocation failure must not mark rows as written"
+        );
+        frames.fail_allocation_at = None;
+        frames.begin_window_uploads();
+        let instances = if pane {
+            frames.upload_pane(&lease, key, &cells, Some(&text))
+        } else {
+            frames.upload(&lease, LARGE, Some(&cells), Some(&text))
+        }
+        .unwrap();
+        assert_eq!(instances, 1);
+        assert_eq!(generation(&frames), before_generation + 1);
+        let (bg, glyphs, table) = crate::uploads::full_layout(&cells, &text, LARGE.cols);
+        assert_eq!(
+            frames.upload_bytes().0,
+            u64::try_from(bg.len() + glyphs.len() + table.len()).unwrap()
+        );
+        assert_eq!(ledger.snapshot().buffer_total.live_count, before_live);
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            before_resident
+        );
+        drop(lease);
+        if !pane {
+            assert_eq!(frames.read(slot, SlotBuffer::CellBg, bg.len()), bg);
+            assert_eq!(
+                frames.read(slot, SlotBuffer::CellText, glyphs.len()),
+                glyphs
+            );
+            assert_eq!(frames.read(slot, SlotBuffer::RowTable, table.len()), table);
+        }
+    }
+
+    #[test]
+    fn failed_slot_growth_keeps_old_buffers_and_retries_a_full_upload() {
+        check_failed_buffer_growth(false);
+    }
+
+    #[test]
+    fn failed_pane_growth_keeps_old_buffers_and_retries_a_full_upload() {
+        check_failed_buffer_growth(true);
+    }
+
+    #[test]
+    fn failed_new_pane_allocations_leave_no_residency_or_ledger_entries() {
+        let ledger = private_ledger();
+        let mut frames = FrameSlots::new(device(), SMALL, ledger).unwrap();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        let cells = CellBgGrid::new(SMALL);
+        let text = CellTextGrid::new(SMALL);
+        let before_live = ledger.snapshot().buffer_total.live_count;
+        let before_resident = frames.residency().map(MTLResidencySet::allocationCount);
+        let key = 72;
+        for completed in 0..u64::try_from(PANE_BUFFERS.len()).unwrap() {
+            frames.fail_allocation_at = Some(frames.allocations() + completed);
+            assert!(matches!(
+                frames.upload_pane(&lease, key, &cells, Some(&text)),
+                Err(FrameError::AllocationFailed { .. })
+            ));
+            assert!(
+                frames
+                    .pane_buffer(lease.slot(), key, SlotBuffer::CellText)
+                    .is_none()
+            );
+            assert_eq!(ledger.snapshot().buffer_total.live_count, before_live);
+            assert_eq!(
+                frames.residency().map(MTLResidencySet::allocationCount),
+                before_resident
+            );
+        }
+        frames.fail_allocation_at = None;
+        assert_eq!(
+            frames
+                .upload_pane(&lease, key, &cells, Some(&text))
+                .unwrap(),
+            0
+        );
+        assert_eq!(ledger.snapshot().buffer_total.live_count, before_live + 3);
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            before_resident.map(|count| count + 3)
+        );
+    }
+
+    #[test]
+    fn a_rejected_upload_size_does_not_mark_dirty_text_as_written() {
+        let grid = GridExtent::new(4, 8);
+        let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
+        let lease = frames.begin(grid, LONG).unwrap();
+        let slot = lease.slot();
+        let cells = CellBgGrid::new(grid);
+        let mut text = CellTextGrid::new(grid);
+        frames
+            .upload(&lease, grid, Some(&cells), Some(&text))
+            .unwrap();
+        text.push(1, CellText::new(0, [255; 4]));
+        let huge = GridExtent {
+            rows: u32::MAX,
+            cols: u32::MAX,
+        };
+        assert!(matches!(
+            frames.upload(&lease, huge, Some(&cells), Some(&text)),
+            Err(FrameError::GridTooLarge { .. })
+        ));
+        frames
+            .upload(&lease, grid, Some(&cells), Some(&text))
+            .unwrap();
+        let (bg, glyphs, table) = crate::uploads::full_layout(&cells, &text, grid.cols);
+        assert_eq!(
+            frames.upload_bytes().0,
+            u64::try_from(bg.len() + glyphs.len() + table.len()).unwrap()
+        );
+        drop(lease);
+        assert_eq!(
+            frames.read(slot, SlotBuffer::CellText, glyphs.len()),
+            glyphs
+        );
+    }
+
     #[test]
     fn writes_are_bounds_checked() {
         let grid = GridExtent::new(2, 2);
@@ -3576,7 +3833,7 @@ mod tests {
         let mut frames = FrameSlots::new(device(), grid, private_ledger()).unwrap();
         let pane = 41;
         let full_bytes = 6 * 10 * CELL_TEXT_INSTANCE_BYTES;
-        let check = |frames: &mut FrameSlots, text: &CellTextGrid, expected: usize| {
+        let check = |frames: &mut FrameSlots, text: &CellTextGrid, expected: usize, bytes: u64| {
             let (_, instances, _) = crate::uploads::full_layout(&cells, text, grid.cols);
             // Every slot sees each mutation, including clearing a row it
             // previously held. Release each lease before reading its bytes.
@@ -3589,12 +3846,15 @@ mod tests {
                         .unwrap(),
                     expected
                 );
+                assert_eq!(frames.upload_bytes().0, bytes, "single-grid upload");
+                frames.begin_window_uploads();
                 assert_eq!(
                     frames
                         .upload_pane(&lease, pane, &cells, Some(text))
                         .unwrap(),
                     expected
                 );
+                assert_eq!(frames.upload_bytes().0, bytes, "pane upload");
                 assert!(frames.buffer(slot, SlotBuffer::CellText).length() >= full_bytes);
                 assert!(
                     frames
@@ -3610,15 +3870,20 @@ mod tests {
                 );
             }
         };
-        check(&mut frames, &text, 0);
-        text.push(0, CellText::new(1, [255; 4]));
-        check(&mut frames, &text, 1);
+        check(&mut frames, &text, 0, 6 * (10 * 4 + 10 * 24 + 16));
+        for col in 0..4 {
+            text.push(0, CellText::new(col, [255; 4]));
+        }
+        check(&mut frames, &text, 4, 4 * 24 + 16);
         text.push(5, CellText::new(0, [255; 4]));
-        check(&mut frames, &text, 51);
+        check(&mut frames, &text, 51, 24 + 16);
         text.clear_row(5);
-        check(&mut frames, &text, 1);
+        check(&mut frames, &text, 4, 24 + 16);
         text.clear_row(0);
-        check(&mut frames, &text, 0);
+        text.push(0, CellText::new(1, [127; 4]));
+        check(&mut frames, &text, 1, 4 * 24 + 16);
+        text.clear_row(0);
+        check(&mut frames, &text, 0, 24 + 16);
     }
 
     /// Every slot ends up holding the grids' region layout (ft-yccm0.4.2.4)

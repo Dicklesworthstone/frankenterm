@@ -364,7 +364,7 @@ fn render_cache_gauge_values(
     let mut shape_bytes = 0u64;
     shapes.for_each_resident(|key, shape| {
         shape_bytes +=
-            (size_of::<ShapeCacheKey>() + key.text.capacity()) as u64 + shape.accounted_bytes();
+            (size_of::<ShapeCacheKey>() + key.heap_bytes()) as u64 + shape.accounted_bytes();
     });
     let mut line_bytes = 0u64;
     lines.for_each_resident(|key, item| {
@@ -1092,19 +1092,16 @@ impl crate::TermWindow {
         paragraph_context: Option<(&str, Range<usize>)>,
     ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
         let shape_resolve_start = Instant::now();
+        let font = match font {
+            Some(font) => Rc::clone(font),
+            None => self.fonts.resolve_font(style)?,
+        };
+        let key = BorrowedShapeCacheKey::new(style, font.id(), cluster, paragraph_context.clone());
         let (shape_text, paragraph_range) = match paragraph_context {
             Some((text, range)) => (text, Some(range)),
             None => (cluster.text.as_str(), None),
         };
-        let key = BorrowedShapeCacheKey {
-            style,
-            text: &cluster.text,
-        };
         let shape = || -> anyhow::Result<(Vec<GlyphInfo>, Rc<Vec<ShapedInfo>>)> {
-            let font = match font {
-                Some(f) => Rc::clone(f),
-                None => self.fonts.resolve_font(style)?,
-            };
             let fallback_completion = self.fallback_font_completion();
 
             let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
@@ -1137,38 +1134,30 @@ impl crate::TermWindow {
             let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
             Ok((info, shaped))
         };
-        let glyph_info = if paragraph_range.is_some() {
-            // Context-sensitive shapes never share this context-free cache;
-            // avoid allocating an Rc<CachedShape> for their uncached result.
-            shape()?.1
+        let mut fresh = None;
+        let cached = resolve_cached_shape(&self.shape_cache, key, || {
+            let (infos, glyphs) = shape()?;
+            fresh = Some(glyphs);
+            Ok(CachedShape::new(infos))
+        })?;
+        let mut glyph_cache = gl_state.glyph_cache().borrow_mut();
+        let glyph_info = if let Some(glyphs) = fresh {
+            glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+            glyphs
+        } else if let Some(glyphs) = glyph_cache.shape_binding(cached.id()) {
+            glyphs
         } else {
-            let mut fresh = None;
-            let cached = resolve_cached_shape(&self.shape_cache, key, || {
-                let (infos, glyphs) = shape()?;
-                fresh = Some(glyphs);
-                Ok(CachedShape::new(infos))
-            })?;
-            let mut glyph_cache = gl_state.glyph_cache().borrow_mut();
-            if let Some(glyphs) = fresh {
-                glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
-                glyphs
-            } else if let Some(glyphs) = glyph_cache.shape_binding(cached.id()) {
-                glyphs
-            } else {
-                // The bindings died with a rebuilt atlas (or were evicted);
-                // resolve only the sprites from the kept HarfBuzz output.
-                let font = match font {
-                    Some(f) => Rc::clone(f),
-                    None => self.fonts.resolve_font(style)?,
-                };
-                let infos = cached.infos();
-                let glyphs =
-                    self.glyph_infos_to_glyphs(style, &mut glyph_cache, infos, &font, metrics)?;
-                let glyphs = Rc::new(ShapedInfo::process(infos, &glyphs));
-                glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
-                glyphs
-            }
+            // The bindings died with a rebuilt atlas (or were evicted);
+            // resolve only the sprites from the kept HarfBuzz output. This
+            // now also applies to exact paragraph-context cache hits.
+            let infos = cached.infos();
+            let glyphs =
+                self.glyph_infos_to_glyphs(style, &mut glyph_cache, infos, &font, metrics)?;
+            let glyphs = Rc::new(ShapedInfo::process(infos, &glyphs));
+            glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+            glyphs
         };
+        drop(glyph_cache);
         metrics::histogram!("cached_cluster_shape").record(shape_resolve_start.elapsed());
         log::trace!(
             "shape_resolve for cluster len {} -> elapsed {:?}",
@@ -1384,7 +1373,7 @@ mod tests {
             render_cache_gauge_values,
         };
         use crate::quad::HeapQuadAllocator;
-        use crate::shapecache::{CachedShape, ShapeCacheKey};
+        use crate::shapecache::{BorrowedShapeCacheKey, CachedShape, ShapeCacheKey};
         use config::{ConfigHandle, TextStyle};
         use frankenterm_alloc::resource_ledger::CacheGauge;
         use lfucache::LfuCache;
@@ -1413,9 +1402,11 @@ mod tests {
         let empty = render_cache_gauge_values(&shapes, &lines, &quads);
         assert!(empty.iter().all(|(_, value)| *value == 0), "{empty:?}");
 
-        let key = |text: &str| ShapeCacheKey {
-            style: TextStyle::default(),
-            text: text.to_string(),
+        let key = |text: &str| {
+            let clusters =
+                termwiz::surface::Line::from_text(text, &CellAttributes::default(), 0, None)
+                    .cluster(None);
+            BorrowedShapeCacheKey::new(&TextStyle::default(), 0, &clusters[0], None).to_owned()
         };
         let shaped = Rc::new(CachedShape::new(Vec::with_capacity(8)));
         shapes.put(key("a"), Rc::clone(&shaped));
@@ -1508,10 +1499,9 @@ mod tests {
             |_| 8,
             &fonts.config(),
         ));
-        let key = BorrowedShapeCacheKey {
-            style: &style,
-            text: "A",
-        };
+        let clusters = termwiz::surface::Line::from_text("A", &CellAttributes::default(), 0, None)
+            .cluster(None);
+        let key = BorrowedShapeCacheKey::new(&style, font.id(), &clusters[0], None);
         let attempts = Cell::new(0);
         let mut resolve = || -> anyhow::Result<CachedShape> {
             assert!(
@@ -1561,10 +1551,10 @@ mod tests {
         assert_eq!(hit.infos().len(), 1);
         assert!(glyph_cache.shape_binding(hit.id()).is_some());
 
-        let other = BorrowedShapeCacheKey {
-            style: &style,
-            text: "B",
-        };
+        let other_clusters =
+            termwiz::surface::Line::from_text("B", &CellAttributes::default(), 0, None)
+                .cluster(None);
+        let other = BorrowedShapeCacheKey::new(&style, font.id(), &other_clusters[0], None);
         let clear = resolve_cached_shape(&cache, other, || {
             Err(anyhow::Error::new(ClearShapeCache {}).context("shaper error"))
         })
@@ -1594,6 +1584,116 @@ mod tests {
                 .get(&key as &dyn ShapeCacheKeyTrait)
                 .unwrap(),
         ));
+    }
+
+    #[test]
+    fn contextual_shape_cache_matches_uncached_shaping_and_stays_bounded() {
+        use crate::shapecache::{BorrowedShapeCacheKey, CachedShape};
+        use frankenterm_font::FontConfiguration;
+        use frankenterm_font::shaper::PresentationWidth;
+        use lfucache::LfuCache;
+        use std::cell::{Cell, RefCell};
+        use std::ops::Range;
+        use std::rc::Rc;
+        use termwiz::cellcluster::CellCluster;
+        use termwiz::surface::Line;
+        use wezterm_bidi::Direction;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let style = fonts.config().font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let cache = RefCell::new(LfuCache::new(
+            "test.context_shape_cache.hit.rate",
+            "test.context_shape_cache.miss.rate",
+            |_| 4,
+            &fonts.config(),
+        ));
+        let mut cases = Vec::new();
+        for (text, context, rtl) in [
+            ("ffi", Some(("office ffi", 1..4)), false),
+            ("ffi", Some(("office ffi", 7..10)), false),
+            ("ffi", Some(("affice ffi", 1..4)), false),
+            ("ffi", None, false),
+            ("A\u{301}", Some(("XA\u{301}Y", 1..4)), false),
+            ("界", None, false),
+            ("😀", None, false),
+            ("لا", Some(("بلا", 2..6)), true),
+            ("لا", Some((" لا", 1..5)), true),
+        ] {
+            let mut cluster = Line::from_text(text, &CellAttributes::default(), 0, None)
+                .cluster(None)
+                .remove(0);
+            if rtl {
+                cluster.direction = Direction::RightToLeft;
+            }
+            cases.push((cluster, context));
+        }
+        let shape = |cluster: &CellCluster, context: Option<(&str, Range<usize>)>| {
+            let (text, range) = match context {
+                Some((text, range)) => (text, Some(range)),
+                None => (cluster.text.as_str(), None),
+            };
+            let width = match &range {
+                Some(range) => {
+                    PresentationWidth::with_cluster_and_byte_offset(cluster, range.start)
+                }
+                None => PresentationWidth::with_cluster(cluster),
+            };
+            let mut infos = font
+                .blocking_shape(
+                    text,
+                    Some(cluster.presentation),
+                    cluster.direction,
+                    range.clone(),
+                    Some(&width),
+                )
+                .unwrap();
+            if let Some(range) = range {
+                rebase_glyph_clusters(&mut infos, range.start).unwrap();
+            }
+            infos
+        };
+        // Settle font discovery before comparing cached output from a fixed
+        // chain. Production fallback invalidation clears this same LFU.
+        for (cluster, context) in &cases {
+            shape(cluster, context.clone());
+        }
+        let calls = Cell::new(0);
+        for (cluster, context) in &cases {
+            let key = BorrowedShapeCacheKey::new(&style, font.id(), cluster, context.clone());
+            let expected = shape(cluster, context.clone());
+            let cached = resolve_cached_shape(&cache, key, || {
+                calls.set(calls.get() + 1);
+                Ok(CachedShape::new(shape(cluster, context.clone())))
+            })
+            .unwrap();
+            assert_eq!(
+                cached.infos(),
+                expected.as_slice(),
+                "{cluster:?} {context:?}"
+            );
+            let hit = resolve_cached_shape(&cache, key, || panic!("exact contextual hit reshaped"))
+                .unwrap();
+            assert!(Rc::ptr_eq(&cached, &hit));
+            assert!(cache.borrow().len() <= 4);
+        }
+        assert_eq!(calls.get(), cases.len());
+        cache.borrow_mut().clear();
+        assert!(cache.borrow().is_empty());
+        let (cluster, context) = &cases[0];
+        let key = BorrowedShapeCacheKey::new(&style, font.id(), cluster, context.clone());
+        let rebuilt = resolve_cached_shape(&cache, key, || {
+            calls.set(calls.get() + 1);
+            Ok(CachedShape::new(shape(cluster, context.clone())))
+        })
+        .unwrap();
+        assert_eq!(rebuilt.infos(), shape(cluster, context.clone()).as_slice());
+        assert_eq!(
+            calls.get(),
+            cases.len() + 1,
+            "invalidation must resolve again"
+        );
     }
 
     fn glyph_with_cluster(cluster: u32) -> GlyphInfo {

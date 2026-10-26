@@ -22,6 +22,10 @@
 //! instance; entirely empty grids submit no text draw. The capacity starts
 //! at one instance per cell (or the fullest row) and grows by half when a
 //! row outgrows it, which re-lays the slot out once.
+//!
+//! A new layout initializes every reserved instance. Later dirty rows
+//! write only through the larger of their old and new lengths in that
+//! slot, clearing removed glyphs without rewriting already-zero padding.
 
 use crate::cell_bg::CellBgGrid;
 use crate::cell_text::CellTextGrid;
@@ -84,6 +88,17 @@ impl Clone for RowChanges {
     }
 }
 
+/// One dirty text row's upload into its fixed region in a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextRowUpload {
+    /// The physical ring row, independent of the logical scroll offset.
+    pub row: u32,
+    /// Instances to write, including any removed instances to zero. This
+    /// is the full row capacity when initializing a layout, and the larger
+    /// of this slot's old row length and the new length otherwise.
+    pub instances: u32,
+}
+
 /// The ring rows one frame uploads into its slot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UploadPlan {
@@ -93,8 +108,8 @@ pub struct UploadPlan {
     pub capacity: u32,
     /// Ring rows of cell backgrounds to upload.
     pub cell_rows: Vec<u32>,
-    /// Ring rows of glyph instances (and their row-table entries) to upload.
-    pub text_rows: Vec<u32>,
+    /// Glyph row regions (and their row-table entries) to upload.
+    pub text_rows: Vec<TextRowUpload>,
 }
 
 impl UploadPlan {
@@ -102,9 +117,15 @@ impl UploadPlan {
     #[must_use]
     pub fn bytes(&self, extent: GridExtent) -> u64 {
         let cell_row = u64::from(extent.cols) * 4;
-        let text_row = u64::from(self.capacity) * CELL_TEXT_INSTANCE_BYTES as u64
-            + ROW_TABLE_BYTES_PER_ROW as u64;
-        self.cell_rows.len() as u64 * cell_row + self.text_rows.len() as u64 * text_row
+        let text_bytes: u64 = self
+            .text_rows
+            .iter()
+            .map(|row| {
+                u64::from(row.instances) * CELL_TEXT_INSTANCE_BYTES as u64
+                    + ROW_TABLE_BYTES_PER_ROW as u64
+            })
+            .sum();
+        self.cell_rows.len() as u64 * cell_row + text_bytes
     }
 
     /// Instances reserved in the slot for a grid of `extent`. Buffer sizing
@@ -139,6 +160,9 @@ pub struct SlotUploads {
     buffers: Option<u64>,
     cells_written: Vec<u64>,
     text_written: Vec<u64>,
+    /// Actual row lengths last uploaded to this slot; padding stays zero
+    /// until a later upload puts an instance there.
+    text_lengths: Vec<u32>,
 }
 
 /// The instances each ring row of `text` needs at least: one per cell, or
@@ -209,6 +233,7 @@ impl SlotUploads {
             self.buffers = Some(buffers_generation);
             self.cells_written.clear();
             self.text_written.clear();
+            self.text_lengths.clear();
         }
         let mut plan = UploadPlan {
             full,
@@ -228,11 +253,24 @@ impl SlotUploads {
         }
         if let Some(grid) = text {
             self.text_written.resize(grid.ring_rows(), 0);
+            self.text_lengths.resize(grid.ring_rows(), 0);
             for (ring, written) in self.text_written.iter_mut().enumerate() {
                 let generation = grid.changes().row(ring);
                 if full || *written != generation {
+                    let length = u32::try_from(grid.ring_row_len(ring))
+                        .unwrap_or(u32::MAX)
+                        .min(self.capacity);
+                    let instances = if full {
+                        self.capacity
+                    } else {
+                        self.text_lengths[ring].max(length)
+                    };
                     *written = generation;
-                    plan.text_rows.push(u32::try_from(ring).unwrap_or(u32::MAX));
+                    self.text_lengths[ring] = length;
+                    plan.text_rows.push(TextRowUpload {
+                        row: u32::try_from(ring).unwrap_or(u32::MAX),
+                        instances,
+                    });
                 }
             }
         }
@@ -301,6 +339,7 @@ mod tests {
     #[derive(Default)]
     struct SlotModel {
         uploads: SlotUploads,
+        generation: u64,
         cells: Vec<u8>,
         text: Vec<u8>,
         table: Vec<u8>,
@@ -309,23 +348,26 @@ mod tests {
 
     impl SlotModel {
         fn upload(&mut self, cells: &CellBgGrid, text: &CellTextGrid) -> UploadPlan {
-            let plan = self.uploads.plan(Some(cells), Some(text), 0);
+            let plan = self.uploads.plan(Some(cells), Some(text), self.generation);
             let extent = cells.extent();
             let cell_row = extent.cols as usize * 4;
             let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
             self.cells.resize(cells.as_bytes().len(), 0);
-            self.text.resize(text.ring_rows() * region, 0);
+            // Fresh memory is deliberately nonzero: only a full upload can
+            // establish the zero-padding invariant for a new layout.
+            self.text.resize(text.ring_rows() * region, 0xa5);
             self.table
                 .resize(text.ring_rows() * ROW_TABLE_BYTES_PER_ROW, 0);
             for &ring in &plan.cell_rows {
                 let at = ring as usize * cell_row;
                 self.cells[at..at + cell_row].copy_from_slice(&cells.as_bytes()[at..at + cell_row]);
             }
-            for &ring in &plan.text_rows {
-                let ring = ring as usize;
+            for upload in &plan.text_rows {
+                let ring = upload.row as usize;
                 let mut bytes = Vec::new();
-                text_region(text, ring, plan.capacity, &mut bytes);
-                self.text[ring * region..(ring + 1) * region].copy_from_slice(&bytes);
+                text_region(text, ring, upload.instances, &mut bytes);
+                let at = ring * region;
+                self.text[at..at + bytes.len()].copy_from_slice(&bytes);
                 let at = ring * ROW_TABLE_BYTES_PER_ROW;
                 self.table[at..at + ROW_TABLE_BYTES_PER_ROW].copy_from_slice(&row_table_entry(
                     text,
@@ -341,6 +383,10 @@ mod tests {
     fn grids(rows: usize, cols: usize) -> (CellBgGrid, CellTextGrid) {
         let extent = GridExtent::new(rows, cols);
         (CellBgGrid::new(extent), CellTextGrid::new(extent))
+    }
+
+    fn text_rows(plan: &UploadPlan) -> Vec<u32> {
+        plan.text_rows.iter().map(|upload| upload.row).collect()
     }
 
     fn write_row(cells: &mut CellBgGrid, text: &mut CellTextGrid, row: u32, seed: u8) {
@@ -403,7 +449,7 @@ mod tests {
         let one = slot.upload(&cells, &text);
         let ring = cells.ring_row(3);
         assert_eq!(
-            (one.cell_rows.clone(), one.text_rows.clone()),
+            (one.cell_rows.clone(), text_rows(&one)),
             (vec![ring], vec![ring])
         );
     }
@@ -426,13 +472,13 @@ mod tests {
         text.push(4, CellText::new(1, [1, 2, 3, 255]));
         let glyph = slot.upload(&cells, &text);
         assert!(glyph.cell_rows.is_empty());
-        assert_eq!(glyph.text_rows, vec![4]);
+        assert_eq!(text_rows(&glyph), vec![4]);
         assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
 
         text.clear_row(4);
         let cleared = slot.upload(&cells, &text);
         assert!(cleared.cell_rows.is_empty());
-        assert_eq!(cleared.text_rows, vec![4]);
+        assert_eq!(text_rows(&cleared), vec![4]);
         assert!(slot.text.iter().all(|byte| *byte == 0));
     }
 
@@ -456,20 +502,22 @@ mod tests {
         assert!(replaced_buffers.full);
         assert_eq!(replaced_buffers.cell_rows.len(), 6);
         assert_eq!(replaced_buffers.text_rows.len(), 6);
+        assert!(
+            replaced_buffers
+                .text_rows
+                .iter()
+                .all(|row| row.instances == 4)
+        );
 
         assert!(uploads.plan(Some(&replacement_cells), None, 1).full);
         assert!(!uploads.plan(Some(&replacement_cells), None, 1).full);
-        assert!(
-            uploads
-                .plan(Some(&replacement_cells), Some(&replacement_text), 1)
-                .full
-        );
+        let restored = uploads.plan(Some(&replacement_cells), Some(&replacement_text), 1);
+        assert!(restored.full);
+        assert!(restored.text_rows.iter().all(|row| row.instances == 4));
         uploads.invalidate();
-        assert!(
-            uploads
-                .plan(Some(&replacement_cells), Some(&replacement_text), 1)
-                .full
-        );
+        let retried = uploads.plan(Some(&replacement_cells), Some(&replacement_text), 1);
+        assert!(retried.full);
+        assert!(retried.text_rows.iter().all(|row| row.instances == 4));
     }
 
     #[test]
@@ -485,7 +533,7 @@ mod tests {
         write_row(&mut cells, &mut text, 5, 7);
         let changed = slot.upload(&cells, &text);
         assert_eq!(changed.cell_rows, vec![1]);
-        assert_eq!(changed.text_rows, vec![1]);
+        assert_eq!(text_rows(&changed), vec![1]);
         let (expected_cells, expected_text, expected_table) =
             full_layout(&cells, &text, changed.capacity);
         assert_eq!(slot.cells, expected_cells);
@@ -591,6 +639,65 @@ mod tests {
         let grown = uploads.plan(Some(&other), Some(&text), 1);
         assert!(grown.full, "a row past the capacity");
         assert!(grown.capacity >= 5);
+        assert!(
+            grown
+                .text_rows
+                .iter()
+                .all(|row| row.instances == grown.capacity)
+        );
+    }
+
+    #[test]
+    fn sparse_text_uploads_retire_each_slots_own_previous_length() {
+        let (cells, mut text) = grids(3, 512);
+        let mut slots: Vec<SlotModel> = (0..3).map(|_| SlotModel::default()).collect();
+        for slot in &mut slots {
+            let initial = slot.upload(&cells, &text);
+            assert!(initial.full);
+            assert!(initial.text_rows.iter().all(|row| row.instances == 512));
+            assert!(slot.text.iter().all(|byte| *byte == 0));
+        }
+        let set_row = |text: &mut CellTextGrid, count: u8| {
+            text.clear_row(1);
+            for col in 0..count {
+                text.push(1, CellText::new(u16::from(col), [col, 9, 7, 255]));
+            }
+        };
+        // Slots deliberately see different intermediate lengths.
+        set_row(&mut text, 8);
+        assert_eq!(
+            slots[0].upload(&cells, &text).bytes(cells.extent()),
+            8 * 24 + 16
+        );
+        set_row(&mut text, 3);
+        assert_eq!(
+            slots[1].upload(&cells, &text).bytes(cells.extent()),
+            3 * 24 + 16
+        );
+        set_row(&mut text, 1);
+        for (slot, instances) in slots.iter_mut().zip([8, 3, 1]) {
+            let plan = slot.upload(&cells, &text);
+            assert!(!plan.full);
+            assert_eq!(plan.capacity, 512);
+            assert_eq!(plan.text_rows, [TextRowUpload { row: 1, instances }]);
+            assert_eq!(plan.bytes(cells.extent()), u64::from(instances) * 24 + 16);
+            let (_, expected, _) = full_layout(&cells, &text, plan.capacity);
+            assert_eq!(slot.text, expected);
+            assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
+        }
+        set_row(&mut text, 0);
+        for slot in &mut slots {
+            let cleared = slot.upload(&cells, &text);
+            assert_eq!(
+                cleared.text_rows,
+                [TextRowUpload {
+                    row: 1,
+                    instances: 1
+                }]
+            );
+            assert_eq!(cleared.bytes(cells.extent()), 24 + 16);
+            assert!(slot.text.iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]
@@ -622,8 +729,8 @@ mod tests {
         assert_eq!(shorter.draw_instances(&text), 1);
         assert_eq!(
             shorter.bytes(cells.extent()),
-            4 * 24 + 16,
-            "the old row is still cleared in full"
+            2 * 24 + 16,
+            "all old instances are cleared; existing padding stays zero"
         );
         assert_eq!(slot.text.len(), 24 * CELL_TEXT_INSTANCE_BYTES);
         assert!(
@@ -667,8 +774,13 @@ mod tests {
                     }
                     8 => {
                         let lines = 1 + next(rows as u64 - 1) as u32;
-                        cells.scroll_up(lines);
-                        text.scroll_up(lines);
+                        if next(2) == 0 {
+                            cells.scroll_up(lines);
+                            text.scroll_up(lines);
+                        } else {
+                            cells.scroll_down(lines);
+                            text.scroll_down(lines);
+                        }
                     }
                     _ => {
                         if next(20) == 0 {
@@ -680,6 +792,16 @@ mod tests {
                 }
             }
             let slot = &mut slots[frame % 3];
+            if frame % 97 == 0 {
+                // Simulate a partially failed write, whose contents can
+                // no longer be trusted even without replacing the buffer.
+                slot.uploads.invalidate();
+                slot.text.fill(0x5a);
+            } else if frame % 131 == 0 {
+                // Replaced buffers have no known initialized prefix.
+                slot.generation += 1;
+                slot.text.fill(0xa5);
+            }
             let plan = slot.upload(&cells, &text);
             let (expected_cells, expected_text, expected_table) =
                 full_layout(&cells, &text, plan.capacity);

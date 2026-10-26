@@ -3888,9 +3888,9 @@ impl TermWindow {
             .unwrap_or_else(TierSwapDoctorReport::no_atlases_in_process)
     }
 
-    /// A window hidden for [`SURFACE_PARK_DELAY`] parks its WebGPU surface,
-    /// releasing its window-size drawables; showing it again unparks the
-    /// surface and repaints (ft-34at5).
+    /// A window hidden for [`SURFACE_PARK_DELAY`] parks its surface;
+    /// showing it again restores its size and repaints (ft-34at5). A
+    /// dedicated Metal render thread performs this on its own thread.
     fn occlusion_changed(&mut self, occluded: bool, window: &Window) {
         if self.occluded == occluded {
             return;
@@ -3906,10 +3906,14 @@ impl TermWindow {
                 metrics::counter!("gui.surface.park", "action" => "unparked").increment(1);
                 self.note_render_surface_recovery_signal();
             }
+            if let Some(metal) = &self.metal {
+                let surface = self.metal_surface();
+                metal.set_surface_occluded(false, surface.pixel_width, surface.pixel_height);
+            }
             window.invalidate();
             return;
         }
-        if self.webgpu.is_none() {
+        if self.webgpu.is_none() && self.metal.is_none() {
             return;
         }
         let generation = self.occlusion_generation;
@@ -3923,15 +3927,24 @@ impl TermWindow {
                     .spawn_local(async move {
                         sleep(SURFACE_PARK_DELAY).await;
                         window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                            if tw.occluded
-                                && tw.occlusion_generation == generation
-                                && tw
-                                    .webgpu
-                                    .as_ref()
-                                    .is_some_and(|webgpu| webgpu.park_surface())
+                            if !tw.occluded || tw.occlusion_generation != generation {
+                                return;
+                            }
+                            if tw
+                                .webgpu
+                                .as_ref()
+                                .is_some_and(|webgpu| webgpu.park_surface())
                             {
                                 metrics::counter!("gui.surface.park", "action" => "parked")
                                     .increment(1);
+                            }
+                            if let Some(metal) = &tw.metal {
+                                let surface = tw.metal_surface();
+                                metal.set_surface_occluded(
+                                    true,
+                                    surface.pixel_width,
+                                    surface.pixel_height,
+                                );
                             }
                         })));
                     })
@@ -4059,7 +4072,7 @@ const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
 /// `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
 const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
 
-/// How long a window stays hidden before its WebGPU surface is parked
+/// How long a window stays hidden before its surface is parked
 /// (ft-34at5). Long enough that switching between windows does not park
 /// the ones briefly covered.
 const SURFACE_PARK_DELAY: Duration = Duration::from_secs(5);
@@ -5366,6 +5379,12 @@ impl TermWindow {
         let Some(metal) = self.metal.as_ref().map(Rc::clone) else {
             return false;
         };
+        // Queued paints must not recreate a hidden window's drawable pool.
+        // Keep explicit snapshots available and leave ordinary damage
+        // pending for the repaint requested when the window becomes visible.
+        if self.occluded && self.render_snapshot.is_none() {
+            return true;
+        }
         self.begin_metal_font_read();
         self.stage_metal_selection_frames();
         let captured_generation = self.damage_generation;
