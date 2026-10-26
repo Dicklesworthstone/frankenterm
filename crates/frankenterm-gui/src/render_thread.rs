@@ -30,7 +30,7 @@
 
 use procinfo::ThreadQos;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -553,6 +553,92 @@ impl std::fmt::Debug for RenderWaker {
     }
 }
 
+/// Recovery of a submitted frame that failed asynchronously on the GPU.
+/// Completion handlers own this thread-safe state and a waker, never the
+/// renderer. A failed last frame must still be retried after output stops;
+/// repeated failures back off instead of keeping the GPU busy at max_fps.
+#[derive(Debug, Default)]
+pub struct FrameRetry {
+    state: Mutex<RetryState>,
+    waker: OnceLock<RenderWaker>,
+}
+
+#[derive(Debug, Default)]
+struct RetryState {
+    latest_completion: Option<u64>,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+const FIRST_GPU_RETRY: Duration = Duration::from_millis(16);
+const MAX_GPU_RETRY: Duration = Duration::from_secs(1);
+
+impl FrameRetry {
+    /// Installs the render thread's waker after it starts. An unusually fast
+    /// failed first frame may complete before installation; retain and wake
+    /// that request instead of silently losing its only retry.
+    pub fn set_waker(&self, waker: RenderWaker) {
+        let _ = self.waker.set(waker);
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retry_at
+            .is_some();
+        if pending {
+            self.wake();
+        }
+    }
+
+    /// Records a GPU completion, potentially from a Metal-managed thread.
+    /// A newer success supersedes earlier failures; late or duplicate
+    /// completions cannot reset backoff or resurrect an obsolete retry.
+    pub fn complete(&self, frame: u64, succeeded: bool, now: Instant) {
+        let failed = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state
+                .latest_completion
+                .is_some_and(|latest| frame <= latest)
+            {
+                return;
+            }
+            state.latest_completion = Some(frame);
+            if succeeded {
+                state.failures = 0;
+                state.retry_at = None;
+                false
+            } else {
+                state.failures = state.failures.saturating_add(1).min(7);
+                let delay = (FIRST_GPU_RETRY * (1 << (state.failures - 1))).min(MAX_GPU_RETRY);
+                state.retry_at = now.checked_add(delay).or(Some(now));
+                true
+            }
+        };
+        if failed {
+            // Do not hold the retry-state lock while interrupting a run loop.
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
+    }
+
+    /// Defer actual snapshot and submission work until this time. Once due,
+    /// one attempt may run; its GPU completion either clears the failure or
+    /// schedules another backed-off attempt. The retained deadline also
+    /// survives occlusion, whose scheduler already parks all frame work.
+    pub fn wait_until(&self, now: Instant) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retry_at
+            .filter(|due| *due > now)
+    }
+}
+
 /// A window's render thread. Dropping it stops and joins the thread.
 pub struct RenderThread {
     shared: Arc<Shared>,
@@ -1071,6 +1157,150 @@ mod tests {
         state.pixel_height == 2 * state.pixel_width
             && state.dpi == 72 + n % 256
             && state.focused == (n % 2 == 0)
+    }
+
+    #[test]
+    fn gpu_retries_back_off_to_one_second_and_reset_after_success() {
+        let retry = FrameRetry::default();
+        let now = Instant::now();
+        for (frame, millis) in [16, 32, 64, 128, 256, 512, 1000, 1000]
+            .into_iter()
+            .enumerate()
+        {
+            retry.complete(frame as u64, false, now);
+            let due = now + Duration::from_millis(millis);
+            assert_eq!(retry.wait_until(now), Some(due));
+            assert_eq!(retry.wait_until(due), None);
+        }
+        retry.complete(8, true, now);
+        assert_eq!(retry.wait_until(now), None);
+        retry.complete(9, false, now);
+        assert_eq!(retry.wait_until(now), Some(now + FIRST_GPU_RETRY));
+    }
+
+    #[test]
+    fn old_or_duplicate_gpu_completions_cannot_cancel_or_resurrect_a_retry() {
+        let retry = FrameRetry::default();
+        let now = Instant::now();
+        retry.complete(3, false, now);
+        retry.complete(2, true, now);
+        retry.complete(3, false, now + Duration::from_millis(1));
+        assert_eq!(retry.wait_until(now), Some(now + FIRST_GPU_RETRY));
+        retry.complete(4, true, now);
+        retry.complete(1, false, now);
+        retry.complete(3, false, now);
+        assert_eq!(retry.wait_until(now), None);
+        retry.complete(5, false, now);
+        assert_eq!(retry.wait_until(now), Some(now + FIRST_GPU_RETRY));
+    }
+
+    #[test]
+    fn a_failed_first_frame_is_not_lost_before_its_waker_is_installed() {
+        let retry = FrameRetry::default();
+        let shared = Arc::new(Shared::default());
+        retry.complete(0, false, Instant::now());
+        assert!(!shared.pending.load(Ordering::Acquire));
+        retry.set_waker(RenderWaker {
+            shared: Arc::clone(&shared),
+        });
+        assert!(shared.pending.load(Ordering::Acquire));
+        assert_eq!(shared.wakes.load(Ordering::Relaxed), 1);
+
+        shared.pending.store(false, Ordering::Release);
+        retry.complete(1, true, Instant::now());
+        assert!(!shared.pending.load(Ordering::Acquire));
+        retry.complete(2, false, Instant::now());
+        assert!(shared.pending.load(Ordering::Acquire));
+        assert_eq!(shared.wakes.load(Ordering::Relaxed), 2);
+    }
+
+    /// Models the production driver's gate before it snapshots new output.
+    /// GPU completions are injected from the test thread, after submission.
+    struct RetryDriver {
+        retry: Arc<FrameRetry>,
+        content: Arc<AtomicU64>,
+        submissions: Arc<Mutex<Vec<(Instant, u64)>>>,
+    }
+
+    impl FrameDriver for RetryDriver {
+        fn reconfigure(&mut self, _surface: &Surface) {}
+
+        fn frame(&mut self, _surface: &Surface) -> FrameReport {
+            let now = Instant::now();
+            if let Some(at) = self.retry.wait_until(now) {
+                return FrameReport {
+                    presented: false,
+                    redraw_at: Some(at),
+                };
+            }
+            self.submissions
+                .lock()
+                .unwrap()
+                .push((now, self.content.load(Ordering::Acquire)));
+            FrameReport {
+                presented: true,
+                redraw_at: None,
+            }
+        }
+
+        fn can_draw_on_idle_wake(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_failed_last_frame_retries_newest_content_without_output_and_parks_when_hidden() {
+        let retry = Arc::new(FrameRetry::default());
+        let content = Arc::new(AtomicU64::new(1));
+        let submissions = Arc::new(Mutex::new(Vec::new()));
+        let driver = RetryDriver {
+            retry: Arc::clone(&retry),
+            content: Arc::clone(&content),
+            submissions: Arc::clone(&submissions),
+        };
+        let thread = RenderThread::spawn(
+            "ft-render-retry-test".to_string(),
+            correlated(0),
+            Duration::from_millis(1),
+            move || driver,
+        )
+        .unwrap();
+        retry.set_waker(thread.waker());
+        assert!(eventually(|| submissions.lock().unwrap().len() == 1));
+
+        let failed_at = Instant::now();
+        retry.complete(0, false, failed_at);
+        content.store(2, Ordering::Release);
+        assert!(eventually(|| submissions.lock().unwrap().len() == 2));
+        let (retried_at, rendered) = submissions.lock().unwrap()[1];
+        assert!(retried_at >= failed_at + FIRST_GPU_RETRY);
+        assert_eq!(rendered, 2, "retry snapshots the latest available output");
+
+        thread.post_surface(SurfaceState {
+            occluded: true,
+            ..correlated(0)
+        });
+        assert!(eventually(|| thread.stats().pauses == 1));
+        let failed_at = Instant::now();
+        retry.complete(1, false, failed_at);
+        std::thread::sleep(FIRST_GPU_RETRY * 3);
+        assert_eq!(submissions.lock().unwrap().len(), 2);
+        content.store(3, Ordering::Release);
+        thread.post_surface(correlated(0));
+        assert!(eventually(|| submissions.lock().unwrap().len() == 3));
+        let (retried_at, rendered) = submissions.lock().unwrap()[2];
+        assert!(retried_at >= failed_at + FIRST_GPU_RETRY * 2);
+        assert_eq!(rendered, 3);
+
+        // A long retry deadline must not hold up shutdown. Completion state
+        // can outlive the driver without retaining a renderer or deadlocking.
+        for frame in 2..7 {
+            retry.complete(frame, false, Instant::now());
+        }
+        let stopped = Instant::now();
+        drop(thread);
+        assert!(stopped.elapsed() < Duration::from_millis(500));
+        retry.complete(7, false, Instant::now());
     }
 
     #[derive(Default)]
@@ -1796,6 +2026,42 @@ mod tests {
 
     fn spawn_with_fake_link(max_fps: f64, always_dirty: bool) -> (RenderThread, LinkHandle) {
         spawn_fake_link(max_fps, move |_| DirtyDriver(always_dirty))
+    }
+
+    #[test]
+    fn a_gpu_failure_restarts_an_idle_display_link_and_retries_after_its_deadline() {
+        let retry = Arc::new(FrameRetry::default());
+        let submissions = Arc::new(Mutex::new(Vec::new()));
+        let driver = RetryDriver {
+            retry: Arc::clone(&retry),
+            content: Arc::new(AtomicU64::new(1)),
+            submissions: Arc::clone(&submissions),
+        };
+        let (thread, link) = spawn_fake_link(120.0, move |_| driver);
+        retry.set_waker(thread.waker());
+        assert_eq!(submissions.lock().unwrap().len(), 1);
+        // The first frame was immediate; let its wall-time cap elapse before
+        // manually ticking an otherwise idle link until it parks.
+        std::thread::sleep(hz(120.0));
+        for _ in 0..IDLE_TICKS_BEFORE_PAUSE {
+            link.tick(hz(60.0));
+        }
+        assert_eq!(link.running(), [true, false]);
+
+        let failed_at = Instant::now();
+        retry.complete(0, false, failed_at);
+        assert!(eventually(|| thread.stats().link_starts == 2));
+        std::thread::sleep(FIRST_GPU_RETRY);
+        link.tick(hz(60.0));
+        let submitted = submissions.lock().unwrap();
+        assert_eq!(submitted.len(), 2, "failure was the only new wake");
+        assert!(submitted[1].0 >= failed_at + FIRST_GPU_RETRY);
+        drop(submitted);
+        retry.complete(1, true, Instant::now());
+        for _ in 0..IDLE_TICKS_BEFORE_PAUSE {
+            link.tick(hz(60.0));
+        }
+        assert_eq!(link.running(), [true, false, true, false]);
     }
 
     struct SnapshotDriver {
