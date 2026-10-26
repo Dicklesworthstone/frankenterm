@@ -127,6 +127,83 @@ impl RenderRowRef<'_> {
             Self::Page { .. } => false,
         }
     }
+
+    /// Appends the native row's hyperlink scan text without building a Line.
+    /// Returns false when existing links or ambiguous grapheme boundaries
+    /// require the legacy scanner. `previous` carries the actual last scalar
+    /// across wrapped rows, excluding the artificial wide-cell padding.
+    /// On refusal, the caller must discard the partial text and fall back.
+    pub fn append_unlinked_native_scan_text(
+        &self,
+        text: &mut String,
+        previous: &mut Option<char>,
+    ) -> bool {
+        // A bounded cell count does not bound combining-sequence bytes.
+        // Larger inputs keep the existing scanner without growing this
+        // additional retained scratch buffer beyond a normal text window.
+        const MAX_SCAN_BYTES: usize = 64 * 1024;
+        let Self::Page { page, row, .. } = self else {
+            return false;
+        };
+        let words = page.row_words(*row);
+        if words.last().is_some_and(|word| {
+            let cell = PackedCell::from_bits(*word);
+            cell.is_wide() && !cell.is_hidden()
+        }) {
+            // Appending to a vector Line with a truncated wide spacer can
+            // hide the next row's first cell. Leave that case to the oracle.
+            return false;
+        }
+        for (col, word) in words.iter().enumerate() {
+            let cell = PackedCell::from_bits(*word);
+            if cell.has_hyperlink() {
+                // Explicit links split scan runs; implicit ones may need
+                // removal. Neither is a no-match proof for an unlinked row.
+                return false;
+            }
+            if cell.is_hidden() {
+                continue;
+            }
+            let mut utf8 = [0_u8; 4];
+            let glyph = match page.glyph(*row, col) {
+                Glyph::Blank => " ",
+                Glyph::Char(ch) => ch.encode_utf8(&mut utf8),
+                Glyph::Cluster(glyph) => glyph,
+            };
+            if text
+                .len()
+                .checked_add(glyph.len())
+                .and_then(|len| len.checked_add(usize::from(cell.is_wide())))
+                .is_none_or(|len| len > MAX_SCAN_BYTES)
+            {
+                return false;
+            }
+            if cell.has_grapheme() {
+                let mut graphemes = finl_unicode::grapheme_clusters::Graphemes::new(glyph);
+                if graphemes.next() != Some(glyph) || graphemes.next().is_some() {
+                    // Legacy Cell permits more than one grapheme in a
+                    // cell; clustered concatenation can split it again.
+                    return false;
+                }
+            }
+            let Some(first) = glyph.chars().next() else {
+                return false;
+            };
+            if !frankenterm_surface::line::clustered_append_breaks(*previous, first) {
+                // Concatenating clustered Lines can resegment a regional
+                // indicator, combining mark or ZWJ across a cell boundary.
+                return false;
+            }
+            *previous = glyph.chars().next_back();
+            text.push_str(glyph);
+            if cell.is_wide() {
+                // HyperlinkScanRun::push includes this unmatchable spacer
+                // even though visible-cell iteration skips the stored word.
+                text.push(' ');
+            }
+        }
+        true
+    }
 }
 
 /// An owned snapshot of one native page row. Copying retains raw packed
@@ -1339,6 +1416,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_hyperlink_scan_text_keeps_wide_padding_and_rejects_ambiguous_cells() {
+        use crate::pagegrid::view::store_line;
+
+        let mut page = Page::new(32, 4, 1);
+        let wide = page.grow(1).unwrap();
+        assert!(store_line(
+            &mut page,
+            wide,
+            &Line::from_text("界https://example.test", &CellAttributes::blank(), 1, None)
+        ));
+        let source = |row| RenderRowRef::Page {
+            page: &page,
+            row,
+            seqno: 1,
+        };
+        let mut text = String::new();
+        let mut previous = None;
+        assert!(source(wide).append_unlinked_native_scan_text(&mut text, &mut previous));
+        assert_eq!(text, "界 https://example.test");
+
+        // A cell may legally hold more than one grapheme. Legacy clustered
+        // append can split it, so a negative scan must not guess its padding.
+        let multiple = page.grow(1).unwrap();
+        let line = Line::from_cells(
+            vec![
+                Cell::new_grapheme_with_width("AB", 2, CellAttributes::blank()),
+                Cell::blank(),
+            ],
+            1,
+        );
+        assert!(store_line(&mut page, multiple, &line));
+        text.clear();
+        text.push('q');
+        previous = Some('q');
+        assert!(!RenderRowRef::Page {
+            page: &page,
+            row: multiple,
+            seqno: 1,
+        }
+        .append_unlinked_native_scan_text(&mut text, &mut previous));
+
+        let truncated = page.grow(1).unwrap();
+        let line = Line::from_cells(vec![Cell::new('界', CellAttributes::blank())], 1);
+        assert!(store_line(&mut page, truncated, &line));
+        assert!(!RenderRowRef::Page {
+            page: &page,
+            row: truncated,
+            seqno: 1,
+        }
+        .append_unlinked_native_scan_text(&mut String::new(), &mut None));
+    }
+
+    #[test]
+    fn native_scan_text_bounds_bytes_and_rejects_joining_unicode_boundaries() {
+        use crate::pagegrid::view::store_line;
+
+        let mut page = Page::new(16, 2, 1);
+        let first = page.grow(1).unwrap();
+        let next = page.grow(1).unwrap();
+        assert!(store_line(
+            &mut page,
+            first,
+            &Line::from_cells(
+                vec![Cell::new_grapheme(
+                    "e\u{301}",
+                    CellAttributes::blank(),
+                    None
+                )],
+                1,
+            ),
+        ));
+        assert!(store_line(
+            &mut page,
+            next,
+            &Line::from_text("next", &CellAttributes::blank(), 1, None),
+        ));
+        let source = |row| RenderRowRef::Page {
+            page: &page,
+            row,
+            seqno: 1,
+        };
+        let mut text = String::new();
+        let mut previous = None;
+        assert!(source(first).append_unlinked_native_scan_text(&mut text, &mut previous));
+        assert!(!source(next).append_unlinked_native_scan_text(&mut text, &mut previous));
+
+        let mut full = "x".repeat(64 * 1024);
+        assert!(!source(first).append_unlinked_native_scan_text(&mut full, &mut None));
+        assert_eq!(full.len(), 64 * 1024, "refusal cannot grow the scan buffer");
     }
 
     #[test]
