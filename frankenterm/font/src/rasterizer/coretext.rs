@@ -4,8 +4,8 @@
 //! system draws it, and Apple Color Emoji (sbix bitmaps) renders best through
 //! CoreText. Ghostty rasterizes with CoreText too.
 //!
-//! Each glyph is drawn with `CTFontDrawGlyphs` into a `CGBitmapContext` sized
-//! to the glyph's ink bounds:
+//! Each glyph is drawn with `CTFontDrawGlyphs` into a bounded reusable
+//! `CGBitmapContext`, clipped to the glyph's ink bounds:
 //!
 //! - outline glyphs into an 8-bit DeviceGray context, white on black, so the
 //!   gray value is the coverage. It is stored like the FreeType rasterizer's
@@ -40,7 +40,7 @@ use core_foundation::url::CFURL;
 use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaPremultipliedLast, CGFloat};
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::{CGContext, CGTextDrawingMode};
-use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect};
+use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect, CGSize};
 use core_text::font::CTFont;
 use core_text::font_descriptor::{
     kCTFontColorGlyphsTrait, kCTFontOrientationDefault, CTFontDescriptor,
@@ -53,6 +53,11 @@ const IMAGE_ALPHA_NONE: u32 = 0;
 
 /// Largest bitmap side drawn; anything bigger is an absurd size request.
 const MAX_GLYPH_EXTENT: usize = 4096;
+
+/// Retain at most 64 KiB of grayscale or 256 KiB of color scratch per face.
+/// Oversized glyphs use a temporary exact-sized context, so one unusual font
+/// size never makes every subsequent glyph clear a huge retained surface.
+const MAX_CACHED_BITMAP_EXTENT: usize = 256;
 
 /// Transparent margin around the ink bounds so antialiased edges are never
 /// clipped; cropped away after drawing.
@@ -131,10 +136,88 @@ pub(crate) fn ink_bounds(
     (right > left).then_some((left, top, right, bottom))
 }
 
+/// CPU drawing storage, separate from the owned pixels returned for a glyph.
+/// Its graphics state is initialized once and restored after every draw.
+struct GlyphBitmap {
+    context: CGContext,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    bytes_per_pixel: usize,
+}
+
+impl GlyphBitmap {
+    fn new(width: usize, height: usize, color: bool) -> Self {
+        let (space, bytes_per_pixel, bitmap_info) = if color {
+            (
+                srgb_color_space(),
+                4,
+                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+            )
+        } else {
+            (CGColorSpace::create_device_gray(), 1, IMAGE_ALPHA_NONE)
+        };
+        let context = CGContext::create_bitmap_context(
+            None,
+            width,
+            height,
+            8,
+            width * bytes_per_pixel,
+            &space,
+            bitmap_info,
+        );
+        context.set_allows_antialiasing(true);
+        context.set_should_antialias(true);
+        context.set_allows_font_smoothing(true);
+        context.set_should_smooth_fonts(false);
+        context.set_allows_font_subpixel_positioning(true);
+        context.set_should_subpixel_position_fonts(true);
+        context.set_allows_font_subpixel_quantization(false);
+        context.set_should_subpixel_quantize_fonts(false);
+        context.set_rgb_fill_color(1.0, 1.0, 1.0, 1.0);
+        context.set_rgb_stroke_color(1.0, 1.0, 1.0, 1.0);
+        let pitch = context.bytes_per_row();
+        Self {
+            context,
+            width,
+            height,
+            pitch,
+            bytes_per_pixel,
+        }
+    }
+
+    /// Draw in the top-left `width x height` part of this surface using the
+    /// same local coordinates as an exact-sized context. Only those pixels
+    /// are cleared or read; clipping excludes pixels left by a previous draw.
+    fn begin(&mut self, width: usize, height: usize) {
+        debug_assert!(width <= self.width && height <= self.height);
+        let row_bytes = width * self.bytes_per_pixel;
+        for row in self
+            .context
+            .data()
+            .chunks_exact_mut(self.pitch)
+            .take(height)
+        {
+            row[..row_bytes].fill(0);
+        }
+        self.context.save();
+        // CoreGraphics draws with y up, while bitmap rows are top first.
+        // Translate the CTM rather than the glyph's position: a text-matrix
+        // italic skew must not turn this padding into a horizontal shift.
+        self.context
+            .translate(0.0, (self.height - height) as CGFloat);
+        self.context.clip_to_rect(CGRect::new(
+            &CGPoint::new(0.0, 0.0),
+            &CGSize::new(width as CGFloat, height as CGFloat),
+        ));
+    }
+}
+
 /// The face, at its loaded size, plus a per-size clone for drawing.
 pub struct CoreTextRasterizer {
     font: CTFont,
     sized: RefCell<Option<(u64, CTFont)>>,
+    bitmap: RefCell<Option<GlyphBitmap>>,
     has_color: bool,
     synthesize_bold: bool,
     synthesize_italic: bool,
@@ -165,12 +248,15 @@ impl CoreTextRasterizer {
             .get_font_table(tag(b"COLR"))
             .and_then(|table| colr_table_version(table.bytes()));
         if unsupported_color_format(has_table(b"CBDT"), has_table(b"sbix"), colr_version) {
-            bail!("its color glyphs are CBDT bitmaps or COLR v1 paint graphs, which CoreText does not draw");
+            bail!(
+                "its color glyphs are CBDT bitmaps or COLR v1 paint graphs, which CoreText does not draw"
+            );
         }
         let has_color = font.symbolic_traits() & kCTFontColorGlyphsTrait != 0;
         Ok(Self {
             font,
             sized: RefCell::new(None),
+            bitmap: RefCell::new(None),
             has_color,
             synthesize_bold: parsed.synthesize_bold,
             synthesize_italic: parsed.synthesize_italic,
@@ -196,6 +282,35 @@ impl CoreTextRasterizer {
                 font
             }
         }
+    }
+
+    /// Reuse geometric scratch growth for normal text and emoji. Large
+    /// glyphs still render at their requested size without replacing the
+    /// bounded common-case surface.
+    fn with_bitmap<R>(
+        &self,
+        width: usize,
+        height: usize,
+        draw: impl FnOnce(&mut GlyphBitmap) -> R,
+    ) -> R {
+        if width > MAX_CACHED_BITMAP_EXTENT || height > MAX_CACHED_BITMAP_EXTENT {
+            return draw(&mut GlyphBitmap::new(width, height, self.has_color));
+        }
+        let mut cached = self.bitmap.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|bitmap| bitmap.width < width || bitmap.height < height)
+        {
+            let (old_width, old_height) = cached
+                .as_ref()
+                .map_or((1, 1), |bitmap| (bitmap.width, bitmap.height));
+            *cached = Some(GlyphBitmap::new(
+                old_width.max(width).next_power_of_two(),
+                old_height.max(height).next_power_of_two(),
+                self.has_color,
+            ));
+        }
+        draw(cached.as_mut().expect("the glyph bitmap was just fitted"))
     }
 
     /// The horizontal advance of `glyph` at `pixel_size`, in pixels.
@@ -288,87 +403,57 @@ impl FontRasterizer for CoreTextRasterizer {
         if width == 0 || height == 0 || width > MAX_GLYPH_EXTENT || height > MAX_GLYPH_EXTENT {
             bail!("glyph {glyph} at {pixel_size:.1} px needs a {width}x{height} bitmap");
         }
-        let (bytes_per_pixel, mut context) = if self.has_color {
-            let space = srgb_color_space();
-            let context = CGContext::create_bitmap_context(
-                None,
-                width,
-                height,
-                8,
-                width * 4,
-                &space,
-                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
-            );
-            (4, context)
-        } else {
-            let space = CGColorSpace::create_device_gray();
-            let context = CGContext::create_bitmap_context(
-                None,
-                width,
-                height,
-                8,
-                width,
-                &space,
-                IMAGE_ALPHA_NONE,
-            );
-            (1, context)
-        };
-        context.set_allows_antialiasing(true);
-        context.set_should_antialias(true);
-        context.set_allows_font_smoothing(true);
-        context.set_should_smooth_fonts(false);
-        context.set_allows_font_subpixel_positioning(true);
-        context.set_should_subpixel_position_fonts(true);
-        context.set_allows_font_subpixel_quantization(false);
-        context.set_should_subpixel_quantize_fonts(false);
-        context.set_rgb_fill_color(1.0, 1.0, 1.0, 1.0);
-        context.set_rgb_stroke_color(1.0, 1.0, 1.0, 1.0);
-        context.set_text_matrix(&CGAffineTransform::new(
-            1.0,
-            0.0,
-            skew as CGFloat,
-            1.0,
-            0.0,
-            0.0,
-        ));
-        if stroke > 0.0 {
-            context.set_text_drawing_mode(CGTextDrawingMode::CGTextFillStroke);
-            context.set_line_width(stroke);
-        }
-        font.draw_glyphs(&[glyph], &[CGPoint::new(-x0, -y0)], context.clone());
+        self.with_bitmap(width, height, |bitmap| {
+            bitmap.begin(width, height);
+            let context = &mut bitmap.context;
+            context.set_text_matrix(&CGAffineTransform::new(
+                1.0,
+                0.0,
+                skew as CGFloat,
+                1.0,
+                0.0,
+                0.0,
+            ));
+            if stroke > 0.0 {
+                context.set_text_drawing_mode(CGTextDrawingMode::CGTextFillStroke);
+                context.set_line_width(stroke);
+            }
+            font.draw_glyphs(&[glyph], &[CGPoint::new(-x0, -y0)], context.clone());
+            context.restore();
 
-        // Rows are stored top first; the bitmap's top edge is y1 above the
-        // baseline and its left edge x0 right of the pen.
-        let pixels = context.data();
-        let alpha = |x: usize, y: usize| match bytes_per_pixel {
-            4 => pixels[(y * width + x) * 4 + 3],
-            _ => pixels[y * width + x],
-        };
-        let Some((left, top, right, bottom)) = ink_bounds(width, height, alpha) else {
-            return Ok(empty_glyph(self.has_color));
-        };
-        let (out_width, out_height) = (right - left, bottom - top);
-        let mut data = Vec::with_capacity(out_width * out_height * 4);
-        for y in top..bottom {
-            for x in left..right {
+            // The requested image occupies the top-left region of a possibly
+            // larger context. Read its actual pitch, not the requested width.
+            let pixels = context.data();
+            let pitch = bitmap.pitch;
+            let bytes_per_pixel = bitmap.bytes_per_pixel;
+            let alpha = |x: usize, y: usize| match bytes_per_pixel {
+                4 => pixels[y * pitch + x * 4 + 3],
+                _ => pixels[y * pitch + x],
+            };
+            let Some((left, top, right, bottom)) = ink_bounds(width, height, alpha) else {
+                return Ok(empty_glyph(self.has_color));
+            };
+            let (out_width, out_height) = (right - left, bottom - top);
+            let mut data = Vec::with_capacity(out_width * out_height * 4);
+            for y in top..bottom {
                 if bytes_per_pixel == 4 {
-                    let at = (y * width + x) * 4;
-                    data.extend_from_slice(&pixels[at..at + 4]);
+                    data.extend_from_slice(&pixels[y * pitch + left * 4..y * pitch + right * 4]);
                 } else {
-                    let coverage = pixels[y * width + x];
-                    let gray = linear_u8_to_srgb8(coverage);
-                    data.extend_from_slice(&[gray, gray, gray, coverage]);
+                    for &coverage in &pixels[y * pitch + left..y * pitch + right] {
+                        let gray = linear_u8_to_srgb8(coverage);
+                        data.extend_from_slice(&[gray, gray, gray, coverage]);
+                    }
                 }
             }
-        }
-        Ok(RasterizedGlyph {
-            data,
-            width: out_width,
-            height: out_height,
-            bearing_x: PixelLength::new(x0 + left as f64),
-            bearing_y: PixelLength::new(y1 - top as f64),
-            has_color: self.has_color,
-            is_scaled: true,
+            Ok(RasterizedGlyph {
+                data,
+                width: out_width,
+                height: out_height,
+                bearing_x: PixelLength::new(x0 + left as f64),
+                bearing_y: PixelLength::new(y1 - top as f64),
+                has_color: self.has_color,
+                is_scaled: true,
+            })
         })
     }
 }
@@ -458,6 +543,52 @@ mod tests {
         glyph.data.chunks(4).map(|px| u64::from(px[3])).sum()
     }
 
+    /// A fresh context with the original exact dimensions, so comparisons
+    /// catch pitch, clipping and y-origin errors in oversized reused storage.
+    fn exact_context_raster(
+        parsed: &ParsedFont,
+        glyph: u32,
+        size: f64,
+        dpi: u32,
+    ) -> RasterizedGlyph {
+        let rasterizer = CoreTextRasterizer::from_locator(parsed).unwrap();
+        let pixel_size = size * rasterizer.scale * f64::from(dpi) / 72.0;
+        let font = rasterizer.at_size(pixel_size);
+        let ink = font.get_bounding_rects_for_glyphs(
+            kCTFontOrientationDefault,
+            &[u16::try_from(glyph).unwrap()],
+        );
+        if ink.size.width > 0.0 && ink.size.height > 0.0 {
+            let skew = if parsed.synthesize_italic {
+                FAKE_ITALIC_SKEW
+            } else {
+                0.0
+            };
+            let stroke = if parsed.synthesize_bold {
+                (pixel_size / 24.0).max(0.5)
+            } else {
+                0.0
+            };
+            let (x0, y0, x1, y1) = pixel_box(ink, skew, PADDING + stroke / 2.0);
+            let (width, height) = ((x1 - x0) as usize, (y1 - y0) as usize);
+            *rasterizer.bitmap.borrow_mut() =
+                Some(GlyphBitmap::new(width, height, rasterizer.has_color));
+        }
+        rasterizer.rasterize_glyph(glyph, size, dpi).unwrap()
+    }
+
+    fn assert_same_raster(actual: &RasterizedGlyph, expected: &RasterizedGlyph) {
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.bearing_x, expected.bearing_x);
+        assert_eq!(actual.bearing_y, expected.bearing_y);
+        assert_eq!(actual.has_color, expected.has_color);
+        assert_eq!(actual.is_scaled, expected.is_scaled);
+        assert_eq!(actual.data, expected.data);
+    }
+
     /// The glyph `character` maps to in `font`, via CoreText's cmap lookup.
     fn glyph_for(font: &CTFont, character: char) -> Option<u16> {
         let mut units = [0u16; 2];
@@ -469,6 +600,87 @@ mod tests {
             font.get_glyphs_for_characters(units.as_ptr(), glyphs.as_mut_ptr(), len as isize)
         };
         (found && glyphs[0] != 0).then_some(glyphs[0])
+    }
+
+    #[test]
+    fn reused_gray_context_matches_fresh_pixels_across_glyphs_styles_and_sizes() {
+        let regular = jetbrains_mono();
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut parsed = regular.clone();
+            parsed.synthesize_bold = bold;
+            parsed.synthesize_italic = italic;
+            let rasterizer = CoreTextRasterizer::from_locator(&parsed).unwrap();
+            let storage = rasterizer.with_bitmap(240, 240, |bitmap| {
+                // Poison retained pixels, including outside the next glyph's
+                // rectangle: only its clear/clip region may affect the result.
+                bitmap.context.data().fill(0xa5);
+                bitmap.context.data().as_ptr()
+            });
+            let glyphs = shaped(&parsed, "Wg|@Ay., ");
+            for (size, dpi) in [(SIZE_PT, DPI), (9.25, 72), (28.5, 192), (SIZE_PT, DPI)] {
+                for &(glyph, _) in &glyphs {
+                    let actual = rasterizer.rasterize_glyph(glyph, size, dpi).unwrap();
+                    let expected = exact_context_raster(&parsed, glyph, size, dpi);
+                    assert_same_raster(&actual, &expected);
+                    let mut cached = rasterizer.bitmap.borrow_mut();
+                    let bitmap = cached.as_mut().unwrap();
+                    assert_eq!(bitmap.context.data().as_ptr(), storage);
+                    assert_eq!((bitmap.width, bitmap.height), (256, 256));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reused_color_context_matches_fresh_emoji_pixels() {
+        let parsed = system_font("/System/Library/Fonts/Apple Color Emoji.ttc", 0);
+        let rasterizer = CoreTextRasterizer::from_locator(&parsed).unwrap();
+        assert!(rasterizer.has_color());
+        let storage = rasterizer.with_bitmap(240, 240, |bitmap| {
+            bitmap.context.data().fill(0x7f);
+            bitmap.context.data().as_ptr()
+        });
+        let font = rasterizer.at_size(SIZE_PT * f64::from(DPI) / 72.0);
+        let glyphs: Vec<_> = ['😀', '🚀', '🌍', '🧑']
+            .into_iter()
+            .map(|character| u32::from(glyph_for(&font, character).expect("known emoji")))
+            .collect();
+        for (size, dpi) in [(SIZE_PT, DPI), (26.0, DPI), (9.5, 72), (SIZE_PT, DPI)] {
+            for &glyph in &glyphs {
+                let actual = rasterizer.rasterize_glyph(glyph, size, dpi).unwrap();
+                assert!(coverage(&actual) > 0);
+                assert_same_raster(&actual, &exact_context_raster(&parsed, glyph, size, dpi));
+                let mut cached = rasterizer.bitmap.borrow_mut();
+                let bitmap = cached.as_mut().unwrap();
+                assert_eq!(bitmap.context.data().as_ptr(), storage);
+                assert!(bitmap.pitch * bitmap.height <= 256 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_bitmaps_do_not_replace_the_bounded_retained_surface() {
+        let rasterizer = CoreTextRasterizer::from_locator(&jetbrains_mono()).unwrap();
+        let original = rasterizer.with_bitmap(17, 33, |bitmap| {
+            assert_eq!((bitmap.width, bitmap.height), (32, 64));
+            bitmap.context.data().as_ptr()
+        });
+        for (width, height) in [(257, 17), (9, 513)] {
+            rasterizer.with_bitmap(width, height, |bitmap| {
+                assert_eq!((bitmap.width, bitmap.height), (width, height));
+                assert_ne!(bitmap.context.data().as_ptr(), original);
+            });
+            rasterizer.with_bitmap(17, 33, |bitmap| {
+                assert_eq!((bitmap.width, bitmap.height), (32, 64));
+                assert_eq!(bitmap.context.data().as_ptr(), original);
+            });
+        }
+        rasterizer.with_bitmap(40, 20, |bitmap| {
+            assert_eq!((bitmap.width, bitmap.height), (64, 64));
+        });
+        rasterizer.with_bitmap(2, 3, |bitmap| {
+            assert_eq!((bitmap.width, bitmap.height), (64, 64));
+        });
     }
 
     #[test]
@@ -735,7 +947,11 @@ mod tests {
         }
         eprintln!(
             "Apple Color Emoji: {drawn} of 1376 T0 codepoints drawn in color; missing (fallback per ft-yccm0.4.3.5): {}",
-            missing.iter().map(|cp| format!("U+{cp:X}")).collect::<Vec<_>>().join(" ")
+            missing
+                .iter()
+                .map(|cp| format!("U+{cp:X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         assert_eq!(drawn + missing.len(), 1376);
         assert!(drawn >= 1300, "only {drawn} of the T0 emoji have glyphs");
