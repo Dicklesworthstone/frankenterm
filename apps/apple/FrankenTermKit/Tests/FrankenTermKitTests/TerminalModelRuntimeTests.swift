@@ -631,6 +631,41 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         try await runtime.close()
     }
 
+    /// Input that left this phone awaits the machine's answer until its next
+    /// output. The terminal's own replies and a local resize are neither.
+    func testInputAwaitsAnAnswerUntilTheMachinesNextOutput() async throws {
+        let (coordinator, _, source) = try await source()
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        let stream = try await coordinator.makeStream(sceneID: UUID())
+        let focus = try await coordinator.changeFocus(stream, to: source)
+        func deliver() async throws {
+            for _ in 0..<8 { guard case .progressed = try await coordinator.drainOne(source) else { break } }
+            let batch = try await coordinator.pendingOutcomes(source)
+            XCTAssertFalse(batch.outcomes.isEmpty)
+            try await runtime.receive(batch.outcomes, source: source)
+            try await coordinator.acknowledgeOutcomes(batch)
+        }
+        var awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertFalse(awaits)
+        _ = try await coordinator.reply(source, encodedBytes: Data("\u{1b}[0n".utf8))
+        try await deliver()
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertFalse(awaits, "the terminal's own reply is not the person's input")
+        _ = try await coordinator.submit(focus, encodedBytes: Data("lost\r".utf8))
+        try await deliver()
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertTrue(awaits, "accepted input waits for the machine's answer")
+        try await runtime.receive(.init(output: Data(), resized: try TerminalSessionGeometry(columns: 90, rows: 30)),
+                                  source: source)
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertTrue(awaits, "a local resize is not an answer")
+        try await runtime.receive(.init(output: Data("lost\r\n".utf8)), source: source)
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertFalse(awaits, "the machine's output answers it")
+        try await runtime.close()
+    }
+
     func testEOFDeliversFinalOutputAndRepliesThenRefusesFurtherInput() async throws {
         let (coordinator, _, source) = try await source()
         let model = OwnedModelFixture(source: source, replies: [try .init(sequence: 1, bytes: Data([2]))])

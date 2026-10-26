@@ -124,8 +124,7 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
     // its hide. An already-captured obsolete frame cannot restart hidden work.
     var acceptsFrames = false
     var onUnavailable: ((TerminalRenderError) -> Void)?
-    var onInterruptedInput: (() -> Void)?
-    private var reportedInterruptedInput = false
+    var onInterruptedInput: (([TerminalInputOutcome]) -> Void)?
     init(source: TerminalSource, connection: WorkspaceSSHConnection) {
         self.source = source; self.connection = connection
     }
@@ -150,14 +149,13 @@ private final class TerminalFramePresenter: TerminalModelDelivery {
         // evidence before the pump can acknowledge this batch, including final
         // cleanup outcomes delivered after the view has retired.
         try await connection.recordInput(outcomes, source: source)
-        if !reportedInterruptedInput, outcomes.contains(where: {
+        if outcomes.contains(where: {
             switch $0.disposition {
             case .connectionLost, .definitelyNotWritten, .cancelledAfterPrefix: true
             case .transportAccepted, .cancelledBeforeWrite: false
             }
         }) {
-            reportedInterruptedInput = true
-            onInterruptedInput?()
+            onInterruptedInput?(outcomes)
         }
     }
 }
@@ -213,7 +211,10 @@ final class TerminalSessionController {
     private(set) var dropped = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
-    private(set) var interruptedInput = false
+    /// What an ended connection left known about the person's input. A later
+    /// session on this machine keeps it until they dismiss it: a new live
+    /// frame says nothing about whether the earlier input arrived.
+    private(set) var inputDelivery: TerminalInputDelivery
     private(set) var interactionProblem: String?
     private(set) var localInputRecovery: TerminalKeyboardRecovery?
     private(set) var resolvingLocalInput = false
@@ -292,8 +293,10 @@ final class TerminalSessionController {
     @ObservationIgnored private var muxObservation: TerminalMuxObservation?
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
-         reconnectingFrom previous: TerminalSessionController? = nil) {
+         reconnectingFrom previous: TerminalSessionController? = nil,
+         inputDelivery: TerminalInputDelivery = .init()) {
         self.target = target; self.connections = connections; self.focus = focus
+        self.inputDelivery = inputDelivery
         basePalette = target.basePalette
         route = target.routes[0]
         retriesDrop = previous?.dropped == true
@@ -463,6 +466,9 @@ final class TerminalSessionController {
     func discardRetainedOutput() {
         retainEndedOutput = false; retainedOutput = nil; retainedOutputFailure = nil
     }
+
+    /// The person has read what an ended connection left known about their input.
+    func dismissInputDelivery() { inputDelivery = .init() }
 
     private func inputFailed(_ error: Error) {
         if let recovery = keyboard?.recovery,
@@ -959,7 +965,12 @@ final class TerminalSessionController {
             presenter.onUnavailable = { [weak self] reason in
                 self?.fail("The display is unavailable (\(Self.describe(reason))).")
             }
-            presenter.onInterruptedInput = { [weak self] in self?.interruptedInput = true }
+            presenter.onInterruptedInput = { [weak self] outcomes in
+                guard let self else { return }
+                var delivery = self.inputDelivery
+                delivery.record(outcomes)
+                if delivery != self.inputDelivery { self.inputDelivery = delivery }
+            }
             self.presenter = presenter
             let model = try NativeTerminalModel(source: pump.source, geometry: geometry)
             unadoptedModel = model
@@ -1532,6 +1543,9 @@ final class TerminalSessionController {
                 } catch {
                     if retainEndedOutput { retainedOutputFailure = Self.describe(error) }
                 }
+            }
+            if dropped, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
+                inputDelivery.endedUnanswered()
             }
             do { try await runtime.close(); self.runtime = nil }
             catch { failure = failure ?? error }

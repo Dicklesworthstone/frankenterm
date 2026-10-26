@@ -793,7 +793,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let previous = sessions[machineID]
         previous?.discardRetainedOutput()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
-            reconnectingFrom: preservingSuccessfulCandidate ? previous : nil)
+            reconnectingFrom: preservingSuccessfulCandidate ? previous : nil,
+            inputDelivery: previous?.inputDelivery ?? .init())
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
             // Releasing an unused sign-in did not end a remote terminal and
@@ -1333,6 +1334,11 @@ struct WorkspaceTerminalScreen: View {
             } else if scene.selectedSession?.resolvingLocalInput == true {
                 ProgressView("Resetting keyboard…")
                     .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
+            } else if let session = scene.selectedSession,
+                      let delivery = session.inputDelivery.message(machine: session.target.machineName) {
+                problemBanner(delivery) { session.dismissInputDelivery() }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("terminal.input.delivery")
             } else if let session = scene.selectedSession, let problem = session.interactionProblem {
                 problemBanner(problem) { session.dismissInteractionProblem() }
             } else if let problem = scene.problem {

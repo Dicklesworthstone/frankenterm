@@ -419,6 +419,65 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// What the person reads after the connection ends: input that never left
+    /// this phone, and input that left it with its arrival unknown. Accepted
+    /// input and the terminal's own replies are not theirs to worry about.
+    func testAnEndedConnectionSaysWhichInputNeverLeftAndWhichMayHaveArrived() async throws {
+        for (answer, unanswered) in [(TerminalTransportWrite.wouldBlock, false), (.accepted(2), true), (.failed, true)] {
+            let (coordinator, transport, source, focus) = try await setup()
+            await transport.setBlocked(true, closeResult: answer)
+            _ = try await coordinator.submit(focus, encodedBytes: Data("first".utf8))
+            _ = try await coordinator.submit(focus, encodedBytes: Data("queued".utf8))
+            let running = Task { try await coordinator.drainOne(source) }
+            await transport.waitUntilWriting()
+            try await coordinator.disconnect(source)
+            _ = try await running.value
+            var delivery = TerminalInputDelivery()
+            delivery.record(try await coordinator.takeOutcomes(source))
+            XCTAssertTrue(delivery.unsent, "the queued input never left (\(answer))")
+            XCTAssertEqual(delivery.unanswered, unanswered, "the written input's arrival is unknown (\(answer))")
+            XCTAssertFalse(delivery.stoppedPartway)
+            let message = try XCTUnwrap(delivery.message(machine: "Alpha"))
+            XCTAssertEqual(message.contains("It may or may not have arrived."), unanswered, message)
+            XCTAssertTrue(message.contains("never left this phone and was not sent."), message)
+            XCTAssertTrue(message.hasSuffix("Nothing is sent again by itself: check the screen before you type it again."), message)
+        }
+
+        // A reply the connection lost mid-write and accepted input are not the person's interrupted input.
+        let (coordinator, transport, source, focus) = try await setup()
+        _ = try await coordinator.submit(focus, encodedBytes: Data("ls\r".utf8))
+        try await drain(coordinator, source)
+        await transport.setBlocked(true, closeResult: .failed)
+        _ = try await coordinator.reply(source, encodedBytes: Data("\u{1b}[0n".utf8))
+        let running = Task { try await coordinator.drainOne(source) }
+        await transport.waitUntilWriting()
+        try await coordinator.disconnect(source)
+        _ = try await running.value
+        let outcomes = try await coordinator.takeOutcomes(source)
+        XCTAssertEqual(outcomes.map(\.kind), [.encodedInput, .reply])
+        XCTAssertEqual(outcomes.last?.disposition, .connectionLost(leasedTailUnknown: true))
+        var delivery = TerminalInputDelivery()
+        delivery.record(outcomes)
+        XCTAssertTrue(delivery.isEmpty)
+        XCTAssertNil(delivery.message(machine: "Alpha"))
+        delivery.endedUnanswered()
+        XCTAssertEqual(delivery.message(machine: "Alpha"),
+                       "Your last input left this phone, but the connection ended before Alpha answered it. It may or may not have arrived. Nothing is sent again by itself: check the screen before you type it again.")
+
+        // A paste stopped after its beginning was sent.
+        let (pasting, _, pasteSource, pasteFocus) = try await setup()
+        let paste = try await pasting.paste(pasteFocus, text: "echo stopped", bracketed: true)
+        _ = try await pasting.drainOne(pasteSource, maximumBytes: 8)
+        _ = try await pasting.cancel(paste)
+        try await drain(pasting, pasteSource)
+        var stopped = TerminalInputDelivery()
+        stopped.record(try await pasting.takeOutcomes(pasteSource))
+        XCTAssertTrue(stopped.stoppedPartway)
+        XCTAssertFalse(stopped.unsent || stopped.unanswered)
+        XCTAssertEqual(stopped.message(machine: "Alpha"),
+                       "Some input was stopped after only part of it was sent. Nothing is sent again by itself: check the screen before you type it again.")
+    }
+
     func testInvalidTransportCountsCloseWithoutInventingAcceptedBytes() async throws {
         for result in [TerminalTransportWrite.accepted(0), .accepted(-1), .accepted(Int.max), .failed] {
             let (coordinator, transport, source, focus) = try await setup()

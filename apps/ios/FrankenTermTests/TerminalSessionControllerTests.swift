@@ -1205,6 +1205,63 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
+    /// The network goes away after Enter, before the machine answered: the
+    /// phone says the line left it and may or may not have arrived, sends
+    /// nothing again, and the next session keeps saying so until dismissed.
+    /// Input the machine answered is not reported. A relay to the loopback
+    /// sshd stands in for the network.
+    func testInputTheMachineNeverAnsweredIsReportedAfterADropAndNotSentAgain() async throws {
+        guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(machineIDs: ["alpha"], relayPort: relay.port)
+        let scene = live.scene, run = UUID().uuidString.prefix(8)
+        let first = try await connect(scene, "alpha")
+        let terminal = try shown(first)
+        defer { terminal.removeFromSuperview() }
+        // The host reads the next line without echoing it, so nothing answers it.
+        try await type("stty -echo; echo SILENT-$((40+2)); /bin/cat > /dev/null", into: terminal)
+        _ = try await rows(of: terminal) { self.shows($0, "SILENT-42") }
+        try await Task.sleep(for: .milliseconds(500))
+        try await type("LOST-\(run)", into: terminal)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertTrue(first.inputDelivery.isEmpty, "a live connection reports nothing")
+        relay.down()
+        for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertTrue(first.dropped, "the connection was lost (\(first.phase))")
+        XCTAssertTrue(first.inputDelivery.unanswered, "the line left the phone with no answer")
+        XCTAssertFalse(first.inputDelivery.unsent)
+        let message = try XCTUnwrap(first.inputDelivery.message(machine: first.target.machineName))
+        XCTAssertTrue(message.contains("before Alpha answered it. It may or may not have arrived."), message)
+        await assertReleased(first, connections: live.connections)
+
+        // The next session keeps the notice and types nothing again.
+        try await relay.up()
+        let again = try await connect(scene, "alpha")
+        XCTAssertFalse(again === first)
+        XCTAssertEqual(again.phase, .live)
+        XCTAssertEqual(again.inputDelivery, first.inputDelivery, "a new live terminal does not erase it")
+        let fresh = try shown(again)
+        defer { fresh.removeFromSuperview() }
+        try await type("echo SEEN-$((40+2))", into: fresh)
+        let seen = try await rows(of: fresh) { self.shows($0, "SEEN-42") }
+        XCTAssertFalse(shows(seen, "LOST-\(run)"), "the lost line was not typed again (screen: \(seen))")
+        again.dismissInputDelivery()
+        XCTAssertTrue(again.inputDelivery.isEmpty)
+
+        // Input the machine answered is not reported when the connection drops.
+        try await Task.sleep(for: .milliseconds(500))
+        relay.down()
+        for _ in 0..<200 where !again.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertTrue(again.dropped, "the connection was lost (\(again.phase))")
+        XCTAssertTrue(again.inputDelivery.isEmpty, "answered input is not reported (\(again.inputDelivery))")
+        await assertReleased(again, connections: live.connections)
+        await scene.close()
+    }
+
     /// A dropped machine keeps retrying, and one the network stays away from
     /// longer than its retries last comes back when the network does, with no
     /// tap. A relay to the loopback sshd stands in for the network. A direct
