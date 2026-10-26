@@ -40,6 +40,10 @@
 //!   face, the glyph, its cell count, the font style and whether a space
 //!   follows it. Each shaped occurrence applies its own shaper offsets to
 //!   the cached bitmap's bearings and fit scale.
+//! - Laid-out runs are bound to their immutable shape ids in a separate,
+//!   byte-bounded cache. A warm run reuses its glyph placements without
+//!   allocating or looking up every glyph again. These bindings contain
+//!   value slots, never texture owners, and are cleared with stale pages.
 //!
 //! Every frame touches one representative per cached atlas page lifetime,
 //! so the atlases keep the glyphs without scanning the whole glyph cache.
@@ -57,7 +61,7 @@
 use super::metal_images::{ImageSlices, Slice};
 use crate::customglyph::BlockKey;
 use crate::glyphcache::{GlyphCache, GlyphPositionScale};
-use crate::shapecache::{BorrowedShapeCacheKey, ShapeCacheKey, ShapeCacheKeyTrait};
+use crate::shapecache::{BorrowedShapeCacheKey, CachedShape, ShapeCacheKey, ShapeCacheKeyTrait};
 use crate::utilsprites::RenderMetrics;
 use config::TextStyle;
 use frankenterm_font::shaper::PresentationWidth;
@@ -68,7 +72,7 @@ use frankenterm_gui::metal_scene::{
     CursorSprite, GlyphSource, LineSprite, PlacedGlyph, ShapedGlyph,
 };
 use frankenterm_renderer_metal::{AtlasKind, AtlasPageSet, AtlasSlot, MetalRenderer};
-use lfucache::LfuCache;
+use lfucache::{LfuCache, LfuCacheU64};
 use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -90,7 +94,7 @@ use window::bitmaps::{BitmapImage, Image};
 pub(crate) type FallbackReady = Arc<dyn Fn() + Send + Sync>;
 
 /// A glyph laid out the WebGpu renderer's way, in an atlas.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum LaidGlyph {
     /// A custom block glyph's bitmap, drawn from the cell's top-left.
     Block(PlacedGlyph),
@@ -129,10 +133,81 @@ impl CachedFontGlyph {
 
 /// One glyph of a shaped cluster or run: its shaper cell count, and what
 /// draws it (`None` for an inkless glyph, which only advances the cells).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct RunGlyph {
     num_cells: u8,
     laid: Option<LaidGlyph>,
+}
+
+/// Bound both the entry count and the glyph-vector storage: a screen-width
+/// run must not cost the same cache budget as one character. Each pane owns a
+/// font source, so keep this small: 200 panes retain at most 50 MiB of run
+/// storage. LFU bookkeeping is separately limited to at most 1,024 entries
+/// per pane, or fewer when `shape_cache_size` is lower. Oversized runs still
+/// render normally; only their optional binding is left uncached.
+const MAX_RUN_BINDING_BYTES: usize = 256 * 1024;
+const MAX_RUN_BINDING_ENTRIES: usize = 1024;
+
+struct RunBindings {
+    runs: LfuCacheU64<Rc<Vec<RunGlyph>>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl RunBindings {
+    fn new(config: &config::ConfigHandle) -> Self {
+        Self {
+            runs: LfuCacheU64::new(
+                "metal_shape_bindings.hit.rate",
+                "metal_shape_bindings.miss.rate",
+                |config| config.shape_cache_size.min(MAX_RUN_BINDING_ENTRIES),
+                config,
+            ),
+            bytes: 0,
+            max_bytes: MAX_RUN_BINDING_BYTES,
+        }
+    }
+
+    fn get(&mut self, id: u64) -> Option<Rc<Vec<RunGlyph>>> {
+        self.runs.get(&id).cloned()
+    }
+
+    fn entry_bytes(glyphs: &Vec<RunGlyph>) -> usize {
+        // Include the key, Rc counters and vector header, not only its live
+        // length: unused vector capacity is retained by the binding too.
+        std::mem::size_of::<u64>()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<RunGlyph>>()
+            + glyphs.capacity() * std::mem::size_of::<RunGlyph>()
+    }
+
+    fn insert(&mut self, id: u64, glyphs: Rc<Vec<RunGlyph>>) {
+        let bytes = Self::entry_bytes(&glyphs);
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some((_, old)) = self.runs.remove(&id) {
+            self.bytes -= Self::entry_bytes(&old);
+        }
+        while self.bytes > self.max_bytes - bytes {
+            let Some((_, old)) = self.runs.evict_lfu() else {
+                break;
+            };
+            self.bytes -= Self::entry_bytes(&old);
+        }
+        for (_, old) in self.runs.put_capturing_evictions(id, glyphs) {
+            self.bytes -= Self::entry_bytes(&old);
+        }
+        // A disabled cache (capacity zero) can decline the insertion.
+        if self.runs.contains_key(&id) {
+            self.bytes += bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.runs.clear();
+        self.bytes = 0;
+    }
 }
 
 /// WebGpu's glyph key (`GlyphKey`) within one font configuration and cell
@@ -169,7 +244,12 @@ pub(crate) struct FontGlyphs {
     /// where its address stays put while the address map holds it.
     lock_style: Rc<TextStyle>,
     /// Shaper output keyed by the complete cluster or paragraph context.
-    shapes: LfuCache<ShapeCacheKey<u32>, Rc<Vec<GlyphInfo>>>,
+    shapes: LfuCache<ShapeCacheKey<u32>, Rc<CachedShape>>,
+    /// Current-atlas bindings of complete immutable shapes. `begin_frame`
+    /// validates and pins every referenced page through `cached_pages`, then
+    /// clears these bindings whenever it clears the raster caches. Growth
+    /// alone preserves the page epochs and therefore preserves the bindings.
+    bindings: RunBindings,
     /// Rasterized font glyphs, `None` for inkless ones. Shaper positions are
     /// applied per occurrence after lookup, not retained under a glyph id.
     glyphs: HashMap<GlyphKey, Option<CachedFontGlyph>>,
@@ -232,6 +312,7 @@ impl FontGlyphs {
             |config| config.shape_cache_size,
             &config,
         );
+        let bindings = RunBindings::new(&config);
         Self {
             fonts,
             config,
@@ -245,6 +326,7 @@ impl FontGlyphs {
             style_ids: HashMap::new(),
             lock_style: Rc::new(TextStyle::default()),
             shapes,
+            bindings,
             glyphs: HashMap::new(),
             blocks: HashMap::new(),
             lines: HashMap::new(),
@@ -280,6 +362,7 @@ impl FontGlyphs {
         let changed = std::mem::take(&mut self.chain_changed);
         if changed {
             self.shapes.clear();
+            self.bindings.clear();
         }
         changed
     }
@@ -307,6 +390,7 @@ impl FontGlyphs {
         let fallback_resolved = self.fallback_resolved.swap(false, Ordering::AcqRel);
         if fallback_resolved {
             self.shapes.clear();
+            self.bindings.clear();
         }
         // Image slices the last frame did not draw are let go first, so
         // their atlas slots age out.
@@ -323,6 +407,7 @@ impl FontGlyphs {
             rebuild = !alive;
         }
         if rebuild {
+            self.bindings.clear();
             self.glyphs.clear();
             self.blocks.clear();
             self.lines.clear();
@@ -487,6 +572,7 @@ impl FontGlyphs {
                     attempts += 1;
                     self.chain_changed = true;
                     self.shapes.clear();
+                    self.bindings.clear();
                 }
                 Err(err) => {
                     log::warn!("Metal glyphs: shaping {:?} failed: {err:#}", cluster.text);
@@ -498,17 +584,18 @@ impl FontGlyphs {
 
     /// Lays out one shaped glyph as the WebGpu renderer's
     /// `glyph_infos_to_glyphs` does, through the glyph cache. `None` for an
-    /// inkless glyph, or one that failed to lay out or place (not kept).
+    /// inkless glyph. A failed layout or placement is an error so a partial
+    /// run cannot be mistaken for an inkless but successfully bound shape.
     fn lay_out(
         &mut self,
         style_id: u32,
         font: &Rc<LoadedFont>,
         info: &GlyphInfo,
         followed_by_space: bool,
-    ) -> Option<LaidGlyph> {
+    ) -> Result<Option<LaidGlyph>, ()> {
         if self.config.custom_block_glyphs {
             if let Some(block) = info.only_char.and_then(BlockKey::from_char) {
-                return self.block(block).map(LaidGlyph::Block);
+                return self.block(block).map(LaidGlyph::Block).map(Some).ok_or(());
             }
         }
         let key = GlyphKey {
@@ -520,7 +607,7 @@ impl FontGlyphs {
             followed_by_space,
         };
         if let Some(laid) = self.glyphs.get(&key) {
-            return laid.map(|glyph| glyph.for_shaped_glyph(info));
+            return Ok(laid.map(|glyph| glyph.for_shaped_glyph(info)));
         }
         let layout = match GlyphCache::lay_out_glyph(
             &self.config,
@@ -535,12 +622,14 @@ impl FontGlyphs {
                     "Metal glyphs: laying out glyph {} failed: {err:#}",
                     info.glyph_pos
                 );
-                return None;
+                return Err(());
             }
         };
         let laid = match &layout.image {
             Some(image) => {
-                let slot = self.place_image(image, layout.has_color, "a glyph")?;
+                let slot = self
+                    .place_image(image, layout.has_color, "a glyph")
+                    .ok_or(())?;
                 Some(CachedFontGlyph {
                     slot,
                     bearing_x: layout.bearing_x,
@@ -555,7 +644,7 @@ impl FontGlyphs {
         if let Some(CachedFontGlyph { slot, .. }) = laid {
             self.cached_pages.insert(slot);
         }
-        laid.map(|glyph| glyph.for_shaped_glyph(info))
+        Ok(laid.map(|glyph| glyph.for_shaped_glyph(info)))
     }
 
     /// Retains only atlas-independent shaper output. Borrowed keys avoid
@@ -567,7 +656,7 @@ impl FontGlyphs {
         font: &Rc<LoadedFont>,
         cluster: &CellCluster,
         context: Option<(&str, Range<usize>)>,
-    ) -> Option<Rc<Vec<GlyphInfo>>> {
+    ) -> Option<Rc<CachedShape>> {
         let key = BorrowedShapeCacheKey::new(&style_id, font.id(), cluster, context.clone());
         let reusable = !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire);
         if reusable {
@@ -575,7 +664,7 @@ impl FontGlyphs {
                 return Some(Rc::clone(infos));
             }
         }
-        let infos = Rc::new(self.run_shaper(font, cluster, context)?);
+        let infos = Rc::new(CachedShape::new(self.run_shaper(font, cluster, context)?));
         if !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire) {
             self.shapes.put(key.to_owned(), Rc::clone(&infos));
         }
@@ -599,18 +688,37 @@ impl FontGlyphs {
             }
         };
         let style_id = self.style_id(style);
-        let Some(infos) = self.cached_shape(style_id, &font, cluster, context) else {
+        let Some(shape) = self.cached_shape(style_id, &font, cluster, context) else {
             return Rc::new(Vec::new());
         };
+        let reusable = !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire);
+        if reusable {
+            if let Some(glyphs) = self.bindings.get(shape.id()) {
+                return glyphs;
+            }
+        }
+        let infos = shape.infos();
         let mut glyphs = Vec::with_capacity(infos.len());
+        let mut complete = true;
         for (index, info) in infos.iter().enumerate() {
             let followed_by_space = infos.get(index + 1).is_some_and(|next| next.is_space);
+            let laid = match self.lay_out(style_id, &font, info, followed_by_space) {
+                Ok(laid) => laid,
+                Err(()) => {
+                    complete = false;
+                    None
+                }
+            };
             glyphs.push(RunGlyph {
                 num_cells: info.num_cells,
-                laid: self.lay_out(style_id, &font, info, followed_by_space),
+                laid,
             });
         }
-        Rc::new(glyphs)
+        let glyphs = Rc::new(glyphs);
+        if complete && !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire) {
+            self.bindings.insert(shape.id(), Rc::clone(&glyphs));
+        }
+        glyphs
     }
 
     /// The width of `cells` cells in pixels, as an offset.
@@ -779,6 +887,226 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_bindings_bound_vector_capacity_and_preserve_hot_runs() {
+        let config = config::ConfigHandle::default_config();
+        let mut bindings = RunBindings::new(&config);
+        let run = Rc::new(vec![RunGlyph {
+            num_cells: 1,
+            laid: None,
+        }]);
+        let bytes = RunBindings::entry_bytes(&run);
+        bindings.max_bytes = 2 * bytes;
+        bindings.insert(1, Rc::clone(&run));
+        bindings.insert(2, Rc::clone(&run));
+        assert!(Rc::ptr_eq(&bindings.get(1).unwrap(), &run));
+        bindings.insert(3, Rc::clone(&run));
+        assert!(bindings.get(1).is_some(), "retain the frequently used run");
+        assert!(bindings.get(2).is_none(), "evict the colder run for bytes");
+        assert!(bindings.get(3).is_some());
+        assert_eq!(bindings.bytes, 2 * bytes);
+
+        let mut spare_capacity = Vec::with_capacity(64);
+        spare_capacity.push(run[0]);
+        bindings.insert(4, Rc::new(spare_capacity));
+        assert!(bindings.get(4).is_none(), "account capacity, not length");
+        assert!(
+            bindings.get(1).is_some(),
+            "oversized runs do not flush hot ones"
+        );
+        assert_eq!(bindings.bytes, 2 * bytes);
+        bindings.insert(1, Rc::clone(&run));
+        assert_eq!(bindings.bytes, 2 * bytes, "replacement counts exactly once");
+        bindings.clear();
+        assert_eq!(bindings.bytes, 0);
+        assert!(bindings.runs.is_empty());
+
+        bindings.runs = LfuCacheU64::new("test.hit", "test.miss", |_| 2, &config);
+        bindings.max_bytes = 10 * bytes;
+        for id in 0..3 {
+            bindings.insert(id, Rc::clone(&run));
+        }
+        assert_eq!(bindings.runs.len(), 2, "entry count is bounded too");
+        assert_eq!(bindings.bytes, 2 * bytes, "account count-limit evictions");
+        bindings.clear();
+        bindings.runs = LfuCacheU64::new("test.hit", "test.miss", |_| 0, &config);
+        bindings.insert(1, run);
+        assert_eq!(bindings.bytes, 0, "a disabled cache retains no run bytes");
+        assert!(bindings.runs.is_empty());
+    }
+
+    #[test]
+    fn bound_runs_reuse_geometry_through_growth_and_rebind_after_stale_pages() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let style = config.font.clone();
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, Rc::clone(&renderer), &metrics);
+        let clusters = Line::from_text("ABC", &CellAttributes::blank(), 0, None).cluster(None);
+        let first = glyphs.shape(&style, &clusters[0], None);
+        assert!(first.iter().all(|glyph| glyph.laid.is_some()));
+        let original = first.as_ref().clone();
+        let entries = glyphs.glyphs.len();
+        let bytes = glyphs.bindings.bytes;
+        for _ in 0..10 {
+            assert!(!glyphs.begin_frame());
+            let hit = glyphs.shape(&style, &clusters[0], None);
+            assert!(Rc::ptr_eq(&first, &hit), "no per-hit run allocation");
+            assert_eq!(glyphs.glyphs.len(), entries);
+            assert_eq!(glyphs.bindings.bytes, bytes);
+        }
+
+        // Fill each original page with one page-sized rectangle. The page
+        // holding ABC cannot fit one, so this necessarily grows the texture.
+        let atlas = frankenterm_renderer_metal::AtlasConfig::for_kind(AtlasKind::Grayscale);
+        let width = atlas.width - atlas.padding;
+        let height = atlas.page_height - atlas.padding;
+        let pixels = vec![0; width as usize * height as usize];
+        let pages = atlas.initial_height / atlas.page_height;
+        let mut last_page = 0;
+        for _ in 0..pages {
+            last_page = renderer
+                .insert_glyph(AtlasKind::Grayscale, width, height, &pixels)
+                .unwrap()
+                .page;
+        }
+        assert!(last_page >= pages, "the atlas really grew");
+        assert!(
+            !glyphs.begin_frame(),
+            "growth preserves existing page epochs"
+        );
+        assert!(Rc::ptr_eq(
+            &first,
+            &glyphs.shape(&style, &clusters[0], None)
+        ));
+
+        // A different page epoch is the exact stale-slot signal produced
+        // by page eviction. Exercise the live begin-frame validity check,
+        // which must retire every binding before that slot can be reused.
+        let mut stale = *glyphs.cached_pages.slots().next().unwrap();
+        stale.epoch = stale.epoch.wrapping_add(1);
+        glyphs.cached_pages.insert(stale);
+        assert!(glyphs.begin_frame());
+        assert_eq!(glyphs.bindings.bytes, 0);
+        assert!(glyphs.bindings.runs.is_empty());
+        assert!(
+            !glyphs.shapes.is_empty(),
+            "shaper output survives atlas changes"
+        );
+        let rebound = glyphs.shape(&style, &clusters[0], None);
+        assert!(!Rc::ptr_eq(&first, &rebound));
+        assert!(rebound.iter().all(|glyph| glyph.laid.is_some()));
+        assert!(Rc::ptr_eq(
+            &rebound,
+            &glyphs.shape(&style, &clusters[0], None)
+        ));
+        assert_eq!(
+            first.as_ref(),
+            &original,
+            "published occurrences stay immutable"
+        );
+
+        // Compare all placement data against a forced binding miss under
+        // the same live raster cache, not against the binding itself.
+        glyphs.bindings.clear();
+        let fresh = glyphs.shape(&style, &clusters[0], None);
+        assert_eq!(fresh.as_ref(), rebound.as_ref());
+        assert!(!Rc::ptr_eq(&fresh, &rebound));
+
+        // An over-budget run takes the normal placement path on each call;
+        // storage admission must never affect the glyphs that get drawn.
+        glyphs.bindings.clear();
+        glyphs.bindings.max_bytes = 0;
+        let uncached = glyphs.shape(&style, &clusters[0], None);
+        let repeated = glyphs.shape(&style, &clusters[0], None);
+        assert_eq!(uncached.as_ref(), fresh.as_ref());
+        assert_eq!(repeated.as_ref(), fresh.as_ref());
+        assert!(!Rc::ptr_eq(&uncached, &repeated));
+        assert!(glyphs.bindings.runs.is_empty());
+        assert_eq!(glyphs.bindings.bytes, 0);
+    }
+
+    #[test]
+    fn fallback_changes_invalidate_bound_runs_before_the_next_hit() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let style = config.font.clone();
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, renderer, &metrics);
+        let clusters = Line::from_text("ABC", &CellAttributes::blank(), 0, None).cluster(None);
+        let first = glyphs.shape(&style, &clusters[0], None);
+        assert!(glyphs.bindings.bytes > 0);
+
+        glyphs.chain_changed = true;
+        let changed = glyphs.shape(&style, &clusters[0], None);
+        assert!(
+            !Rc::ptr_eq(&first, &changed),
+            "do not hit a changed chain's binding"
+        );
+        assert!(glyphs.take_chain_changed());
+        assert!(glyphs.bindings.runs.is_empty());
+        assert_eq!(glyphs.bindings.bytes, 0);
+        let fresh = glyphs.shape(&style, &clusters[0], None);
+        assert!(Rc::ptr_eq(
+            &fresh,
+            &glyphs.shape(&style, &clusters[0], None)
+        ));
+
+        glyphs.fallback_resolved.store(true, Ordering::Release);
+        let pending = glyphs.shape(&style, &clusters[0], None);
+        assert!(
+            !Rc::ptr_eq(&fresh, &pending),
+            "do not hit before begin_frame either"
+        );
+        assert!(glyphs.begin_frame());
+        assert!(glyphs.bindings.runs.is_empty());
+        assert_eq!(glyphs.bindings.bytes, 0);
+        let resolved = glyphs.shape(&style, &clusters[0], None);
+        assert!(Rc::ptr_eq(
+            &resolved,
+            &glyphs.shape(&style, &clusters[0], None)
+        ));
+    }
+
+    #[test]
+    fn failed_glyph_layout_does_not_publish_a_partially_bound_run() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let style = config.font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, renderer, &metrics);
+        let clusters = Line::from_text("AB", &CellAttributes::blank(), 0, None).cluster(None);
+        let style_id = glyphs.style_id(&style);
+        let mut infos = glyphs.run_shaper(&font, &clusters[0], None).unwrap();
+        assert_eq!(infos.len(), 2);
+        infos[1].font_idx = usize::MAX; // rasterization fails for an unavailable fallback
+        let broken = Rc::new(CachedShape::new(infos));
+        let key = BorrowedShapeCacheKey::new(&style_id, font.id(), &clusters[0], None);
+        glyphs.shapes.put(key.to_owned(), broken);
+
+        let first = glyphs.shape(&style, &clusters[0], None);
+        assert!(
+            first[0].laid.is_some(),
+            "the successfully rasterized glyph draws"
+        );
+        assert!(first[1].laid.is_none());
+        assert!(
+            glyphs.bindings.runs.is_empty(),
+            "a partial run must be retried"
+        );
+        assert_eq!(glyphs.bindings.bytes, 0);
+        let retry = glyphs.shape(&style, &clusters[0], None);
+        assert!(!Rc::ptr_eq(&first, &retry), "retry attempts layout again");
+        assert!(glyphs.bindings.runs.is_empty());
+    }
+
+    #[test]
     fn contextual_positions_share_one_metal_raster_and_keep_fresh_layout_offsets() {
         config::use_test_configuration();
         let config = config::configuration();
@@ -795,7 +1123,7 @@ mod tests {
                 .unwrap();
             assert!(!infos.is_empty());
             for info in infos {
-                let first = glyphs.lay_out(style_id, &font, &info, false);
+                let first = glyphs.lay_out(style_id, &font, &info, false).unwrap();
                 let entries = glyphs.glyphs.len();
                 let pages: Vec<_> = glyphs.cached_pages.slots().copied().collect();
                 let mut shifted = info.clone();
@@ -810,7 +1138,7 @@ mod tests {
                         occurrence.num_cells,
                     )
                     .unwrap();
-                    let actual = glyphs.lay_out(style_id, &font, occurrence, false);
+                    let actual = glyphs.lay_out(style_id, &font, occurrence, false).unwrap();
                     match (first, actual) {
                         (Some(first), Some(actual)) => {
                             assert!(expected.image.is_some());
@@ -866,8 +1194,11 @@ mod tests {
         let hit = glyphs
             .cached_shape(style_id, &font, cluster, context.clone())
             .unwrap();
-        assert_eq!(cached.as_ref(), &expected);
+        assert_eq!(cached.infos(), &expected);
         assert!(Rc::ptr_eq(&cached, &hit));
+        let bound = glyphs.shape(&style, cluster, context.clone());
+        let bound_hit = glyphs.shape(&style, cluster, context.clone());
+        assert!(Rc::ptr_eq(&bound, &bound_hit));
 
         glyphs.reset = true;
         assert!(glyphs.begin_frame());
@@ -878,6 +1209,15 @@ mod tests {
             Rc::ptr_eq(&cached, &hit),
             "atlas rebuilds keep shaper output"
         );
+        let rebound = glyphs.shape(&style, cluster, context.clone());
+        assert!(
+            !Rc::ptr_eq(&bound, &rebound),
+            "atlas resets replace run bindings"
+        );
+        assert!(Rc::ptr_eq(
+            &rebound,
+            &glyphs.shape(&style, cluster, context.clone())
+        ));
 
         glyphs.chain_changed = true;
         let changed = glyphs
