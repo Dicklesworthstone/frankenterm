@@ -2001,7 +2001,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         let left = try XCTUnwrap(button("terminal.key.Left arrow", in: row))
         let right = try XCTUnwrap(button("terminal.key.Right arrow", in: row))
         let control = try XCTUnwrap(button("terminal.key.Control modifier", in: row))
-        try await type("echo started > \(out).started; cat -v > \(out)", into: terminal)
+        // Unbuffered, so each line lands as it is read; then how cat ended.
+        // The login shell may alias cat, so its path is spelled out.
+        try await type("echo started > \(out).started; /bin/cat -uv > \(out); echo \"cat $?\" >> \(out)", into: terminal)
         _ = try await hostFile(out + ".started", containing: "started")
         try await Task.sleep(for: .milliseconds(500))
         // One repeat soon after a touch, then none for the rest of the test.
@@ -2014,10 +2016,11 @@ final class TerminalSessionControllerTests: XCTestCase {
         terminal.input.insertText("\n")
         control.sendActions(for: .touchUpInside)
         terminal.input.insertText("d")
-        let text = try await hostFile(out, containing: "\n")
-        let keys = text.trimmingCharacters(in: .newlines).components(separatedBy: "^[").filter { !$0.isEmpty }
+        let text = try await hostFile(out, containing: "cat 0")
+        let line = text.components(separatedBy: "\n").first ?? ""
+        let keys = line.components(separatedBy: "^[").filter { !$0.isEmpty }
         XCTAssertEqual(keys.map(\.last), ["D", "C"], "the left arrow repeated once, the right one was touched "
-            + "(got \(text); screen: \(terminal.renderer.accessibilityValue ?? ""))")
+            + "(got \(text); \(session.phase); screen: \(terminal.renderer.accessibilityValue ?? ""))")
         await scene.close()
         await assertReleased(session, connections: live.connections)
     }
