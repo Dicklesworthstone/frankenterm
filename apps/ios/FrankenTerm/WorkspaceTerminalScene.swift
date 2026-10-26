@@ -557,15 +557,16 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// A hint from the device's network path, never proof that a transport
     /// survived or died. When the network comes back or changes interfaces,
-    /// each dropped machine that may reconnect gets a new retry budget (every
-    /// retry still verifies the host and signs in again), and each live one
-    /// probes its server, so a connection stranded on the old route is found
-    /// within one liveness interval.
+    /// each machine that may reconnect gets a new retry budget for its current
+    /// or next drop (every retry still verifies the host and signs in again),
+    /// and each live one probes its server, so a connection stranded on the
+    /// old route is found within one liveness interval.
     func networkPathChanged(_ path: TerminalNetworkPath) {
         let previous = networkPath
         networkPath = path
         guard !closed, path.isNewRoute(after: previous) else { return }
-        for (id, session) in sessions where session.dropped && connectionIntent.permitsReconnect(id) {
+        // Dropped, still retrying, or live and about to find out.
+        for id in sessions.keys where connectionIntent.permitsReconnect(id) {
             reconnectPolicies[id, default: .init()].networkChanged()
         }
         for session in sessions.values { session.networkRouteChanged() }

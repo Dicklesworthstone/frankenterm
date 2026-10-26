@@ -76,19 +76,23 @@ final class TerminalReconnectPolicyTests: XCTestCase {
         XCTAssertNil(policy.nextDelay)
     }
 
-    func testANewNetworkPathStartsANewBudgetOnlyForADroppedTerminal() {
+    func testANewNetworkPathStartsANewBudgetForTheNextDrop() {
         var policy = TerminalReconnectPolicy()
         for _ in 0..<3 { XCTAssertTrue(policy.beginRetry()) }
         XCTAssertNil(policy.nextDelay)
         policy.networkChanged()
-        XCTAssertEqual(policy.nextDelay, .seconds(1))
+        XCTAssertEqual(policy.nextDelay, .seconds(1), "a dropped terminal, or a retry in flight, starts over")
         XCTAssertTrue(policy.beginRetry())
         let start = ContinuousClock.now
         policy.recordLive(at: start)
         policy.networkChanged()
-        XCTAssertEqual(policy.attemptsUsed, 1, "a live terminal keeps its accounting")
+        XCTAssertEqual(policy.attemptsUsed, 1, "a live terminal keeps its accounting while live")
         policy.recordEnd(at: start.advanced(by: .seconds(1)))
-        XCTAssertEqual(policy.nextDelay, .seconds(2))
+        XCTAssertEqual(policy.nextDelay, .seconds(1), "and its next drop starts over, however brief its connection")
+        XCTAssertTrue(policy.beginRetry())
+        policy.recordLive(at: start.advanced(by: .seconds(2)))
+        policy.recordEnd(at: start.advanced(by: .seconds(3)))
+        XCTAssertEqual(policy.nextDelay, .seconds(2), "once: a later brief connection keeps counting")
     }
 
     func testOnlyAUsablePathThatChangedIsANewRoute() {

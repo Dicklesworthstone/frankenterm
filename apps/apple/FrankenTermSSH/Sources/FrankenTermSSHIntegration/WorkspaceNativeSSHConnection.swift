@@ -469,6 +469,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var nextLivenessProbe: ContinuousClock.Instant?
     /// The device took a new network route since the last liveness check.
     private var routeChanged = false
+    /// When a keepalive last left. libssh2 sends at most one per 2 s and
+    /// reports a skipped one as sent.
+    private var lastProbe: ContinuousClock.Instant?
+    private static let probeSpacing: Duration = .seconds(2)
     private var mux: MuxAttachment?
 
     /// One attachment to the machine's mux over this SSH command channel.
@@ -933,13 +937,21 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // make this the last probe. A last probe already out keeps its earlier
         // deadline: the hint never delays reporting a loss.
         if routeChanged {
-            routeChanged = false
             if event.accounting.receivedBytes != lastReceived || silentIntervals < liveness.missedReplies {
+                // One sent sooner would never leave: wait out the gap instead
+                // of waiting for its answer. No pending deadline is earlier,
+                // since an interval is at least 2 s.
+                if let lastProbe, now < lastProbe + Self.probeSpacing {
+                    nextLivenessProbe = lastProbe + Self.probeSpacing
+                    return
+                }
+                routeChanged = false
                 lastReceived = event.accounting.receivedBytes; silentIntervals = liveness.missedReplies
                 nextLivenessProbe = now + liveness.interval
-                if try await session.keepalive(driver: driver) == .unavailable { probing = false }
+                try await probe(driver: driver, now: now)
                 return
             }
+            routeChanged = false
         }
         if event.accounting.receivedBytes != lastReceived {
             lastReceived = event.accounting.receivedBytes; silentIntervals = 0
@@ -957,7 +969,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         nextLivenessProbe = now + liveness.interval
         silentIntervals += 1
         guard silentIntervals <= liveness.missedReplies else { throw TerminalTransportError.peerUnresponsive }
-        if try await session.keepalive(driver: driver) == .unavailable { probing = false }
+        try await probe(driver: driver, now: now)
+    }
+
+    private func probe(driver: NativeSSHDriver, now: ContinuousClock.Instant) async throws {
+        switch try await session.keepalive(driver: driver) {
+        case .sent: lastProbe = now
+        case .deferred: break
+        case .unavailable: probing = false
+        }
     }
 
     func requestResize(_ geometry: NativeSSHGeometry) async throws {

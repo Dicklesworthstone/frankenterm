@@ -10,6 +10,8 @@ public struct TerminalReconnectPolicy: Sendable {
 
     public private(set) var attemptsUsed = 0
     private var liveSince: ContinuousClock.Instant?
+    /// The network changed while live: the end that follows starts a new budget.
+    private var networkChangedWhileLive = false
 
     public init() {}
 
@@ -38,25 +40,26 @@ public struct TerminalReconnectPolicy: Sendable {
     }
 
     public mutating func recordEnd(at now: ContinuousClock.Instant = .now) {
-        if let liveSince, liveSince.duration(to: now) >= Self.stableConnectionDuration {
+        if networkChangedWhileLive { attemptsUsed = 0 }
+        else if let liveSince, liveSince.duration(to: now) >= Self.stableConnectionDuration {
             attemptsUsed = 0
         }
-        liveSince = nil
+        liveSince = nil; networkChangedWhileLive = false
     }
 
     /// A deliberate user retry starts a new budget. Returning to the foreground,
     /// selecting a machine or cancelling a timer does not call this method.
     public mutating func resetForUserRequest() {
         attemptsUsed = 0
-        liveSince = nil
+        liveSince = nil; networkChangedWhileLive = false
     }
 
     /// The network came back or changed interfaces (another Wi-Fi, cellular,
     /// a VPN coming up). Attempts on the old path say nothing about this one,
-    /// so a dropped terminal gets a new budget. A live one is unaffected.
+    /// so a terminal that is not live (dropped, or a retry still in flight)
+    /// gets a new budget, and a live one gets it when it next ends.
     public mutating func networkChanged() {
-        guard liveSince == nil else { return }
-        attemptsUsed = 0
+        if liveSince == nil { attemptsUsed = 0 } else { networkChangedWhileLive = true }
     }
 }
 

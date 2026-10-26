@@ -35,6 +35,10 @@ public struct TerminalConnectionIntent: Sendable {
     public private(set) var selectedMachineID: String?
     public private(set) var disconnected: Set<String> = []
     public private(set) var requiresNewSession: Set<String> = []
+    /// Machines whose attachment to existing mux panes was lost. Selecting one
+    /// may attach to those panes again, which creates no PTY; a new shell
+    /// still needs New Session.
+    private var reattachable: Set<String> = []
     private let inventory: [String], known: Set<String>, optedIn: Set<String>
     private var approvedConnections: Set<String> = []
     private var startedConnections: Set<String> = []
@@ -96,24 +100,25 @@ public struct TerminalConnectionIntent: Sendable {
 
     public mutating func terminalOpened(_ machineID: String) throws {
         try check(machineID)
-        explicitTerminals.remove(machineID); requiresNewSession.remove(machineID)
+        explicitTerminals.remove(machineID); requiresNewSession.remove(machineID); reattachable.remove(machineID)
     }
 
     /// A lost or normally ended terminal is not a request for another PTY.
     /// Reauthentication may prepare a transport, but only New Session removes
     /// this gate. Merely returning to its selected chip never does. A lost
-    /// attachment to existing mux panes is different: reattaching creates no
-    /// PTY, so its machine comes back to those panes without New Session.
+    /// attachment to existing mux panes may also attach to those panes again
+    /// on selection, since that creates no PTY; the gate still holds for any
+    /// route that would start a shell.
     public mutating func terminalEnded(_ machineID: String, reattachesExistingPanes: Bool = false) throws {
         try check(machineID)
-        explicitTerminals.remove(machineID)
-        if reattachesExistingPanes { requiresNewSession.remove(machineID) } else { requiresNewSession.insert(machineID) }
+        explicitTerminals.remove(machineID); requiresNewSession.insert(machineID)
+        if reattachesExistingPanes { reattachable.insert(machineID) } else { reattachable.remove(machineID) }
     }
 
     public mutating func disconnect(_ machineID: String) throws {
         try check(machineID)
         disconnected.insert(machineID); approvedConnections.remove(machineID)
-        startedConnections.remove(machineID); explicitTerminals.remove(machineID)
+        startedConnections.remove(machineID); explicitTerminals.remove(machineID); reattachable.remove(machineID)
     }
 
     public func shouldPrepare(_ machineID: String) -> Bool {
@@ -133,8 +138,9 @@ public struct TerminalConnectionIntent: Sendable {
         guard known.contains(machineID), !disconnected.contains(machineID),
               startedConnections.contains(machineID) || shouldPrepare(machineID) else { return .none }
         if explicitTerminals.contains(machineID), creation.permitsOpening(explicit: true) { return .explicit }
-        guard selectedMachineID == machineID, !requiresNewSession.contains(machineID),
-              creation.permitsOpening(explicit: false) else { return .none }
+        guard selectedMachineID == machineID, creation.permitsOpening(explicit: false),
+              !requiresNewSession.contains(machineID)
+                || (creation == .existingOnly && reattachable.contains(machineID)) else { return .none }
         return .onSelect
     }
 

@@ -172,6 +172,9 @@ protocol TerminalSessionFocus: AnyObject {
     /// Whether this machine is the one on screen now; a session connecting in
     /// the background waits to attach its view until it is.
     func shows(machineID: String) -> Bool
+    /// A terminal on this machine ended or was lost: only New Session may
+    /// start another shell there.
+    func requiresNewSession(_ machineID: String) -> Bool
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
     func detach(machineID: String, source: TerminalSource) async throws
@@ -869,7 +872,12 @@ final class TerminalSessionController {
     private var shouldOpenTerminal: Bool {
         guard focus?.permitsTerminalCreation == true, terminalRequested,
               route.sessionCreation.permitsOpening(explicit: explicitTerminalRequested) else { return false }
-        return explicitTerminalRequested || focus?.shows(machineID: target.machineID) == true
+        if explicitTerminalRequested { return true }
+        // Attaching to existing mux panes starts no shell. A shell after one
+        // ended or was lost, including the fallback when a reattached mux is
+        // gone, waits for New Session.
+        guard route.mux || focus?.requiresNewSession(target.machineID) == false else { return false }
+        return focus?.shows(machineID: target.machineID) == true
     }
 
     /// Each operation retains all partially constructed resources. Teardown
@@ -1014,7 +1022,7 @@ final class TerminalSessionController {
         } catch TerminalSessionJournalError.reviewRequired {
             if !stopped { phase = .failed("The previous session on this machine is still closing. Try again in a moment.") }
         } catch let failure as ConnectFailure {
-            if !stopped { dropped = retriesDrop; phase = .couldNotConnect(failure.help) }
+            if !stopped { dropped = retriesDrop && failure.unreachable; phase = .couldNotConnect(failure.help) }
         } catch {
             if !stopped { phase = .failed(Self.describe(error)) }
         }
@@ -1171,7 +1179,10 @@ final class TerminalSessionController {
         throw TerminalSessionJournalError.reviewRequired
     }
 
-    private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp }
+    /// `unreachable`: no route answered at all. Only that failure may end a
+    /// retry as another drop; a refused key, a changed host key or any other
+    /// answer from the machine never retries.
+    private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp; var unreachable = false }
     /// Each failed route, for `idevicesyslog` or Console: the screen shows
     /// only the explanation.
     private static let log = Logger(subsystem: "org.frankenterm.mobile", category: "connect")
@@ -1250,7 +1261,8 @@ final class TerminalSessionController {
             }
         }
         throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)
-            ?? .init(title: "Couldn't connect to \(target.machineName)", message: "No route answered.", remedy: .none))
+            ?? .init(title: "Couldn't connect to \(target.machineName)", message: "No route answered.", remedy: .none),
+            unreachable: true)
     }
 
     /// The desktop's default terminal font, bundled with its license, when it

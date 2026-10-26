@@ -103,21 +103,27 @@ final class TerminalConnectionIntentTests: XCTestCase {
         }
     }
 
-    func testALostMuxAttachmentReattachesOnSelectionWithoutNewSession() throws {
+    func testALostMuxAttachmentReattachesOnSelectionButStartsNoShell() throws {
         var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "build", group: work)
         try intent.connectionStarted("build")
         try intent.terminalOpened("build")
-        try intent.terminalEnded("build")
-        try intent.terminalOpened("build")
         try intent.terminalEnded("build", reattachesExistingPanes: true)
-        XCTAssertFalse(intent.requiresNewSession.contains("build"), "an earlier normal end does not linger")
+        XCTAssertTrue(intent.requiresNewSession.contains("build"), "a new shell there still needs New Session")
         XCTAssertTrue(intent.permitsReconnect("build"))
         try intent.connectionStarted("build")
         XCTAssertEqual(intent.opening("build", creation: .existingOnly), .onSelect)
+        XCTAssertEqual(intent.opening("build", creation: .onSelect), .none, "a route that would start a shell waits")
         try intent.select("gpu")
         XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "only the machine on screen opens")
-        try intent.disconnect("build")
         try intent.select("build")
+        try intent.terminalEnded("build")
+        XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "a normal end does not reattach")
+        try intent.terminalEnded("build", reattachesExistingPanes: true)
+        try intent.terminalOpened("build")
+        try intent.terminalEnded("build")
+        XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "nor does an earlier loss linger")
+        try intent.terminalEnded("build", reattachesExistingPanes: true)
+        try intent.disconnect("build")
         XCTAssertEqual(intent.opening("build", creation: .existingOnly), .none, "a disconnect still holds")
     }
 

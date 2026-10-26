@@ -55,7 +55,7 @@ private final class SceneMemorySigner: WorkspaceSSHSigning, @unchecked Sendable 
 /// ones; brought back, it listens on the same port again.
 private final class LoopbackRelay: @unchecked Sendable {
     private let queue = DispatchQueue(label: "loopback-relay")
-    private let target: NWEndpoint.Port
+    private var target: NWEndpoint.Port
     private var listener: NWListener?
     private var connections: [NWConnection] = []
     /// Bytes reach the relay and go no further, with no reset: a connection
@@ -69,6 +69,18 @@ private final class LoopbackRelay: @unchecked Sendable {
     }
 
     func up() async throws {
+        var attempts = 0
+        while true {
+            do { return try await listen() }
+            catch where port != 0 && attempts < 40 {
+                // The listener down() cancelled may hold the port for a moment.
+                attempts += 1
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+    }
+
+    private func listen() async throws {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port) ?? .any)
@@ -82,6 +94,7 @@ private final class LoopbackRelay: @unchecked Sendable {
                     continuation.resume(returning: listener.port?.rawValue ?? 0)
                 case .failed(let error):
                     listener.stateUpdateHandler = nil
+                    listener.cancel()
                     continuation.resume(throwing: error)
                 default: break
                 }
@@ -100,6 +113,12 @@ private final class LoopbackRelay: @unchecked Sendable {
     }
 
     func stall() { queue.sync { stalled = true } }
+
+    /// New connections reach another server on the same relay port.
+    func retarget(to port: UInt16) throws {
+        guard let port = NWEndpoint.Port(rawValue: port) else { throw TerminalModelError.invalid }
+        queue.sync { target = port }
+    }
 
     /// Runs on the relay's queue.
     private func relay(_ inbound: NWConnection) {
@@ -1280,16 +1299,20 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
 
-        // The connection survives the change: the probe is answered within its
-        // interval. After the shell's first prompt, nothing else would answer.
+        // The connection survives a burst of changes: each probe is answered
+        // within its interval. After the shell's first prompt nothing else
+        // would answer, and the second update comes while libssh2 still
+        // refuses another keepalive.
         try await Task.sleep(for: .seconds(3))
         scene.networkPathChanged(cellular)
+        try await Task.sleep(for: .seconds(1))
+        scene.networkPathChanged(wifi)
         try await Task.sleep(for: .seconds(13))
-        XCTAssertEqual(session.phase, .live, "a connection that survived a new route answers its probe and stays")
+        XCTAssertEqual(session.phase, .live, "a connection that survived new routes answers their probes and stays")
 
         // Stranded on the route the device left.
         relay.stall()
-        scene.networkPathChanged(wifi)
+        scene.networkPathChanged(cellular)
         let changed = ContinuousClock.now
         for _ in 0..<400 where !session.settled { try await Task.sleep(for: .milliseconds(50)) }
         let detected = ContinuousClock.now - changed
@@ -1298,6 +1321,149 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertLessThan(detected, .seconds(14), "one 10 s interval after the change, not three after the last byte")
         await scene.close()
         await assertReleased(session, connections: live.connections)
+    }
+
+    /// A retry that meets another host key (a server posing as the machine on
+    /// the network the phone came back to) is not a drop: it is the last try,
+    /// the machine needs attention, and a network change does not retry it.
+    func testARetryThatMeetsAnotherHostKeyIsTheLast() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init),
+              let impostorPort = environment["FT_LIVE_SSH_IMPOSTOR_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT and TEST_RUNNER_FT_LIVE_SSH_IMPOSTOR_PORT (an sshd with another host key)")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(machineIDs: ["alpha"], autoConnect: true, relayPort: relay.port)
+        let scene = live.scene
+        scene.networkPathChanged(.init(usable: true, interfaces: ["en0"]))
+        let first = try await connect(scene, "alpha")
+        XCTAssertEqual(first.phase, .live)
+
+        // The connection drops, and a retry reaches a server with another host key.
+        relay.down()
+        try relay.retarget(to: impostorPort)
+        try await relay.up()
+        for _ in 0..<300 where scene.sessions["alpha"] === first || scene.status(of: "alpha") != .attention {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let last = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertFalse(last === first, "it retried")
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+        XCTAssertFalse(last.dropped, "meeting another host key is not a drop")
+        guard case .couldNotConnect = last.phase else { return XCTFail("expected Couldn't connect, not \(last.phase)") }
+
+        // It is the last try: longer than any retry delay passes, and then
+        // the network changes, with no other.
+        try await Task.sleep(for: .seconds(5))
+        XCTAssertTrue(scene.sessions["alpha"] === last, "no retry follows it")
+        scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
+        try await Task.sleep(for: .seconds(4))
+        XCTAssertTrue(scene.sessions["alpha"] === last, "nor does a network change retry it")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A machine whose mux attachment dropped reattaches by itself, but if its
+    /// mux is gone by then, no shell opens in its place: it waits, signed in on
+    /// its direct route, for New Session. Needs the disposable mux.
+    func testAMachineWhoseMuxIsGoneAfterADropWaitsForNewSession() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init),
+              let command = environment["FT_LIVE_MUX_COMMAND"], let outPath = environment["FT_LIVE_SSH_OUT"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT, TEST_RUNNER_FT_LIVE_MUX_COMMAND and TEST_RUNNER_FT_LIVE_SSH_OUT")
+        }
+        // The mux answers until its pane writes this file.
+        let gone = "\(outPath).nomux-\(UUID().uuidString.prefix(8))"
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(muxCommand: "test ! -e \(gone) && \(command)", directAfterMux: true,
+                                       machineIDs: ["alpha"], autoConnect: true, relayPort: relay.port)
+        let scene = live.scene
+        scene.networkPathChanged(.init(usable: true, interfaces: ["en0"]))
+        let first = try await connect(scene, "alpha")
+        XCTAssertEqual(first.phase, .live)
+        XCTAssertFalse(first.shellOnly, "attached to the mux")
+        for _ in 0..<200 where first.muxState?.shown == nil || first.terminal == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let view = try shown(first)
+        try await type("echo gone > \(gone)", into: view)
+        let written = try await hostFile(gone, containing: "gone")
+        XCTAssertTrue(written.contains("gone"), "the pane wrote the file (contents: \(written))")
+        view.removeFromSuperview()
+
+        // The connection drops, and a retry signs in, but the mux is gone.
+        relay.down()
+        for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(25)) }
+        try await relay.up()
+        for _ in 0..<400 {
+            if let session = scene.sessions["alpha"], session !== first,
+               session.phase == .ready || session.phase == .live { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        // Nothing opens later either.
+        try await Task.sleep(for: .seconds(2))
+        let back = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertEqual(back.phase, .ready, "signed in, with no shell opened in place of the mux")
+        XCTAssertTrue(back.shellOnly, "on the direct route")
+        XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A network change while a machine is live gives its next drop a new
+    /// retry budget, however briefly it was connected: retries spent before
+    /// the change say nothing about the new network. Needs the disposable mux,
+    /// whose attachment reconnects to live.
+    func testANetworkChangeWhileLiveRenewsTheNextDropsRetries() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init),
+              let command = environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT and TEST_RUNNER_FT_LIVE_MUX_COMMAND")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(muxCommand: command, machineIDs: ["alpha"], autoConnect: true,
+                                       relayPort: relay.port)
+        let scene = live.scene
+        scene.networkPathChanged(.init(usable: true, interfaces: ["en0"]))
+        let first = try await connect(scene, "alpha")
+        XCTAssertEqual(first.phase, .live)
+
+        // A drop whose first retry is refused and whose second reattaches:
+        // two of its three retries are spent.
+        relay.down()
+        var seen: Set<UUID> = [first.id]
+        for _ in 0..<200 {
+            if let session = scene.sessions["alpha"] { seen.insert(session.id) }
+            if seen.count == 2, scene.sessions["alpha"]?.settled == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await relay.up()
+        for _ in 0..<400 where scene.sessions["alpha"] === first || scene.sessions["alpha"]?.phase != .live {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let again = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertEqual(again.phase, .live)
+
+        // The network changes while it is live, and then it drops again.
+        scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
+        try await Task.sleep(for: .seconds(1))
+        relay.down()
+        var retries = Set<UUID>()
+        func noteRetry() { if let session = scene.sessions["alpha"], session !== again { retries.insert(session.id) } }
+        for _ in 0..<300 where retries.isEmpty || scene.status(of: "alpha") != .attention {
+            noteRetry()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        noteRetry()
+        XCTAssertEqual(retries.count, TerminalReconnectPolicy.maximumAttempts, "a new budget after the network changed")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
     /// The Mac's export lists a machine's mux route before its direct routes.
