@@ -209,6 +209,59 @@ pub(crate) struct GlyphLayout {
     pub bearing_y: PixelLength,
     pub image: Option<Image>,
     pub scale: f64,
+    /// Converts this occurrence's shaper positions to the fitted bitmap's
+    /// coordinates. This survives physical bitmap scaling, which resets
+    /// `scale` to one, and is independent of the occurrence's actual offsets.
+    pub position_scale: GlyphPositionScale,
+}
+
+/// The raster's fitting scale and bitmap-strike correction, kept separately
+/// to preserve the same arithmetic as uncached glyph layout.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlyphPositionScale {
+    scale: f64,
+    metrics_only_scale: f64,
+}
+
+impl GlyphPositionScale {
+    pub(crate) fn apply(self, position: PixelLength) -> PixelLength {
+        position * self.scale * self.metrics_only_scale
+    }
+}
+
+/// One raster allocation, with the positions from its first use retained as
+/// the allocation-free common case. GPOS offsets and advances belong to each
+/// shaped occurrence, not to the glyph id: a mark can attach at a different
+/// position, or kerning can change the advance, without changing its bitmap.
+struct GlyphCacheEntry {
+    glyph: Rc<CachedGlyph>,
+    position_scale: GlyphPositionScale,
+}
+
+impl GlyphCacheEntry {
+    fn for_shaped_glyph(&self, info: &GlyphInfo) -> Rc<CachedGlyph> {
+        let x_offset = self.position_scale.apply(info.x_offset);
+        let y_offset = self.position_scale.apply(info.y_offset);
+        let x_advance = self.position_scale.apply(info.x_advance);
+        let glyph = &self.glyph;
+        if glyph.x_offset.get().to_bits() == x_offset.get().to_bits()
+            && glyph.y_offset.get().to_bits() == y_offset.get().to_bits()
+            && glyph.x_advance.get().to_bits() == x_advance.get().to_bits()
+        {
+            return Rc::clone(glyph);
+        }
+        Rc::new(CachedGlyph {
+            has_color: glyph.has_color,
+            brightness_adjust: glyph.brightness_adjust,
+            x_offset,
+            y_offset,
+            x_advance,
+            bearing_x: glyph.bearing_x,
+            bearing_y: glyph.bearing_y,
+            texture: glyph.texture.clone(),
+            scale: glyph.scale,
+        })
+    }
 }
 
 /// Caches a rendered glyph.
@@ -1222,7 +1275,7 @@ impl DecodedImage {
 /// A number of items here are AHashMaps rather than LfuCaches;
 /// eviction is managed by recreating Self when the Atlas is filled
 pub struct GlyphCache {
-    glyph_cache: AHashMap<GlyphKey, Rc<CachedGlyph>>,
+    glyph_cache: AHashMap<GlyphKey, GlyphCacheEntry>,
     pub atlas: Atlas,
     pub fonts: Rc<FontConfiguration>,
     image_cache: LfuCache<ImageCacheKey, DecodedImage>,
@@ -2032,12 +2085,13 @@ impl GlyphCache {
 
         if let Some(entry) = self.glyph_cache.get(&key as &dyn GlyphKeyTrait) {
             self.glyph_hits.add_one();
-            return Ok((Rc::clone(entry), true));
+            return Ok((entry.for_shaped_glyph(info), true));
         }
         self.glyph_misses.add_one();
 
-        let glyph = self.load_glyph(info, font, followed_by_space, num_cells)?;
-        self.glyph_cache.insert(key.to_owned(), Rc::clone(&glyph));
+        let entry = self.load_glyph(info, font, followed_by_space, num_cells)?;
+        let glyph = Rc::clone(&entry.glyph);
+        self.glyph_cache.insert(key.to_owned(), entry);
         Ok((glyph, false))
     }
 
@@ -2090,7 +2144,7 @@ impl GlyphCache {
         font: &Rc<LoadedFont>,
         followed_by_space: bool,
         num_cells: u8,
-    ) -> anyhow::Result<Rc<CachedGlyph>> {
+    ) -> anyhow::Result<GlyphCacheEntry> {
         let layout = Self::lay_out_glyph(
             &self.fonts.config(),
             info,
@@ -2118,7 +2172,10 @@ impl GlyphCache {
             // that we might have fallen back to
             log::trace!("{:?} {:?}", info, glyph);
         }
-        Ok(Rc::new(glyph))
+        Ok(GlyphCacheEntry {
+            glyph: Rc::new(glyph),
+            position_scale: layout.position_scale,
+        })
     }
 
     /// What [`Self::load_glyph`] computes before the atlas: the rasterized
@@ -2259,6 +2316,10 @@ impl GlyphCache {
                 bearing_x: PixelLength::zero(),
                 bearing_y: descender_adjust,
                 scale,
+                position_scale: GlyphPositionScale {
+                    scale,
+                    metrics_only_scale: 1.0,
+                },
             }
         } else {
             let raw_im = Image::with_rgba32(
@@ -2276,6 +2337,10 @@ impl GlyphCache {
             let x_offset = info.x_offset * scale * metrics_only_scale;
             let y_offset = info.y_offset * scale * metrics_only_scale;
             let x_advance = info.x_advance * scale * metrics_only_scale;
+            let position_scale = GlyphPositionScale {
+                scale,
+                metrics_only_scale,
+            };
 
             log::trace!(
                 "bearing_x={bearing_x:?} bearing_y={bearing_y:?} \
@@ -2308,6 +2373,7 @@ impl GlyphCache {
                 bearing_x,
                 bearing_y,
                 scale,
+                position_scale,
             }
         };
 
@@ -3412,6 +3478,130 @@ mod tests {
     }
 
     #[test]
+    fn glyph_cache_positions_each_occurrence_without_another_raster_upload() {
+        let (mut cache, metrics) = test_glyph_cache_with_atlas_size(2048);
+        let style = cache.fonts.config().font.clone();
+        let font = cache.fonts.resolve_font(&style).unwrap();
+        let config = cache.fonts.config();
+        // Include an inkless advance, combining marks and a color fallback.
+        // Shift their shaper positions explicitly so this regression remains
+        // sensitive even when a bundled face changes its GPOS tables.
+        for text in ["A", " ", "x\u{301}\u{323}", "\u{1f600}"] {
+            let infos = font
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap();
+            assert!(!infos.is_empty());
+            for info in infos {
+                let original = cache
+                    .cached_glyph(&info, &style, false, &font, &metrics, info.num_cells)
+                    .unwrap();
+                let version = cache.atlas.version();
+                let entries = cache.glyph_cache.len();
+                let original_positions = (original.x_offset, original.y_offset, original.x_advance);
+                let mut shifted = info.clone();
+                shifted.x_offset += PixelLength::new(2.75);
+                shifted.y_offset -= PixelLength::new(1.5);
+                shifted.x_advance += PixelLength::new(3.25);
+                for occurrence in [&shifted, &info, &shifted] {
+                    // Re-running the uncached raster/layout path is the oracle;
+                    // a cache hit must reproduce its positions and fit geometry.
+                    let expected = GlyphCache::lay_out_glyph(
+                        &config,
+                        occurrence,
+                        &font,
+                        false,
+                        occurrence.num_cells,
+                    )
+                    .unwrap();
+                    let (actual, hit) = cache
+                        .cached_glyph_for_subpixel_bin_with_status(
+                            occurrence,
+                            &style,
+                            false,
+                            &font,
+                            &metrics,
+                            occurrence.num_cells,
+                            SubpixelBin::Quarter0,
+                        )
+                        .unwrap();
+                    assert!(hit);
+                    assert_eq!(actual.x_offset, expected.x_offset);
+                    assert_eq!(actual.y_offset, expected.y_offset);
+                    assert_eq!(actual.x_advance, expected.x_advance);
+                    assert_eq!(actual.bearing_x, expected.bearing_x);
+                    assert_eq!(actual.bearing_y, expected.bearing_y);
+                    assert_eq!(actual.scale.to_bits(), expected.scale.to_bits());
+                    assert_eq!(cache.glyph_cache.len(), entries);
+                    assert_eq!(cache.atlas.version(), version, "no bitmap upload on a hit");
+                    match (&original.texture, &actual.texture) {
+                        (Some(original), Some(actual)) => {
+                            assert!(Rc::ptr_eq(&original.texture, &actual.texture));
+                            assert_eq!(original.coords, actual.coords);
+                            assert_eq!(original.version, actual.version);
+                        }
+                        (None, None) => {}
+                        _ => panic!("position changes must preserve ink presence"),
+                    }
+                    if occurrence == &info && text == "A" {
+                        assert!(Rc::ptr_eq(&original, &actual));
+                    } else if occurrence != &info {
+                        assert!(!Rc::ptr_eq(&original, &actual));
+                    }
+                }
+                assert_eq!(
+                    original_positions,
+                    (original.x_offset, original.y_offset, original.x_advance),
+                    "previously bound shapes retain their positions"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_position_scale_survives_physical_bitmap_scaling() {
+        let info = GlyphInfo {
+            #[cfg(debug_assertions)]
+            text: "\u{301}".into(),
+            only_char: Some('\u{301}'),
+            is_space: false,
+            num_cells: 0,
+            cluster: 1,
+            font_idx: 1,
+            glyph_pos: 7,
+            x_advance: PixelLength::new(8.0),
+            y_advance: PixelLength::zero(),
+            x_offset: PixelLength::new(-2.0),
+            y_offset: PixelLength::new(6.0),
+        };
+        let entry = GlyphCacheEntry {
+            glyph: Rc::new(CachedGlyph {
+                has_color: false,
+                brightness_adjust: 1.0,
+                x_offset: PixelLength::zero(),
+                y_offset: PixelLength::zero(),
+                x_advance: PixelLength::zero(),
+                bearing_x: PixelLength::new(1.0),
+                bearing_y: PixelLength::new(3.0),
+                texture: None,
+                // The bitmap has already been physically resized. This scale
+                // must not replace the retained shaper-to-bitmap conversion.
+                scale: 1.0,
+            }),
+            position_scale: GlyphPositionScale {
+                scale: 0.5,
+                metrics_only_scale: 0.75,
+            },
+        };
+        let positioned = entry.for_shaped_glyph(&info);
+        assert_eq!(positioned.x_offset, PixelLength::new(-0.75));
+        assert_eq!(positioned.y_offset, PixelLength::new(2.25));
+        assert_eq!(positioned.x_advance, PixelLength::new(3.0));
+        assert_eq!(positioned.bearing_x, PixelLength::new(1.0));
+        assert_eq!(positioned.bearing_y, PixelLength::new(3.0));
+        assert_eq!(positioned.scale.to_bits(), 1.0f64.to_bits());
+    }
+
+    #[test]
     fn config_changed_refreshes_frame_interval_from_explicit_config() {
         let (mut cache, _) = test_glyph_cache();
         cache.min_frame_duration = Duration::ZERO;
@@ -4228,13 +4418,20 @@ mod tests {
             let key = cache
                 .glyph_cache
                 .iter()
-                .find(|(_, value)| Rc::ptr_eq(value, &correct))
+                .find(|(_, value)| Rc::ptr_eq(&value.glyph, &correct))
                 .map(|(key, _)| key.clone())
                 .unwrap();
+            let position_scale = cache.glyph_cache[&key].position_scale;
 
             // Plant old-scale pixels under a current, production-generated key.
             // The real lookup must hit the canary; the output oracle must fail.
-            cache.glyph_cache.insert(key.clone(), stale);
+            cache.glyph_cache.insert(
+                key.clone(),
+                GlyphCacheEntry {
+                    glyph: stale,
+                    position_scale,
+                },
+            );
             let (corrupt, hit) = cache
                 .cached_glyph_for_subpixel_bin_with_status(
                     &info,
@@ -4254,17 +4451,20 @@ mod tests {
 
             cache.glyph_cache.insert(
                 key,
-                Rc::new(CachedGlyph {
-                    texture: None,
-                    has_color: correct.has_color,
-                    brightness_adjust: correct.brightness_adjust,
-                    x_offset: correct.x_offset,
-                    y_offset: correct.y_offset,
-                    x_advance: correct.x_advance,
-                    bearing_x: correct.bearing_x,
-                    bearing_y: correct.bearing_y,
-                    scale: correct.scale,
-                }),
+                GlyphCacheEntry {
+                    glyph: Rc::new(CachedGlyph {
+                        texture: None,
+                        has_color: correct.has_color,
+                        brightness_adjust: correct.brightness_adjust,
+                        x_offset: correct.x_offset,
+                        y_offset: correct.y_offset,
+                        x_advance: correct.x_advance,
+                        bearing_x: correct.bearing_x,
+                        bearing_y: correct.bearing_y,
+                        scale: correct.scale,
+                    }),
+                    position_scale,
+                },
             );
             let missing = cache
                 .cached_glyph(&info, &style, false, &font, &metrics, 1)

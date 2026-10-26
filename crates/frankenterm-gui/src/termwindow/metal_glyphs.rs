@@ -36,10 +36,10 @@
 //! - Shaper output is kept by font, style, text, paragraph context, direction,
 //!   presentation and cell mapping, in an LFU cache as large as WebGpu's
 //!   (`shape_cache_size`). Contextual runs reuse only an exact shaping input.
-//! - A laid-out glyph is kept by WebGpu's glyph key: the font, the fallback
+//! - A rasterized glyph is kept by WebGpu's glyph key: the font, the fallback
 //!   face, the glyph, its cell count, the font style and whether a space
-//!   follows it. As in WebGpu, the first layout of a key (with its shaper
-//!   offsets) serves every later use of it.
+//!   follows it. Each shaped occurrence applies its own shaper offsets to
+//!   the cached bitmap's bearings and fit scale.
 //!
 //! Every frame touches one representative per cached atlas page lifetime,
 //! so the atlases keep the glyphs without scanning the whole glyph cache.
@@ -56,11 +56,12 @@
 
 use super::metal_images::{ImageSlices, Slice};
 use crate::customglyph::BlockKey;
-use crate::glyphcache::GlyphCache;
+use crate::glyphcache::{GlyphCache, GlyphPositionScale};
 use crate::shapecache::{BorrowedShapeCacheKey, ShapeCacheKey, ShapeCacheKeyTrait};
 use crate::utilsprites::RenderMetrics;
 use config::TextStyle;
 use frankenterm_font::shaper::PresentationWidth;
+use frankenterm_font::units::PixelLength;
 use frankenterm_font::{ClearShapeCache, FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use frankenterm_gui::line_shaping::{cluster_shaping_context, line_paragraph_context, shape_runs};
 use frankenterm_gui::metal_scene::{
@@ -101,6 +102,29 @@ enum LaidGlyph {
         y_adjust: f32,
         brightness: f32,
     },
+}
+
+/// The bitmap and fit geometry shared by every occurrence of a font glyph.
+/// Contextual positioning is applied after lookup, so combining marks can
+/// reuse one atlas slot while attaching at different positions.
+#[derive(Debug, Clone, Copy)]
+struct CachedFontGlyph {
+    slot: AtlasSlot,
+    bearing_x: PixelLength,
+    bearing_y: PixelLength,
+    position_scale: GlyphPositionScale,
+    brightness: f32,
+}
+
+impl CachedFontGlyph {
+    fn for_shaped_glyph(self, info: &GlyphInfo) -> LaidGlyph {
+        LaidGlyph::Font {
+            slot: self.slot,
+            x_adjust: (self.position_scale.apply(info.x_offset) + self.bearing_x).get() as f32,
+            y_adjust: (self.position_scale.apply(info.y_offset) + self.bearing_y).get() as f32,
+            brightness: self.brightness,
+        }
+    }
 }
 
 /// One glyph of a shaped cluster or run: its shaper cell count, and what
@@ -146,8 +170,9 @@ pub(crate) struct FontGlyphs {
     lock_style: Rc<TextStyle>,
     /// Shaper output keyed by the complete cluster or paragraph context.
     shapes: LfuCache<ShapeCacheKey<u32>, Rc<Vec<GlyphInfo>>>,
-    /// Laid-out font glyphs, `None` for inkless ones.
-    glyphs: HashMap<GlyphKey, Option<LaidGlyph>>,
+    /// Rasterized font glyphs, `None` for inkless ones. Shaper positions are
+    /// applied per occurrence after lookup, not retained under a glyph id.
+    glyphs: HashMap<GlyphKey, Option<CachedFontGlyph>>,
     /// Custom block glyphs placed in the grayscale atlas.
     blocks: HashMap<BlockKey, PlacedGlyph>,
     /// Line sprites placed in the grayscale atlas (ft-yccm0.4.7.3).
@@ -495,7 +520,7 @@ impl FontGlyphs {
             followed_by_space,
         };
         if let Some(laid) = self.glyphs.get(&key) {
-            return *laid;
+            return laid.map(|glyph| glyph.for_shaped_glyph(info));
         }
         let layout = match GlyphCache::lay_out_glyph(
             &self.config,
@@ -516,20 +541,21 @@ impl FontGlyphs {
         let laid = match &layout.image {
             Some(image) => {
                 let slot = self.place_image(image, layout.has_color, "a glyph")?;
-                Some(LaidGlyph::Font {
+                Some(CachedFontGlyph {
                     slot,
-                    x_adjust: (layout.x_offset + layout.bearing_x).get() as f32,
-                    y_adjust: (layout.y_offset + layout.bearing_y).get() as f32,
+                    bearing_x: layout.bearing_x,
+                    bearing_y: layout.bearing_y,
+                    position_scale: layout.position_scale,
                     brightness: layout.brightness_adjust,
                 })
             }
             None => None,
         };
         self.glyphs.insert(key, laid);
-        if let Some(LaidGlyph::Font { slot, .. }) = laid {
+        if let Some(CachedFontGlyph { slot, .. }) = laid {
             self.cached_pages.insert(slot);
         }
-        laid
+        laid.map(|glyph| glyph.for_shaped_glyph(info))
     }
 
     /// Retains only atlas-independent shaper output. Borrowed keys avoid
@@ -753,6 +779,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contextual_positions_share_one_metal_raster_and_keep_fresh_layout_offsets() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let style = config.font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config.clone(), renderer, &metrics);
+        let style_id = glyphs.style_id(&style);
+        for text in ["A", " ", "x\u{301}\u{323}", "\u{1f600}"] {
+            let infos = font
+                .blocking_shape(text, None, wezterm_bidi::Direction::LeftToRight, None, None)
+                .unwrap();
+            assert!(!infos.is_empty());
+            for info in infos {
+                let first = glyphs.lay_out(style_id, &font, &info, false);
+                let entries = glyphs.glyphs.len();
+                let pages: Vec<_> = glyphs.cached_pages.slots().copied().collect();
+                let mut shifted = info.clone();
+                shifted.x_offset += PixelLength::new(7.25);
+                shifted.y_offset -= PixelLength::new(3.5);
+                for occurrence in [&shifted, &info] {
+                    let expected = GlyphCache::lay_out_glyph(
+                        &config,
+                        occurrence,
+                        &font,
+                        false,
+                        occurrence.num_cells,
+                    )
+                    .unwrap();
+                    let actual = glyphs.lay_out(style_id, &font, occurrence, false);
+                    match (first, actual) {
+                        (Some(first), Some(actual)) => {
+                            assert!(expected.image.is_some());
+                            let (first, _) = glyphs.place(first, VerticalAlign::BaseLine);
+                            let (actual, _) = glyphs.place(actual, VerticalAlign::BaseLine);
+                            assert_eq!(actual.slot, first.slot, "reuse the same atlas allocation");
+                            let x = (expected.x_offset + expected.bearing_x).get() as f32;
+                            let y = (expected.y_offset + expected.bearing_y).get() as f32;
+                            assert_eq!(
+                                actual.offset,
+                                [
+                                    quad_origin(x),
+                                    quad_origin(glyphs.cell_height + (glyphs.descender - y)),
+                                ],
+                                "each occurrence matches uncached glyph placement"
+                            );
+                        }
+                        (None, None) => assert!(expected.image.is_none()),
+                        _ => panic!("position changes must preserve ink presence"),
+                    }
+                    assert_eq!(glyphs.glyphs.len(), entries);
+                    assert_eq!(
+                        glyphs.cached_pages.slots().copied().collect::<Vec<_>>(),
+                        pages
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn contextual_shapes_hit_across_atlas_resets_but_not_fallback_changes() {
         config::use_test_configuration();
         let config = config::configuration();
@@ -852,7 +941,7 @@ mod tests {
             .glyphs
             .values()
             .filter_map(|laid| match laid {
-                Some(LaidGlyph::Font { slot, .. }) => Some(slot),
+                Some(CachedFontGlyph { slot, .. }) => Some(slot),
                 _ => None,
             })
             .chain(glyphs.blocks.values().map(|placed| &placed.slot))
