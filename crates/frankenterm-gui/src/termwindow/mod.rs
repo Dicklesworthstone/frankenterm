@@ -123,6 +123,7 @@ pub mod keyevent;
 mod metal_cells;
 mod metal_chrome;
 mod metal_glyphs;
+mod metal_hyperlinks;
 mod metal_images;
 mod metal_render_thread;
 mod metal_window;
@@ -5410,6 +5411,7 @@ impl TermWindow {
             &self.fonts,
             &self.render_metrics,
             &metal,
+            None,
             |window, images_loading| {
                 let outcome = match window {
                     Some(window) => metal.render_window(width, height, window),

@@ -15,8 +15,9 @@
 //! so the frame itself can be built on the window's render thread
 //! (ft-yccm0.4.1.2) with that thread's own fonts.
 
+use super::metal_hyperlinks::{HyperlinkRowCache, PaneHyperlinks};
 use crate::colorease::ColorEase;
-use crate::selection::SelectionRange;
+use crate::selection::{FrameHyperlinks, SelectionRange};
 use crate::termwindow::metal_glyphs::{FallbackReady, FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -26,7 +27,8 @@ use frankenterm_gui::metal_scene::{
     reverse_video_cursor_applies,
 };
 use frankenterm_renderer_metal::{
-    BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
+    BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, PixelRect,
+    TextUniforms,
 };
 use mux::localpane::LocalPane;
 use mux::pane::{Pane, PaneId};
@@ -83,7 +85,9 @@ fn visible(color: SrgbaTuple) -> Option<SrgbaTuple> {
 /// One pane's live Metal frame state.
 pub(crate) struct MetalFrame {
     pane_id: PaneId,
+    owner: FrameHyperlinks,
     mirror: RenderMirror,
+    hyperlinks: HyperlinkRowCache,
     scene: MetalScene,
     glyphs: FontGlyphs,
     /// The cursor and the pane's focus as last drawn, and when either last
@@ -95,6 +99,26 @@ pub(crate) struct MetalFrame {
 impl MetalFrame {
     pub(crate) fn scene(&self) -> &MetalScene {
         &self.scene
+    }
+
+    pub(crate) fn hyperlinks(
+        &mut self,
+        inputs: &MetalFrameInputs,
+        geometry: Option<[usize; 12]>,
+        clip: PixelRect,
+        background: &BackgroundUniforms,
+    ) -> Option<Arc<PaneHyperlinks>> {
+        self.hyperlinks.update(
+            inputs.pane.as_ref()?,
+            &self.mirror,
+            geometry,
+            clip,
+            background,
+            inputs
+                .compose
+                .as_ref()
+                .and_then(|compose| compose.text.as_deref()),
+        )
     }
 }
 
@@ -283,6 +307,7 @@ impl MetalFrame {
         let mut frame = match slot.take() {
             Some(frame)
                 if frame.pane_id == pane_id
+                    && frame.owner.belongs_to(pane)
                     && frame
                         .glyphs
                         .serves(fonts, metal, metrics, config.generation()) =>
@@ -291,7 +316,9 @@ impl MetalFrame {
             }
             _ => MetalFrame {
                 pane_id,
+                owner: FrameHyperlinks::new(pane),
                 mirror: RenderMirror::new(),
+                hyperlinks: HyperlinkRowCache::default(),
                 scene: MetalScene::new(),
                 glyphs: FontGlyphs::new(
                     Rc::clone(fonts),
