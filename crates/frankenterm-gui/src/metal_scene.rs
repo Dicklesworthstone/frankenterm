@@ -41,10 +41,11 @@
 //! Glyphs come from a [`GlyphSource`]: the GUI's fonts placing them in the
 //! renderer's atlases, or a synthetic source in tests.
 
+use frankenterm_renderer_metal::cell_text::TextRowMode;
 use frankenterm_renderer_metal::{
     AtlasSlot, CellBg, CellBgGrid, CellText, CellTextGrid, GridExtent, apply_hsb,
 };
-use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow, RenderMirror};
+use mux::render_mirror::{MirrorCell, MirrorColor, MirrorLineMode, MirrorRow, RenderMirror};
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline, unicode_column_width};
@@ -221,6 +222,9 @@ pub struct SceneStyle<'a> {
     /// boundary are sliced at the pixels that overlay actually covers.
     pub cell_width: f32,
     pub grid_origin_x: f32,
+    /// Vertical geometry for independently clipped DEC double-height halves.
+    pub cell_height: f32,
+    pub grid_origin_y: f32,
     /// `bold_brightens_ansi_colors` is enabled.
     pub bold_brightens: bool,
     /// The selection's text color; `None` keeps each cell's foreground.
@@ -468,6 +472,10 @@ struct BuiltRow {
     stable: Option<StableRowIndex>,
     generation: u64,
     selection: Range<usize>,
+    mode: TextRowMode,
+    /// A double-height half may cover a different number of pixel centers
+    /// after a scroll when the cell height is fractional.
+    clip_phase: Option<u32>,
     /// The cursor, when it is on this row.
     cursor: Option<RowCursor>,
     /// The row's blinking text, and the levels it was drawn at; `None` when
@@ -498,9 +506,9 @@ pub struct MetalScene {
     first: Option<StableRowIndex>,
     hover: Option<Arc<Hyperlink>>,
     style_generation: Option<u64>,
-    /// Cell width and fractional origin as bits: integer translations move
+    /// Cell size and fractional origin as bits: integer translations move
     /// the existing instances, but a different pixel phase can move a cut.
-    text_geometry: Option<[u32; 2]>,
+    text_geometry: Option<[u32; 4]>,
     reverse_video: bool,
 }
 
@@ -584,6 +592,8 @@ fn cell_colors(
     }
 }
 
+type ImageGlyph = (usize, PlacedGlyph);
+
 /// The instances that draw a row's images (ft-yccm0.4.7.2), as WebGpu draws
 /// a line's image cells: every image of a cell over each of the cell's
 /// columns, column by column; those at a negative z-index first, the rest
@@ -596,7 +606,7 @@ fn image_instances(
     cols: usize,
     composed: &Range<usize>,
     glyphs: &mut dyn GlyphSource,
-) -> (Vec<CellText>, Vec<CellText>) {
+) -> (Vec<ImageGlyph>, Vec<ImageGlyph>) {
     let (mut under, mut over) = (Vec::new(), Vec::new());
     let images = row.images();
     let mut start = 0;
@@ -619,9 +629,7 @@ fn image_instances(
                 let Some(placed) = glyphs.image_cell(&image.image) else {
                     continue;
                 };
-                // Image texels keep their own colors at full strength.
-                let instance =
-                    CellText::new(column as u16, [255; 4]).with_glyph(&placed.slot, placed.offset);
+                let instance = (column, placed);
                 if image.image.z_index() < 0 {
                     under.push(instance);
                 } else {
@@ -691,21 +699,89 @@ fn text_color(
     drawn_fg(style, fg, under, blink)
 }
 
+fn text_row_mode(mode: MirrorLineMode) -> TextRowMode {
+    match mode {
+        MirrorLineMode::SingleWidth => TextRowMode::SingleWidth,
+        MirrorLineMode::DoubleWidth => TextRowMode::DoubleWidth,
+        MirrorLineMode::DoubleHeightTop => TextRowMode::DoubleHeightTop,
+        MirrorLineMode::DoubleHeightBottom => TextRowMode::DoubleHeightBottom,
+    }
+}
+
+/// A glyph's screen geometry. Atlas origins remain source texels, sizes
+/// are framebuffer pixels, and phase locates a cut inside a doubled texel.
+/// Keeping these as values reuses the same cached bitmap for every line mode.
+struct PreparedGlyph {
+    col: usize,
+    slot: AtlasSlot,
+    offset: [i64; 2],
+    phase: [u8; 2],
+    scale: [u32; 2],
+}
+
+fn prepare_glyph(
+    col: usize,
+    glyph: PlacedGlyph,
+    mode: TextRowMode,
+    row: u32,
+    style: &SceneStyle<'_>,
+) -> Option<PreparedGlyph> {
+    let scale = mode.scale();
+    let mut prepared = PreparedGlyph {
+        col: col.checked_mul(scale[0] as usize)?,
+        slot: AtlasSlot {
+            width: glyph.slot.width.checked_mul(scale[0])?,
+            height: glyph.slot.height.checked_mul(scale[1])?,
+            ..glyph.slot
+        },
+        offset: [
+            i64::from(glyph.offset[0]) * i64::from(scale[0]),
+            i64::from(glyph.offset[1]) * i64::from(scale[1]),
+        ],
+        phase: [0, 0],
+        scale,
+    };
+    if mode.is_double_height() {
+        let top = style.grid_origin_y + row as f32 * style.cell_height;
+        let origin = top.floor();
+        if mode == TextRowMode::DoubleHeightBottom {
+            // Anchor this half to the previous physical row. The difference
+            // of snapped origins also handles fractional heights and a
+            // bottom half exposed at the top of a scrolled viewport.
+            let previous = style.grid_origin_y + (row as f32 - 1.0) * style.cell_height;
+            prepared.offset[1] += (previous.floor() - origin) as i64;
+        }
+        let first_pixel = ((top - 0.5).ceil() - origin) as i64;
+        let end_pixel = ((top + style.cell_height - 0.5).ceil() - origin) as i64;
+        let height = i64::from(prepared.slot.height);
+        let start = (first_pixel - prepared.offset[1]).clamp(0, height) as u32;
+        let end = (end_pixel - prepared.offset[1]).clamp(0, height) as u32;
+        if start >= end {
+            return None;
+        }
+        prepared.slot.y = prepared.slot.y.checked_add(start / scale[1])?;
+        prepared.slot.height = end - start;
+        prepared.offset[1] += i64::from(start);
+        prepared.phase[1] = (start % scale[1]) as u8;
+    }
+    Some(prepared)
+}
+
 /// A cropped atlas rectangle with exactly the original glyph's texels and
 /// position. Re-anchor the rare strip whose added offset would overflow
 /// i16, instead of wrapping the offset or shifting the glyph on screen.
 fn glyph_strip(
-    shaped: &ShapedGlyph,
+    glyph: &PreparedGlyph,
     range: Range<u32>,
     color: [u8; 4],
     style: &SceneStyle<'_>,
     cols: u32,
 ) -> Option<CellText> {
-    if range.is_empty() || range.end > shaped.glyph.slot.width {
+    if range.is_empty() || range.end > glyph.slot.width {
         return None;
     }
-    let mut col = u16::try_from(shaped.cell).ok()?;
-    let offset = i64::from(shaped.glyph.offset[0]) + i64::from(range.start);
+    let mut col = u16::try_from(glyph.col).ok()?;
+    let offset = glyph.offset[0] + i64::from(range.start);
     let offset = match i16::try_from(offset) {
         Ok(offset) => offset,
         Err(_) => {
@@ -722,11 +798,71 @@ fn glyph_strip(
         }
     };
     let slot = AtlasSlot {
-        x: shaped.glyph.slot.x.checked_add(range.start)?,
+        x: glyph
+            .slot
+            .x
+            .checked_add((u32::from(glyph.phase[0]) + range.start) / glyph.scale[0])?,
         width: range.end.checked_sub(range.start)?,
-        ..shaped.glyph.slot
+        ..glyph.slot
     };
-    Some(CellText::new(col, color).with_glyph(&slot, [offset, shaped.glyph.offset[1]]))
+    Some(
+        CellText::new(col, color)
+            .with_glyph(&slot, [offset, i16::try_from(glyph.offset[1]).ok()?])
+            .with_texture_phase([
+                ((u32::from(glyph.phase[0]) + range.start) % glyph.scale[0]) as u8,
+                glyph.phase[1],
+            ]),
+    )
+}
+
+fn sprite_instance(
+    text: &CellTextGrid,
+    row: u32,
+    col: usize,
+    glyph: PlacedGlyph,
+    color: [u8; 4],
+    style: &SceneStyle<'_>,
+) -> Option<CellText> {
+    let prepared = prepare_glyph(col, glyph, text.row_mode(row), row, style)?;
+    glyph_strip(
+        &prepared,
+        0..prepared.slot.width,
+        color,
+        style,
+        text.extent().cols,
+    )
+}
+
+/// A cursor belongs to its physical row, including the underline, hollow
+/// border, lock icon and composition indicator. Enlarge its width on DEC
+/// lines without hiding half of its height with the text's half-row crop.
+fn cursor_instance(
+    text: &CellTextGrid,
+    row: u32,
+    col: usize,
+    glyph: PlacedGlyph,
+    color: [u8; 4],
+    style: &SceneStyle<'_>,
+) -> Option<CellText> {
+    let mode = text.row_mode(row);
+    let sprite_mode = if mode.is_double_height() {
+        TextRowMode::DoubleWidth
+    } else {
+        mode
+    };
+    let prepared = prepare_glyph(col, glyph, sprite_mode, row, style)?;
+    let instance = glyph_strip(
+        &prepared,
+        0..prepared.slot.width,
+        color,
+        style,
+        text.extent().cols,
+    )?;
+    Some(if mode.is_double_height() {
+        instance.with_unscaled_y()
+    } else {
+        instance
+    })
 }
 
 /// Draw a glyph using no more than five disjoint strips: the selection and
@@ -742,8 +878,12 @@ fn push_text_glyph(
     text_fg: SrgbaTuple,
     bg: SrgbaTuple,
 ) {
-    let width = shaped.glyph.slot.width;
-    if width == 0 || shaped.glyph.slot.height == 0 {
+    let mode = text.row_mode(row);
+    let Some(prepared) = prepare_glyph(shaped.cell, shaped.glyph, mode, row, style) else {
+        return;
+    };
+    let width = prepared.slot.width;
+    if width == 0 || prepared.slot.height == 0 {
         return;
     }
     let cursor = built.cursor.as_ref().filter(|cursor| {
@@ -754,7 +894,7 @@ fn push_text_glyph(
             || cursor.blink.is_some()
     });
     let mut emit = |range, color| {
-        if let Some(instance) = glyph_strip(shaped, range, color, style, text.extent().cols) {
+        if let Some(instance) = glyph_strip(&prepared, range, color, style, text.extent().cols) {
             text.push(row, instance);
         }
     };
@@ -771,10 +911,12 @@ fn push_text_glyph(
     // The shader places the glyph on integer pixels. An overlay beginning
     // at x includes the first pixel center >= x, so ceil(x - 0.5) is its
     // integer cut, including at fractional pane origins and cell widths.
-    let left = (style.grid_origin_x + shaped.cell as f32 * style.cell_width).floor()
-        + f32::from(shaped.glyph.offset[0]);
+    let left = (style.grid_origin_x + prepared.col as f32 * style.cell_width).floor()
+        + prepared.offset[0] as f32;
     let edge = |col: usize| {
-        ((style.grid_origin_x + col as f32 * style.cell_width - 0.5).ceil() - left)
+        ((style.grid_origin_x + col as f32 * style.cell_width * prepared.scale[0] as f32 - 0.5)
+            .ceil()
+            - left)
             .clamp(0.0, width as f32) as u32
     };
     let selection = if built.selection.is_empty() {
@@ -945,7 +1087,9 @@ impl MetalScene {
         let extent = GridExtent::new(rows.len(), dimensions.cols);
         let text_geometry = [
             style.cell_width.to_bits(),
+            style.cell_height.to_bits(),
             (style.grid_origin_x - style.grid_origin_x.floor()).to_bits(),
+            (style.grid_origin_y - style.grid_origin_y.floor()).to_bits(),
         ];
         let mut update = SceneUpdate {
             full: self.cells.extent() != extent
@@ -990,6 +1134,7 @@ impl MetalScene {
         .then(|| cursor.y - mirror.first())
         .and_then(|row| usize::try_from(row).ok());
         for (row, mirror_row) in rows.iter().enumerate() {
+            let mode = text_row_mode(mirror_row.line_mode());
             let previous = &self.built[row];
             let same_cells = previous.stable == Some(mirror_row.stable())
                 && previous.generation == mirror_row.generation();
@@ -997,6 +1142,11 @@ impl MetalScene {
                 stable: Some(mirror_row.stable()),
                 generation: mirror_row.generation(),
                 selection: selection(mirror_row.stable()),
+                mode,
+                clip_phase: mode.is_double_height().then(|| {
+                    let top = style.grid_origin_y + row as f32 * style.cell_height;
+                    (top - top.floor()).to_bits()
+                }),
                 cursor: (cursor_row == Some(row)).then(|| match &style.compose {
                     Some(compose) => RowCursor::compose(
                         compose,
@@ -1079,8 +1229,11 @@ impl MetalScene {
     ) {
         let grid_row = row as u32;
         let cols = self.cells.extent().cols;
+        let scale_x = built.mode.scale()[0] as usize;
+        let logical_cols = (cols as usize).div_ceil(scale_x);
         self.cells.fill_row(grid_row, CellBg::DEFAULT);
         self.text.clear_row(grid_row);
+        self.text.set_row_mode(grid_row, built.mode);
         // Decorations first: the WebGpu renderer draws its line sprites, one
         // per cell, in the layer under every glyph, in the underline color
         // whatever the selection or cursor do to the text, and also under
@@ -1126,16 +1279,18 @@ impl MetalScene {
                 }
                 color => style.palette.resolve_fg(color.to_attribute()),
             };
-            let end = (cell.col() + cell.width().max(1)).min(cols as usize);
+            let end = (cell.col() + cell.width().max(1)).min(logical_cols);
             for col in cell.col()..end {
                 let color = if built.selection.contains(&col) {
                     selection_tinted(color, selection_opaque, tint)
                 } else {
                     rgba8(color)
                 };
-                let instance =
-                    CellText::new(col as u16, color).with_glyph(&sprite.slot, sprite.offset);
-                self.text.push(grid_row, instance);
+                if let Some(instance) =
+                    sprite_instance(&self.text, grid_row, col, sprite, color, style)
+                {
+                    self.text.push(grid_row, instance);
+                }
             }
         }
         // A cursor sprite: a hollow block or an underline goes after the
@@ -1154,8 +1309,7 @@ impl MetalScene {
                     .map_or(1, |cell| cell.width().clamp(1, 2)),
             };
             let sprite = glyphs.cursor_sprite(shape, width as u8)?;
-            let instance =
-                CellText::new(cursor.col as u16, color).with_glyph(&sprite.slot, sprite.offset);
+            let instance = cursor_instance(&self.text, grid_row, cursor.col, sprite, color, style)?;
             Some((shape, instance))
         });
         if let Some((shape, instance)) = cursor_sprite {
@@ -1167,7 +1321,17 @@ impl MetalScene {
             let colors = cell_colors(cell, style, reverse_video, None);
             if let Some(SrgbaTuple(red, green, blue, _)) = colors.explicit_bg {
                 let background = CellBg::rgb(unorm8(red), unorm8(green), unorm8(blue));
-                if cell.width() > 1 {
+                if scale_x > 1 {
+                    let start = cell.col().saturating_mul(scale_x);
+                    let end = cell
+                        .col()
+                        .saturating_add(cell.width().max(1))
+                        .saturating_mul(scale_x)
+                        .min(cols as usize);
+                    for col in start..end {
+                        self.cells.set(grid_row, col as u32, background);
+                    }
+                } else if cell.width() > 1 {
                     self.cells.set_wide(grid_row, cell.col() as u32, background);
                 } else {
                     self.cells.set(grid_row, cell.col() as u32, background);
@@ -1202,13 +1366,17 @@ impl MetalScene {
         // decorations and an under-glyph cursor, under the glyphs, as WebGpu
         // draws them in a line's first layer; the rest after the glyphs.
         let (under_images, over_images) =
-            image_instances(mirror_row, cols as usize, &composed, glyphs);
-        for instance in under_images {
-            self.text.push(grid_row, instance);
+            image_instances(mirror_row, logical_cols, &composed, glyphs);
+        for (col, glyph) in under_images {
+            if let Some(instance) =
+                sprite_instance(&self.text, grid_row, col, glyph, [255; 4], style)
+            {
+                self.text.push(grid_row, instance);
+            }
         }
         for shaped in glyphs.shape_row(&clusters) {
             let col = shaped.cell;
-            if col >= cols as usize {
+            if col >= logical_cols {
                 break;
             }
             let colors = match composing {
@@ -1245,11 +1413,21 @@ impl MetalScene {
             }
         }
         // WebGpu's last layer: a bar cursor, then the images over the text.
-        for instance in over_images {
-            self.text.push(grid_row, instance);
+        for (col, glyph) in over_images {
+            if let Some(instance) =
+                sprite_instance(&self.text, grid_row, col, glyph, [255; 4], style)
+            {
+                self.text.push(grid_row, instance);
+            }
         }
         // The selection tints its whole span, blank columns included.
-        for col in built.selection.start..built.selection.end.min(cols as usize) {
+        let selected_start = built.selection.start.saturating_mul(scale_x);
+        let selected_end = built
+            .selection
+            .end
+            .saturating_mul(scale_x)
+            .min(cols as usize);
+        for col in selected_start..selected_end {
             let col = col as u32;
             if let Some(background) = self.cells.get(grid_row, col) {
                 self.cells.set(grid_row, col, background.selected());
@@ -1522,6 +1700,9 @@ mod tests {
             ));
         }
         for row in 0..extent.rows {
+            if scene.text().row_mode(row) != reference.text().row_mode(row) {
+                return Some(format!("text geometry differs in row {row}"));
+            }
             for col in 0..extent.cols {
                 let (ours, theirs) = (scene.cells().get(row, col), reference.cells().get(row, col));
                 if ours != theirs {
@@ -1694,6 +1875,8 @@ mod tests {
                 generation,
                 cell_width: 8.0,
                 grid_origin_x: 0.0,
+                cell_height: 16.0,
+                grid_origin_y: 0.0,
                 bold_brightens: true,
                 selection_fg: selection_fgs[generation as usize % selection_fgs.len()],
                 selection_bg: palette.selection_bg,
@@ -1780,6 +1963,8 @@ mod tests {
             generation: 0,
             cell_width: 8.0,
             grid_origin_x: 0.0,
+            cell_height: 16.0,
+            grid_origin_y: 0.0,
             bold_brightens: true,
             selection_fg: None,
             selection_bg: palette.selection_bg,
@@ -1797,6 +1982,438 @@ mod tests {
 
     fn no_selection(_: StableRowIndex) -> Range<usize> {
         0..0
+    }
+
+    /// Expand source pixels in the reference atlas, then draw them at 1x.
+    /// The actual scene keeps the small source atlas and must reproduce the
+    /// same pixels through scaling, fractional cuts and top/bottom clipping.
+    #[test]
+    fn dec_scaled_glyphs_match_expanded_pixels_with_highlights_and_fractional_halves() {
+        use frankenterm_renderer_metal::cell_text::shade_text;
+        use frankenterm_renderer_metal::frame::FrameUniforms;
+        use frankenterm_renderer_metal::{BackgroundUniforms, TextUniforms};
+
+        let palette = ColorPalette::default();
+        let fg = SrgbaTuple(0.8, 0.2, 0.5, 0.7);
+        let selected_fg = SrgbaTuple(0.2, 0.4, 0.9, 0.8);
+        let cursor_fg = SrgbaTuple(0.1, 0.8, 0.3, 0.6);
+        let source: Vec<u8> = (0..19 * 13).map(|i| ((i * 37) % 251) as u8).collect();
+        let shaped = ShapedGlyph {
+            cell: 1,
+            glyph: PlacedGlyph {
+                slot: AtlasSlot {
+                    kind: AtlasKind::Grayscale,
+                    page: 0,
+                    epoch: 0,
+                    x: 17,
+                    y: 23,
+                    width: 19,
+                    height: 13,
+                },
+                offset: [-3, -2],
+            },
+            brightness: 1.0,
+        };
+        for mode in [
+            TextRowMode::DoubleWidth,
+            TextRowMode::DoubleHeightTop,
+            TextRowMode::DoubleHeightBottom,
+        ] {
+            let scale = mode.scale();
+            let (width, height) = (19 * scale[0], 13 * scale[1]);
+            let expanded: Vec<_> = (0..width * height)
+                .map(|i| source[((i / width / scale[1]) * 19 + i % width / scale[0]) as usize])
+                .collect();
+            for origin in [0.0_f32, 0.75] {
+                for cell_width in [7.5, 8.0] {
+                    for cell_height in [16.0, 16.5] {
+                        let style = SceneStyle {
+                            grid_origin_x: origin,
+                            grid_origin_y: origin,
+                            cell_width,
+                            cell_height,
+                            selection_fg: Some(selected_fg),
+                            ..plain_style(&palette)
+                        };
+                        let built = BuiltRow {
+                            mode,
+                            selection: 1..2,
+                            cursor: Some(RowCursor {
+                                col: 2,
+                                cols: 1,
+                                fg: Some(cursor_fg),
+                                block: Some(palette.cursor_bg),
+                                sprite: None,
+                                composing: None,
+                                reverse: None,
+                                blink: None,
+                            }),
+                            ..BuiltRow::default()
+                        };
+                        let extent = GridExtent::new(1, 8);
+                        let mut actual = CellTextGrid::new(extent);
+                        actual.set_row_mode(0, mode);
+                        push_text_glyph(
+                            &mut actual,
+                            0,
+                            &shaped,
+                            &style,
+                            &built,
+                            fg,
+                            palette.background,
+                        );
+                        let bottom_shift = if mode == TextRowMode::DoubleHeightBottom {
+                            (origin - cell_height).floor() - origin.floor()
+                        } else {
+                            0.0
+                        };
+                        let references: Vec<_> = [fg, selected_fg, cursor_fg]
+                            .into_iter()
+                            .map(|color| {
+                                let mut text = CellTextGrid::new(extent);
+                                text.push(
+                                    0,
+                                    CellText::new(2, rgba8(color)).with_glyph(
+                                        &AtlasSlot {
+                                            x: 0,
+                                            y: 0,
+                                            width,
+                                            height,
+                                            ..shaped.glyph.slot
+                                        },
+                                        [-6, (-2.0 * scale[1] as f32 + bottom_shift) as i16],
+                                    ),
+                                );
+                                text
+                            })
+                            .collect();
+                        let u = FrameUniforms {
+                            frame: 0,
+                            viewport: [80, 24],
+                            grid: extent,
+                            clear: [0.0, 0.0, 0.0, 1.0],
+                            background: BackgroundUniforms {
+                                cell_size: [cell_width, cell_height],
+                                grid_origin: [origin, origin],
+                                ..BackgroundUniforms::default()
+                            },
+                            text: TextUniforms::default(),
+                        };
+                        for y in 0..24 {
+                            for x in 0..80 {
+                                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                                let local_x = px - origin;
+                                let color = if (4.0 * cell_width..6.0 * cell_width)
+                                    .contains(&local_x)
+                                {
+                                    2
+                                } else if (2.0 * cell_width..4.0 * cell_width).contains(&local_x) {
+                                    1
+                                } else {
+                                    0
+                                };
+                                let expected = if !(origin..origin + 8.0 * cell_width).contains(&px)
+                                    || (mode.is_double_height()
+                                        && !(origin..origin + cell_height).contains(&py))
+                                {
+                                    u.clear
+                                } else {
+                                    shade_text(
+                                        &u,
+                                        &references[color],
+                                        |_, tx, ty| [expanded[(ty * width + tx) as usize], 0, 0, 0],
+                                        u.clear,
+                                        px,
+                                        py,
+                                    )
+                                };
+                                let pixel = shade_text(
+                                    &u,
+                                    &actual,
+                                    |_, tx, ty| {
+                                        [source[((ty - 23) * 19 + tx - 17) as usize], 0, 0, 0]
+                                    },
+                                    u.clear,
+                                    px,
+                                    py,
+                                );
+                                assert_eq!(
+                                    pixel, expected,
+                                    "{mode:?} origin={origin} size=({cell_width},{cell_height}) pixel=({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dec_line_modes_scale_live_backgrounds_sprites_images_and_composition() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(3, 12);
+        term.advance_bytes(
+            "\x1b#6\x1b[4;41ma\x1b[0mb\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\c\x1b[1;2H",
+        );
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let style = SceneStyle {
+            cursor_sprite: Some((CursorSprite::Bar, palette.cursor_bg)),
+            ..plain_style(&palette)
+        };
+        let selection = |_: StableRowIndex| 1..2;
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &selection,
+            &style,
+        );
+        assert_eq!(mirror.rows()[0].line_mode(), MirrorLineMode::DoubleWidth);
+        assert_eq!(scene.text().row_mode(0), TextRowMode::DoubleWidth);
+        assert_eq!(scene.cells().get(0, 0), scene.cells().get(0, 1));
+        assert_eq!(scene.cells().get(0, 2), Some(CellBg::DEFAULT.selected()));
+        assert_eq!(scene.cells().get(0, 3), Some(CellBg::DEFAULT.selected()));
+        assert_eq!(scene.cells().get(0, 4), Some(CellBg::DEFAULT));
+        let row: Vec<_> = scene.text().row(0).collect();
+        let decoration = glyphs.lines.values().next().unwrap();
+        assert_eq!(row[0].glyph_size()[0], decoration.slot.width as u16 * 2);
+        let image = row
+            .iter()
+            .find(|glyph| glyph.atlas_origin()[1] >= 4608)
+            .unwrap();
+        let placed_image = glyphs.images.values().next().unwrap();
+        assert_eq!(image.col(), 4);
+        assert_eq!(image.glyph_size()[0], placed_image.slot.width as u16 * 2);
+        let bar = glyphs.cursors[&(CursorSprite::Bar, 1)];
+        let cursor = row.last().unwrap();
+        // Positive-z images follow the bar, so identify it by its atlas row.
+        let cursor = if cursor.atlas_origin()[1] >= 4608 {
+            row.iter()
+                .find(|glyph| glyph.atlas_origin()[1] == bar.slot.y as u16)
+                .unwrap()
+        } else {
+            cursor
+        };
+        assert_eq!(cursor.col(), 2);
+        assert_eq!(cursor.glyph_size()[0], bar.slot.width as u16 * 2);
+
+        let compose = SceneStyle {
+            compose: Some(Compose {
+                text: Some("xy"),
+                color: palette.cursor_bg,
+                fg: palette.cursor_fg,
+                under: palette.cursor_bg,
+                lock: false,
+            }),
+            ..style
+        };
+        scene.update(&mirror, &compose, &selection, &mut glyphs);
+        assert!(glyphs.cursors.contains_key(&(CursorSprite::Solid, 2)));
+        assert!(
+            !scene
+                .text()
+                .row(0)
+                .any(|glyph| glyph.atlas_origin()[1] >= 4608)
+        );
+        for text in ["x", "y"] {
+            let placed = glyphs.slots[&(text.to_string(), (0, false))];
+            assert!(scene.text().row(0).any(|glyph| glyph.atlas_origin()
+                == [placed.slot.x as u16, placed.slot.y as u16]
+                && glyph.col() == if text == "x" { 2 } else { 4 }));
+        }
+        let mut fresh = MetalScene::new();
+        fresh.update(
+            &reference_mirror(&mut term, None),
+            &compose,
+            &selection,
+            &mut glyphs,
+        );
+        assert_eq!(difference(&scene, &fresh), None);
+
+        // Escape-driven geometry changes invalidate a row even when its
+        // characters stay unchanged; scroll rings keep the mode with it.
+        term.advance_bytes(b"\x1b[1;1H\x1b#3\x1b[2;1H\x1b#4ab\x1b[?25l");
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &plain_style(&palette),
+        );
+        assert_eq!(scene.text().row_mode(0), TextRowMode::DoubleHeightTop);
+        assert_eq!(scene.text().row_mode(1), TextRowMode::DoubleHeightBottom);
+        term.advance_bytes(b"\x1b[3;1H\n");
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &plain_style(&palette),
+        );
+        assert_eq!(scene.text().row_mode(0), TextRowMode::DoubleHeightBottom);
+        assert!(
+            scene.text().row(0).next().is_some(),
+            "the exposed lower half retains its ink"
+        );
+        let mut fresh = MetalScene::new();
+        fresh.update(
+            &reference_mirror(&mut term, None),
+            &plain_style(&palette),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!(difference(&scene, &fresh), None);
+    }
+
+    #[test]
+    fn dec_double_height_keeps_all_cursor_shapes_in_the_physical_row() {
+        use frankenterm_renderer_metal::cell_text::shade_text;
+        use frankenterm_renderer_metal::frame::FrameUniforms;
+        use frankenterm_renderer_metal::{BackgroundUniforms, TextUniforms};
+
+        let palette = ColorPalette::default();
+        for (escape, mode) in [
+            ("\x1b#3", TextRowMode::DoubleHeightTop),
+            ("\x1b#4", TextRowMode::DoubleHeightBottom),
+        ] {
+            for shape in [
+                CursorSprite::Underline,
+                CursorSprite::Bar,
+                CursorSprite::HollowBlock,
+                CursorSprite::Solid,
+                CursorSprite::Lock { over: false },
+                CursorSprite::Lock { over: true },
+            ] {
+                for origin in [0.0_f32, 0.75] {
+                    let mut term = terminal(3, 8);
+                    term.advance_bytes(format!("\x1b[2;1H{escape} a\x1b[2;2H"));
+                    let mut mirror = RenderMirror::new();
+                    let mut scene = MetalScene::new();
+                    let mut glyphs = SyntheticGlyphs::default();
+                    let underline = shape == CursorSprite::Underline;
+                    let source = PlacedGlyph {
+                        slot: AtlasSlot {
+                            kind: AtlasKind::Grayscale,
+                            page: 0,
+                            epoch: 0,
+                            x: 16376,
+                            y: 16368,
+                            width: 8,
+                            height: if underline { 1 } else { 16 },
+                        },
+                        offset: [0, if underline { 15 } else { 0 }],
+                    };
+                    glyphs.cursors.insert((shape, 1), source);
+                    let style = SceneStyle {
+                        grid_origin_x: origin,
+                        grid_origin_y: origin,
+                        cursor_sprite: Some((shape, palette.cursor_bg)),
+                        compose: (shape == CursorSprite::Solid).then_some(Compose {
+                            text: None,
+                            color: palette.cursor_bg,
+                            fg: palette.cursor_fg,
+                            under: palette.cursor_bg,
+                            lock: false,
+                        }),
+                        ..plain_style(&palette)
+                    };
+                    step(
+                        &mut term,
+                        &mut mirror,
+                        &mut scene,
+                        &mut glyphs,
+                        &no_selection,
+                        &style,
+                    );
+                    assert_eq!(scene.text().row_mode(1), mode);
+                    let cursor = scene.text().row(1).find(|cell| cell.unscaled_y()).unwrap();
+                    assert_eq!(cursor.col(), 2);
+                    assert_eq!(cursor.glyph_size(), [16, source.slot.height as u16]);
+                    assert_eq!(cursor.offset(), source.offset);
+                    assert_eq!(cursor.atlas_origin(), [16376, 16368]);
+                    let text = scene.text().row(1).find(|cell| !cell.unscaled_y()).unwrap();
+                    assert_eq!(
+                        text.glyph_size()[1],
+                        if mode == TextRowMode::DoubleHeightTop {
+                            16
+                        } else {
+                            8 - u16::from(origin > 0.5)
+                        }
+                    );
+
+                    // Isolate the live cursor and compare its pixels with a
+                    // physically expanded 2x-width, 1x-height reference.
+                    let mut actual = CellTextGrid::new(scene.text().extent());
+                    actual.set_row_mode(1, mode);
+                    actual.push(1, cursor);
+                    let mut reference = CellTextGrid::new(actual.extent());
+                    reference.push(
+                        1,
+                        CellText::new(2, cursor.fg()).with_glyph(
+                            &AtlasSlot {
+                                x: 0,
+                                y: 0,
+                                width: 16,
+                                ..source.slot
+                            },
+                            source.offset,
+                        ),
+                    );
+                    let u = FrameUniforms {
+                        frame: 0,
+                        viewport: [72, 52],
+                        grid: actual.extent(),
+                        clear: [0.0, 0.0, 0.0, 1.0],
+                        background: BackgroundUniforms {
+                            cell_size: [style.cell_width, style.cell_height],
+                            grid_origin: [origin, origin],
+                            ..BackgroundUniforms::default()
+                        },
+                        text: TextUniforms::default(),
+                    };
+                    let coverage = |x: u32, y: u32| [((y * 8 + x) * 17 % 251 + 1) as u8, 0, 0, 0];
+                    let top = origin + style.cell_height;
+                    let mut visible = 0;
+                    for y in 0..52 {
+                        for x in 0..72 {
+                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                            let expected = if (top..top + style.cell_height).contains(&py) {
+                                shade_text(
+                                    &u,
+                                    &reference,
+                                    |_, tx, ty| coverage(tx / 2, ty),
+                                    u.clear,
+                                    px,
+                                    py,
+                                )
+                            } else {
+                                u.clear
+                            };
+                            let pixel = shade_text(
+                                &u,
+                                &actual,
+                                |_, tx, ty| coverage(tx - 16376, ty - 16368),
+                                u.clear,
+                                px,
+                                py,
+                            );
+                            visible += usize::from(pixel != u.clear);
+                            assert_eq!(
+                                pixel, expected,
+                                "{mode:?} {shape:?} origin={origin} ({x},{y})"
+                            );
+                        }
+                    }
+                    assert!(visible > 0, "{mode:?} {shape:?} stays visible");
+                }
+            }
+        }
     }
 
     /// Compare the sliced instances with a complete, uncropped glyph in
@@ -2040,7 +2657,15 @@ mod tests {
             },
             ..shaped
         };
-        let cropped = glyph_strip(&wide_offset, 7..20, [255; 4], &style, 6000).unwrap();
+        let prepared = prepare_glyph(
+            wide_offset.cell,
+            wide_offset.glyph,
+            TextRowMode::SingleWidth,
+            0,
+            &style,
+        )
+        .unwrap();
+        let cropped = glyph_strip(&prepared, 7..20, [255; 4], &style, 6000).unwrap();
         assert_eq!(cropped.atlas_origin()[0], 7);
         assert_eq!(cropped.glyph_size()[0], 13);
         assert_eq!(
@@ -2048,12 +2673,12 @@ mod tests {
             i32::from(i16::MAX) - 2 + 7,
         );
         assert_eq!(cropped.offset()[1], wide_offset.glyph.offset[1]);
-        assert!(glyph_strip(&wide_offset, 7..20, [255; 4], &style, 4).is_none());
+        assert!(glyph_strip(&prepared, 7..20, [255; 4], &style, 4).is_none());
         assert!(
             glyph_strip(
-                &ShapedGlyph {
-                    cell: usize::from(u16::MAX) + 1,
-                    ..shaped
+                &PreparedGlyph {
+                    col: usize::from(u16::MAX) + 1,
+                    ..prepared
                 },
                 0..20,
                 [255; 4],
@@ -3726,6 +4351,124 @@ mod tests {
             }
         }
 
+        /// Compare two independently clipped half rows with one ordinary
+        /// glyph whose pixels were expanded 2x on the CPU. Fractional row
+        /// boundaries require odd texel phases in both axes.
+        #[test]
+        fn double_height_halves_match_expanded_metal_bitmaps() {
+            let renderer = MetalRenderer::offscreen().expect("an offscreen Metal renderer");
+            let palette = ColorPalette::default();
+            let fg = SrgbaTuple(0.8, 0.2, 0.5, 0.7);
+            let selected_fg = SrgbaTuple(0.2, 0.7, 0.9, 0.8);
+            let extent = GridExtent::new(2, 8);
+            let cells = CellBgGrid::new(extent);
+            for kind in [AtlasKind::Grayscale, AtlasKind::Color] {
+                let bpp = if kind == AtlasKind::Grayscale { 1 } else { 4 };
+                let source: Vec<u8> = (0..13 * 10_u32)
+                    .flat_map(|i| {
+                        let level = ((i * 37) % 251) as u8;
+                        if bpp == 1 {
+                            vec![level]
+                        } else {
+                            vec![level, level / 2, level / 3, level]
+                        }
+                    })
+                    .collect();
+                let expanded: Vec<u8> = (0..26 * 20)
+                    .flat_map(|i| {
+                        let index = ((i / 26 / 2) * 13 + i % 26 / 2) * bpp;
+                        source[index..index + bpp].iter().copied()
+                    })
+                    .collect();
+                let slot = renderer
+                    .insert_glyph(kind, 13, 10, &source)
+                    .expect("source glyph");
+                let expanded_slot = renderer
+                    .insert_glyph(kind, 26, 20, &expanded)
+                    .expect("expanded reference glyph");
+                let shaped = ShapedGlyph {
+                    cell: 1,
+                    glyph: PlacedGlyph {
+                        slot,
+                        offset: [-1, 2],
+                    },
+                    brightness: 1.0,
+                };
+                for origin in [0.0, 0.75] {
+                    for cell_height in [16.0, 16.5] {
+                        let style = SceneStyle {
+                            grid_origin_x: origin,
+                            grid_origin_y: origin,
+                            cell_height,
+                            selection_fg: Some(selected_fg),
+                            ..plain_style(&palette)
+                        };
+                        let snapshot = |text: &CellTextGrid| {
+                            renderer
+                                .snapshot_frame(
+                                    80,
+                                    40,
+                                    &FrameScene {
+                                        cells: &cells,
+                                        background: BackgroundUniforms {
+                                            cell_size: [8.0, cell_height],
+                                            grid_origin: [origin, origin],
+                                            ..BackgroundUniforms::default()
+                                        },
+                                        text,
+                                        text_uniforms: TextUniforms::default(),
+                                        clear: ClearColor::from_srgba(0.05, 0.05, 0.05, 1.0),
+                                    },
+                                )
+                                .expect("double-size snapshot")
+                        };
+                        let references: Vec<_> = [fg, selected_fg]
+                            .into_iter()
+                            .map(|color| {
+                                let mut text = CellTextGrid::new(extent);
+                                text.push(
+                                    0,
+                                    CellText::new(2, rgba8(color))
+                                        .with_glyph(&expanded_slot, [-2, 4]),
+                                );
+                                snapshot(&text)
+                            })
+                            .collect();
+                        let mut actual = CellTextGrid::new(extent);
+                        for (row, mode) in [
+                            (0, TextRowMode::DoubleHeightTop),
+                            (1, TextRowMode::DoubleHeightBottom),
+                        ] {
+                            actual.set_row_mode(row, mode);
+                            push_text_glyph(
+                                &mut actual,
+                                row,
+                                &shaped,
+                                &style,
+                                &BuiltRow {
+                                    mode,
+                                    selection: 1..2,
+                                    ..BuiltRow::default()
+                                },
+                                fg,
+                                palette.background,
+                            );
+                        }
+                        let pixels = snapshot(&actual);
+                        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                            let x = (index % 80) as f32 + 0.5 - origin;
+                            let selected = usize::from((16.0..32.0).contains(&x));
+                            assert_eq!(
+                                pixel,
+                                &references[selected][index * 4..index * 4 + 4],
+                                "{kind:?} origin={origin} height={cell_height} pixel={index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         fn readback_session(seed: u64, plant: bool) -> usize {
             let renderer = MetalRenderer::offscreen().expect("an offscreen Metal renderer");
             let mut glyphs = AtlasGlyphs {
@@ -3746,6 +4489,8 @@ mod tests {
                 generation: 0,
                 cell_width: 8.0,
                 grid_origin_x: 0.0,
+                cell_height: 16.0,
+                grid_origin_y: 0.0,
                 bold_brightens: true,
                 selection_fg: Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
                 selection_bg: palette.selection_bg,

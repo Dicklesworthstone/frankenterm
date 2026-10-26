@@ -971,16 +971,25 @@ impl super::TermWindow {
         // Hit test the rule-expanded cells that reached presentation. Reading
         // the terminal here can drain parser work, lose the link on contention,
         // or pick a URL that has never been displayed beneath the pointer.
-        let new_highlight = mouse_selection_frame
-            .zip(stable_row)
-            .and_then(|(frame, row)| {
-                if !self.pane_input_ready(&pane) {
-                    return None;
-                }
-                self.pane_state(pane.pane_id())?
-                    .selection_frame
-                    .hyperlink_at(&pane, frame, row, event.coords.x as f32)
-            });
+        let new_highlight = if !self.pane_input_ready(&pane) {
+            None
+        } else if self.metal_render.is_some() || self.metal.is_some() {
+            selection_position.as_ref().and_then(|position| {
+                self.metal_hyperlink_at(
+                    &pane,
+                    position,
+                    [event.coords.x as f32, event.coords.y as f32],
+                )
+            })
+        } else {
+            mouse_selection_frame
+                .zip(stable_row)
+                .and_then(|(frame, row)| {
+                    self.pane_state(pane.pane_id())?
+                        .selection_frame
+                        .hyperlink_at(&pane, frame, row, event.coords.x as f32)
+                })
+        };
 
         match (self.current_highlight.as_ref(), new_highlight) {
             (Some(old_link), Some(new_link)) if Arc::ptr_eq(&old_link, &new_link) => {

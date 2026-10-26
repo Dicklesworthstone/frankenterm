@@ -10,6 +10,7 @@ use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::render::{MirrorLineMode, RenderRowRef};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use frankenterm_term::{
     Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
@@ -841,6 +842,10 @@ pub struct PaneRenderFacts {
     /// Terminal sequence number at capture.
     pub seqno: SequenceNo,
     pub cursor: StableCursorPosition,
+    /// DEC geometry of the cursor's physical row, from the same publication.
+    pub cursor_line_mode: MirrorLineMode,
+    /// Logical cursor width (1 or 2); a wide-cell spacer is always 1.
+    pub cursor_cell_width: u8,
     pub dimensions: RenderableDimensions,
     /// Any mouse reporting mode is enabled (false while tmux owns the pane).
     pub mouse_grabbed: bool,
@@ -928,9 +933,23 @@ pub trait Pane: Downcast + Send + Sync {
     /// `bracketed_paste`/`focus_tracking` as false with an untracked palette
     /// generation.
     fn render_facts(&self) -> Arc<PaneRenderFacts> {
+        let cursor = self.get_cursor_position();
+        let (first, lines) = self.get_lines(cursor.y..cursor.y.saturating_add(1));
+        let (cursor_line_mode, cursor_cell_width) = cursor
+            .y
+            .checked_sub(first)
+            .and_then(|row| usize::try_from(row).ok())
+            .and_then(|row| lines.get(row))
+            .map(|line| {
+                let row = RenderRowRef::Line(line);
+                (row.line_mode(), row.cursor_cell_width(cursor.x))
+            })
+            .unwrap_or((MirrorLineMode::SingleWidth, 1));
         Arc::new(PaneRenderFacts {
             seqno: self.get_current_seqno(),
-            cursor: self.get_cursor_position(),
+            cursor,
+            cursor_line_mode,
+            cursor_cell_width,
             dimensions: self.get_dimensions(),
             mouse_grabbed: self.is_mouse_grabbed(),
             alt_screen_active: self.is_alt_screen_active(),
@@ -1868,6 +1887,7 @@ mod test {
 
     struct FakePane {
         lines: Mutex<Vec<Line>>,
+        cursor: StableCursorPosition,
         size: Mutex<TerminalSize>,
         writes: Mutex<Vec<u8>>,
         base_row: StableRowIndex,
@@ -1898,6 +1918,7 @@ mod test {
         ) -> Self {
             Self {
                 lines: Mutex::new(lines),
+                cursor: StableCursorPosition::default(),
                 size: Mutex::new(TerminalSize::default()),
                 writes: Mutex::new(Vec::new()),
                 base_row,
@@ -1929,7 +1950,7 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
-            StableCursorPosition::default()
+            self.cursor
         }
 
         fn get_current_seqno(&self) -> SequenceNo {
@@ -2132,6 +2153,37 @@ mod test {
             writer.flush().unwrap();
         }
         assert_eq!(&*pane.writes.lock(), b"captured");
+    }
+
+    #[test]
+    fn default_render_facts_keep_cursor_row_mode_and_exact_start_width() {
+        for mode in [
+            MirrorLineMode::SingleWidth,
+            MirrorLineMode::DoubleWidth,
+            MirrorLineMode::DoubleHeightTop,
+            MirrorLineMode::DoubleHeightBottom,
+        ] {
+            let mut source = line("你x", false);
+            match mode {
+                MirrorLineMode::SingleWidth => {}
+                MirrorLineMode::DoubleWidth => source.set_double_width(1),
+                MirrorLineMode::DoubleHeightTop => source.set_double_height_top(1),
+                MirrorLineMode::DoubleHeightBottom => source.set_double_height_bottom(1),
+            }
+            let mut pane = FakePane::new_with_base_row(vec![source], 17);
+            pane.cursor.y = 17;
+            for (col, width) in [(0, 2), (1, 1), (2, 1), (usize::MAX, 1)] {
+                pane.cursor.x = col;
+                let facts = pane.render_facts();
+                assert_eq!(facts.cursor, pane.cursor);
+                assert_eq!(facts.cursor_line_mode, mode);
+                assert_eq!(facts.cursor_cell_width, width);
+            }
+            pane.empty_one_line_rows.push(17);
+            let missing = pane.render_facts();
+            assert_eq!(missing.cursor_line_mode, MirrorLineMode::SingleWidth);
+            assert_eq!(missing.cursor_cell_width, 1);
+        }
     }
 
     #[test]

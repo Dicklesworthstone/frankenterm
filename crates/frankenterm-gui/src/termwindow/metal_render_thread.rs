@@ -29,6 +29,7 @@
 
 use super::TermWindow;
 use super::metal_chrome::ChromeFrame;
+use super::metal_hyperlinks::MetalHyperlinks;
 use super::metal_window::{MetalPaneRequest, MetalPanes};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -453,6 +454,7 @@ impl MetalDriver {
         };
         // Every visible pane in one render pass (ft-yccm0.4.6).
         let renderer = Rc::clone(&self.renderer);
+        let presentation = Arc::clone(&self.presentation);
         let outcome = self.panes.draw(
             &request.panes,
             &request.splits,
@@ -461,6 +463,7 @@ impl MetalDriver {
             &fonts,
             &metrics,
             &renderer,
+            Some(Arc::new(move |event| presentation.observe(event))),
             // A decoding image is polled by the panes' redraw time.
             |window, _images_loading| match (window, update) {
                 (Some(window), Some(update)) => {
@@ -536,6 +539,7 @@ impl MetalDriver {
 /// stops the output wakes, then stops and joins the thread.
 pub(crate) struct MetalRenderThread {
     thread: RenderThread,
+    hyperlinks: Arc<MetalHyperlinks>,
     request: Arc<Mutex<Arc<MetalFrameRequest>>>,
     output: Arc<MetalOutputWake>,
     surface: std::cell::Cell<SurfaceState>,
@@ -568,6 +572,8 @@ impl MetalRenderThread {
         let driver_retry = Arc::clone(&retry);
         let presentation = Arc::new(PresentationFeedback::default());
         let driver_presentation = Arc::clone(&presentation);
+        let hyperlinks = Arc::new(MetalHyperlinks::default());
+        let driver_hyperlinks = Arc::clone(&hyperlinks);
         #[cfg(test)]
         let submitted_size = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
@@ -582,7 +588,7 @@ impl MetalRenderThread {
             // and every field after it would never be evaluated.
             let mut driver = MetalDriver {
                 request: driver_request,
-                panes: MetalPanes::default(),
+                panes: MetalPanes::with_hyperlinks(driver_hyperlinks),
                 fonts: None,
                 retry: driver_retry,
                 presentation: driver_presentation,
@@ -646,6 +652,7 @@ impl MetalRenderThread {
         output.set_waker(Some(thread.waker()));
         Ok(Self {
             thread,
+            hyperlinks,
             request,
             output,
             surface: std::cell::Cell::new(surface),
@@ -683,6 +690,16 @@ impl MetalRenderThread {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .size
+    }
+
+    /// Publishes the window state for the next frame and asks for it.
+    pub(crate) fn hyperlink_at(
+        &self,
+        pane: &Arc<dyn mux::pane::Pane>,
+        geometry: [usize; 12],
+        pixel: [f32; 2],
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        self.hyperlinks.link_at(pane, geometry, pixel)
     }
 
     /// Publishes the window state for the next frame and asks for it.
@@ -1017,6 +1034,7 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn pane_request(pane: &TestPane, rect: PixelRect, active: bool) -> MetalPaneRequest {
         MetalPaneRequest {
+            geometry: None,
             inputs: MetalFrameInputs {
                 pane: Some(Arc::clone(&pane.0)),
                 viewport_top: None,
@@ -1118,6 +1136,7 @@ mod tests {
                 &fonts,
                 &metrics,
                 &renderer,
+                None,
                 |frame, _| frame.is_some(),
             );
             panes.kept_frames()

@@ -938,8 +938,8 @@ pub enum PendingSelectionResolution {
 pub(crate) struct FrameHyperlinks {
     pane: std::sync::Weak<dyn Pane>,
     registration: Option<mux::PaneRegistrationHandle>,
-    rows: Vec<(StableRowIndex, Vec<HyperlinkSpan>)>,
-    double_height_bottom: Option<(StableRowIndex, Vec<HyperlinkSpan>)>,
+    rows: Vec<(StableRowIndex, Arc<[HyperlinkSpan]>)>,
+    double_height_bottom: Option<(StableRowIndex, Arc<[HyperlinkSpan]>)>,
 }
 
 /// Window-pixel hit interval emitted by the glyph layout used for drawing.
@@ -998,10 +998,11 @@ impl FrameHyperlinks {
     pub(crate) fn retain_line(
         &mut self,
         row: StableRowIndex,
-        mut spans: Vec<HyperlinkSpan>,
+        spans: Vec<HyperlinkSpan>,
         double_height_top: bool,
         double_height_bottom: bool,
     ) {
+        let mut spans: Arc<[HyperlinkSpan]> = spans.into();
         let preceding_top = self.double_height_bottom.take();
         if double_height_bottom {
             // The renderer skips this row because the preceding top row drew
@@ -1017,12 +1018,13 @@ impl FrameHyperlinks {
         self.rows.push((row, spans));
     }
 
-    fn link_at(
-        &self,
-        pane: &Arc<dyn Pane>,
-        row: StableRowIndex,
-        pixel_x: f32,
-    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+    /// Metal draws each DEC half independently and caches unchanged rows.
+    /// Retain those exact immutable spans without cloning their link handles.
+    pub(crate) fn retain_shared_line(&mut self, row: StableRowIndex, spans: Arc<[HyperlinkSpan]>) {
+        self.rows.push((row, spans));
+    }
+
+    pub(crate) fn belongs_to(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = pane.mux_registration_slot().load();
         let same_registration = match (&self.registration, &current) {
             (Some(expected), Some(current)) => {
@@ -1033,14 +1035,20 @@ impl FrameHyperlinks {
             (None, None) => true,
             _ => false,
         };
-        if !same_registration {
-            return None;
-        }
-        if !self
-            .pane
-            .upgrade()
-            .is_some_and(|owner| Arc::ptr_eq(&owner, pane))
-        {
+        same_registration
+            && self
+                .pane
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, pane))
+    }
+
+    pub(crate) fn link_at(
+        &self,
+        pane: &Arc<dyn Pane>,
+        row: StableRowIndex,
+        pixel_x: f32,
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        if !self.belongs_to(pane) {
             return None;
         }
         let index = self.rows.binary_search_by_key(&row, |(row, _)| *row).ok()?;

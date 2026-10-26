@@ -22,6 +22,7 @@ use frankenterm_alloc::resource_ledger::{TerminalLockHolder, TerminalLockLedger}
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::render::MirrorLineMode;
 #[cfg(test)]
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3;
 use frankenterm_term::terminalstate::checkpoint::{
@@ -4608,6 +4609,8 @@ struct PaletteSource {
 struct ScalarFacts {
     seqno: SequenceNo,
     cursor: StableCursorPosition,
+    cursor_line_mode: MirrorLineMode,
+    cursor_cell_width: u8,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     alt_screen_active: bool,
@@ -4648,6 +4651,8 @@ impl PublishedFacts {
         let scalars = self.scalars;
         slot.seqno = scalars.seqno;
         slot.cursor = scalars.cursor;
+        slot.cursor_line_mode = scalars.cursor_line_mode;
+        slot.cursor_cell_width = scalars.cursor_cell_width;
         slot.dimensions = scalars.dimensions;
         slot.mouse_grabbed = scalars.mouse_grabbed;
         slot.alt_screen_active = scalars.alt_screen_active;
@@ -4667,6 +4672,8 @@ impl PublishedFacts {
         crate::pane::PaneRenderFacts {
             seqno: scalars.seqno,
             cursor: scalars.cursor,
+            cursor_line_mode: scalars.cursor_line_mode,
+            cursor_cell_width: scalars.cursor_cell_width,
             dimensions: scalars.dimensions,
             mouse_grabbed: scalars.mouse_grabbed,
             alt_screen_active: scalars.alt_screen_active,
@@ -4761,9 +4768,17 @@ impl RenderFactsPublisher {
         if tmux {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
         }
+        let position = terminal.cursor_pos();
+        let screen = terminal.screen();
+        let (cursor_line_mode, cursor_cell_width) = screen
+            .render_row(screen.phys_row(position.y))
+            .map(|row| (row.line_mode(), row.cursor_cell_width(position.x)))
+            .unwrap_or((MirrorLineMode::SingleWidth, 1));
         ScalarFacts {
             seqno: terminal.current_seqno(),
             cursor,
+            cursor_line_mode,
+            cursor_cell_width,
             dimensions: terminal_get_dimensions(terminal),
             mouse_grabbed: !tmux && terminal.is_mouse_grabbed(),
             alt_screen_active: !tmux && terminal.is_alt_screen_active(),
@@ -6918,14 +6933,13 @@ impl LocalPane {
         let mut term = self.terminal.lock_as(TerminalLockHolder::Paint);
         #[cfg(feature = "disruptor-pane-io")]
         self.drain_action_ring_locked(&mut term);
-        let stats =
-            crate::render_mirror::capture_terminal_rows_deferred(&mut term, mirror, request)?;
+        crate::render_mirror::capture_terminal_rows_deferred(&mut term, mirror, request)?;
         drop(term);
-        mirror.resolve_pending();
+        mirror.resolve_pending(request.rules);
         if hide_cursor {
             mirror.hide_cursor();
         }
-        Some(stats)
+        Some(mirror.last_capture())
     }
 
     pub fn try_capture_render_frame(
@@ -18723,6 +18737,67 @@ mod tests {
     }
 
     #[test]
+    fn render_facts_publish_dec_cursor_geometry_and_wide_spacers_together() {
+        use frankenterm_term::config::GridEngine;
+
+        #[derive(Debug)]
+        struct CursorFactsConfig(GridEngine);
+        impl TerminalConfiguration for CursorFactsConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn grid_engine(&self) -> GridEngine {
+                self.0
+            }
+        }
+        for (index, engine) in [GridEngine::Legacy, GridEngine::Page]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let pane = make_legacy_test_pane(
+                796 + index,
+                Terminal::new(
+                    term_size(8, 3),
+                    Arc::new(CursorFactsConfig(engine)),
+                    "FrankenTerm",
+                    "cursor-facts-test",
+                    Box::new(Vec::<u8>::new()),
+                ),
+            );
+            let initial = pane.render_facts();
+            assert_eq!(initial.cursor_line_mode, MirrorLineMode::SingleWidth);
+            assert_eq!(initial.cursor_cell_width, 1);
+            for (escape, mode) in [
+                ("\x1b#6", MirrorLineMode::DoubleWidth),
+                ("\x1b#3", MirrorLineMode::DoubleHeightTop),
+                ("\x1b#4", MirrorLineMode::DoubleHeightBottom),
+                ("\x1b#5", MirrorLineMode::SingleWidth),
+            ] {
+                let head = apply_output(&pane, format!("\x1b[2;1H{escape}你x\x1b[2;1H").as_bytes());
+                assert_eq!((head.cursor.x, head.cursor.y), (0, 1));
+                assert_eq!(head.cursor_line_mode, mode);
+                assert_eq!(head.cursor_cell_width, 2);
+                let spacer = apply_output(&pane, b"\x1b[2;2H");
+                assert_eq!(spacer.cursor.x, 1);
+                assert_eq!(spacer.cursor_line_mode, mode);
+                assert_eq!(spacer.cursor_cell_width, 1);
+                let next = apply_output(&pane, b"\x1b[2;3H");
+                assert_eq!(next.cursor.x, 2);
+                assert_eq!(next.cursor_line_mode, mode);
+                assert_eq!(next.cursor_cell_width, 1);
+                assert_eq!((head.cursor.x, head.cursor_cell_width), (0, 2));
+                if engine == GridEngine::Page {
+                    assert!(matches!(
+                        pane.terminal.lock().screen().render_row(1),
+                        Some(frankenterm_term::render::RenderRowRef::Page { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn render_facts_follow_every_render_relevant_change() {
         let pane = render_facts_test_pane(790);
         let initial = pane.render_facts();
@@ -19052,7 +19127,7 @@ mod tests {
     #[test]
     fn render_facts_reader_never_waits_for_the_terminal_mutex() {
         let pane = render_facts_test_pane(791);
-        let published = apply_output(&pane, b"\x1b[3;7Hready");
+        let published = apply_output(&pane, "\x1b[3;7H\x1b#3你\x1b[3;7H".as_bytes());
         let pane = &pane;
         std::thread::scope(|scope| {
             let held = pane.terminal.lock();
@@ -19062,6 +19137,8 @@ mod tests {
             drop(held);
             let facts = observed.expect("render_facts waited on the terminal mutex");
             assert!(Arc::ptr_eq(&facts, &published));
+            assert_eq!(facts.cursor_line_mode, MirrorLineMode::DoubleHeightTop);
+            assert_eq!(facts.cursor_cell_width, 2);
         });
     }
 

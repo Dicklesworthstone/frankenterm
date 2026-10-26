@@ -24,6 +24,7 @@ use super::metal_cells::{
     MetalBlinkClocks, MetalBlinkPhase, MetalCompose, MetalFrame, MetalFrameInputs,
 };
 use super::metal_glyphs::FallbackReady;
+use super::metal_hyperlinks::MetalHyperlinks;
 use super::render::pane::pane_border_rects;
 use super::render::split::split_render_geometry;
 use super::{PendingFallbackInvalidation, TermWindow, TermWindowNotif, UIItem, UIItemType};
@@ -34,7 +35,8 @@ use ::window::{DeadKeyStatus, WindowOps};
 use config::VisualBellTarget;
 use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::{
-    ClearColor, MetalRenderer, PaneScene, PixelRect, SolidRect, UiLayer, WindowFrame,
+    ClearColor, FramePresentationHandler, MetalRenderer, PaneScene, PixelRect, SolidRect, UiLayer,
+    WindowFrame,
 };
 use mux::pane::{Pane, PaneId};
 use std::collections::HashMap;
@@ -47,6 +49,8 @@ use wezterm_term::color::SrgbaTuple;
 #[derive(Clone)]
 pub(crate) struct MetalPaneRequest {
     pub(crate) inputs: MetalFrameInputs,
+    /// Pure main-thread geometry witness for presented hyperlink hit tests.
+    pub(crate) geometry: Option<[usize; 12]>,
     /// Where the pane draws, in drawable pixels.
     pub(crate) rect: PixelRect,
     /// Its default background, scaled by `window_background_opacity`.
@@ -207,6 +211,27 @@ fn reports_password_input(pane: &dyn Pane) -> bool {
 }
 
 impl TermWindow {
+    /// Both Metal submission paths publish through the same immutable state.
+    /// No terminal read or hyperlink rule expansion occurs on this path.
+    pub(crate) fn metal_hyperlink_at(
+        &self,
+        pane: &Arc<dyn Pane>,
+        position: &mux::tab::PositionedPane,
+        pixel: [f32; 2],
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        if !Arc::ptr_eq(pane, &position.pane) {
+            return None;
+        }
+        let geometry = self.selection_frame_geometry(position)?;
+        if let Some(thread) = &self.metal_render {
+            thread.hyperlink_at(pane, geometry, pixel)
+        } else if self.metal.is_some() {
+            self.metal_panes.hyperlink_at(pane, geometry, pixel)
+        } else {
+            None
+        }
+    }
+
     /// The window's repaint when a fallback font a Metal frame's shaping
     /// asked for resolves (ft-yccm0.4.7.3): what `fallback_font_completion`
     /// does for the WebGpu renderer's shaping, callable from every
@@ -304,6 +329,10 @@ impl TermWindow {
             .collect();
         let mut panes = Vec::new();
         for pos in self.get_panes_to_render() {
+            if pos.is_active {
+                self.update_text_cursor(&pos);
+            }
+            let geometry = self.selection_frame_geometry(&pos);
             let pane_id = pos.pane.pane_id();
             let facts = pos.pane.render_facts();
             let palette = &facts.palette;
@@ -371,6 +400,7 @@ impl TermWindow {
                 fills.push(fill(thumb.rect(), srgb_color(palette.scrollbar_thumb)));
             }
             panes.push(MetalPaneRequest {
+                geometry,
                 inputs: MetalFrameInputs {
                     viewport_top: self.get_viewport(pane_id),
                     selection: self.selection(pane_id).and_then(|selection| {
@@ -452,6 +482,9 @@ impl TermWindow {
 #[derive(Default)]
 pub(crate) struct MetalPanes {
     frames: HashMap<PaneId, MetalFrame>,
+    hyperlinks: Arc<MetalHyperlinks>,
+    renderer: Option<std::rc::Weak<MetalRenderer>>,
+    epoch: Option<u64>,
     /// How many rows each pane's scene rebuilt in the last draw.
     rebuilt: Vec<(PaneId, usize)>,
     /// The window's blink clocks (ft-yccm0.4.7.3), made on the first draw.
@@ -461,6 +494,27 @@ pub(crate) struct MetalPanes {
 }
 
 impl MetalPanes {
+    pub(crate) fn with_hyperlinks(hyperlinks: Arc<MetalHyperlinks>) -> Self {
+        Self {
+            frames: HashMap::new(),
+            hyperlinks,
+            renderer: None,
+            epoch: None,
+            rebuilt: Vec::new(),
+            blink: None,
+            redraw_at: None,
+        }
+    }
+
+    pub(crate) fn hyperlink_at(
+        &self,
+        pane: &Arc<dyn Pane>,
+        geometry: [usize; 12],
+        pixel: [f32; 2],
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        self.hyperlinks.link_at(pane, geometry, pixel)
+    }
+
     /// How many rows each pane drawn last rebuilt.
     pub(crate) fn rows_rebuilt(&self) -> &[(PaneId, usize)] {
         &self.rebuilt
@@ -496,8 +550,20 @@ impl MetalPanes {
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
         renderer: &Rc<MetalRenderer>,
+        presentation_observer: Option<FramePresentationHandler>,
         draw: impl FnOnce(Option<&WindowFrame<'_>>, bool) -> R,
     ) -> R {
+        if self
+            .renderer
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .is_none_or(|current| !Rc::ptr_eq(&current, renderer))
+        {
+            // The weak allocation identity cannot alias a recycled pointer;
+            // the epoch also rejects callbacks from a retired renderer.
+            self.epoch = Some(self.hyperlinks.begin_epoch());
+            self.renderer = Some(Rc::downgrade(renderer));
+        }
         let mut previous = std::mem::take(&mut self.frames);
         let mut updated = Vec::with_capacity(panes.len());
         self.rebuilt.clear();
@@ -548,6 +614,20 @@ impl MetalPanes {
             .chain(cursor_due)
             .chain(image_due)
             .min();
+        let hyperlinks: Vec<_> = updated
+            .iter_mut()
+            .filter_map(|(_, pane, frame, uniforms)| {
+                frame.hyperlinks(&pane.inputs, pane.geometry, pane.rect, &uniforms.background)
+            })
+            .collect();
+        // Register before native submission: a drawable can report its
+        // presentation before the draw call returns. Empty frames replace
+        // all prior panes with an empty snapshot when actually displayed.
+        renderer.set_frame_presentation_handler(Some(self.hyperlinks.handler(
+            self.epoch.expect("renderer epoch established above"),
+            hyperlinks.into(),
+            presentation_observer,
+        )));
         let scenes: Vec<PaneScene<'_>> = updated
             .iter()
             .map(|(pane_id, pane, frame, uniforms)| PaneScene {
@@ -579,6 +659,14 @@ impl MetalPanes {
             .map(|(pane_id, _, frame, _)| (pane_id, frame))
             .collect();
         drawn
+    }
+}
+
+impl Drop for MetalPanes {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            self.hyperlinks.retire_epoch(epoch);
+        }
     }
 }
 

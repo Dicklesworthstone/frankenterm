@@ -9655,6 +9655,8 @@ impl Screen {
                     seqno: rows
                         .effective_seqno(idx)
                         .expect("a retained row has a sequence"),
+                    compress: idx + rows.list().viewport_rows() < self.lines.len()
+                        && scrollback_compression_enabled(),
                 });
             }
         }

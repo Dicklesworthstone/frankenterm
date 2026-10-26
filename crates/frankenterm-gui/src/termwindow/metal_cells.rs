@@ -15,8 +15,9 @@
 //! so the frame itself can be built on the window's render thread
 //! (ft-yccm0.4.1.2) with that thread's own fonts.
 
+use super::metal_hyperlinks::{HyperlinkRowCache, PaneHyperlinks};
 use crate::colorease::ColorEase;
-use crate::selection::SelectionRange;
+use crate::selection::{FrameHyperlinks, SelectionRange};
 use crate::termwindow::metal_glyphs::{FallbackReady, FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -26,7 +27,8 @@ use frankenterm_gui::metal_scene::{
     reverse_video_cursor_applies,
 };
 use frankenterm_renderer_metal::{
-    BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
+    BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, PixelRect,
+    TextUniforms,
 };
 use mux::localpane::LocalPane;
 use mux::pane::{Pane, PaneId};
@@ -83,7 +85,9 @@ fn visible(color: SrgbaTuple) -> Option<SrgbaTuple> {
 /// One pane's live Metal frame state.
 pub(crate) struct MetalFrame {
     pane_id: PaneId,
+    owner: FrameHyperlinks,
     mirror: RenderMirror,
+    hyperlinks: HyperlinkRowCache,
     scene: MetalScene,
     glyphs: FontGlyphs,
     /// The cursor and the pane's focus as last drawn, and when either last
@@ -95,6 +99,26 @@ pub(crate) struct MetalFrame {
 impl MetalFrame {
     pub(crate) fn scene(&self) -> &MetalScene {
         &self.scene
+    }
+
+    pub(crate) fn hyperlinks(
+        &mut self,
+        inputs: &MetalFrameInputs,
+        geometry: Option<[usize; 12]>,
+        clip: PixelRect,
+        background: &BackgroundUniforms,
+    ) -> Option<Arc<PaneHyperlinks>> {
+        self.hyperlinks.update(
+            inputs.pane.as_ref()?,
+            &self.mirror,
+            geometry,
+            clip,
+            background,
+            inputs
+                .compose
+                .as_ref()
+                .and_then(|compose| compose.text.as_deref()),
+        )
     }
 }
 
@@ -283,6 +307,7 @@ impl MetalFrame {
         let mut frame = match slot.take() {
             Some(frame)
                 if frame.pane_id == pane_id
+                    && frame.owner.belongs_to(pane)
                     && frame
                         .glyphs
                         .serves(fonts, metal, metrics, config.generation()) =>
@@ -291,7 +316,9 @@ impl MetalFrame {
             }
             _ => MetalFrame {
                 pane_id,
+                owner: FrameHyperlinks::new(pane),
                 mirror: RenderMirror::new(),
+                hyperlinks: HyperlinkRowCache::default(),
                 scene: MetalScene::new(),
                 glyphs: FontGlyphs::new(
                     Rc::clone(fonts),
@@ -441,6 +468,8 @@ impl MetalFrame {
                 | (facts.palette_generation & 0xffff_ffff),
             cell_width: metrics.cell_size.width as f32,
             grid_origin_x: inputs.grid_origin[0],
+            cell_height: metrics.cell_size.height as f32,
+            grid_origin_y: inputs.grid_origin[1],
             bold_brightens,
             selection_fg: visible(palette.selection_fg),
             selection_bg: palette.selection_bg,
@@ -481,6 +510,10 @@ impl MetalFrame {
         let cursor_row = cursor.y - frame.mirror.first();
         let cursor = match usize::try_from(cursor_row) {
             Ok(row) if cursor.visibility == CursorVisibility::Visible && row < rows.len() => {
+                let scale_x = match rows[row].line_mode() {
+                    mux::render_mirror::MirrorLineMode::SingleWidth => 1,
+                    _ => 2,
+                };
                 let width_cells = rows[row]
                     .cells()
                     .iter()
@@ -493,9 +526,9 @@ impl MetalFrame {
                     } else {
                         metal_shape
                     },
-                    col: cursor.x as u32,
+                    col: (cursor.x as u32).saturating_mul(scale_x),
                     row: row as u32,
-                    width_cells,
+                    width_cells: width_cells.saturating_mul(scale_x),
                     thickness: metrics.underline_height.max(1) as f32,
                     color: premultiplied(cursor_color),
                 }

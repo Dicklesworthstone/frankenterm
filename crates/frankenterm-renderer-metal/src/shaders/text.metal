@@ -43,11 +43,20 @@ struct FrameUniforms {
 // Byte layout: CellText in src/cell_text.rs (24 bytes).
 struct CellText {
     ushort2 grid;        // 0: column, ring row
-    ushort2 atlas;       // 4: glyph's top-left texel
+    ushort2 atlas;       // 4: glyph's top-left texel; high bits: scaled-texel phase
     ushort2 size;        // 8: glyph width, height in pixels
     short2 offset;       // 12: glyph top-left from the cell's top-left
     uchar4 fg;           // 16: straight RGBA
     uchar4 decoration;   // 20: underline RGB, flags
+};
+
+// RowTable's existing 16-byte stride: first instance, count, DEC line mode,
+// reserved. Mode 0 is ordinary, 1 double-width, 2/3 double-height top/bottom.
+struct TextRow {
+    uint first;
+    uint count;
+    uint mode;
+    uint reserved;
 };
 
 // CellText flag bits (src/cell_text.rs `flags`).
@@ -76,17 +85,22 @@ struct TextVertex {
     float2 glyph_origin [[flat]];
     float2 glyph_size [[flat]];
     float2 atlas_origin [[flat]];
+    float2 texel_step [[flat]];
+    float2 texture_phase [[flat]];
     float4 fg [[flat]];
     float3 decoration [[flat]];
     uint flags [[flat]];
+    uint row_mode [[flat]];
 };
 
 // Vertices 0..4 of a triangle strip: the corners (0, 0), (1, 0), (0, 1), (1, 1).
 vertex TextVertex text_vertex(uint vertex_id [[vertex_id]],
                               uint instance_id [[instance_id]],
                               constant FrameUniforms &u [[buffer(0)]],
-                              device const CellText *instances [[buffer(2)]]) {
+                              device const CellText *instances [[buffer(2)]],
+                              device const TextRow *row_table [[buffer(3)]]) {
     CellText cell = instances[instance_id];
+    uint mode = row_table[cell.grid.y].mode;
     uint rows = max(u.grid.x, 1u);
     uint logical_row = (uint(cell.grid.y) + rows - u.row_offset % rows) % rows;
     uint flags = cell.decoration.a;
@@ -104,6 +118,15 @@ vertex TextVertex text_vertex(uint vertex_id [[vertex_id]],
         low = min(low, glyph_origin);
         high = max(high, glyph_origin + glyph_size);
     }
+    if (mode != 0) {
+        low.x = max(low.x, u.grid_origin.x);
+        high.x = min(high.x, u.grid_origin.x + float(u.grid.y) * u.cell_size.x);
+    }
+    if (mode >= 2) {
+        low.y = max(low.y, span_origin.y);
+        high.y = min(high.y, span_origin.y + u.cell_size.y);
+    }
+    high = max(low, high);
     float2 corner = float2(float(vertex_id & 1), float(vertex_id >> 1));
     float2 pixel = mix(low, high, corner);
     float2 viewport = float2(u.viewport);
@@ -113,13 +136,17 @@ vertex TextVertex text_vertex(uint vertex_id [[vertex_id]],
     out.span_size = span_size;
     out.glyph_origin = glyph_origin;
     out.glyph_size = glyph_size;
-    out.atlas_origin = float2(cell.atlas);
+    out.atlas_origin = float2(cell.atlas & ushort2(0x7fff, 0x3fff));
+    bool unscaled_y = (cell.atlas.y & 0x4000) != 0;
+    out.texel_step = float2(mode == 0 ? 1.0 : 0.5, mode >= 2 && !unscaled_y ? 0.5 : 1.0);
+    out.texture_phase = float2(cell.atlas >> 15);
     out.fg = float4(SRGB_TO_LINEAR[cell.fg.r], SRGB_TO_LINEAR[cell.fg.g],
                     SRGB_TO_LINEAR[cell.fg.b], float(cell.fg.a) / 255.0);
     out.decoration = float3(SRGB_TO_LINEAR[cell.decoration.r],
                             SRGB_TO_LINEAR[cell.decoration.g],
                             SRGB_TO_LINEAR[cell.decoration.b]);
     out.flags = flags;
+    out.row_mode = mode;
     return out;
 }
 
@@ -189,6 +216,14 @@ fragment float4 text_fragment(TextVertex in [[stage_in]],
                               texture2d<float> color [[texture(1)]]) {
     constexpr sampler texel(coord::pixel, filter::nearest, address::clamp_to_edge);
     float2 p = in.position.xy;
+    if (in.row_mode != 0
+        && (p.x < u.grid_origin.x || p.x >= u.grid_origin.x + float(u.grid.y) * u.cell_size.x)) {
+        discard_fragment();
+    }
+    if (in.row_mode >= 2
+        && (p.y < in.span_origin.y || p.y >= in.span_origin.y + u.cell_size.y)) {
+        discard_fragment();
+    }
     float alpha = in.fg.a;
     // The underline has its own color (SGR 58); the overline and the
     // strikethrough take the foreground's.
@@ -213,7 +248,11 @@ fragment float4 text_fragment(TextVertex in [[stage_in]],
     if ((atlas == FLAG_ATLAS_GRAY || atlas == FLAG_ATLAS_COLOR)
         && inner.x >= 0.0 && inner.y >= 0.0
         && inner.x < in.glyph_size.x && inner.y < in.glyph_size.y) {
-        float2 at = in.atlas_origin + floor(inner) + 0.5;
+        float2 sample_position = inner;
+        if (in.row_mode != 0) {
+            sample_position = (inner + in.texture_phase) * in.texel_step;
+        }
+        float2 at = in.atlas_origin + floor(sample_position) + 0.5;
         float4 glyph;
         if (atlas == FLAG_ATLAS_COLOR) {
             // Color glyphs keep their own colors. Their texels are
