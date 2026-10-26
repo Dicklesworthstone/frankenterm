@@ -102,6 +102,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var stateObservation: UUID?
     private var observedPhase: TerminalKeyboardPhase = .active
     private var physicalKeys: [UInt16: TerminalHardwareKey] = [:]
+    /// UIKit reports a hardware key once however long it is held, so the last
+    /// terminal key pressed repeats here while it stays down, as on a desktop.
+    /// A key-row arrow held down repeats the same way.
+    private var repeatingKey: (usage: UInt16, timer: Timer)?
+    /// Whether the key-row arrow now held has repeated: its lift sends no extra key.
+    private var rowKeyRepeated = false
+    /// The pause before a held key repeats, then the time between repeats.
+    var keyRepeat: (delay: TimeInterval, interval: TimeInterval) = (0.4, 0.1)
     private var retiring = false
     private var enteredWindow = false
     private var keyboardRequested = false
@@ -201,7 +209,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         retiring = true
         keyboardRequested = false
         inputDelegate?.textWillChange(self); inputDelegate?.selectionWillChange(self)
-        accessoryModifiers.clear(); pendingPaste = nil; physicalKeys.removeAll()
+        accessoryModifiers.clear(); pendingPaste = nil; physicalKeys.removeAll(); stopRepeating()
         session.suspend()
         if let token = stateObservation { session.removeStateObserver(token); stateObservation = nil }
         refreshComposition()
@@ -492,6 +500,8 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         var unhandled = Set<UIPress>()
         for press in presses {
             guard let key = press.key, let usage = UInt16(exactly: key.keyCode.rawValue) else { unhandled.insert(press); continue }
+            // Pressing another key ends a repeat, as on a desktop; a modifier does not.
+            if !(0xE0...0xE7).contains(usage) { stopRepeating() }
             let mods = modifiers(key.modifierFlags)
             guard TerminalHardwareRouting.destination(usage: usage, modifiers: mods,
                                                        hasMarkedText: session.document.isMarked) == .terminal else {
@@ -501,16 +511,66 @@ public final class NativeTerminalInputView: UIView, UITextInput {
                 guard physicalKeys[usage] != nil || physicalKeys.count < 32 else { throw TerminalKeyboardError.capacity }
                 let value = try TerminalHardwareKey(usage: usage, modifiers: mods.union(accessoryModifiers.modifiers),
                                                     characters: key.charactersIgnoringModifiers)
-                try session.key(value, phase: physicalKeys[usage] == nil ? .down : .repeated)
+                let held = physicalKeys[usage] != nil
+                try session.key(value, phase: held ? .repeated : .down)
                 physicalKeys[usage] = value; accessoryModifiers.consume()
+                // A key UIKit reports again while held is one UIKit repeats.
+                if !held { startRepeating(usage) { $0.repeatHeldKey(usage) } }
             }
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+    private func startRepeating(_ usage: UInt16, _ tick: @escaping @MainActor (NativeTerminalInputView) -> Void) {
+        stopRepeating()
+        let timer = Timer(fire: Date(timeIntervalSinceNow: keyRepeat.delay), interval: keyRepeat.interval,
+                          repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            MainActor.assumeIsolated { tick(self) }
+        }
+        // Common modes: a held key keeps repeating while a scroll is tracked.
+        RunLoop.main.add(timer, forMode: .common)
+        repeatingKey = (usage, timer)
+    }
+    private func stopRepeating(_ usage: UInt16? = nil) {
+        guard let repeating = repeatingKey, usage == nil || usage == repeating.usage else { return }
+        repeating.timer.invalidate(); repeatingKey = nil
+    }
+    private func repeatHeldKey(_ usage: UInt16) {
+        guard let key = physicalKeys[usage] else { stopRepeating(usage); return }
+        // A repeat waits until the keys before it are taken, so a slow
+        // connection never fills the bounded queue with repeats.
+        guard session.accounting.pendingEvents == 0 else { return }
+        typed { try session.key(key, phase: .repeated) }
+    }
+    private func sendRowKey(_ usage: UInt16, modifiers: TerminalKeyModifiers) {
+        typed {
+            try session.key(TerminalHardwareKey(usage: usage, modifiers: modifiers), phase: .press)
+            accessoryModifiers.consume()
+        }
+    }
+    /// A held arrow repeats with the modifiers set when it was touched.
+    private func holdRowKey(_ usage: UInt16) {
+        let modifiers = accessoryModifiers.modifiers
+        rowKeyRepeated = false
+        startRepeating(usage) { view in
+            guard view.session.accounting.pendingEvents == 0 else { return }
+            view.typed {
+                try view.session.key(TerminalHardwareKey(usage: usage, modifiers: modifiers), phase: .press)
+                view.accessoryModifiers.consume(); view.rowKeyRepeated = true
+            }
+        }
+    }
+    /// Whether the hold that ends here repeated its key.
+    private func endRowHold(_ usage: UInt16) -> Bool {
+        stopRepeating(usage)
+        defer { rowKeyRepeated = false }
+        return rowKeyRepeated
     }
     private func finishPresses(_ presses: Set<UIPress>) -> Set<UIPress> {
         var unhandled = Set<UIPress>()
         for press in presses {
             guard let key = press.key, let usage = UInt16(exactly: key.keyCode.rawValue) else { unhandled.insert(press); continue }
+            stopRepeating(usage)
             if let captured = physicalKeys[usage] {
                 do {
                     try session.key(captured, phase: .up)
@@ -637,13 +697,18 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         for (title, symbol, label, usage) in [("esc", nil, "Escape", UInt16(0x29)), ("tab", nil, "Tab", 0x2B),
                                               (nil, "arrow.left", "Left arrow", 0x50), (nil, "arrow.down", "Down arrow", 0x51),
                                               (nil, "arrow.up", "Up arrow", 0x52), (nil, "arrow.right", "Right arrow", 0x4F)] {
-            terminalButtons.append(add(key(title, symbol: symbol, label: label) { [weak self] in
-                guard let self else { return }
-                self.typed {
-                    try self.session.key(TerminalHardwareKey(usage: usage, modifiers: self.accessoryModifiers.modifiers), phase: .press)
-                    self.accessoryModifiers.consume()
-                }
-            }))
+            // Arrows repeat while held, like the software keyboard's Delete;
+            // a tap sends one key when the finger lifts.
+            let repeats = (0x4F...0x52).contains(usage)
+            let button = add(key(title, symbol: symbol, label: label) { [weak self] in
+                guard let self, !(repeats && self.endRowHold(usage)) else { return }
+                self.sendRowKey(usage, modifiers: self.accessoryModifiers.modifiers)
+            })
+            if repeats {
+                button.addAction(UIAction { [weak self] _ in self?.holdRowKey(usage) }, for: .touchDown)
+                button.addAction(UIAction { [weak self] _ in _ = self?.endRowHold(usage) }, for: [.touchUpOutside, .touchCancel])
+            }
+            terminalButtons.append(button)
         }
         // Characters a shell wants that hide on the keyboard's second pages.
         for character in ["~", "|", "/", "-"] {

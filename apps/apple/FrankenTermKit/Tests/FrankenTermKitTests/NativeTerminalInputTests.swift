@@ -20,7 +20,10 @@ private struct UIKitInputEncoder: TerminalKeyboardEncoding {
         let value: String
         switch intent {
         case .text(let text): value = text
-        case .key(let key, _): value = "<key:\(key.usage)>"
+        case .key(let key, .press): value = "<key:\(key.usage)>"
+        case .key(let key, .down): value = "<down:\(key.usage)>"
+        case .key(let key, .repeated): value = "<repeat:\(key.usage)>"
+        case .key(let key, .up): value = "<up:\(key.usage)>"
         case .releaseAll: value = ""
         }
         guard value.utf8.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
@@ -30,6 +33,21 @@ private struct UIKitInputEncoder: TerminalKeyboardEncoding {
         guard text.utf8.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
         return TerminalPreparedPaste(text: text, bracketed: true)
     }
+}
+/// UIKit makes presses only from real hardware; these stand in for one key.
+private final class HardwareKey: UIKey {
+    private let usage: UIKeyboardHIDUsage
+    init(_ usage: UIKeyboardHIDUsage) { self.usage = usage; super.init() }
+    required init?(coder: NSCoder) { nil }
+    override var keyCode: UIKeyboardHIDUsage { usage }
+    override var modifierFlags: UIKeyModifierFlags { [] }
+    override var characters: String { "" }
+    override var charactersIgnoringModifiers: String { "" }
+}
+private final class HardwarePress: UIPress {
+    private let hardwareKey: UIKey
+    init(_ usage: UIKeyboardHIDUsage) { hardwareKey = HardwareKey(usage); super.init() }
+    override var key: UIKey? { hardwareKey }
 }
 @MainActor
 private final class NativeInputDelegate: NSObject, UITextInputDelegate {
@@ -412,6 +430,116 @@ final class NativeTerminalInputTests: XCTestCase {
         for _ in 0..<100 where shortHolder.isHolding { try await Task.sleep(for: .milliseconds(20)) }
         XCTAssertFalse(shortHolder.isHolding, "no terminal took it: the keyboard goes down at the deadline")
         XCTAssertFalse(shortHolder.isFirstResponder)
+    }
+
+    private func sent(_ view: NativeTerminalInputView, _ coordinator: TerminalInputCoordinator,
+                      _ source: TerminalSource, _ transport: UIKitInputTransport) async throws -> String {
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        return String(decoding: await transport.bytes(), as: UTF8.self)
+    }
+    private func count(_ text: String, _ token: String) -> Int { text.components(separatedBy: token).count - 1 }
+
+    /// UIKit reports a held hardware key once. A held Backspace or arrow
+    /// repeats after a pause, steadily, until it is let go.
+    func testAHeldTerminalKeyRepeatsUntilItIsLetGo() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        view.keyRepeat = (delay: 0.3, interval: 0.03)
+        let backspace = HardwarePress(.keyboardDeleteOrBackspace)
+        view.pressesBegan([backspace], with: nil)
+        let early = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(early, "<down:42>", "no repeat before the pause")
+        try await Task.sleep(for: .milliseconds(600))
+        view.pressesEnded([backspace], with: nil)
+        let held = try await sent(view, coordinator, source, transport)
+        XCTAssertGreaterThanOrEqual(count(held, "<repeat:42>"), 3, held)
+        XCTAssertTrue(held.hasPrefix("<down:42><repeat:42>"), held)
+        XCTAssertTrue(held.hasSuffix("<repeat:42><up:42>"), held)
+        try await Task.sleep(for: .milliseconds(200))
+        let after = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(after, held, "a key let go repeats no more")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    /// Only the last key pressed repeats, as on a desktop keyboard: a new key
+    /// ends the repeat (even one the text system takes), a modifier does not,
+    /// and letting go of an earlier key leaves the new one repeating.
+    func testOnlyTheLastKeyPressedRepeats() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        view.keyRepeat = (delay: 0.05, interval: 0.03)
+        let left = HardwarePress(.keyboardLeftArrow), shift = HardwarePress(.keyboardLeftShift)
+        view.pressesBegan([left], with: nil)
+        try await Task.sleep(for: .milliseconds(250))
+        let before = count(try await sent(view, coordinator, source, transport), "<repeat:80>")
+        XCTAssertGreaterThan(before, 0)
+        view.pressesBegan([shift], with: nil)
+        try await Task.sleep(for: .milliseconds(250))
+        let withShift = count(try await sent(view, coordinator, source, transport), "<repeat:80>")
+        XCTAssertGreaterThan(withShift, before, "a modifier does not end the repeat")
+        let letter = HardwarePress(.keyboardA)
+        view.pressesBegan([letter], with: nil)
+        let stopped = try await sent(view, coordinator, source, transport)
+        try await Task.sleep(for: .milliseconds(250))
+        let later = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(later, stopped, "a key the text system takes ends the repeat")
+        view.pressesEnded([letter, shift, left], with: nil)
+
+        let down = HardwarePress(.keyboardDownArrow), up = HardwarePress(.keyboardUpArrow)
+        view.pressesBegan([down], with: nil); view.pressesBegan([up], with: nil)
+        view.pressesEnded([down], with: nil)
+        try await Task.sleep(for: .milliseconds(250))
+        view.pressesEnded([up], with: nil)
+        let tail = String(try await sent(view, coordinator, source, transport).dropFirst(stopped.count))
+        XCTAssertTrue(tail.hasPrefix("<up:80><down:81><down:82><up:81>"), tail)
+        XCTAssertEqual(count(tail, "<repeat:81>"), 0, "the earlier key stopped repeating")
+        XCTAssertGreaterThanOrEqual(count(tail, "<repeat:82>"), 2, "letting go of it left the new key repeating")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    /// Should UIKit report a held key again itself, that is its repeat: the
+    /// view's own stops, so a key never repeats twice over.
+    func testAKeyUIKitReportsAgainIsNotAlsoRepeatedHere() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        view.keyRepeat = (delay: 0.05, interval: 0.03)
+        let right = HardwarePress(.keyboardRightArrow)
+        view.pressesBegan([right], with: nil); view.pressesBegan([right], with: nil)
+        try await Task.sleep(for: .milliseconds(250))
+        view.pressesEnded([right], with: nil)
+        let output = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(output, "<down:79><repeat:79><up:79>")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    /// A key-row arrow held down repeats, like the software keyboard's Delete;
+    /// a tap still sends one key.
+    func testAHeldKeyRowArrowRepeatsAndATapSendsOne() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        view.keyRepeat = (delay: 0.05, interval: 0.03)
+        let left = try XCTUnwrap(accessoryButton(view, "Left arrow"))
+        left.sendActions(for: .touchDown); left.sendActions(for: .touchUpInside)
+        try await Task.sleep(for: .milliseconds(150))
+        let tap = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(tap, "<key:80>", "a tap is one key")
+        left.sendActions(for: .touchDown)
+        try await Task.sleep(for: .milliseconds(250))
+        left.sendActions(for: .touchUpInside)
+        let held = try await sent(view, coordinator, source, transport)
+        XCTAssertGreaterThanOrEqual(count(held, "<key:80>"), 4, held)
+        try await Task.sleep(for: .milliseconds(150))
+        let lifted = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(lifted, held, "the lift ends the repeat")
+        // One repeat, then the lift: the lift adds no key of its own.
+        view.keyRepeat = (delay: 0.05, interval: 60)
+        left.sendActions(for: .touchDown)
+        try await Task.sleep(for: .milliseconds(250))
+        left.sendActions(for: .touchUpInside)
+        let once = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(once, held + "<key:80>", "one repeat, and nothing more at the lift")
+        // A finger that slides off, or scrolls the row, ends the hold too.
+        left.sendActions(for: .touchDown); left.sendActions(for: .touchCancel)
+        try await Task.sleep(for: .milliseconds(150))
+        let cancelled = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(cancelled, once)
+        view.retire(); await view.session.waitUntilSuspended()
     }
 }
 #endif

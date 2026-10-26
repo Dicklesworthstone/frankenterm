@@ -242,6 +242,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("+\n")
         waitFor("ARROW-42", in: terminal, "the accessory Left arrow must move the line editor's cursor")
 
+        // A held Left arrow repeats: only a repeat walks the cursor back over
+        // the whole line, so the missing "ec" lands at its start.
+        app.typeText("ho HOLD-$((40+2))")
+        app.buttons["terminal.key.Left arrow"].press(forDuration: 3)
+        app.typeText("ec\n")
+        waitFor("HOLD-42", in: terminal, "a held accessory Left arrow must repeat to the line's start")
+
         // Tab completes the only /usr entry starting with "shar"; without it cd fails.
         app.typeText("cd /usr/shar")
         app.buttons["terminal.key.Tab"].tap()
