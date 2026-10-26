@@ -207,9 +207,25 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
 
 /// `paint_line` for the screen's top row. Erasing that whole row would end
 /// the wrap of the history row above it in the phone's terminal, which the
-/// remote keeps, so its cells are erased one by one (ECH) instead.
+/// remote keeps, so the row's first cell is written first and the rest is
+/// erased from there. (ECH would keep the wrap too, but the phone charges
+/// it the square of the width, past its work budget on a wide screen.)
 pub fn paint_top_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
-    let _ = write!(out, "\r\x1b[0m\x1b[{cols}X");
+    out.push_str("\r\x1b[0m");
+    write_alone(
+        out,
+        first_cell(line).filter(|cell| cell.width().max(1) <= cols),
+    );
+    if cols > 1 {
+        out.push_str("\x1b[K");
+    }
+    out.push('\r');
+    paint_cells(out, line, cols)
+}
+
+/// `paint_line` for a row already blank, which it does not erase.
+pub fn paint_blank_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+    out.push_str("\r\x1b[0m");
     paint_cells(out, line, cols)
 }
 
@@ -261,10 +277,26 @@ fn paint_cells(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
 /// and marks the one above as continuing there; the row below shows what
 /// it did. Leaves the cursor on the row below with SGR reset and no link.
 pub fn continue_onto(out: &mut String, next: Option<&Line>) {
-    let first = next
-        .and_then(|line| line.visible_cells().next())
-        .filter(|cell| cell.cell_index() == 0);
-    match first {
+    write_alone(out, first_cell(next));
+}
+
+/// Carries a wrap on into a row painted next, with a blank written plain:
+/// a row that scrolls in for it takes the pen's background, so it stays
+/// blank.
+pub fn carry_on(out: &mut String) {
+    out.push(' ');
+}
+
+/// The cell in `line`'s first column, unless a wide one covers it.
+fn first_cell(line: Option<&Line>) -> Option<CellRef<'_>> {
+    line.and_then(|line| line.visible_cells().next())
+        .filter(|cell| cell.cell_index() == 0)
+}
+
+/// Writes `cell` at the cursor as it looks, or a blank without one, leaving
+/// SGR reset and no link open.
+fn write_alone(out: &mut String, cell: Option<CellRef<'_>>) {
+    match cell {
         Some(cell) => {
             let mut pen = Pen::new();
             pen.write(out, Style::of(cell.attrs()), &cell);
@@ -509,6 +541,35 @@ mod tests {
         let mut out = String::new();
         continue_onto(&mut out, None);
         assert_eq!(out, " ", "a row the server no longer has carries on blank");
+    }
+
+    #[test]
+    fn a_blank_row_is_painted_without_an_erase() {
+        let line = line_of(&[
+            ("a", CellAttributes::default()),
+            (" ", CellAttributes::default()),
+            ("b", CellAttributes::default()),
+        ]);
+        let mut out = String::new();
+        assert!(!paint_blank_line(&mut out, Some(&line), 300));
+        assert_eq!(out, "\r\x1b[0ma\x1b[3Gb");
+    }
+
+    #[test]
+    fn the_top_row_is_erased_from_after_its_first_cell() {
+        let line = line_of(&[
+            ("a", CellAttributes::default()),
+            (" ", CellAttributes::default()),
+            ("b", CellAttributes::default()),
+        ]);
+        let mut out = String::new();
+        assert!(!paint_top_line(&mut out, Some(&line), 300));
+        // One EL, from the second column: erasing the whole top row would end
+        // the wrap of the history row above it; ECH would cost 300 * 300.
+        assert_eq!(out, "\r\x1b[0ma\x1b[K\ra\x1b[3Gb");
+        let mut out = String::new();
+        paint_top_line(&mut out, None, 300);
+        assert_eq!(out, "\r\x1b[0m \x1b[K\r", "a row not known is blank");
     }
 
     #[test]

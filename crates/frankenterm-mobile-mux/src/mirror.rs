@@ -52,9 +52,13 @@ fn distance(from: StableRowIndex, to: StableRowIndex) -> usize {
 }
 
 /// Draws `line` on screen row `y`, where the cursor is; true when it wraps
-/// (see `render::paint_line`).
-fn paint(out: &mut String, line: Option<&Line>, cols: usize, y: usize) -> bool {
-    if y == 0 {
+/// (see `render::paint_line`). A row `blank` already (it scrolled in, or
+/// the screen was just wiped) is not erased: each erase costs the phone's
+/// terminal a row's width of the work budget it has for a piece of output.
+fn paint(out: &mut String, line: Option<&Line>, cols: usize, y: usize, blank: bool) -> bool {
+    if blank {
+        render::paint_blank_line(out, line, cols)
+    } else if y == 0 {
         render::paint_top_line(out, line, cols)
     } else {
         render::paint_line(out, line, cols)
@@ -385,14 +389,18 @@ impl PaneMirror {
         ranges
     }
 
-    /// Draws what changed once every row it needs is here.
-    pub fn render(&mut self) -> Option<Output> {
+    /// Draws what changed once every row it needs is here, as outputs for
+    /// the phone's terminal to take in order, each a piece of its own.
+    pub fn render(&mut self) -> Vec<Output> {
+        let mut outputs = Vec::new();
         if !self.visible || self.fetching || !self.wanted().is_empty() {
-            return None;
+            return outputs;
         }
-        let target = self.target.clone()?;
+        let Some(target) = self.target.clone() else {
+            return outputs;
+        };
         if self.waiting_for_size(&target) {
-            return None;
+            return outputs;
         }
         let plan = self.plan(&target);
         let viewport = target.viewport();
@@ -401,21 +409,30 @@ impl PaneMirror {
             self.lines.clear();
             self.absent.clear();
             self.dirty.clear();
-            return None;
+            return outputs;
         }
 
         let rows = target.rows();
         let cols = target.dims.cols;
         let top = target.top();
-        let mut out = String::from("\x1b[?25l");
         if !self.shown.painted {
             // Whatever the terminal showed before (another pane, perhaps in
-            // its alternate screen) goes: back to the primary screen, wiped
-            // with its history. Pastes are bracketed from here on, so the
-            // session can hand each one to the server whole, which brackets
-            // it again only if the pane's program asked.
-            out.push_str("\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[?2004h");
+            // its alternate screen) goes, with its history: a full reset,
+            // which the phone's terminal charges both screens and the
+            // history it keeps, all one piece of output may cost. Pastes are
+            // bracketed from here on, so the session can hand each one to
+            // the server whole, which brackets it again only if the pane's
+            // program asked.
+            outputs.push(Output {
+                rows,
+                cols,
+                bytes: b"\x1bc\x1b[?25l\x1b[?2004h".to_vec(),
+            });
         }
+        let mut out = String::from("\x1b[?25l");
+        // The screen drawn on is blank now: wiped above, or an alternate
+        // screen entered here, which clears it.
+        let wiped = !self.shown.painted || (target.alt && self.shown.alt.is_none());
         if target.alt && self.shown.alt.is_none() {
             out.push_str("\x1b[?1049h");
         } else if !target.alt && self.shown.alt.is_some() {
@@ -425,15 +442,21 @@ impl PaneMirror {
         let at = |row: StableRowIndex, from: StableRowIndex| distance(from, row);
         // Draws `row` on screen row `y`. A row that wraps carries on into
         // the first cell of the row below, so the phone marks the wrap too;
-        // never from the bottom row, where that would scroll.
+        // never from the bottom row, where that would scroll: true when the
+        // cursor waits past it there instead.
         let in_place = |out: &mut String, row: StableRowIndex, y: usize| {
             render::move_to(out, y, 0);
-            if paint(out, line(row), cols, y) && y + 1 < rows {
+            let wraps = paint(out, line(row), cols, y, wiped);
+            if wraps && y + 1 < rows {
                 render::continue_onto(out, line(offset(row, 1)));
+                return false;
             }
+            wraps
         };
         match plan {
             Plan::Stream { from } => {
+                // The primary screen was not drawn since the wipe, so every
+                // row lands on a blank one, or scrolls in blank.
                 out.push_str("\x1b[H");
                 // The row written last, and whether it wraps.
                 let mut previous: Option<(StableRowIndex, bool)> = None;
@@ -445,12 +468,12 @@ impl PaneMirror {
                     }
                     match previous {
                         Some((above, true)) if offset(above, 1) == row => {
-                            render::continue_onto(&mut out, line(row));
+                            render::carry_on(&mut out);
                         }
                         Some(_) => out.push_str("\r\n"),
                         None => {}
                     }
-                    previous = Some((row, paint(&mut out, line(row), cols, y)));
+                    previous = Some((row, paint(&mut out, line(row), cols, y, true)));
                     y = (y + 1).min(rows.saturating_sub(1));
                 }
             }
@@ -464,32 +487,38 @@ impl PaneMirror {
                 entering,
                 all,
             } => {
-                for row in old_top..top.min(offset(old_top, rows)) {
-                    in_place(&mut out, row, at(row, old_top));
+                let redrawn = |row: &StableRowIndex| all || self.dirty.contains(row);
+                let leaving = old_top..top.min(offset(old_top, rows));
+                let mut wraps = false;
+                for row in leaving.clone() {
+                    wraps = in_place(&mut out, row, at(row, old_top));
                 }
                 // The phone's bottom row shows the row above the first one
-                // entering. If that row wraps, it is drawn again, so the
-                // first entering row carries it on.
+                // entering; if that row wraps, the first entering row
+                // carries it on, from the cursor waiting past it. Drawn there
+                // just now if it left; else drawn again, unless it is drawn
+                // in place below, where it carries on.
                 let above = entering.saturating_sub(1);
                 let bottom = rows.saturating_sub(1);
-                render::move_to(&mut out, bottom, 0);
-                let mut wraps = if entering == offset(old_top, rows)
-                    && line(above).is_some_and(Line::last_cell_was_wrapped)
-                {
-                    paint(&mut out, line(above), cols, bottom)
-                } else {
-                    false
-                };
+                let continued = entering == offset(old_top, rows);
+                if !(continued && leaving.contains(&above)) {
+                    render::move_to(&mut out, bottom, 0);
+                    wraps = continued
+                        && !redrawn(&above)
+                        && line(above).is_some_and(Line::last_cell_was_wrapped)
+                        && paint(&mut out, line(above), cols, bottom, false);
+                }
+                // Each entering row scrolls in blank.
                 for row in entering..viewport.end {
                     if wraps {
-                        render::continue_onto(&mut out, line(row));
+                        render::carry_on(&mut out);
                     } else {
                         out.push('\n');
                     }
-                    wraps = paint(&mut out, line(row), cols, bottom);
+                    wraps = paint(&mut out, line(row), cols, bottom, true);
                 }
                 for row in top..entering.min(viewport.end) {
-                    if all || self.dirty.contains(&row) {
+                    if redrawn(&row) {
                         in_place(&mut out, row, at(row, top));
                     }
                 }
@@ -531,10 +560,11 @@ impl PaneMirror {
         self.lines.clear();
         self.absent.clear();
         self.dirty.clear();
-        Some(Output {
+        outputs.push(Output {
             rows,
             cols,
             bytes: out.into_bytes(),
-        })
+        });
+        outputs
     }
 }

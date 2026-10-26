@@ -5,7 +5,7 @@ mod support;
 
 use frankenterm_mobile_mux::Event;
 use frankenterm_mobile_mux::mirror::HISTORY_ROWS;
-use support::{Harness, all_text, assert_mirrored, text, wraps};
+use support::{Harness, all_text, assert_kept, assert_mirrored, text, wraps};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -206,6 +206,94 @@ fn rows_wrap_on_the_phone_where_they_wrap_on_the_remote() {
     mirrored(&mut harness);
 }
 
+/// The phone's model ends the session on a piece of output that would make
+/// it do more than its work budget allows (the harness fails there). A wide
+/// screen is drawn within it: the top row, which history wraps into, is
+/// redrawn without erasing it cell by cell, which costs the square of the
+/// width (90,000 at 300 columns).
+#[test]
+fn a_wide_screen_is_drawn_within_the_phones_work_budget() {
+    let mut harness = Harness::new(100, 300);
+    harness.quiet_output(&numbered(0, 20));
+    let mut long = "w".repeat(300 * 120 + 7).into_bytes();
+    long.extend_from_slice(b"\r\n$ ");
+    harness.quiet_output(&long);
+    harness.attach();
+    assert_mirrored(&mut harness);
+    assert_kept(&mut harness);
+    // The top row changes in place.
+    harness.output(b"\x1b7\x1b[1;1HZ\x1b8");
+    assert_mirrored(&mut harness);
+    assert_kept(&mut harness);
+}
+
+/// A burst of short lines on a wide screen scrolls a thousand rows in at
+/// once. They enter blank and are not erased, which would cost the width
+/// each (206,000 here).
+#[test]
+fn a_burst_of_short_lines_on_a_wide_screen_stays_within_the_budget() {
+    let mut harness = Harness::new(30, 200);
+    harness.quiet_output(b"$ ");
+    harness.attach();
+    harness.quiet_output(&numbered(0, 1100));
+    harness.push();
+    assert_mirrored(&mut harness);
+    assert_kept(&mut harness);
+}
+
+/// At the most cells the phone shows (32,768), the first paint's wipe
+/// costs the whole budget (both screens), on its own. A screenful of
+/// output in one go then draws each row that leaves where it was, erasing
+/// it: half. The row above the entering ones wraps into them, and is
+/// carried on as it leaves; the rows entering scroll in blank.
+#[test]
+fn a_screenful_at_the_largest_size_stays_within_the_budget() {
+    let mut harness = Harness::new(128, 256);
+    harness.quiet_output(&numbered(0, 127));
+    harness.attach();
+    // From the bottom row: a line that wraps once, then enough lines to
+    // move the screen by exactly its height.
+    let mut batch = "x".repeat(300).into_bytes();
+    batch.extend_from_slice(b"\r\n");
+    batch.extend(numbered(127, 253));
+    harness.output(&batch);
+    assert_mirrored(&mut harness);
+    assert_kept(&mut harness);
+}
+
+/// Shown first in a full-screen program at that size: the wipe takes the
+/// whole budget, so the program's screen is entered (a screen's worth) in
+/// a piece of output of its own.
+#[test]
+fn a_pane_shown_in_a_full_screen_program_at_the_largest_size_stays_within_the_budget() {
+    let mut harness = Harness::new(128, 256);
+    harness.quiet_output(&numbered(0, 40));
+    harness.quiet_output(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[44m~ editing\x1b[0m");
+    harness.attach();
+    assert!(harness.phone.is_alt_screen_active());
+    assert_mirrored(&mut harness);
+}
+
+/// At that size, a full-screen program's screen is entered and drawn for
+/// a screen's worth. Leaving it as the bottom row wraps into one more
+/// redraws every primary row in place: with the switch back, the whole
+/// budget, so the row wrapping into the new one carries on in place
+/// instead of being drawn twice.
+#[test]
+fn a_full_screen_program_at_the_largest_size_stays_within_the_budget() {
+    let mut harness = Harness::new(128, 256);
+    harness.quiet_output(&numbered(0, 126));
+    harness.quiet_output(&"y".repeat(300).into_bytes());
+    harness.attach();
+    harness.output(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[44m~ editing\x1b[0m");
+    assert_mirrored(&mut harness);
+    let mut back = b"\x1b[?1049l".to_vec();
+    back.extend("z".repeat(222).into_bytes());
+    harness.output(&back);
+    assert_mirrored(&mut harness);
+    assert_kept(&mut harness);
+}
+
 #[test]
 fn input_paste_and_resize_reach_the_pane() {
     let mut harness = Harness::new(6, 20);
@@ -284,7 +372,7 @@ fn showing_a_pane_again_redraws_it_from_scratch() {
     harness.output(&numbered(8, 30));
     assert_eq!(harness.outputs, before, "a hidden pane draws nothing");
 
-    harness.phone = support::terminal(5, 20);
+    harness.phone = support::phone_terminal(5, 20);
     harness.session.show(pane);
     harness.pump();
     assert_mirrored(&mut harness);
@@ -1142,7 +1230,7 @@ fn a_hidden_pane_that_changes_is_reported_and_one_on_screen_is_not() {
     harness.pump();
     assert_eq!(activity(&harness), before + 1);
 
-    harness.phone = support::terminal(5, 20);
+    harness.phone = support::phone_terminal(5, 20);
     harness.session.show(pane);
     harness.pump();
     let shown = activity(&harness);

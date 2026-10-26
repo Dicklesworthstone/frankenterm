@@ -17,6 +17,7 @@ use codec::{
 };
 use frankenterm_mobile_mux::{Event, Session};
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::config::TerminalFeatureProfile;
 use frankenterm_term::{
     CellAttributes, Line, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
 };
@@ -30,8 +31,25 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A desktop pane's terminal, or with `NativeText` the phone's, which has
+/// a work budget for each piece of output it takes.
 #[derive(Debug)]
-struct Config;
+struct Config {
+    profile: TerminalFeatureProfile,
+    scrollback: usize,
+}
+
+impl Config {
+    /// The phone's model keeps at most 4096 history rows
+    /// (`NativeTerminalConfig`), and only those that fit beside both
+    /// screens in `native::MAX_RESIDENT_CELLS` (`retained_scrollback_rows`).
+    fn phone(rows: usize, cols: usize) -> Self {
+        Self {
+            profile: TerminalFeatureProfile::NativeText,
+            scrollback: 4096.min(65_536usize.saturating_sub(2 * rows * cols) / cols.max(1)),
+        }
+    }
+}
 
 impl TerminalConfiguration for Config {
     fn color_palette(&self) -> ColorPalette {
@@ -39,9 +57,16 @@ impl TerminalConfiguration for Config {
     }
 
     fn scrollback_size(&self) -> usize {
-        5000
+        self.scrollback
+    }
+
+    fn feature_profile(&self) -> TerminalFeatureProfile {
+        self.profile
     }
 }
+
+/// The most the phone's terminal takes at once (`native::MAX_FEED_BYTES`).
+const PHONE_FEED_BYTES: usize = 16 * 1024;
 
 pub fn size(rows: usize, cols: usize) -> TerminalSize {
     TerminalSize {
@@ -54,9 +79,30 @@ pub fn size(rows: usize, cols: usize) -> TerminalSize {
 }
 
 pub fn terminal(rows: usize, cols: usize) -> Terminal {
+    let config = Config {
+        profile: TerminalFeatureProfile::Full,
+        scrollback: 5000,
+    };
+    terminal_with(rows, cols, config)
+}
+
+/// The phone's terminal: the native profile and history its model runs.
+pub fn phone_terminal(rows: usize, cols: usize) -> Terminal {
+    terminal_with(rows, cols, Config::phone(rows, cols))
+}
+
+/// Resizes the phone's terminal as its model does, keeping the history
+/// that still fits.
+pub fn resize_phone(phone: &mut Terminal, rows: usize, cols: usize) {
+    phone.resize(size(rows, cols));
+    phone.set_config(Arc::new(Config::phone(rows, cols)));
+    phone.trim_scrollback_to_config();
+}
+
+fn terminal_with(rows: usize, cols: usize, config: Config) -> Terminal {
     Terminal::new(
         size(rows, cols),
-        Arc::new(Config),
+        Arc::new(config),
         "frankenterm-mobile-mux-test",
         "0",
         Box::new(std::io::sink()),
@@ -511,7 +557,7 @@ impl Harness {
         Self {
             server: Server::new(rows, cols),
             session: Session::new(),
-            phone: terminal(rows, cols),
+            phone: phone_terminal(rows, cols),
             events: Vec::new(),
             chunk: usize::MAX,
             outputs: 0,
@@ -551,9 +597,17 @@ impl Harness {
                 } = &event
                 {
                     if (self.phone.get_size().rows, self.phone.get_size().cols) != (*rows, *cols) {
-                        self.phone.resize(size(*rows, *cols));
+                        resize_phone(&mut self.phone, *rows, *cols);
                     }
-                    self.phone.advance_bytes(bytes);
+                    for piece in bytes.chunks(PHONE_FEED_BYTES) {
+                        self.phone.advance_bytes(piece);
+                        // The phone's model ends the session on this.
+                        assert!(
+                            !self.phone.native_execution_limit_exceeded(),
+                            "a piece of {} bytes for a {rows}x{cols} screen overran the phone's work budget",
+                            piece.len()
+                        );
+                    }
                     self.outputs += 1;
                 }
                 self.events.push(event);
@@ -663,6 +717,18 @@ pub fn all_text(term: &mut Terminal) -> Vec<String> {
         term,
         dims.scrollback_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
     )
+}
+
+/// The phone holds the remote's newest rows, as many as it keeps beside
+/// its screens: the same text, wrapping in the same places.
+pub fn assert_kept(harness: &mut Harness) {
+    let phone = all_text(&mut harness.phone);
+    let remote = all_text(&mut harness.server.term);
+    assert!(phone.len() <= remote.len(), "{phone:?}");
+    let older = remote.len() - phone.len();
+    assert_eq!(phone, remote[older..], "rows differ");
+    let wrapped = wraps(&mut harness.server.term);
+    assert_eq!(wraps(&mut harness.phone), wrapped[older..], "wraps differ");
 }
 
 /// The cursor's column and its row on screen.

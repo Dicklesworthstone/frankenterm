@@ -45,6 +45,8 @@ pub enum Event {
     /// The pane list, again whenever it may have changed.
     Panes(Vec<PaneInfo>),
     /// Bytes for the pane's terminal, which must be `rows` by `cols` first.
+    /// Fed apart from any other output: one may cost all the work the
+    /// phone's terminal allows a piece of output.
     Output {
         pane_id: usize,
         rows: usize,
@@ -1045,13 +1047,15 @@ impl Session {
                     ranges: wanted,
                 },
             );
-        } else if let Some(output) = mirror.render() {
-            self.events.push_back(Event::Output {
-                pane_id,
-                rows: output.rows,
-                cols: output.cols,
-                bytes: output.bytes,
-            });
+        } else {
+            for output in mirror.render() {
+                self.events.push_back(Event::Output {
+                    pane_id,
+                    rows: output.rows,
+                    cols: output.cols,
+                    bytes: output.bytes,
+                });
+            }
         }
     }
 }
