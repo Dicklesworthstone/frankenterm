@@ -143,6 +143,9 @@ public struct WorkspaceLocalState: Sendable {
     public let workspace: InstalledWorkspace
     public let credentialIDs: Set<String>
     public let revokedHostKeysByTrustScope: [String: Set<WorkspaceDocument.HostKey>]
+    /// Refused host keys whose block could not be saved: this run of the app
+    /// refuses them, a relaunch would not until a retry saves the block.
+    public let unsavedHostKeysByTrustScope: [String: Set<WorkspaceDocument.HostKey>]
     public let requiredHostCapabilitiesByTrustScope: [String: Set<String>]
     public let routes: [WorkspaceDocument.RouteReadiness]
 }
@@ -324,8 +327,13 @@ public actor WorkspaceStore {
             return try catalog.workspaces.map { workspace in
                 let document = try workspace.document()
                 let available = try availableCredentials(workspace, catalog: catalog)
-                return .init(workspace: workspace, credentialIDs: available,
-                      revokedHostKeysByTrustScope: hostRevocations(workspace.id, document: document, catalog: catalog),
+                let refused = hostRevocations(workspace.id, document: document, catalog: catalog)
+                let saved = hostRevocations(workspace.id, document: document, catalog: catalog, savedOnly: true)
+                return .init(workspace: workspace, credentialIDs: available, revokedHostKeysByTrustScope: refused,
+                      unsavedHostKeysByTrustScope: refused.reduce(into: [:]) { unsaved, scope in
+                          let keys = scope.value.subtracting(saved[scope.key] ?? [])
+                          if !keys.isEmpty { unsaved[scope.key] = keys }
+                      },
                       requiredHostCapabilitiesByTrustScope: hostRequirements(workspace.id, catalog: catalog),
                       routes: try readiness(document: document, workspaceID: workspace.id, available: available,
                           findings: workspace.findings, catalog: catalog, support: support))
@@ -1003,14 +1011,15 @@ public actor WorkspaceStore {
         }
     }
 
-    private func hostRevocations(_ workspaceID: UUID?, document: WorkspaceDocument,
-                                 catalog: Catalog) -> [String: Set<WorkspaceDocument.HostKey>] {
+    /// Every refusal in force, or with `savedOnly` the ones the catalog holds.
+    private func hostRevocations(_ workspaceID: UUID?, document: WorkspaceDocument, catalog: Catalog,
+                                 savedOnly: Bool = false) -> [String: Set<WorkspaceDocument.HostKey>] {
         var result: [String: Set<WorkspaceDocument.HostKey>] = [:]
-        for revocation in catalog.scopedHostRevocations.union(processScopedHostRevocations)
+        for revocation in catalog.scopedHostRevocations.union(savedOnly ? [] : processScopedHostRevocations)
         where revocation.workspaceID == workspaceID {
             result[revocation.scope, default: []].insert(revocation.key)
         }
-        let endpoints = catalog.hostRevocations.union(processHostRevocations)
+        let endpoints = catalog.hostRevocations.union(savedOnly ? [] : processHostRevocations)
         for trust in document.hostTrust {
             result[trust.canonicalTrustScope, default: []].formUnion(endpoints.filter {
                 $0.host == trust.host && $0.port == trust.port

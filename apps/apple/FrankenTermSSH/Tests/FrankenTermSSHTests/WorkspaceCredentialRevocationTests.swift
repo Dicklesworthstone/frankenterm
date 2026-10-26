@@ -150,6 +150,12 @@ final class WorkspaceCredentialRevocationTests: XCTestCase {
         try await store.revokedHostKeys(workspaceID: workspaceID).values.contains { $0.contains(key) }
     }
 
+    /// Whether Keys shows `key`'s block as not saved.
+    private func unsaved(_ store: WorkspaceStore, _ workspaceID: UUID, _ key: WorkspaceDocument.HostKey) async throws -> Bool {
+        try await store.loadWithLocalPolicy().first { $0.workspace.id == workspaceID }?
+            .unsavedHostKeysByTrustScope.values.contains { $0.contains(key) } == true
+    }
+
     func testOneConfirmedHostKeyRefusalCoversItsEndpointInEveryWorkspace() async throws {
         let fixture = try await SSHWorkspaceTestFixture.make()
         let alias = try await SSHWorkspaceTestFixture.make { $0["id"] = "alias-workspace" }
@@ -218,9 +224,14 @@ final class WorkspaceCredentialRevocationTests: XCTestCase {
             let relaunched = try await refuses(WorkspaceStore(persistence: persistence, vault: fixture.vault),
                                                fixture.installed.id, fixture.host)
             XCTAssertEqual(relaunched, afterPublication)
+            // Keys offers the retry exactly when a relaunch would forget it.
+            let notSaved = try await unsaved(fixture.store, fixture.installed.id, fixture.host)
+            XCTAssertEqual(notSaved, !afterPublication)
             let receipt = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
                 key: fixture.host, confirmedByUser: true)
             XCTAssertEqual(receipt.affectedWorkspaceIDs, [fixture.installed.id])
+            let stillUnsaved = try await unsaved(fixture.store, fixture.installed.id, fixture.host)
+            XCTAssertFalse(stillUnsaved, "a saved block is shown as saved")
             let reopened = WorkspaceStore(persistence: persistence, vault: fixture.vault)
             let saved = try await refuses(reopened, fixture.installed.id, fixture.host)
             XCTAssertTrue(saved)

@@ -1174,7 +1174,7 @@ final class MobileWorkspaceModel {
                 for owner in sealedOwners { await owner.close() }
                 // A failed write may still have landed; the refresh below
                 // shows the saved state beside the key.
-                self.credentialMessage = "Blocking this host key could not be confirmed. Affected sessions have been stopped. If the key is not shown as blocked, try again. \(error.localizedDescription)"
+                self.credentialMessage = "Saving the block on this host key could not be confirmed. Affected sessions have been stopped, and FrankenTerm refuses the key until it quits. If the key says the block was not saved, tap Save Block. \(error.localizedDescription)"
             }
             if self.active {
                 do { try await self.refreshWorkspaces(using: store, epoch: self.epoch) }
@@ -2921,6 +2921,8 @@ private struct WorkspaceKeysSheet: View {
     private func hostRow(_ endpoint: HostEndpoint) -> some View {
         let scopes = model.localPolicies[workspaceID]?.revokedHostKeysByTrustScope ?? [:]
         let blocked = Set(endpoint.trusts.flatMap { (scopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
+        let unsavedScopes = model.localPolicies[workspaceID]?.unsavedHostKeysByTrustScope ?? [:]
+        let unsaved = Set(endpoint.trusts.flatMap { (unsavedScopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
         let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
         return VStack(alignment: .leading, spacing: 10) {
             Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
@@ -2929,7 +2931,16 @@ private struct WorkspaceKeysSheet: View {
                     Text(verbatim: pin.key.algorithm).font(.caption).foregroundStyle(.secondary)
                     Text(verbatim: pin.key.fingerprint).font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
-                    if blocked.contains(pin.key.fingerprint) {
+                    if unsaved.contains(pin.key.fingerprint) {
+                        // Refused until the app quits; a relaunch would trust it.
+                        Label("Blocked until FrankenTerm quits. The block was not saved.",
+                              systemImage: "exclamationmark.shield").font(.callout)
+                        Button("Save Block", role: .destructive) {
+                            reviewed = nil
+                            hostReview = model.reviewHostRevocation(workspaceID: workspaceID, trustID: pin.trustID,
+                                                                    key: pin.key)
+                        }.accessibilityIdentifier("hostkeys.save.\(pin.trustID)")
+                    } else if blocked.contains(pin.key.fingerprint) {
                         Label("Blocked on this phone", systemImage: "xmark.shield").font(.callout)
                     } else if revoked.contains(pin.key.fingerprint) {
                         Label("Revoked by this workspace", systemImage: "xmark.shield").font(.callout)
