@@ -4,6 +4,8 @@ use config::FontRasterizerSelection;
 #[cfg(not(windows))]
 use image::{ImageBuffer, Rgba};
 
+pub(crate) mod cache;
+
 /// The amount, as a number in [0,1], to horizontally skew a glyph when rendering synthetic
 /// italics
 #[cfg(not(windows))]
@@ -20,7 +22,7 @@ pub mod harfbuzz;
 
 /// A bitmap representation of a glyph.
 /// The data is stored as pre-multiplied RGBA 32bpp.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RasterizedGlyph {
     pub data: Vec<u8>,
     pub height: usize,

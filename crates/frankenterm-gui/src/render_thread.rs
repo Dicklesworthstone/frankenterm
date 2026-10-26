@@ -174,8 +174,9 @@ impl SurfaceMailbox {
 /// What one [`FrameDriver::frame`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameReport {
-    /// A frame was presented.
-    pub presented: bool,
+    /// A frame was committed for presentation. Actual display feedback is
+    /// reported separately through [`RenderWaker::record_presented`].
+    pub submitted: bool,
     /// Build another frame at this time even without a wake: an animation,
     /// a blinking cursor, or a retry after a drawable timeout.
     pub redraw_at: Option<Instant>,
@@ -470,6 +471,8 @@ impl Activity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderThreadStats {
     pub frames_built: u64,
+    pub frames_submitted: u64,
+    /// Actual presentation callbacks, not command submissions/completions.
     pub frames_presented: u64,
     pub reconfigures: u64,
     pub wakes: u64,
@@ -500,6 +503,7 @@ struct Shared {
     interrupt: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     min_frame_interval_ns: AtomicU64,
     frames_built: AtomicU64,
+    frames_submitted: AtomicU64,
     frames_presented: AtomicU64,
     reconfigures: AtomicU64,
     wakes: AtomicU64,
@@ -545,6 +549,14 @@ impl RenderWaker {
     pub fn wake(&self) {
         self.shared.wake();
     }
+
+    /// Records display-confirmed frames without requesting a redraw. A
+    /// callback must not turn an otherwise idle window into a render loop.
+    pub fn record_presented(&self, count: u64) {
+        self.shared
+            .frames_presented
+            .fetch_add(count, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for RenderWaker {
@@ -553,10 +565,12 @@ impl std::fmt::Debug for RenderWaker {
     }
 }
 
-/// Recovery of a submitted frame that failed asynchronously on the GPU.
-/// Completion handlers own this thread-safe state and a waker, never the
-/// renderer. A failed last frame must still be retried after output stops;
-/// repeated failures back off instead of keeping the GPU busy at max_fps.
+/// Recovery of a submitted frame that failed asynchronously on the GPU or
+/// was skipped during presentation. Each feedback stream owns its own
+/// instance, so successful command completion cannot clear a skipped frame.
+/// Handlers own only this thread-safe state and a waker, never the renderer.
+/// A failed last frame is retried after output stops; persistent failure
+/// backs off instead of keeping the GPU busy at max_fps.
 #[derive(Debug, Default)]
 pub struct FrameRetry {
     state: Mutex<RetryState>,
@@ -590,7 +604,8 @@ impl FrameRetry {
         }
     }
 
-    /// Records a GPU completion, potentially from a Metal-managed thread.
+    /// Records a completion from one feedback stream, potentially from a
+    /// Metal-managed thread.
     /// A newer success supersedes earlier failures; late or duplicate
     /// completions cannot reset backoff or resurrect an obsolete retry.
     pub fn complete(&self, frame: u64, succeeded: bool, now: Instant) {
@@ -739,6 +754,7 @@ impl RenderThread {
         let shared = &self.shared;
         RenderThreadStats {
             frames_built: shared.frames_built.load(Ordering::Relaxed),
+            frames_submitted: shared.frames_submitted.load(Ordering::Relaxed),
             frames_presented: shared.frames_presented.load(Ordering::Relaxed),
             reconfigures: shared.reconfigures.load(Ordering::Relaxed),
             wakes: shared.wakes.load(Ordering::Relaxed),
@@ -811,8 +827,8 @@ fn build_frame<D: FrameDriver>(
         driver.frame(surface)
     };
     shared.frames_built.fetch_add(1, Ordering::Relaxed);
-    if report.presented {
-        shared.frames_presented.fetch_add(1, Ordering::Relaxed);
+    if report.submitted {
+        shared.frames_submitted.fetch_add(1, Ordering::Relaxed);
     }
     report
 }
@@ -1195,6 +1211,21 @@ mod tests {
     }
 
     #[test]
+    fn actual_presentation_accounting_never_requests_a_frame() {
+        let shared = Arc::new(Shared::default());
+        let waker = RenderWaker {
+            shared: Arc::clone(&shared),
+        };
+        shared.frames_submitted.store(3, Ordering::Relaxed);
+        assert_eq!(shared.frames_presented.load(Ordering::Relaxed), 0);
+        waker.record_presented(2);
+        assert_eq!(shared.frames_presented.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.frames_submitted.load(Ordering::Relaxed), 3);
+        assert!(!shared.pending.load(Ordering::Acquire));
+        assert_eq!(shared.wakes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn a_failed_first_frame_is_not_lost_before_its_waker_is_installed() {
         let retry = FrameRetry::default();
         let shared = Arc::new(Shared::default());
@@ -1229,7 +1260,7 @@ mod tests {
             let now = Instant::now();
             if let Some(at) = self.retry.wait_until(now) {
                 return FrameReport {
-                    presented: false,
+                    submitted: false,
                     redraw_at: Some(at),
                 };
             }
@@ -1238,7 +1269,7 @@ mod tests {
                 .unwrap()
                 .push((now, self.content.load(Ordering::Acquire)));
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: None,
             }
         }
@@ -1363,7 +1394,7 @@ mod tests {
                 .base_priority
                 .push(procinfo::current_thread_base_priority());
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: None,
             }
         }
@@ -1435,7 +1466,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             });
-            assert!(eventually(|| thread.stats().frames_presented > 0));
+            assert!(eventually(|| thread.stats().frames_submitted > 0));
             let before = thread.stats();
             // The main thread is blocked: no posts, no wakes, no tasks.
             std::thread::sleep(Duration::from_millis(200));
@@ -1443,7 +1474,7 @@ mod tests {
             output_done.store(true, Ordering::Release);
             (before, after)
         });
-        let presented = after.frames_presented - before.frames_presented;
+        let presented = after.frames_submitted - before.frames_submitted;
         // At most 50 at the 4 ms interval; honest slack for a loaded host.
         assert!(
             presented >= 10,
@@ -1517,7 +1548,7 @@ mod tests {
     fn dropping_the_render_thread_joins_it_after_dropping_the_driver_there() {
         let (thread, record) =
             spawn_recording(correlated(0), Duration::from_millis(1), Duration::ZERO);
-        assert!(eventually(|| thread.stats().frames_presented > 0));
+        assert!(eventually(|| thread.stats().frames_submitted > 0));
         let render_thread_id = thread.join.as_ref().unwrap().thread().id();
         assert!(thread.is_running());
         drop(thread);
@@ -1530,7 +1561,7 @@ mod tests {
     fn an_occluded_window_pauses_frames_until_it_is_visible_again() {
         let (thread, _record) =
             spawn_recording(correlated(0), Duration::from_millis(1), Duration::ZERO);
-        assert!(eventually(|| thread.stats().frames_presented > 0));
+        assert!(eventually(|| thread.stats().frames_submitted > 0));
         let occluded = SurfaceState {
             occluded: true,
             ..correlated(0)
@@ -1566,7 +1597,7 @@ mod tests {
     fn timer_pacing_restores_same_size_and_resized_occluded_surfaces() {
         let (thread, record) =
             spawn_recording(correlated(0), Duration::from_millis(1), Duration::ZERO);
-        assert!(eventually(|| thread.stats().frames_presented > 0));
+        assert!(eventually(|| thread.stats().frames_submitted > 0));
         let mut visible = correlated(0);
         for (index, restored) in [correlated(0), correlated(17)].into_iter().enumerate() {
             thread.post_surface(SurfaceState {
@@ -1665,7 +1696,7 @@ mod tests {
     fn wakes_faster_than_the_frame_interval_coalesce() {
         let (thread, _record) =
             spawn_recording(correlated(0), Duration::from_millis(20), Duration::ZERO);
-        assert!(eventually(|| thread.stats().frames_presented > 0));
+        assert!(eventually(|| thread.stats().frames_submitted > 0));
         let before = thread.stats();
         let started = Instant::now();
         let waker = thread.waker();
@@ -1977,7 +2008,7 @@ mod tests {
 
         fn frame(&mut self, _surface: &Surface) -> FrameReport {
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: self.0.then(Instant::now),
             }
         }
@@ -2079,7 +2110,7 @@ mod tests {
                 .unwrap()
                 .push(self.content.load(Ordering::Acquire));
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: None,
             }
         }
@@ -2205,7 +2236,7 @@ mod tests {
         fn frame(&mut self, _surface: &Surface) -> FrameReport {
             assert_eq!(self.log.lock().unwrap().running.last(), Some(&true));
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: None,
             }
         }
@@ -2221,7 +2252,7 @@ mod tests {
                 "direct drawable acquisition requires a paused link"
             );
             FrameReport {
-                presented: true,
+                submitted: true,
                 redraw_at: None,
             }
         }

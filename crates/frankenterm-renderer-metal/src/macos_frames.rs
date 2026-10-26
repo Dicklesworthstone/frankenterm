@@ -24,11 +24,11 @@ use crate::ui_quads::{
 use crate::uploads::{SlotUploads, UploadPlan, row_table_entry};
 use crate::{
     ClearColor, FRAME_SLOT_TIMEOUT, FrameCompletion, FrameCompletionHandler, FrameError,
-    MAX_TEXTURE_EXTENT, SubmissionPath,
+    FramePresentation, FramePresentationHandler, MAX_TEXTURE_EXTENT, SubmissionPath,
 };
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{
-    GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose,
+    FrameLedger, GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose,
 };
 use objc2::Message;
 use objc2::rc::Retained;
@@ -47,14 +47,14 @@ use objc2_metal::{
     MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect,
     MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CACurrentMediaTime, CAMetalLayer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Every Metal frame's target: the layer's drawables, the offscreen
 /// readback textures and the pipelines' color attachment. sRGB, so the GPU
@@ -1421,6 +1421,8 @@ pub(crate) struct Metal3Submission {
     passes: Vec<Retained<MTLRenderPassDescriptor>>,
     failed: Arc<AtomicU64>,
     completion_handler: RefCell<Option<FrameCompletionHandler>>,
+    presentation_handler: RefCell<Option<FramePresentationHandler>>,
+    presentations: Arc<PresentationCounters>,
 }
 
 pub(crate) struct Metal4Submission {
@@ -1433,6 +1435,8 @@ pub(crate) struct Metal4Submission {
     passes: Vec<Retained<MTL4RenderPassDescriptor>>,
     failed: Arc<AtomicU64>,
     completion_handler: RefCell<Option<FrameCompletionHandler>>,
+    presentation_handler: RefCell<Option<FramePresentationHandler>>,
+    presentations: Arc<PresentationCounters>,
     /// Creates a window frame's argument tables.
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Per slot, one argument table per draw of a window frame
@@ -1459,6 +1463,8 @@ impl Submission {
                 .collect(),
             failed: Arc::new(AtomicU64::new(0)),
             completion_handler: RefCell::new(None),
+            presentation_handler: RefCell::new(None),
+            presentations: Arc::default(),
         })
     }
 
@@ -1513,6 +1519,8 @@ impl Submission {
                 .collect(),
             failed: Arc::new(AtomicU64::new(0)),
             completion_handler: RefCell::new(None),
+            presentation_handler: RefCell::new(None),
+            presentations: Arc::default(),
             device: device.retain(),
             window_tables: (0..FRAME_SLOTS)
                 .map(|_| std::cell::RefCell::new(Vec::new()))
@@ -1564,6 +1572,26 @@ impl Submission {
             Self::Metal4(metal4) => &metal4.completion_handler,
         };
         *target.borrow_mut() = handler;
+    }
+
+    pub(crate) fn set_presentation_handler(&self, handler: Option<FramePresentationHandler>) {
+        let target = match self {
+            Self::Metal3(metal3) => &metal3.presentation_handler,
+            Self::Metal4(metal4) => &metal4.presentation_handler,
+        };
+        *target.borrow_mut() = handler;
+    }
+
+    pub(crate) fn presentation_counts(&self) -> (u64, u64, u64) {
+        let counters = match self {
+            Self::Metal3(metal3) => &metal3.presentations,
+            Self::Metal4(metal4) => &metal4.presentations,
+        };
+        (
+            counters.presented.load(Ordering::Relaxed),
+            counters.skipped.load(Ordering::Relaxed),
+            counters.unavailable.load(Ordering::Relaxed),
+        )
     }
 
     /// Encodes one frame into the leased slot and commits it: a render pass
@@ -2017,6 +2045,81 @@ impl UiPipeline {
     }
 }
 
+#[derive(Default)]
+struct PresentationCounters {
+    presented: AtomicU64,
+    skipped: AtomicU64,
+    unavailable: AtomicU64,
+}
+
+/// Observes the drawable itself, not command completion. This deliberately
+/// holds no slot token: GPU resources become reusable independently of the
+/// window server's presentation decision or callback delivery latency.
+fn observe_presentation(
+    drawable: &ProtocolObject<dyn MTLDrawable>,
+    target: &ProtocolObject<dyn MTLTexture>,
+    frame: u64,
+    counters: &Arc<PresentationCounters>,
+    observer: Option<FramePresentationHandler>,
+) {
+    if !drawable.respondsToSelector(sel!(addPresentedHandler:))
+        || !drawable.respondsToSelector(sel!(presentedTime))
+    {
+        counters.unavailable.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let size = [
+        u32::try_from(target.width()).unwrap_or(u32::MAX),
+        u32::try_from(target.height()).unwrap_or(u32::MAX),
+    ];
+    // The two clocks are sampled adjacent to one another. Mapping from this
+    // anchor preserves actual presentation time even if the handler runs
+    // much later. Sampling Instant first makes the mapping conservative.
+    let submitted_at = Instant::now();
+    let submitted_host = CACurrentMediaTime();
+    let reused_content = FrameLedger::global().take_reused_content();
+    let counters = Arc::clone(counters);
+    let handler = RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-BLOCK. Metal provides the drawable that finished
+        // presentation, valid for this callback; the borrow never escapes.
+        let presented_time = unsafe { drawable.as_ref() }.presentedTime();
+        let presentation = FramePresentation::from_host_time(
+            frame,
+            size,
+            submitted_at,
+            submitted_host,
+            presented_time,
+        );
+        finish_presentation(presentation, &counters, observer.as_ref(), reused_content);
+    });
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-BLOCK. Metal copies the live block before this call returns.
+    // It captures only Send + Sync owned state and scalar clock/extent values,
+    // never the drawable, renderer or a GPU slot. Registered before present.
+    unsafe {
+        drawable.addPresentedHandler(RcBlock::as_ptr(&handler));
+    }
+}
+
+fn finish_presentation(
+    presentation: FramePresentation,
+    counters: &PresentationCounters,
+    observer: Option<&FramePresentationHandler>,
+    reused_content: bool,
+) {
+    if let Some(at) = presentation.presented_at {
+        counters.presented.fetch_add(1, Ordering::Relaxed);
+        FrameLedger::global().record_presented_at(presentation.submitted_at, at, reused_content);
+    } else {
+        counters.skipped.fetch_add(1, Ordering::Relaxed);
+        FrameLedger::global().record_present_skipped();
+    }
+    if let Some(observer) = observer {
+        observer(presentation);
+    }
+}
+
 /// Release the GPU slot before a recovery observer can wake and submit a
 /// replacement frame. Both submission APIs use exactly this completion path.
 fn finish_frame(
@@ -2024,9 +2127,13 @@ fn finish_frame(
     failed: &AtomicU64,
     handler: Option<&FrameCompletionHandler>,
     succeeded: bool,
+    drawable_frame: bool,
 ) {
     if !succeeded {
         failed.fetch_add(1, Ordering::Relaxed);
+        if drawable_frame {
+            FrameLedger::global().record_present_failure();
+        }
     }
     token.complete();
     if let Some(handler) = handler {
@@ -2082,7 +2189,11 @@ impl Metal3Submission {
         }
         if let Some(text) = frame.text {
             encoder.setRenderPipelineState(&text.pipeline.state);
-            for kind in [SlotBuffer::Uniforms, SlotBuffer::CellText] {
+            for kind in [
+                SlotBuffer::Uniforms,
+                SlotBuffer::CellText,
+                SlotBuffer::RowTable,
+            ] {
                 #[allow(unsafe_code)]
                 // SAFETY: FFI-DRAW. The buffer is a live slot buffer of the
                 // leased slot, bound from offset 0 at its SlotBuffer index,
@@ -2134,7 +2245,7 @@ impl Metal3Submission {
             }
         }
         encoder.endEncoding();
-        self.commit(&commands, lease, frame.drawable);
+        self.commit(&commands, lease, frame.drawable, frame.target);
         Ok(())
     }
 
@@ -2195,6 +2306,16 @@ impl Metal3Submission {
                 );
             }
             #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The pane's leased row table supplies each
+            // visible row's DEC width/height mode at the shader's [[buffer(3)]].
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(
+                    Some(text.row_table),
+                    0,
+                    SlotBuffer::RowTable.index(),
+                );
+            }
+            #[allow(unsafe_code)]
             // SAFETY: FFI-DRAW. The window uniforms at the draw's block
             // offset, at the fragment shader's [[buffer(0)]].
             unsafe {
@@ -2224,7 +2345,7 @@ impl Metal3Submission {
             draw_ui(&encoder, ui);
         }
         encoder.endEncoding();
-        self.commit(&commands, lease, window.drawable);
+        self.commit(&commands, lease, window.drawable, window.target);
         Ok(())
     }
 
@@ -2235,10 +2356,19 @@ impl Metal3Submission {
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
         lease: SlotLease,
         drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
+        target: &ProtocolObject<dyn MTLTexture>,
     ) {
         if let Some(drawable) = drawable {
+            observe_presentation(
+                drawable,
+                target,
+                lease.frame(),
+                &self.presentations,
+                self.presentation_handler.borrow().clone(),
+            );
             commands.presentDrawable(drawable);
         }
+        let drawable_frame = drawable.is_some();
         let token = lease.submit();
         let failed = Arc::clone(&self.failed);
         let completion = self.completion_handler.borrow().clone();
@@ -2253,6 +2383,7 @@ impl Metal3Submission {
                     &failed,
                     completion.as_ref(),
                     status == MTLCommandBufferStatus::Completed,
+                    drawable_frame,
                 );
             },
         );
@@ -2368,7 +2499,7 @@ impl Metal4Submission {
             }
         }
         encoder.endEncoding();
-        self.commit(slot, lease, drawable);
+        self.commit(slot, lease, drawable, target);
         Ok(())
     }
 
@@ -2574,7 +2705,7 @@ impl Metal4Submission {
         }
         encoder.endEncoding();
         drop(tables);
-        self.commit(slot, lease, window.drawable);
+        self.commit(slot, lease, window.drawable, window.target);
         Ok(())
     }
 
@@ -2585,12 +2716,21 @@ impl Metal4Submission {
         slot: usize,
         lease: SlotLease,
         drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
+        target: &ProtocolObject<dyn MTLTexture>,
     ) {
         let commands = &self.command_buffers[slot];
         commands.endCommandBuffer();
         if let Some(drawable) = drawable {
+            observe_presentation(
+                drawable,
+                target,
+                lease.frame(),
+                &self.presentations,
+                self.presentation_handler.borrow().clone(),
+            );
             self.queue.waitForDrawable(drawable);
         }
+        let drawable_frame = drawable.is_some();
         let options = MTL4CommitOptions::new();
         let token = lease.submit();
         let failed = Arc::clone(&self.failed);
@@ -2601,7 +2741,13 @@ impl Metal4Submission {
                 // SAFETY: FFI-BLOCK. Metal passes the commit's feedback object,
                 // valid for the duration of the handler.
                 let error = unsafe { feedback.as_ref() }.error();
-                finish_frame(&token, &failed, completion.as_ref(), error.is_none());
+                finish_frame(
+                    &token,
+                    &failed,
+                    completion.as_ref(),
+                    error.is_none(),
+                    drawable_frame,
+                );
             },
         );
         #[allow(unsafe_code)]
@@ -3616,7 +3762,7 @@ mod tests {
                 completed_failed.load(Ordering::Relaxed),
             ));
         });
-        finish_frame(&token, &failed, Some(&handler), false);
+        finish_frame(&token, &failed, Some(&handler), false, false);
         assert_eq!(
             rx.recv_timeout(LONG).unwrap(),
             (
@@ -3649,6 +3795,10 @@ mod tests {
             submission.set_completion_handler(Some(Arc::new(move |completion| {
                 let _ = tx.send(completion);
             })));
+            let (present_tx, present_rx) = std::sync::mpsc::channel();
+            submission.set_presentation_handler(Some(Arc::new(move |presentation| {
+                let _ = present_tx.send(presentation);
+            })));
             run_offscreen_frames(&submission, &mut frames, SMALL, 6);
             let mut completions = (0..6)
                 .map(|_| rx.recv_timeout(LONG).unwrap())
@@ -3662,6 +3812,14 @@ mod tests {
                         succeeded: true,
                     })
                     .collect::<Vec<_>>()
+            );
+            assert_eq!(submission.presentation_counts(), (0, 0, 0));
+            assert!(
+                matches!(
+                    present_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "GPU completions must not fabricate drawable presentation"
             );
             submission.set_completion_handler(None);
             run_offscreen_frames(&submission, &mut frames, SMALL, 1);

@@ -523,7 +523,10 @@ impl ConceptFrame {
         };
 
         for info in infos {
-            if let Ok(mut glyph) = font.rasterize_glyph(info.glyph_pos, info.font_idx) {
+            if let Ok(glyph) = font.rasterize_glyph(info.glyph_pos, info.font_idx) {
+                // Title colors must not modify the shared source raster that
+                // other panes and atlas rebuilds use.
+                let mut glyph = Rc::unwrap_or_clone(glyph);
                 // fixup colors: they need to be switched to the appropriate
                 // pixel format, and for monochrome font data we need to tint
                 // it with their preferred title color

@@ -441,16 +441,27 @@ impl MetalRenderer {
         self.submission.set_completion_handler(handler);
     }
 
+    /// Observes actual drawable presentation, independently of GPU command
+    /// completion. In-flight drawables keep the observer installed at submit.
+    pub fn set_frame_presentation_handler(&self, handler: Option<crate::FramePresentationHandler>) {
+        self.submission.set_presentation_handler(handler);
+    }
+
     /// Frame pacing and allocation counters.
     #[must_use]
     pub fn frame_stats(&self) -> FrameStats {
         let frames = self.frames.borrow();
         let ring = frames.ring();
         let (upload_bytes_last, upload_bytes_total) = frames.upload_bytes();
+        let (frames_presented, frames_skipped, presentation_unavailable) =
+            self.submission.presentation_counts();
         FrameStats {
             path: self.submission.path(),
             frames_completed: ring.frames_completed(),
             frames_failed: self.submission.failed_frames(),
+            frames_presented,
+            frames_skipped,
+            presentation_unavailable,
             in_flight: ring.in_flight(),
             peak_in_flight: ring.peak_in_flight(),
             buffer_allocations: frames.allocations(),
@@ -826,7 +837,7 @@ impl MetalRenderer {
             &drawable.texture(),
             Some(ProtocolObject::from_ref(&*drawable)),
         )?;
-        Ok(FrameOutcome::Presented)
+        Ok(FrameOutcome::Submitted)
     }
 
     /// The chrome draw of a window frame that wrote `quads` chrome quads
@@ -1066,7 +1077,7 @@ impl MetalRenderer {
                 instances: text_instances,
             }),
         )?;
-        Ok(FrameOutcome::Presented)
+        Ok(FrameOutcome::Submitted)
     }
 }
 

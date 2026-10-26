@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Schema identifier written into every published snapshot file.
 pub const RESOURCE_SNAPSHOT_SCHEMA: &str = "frankenterm.resource_snapshot.v1";
@@ -1072,8 +1072,10 @@ impl WritersSnapshot {
     }
 }
 
-/// Frames the GUI handed to its graphics backend for presentation, and the
-/// intervals between them (ft-yccm0.1.4). This is FrankenTerm's own frame
+/// Frames presented by the GUI, and the intervals between them
+/// (ft-yccm0.1.4). Native Metal records actual drawable timestamps; backends
+/// without presentation feedback record when they accept a present request.
+/// This is FrankenTerm's own frame
 /// count: `scripts/mac-gui-throughput.sh` validates its terminal-agnostic
 /// screen-capture FPS meter against it.
 #[derive(Debug)]
@@ -1091,7 +1093,9 @@ pub struct FrameLedger {
     paint_passes_total: AtomicU64,
     retried_paint_frames_total: AtomicU64,
     present_failures_total: AtomicU64,
+    skipped_presents_total: AtomicU64,
     present_interval: LatencyHistogram,
+    submit_to_present: LatencyHistogram,
     /// Monotonic nanoseconds of the latest present; 0 before the first.
     last_present_ns: AtomicU64,
     max_fps: AtomicU64,
@@ -1116,7 +1120,9 @@ impl FrameLedger {
             paint_passes_total: AtomicU64::new(0),
             retried_paint_frames_total: AtomicU64::new(0),
             present_failures_total: AtomicU64::new(0),
+            skipped_presents_total: AtomicU64::new(0),
             present_interval: LatencyHistogram::new(),
+            submit_to_present: LatencyHistogram::new(),
             last_present_ns: AtomicU64::new(0),
             max_fps: AtomicU64::new(0),
         }
@@ -1141,15 +1147,52 @@ impl FrameLedger {
     /// One frame accepted for presentation at `at_ns` on a monotonic
     /// nanosecond clock; the interval since the previous one is recorded.
     pub fn record_present_at(&self, at_ns: u64) {
+        self.record_present_with_reuse(at_ns, self.take_reused_content());
+    }
+
+    /// Captures whether the frame being submitted reused content. An
+    /// asynchronous presentation must carry this value with its own frame,
+    /// rather than consume a later frame's flag when its callback arrives.
+    pub fn take_reused_content(&self) -> bool {
+        self.reused_content_pending.swap(false, Ordering::Relaxed)
+    }
+
+    /// Records a display-confirmed frame using its actual presentation
+    /// timestamp, rather than callback arrival time. Both instants must use
+    /// the same monotonic clock; invalid ordering is rejected.
+    pub fn record_presented_at(
+        &self,
+        submitted_at: Instant,
+        presented_at: Instant,
+        reused_content: bool,
+    ) {
+        let Some(elapsed) = presented_at.checked_duration_since(submitted_at) else {
+            return;
+        };
+        self.submit_to_present
+            .record(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.record_present_with_reuse(monotonic_ns_at(presented_at), reused_content);
+    }
+
+    fn record_present_with_reuse(&self, at_ns: u64, reused_content: bool) {
         let at_ns = at_ns.max(1);
         self.presented_total.fetch_add(1, Ordering::Relaxed);
-        if self.reused_content_pending.swap(false, Ordering::Relaxed) {
+        if reused_content {
             self.stale_presented_total.fetch_add(1, Ordering::Relaxed);
         }
-        let previous = self.last_present_ns.swap(at_ns, Ordering::Relaxed);
-        if previous != 0 {
-            self.present_interval.record(at_ns.saturating_sub(previous));
+        // Callbacks may arrive out of order, including from two windows.
+        // Count every presented frame, but never move the interval clock
+        // backwards or turn an old callback into a spurious long interval.
+        let previous = self.last_present_ns.fetch_max(at_ns, Ordering::Relaxed);
+        if previous != 0 && at_ns > previous {
+            self.present_interval.record(at_ns - previous);
         }
+    }
+
+    /// A drawable's presentation callback reported it was skipped. This is
+    /// distinct from command submission/GPU failure, and is never a present.
+    pub fn record_present_skipped(&self) {
+        self.skipped_presents_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A frame the backend refused to present.
@@ -1182,7 +1225,9 @@ impl FrameLedger {
             paint_passes_total: self.paint_passes_total.load(Ordering::Relaxed),
             retried_paint_frames_total: self.retried_paint_frames_total.load(Ordering::Relaxed),
             present_failures_total: self.present_failures_total.load(Ordering::Relaxed),
+            skipped_presents_total: self.skipped_presents_total.load(Ordering::Relaxed),
             present_interval: self.present_interval.snapshot(),
+            submit_to_present: self.submit_to_present.snapshot(),
             max_fps: self.max_fps.load(Ordering::Relaxed),
         }
     }
@@ -1190,9 +1235,16 @@ impl FrameLedger {
 
 /// Nanoseconds since this process first asked, on the monotonic clock.
 fn monotonic_ns() -> u64 {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
-    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    monotonic_ns_at(Instant::now())
+}
+
+fn monotonic_ns_at(at: Instant) -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(|| at);
+    // Reserve zero for "no sample" without shortening the first interval.
+    u64::try_from(at.saturating_duration_since(epoch).as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 /// The `frames` section of a published snapshot.
@@ -1213,9 +1265,17 @@ pub struct FramesSnapshot {
     #[serde(default)]
     pub retried_paint_frames_total: u64,
     pub present_failures_total: u64,
+    /// Drawables explicitly reported as skipped by native presentation
+    /// feedback. These do not contribute to `presented_total`.
+    #[serde(default)]
+    pub skipped_presents_total: u64,
     /// Present-to-present intervals over the process lifetime, idle gaps
     /// included.
     pub present_interval: LatencySnapshot,
+    /// Native submit-to-display latency, using actual drawable timestamps.
+    /// Empty for backends that provide no presentation feedback.
+    #[serde(default)]
+    pub submit_to_present: LatencySnapshot,
     /// The configured repaint-rate cap; 0 until a frame reports it.
     pub max_fps: u64,
 }
@@ -2407,6 +2467,45 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("writers");
         let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.writers, WritersSnapshot::default());
+    }
+
+    #[test]
+    fn delayed_present_callbacks_preserve_display_intervals_and_frame_reuse() {
+        let ledger = FrameLedger::new();
+        ledger.record_present_at(10_000_000);
+        ledger.record_present_at(30_000_000);
+        ledger.record_present_at(20_000_000); // delivered out of order
+        ledger.record_present_at(40_000_000);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.presented_total, 4);
+        assert_eq!(snapshot.present_interval.count, 2);
+        assert_eq!(snapshot.present_interval.total_ns, 30_000_000);
+        assert_eq!(snapshot.present_interval.max_ns, 20_000_000);
+
+        let actual = FrameLedger::new();
+        let submitted = Instant::now();
+        actual.note_reused_content();
+        let reused = actual.take_reused_content();
+        // Another frame is already being built by the time the first one's
+        // delayed callback arrives; its pending flag must stay with it.
+        actual.note_reused_content();
+        actual.record_presented_at(submitted, submitted + Duration::from_millis(12), reused);
+        assert!(actual.take_reused_content());
+        actual.record_presented_at(submitted, submitted + Duration::from_millis(20), false);
+        actual.record_present_skipped();
+        let snapshot = actual.snapshot();
+        assert_eq!(snapshot.presented_total, 2);
+        assert_eq!(snapshot.stale_presented_total, 1);
+        assert_eq!(snapshot.skipped_presents_total, 1);
+        assert_eq!(snapshot.submit_to_present.count, 2);
+        assert_eq!(snapshot.submit_to_present.total_ns, 32_000_000);
+        assert_eq!(snapshot.present_interval.total_ns, 8_000_000);
+        actual.record_presented_at(submitted + Duration::from_secs(1), submitted, false);
+        assert_eq!(
+            actual.snapshot(),
+            snapshot,
+            "invalid clock order was accepted"
+        );
     }
 
     #[test]
