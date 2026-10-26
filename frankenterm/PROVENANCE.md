@@ -15,7 +15,7 @@ This is the load-bearing portability surface for the project — the
 `mux_client.rs`) sit *on top of* this subtree.
 
 Per `docs/proposals/ft-zoxxq-mux-boundary-truth.md` stance (b) — committed
-to the wezterm-fork identity — these vendored crates are first-class
+to a single owned, diverged engine that began as a WezTerm fork — these vendored crates are first-class
 workspace members and are NOT tracking upstream wezterm for sync.
 Modifications are owned by the FrankenTerm project; upstream
 compatibility is explicitly not maintained.
