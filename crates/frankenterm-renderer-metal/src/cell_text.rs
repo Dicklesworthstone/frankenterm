@@ -58,6 +58,35 @@ pub mod flags {
     pub const OVERLINE: u8 = 128;
 }
 
+/// DEC line geometry, stored in the row table rather than repeated in
+/// every glyph. Instance positions and sizes are already in framebuffer
+/// pixels; this controls atlas sampling and clips double-height halves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TextRowMode {
+    #[default]
+    SingleWidth = 0,
+    DoubleWidth = 1,
+    DoubleHeightTop = 2,
+    DoubleHeightBottom = 3,
+}
+
+impl TextRowMode {
+    #[must_use]
+    pub const fn scale(self) -> [u32; 2] {
+        match self {
+            Self::SingleWidth => [1, 1],
+            Self::DoubleWidth => [2, 1],
+            Self::DoubleHeightTop | Self::DoubleHeightBottom => [2, 2],
+        }
+    }
+
+    #[must_use]
+    pub const fn is_double_height(self) -> bool {
+        matches!(self, Self::DoubleHeightTop | Self::DoubleHeightBottom)
+    }
+}
+
 /// How an instance's underline is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnderlineStyle {
@@ -112,7 +141,7 @@ impl UnderlineStyle {
 /// |---|---|
 /// | 0 | column: `u16` |
 /// | 2 | ring row: `u16` |
-/// | 4 | glyph's top-left atlas texel: `u16` x, `u16` y |
+/// | 4 | glyph's top-left atlas texel: `u16` x, `u16` y; bit 15 holds a scaled-texel phase, Y bit 14 keeps cursor height unscaled |
 /// | 8 | glyph size in pixels: `u16` width, `u16` height |
 /// | 12 | glyph top-left from the cell's top-left: `i16` x, `i16` y |
 /// | 16 | foreground: straight RGBA8 |
@@ -171,6 +200,30 @@ impl CellText {
             AtlasKind::Color => flags::ATLAS_COLOR,
         };
         self.with_flags(atlas)
+    }
+
+    /// Start partway through a 2x texel after pixel-exact clipping. Atlas
+    /// coordinates fit below 16,384, leaving bit 15 free for this one-bit
+    /// phase without growing the 24-byte instance or duplicating bitmaps.
+    #[must_use]
+    pub fn with_texture_phase(mut self, phase: [u8; 2]) -> Self {
+        for (axis, phase) in phase.into_iter().enumerate() {
+            let at = 4 + axis * 2;
+            let value = (read_u16(&self.0, at) & 0x7fff) | (u16::from(phase & 1) << 15);
+            self.0[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        self
+    }
+
+    /// Keep this sprite one physical row tall on a double-height line.
+    /// Cursor shapes and composition indicators follow the cell, while
+    /// the text bitmap supplies one half of a doubled character. Atlas Y
+    /// fits below 16,384, leaving bit 14 free for this sampling override.
+    #[must_use]
+    pub fn with_unscaled_y(mut self) -> Self {
+        let value = read_u16(&self.0, 6) | 0x4000;
+        self.0[6..8].copy_from_slice(&value.to_le_bytes());
+        self
     }
 
     /// The cell span is two cells wide (emoji, CJK).
@@ -254,7 +307,17 @@ impl CellText {
     /// The glyph's top-left atlas texel.
     #[must_use]
     pub fn atlas_origin(&self) -> [u16; 2] {
-        [read_u16(&self.0, 4), read_u16(&self.0, 6)]
+        [read_u16(&self.0, 4) & 0x7fff, read_u16(&self.0, 6) & 0x3fff]
+    }
+
+    #[must_use]
+    pub fn texture_phase(&self) -> [u8; 2] {
+        [self.0[5] >> 7, self.0[7] >> 7]
+    }
+
+    #[must_use]
+    pub fn unscaled_y(&self) -> bool {
+        self.0[7] & 0x40 != 0
     }
 
     /// The glyph's width and height in pixels.
@@ -294,6 +357,7 @@ pub struct CellTextGrid {
     /// The instance bytes of each ring row, so a row uploads as one slice;
     /// cleared rows keep their capacity.
     ring: Vec<Vec<[u8; CELL_TEXT_INSTANCE_BYTES]>>,
+    row_modes: Vec<TextRowMode>,
     /// One bit per nonempty ring row, so clearing the last occupied row
     /// finds its predecessor by words rather than scanning every row.
     occupied_rows: Vec<u64>,
@@ -306,6 +370,7 @@ impl PartialEq for CellTextGrid {
     fn eq(&self, other: &Self) -> bool {
         (self.rows, self.cols, self.row_offset) == (other.rows, other.cols, other.row_offset)
             && self.ring == other.ring
+            && self.row_modes == other.row_modes
     }
 }
 
@@ -323,6 +388,7 @@ impl CellTextGrid {
             cols: extent.cols,
             row_offset: 0,
             ring: (0..stored).map(|_| Vec::new()).collect(),
+            row_modes: vec![TextRowMode::SingleWidth; stored],
             occupied_rows: vec![0; stored.div_ceil(64)],
             last_nonempty_ring_row: None,
             len: 0,
@@ -354,6 +420,28 @@ impl CellTextGrid {
     #[must_use]
     pub fn ring_row_len(&self, ring_row: usize) -> usize {
         self.ring.get(ring_row).map_or(0, Vec::len)
+    }
+
+    #[must_use]
+    pub fn ring_row_mode(&self, ring_row: usize) -> TextRowMode {
+        self.row_modes.get(ring_row).copied().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn row_mode(&self, row: u32) -> TextRowMode {
+        self.ring_index(row)
+            .map_or(TextRowMode::SingleWidth, |index| self.row_modes[index])
+    }
+
+    /// Changes geometry for one logical row. Its table entry participates
+    /// in the same dirty-row/slot catch-up protocol as the glyph instances.
+    pub fn set_row_mode(&mut self, row: u32, mode: TextRowMode) {
+        if let Some(index) = self.ring_index(row)
+            && self.row_modes[index] != mode
+        {
+            self.row_modes[index] = mode;
+            self.changes.touch(index);
+        }
     }
 
     /// Ring row `ring_row`'s instance bytes, back to back.
@@ -420,6 +508,7 @@ impl CellTextGrid {
 
     /// Removes every instance of logical `row`.
     pub fn clear_row(&mut self, row: u32) {
+        self.set_row_mode(row, TextRowMode::SingleWidth);
         if let Some(index) = self.ring_index(row)
             && !self.ring[index].is_empty()
         {
@@ -507,17 +596,21 @@ impl CellTextGrid {
 
     /// The per-row table, one entry per ring row in ring order, as the
     /// RowTable buffer holds it: the row's first instance and its instance
-    /// count (`u32` each), then 8 bytes reserved for per-row flags.
+    /// count (`u32` each), the [`TextRowMode`] code (`u32`), and 4 reserved bytes.
     pub fn row_table(&self) -> impl Iterator<Item = [u8; ROW_TABLE_BYTES_PER_ROW]> {
         let mut first = 0_u32;
-        self.ring.iter().map(move |row| {
-            let count = u32::try_from(row.len()).unwrap_or(u32::MAX);
-            let mut entry = [0; ROW_TABLE_BYTES_PER_ROW];
-            entry[0..4].copy_from_slice(&first.to_le_bytes());
-            entry[4..8].copy_from_slice(&count.to_le_bytes());
-            first = first.saturating_add(count);
-            entry
-        })
+        self.ring
+            .iter()
+            .zip(&self.row_modes)
+            .map(move |(row, mode)| {
+                let count = u32::try_from(row.len()).unwrap_or(u32::MAX);
+                let mut entry = [0; ROW_TABLE_BYTES_PER_ROW];
+                entry[0..4].copy_from_slice(&first.to_le_bytes());
+                entry[4..8].copy_from_slice(&count.to_le_bytes());
+                entry[8..12].copy_from_slice(&(*mode as u32).to_le_bytes());
+                first = first.saturating_add(count);
+                entry
+            })
     }
 }
 
@@ -565,6 +658,7 @@ fn underline_covers(style: UnderlineStyle, local: [f32; 2], x: f32, u: &FrameUni
 fn shade_instance(
     u: &FrameUniforms,
     cell: &CellText,
+    mode: TextRowMode,
     atlas: &impl Fn(AtlasKind, u32, u32) -> [u8; 4],
     x: f32,
     y: f32,
@@ -582,6 +676,17 @@ fn shade_instance(
         background.grid_origin[0] + f32::from(cell.col()) * background.cell_size[0],
         background.grid_origin[1] + logical_row as f32 * background.cell_size[1],
     ];
+    if mode != TextRowMode::SingleWidth
+        && (x < background.grid_origin[0]
+            || x >= background.grid_origin[0] + u.grid.cols as f32 * background.cell_size[0])
+    {
+        return None;
+    }
+    if mode.is_double_height()
+        && (y < span_origin[1] || y >= span_origin[1] + background.cell_size[1])
+    {
+        return None;
+    }
     let span_size = [
         span_cells * background.cell_size[0],
         background.cell_size[1],
@@ -634,10 +739,21 @@ fn shade_instance(
         && inner[1] < f32::from(size[1])
     {
         let origin = cell.atlas_origin();
+        let phase = if mode == TextRowMode::SingleWidth {
+            [0, 0]
+        } else {
+            cell.texture_phase()
+        };
+        let mut scale = mode.scale();
+        if cell.unscaled_y() {
+            scale[1] = 1;
+        }
         let texel = atlas(
             kind,
-            u32::from(origin[0]) + inner[0].floor() as u32,
-            u32::from(origin[1]) + inner[1].floor() as u32,
+            u32::from(origin[0])
+                + ((inner[0] + f32::from(phase[0])) / scale[0] as f32).floor() as u32,
+            u32::from(origin[1])
+                + ((inner[1] + f32::from(phase[1])) / scale[1] as f32).floor() as u32,
         );
         let glyph = match kind {
             // Stored [B, G, R, A], premultiplied sRGB. As on the WebGpu path,
@@ -705,8 +821,15 @@ pub fn shade_text(
     y: f32,
 ) -> [f32; 4] {
     text.instances().fold(under, |color, cell| {
-        shade_instance(uniforms, &cell, &atlas, x, y)
-            .map_or(color, |top| to_target(over(top, color)))
+        shade_instance(
+            uniforms,
+            &cell,
+            text.ring_row_mode(usize::from(cell.ring_row())),
+            &atlas,
+            x,
+            y,
+        )
+        .map_or(color, |top| to_target(over(top, color)))
     })
 }
 
@@ -738,6 +861,137 @@ mod tests {
                 line_thickness: 1.0,
                 strikethrough_position: 8.0,
             },
+        }
+    }
+
+    #[test]
+    fn dec_row_modes_follow_the_scroll_ring_and_dirty_the_row_table() {
+        let mut text = CellTextGrid::new(GridExtent::new(3, 8));
+        let before = text.changes().row(1);
+        text.set_row_mode(1, TextRowMode::DoubleHeightTop);
+        assert!(text.changes().row(1) > before);
+        let unchanged = text.changes().row(1);
+        text.set_row_mode(1, TextRowMode::DoubleHeightTop);
+        assert_eq!(text.changes().row(1), unchanged);
+        text.set_row_mode(2, TextRowMode::DoubleHeightBottom);
+        let table: Vec<_> = text.row_table().collect();
+        assert_eq!(u32::from_le_bytes(table[1][8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(table[2][8..12].try_into().unwrap()), 3);
+        assert_eq!(&table[1][12..], &[0; 4]);
+        assert_eq!(
+            crate::uploads::row_table_entry(&text, 1, 8)[8..12],
+            table[1][8..12],
+        );
+        text.scroll_up(1);
+        assert_eq!(text.row_mode(0), TextRowMode::DoubleHeightTop);
+        assert_eq!(text.row_mode(1), TextRowMode::DoubleHeightBottom);
+        assert_eq!(text.row_mode(2), TextRowMode::SingleWidth);
+        text.scroll_down(1);
+        assert_eq!(text.row_mode(0), TextRowMode::SingleWidth);
+        assert_eq!(text.row_mode(1), TextRowMode::DoubleHeightTop);
+        assert_eq!(text.row_mode(2), TextRowMode::DoubleHeightBottom);
+        text.clear_row(1);
+        assert_eq!(text.row_mode(1), TextRowMode::SingleWidth);
+    }
+
+    /// A physically expanded bitmap is an independent sampling reference:
+    /// it uses ordinary 1x rendering, with no row-mode or phase decoding.
+    #[test]
+    fn dec_sampling_and_phase_match_expanded_bitmaps_without_crossing_rows() {
+        for mode in [
+            TextRowMode::DoubleWidth,
+            TextRowMode::DoubleHeightTop,
+            TextRowMode::DoubleHeightBottom,
+        ] {
+            for unscaled_y in [false, true] {
+                let mut scale = mode.scale();
+                if unscaled_y {
+                    scale[1] = 1;
+                }
+                for kind in [AtlasKind::Grayscale, AtlasKind::Color] {
+                    let source: Vec<[u8; 4]> = (0..20_u32)
+                        .map(|i| {
+                            let level = ((i * 37) % 251) as u8;
+                            [level, level / 2, level / 3, level]
+                        })
+                        .collect();
+                    let (width, height) = (4 * scale[0], 5 * scale[1]);
+                    let expanded: Vec<_> = (0..width * height)
+                        .map(|i| {
+                            let (x, y) = (i % width, i / width);
+                            source[((y / scale[1]) * 4 + x / scale[0]) as usize]
+                        })
+                        .collect();
+                    let phase = [1, u8::from(scale[1] == 2)];
+                    let slot = AtlasSlot {
+                        kind,
+                        page: 0,
+                        epoch: 0,
+                        x: 5,
+                        y: 9,
+                        width: width - u32::from(phase[0]),
+                        height: height - u32::from(phase[1]),
+                    };
+                    let mut actual = CellTextGrid::new(GridExtent::new(3, 8));
+                    actual.set_row_mode(1, mode);
+                    let instance = CellText::new(0, [200, 80, 150, 128]).with_glyph(&slot, [1, -3]);
+                    let instance = if unscaled_y {
+                        instance.with_unscaled_y()
+                    } else {
+                        instance
+                    }
+                    .with_texture_phase(phase);
+                    assert_eq!(instance.atlas_origin(), [5, 9]);
+                    assert_eq!(instance.texture_phase(), phase);
+                    assert_eq!(instance.unscaled_y(), unscaled_y);
+                    actual.push(1, instance);
+                    let mut reference = CellTextGrid::new(actual.extent());
+                    reference.push(
+                        1,
+                        CellText::new(0, instance.fg()).with_glyph(
+                            &AtlasSlot {
+                                x: u32::from(phase[0]),
+                                y: u32::from(phase[1]),
+                                ..slot
+                            },
+                            instance.offset(),
+                        ),
+                    );
+                    let u = uniforms(&actual);
+                    for y in 0..48 {
+                        for x in 0..76 {
+                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                            let top = u.background.grid_origin[1] + u.background.cell_size[1];
+                            let expected = if mode.is_double_height()
+                                && !(top..top + u.background.cell_size[1]).contains(&py)
+                            {
+                                UNDER
+                            } else {
+                                shade_text(
+                                    &u,
+                                    &reference,
+                                    |_, tx, ty| expanded[(ty * width + tx) as usize],
+                                    UNDER,
+                                    px,
+                                    py,
+                                )
+                            };
+                            let pixel = shade_text(
+                                &u,
+                                &actual,
+                                |_, tx, ty| source[((ty - 9) * 4 + tx - 5) as usize],
+                                UNDER,
+                                px,
+                                py,
+                            );
+                            assert_eq!(
+                                pixel, expected,
+                                "{mode:?} {kind:?} unscaled_y={unscaled_y} ({x},{y})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -877,6 +1131,10 @@ mod tests {
             format!(
                 "device const CellText *instances [[buffer({})]]",
                 SlotBuffer::CellText.index()
+            ),
+            format!(
+                "device const TextRow *row_table [[buffer({})]]",
+                SlotBuffer::RowTable.index()
             ),
             format!(
                 "texture2d<float> gray [[texture({})]]",

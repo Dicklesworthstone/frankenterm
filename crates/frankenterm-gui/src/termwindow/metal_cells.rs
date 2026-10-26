@@ -441,6 +441,8 @@ impl MetalFrame {
                 | (facts.palette_generation & 0xffff_ffff),
             cell_width: metrics.cell_size.width as f32,
             grid_origin_x: inputs.grid_origin[0],
+            cell_height: metrics.cell_size.height as f32,
+            grid_origin_y: inputs.grid_origin[1],
             bold_brightens,
             selection_fg: visible(palette.selection_fg),
             selection_bg: palette.selection_bg,
@@ -481,6 +483,10 @@ impl MetalFrame {
         let cursor_row = cursor.y - frame.mirror.first();
         let cursor = match usize::try_from(cursor_row) {
             Ok(row) if cursor.visibility == CursorVisibility::Visible && row < rows.len() => {
+                let scale_x = match rows[row].line_mode() {
+                    mux::render_mirror::MirrorLineMode::SingleWidth => 1,
+                    _ => 2,
+                };
                 let width_cells = rows[row]
                     .cells()
                     .iter()
@@ -493,9 +499,9 @@ impl MetalFrame {
                     } else {
                         metal_shape
                     },
-                    col: cursor.x as u32,
+                    col: (cursor.x as u32).saturating_mul(scale_x),
                     row: row as u32,
-                    width_cells,
+                    width_cells: width_cells.saturating_mul(scale_x),
                     thickness: metrics.underline_height.max(1) as f32,
                     color: premultiplied(cursor_color),
                 }

@@ -363,7 +363,7 @@ pub fn text_region(text: &CellTextGrid, ring_row: usize, capacity: u32, out: &mu
 
 /// The row-table entry of ring row `ring_row` in the region layout: its
 /// first instance (`ring_row * capacity`) and its instance count (`u32`
-/// each), then 8 reserved bytes.
+/// each), the row's text geometry mode (`u32`), and 4 reserved bytes.
 #[must_use]
 pub fn row_table_entry(
     text: &CellTextGrid,
@@ -376,6 +376,7 @@ pub fn row_table_entry(
     let mut entry = [0; ROW_TABLE_BYTES_PER_ROW];
     entry[0..4].copy_from_slice(&first.to_le_bytes());
     entry[4..8].copy_from_slice(&count.to_le_bytes());
+    entry[8..12].copy_from_slice(&(text.ring_row_mode(ring_row) as u32).to_le_bytes());
     entry
 }
 

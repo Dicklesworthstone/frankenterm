@@ -8506,7 +8506,7 @@ impl TermWindow {
             // unit-testable without spinning up a real GPU/window.
             // Future render-quality / live-resize / idle-wake-up
             // beads inherit the same math.
-            let caret = frankenterm_core::ime_caret::compute_caret_anchor_rect(
+            let caret = ime_caret_anchor(
                 frankenterm_core::ime_caret::CaretGeometry {
                     cursor_cell_col: cursor.x as i64,
                     cursor_cell_row: cursor.y as i64,
@@ -8519,11 +8519,13 @@ impl TermWindow {
                     padding_left_px: padding_left as i64,
                     padding_top_px: padding_top as i64,
                 },
+                facts.cursor_line_mode,
+                facts.cursor_cell_width,
             );
 
             let r = Rect::new(
                 Point::new(caret.origin_x as isize, caret.origin_y as isize),
-                self.render_metrics.cell_size,
+                Size::new(caret.width as isize, caret.height as isize),
             );
             win.set_text_cursor_position(r);
         }
@@ -11724,10 +11726,64 @@ impl Drop for TermWindow {
     }
 }
 
+/// DEC sizing changes the cursor's position *inside* its pane and the width
+/// of its occupied cell, never the pane's offset or the physical row height.
+fn ime_caret_anchor(
+    mut geometry: frankenterm_core::ime_caret::CaretGeometry,
+    mode: mux::render_mirror::MirrorLineMode,
+    cell_width: u8,
+) -> frankenterm_core::ime_caret::CaretAnchorRect {
+    let scale = match mode {
+        mux::render_mirror::MirrorLineMode::SingleWidth => 1,
+        _ => 2,
+    };
+    geometry.cursor_cell_col = geometry.cursor_cell_col.saturating_mul(scale);
+    let mut caret = frankenterm_core::ime_caret::compute_caret_anchor_rect(geometry);
+    caret.width = caret
+        .width
+        .saturating_mul(scale as u32)
+        .saturating_mul(u32::from(cell_width.clamp(1, 2)));
+    caret
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[test]
+    fn ime_caret_tracks_dec_and_wide_cells_without_scaling_pane_offset_or_height() {
+        use super::ime_caret_anchor;
+        use frankenterm_core::ime_caret::CaretGeometry;
+        use mux::render_mirror::MirrorLineMode;
+
+        let geometry = CaretGeometry {
+            cursor_cell_col: 3,
+            cursor_cell_row: 101,
+            pane_top_cell: 4,
+            pane_left_cell: 7,
+            physical_top: 100,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            tab_bar_height_px: 20,
+            padding_left_px: 5,
+            padding_top_px: 6,
+        };
+        for (mode, scale) in [
+            (MirrorLineMode::SingleWidth, 1),
+            (MirrorLineMode::DoubleWidth, 2),
+            (MirrorLineMode::DoubleHeightTop, 2),
+            (MirrorLineMode::DoubleHeightBottom, 2),
+        ] {
+            for width in [1, 2] {
+                let caret = ime_caret_anchor(geometry, mode, width);
+                assert_eq!(caret.origin_x, (3 * scale + 7) * 8 + 5);
+                assert_eq!(caret.origin_y, 5 * 16 + 20 + 6);
+                assert_eq!(caret.width, 8 * scale as u32 * u32::from(width));
+                assert_eq!(caret.height, 16);
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
