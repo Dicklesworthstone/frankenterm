@@ -216,6 +216,11 @@ pub struct SceneStyle<'a> {
     /// cursor (a new palette, configuration or color scheme): every row is
     /// rebuilt.
     pub generation: u64,
+    /// Horizontal cell size and grid origin in framebuffer pixels, matching
+    /// the background pass. Glyphs crossing a selection or block cursor
+    /// boundary are sliced at the pixels that overlay actually covers.
+    pub cell_width: f32,
+    pub grid_origin_x: f32,
     /// `bold_brightens_ansi_colors` is enabled.
     pub bold_brightens: bool,
     /// The selection's text color; `None` keeps each cell's foreground.
@@ -365,8 +370,8 @@ pub fn mix_linear(from: SrgbaTuple, to: SrgbaTuple, amount: f32) -> SrgbaTuple {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowCursor {
     col: usize,
-    /// The columns from `col` the cursor covers: one, or a compose cursor's
-    /// width.
+    /// The columns from `col` the cursor covers: the character's width, or
+    /// a compose cursor's width.
     cols: usize,
     /// A focused block's (or compose cursor's) text color override.
     fg: Option<SrgbaTuple>,
@@ -418,10 +423,6 @@ impl RowCursor {
             reverse: reverse.map(f32::to_bits),
             blink: None,
         }
-    }
-
-    fn covers(&self, col: usize) -> bool {
-        (self.col..self.col + self.cols).contains(&col)
     }
 
     /// The text color, and the color under it, for text in `fg` on `bg`
@@ -497,6 +498,9 @@ pub struct MetalScene {
     first: Option<StableRowIndex>,
     hover: Option<Arc<Hyperlink>>,
     style_generation: Option<u64>,
+    /// Cell width and fractional origin as bits: integer translations move
+    /// the existing instances, but a different pixel phase can move a cut.
+    text_geometry: Option<[u32; 2]>,
     reverse_video: bool,
 }
 
@@ -651,46 +655,174 @@ fn blinked_fg(cell: &MirrorCell, colors: &CellColors, style: &SceneStyle<'_>) ->
     }
 }
 
-/// The color `cell`'s text is drawn in, or `None` where it draws no glyph:
-/// invisible text, or text in the color it sits on. As in the WebGpu
-/// renderer (compute_cell_fg_bg), that is the selection's background for
-/// selected text and a focused block cursor's color under it, not the
-/// cell's own background.
+/// The color a strip of a glyph is drawn in, or `None` where it is the
+/// color it sits on. Attributes come from the glyph's source cell, while
+/// selection and cursor coverage come from the strip's physical pixels,
+/// as in WebGpu's compute_cell_fg_bg and split glyph quads.
 fn text_color(
-    cell: &MirrorCell,
     style: &SceneStyle<'_>,
     built: &BuiltRow,
-    reverse_video: bool,
-    style_fg: Option<SrgbaTuple>,
+    text_fg: SrgbaTuple,
+    bg: SrgbaTuple,
+    selected: bool,
+    under_cursor: bool,
 ) -> Option<[u8; 4]> {
-    let colors = cell_colors(cell, style, reverse_video, style_fg);
-    let col = cell.col();
-    let text_fg = blinked_fg(cell, &colors, style);
     let mut fg = text_fg;
-    let mut under = colors.bg;
-    if built.selection.contains(&col) {
+    let mut under = bg;
+    if selected && !under_cursor {
         if let Some(selection_fg) = style.selection_fg {
             fg = selection_fg;
         }
         under = style.selection_bg;
     }
     let mut blink = None;
-    if let Some(cursor) = &built.cursor {
-        if cursor.covers(col) {
-            let (cursor_fg, block) = cursor.text_colors(text_fg, colors.bg);
-            if let Some(cursor_fg) = cursor_fg {
-                fg = cursor_fg;
-            }
-            if let Some(block) = block {
-                under = block;
-            }
-            blink = cursor.blink_mix(text_fg);
+    if let Some(cursor) = &built.cursor
+        && under_cursor
+    {
+        let (cursor_fg, block) = cursor.text_colors(text_fg, bg);
+        if let Some(cursor_fg) = cursor_fg {
+            fg = cursor_fg;
         }
-    }
-    if cell.invisible() {
-        return None;
+        if let Some(block) = block {
+            under = block;
+        }
+        blink = cursor.blink_mix(text_fg);
     }
     drawn_fg(style, fg, under, blink)
+}
+
+/// A cropped atlas rectangle with exactly the original glyph's texels and
+/// position. Re-anchor the rare strip whose added offset would overflow
+/// i16, instead of wrapping the offset or shifting the glyph on screen.
+fn glyph_strip(
+    shaped: &ShapedGlyph,
+    range: Range<u32>,
+    color: [u8; 4],
+    style: &SceneStyle<'_>,
+    cols: u32,
+) -> Option<CellText> {
+    if range.is_empty() || range.end > shaped.glyph.slot.width {
+        return None;
+    }
+    let mut col = u16::try_from(shaped.cell).ok()?;
+    let offset = i64::from(shaped.glyph.offset[0]) + i64::from(range.start);
+    let offset = match i16::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => {
+            let left =
+                (style.grid_origin_x + f32::from(col) * style.cell_width).floor() + offset as f32;
+            let anchor = ((left - style.grid_origin_x) / style.cell_width).floor();
+            if !anchor.is_finite() || style.cell_width <= 0.0 {
+                return None;
+            }
+            let last = cols.checked_sub(1)?.min(u32::from(u16::MAX));
+            col = u16::try_from((anchor.max(0.0) as u32).min(last)).ok()?;
+            let origin = (style.grid_origin_x + f32::from(col) * style.cell_width).floor();
+            i16::try_from((left - origin) as i64).ok()?
+        }
+    };
+    let slot = AtlasSlot {
+        x: shaped.glyph.slot.x.checked_add(range.start)?,
+        width: range.end.checked_sub(range.start)?,
+        ..shaped.glyph.slot
+    };
+    Some(CellText::new(col, color).with_glyph(&slot, [offset, shaped.glyph.offset[1]]))
+}
+
+/// Draw a glyph using no more than five disjoint strips: the selection and
+/// cursor each contribute at most two cuts. The usual single-color glyph
+/// stays one instance, even when it crosses an overlay that keeps its
+/// color. No glyph is re-rasterized or copied into another atlas slot.
+fn push_text_glyph(
+    text: &mut CellTextGrid,
+    row: u32,
+    shaped: &ShapedGlyph,
+    style: &SceneStyle<'_>,
+    built: &BuiltRow,
+    text_fg: SrgbaTuple,
+    bg: SrgbaTuple,
+) {
+    let width = shaped.glyph.slot.width;
+    if width == 0 || shaped.glyph.slot.height == 0 {
+        return;
+    }
+    let cursor = built.cursor.as_ref().filter(|cursor| {
+        !built.selection.is_empty()
+            || cursor.fg.is_some()
+            || cursor.block.is_some()
+            || cursor.reverse.is_some()
+            || cursor.blink.is_some()
+    });
+    let mut emit = |range, color| {
+        if let Some(instance) = glyph_strip(shaped, range, color, style, text.extent().cols) {
+            text.push(row, instance);
+        }
+    };
+    let color = |selected, under_cursor| {
+        text_color(style, built, text_fg, bg, selected, under_cursor)
+            .map(|color| adjust_brightness(color, shaped.brightness))
+    };
+    if built.selection.is_empty() && cursor.is_none() {
+        if let Some(color) = color(false, false) {
+            emit(0..width, color);
+        }
+        return;
+    }
+    // The shader places the glyph on integer pixels. An overlay beginning
+    // at x includes the first pixel center >= x, so ceil(x - 0.5) is its
+    // integer cut, including at fractional pane origins and cell widths.
+    let left = (style.grid_origin_x + shaped.cell as f32 * style.cell_width).floor()
+        + f32::from(shaped.glyph.offset[0]);
+    let edge = |col: usize| {
+        ((style.grid_origin_x + col as f32 * style.cell_width - 0.5).ceil() - left)
+            .clamp(0.0, width as f32) as u32
+    };
+    let selection = if built.selection.is_empty() {
+        0..0
+    } else {
+        edge(built.selection.start)..edge(built.selection.end)
+    };
+    let cursor = cursor.map_or(0..0, |cursor| {
+        edge(cursor.col)..edge(cursor.col.saturating_add(cursor.cols))
+    });
+    if (selection.is_empty() || selection == (0..width))
+        && (cursor.is_empty() || cursor == (0..width))
+    {
+        if let Some(color) = color(selection.contains(&0), cursor.contains(&0)) {
+            emit(0..width, color);
+        }
+        return;
+    }
+    let mut cuts = [
+        0,
+        width,
+        selection.start,
+        selection.end,
+        cursor.start,
+        cursor.end,
+    ];
+    cuts.sort_unstable();
+    let mut pending: Option<(Range<u32>, [u8; 4])> = None;
+    for cut in cuts.windows(2) {
+        let (start, end) = (cut[0], cut[1]);
+        if start == end {
+            continue;
+        }
+        let next = color(selection.contains(&start), cursor.contains(&start));
+        if let Some((range, previous)) = pending.as_mut()
+            && next == Some(*previous)
+        {
+            range.end = end;
+            continue;
+        }
+        if let Some((range, previous)) = pending.take() {
+            emit(range, previous);
+        }
+        pending = next.map(|color| (start..end, color));
+    }
+    if let Some((range, color)) = pending {
+        emit(range, color);
+    }
 }
 
 /// Text color `fg` on `under` as drawn: moved to the minimum contrast with
@@ -751,6 +883,7 @@ impl MetalScene {
             first: None,
             hover: None,
             style_generation: None,
+            text_geometry: None,
             reverse_video: false,
         }
     }
@@ -810,9 +943,14 @@ impl MetalScene {
         };
         let rows = mirror.rows();
         let extent = GridExtent::new(rows.len(), dimensions.cols);
+        let text_geometry = [
+            style.cell_width.to_bits(),
+            (style.grid_origin_x - style.grid_origin_x.floor()).to_bits(),
+        ];
         let mut update = SceneUpdate {
             full: self.cells.extent() != extent
                 || self.style_generation != Some(style.generation)
+                || self.text_geometry != Some(text_geometry)
                 || self.reverse_video != dimensions.reverse_video,
             ..SceneUpdate::default()
         };
@@ -868,7 +1006,11 @@ impl MetalScene {
                     ),
                     None => RowCursor {
                         col: cursor.x,
-                        cols: 1,
+                        cols: mirror_row
+                            .cells()
+                            .iter()
+                            .find(|cell| cell.col() == cursor.x)
+                            .map_or(1, |cell| cell.width().clamp(1, 2)),
                         fg: style.cursor_fg,
                         block: style.cursor_bg,
                         sprite: style
@@ -919,6 +1061,7 @@ impl MetalScene {
         self.first = Some(mirror.first());
         self.hover = style.hover.cloned();
         self.style_generation = Some(style.generation);
+        self.text_geometry = Some(text_geometry);
         self.reverse_video = dimensions.reverse_video;
         update
     }
@@ -1007,9 +1150,7 @@ impl MetalScene {
                 _ => mirror_row
                     .cells()
                     .iter()
-                    .find(|cell| {
-                        (cell.col()..cell.col() + cell.width().max(1)).contains(&cursor.col)
-                    })
+                    .find(|cell| cell.col() == cursor.col)
                     .map_or(1, |cell| cell.width().clamp(1, 2)),
             };
             let sprite = glyphs.cursor_sprite(shape, width as u8)?;
@@ -1034,10 +1175,10 @@ impl MetalScene {
             }
         }
         // Glyphs: the row's clusters, made and shaped as the WebGpu renderer
-        // makes and shapes them (ft-yccm0.4.7.3). Each glyph takes the
-        // colors of the cell it starts in. A composition is overlaid on the
-        // cursor's line before clustering, as WebGpu overlays it, and its
-        // glyphs take the compose cursor's text color.
+        // makes and shapes them (ft-yccm0.4.7.3). Each glyph keeps its source
+        // cell's attributes across ink overhangs, but selection and cursor
+        // colors apply only to their covered pixels. A composition is
+        // overlaid before clustering, as WebGpu overlays it.
         let cells = mirror_row.cells();
         let composing = built
             .cursor
@@ -1070,34 +1211,33 @@ impl MetalScene {
             if col >= cols as usize {
                 break;
             }
-            let fg = match composing {
-                Some((cursor, _)) if composed.contains(&col) => {
+            let colors = match composing {
+                Some(_) if composed.contains(&col) => {
                     // The composition's blank attributes.
                     let palette = style.palette;
-                    let (fg, bg) = if reverse_video {
+                    Some(if reverse_video {
                         (palette.background, palette.foreground)
                     } else {
                         (palette.foreground, palette.background)
-                    };
-                    let (cursor_fg, block) = cursor.text_colors(fg, bg);
-                    drawn_fg(style, cursor_fg.unwrap_or(fg), block.unwrap_or(bg), None)
+                    })
                 }
                 _ => {
                     let index =
                         cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
                     cells.get(index).and_then(|cell| {
+                        if cell.invisible() {
+                            return None;
+                        }
                         let style_fg = style_fgs.as_ref().and_then(|fgs| fgs[index]);
-                        text_color(cell, style, built, reverse_video, style_fg)
+                        let colors = cell_colors(cell, style, reverse_video, style_fg);
+                        Some((blinked_fg(cell, &colors, style), colors.bg))
                     })
                 }
             };
-            let Some(fg) = fg else {
+            let Some((fg, bg)) = colors else {
                 continue;
             };
-            let fg = adjust_brightness(fg, shaped.brightness);
-            let instance =
-                CellText::new(col as u16, fg).with_glyph(&shaped.glyph.slot, shaped.glyph.offset);
-            self.text.push(grid_row, instance);
+            push_text_glyph(&mut self.text, grid_row, &shaped, style, built, fg, bg);
         }
         if let Some((shape, instance)) = cursor_sprite {
             if shape.over_glyphs() {
@@ -1552,6 +1692,8 @@ mod tests {
             let style = SceneStyle {
                 palette: &palette,
                 generation,
+                cell_width: 8.0,
+                grid_origin_x: 0.0,
                 bold_brightens: true,
                 selection_fg: selection_fgs[generation as usize % selection_fgs.len()],
                 selection_bg: palette.selection_bg,
@@ -1636,6 +1778,8 @@ mod tests {
         SceneStyle {
             palette,
             generation: 0,
+            cell_width: 8.0,
+            grid_origin_x: 0.0,
             bold_brightens: true,
             selection_fg: None,
             selection_bg: palette.selection_bg,
@@ -1653,6 +1797,555 @@ mod tests {
 
     fn no_selection(_: StableRowIndex) -> Range<usize> {
         0..0
+    }
+
+    /// Compare the sliced instances with a complete, uncropped glyph in
+    /// the color the physical pixel requires. The reference never computes
+    /// a texture cut, so a wrong boundary, lost bearing, double blend or
+    /// shifted texel changes the result. Partial alpha makes overlaps
+    /// observable for both coverage and color atlases.
+    #[test]
+    fn glyph_strips_match_uncropped_per_pixel_reference() {
+        use frankenterm_renderer_metal::cell_text::shade_text;
+        use frankenterm_renderer_metal::frame::FrameUniforms;
+        use frankenterm_renderer_metal::{BackgroundUniforms, TextUniforms};
+
+        let palette = ColorPalette::default();
+        let text_fg = SrgbaTuple(0.7, 0.25, 0.65, 0.65);
+        let bg = SrgbaTuple(0.1, 0.1, 0.1, 1.0);
+        let extent = GridExtent::new(1, 6);
+        let atlas = |_: AtlasKind, x: u32, y: u32| {
+            let coverage = ((x * 37 + y * 19) % 251) as u8;
+            [coverage, coverage / 2, coverage / 3, coverage]
+        };
+        let mut legacy_differences = 0;
+        for kind in [AtlasKind::Grayscale, AtlasKind::Color] {
+            let shaped = ShapedGlyph {
+                cell: 2,
+                glyph: PlacedGlyph {
+                    slot: AtlasSlot {
+                        kind,
+                        page: 0,
+                        epoch: 0,
+                        x: 17,
+                        y: 23,
+                        width: 28,
+                        height: 11,
+                    },
+                    offset: [-6, 2],
+                },
+                brightness: 0.8,
+            };
+            for cell_width in [7.5, 8.0] {
+                for grid_origin_x in [-0.5, 0.0, 0.25, 0.5, 0.75] {
+                    for mode in 0..3 {
+                        let selected_bg = SrgbaTuple(0.8, 0.8, 0.8, 1.0);
+                        let cursor_bg = SrgbaTuple(0.4, 0.5, 0.2, 1.0);
+                        let selected_fg = if mode == 1 {
+                            selected_bg
+                        } else {
+                            SrgbaTuple(0.05, 0.75, 0.9, 0.7)
+                        };
+                        let cursor_fg = if mode == 1 {
+                            cursor_bg
+                        } else {
+                            SrgbaTuple(0.1, 0.2, 0.3, 0.45)
+                        };
+                        let style = SceneStyle {
+                            cell_width,
+                            grid_origin_x,
+                            selection_fg: Some(selected_fg),
+                            selection_bg: selected_bg,
+                            min_contrast: (mode == 2).then_some(4.5),
+                            ..plain_style(&palette)
+                        };
+                        // Three full-glyph references, independently
+                        // selected by each pixel's overlay coverage below.
+                        let references: Vec<CellTextGrid> = [
+                            (text_fg, bg, false),
+                            (selected_fg, selected_bg, false),
+                            (cursor_fg, cursor_bg, mode == 2),
+                        ]
+                        .into_iter()
+                        .map(|(fg, under, blinking)| {
+                            let fg = style
+                                .min_contrast
+                                .and_then(|ratio| fg.ensure_contrast_ratio(&under, ratio))
+                                .unwrap_or(fg);
+                            let mut text = CellTextGrid::new(extent);
+                            if rgba8(fg) != rgba8(under) {
+                                let fg = if blinking {
+                                    mix_linear(fg, text_fg, 0.5)
+                                } else {
+                                    fg
+                                };
+                                text.push(
+                                    0,
+                                    CellText::new(
+                                        2,
+                                        adjust_brightness(rgba8(fg), shaped.brightness),
+                                    )
+                                    .with_glyph(&shaped.glyph.slot, shaped.glyph.offset),
+                                );
+                            }
+                            text
+                        })
+                        .collect();
+                        let uniforms = FrameUniforms {
+                            frame: 0,
+                            viewport: [64, 16],
+                            grid: extent,
+                            clear: [0.0, 0.0, 0.0, 1.0],
+                            background: BackgroundUniforms {
+                                cell_size: [cell_width, 16.0],
+                                grid_origin: [grid_origin_x, 0.0],
+                                ..BackgroundUniforms::default()
+                            },
+                            text: TextUniforms::default(),
+                        };
+                        for selection in [0..0, 1..2, 2..3, 1..4] {
+                            for cursor in [None, Some((1, 1)), Some((2, 1)), Some((2, 2))] {
+                                let built = BuiltRow {
+                                    selection: selection.clone(),
+                                    cursor: cursor.map(|(col, cols)| RowCursor {
+                                        col,
+                                        cols,
+                                        fg: Some(cursor_fg),
+                                        block: Some(cursor_bg),
+                                        sprite: None,
+                                        composing: None,
+                                        reverse: None,
+                                        blink: (mode == 2).then_some(0.5_f32.to_bits()),
+                                    }),
+                                    ..BuiltRow::default()
+                                };
+                                let mut sliced = CellTextGrid::new(extent);
+                                push_text_glyph(
+                                    &mut sliced,
+                                    0,
+                                    &shaped,
+                                    &style,
+                                    &built,
+                                    text_fg,
+                                    bg,
+                                );
+                                assert!(sliced.row(0).count() <= 5);
+                                let reference_at = |x: f32| {
+                                    if cursor.is_some_and(|(col, cols)| {
+                                        x >= grid_origin_x + col as f32 * cell_width
+                                            && x < grid_origin_x + (col + cols) as f32 * cell_width
+                                    }) {
+                                        2
+                                    } else if x
+                                        >= grid_origin_x + selection.start as f32 * cell_width
+                                        && x < grid_origin_x + selection.end as f32 * cell_width
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                };
+                                let legacy = reference_at(grid_origin_x + 2.5 * cell_width);
+                                for y in 0..16 {
+                                    for x in 0..64 {
+                                        let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                                        let expected = shade_text(
+                                            &uniforms,
+                                            &references[reference_at(x)],
+                                            atlas,
+                                            uniforms.clear,
+                                            x,
+                                            y,
+                                        );
+                                        let actual = shade_text(
+                                            &uniforms,
+                                            &sliced,
+                                            atlas,
+                                            uniforms.clear,
+                                            x,
+                                            y,
+                                        );
+                                        assert_eq!(
+                                            actual, expected,
+                                            "{kind:?} width={cell_width} origin={grid_origin_x} \
+                                             mode={mode} selection={selection:?} cursor={cursor:?} \
+                                             pixel=({x},{y})"
+                                        );
+                                        legacy_differences += usize::from(
+                                            shade_text(
+                                                &uniforms,
+                                                &references[legacy],
+                                                atlas,
+                                                uniforms.clear,
+                                                x,
+                                                y,
+                                            ) != expected,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            legacy_differences > 0,
+            "whole-glyph coloring must fail this oracle"
+        );
+    }
+
+    #[test]
+    fn equal_color_strips_coalesce_and_large_offsets_reanchor_without_wrapping() {
+        let palette = ColorPalette::default();
+        let style = SceneStyle {
+            selection_fg: Some(palette.foreground),
+            ..plain_style(&palette)
+        };
+        let shaped = ShapedGlyph {
+            cell: 0,
+            glyph: PlacedGlyph {
+                slot: AtlasSlot {
+                    width: 20,
+                    ..synthetic_slot(0, "->")
+                },
+                offset: [0, 2],
+            },
+            brightness: 1.0,
+        };
+        let mut text = CellTextGrid::new(GridExtent::new(1, 4));
+        push_text_glyph(
+            &mut text,
+            0,
+            &shaped,
+            &style,
+            &BuiltRow {
+                selection: 1..2,
+                ..BuiltRow::default()
+            },
+            palette.foreground,
+            palette.background,
+        );
+        let instances: Vec<_> = text.row(0).collect();
+        assert_eq!(
+            instances,
+            [CellText::new(0, rgba8(palette.foreground))
+                .with_glyph(&shaped.glyph.slot, shaped.glyph.offset)]
+        );
+
+        let wide_offset = ShapedGlyph {
+            glyph: PlacedGlyph {
+                offset: [i16::MAX - 2, 2],
+                ..shaped.glyph
+            },
+            ..shaped
+        };
+        let cropped = glyph_strip(&wide_offset, 7..20, [255; 4], &style, 6000).unwrap();
+        assert_eq!(cropped.atlas_origin()[0], 7);
+        assert_eq!(cropped.glyph_size()[0], 13);
+        assert_eq!(
+            i32::from(cropped.col()) * 8 + i32::from(cropped.offset()[0]),
+            i32::from(i16::MAX) - 2 + 7,
+        );
+        assert_eq!(cropped.offset()[1], wide_offset.glyph.offset[1]);
+        assert!(glyph_strip(&wide_offset, 7..20, [255; 4], &style, 4).is_none());
+        assert!(
+            glyph_strip(
+                &ShapedGlyph {
+                    cell: usize::from(u16::MAX) + 1,
+                    ..shaped
+                },
+                0..20,
+                [255; 4],
+                &style,
+                u32::MAX,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn selection_yields_to_transparent_block_and_sprite_cursor_text() {
+        let palette = ColorPalette::default();
+        let fg = SrgbaTuple(0.9, 0.2, 0.1, 1.0);
+        let selected_fg = SrgbaTuple(0.2, 0.4, 0.9, 1.0);
+        let style = SceneStyle {
+            selection_fg: Some(selected_fg),
+            ..plain_style(&palette)
+        };
+        let shaped = ShapedGlyph {
+            cell: 0,
+            glyph: PlacedGlyph {
+                slot: AtlasSlot {
+                    width: 16,
+                    ..synthetic_slot(0, "你")
+                },
+                offset: [0, 2],
+            },
+            brightness: 1.0,
+        };
+        for sprite in [
+            None,
+            Some(CursorSprite::Bar),
+            Some(CursorSprite::HollowBlock),
+        ] {
+            let built = BuiltRow {
+                selection: 0..2,
+                cursor: Some(RowCursor {
+                    col: 1,
+                    cols: 1,
+                    // A transparent cursor foreground keeps the source
+                    // foreground, even over a differently colored selection.
+                    fg: None,
+                    block: sprite.is_none().then_some(SrgbaTuple(0.1, 0.3, 0.2, 1.0)),
+                    sprite: sprite.map(|shape| (shape, [255; 4])),
+                    composing: None,
+                    reverse: None,
+                    blink: None,
+                }),
+                ..BuiltRow::default()
+            };
+            let mut text = CellTextGrid::new(GridExtent::new(1, 4));
+            push_text_glyph(
+                &mut text,
+                0,
+                &shaped,
+                &style,
+                &built,
+                fg,
+                palette.background,
+            );
+            let strips: Vec<_> = text
+                .row(0)
+                .map(|glyph| (glyph.offset()[0], glyph.glyph_size()[0], glyph.fg()))
+                .collect();
+            assert_eq!(
+                strips,
+                [(0, 8, rgba8(selected_fg)), (8, 8, rgba8(fg))],
+                "{sprite:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_on_a_wide_cell_continuation_does_not_cover_the_next_character() {
+        let palette = ColorPalette::default();
+        let cursor_fg = SrgbaTuple(0.1, 0.4, 0.7, 1.0);
+        let style = SceneStyle {
+            cursor_fg: Some(cursor_fg),
+            cursor_bg: Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+            ..plain_style(&palette)
+        };
+        let mut term = terminal(1, 6);
+        term.advance_bytes("你x\x1b[1;2H");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        glyphs.slots.insert(
+            ("你".to_string(), (0, false)),
+            PlacedGlyph {
+                slot: AtlasSlot {
+                    width: 16,
+                    ..synthetic_slot(0, "你")
+                },
+                offset: [0, 2],
+            },
+        );
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &style,
+        );
+        assert_eq!(scene.built[0].cursor.as_ref().unwrap().cols, 1);
+        let drawn: Vec<_> = scene
+            .text()
+            .row(0)
+            .map(|glyph| {
+                (
+                    glyph.col(),
+                    glyph.offset()[0],
+                    glyph.glyph_size()[0],
+                    glyph.fg(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                (0, 0, 8, rgba8(palette.foreground)),
+                (0, 8, 8, rgba8(cursor_fg)),
+                (2, 1, 7, rgba8(palette.foreground)),
+            ]
+        );
+
+        let bar = SceneStyle {
+            cursor_fg: None,
+            cursor_bg: None,
+            cursor_sprite: Some((CursorSprite::Bar, palette.cursor_bg)),
+            ..style
+        };
+        scene.update(&mirror, &bar, &no_selection, &mut glyphs);
+        assert!(glyphs.cursors.contains_key(&(CursorSprite::Bar, 1)));
+        assert!(!glyphs.cursors.contains_key(&(CursorSprite::Bar, 2)));
+    }
+
+    #[test]
+    fn partial_ligature_selection_and_wide_cursor_preserve_color_overhangs() {
+        let palette = ColorPalette::default();
+        let selected = SrgbaTuple(0.2, 0.4, 0.9, 1.0);
+        let cursor_fg = SrgbaTuple(0.05, 0.05, 0.05, 1.0);
+        let style = SceneStyle {
+            selection_fg: Some(selected),
+            cursor_fg: Some(cursor_fg),
+            cursor_bg: Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+            ..plain_style(&palette)
+        };
+        let mut term = terminal(2, 8);
+        term.advance_bytes("\x1b[31m->\x1b[32m你\x1b[0m\x1b[1;2H");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        glyphs.slots.insert(
+            ("->".to_string(), (0, false)),
+            PlacedGlyph {
+                slot: AtlasSlot {
+                    width: 20,
+                    ..synthetic_slot(0, "->")
+                },
+                offset: [-2, 2],
+            },
+        );
+        glyphs.slots.insert(
+            ("你".to_string(), (0, false)),
+            PlacedGlyph {
+                slot: AtlasSlot {
+                    width: 16,
+                    ..synthetic_slot(2, "你")
+                },
+                offset: [0, 2],
+            },
+        );
+        let selection = |_: StableRowIndex| 3..4;
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &selection,
+            &style,
+        );
+        let red = rgba8(palette.resolve_fg(ColorAttribute::PaletteIndex(1)));
+        let green = rgba8(palette.resolve_fg(ColorAttribute::PaletteIndex(2)));
+        let strips = |scene: &MetalScene| -> Vec<_> {
+            scene
+                .text()
+                .row(0)
+                .map(|instance| {
+                    (
+                        instance.col(),
+                        instance.atlas_origin()[0],
+                        instance.glyph_size()[0],
+                        instance.offset()[0],
+                        instance.fg(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            strips(&scene),
+            [
+                (0, 0, 10, -2, red),
+                (0, 10, 8, 8, rgba8(cursor_fg)),
+                // The arrow's ink in the neighboring green cell stays red.
+                (0, 18, 2, 16, red),
+                (2, 32, 8, 0, green),
+                (2, 40, 8, 8, rgba8(selected)),
+            ]
+        );
+
+        term.advance_bytes(b"\x1b[1;3H");
+        let update = step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &selection,
+            &style,
+        );
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        assert_eq!(scene.built[0].cursor.as_ref().unwrap().cols, 2);
+        assert_eq!(
+            strips(&scene),
+            [
+                (0, 0, 18, -2, red),
+                (0, 18, 2, 16, rgba8(cursor_fg)),
+                // Both halves of the wide cell take the block color, including
+                // the selected half; the identical strips merge again.
+                (2, 32, 16, 0, rgba8(cursor_fg)),
+            ]
+        );
+        let mut fresh = MetalScene::new();
+        fresh.update(
+            &reference_mirror(&mut term, None),
+            &style,
+            &selection,
+            &mut glyphs,
+        );
+        assert_eq!(difference(&scene, &fresh), None);
+
+        // A fractional pane translation moves the selected pixel boundary;
+        // an integer translation afterwards can reuse the same instances.
+        term.advance_bytes(b"\x1b[?25l");
+        let fractional = SceneStyle {
+            grid_origin_x: 0.75,
+            ..style
+        };
+        assert!(
+            step(
+                &mut term,
+                &mut mirror,
+                &mut scene,
+                &mut glyphs,
+                &selection,
+                &fractional
+            )
+            .full
+        );
+        let row = strips(&scene);
+        assert_eq!(
+            &row[row.len() - 2..],
+            &[(2, 32, 9, 0, green), (2, 41, 7, 9, rgba8(selected)),]
+        );
+        let translated = SceneStyle {
+            grid_origin_x: 4.75,
+            ..fractional
+        };
+        assert_eq!(
+            scene
+                .update(&mirror, &translated, &selection, &mut glyphs)
+                .rows_rebuilt,
+            0
+        );
+        let resized = SceneStyle {
+            cell_width: 7.5,
+            ..translated
+        };
+        assert!(
+            scene
+                .update(&mirror, &resized, &selection, &mut glyphs)
+                .full
+        );
+        let mut fresh = MetalScene::new();
+        fresh.update(
+            &reference_mirror(&mut term, None),
+            &resized,
+            &selection,
+            &mut glyphs,
+        );
+        assert_eq!(difference(&scene, &fresh), None);
     }
 
     /// Captures `term` into `mirror` and updates `scene` from it.
@@ -2160,8 +2853,10 @@ mod tests {
         // Dark text on the light selection and on the gray block is drawn,
         // although the cells' own background is dark too.
         assert_eq!(drawn_cols(dark, dark), [0, 1, 2, 3]);
-        // Text in the selection's or the block's own color is not.
-        assert_eq!(drawn_cols(light, gray), [3]);
+        // Text in the selection's or the block's own color is not. The
+        // synthetic c has one pixel of ink beyond its block, which remains
+        // visible in its ordinary foreground.
+        assert_eq!(drawn_cols(light, gray), [2, 3]);
 
         // The block going away (focus lost) brings back the text it hid,
         // and the incremental update rebuilds that row for it.
@@ -2172,10 +2867,22 @@ mod tests {
         let mut scene = MetalScene::new();
         let mut glyphs = SyntheticGlyphs::default();
         scene.update(&mirror, &block, &no_selection, &mut glyphs);
-        assert!(!scene.text().row(0).any(|instance| instance.col() == 2));
+        let tail: Vec<_> = scene
+            .text()
+            .row(0)
+            .filter(|instance| instance.col() == 2)
+            .collect();
+        assert_eq!(tail.len(), 1);
+        assert_eq!((tail[0].offset()[0], tail[0].glyph_size()[0]), (8, 1));
+        assert_eq!(tail[0].fg(), rgba8(palette.foreground));
         let update = scene.update(&mirror, &plain_style(&palette), &no_selection, &mut glyphs);
         assert_eq!((update.full, update.rows_rebuilt), (false, 1));
-        assert!(scene.text().row(0).any(|instance| instance.col() == 2));
+        let restored = scene
+            .text()
+            .row(0)
+            .find(|instance| instance.col() == 2)
+            .unwrap();
+        assert_eq!((restored.offset()[0], restored.glyph_size()[0]), (1, 8));
     }
 
     /// ft-yccm0.4.7.3: the WebGpu renderer draws the selection's tint over
@@ -2902,6 +3609,123 @@ mod tests {
                 .expect("offscreen frame")
         }
 
+        /// Render each complete glyph in all three colors, then choose the
+        /// expected pixel by physical overlay coverage. This exercises real
+        /// atlas uploads, Metal sampling and blend precision without sharing
+        /// the scene's texture-slicing implementation with the reference.
+        #[test]
+        fn partial_glyph_highlights_match_uncropped_metal_readback() {
+            let renderer = MetalRenderer::offscreen().expect("an offscreen Metal renderer");
+            let palette = ColorPalette::default();
+            let fg = SrgbaTuple(0.7, 0.25, 0.65, 0.65);
+            let selected_fg = SrgbaTuple(0.05, 0.75, 0.9, 0.7);
+            let cursor_fg = SrgbaTuple(0.1, 0.2, 0.3, 0.45);
+            let extent = GridExtent::new(1, 6);
+            let cells = CellBgGrid::new(extent);
+            for kind in [AtlasKind::Grayscale, AtlasKind::Color] {
+                let pixels: Vec<u8> = (0..28 * 11_u32)
+                    .flat_map(|index| {
+                        let coverage = ((index * 37) % 251) as u8;
+                        match kind {
+                            AtlasKind::Grayscale => vec![coverage],
+                            AtlasKind::Color => {
+                                vec![coverage, coverage / 2, coverage / 3, coverage]
+                            }
+                        }
+                    })
+                    .collect();
+                let slot = renderer
+                    .insert_glyph(kind, 28, 11, &pixels)
+                    .expect("a glyph slot");
+                let shaped = ShapedGlyph {
+                    cell: 2,
+                    glyph: PlacedGlyph {
+                        slot,
+                        offset: [-6, 2],
+                    },
+                    brightness: 1.0,
+                };
+                for grid_origin_x in [0.0, 0.75] {
+                    let style = SceneStyle {
+                        grid_origin_x,
+                        selection_fg: Some(selected_fg),
+                        ..plain_style(&palette)
+                    };
+                    let built = BuiltRow {
+                        selection: 1..4,
+                        cursor: Some(RowCursor {
+                            col: 2,
+                            cols: 1,
+                            fg: Some(cursor_fg),
+                            block: Some(palette.cursor_bg),
+                            sprite: None,
+                            composing: None,
+                            reverse: None,
+                            blink: None,
+                        }),
+                        ..BuiltRow::default()
+                    };
+                    let snapshot = |text: &CellTextGrid| {
+                        renderer
+                            .snapshot_frame(
+                                64,
+                                16,
+                                &FrameScene {
+                                    cells: &cells,
+                                    background: BackgroundUniforms {
+                                        cell_size: [8.0, 16.0],
+                                        grid_origin: [grid_origin_x, 0.0],
+                                        ..BackgroundUniforms::default()
+                                    },
+                                    text,
+                                    text_uniforms: TextUniforms::default(),
+                                    clear: ClearColor::from_srgba(0.05, 0.05, 0.05, 1.0),
+                                },
+                            )
+                            .expect("offscreen glyph")
+                    };
+                    let references: Vec<_> = [fg, selected_fg, cursor_fg]
+                        .into_iter()
+                        .map(|color| {
+                            let mut text = CellTextGrid::new(extent);
+                            text.push(
+                                0,
+                                CellText::new(2, rgba8(color))
+                                    .with_glyph(&slot, shaped.glyph.offset),
+                            );
+                            snapshot(&text)
+                        })
+                        .collect();
+                    let mut sliced = CellTextGrid::new(extent);
+                    push_text_glyph(
+                        &mut sliced,
+                        0,
+                        &shaped,
+                        &style,
+                        &built,
+                        fg,
+                        palette.background,
+                    );
+                    let actual = snapshot(&sliced);
+                    for (index, pixel) in actual.chunks_exact(4).enumerate() {
+                        let x = (index % 64) as f32 + 0.5 - grid_origin_x;
+                        let reference = if (16.0..24.0).contains(&x) {
+                            2
+                        } else if (8.0..32.0).contains(&x) {
+                            1
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            pixel,
+                            &references[reference][index * 4..index * 4 + 4],
+                            "{kind:?} origin={grid_origin_x} pixel={index}",
+                        );
+                    }
+                }
+            }
+        }
+
         fn readback_session(seed: u64, plant: bool) -> usize {
             let renderer = MetalRenderer::offscreen().expect("an offscreen Metal renderer");
             let mut glyphs = AtlasGlyphs {
@@ -2920,6 +3744,8 @@ mod tests {
             let style = SceneStyle {
                 palette: &palette,
                 generation: 0,
+                cell_width: 8.0,
+                grid_origin_x: 0.0,
                 bold_brightens: true,
                 selection_fg: Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
                 selection_bg: palette.selection_bg,

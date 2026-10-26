@@ -439,6 +439,8 @@ impl MetalFrame {
             palette,
             generation: ((config.generation() as u64) << 32)
                 | (facts.palette_generation & 0xffff_ffff),
+            cell_width: metrics.cell_size.width as f32,
+            grid_origin_x: inputs.grid_origin[0],
             bold_brightens,
             selection_fg: visible(palette.selection_fg),
             selection_bg: palette.selection_bg,
@@ -482,7 +484,7 @@ impl MetalFrame {
                 let width_cells = rows[row]
                     .cells()
                     .iter()
-                    .find(|cell| (cell.col()..cell.col() + cell.width()).contains(&cursor.x))
+                    .find(|cell| cell.col() == cursor.x)
                     .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
                 CursorUniform {
                     // A cursor the scene draws as a sprite is not drawn here.
