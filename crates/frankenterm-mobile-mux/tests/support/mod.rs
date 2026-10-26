@@ -705,6 +705,21 @@ pub fn wraps(term: &mut Terminal) -> Vec<bool> {
     lines.iter().map(Line::last_cell_was_wrapped).collect()
 }
 
+/// The text of each row that wraps, trailing blanks kept: what runs on into
+/// the row below when the two are read as one line.
+pub fn wrapped_text(term: &mut Terminal) -> Vec<String> {
+    let dims = terminal_get_dimensions(term);
+    let (_, lines) = terminal_get_lines(
+        term,
+        dims.scrollback_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
+    );
+    lines
+        .iter()
+        .filter(|line| line.last_cell_was_wrapped())
+        .map(|line| line.as_str().into_owned())
+        .collect()
+}
+
 /// The text of rows `range`, trailing blanks dropped.
 pub fn text(term: &mut Terminal, range: std::ops::Range<StableRowIndex>) -> Vec<String> {
     let (_, lines) = terminal_get_lines(term, range);

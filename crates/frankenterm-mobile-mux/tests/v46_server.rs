@@ -5,7 +5,7 @@ mod support;
 
 use frankenterm_mobile_mux::Event;
 use frankenterm_mobile_mux::mirror::history_rows;
-use support::{Harness, all_text, assert_kept, assert_mirrored, text, wraps};
+use support::{Harness, all_text, assert_kept, assert_mirrored, text, wrapped_text, wraps};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -169,6 +169,12 @@ fn rows_wrap_on_the_phone_where_they_wrap_on_the_remote() {
             all_text(&mut harness.phone),
             all_text(&mut harness.server.term)
         );
+        // Nothing stands between a wrapping row and the row it runs on into
+        // that is not there on the remote (a link or selection reads across).
+        assert_eq!(
+            wrapped_text(&mut harness.phone),
+            wrapped_text(&mut harness.server.term)
+        );
         remote
     };
     // Into history: two and a half rows; exactly two; a wide character
@@ -188,6 +194,10 @@ fn rows_wrap_on_the_phone_where_they_wrap_on_the_remote() {
     // Shown: output wraps as it scrolls in, and a prompt line that fills
     // the bottom row wraps only when the next key arrives.
     harness.output(b"echo The quick brown fox\r\nThe quick brown fox\r\n$ ");
+    mirrored(&mut harness);
+    // A wide character that does not fit wraps a column early as it scrolls
+    // in, too.
+    harness.output("\r\n123456789\u{754c}x\r\n$ ".as_bytes());
     mirrored(&mut harness);
     harness.output(b"12345678");
     mirrored(&mut harness);

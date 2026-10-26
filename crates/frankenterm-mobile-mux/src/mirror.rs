@@ -61,17 +61,25 @@ fn distance(from: StableRowIndex, to: StableRowIndex) -> usize {
     usize::try_from(to.saturating_sub(from)).unwrap_or(0)
 }
 
-/// Draws `line` on screen row `y`, where the cursor is; true when it wraps
-/// (see `render::paint_line`). A row `blank` already (it scrolled in, or
-/// the screen was just wiped) is not erased: each erase costs the phone's
-/// terminal a row's width of the work budget it has for a piece of output.
-fn paint(out: &mut String, line: Option<&Line>, cols: usize, y: usize, blank: bool) -> bool {
+/// Draws `line`, above `next`, on screen row `y`, where the cursor is; true
+/// when it wraps (see `render::paint_line`). A row `blank` already (it
+/// scrolled in, or the screen was just wiped) is not erased: each erase
+/// costs the phone's terminal a row's width of the work budget it has for a
+/// piece of output.
+fn paint(
+    out: &mut String,
+    line: Option<&Line>,
+    next: Option<&Line>,
+    cols: usize,
+    y: usize,
+    blank: bool,
+) -> bool {
     if blank {
-        render::paint_blank_line(out, line, cols)
+        render::paint_blank_line(out, line, next, cols)
     } else if y == 0 {
-        render::paint_top_line(out, line, cols)
+        render::paint_top_line(out, line, next, cols)
     } else {
-        render::paint_line(out, line, cols)
+        render::paint_line(out, line, next, cols)
     }
 }
 
@@ -457,7 +465,7 @@ impl PaneMirror {
         // cursor waits past it there instead.
         let in_place = |out: &mut String, row: StableRowIndex, y: usize| {
             render::move_to(out, y, 0);
-            let wraps = paint(out, line(row), cols, y, wiped);
+            let wraps = paint(out, line(row), line(offset(row, 1)), cols, y, wiped);
             if wraps && y + 1 < rows {
                 render::continue_onto(out, line(offset(row, 1)));
                 return false;
@@ -479,12 +487,13 @@ impl PaneMirror {
                     }
                     match previous {
                         Some((above, true)) if offset(above, 1) == row => {
-                            render::carry_on(&mut out);
+                            render::carry_on(&mut out, line(row));
                         }
                         Some(_) => out.push_str("\r\n"),
                         None => {}
                     }
-                    previous = Some((row, paint(&mut out, line(row), cols, y, true)));
+                    let wraps = paint(&mut out, line(row), line(offset(row, 1)), cols, y, true);
+                    previous = Some((row, wraps));
                     y = (y + 1).min(rows.saturating_sub(1));
                 }
             }
@@ -517,16 +526,23 @@ impl PaneMirror {
                     wraps = continued
                         && !redrawn(&above)
                         && line(above).is_some_and(Line::last_cell_was_wrapped)
-                        && paint(&mut out, line(above), cols, bottom, false);
+                        && paint(&mut out, line(above), line(entering), cols, bottom, false);
                 }
                 // Each entering row scrolls in blank.
                 for row in entering..viewport.end {
                     if wraps {
-                        render::carry_on(&mut out);
+                        render::carry_on(&mut out, line(row));
                     } else {
                         out.push('\n');
                     }
-                    wraps = paint(&mut out, line(row), cols, bottom, true);
+                    wraps = paint(
+                        &mut out,
+                        line(row),
+                        line(offset(row, 1)),
+                        cols,
+                        bottom,
+                        true,
+                    );
                 }
                 for row in top..entering.min(viewport.end) {
                     if redrawn(&row) {

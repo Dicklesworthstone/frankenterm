@@ -235,6 +235,9 @@ final class TerminalSessionController {
     @ObservationIgnored private weak var noticedMux: TerminalMuxControl?
     /// No mux answered on this machine, so this session is a new shell.
     private(set) var shellOnly = false
+    /// This session showed the machine's mux panes, so a retry after it
+    /// drops attaches to them again rather than waiting for New Session.
+    @ObservationIgnored private(set) var attachedToMux = false
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -873,10 +876,12 @@ final class TerminalSessionController {
         guard focus?.permitsTerminalCreation == true, terminalRequested,
               route.sessionCreation.permitsOpening(explicit: explicitTerminalRequested) else { return false }
         if explicitTerminalRequested { return true }
-        // Attaching to existing mux panes starts no shell. A shell after one
-        // ended or was lost, including the fallback when a reattached mux is
-        // gone, waits for New Session.
-        guard route.mux || focus?.requiresNewSession(target.machineID) == false else { return false }
+        // Attaching to existing mux panes, on a mux route or a direct route's
+        // default mux, starts no shell. A shell after one ended or was lost,
+        // including the fallback when a reattached mux is gone, waits for
+        // New Session.
+        guard route.mux || connection?.muxControl != nil
+                || focus?.requiresNewSession(target.machineID) == false else { return false }
         return focus?.shows(machineID: target.machineID) == true
     }
 
@@ -945,6 +950,7 @@ final class TerminalSessionController {
             let connection = attempt
             self.pump = pump
             if let control = connection.muxControl {
+                attachedToMux = true
                 observeMux(control)
                 control.setVisible(presentationVisible)
             }
@@ -1022,7 +1028,7 @@ final class TerminalSessionController {
         } catch TerminalSessionJournalError.reviewRequired {
             if !stopped { phase = .failed("The previous session on this machine is still closing. Try again in a moment.") }
         } catch let failure as ConnectFailure {
-            if !stopped { dropped = retriesDrop && failure.unreachable; phase = .couldNotConnect(failure.help) }
+            if !stopped { dropped = retriesDrop && !failure.answered; phase = .couldNotConnect(failure.help) }
         } catch {
             if !stopped { phase = .failed(Self.describe(error)) }
         }
@@ -1179,10 +1185,21 @@ final class TerminalSessionController {
         throw TerminalSessionJournalError.reviewRequired
     }
 
-    /// `unreachable`: no route answered at all. Only that failure may end a
-    /// retry as another drop; a refused key, a changed host key or any other
-    /// answer from the machine never retries.
-    private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp; var unreachable = false }
+    /// `answered`: the machine or its jump host gave an answer a retry would
+    /// get again (another host key, every key refused), or this phone's own
+    /// policy refused. That never retries. Any other failure (no route
+    /// answered, a reset or timeout before sign-in finished) ends a retry as
+    /// another drop, and each retry checks the host key before signing in.
+    private struct ConnectFailure: Error { let help: WorkspaceConnectionHelp; var answered = true }
+
+    private static func isAnswer(_ error: Error) -> Bool {
+        switch error {
+        case let failure as SSHAuthenticationError: failure != .busy
+        case let failure as NativeSSHError: failure == .invalidInput || failure.isMachineAnswer
+        case let failure as WorkspaceSSHConnectionError: failure == .capacity || failure == .stale
+        default: true
+        }
+    }
     /// Each failed route, for `idevicesyslog` or Console: the screen shows
     /// only the explanation.
     private static let log = Logger(subsystem: "org.frankenterm.mobile", category: "connect")
@@ -1257,12 +1274,13 @@ final class TerminalSessionController {
                 }
                 _ = try plan.failed(.terminal, attempt: attempt)
                 throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
-                                                 message: Self.describe(error), remedy: .none))
+                                                 message: Self.describe(error), remedy: .none),
+                                     answered: Self.isAnswer(error))
             }
         }
         throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)
             ?? .init(title: "Couldn't connect to \(target.machineName)", message: "No route answered.", remedy: .none),
-            unreachable: true)
+            answered: false)
     }
 
     /// The desktop's default terminal font, bundled with its license, when it

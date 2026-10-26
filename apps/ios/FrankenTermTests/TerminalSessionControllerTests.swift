@@ -61,6 +61,9 @@ private final class LoopbackRelay: @unchecked Sendable {
     /// Bytes reach the relay and go no further, with no reset: a connection
     /// stranded on a route the device left looks like this to the phone.
     private var stalled = false
+    /// New connections are reset as soon as the first bytes pass: the phone
+    /// reaches the machine, and the connection dies before sign-in finishes.
+    private var cutting = false
     private(set) var port: UInt16 = 0
 
     init(to target: UInt16) throws {
@@ -108,11 +111,21 @@ private final class LoopbackRelay: @unchecked Sendable {
         queue.sync {
             listener?.cancel(); listener = nil
             for connection in connections { connection.cancel() }
-            connections = []; stalled = false
+            connections = []; stalled = false; cutting = false
         }
     }
 
     func stall() { queue.sync { stalled = true } }
+
+    /// Drops every relayed connection and resets each new one partway
+    /// through its handshake, until down().
+    func cut() {
+        queue.sync {
+            cutting = true
+            for connection in connections { connection.forceCancel() }
+            connections = []
+        }
+    }
 
     /// New connections reach another server on the same relay port.
     func retarget(to port: UInt16) throws {
@@ -135,6 +148,10 @@ private final class LoopbackRelay: @unchecked Sendable {
 
     private func pipe(_ from: NWConnection, to: NWConnection) {
         from.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
+            if let data, !data.isEmpty, self?.cutting == true {
+                to.send(content: data, completion: .contentProcessed { _ in from.forceCancel(); to.forceCancel() })
+                return
+            }
             if let data, !data.isEmpty, self?.stalled == false { to.send(content: data, completion: .contentProcessed { _ in }) }
             if complete || error != nil { from.cancel(); to.cancel() } else { self?.pipe(from, to: to) }
         }
@@ -1193,18 +1210,26 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// tap. A relay to the loopback sshd stands in for the network. A direct
     /// shell comes back signed in, waiting for New Session (a new shell is
     /// not the old one); through the disposable mux, when set, the machine
-    /// reattaches to the pane it was showing.
+    /// reattaches to the pane it was showing, on a mux route and on a direct
+    /// route whose default mux command reaches it (an sshd on
+    /// TEST_RUNNER_FT_LIVE_SSH_DEFAULT_MUX_PORT that runs that command
+    /// against the disposable mux).
     func testADroppedMachineComesBackWhenTheNetworkDoes() async throws {
-        try await dropAndReturn(muxCommand: nil)
-        if let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] {
-            try await dropAndReturn(muxCommand: command)
+        let environment = ProcessInfo.processInfo.environment
+        guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
+        }
+        try await dropAndReturn(to: sshPort, muxCommand: nil)
+        if let command = environment["FT_LIVE_MUX_COMMAND"] {
+            try await dropAndReturn(to: sshPort, muxCommand: command)
+        }
+        if let port = environment["FT_LIVE_SSH_DEFAULT_MUX_PORT"].flatMap(UInt16.init) {
+            try await dropAndReturn(to: port, muxCommand: nil, defaultMux: true)
         }
     }
 
-    private func dropAndReturn(muxCommand: String?) async throws {
-        guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
-            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
-        }
+    private func dropAndReturn(to sshPort: UInt16, muxCommand: String?, defaultMux: Bool = false) async throws {
+        let attaches = muxCommand != nil || defaultMux
         let relay = try LoopbackRelay(to: sshPort)
         try await relay.up()
         defer { relay.down() }
@@ -1215,10 +1240,15 @@ final class TerminalSessionControllerTests: XCTestCase {
         scene.networkPathChanged(wifi)
         let first = try await connect(scene, "alpha")
         XCTAssertEqual(first.phase, .live)
-        for _ in 0..<200 where muxCommand != nil && first.muxState?.shown == nil {
+        for _ in 0..<200 where attaches && first.muxState?.shown == nil {
             try await Task.sleep(for: .milliseconds(25))
         }
         let pane = first.muxState?.shown
+        if defaultMux {
+            XCTAssertFalse(first.route.mux, "a direct route")
+            XCTAssertFalse(first.shellOnly, "attached to the default mux")
+            XCTAssertNotNil(pane, "showing one of its panes")
+        }
 
         // The network goes away: the connection drops and every retry is refused.
         relay.down()
@@ -1244,13 +1274,13 @@ final class TerminalSessionControllerTests: XCTestCase {
 
         // The device reports the network back, and the machine comes back.
         scene.networkPathChanged(wifi)
-        let expected: TerminalSessionController.Phase = muxCommand == nil ? .ready : .live
+        let expected: TerminalSessionController.Phase = attaches ? .live : .ready
         for _ in 0..<600 where scene.sessions["alpha"] === spent || scene.sessions["alpha"]?.phase != expected {
             try await Task.sleep(for: .milliseconds(50))
         }
         let back = try XCTUnwrap(scene.sessions["alpha"])
         XCTAssertEqual(back.phase, expected, "the machine came back when the network did")
-        if muxCommand == nil {
+        if !attaches {
             XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
         } else {
             // Showing the pane rebuilds the terminal view.
@@ -1361,6 +1391,50 @@ final class TerminalSessionControllerTests: XCTestCase {
         scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
         try await Task.sleep(for: .seconds(4))
         XCTAssertTrue(scene.sessions["alpha"] === last, "nor does a network change retry it")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// A retry that reaches the machine but is reset before sign-in finishes
+    /// (a flaky network, a server restarting) learned nothing about the
+    /// machine: it is another drop. Every retry runs, and when they are
+    /// spent, a network change brings the machine back.
+    func testARetryResetBeforeSignInIsAnotherDrop() async throws {
+        guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
+        }
+        let relay = try LoopbackRelay(to: sshPort)
+        try await relay.up()
+        defer { relay.down() }
+        let live = try await liveScene(machineIDs: ["alpha"], autoConnect: true, relayPort: relay.port)
+        let scene = live.scene
+        scene.networkPathChanged(.init(usable: true, interfaces: ["en0"]))
+        let first = try await connect(scene, "alpha")
+        XCTAssertEqual(first.phase, .live)
+
+        // The connection drops, and every retry is reset partway through its handshake.
+        relay.cut()
+        var retries = Set<UUID>()
+        func noteRetry() { if let session = scene.sessions["alpha"], session !== first { retries.insert(session.id) } }
+        for _ in 0..<400 where retries.isEmpty || scene.status(of: "alpha") != .attention {
+            noteRetry()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        noteRetry()
+        XCTAssertEqual(retries.count, TerminalReconnectPolicy.maximumAttempts, "a reset retry is followed by the next")
+        let last = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertTrue(last.dropped, "a reset before sign-in is a drop")
+        guard case .couldNotConnect = last.phase else { return XCTFail("expected Couldn't connect, not \(last.phase)") }
+
+        // The network is whole again, and the device says it changed.
+        relay.down()
+        try await relay.up()
+        scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
+        for _ in 0..<400 where scene.sessions["alpha"] === last || scene.sessions["alpha"]?.phase != .ready {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(scene.sessions["alpha"]?.phase, .ready, "back, signed in")
+        XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
@@ -1681,6 +1755,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(session.muxState?.unread, [], "showing the pane reads it")
         for _ in 0..<200 where session.hasUnseenOutput { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertFalse(session.hasUnseenOutput)
+
+        // The pane prints again while the first is shown: Next New Output is
+        // offered. Once the machine disconnects, its last pane list still
+        // says unread, but there is nowhere left to go, and it is not offered.
+        try await type("sleep 6; echo AGAIN-\(run)", into: view)
+        try await show(first)
+        for _ in 0..<600 where session.muxState?.unread.contains(other) != true {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(session.muxState?.unread, [other])
+        XCTAssertTrue(scene.hasUnseenOutputElsewhere, "Next New Output goes to the pane that printed")
+        scene.disconnect("alpha")
+        for _ in 0..<200 where !session.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(session.muxState?.unread, [other], "the machine's last pane list")
+        XCTAssertFalse(scene.hasUnseenOutputElsewhere, "a machine that is gone offers no Next New Output")
         view.removeFromSuperview()
         await scene.close()
         await assertReleased(session, connections: live.connections)

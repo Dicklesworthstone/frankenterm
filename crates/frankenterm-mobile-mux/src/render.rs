@@ -196,13 +196,14 @@ impl Pen {
 }
 
 /// Draws `line` on the row the cursor is on, from the first column; cells
-/// past `cols` are dropped. Leaves the cursor on that row with SGR reset and
-/// no link open. True when the line wraps onto the row below: its last
-/// column is then written last, and the cursor waits past it for
-/// `continue_onto`.
-pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+/// past `cols` are dropped. `next` is the row below, when known. Leaves the
+/// cursor on that row with SGR reset and no link open. True when the line
+/// wraps onto the row below: the cursor then waits for `continue_onto` or
+/// `carry_on`, past the last column, or where the line stopped when it
+/// wrapped early for a wide character that did not fit.
+pub fn paint_line(out: &mut String, line: Option<&Line>, next: Option<&Line>, cols: usize) -> bool {
     out.push_str("\r\x1b[0m\x1b[2K");
-    paint_cells(out, line, cols)
+    paint_cells(out, line, next, cols)
 }
 
 /// `paint_line` for the screen's top row. Erasing that whole row would end
@@ -210,7 +211,12 @@ pub fn paint_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
 /// remote keeps, so the row's first cell is written first and the rest is
 /// erased from there. (ECH would keep the wrap too, but the phone charges
 /// it the square of the width, past its work budget on a wide screen.)
-pub fn paint_top_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+pub fn paint_top_line(
+    out: &mut String,
+    line: Option<&Line>,
+    next: Option<&Line>,
+    cols: usize,
+) -> bool {
     out.push_str("\r\x1b[0m");
     write_alone(
         out,
@@ -220,17 +226,22 @@ pub fn paint_top_line(out: &mut String, line: Option<&Line>, cols: usize) -> boo
         out.push_str("\x1b[K");
     }
     out.push('\r');
-    paint_cells(out, line, cols)
+    paint_cells(out, line, next, cols)
 }
 
 /// `paint_line` for a row already blank, which it does not erase.
-pub fn paint_blank_line(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+pub fn paint_blank_line(
+    out: &mut String,
+    line: Option<&Line>,
+    next: Option<&Line>,
+    cols: usize,
+) -> bool {
     out.push_str("\r\x1b[0m");
-    paint_cells(out, line, cols)
+    paint_cells(out, line, next, cols)
 }
 
 /// Writes `line`'s cells on a row just erased, the cursor on its first column.
-fn paint_cells(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
+fn paint_cells(out: &mut String, line: Option<&Line>, next: Option<&Line>, cols: usize) -> bool {
     let Some(line) = line else { return false };
     let wraps = line.last_cell_was_wrapped();
     let mut pen = Pen::new();
@@ -265,26 +276,40 @@ fn paint_cells(out: &mut String, line: Option<&Line>, cols: usize) -> bool {
     }
     pen.finish(out);
     if wraps && end != cols {
-        // It wrapped before a wide character that did not fit, or its last
-        // column was never stored: blank there, as on the remote.
-        let _ = write!(out, "\x1b[{cols}G ");
+        match first_cell(next).map(|cell| cell.width()) {
+            // It wrapped early for the wide character the row below starts
+            // with: the cursor waits where it stopped, and that character,
+            // written there next, wraps on the phone as it did on the remote,
+            // leaving the columns past it empty.
+            Some(width) if width > 1 && width <= cols && end + width > cols => {
+                let _ = write!(out, "\x1b[{}G", end + 1);
+            }
+            // Its last column was never stored: blank there, as on the remote.
+            _ => {
+                let _ = write!(out, "\x1b[{cols}G ");
+            }
+        }
     }
     wraps
 }
 
 /// Writes the first cell of `next`, the row below one `paint_line` left
-/// waiting past its last column. The phone's terminal wraps onto that row
-/// and marks the one above as continuing there; the row below shows what
-/// it did. Leaves the cursor on the row below with SGR reset and no link.
+/// waiting to wrap. The phone's terminal wraps onto that row and marks the
+/// one above as continuing there; the row below shows what it did. Leaves
+/// the cursor on the row below with SGR reset and no link.
 pub fn continue_onto(out: &mut String, next: Option<&Line>) {
     write_alone(out, first_cell(next));
 }
 
-/// Carries a wrap on into a row painted next, with a blank written plain:
-/// a row that scrolls in for it takes the pen's background, so it stays
-/// blank.
-pub fn carry_on(out: &mut String) {
-    out.push(' ');
+/// Carries a wrap on into `next`, painted next, with a character written
+/// plain: a row that scrolls in for it takes the pen's background, so it
+/// stays blank. A blank, or the wide character `next` starts with, which
+/// wraps by itself where a row stopped early for it.
+pub fn carry_on(out: &mut String, next: Option<&Line>) {
+    match first_cell(next).filter(|cell| cell.width() > 1) {
+        Some(cell) => out.push_str(cell.str()),
+        None => out.push(' '),
+    }
 }
 
 /// The cell in `line`'s first column, unless a wide one covers it.
@@ -363,7 +388,7 @@ mod tests {
 
     fn painted(line: &Line, cols: usize) -> String {
         let mut out = String::new();
-        paint_line(&mut out, Some(line), cols);
+        paint_line(&mut out, Some(line), None, cols);
         out
     }
 
@@ -507,24 +532,52 @@ mod tests {
         ]);
         line.set_last_cell_was_wrapped(true, 0);
         let mut out = String::new();
-        assert!(paint_line(&mut out, Some(&line), 3));
+        assert!(paint_line(&mut out, Some(&line), None, 3));
         assert_eq!(
             out, "\r\x1b[0m\x1b[2Kab ",
             "its blank last column is written"
         );
-        // Wrapped before a wide character that did not fit: the last column
-        // was never stored, and is written blank.
+        // Its last column was never stored: written blank.
         let mut early = line_of(&[("a", CellAttributes::default())]);
         early.set_last_cell_was_wrapped(true, 0);
         let mut out = String::new();
-        assert!(paint_line(&mut out, Some(&early), 3));
+        assert!(paint_line(&mut out, Some(&early), None, 3));
         assert_eq!(out, "\r\x1b[0m\x1b[2Ka\x1b[3G ");
         let mut out = String::new();
         assert!(!paint_line(
             &mut out,
             Some(&line_of(&[("a", CellAttributes::default())])),
+            None,
             3
         ));
+    }
+
+    #[test]
+    fn a_row_wrapped_early_for_a_wide_character_waits_where_it_stopped() {
+        let mut early = line_of(&[
+            ("a", CellAttributes::default()),
+            ("b", CellAttributes::default()),
+        ]);
+        early.set_last_cell_was_wrapped(true, 0);
+        let wide = line_of(&[("\u{754c}", CellAttributes::default())]);
+        let mut out = String::new();
+        assert!(paint_line(&mut out, Some(&early), Some(&wide), 3));
+        assert_eq!(
+            out, "\r\x1b[0m\x1b[2Kab\x1b[3G",
+            "no blank in the last column, where the remote has none"
+        );
+        let mut out = String::new();
+        carry_on(&mut out, Some(&wide));
+        assert_eq!(out, "\u{754c}", "the wide character wraps by itself");
+        // A row below that starts narrow, or is not known, carries on blank.
+        let narrow = line_of(&[("x", CellAttributes::default())]);
+        let mut out = String::new();
+        assert!(paint_line(&mut out, Some(&early), Some(&narrow), 3));
+        assert_eq!(out, "\r\x1b[0m\x1b[2Kab\x1b[3G ");
+        let mut out = String::new();
+        carry_on(&mut out, Some(&narrow));
+        carry_on(&mut out, None);
+        assert_eq!(out, "  ");
     }
 
     #[test]
@@ -551,7 +604,7 @@ mod tests {
             ("b", CellAttributes::default()),
         ]);
         let mut out = String::new();
-        assert!(!paint_blank_line(&mut out, Some(&line), 300));
+        assert!(!paint_blank_line(&mut out, Some(&line), None, 300));
         assert_eq!(out, "\r\x1b[0ma\x1b[3Gb");
     }
 
@@ -563,12 +616,12 @@ mod tests {
             ("b", CellAttributes::default()),
         ]);
         let mut out = String::new();
-        assert!(!paint_top_line(&mut out, Some(&line), 300));
+        assert!(!paint_top_line(&mut out, Some(&line), None, 300));
         // One EL, from the second column: erasing the whole top row would end
         // the wrap of the history row above it; ECH would cost 300 * 300.
         assert_eq!(out, "\r\x1b[0ma\x1b[K\ra\x1b[3Gb");
         let mut out = String::new();
-        paint_top_line(&mut out, None, 300);
+        paint_top_line(&mut out, None, None, 300);
         assert_eq!(out, "\r\x1b[0m \x1b[K\r", "a row not known is blank");
     }
 

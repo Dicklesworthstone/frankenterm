@@ -633,10 +633,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     /// A machine or pane other than the one on screen has output the phone
-    /// has not shown, so Next New Output has somewhere to go.
+    /// has not shown, so Next New Output has somewhere to go. The marks are
+    /// the state SwiftUI redraws on; where the button would go decides, so a
+    /// machine that is gone, with its last pane list, never leaves it shown.
     var hasUnseenOutputElsewhere: Bool {
-        navigationMachineIDs.contains(where: hasUnseenOutput)
-            || selectedSession?.muxState.map { state in state.unread.contains { $0 != state.shown } } == true
+        (navigationMachineIDs.contains(where: hasUnseenOutput)
+            || selectedSession?.muxState.map { state in state.unread.contains { $0 != state.shown } } == true)
+            && nextUnseenOutput() != nil
     }
 
     /// Shows the next machine or mux pane with output not yet shown, in ring
@@ -803,9 +806,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 try? self.connectionIntent.terminalOpened(machineID)
                 if !self.inBackground { self.reconnectPolicies[machineID, default: .init()].recordLive() }
             case .ended, .failed:
-                let route = controller.route
-                try? self.connectionIntent.terminalEnded(machineID, reattachesExistingPanes: controller.dropped
-                    && route.mux && route.sessionCreation == .existingOnly)
+                try? self.connectionIntent.terminalEnded(machineID,
+                    reattachesExistingPanes: controller.dropped && controller.attachedToMux)
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
             case .couldNotConnect:
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
