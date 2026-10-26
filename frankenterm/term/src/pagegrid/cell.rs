@@ -152,6 +152,17 @@ pub fn classify(attrs: &CellAttributes) -> StyleClass {
 /// The style part of a legacy `CellAttributes` for a stored cell style:
 /// everything except hyperlink, images, wrap and semantic type.
 pub fn style_attributes(style: CellStyle, table: &RichStyleTable) -> CellAttributes {
+    style_attributes_with(style, |id| {
+        *table.get(id).expect("a stored rich-style id is live (I5)")
+    })
+}
+
+/// Decode a cell against either its live page table or an owned snapshot of
+/// just the referenced styles. The latter must not borrow a page after capture.
+pub(crate) fn style_attributes_with(
+    style: CellStyle,
+    rich: impl FnOnce(u32) -> RichStyle,
+) -> CellAttributes {
     let mut attrs = CellAttributes::default();
     match style {
         CellStyle::Inline(inline) => {
@@ -160,7 +171,7 @@ pub fn style_attributes(style: CellStyle, table: &RichStyleTable) -> CellAttribu
             attrs.set_background(decode_color(inline.bg()));
         }
         CellStyle::Rich(id) => {
-            let style = table.get(id).expect("a stored rich-style id is live (I5)");
+            let style = rich(id);
             apply_attrs(style.attrs, &mut attrs);
             attrs.set_foreground(style.fg);
             attrs.set_background(style.bg);

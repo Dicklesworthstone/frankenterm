@@ -12,10 +12,11 @@
 //! A [`MirrorRow`] also keeps its cells' images ([`MirrorImage`]): shared
 //! handles to their payloads, with each cell's slice and placement.
 //!
-//! Style and color resolution, selection, hyperlink hover and GPU instance
-//! building all happen from the mirror after the lock is released. No
-//! visible [`Line`] is cloned and no row is compared with a previous copy of
-//! itself: change detection is by line sequence number.
+//! Style and color resolution, implicit hyperlink rules, selection, hyperlink
+//! hover and GPU instance building happen after the lock is released. Native
+//! rows remain packed while captured; already-authoritative legacy Lines are
+//! copied only when their logical group changes. Change detection uses exact
+//! source sequence numbers, including wrapped context outside the viewport.
 //!
 //! A row is recaptured when:
 //! - its line's sequence number moved past the one it was captured at, or is
@@ -36,8 +37,10 @@ use crate::renderable::{
     terminal_get_cursor_position, terminal_get_dimensions, RenderableDimensions,
     StableCursorPosition,
 };
-pub use frankenterm_term::render::{MirrorCell, MirrorColor, MirrorImage, MirrorRow};
-use frankenterm_term::render::{PackedMirrorRow, RenderRowRef};
+pub use frankenterm_term::render::{
+    MirrorCell, MirrorColor, MirrorImage, MirrorLineMode, MirrorRow,
+};
+use frankenterm_term::render::{MirrorHyperlinkScanner, RenderRowRef, RenderRowSnapshot};
 use frankenterm_term::screen::ScreenCoordinateWitness;
 use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::collections::HashMap;
@@ -58,6 +61,8 @@ pub struct CaptureStats {
     pub cells_captured: usize,
     /// Rows copied as packed page cells and resolved after the terminal lock.
     pub packed_rows: usize,
+    /// Logical groups whose hyperlink rules ran after source capture.
+    pub hyperlink_scans: usize,
     /// Every row was copied (first capture, or an invalidation).
     pub full: bool,
 }
@@ -74,14 +79,45 @@ pub struct CaptureRequest<'a> {
     pub rules_generation: usize,
 }
 
-/// A complete native logical line had no rule matches. Exact row sequences
-/// include continuations outside the viewport; certificates belong to one
-/// mirror/rule epoch and are pruned after each capture.
+/// The source facts that determine one mirror's logical-line result. Terminal
+/// scan bits are observations, never a substitute for this mirror's rule epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceRow {
+    seqno: SequenceNo,
+    len: usize,
+    wrapped: bool,
+    native: bool,
+    scanned: bool,
+    compress: bool,
+}
+
+impl SourceRow {
+    fn from_row(row: &RenderRowRef<'_>) -> Self {
+        Self {
+            seqno: row.seqno(),
+            len: row.len(),
+            wrapped: row.last_cell_was_wrapped(),
+            native: matches!(row, RenderRowRef::Page { .. }),
+            scanned: row.implicit_hyperlinks_are_scanned(),
+            compress: matches!(row, RenderRowRef::Page { compress: true, .. }),
+        }
+    }
+}
+
+/// A resolved group belongs to one mirror/rule epoch. Exact source facts cover
+/// continuations outside the viewport and are pruned after every capture.
 #[derive(Debug, Clone, Default)]
-struct NativeNoMatch {
+struct LogicalScan {
     end: StableRowIndex,
-    seqnos: Vec<SequenceNo>,
+    source: Vec<SourceRow>,
     generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingGroup {
+    stable: Range<StableRowIndex>,
+    snapshots: Range<usize>,
+    planted_skip: Option<StableRowIndex>,
 }
 
 /// The mirror of a pane's viewport, refreshed by [`capture_terminal_rows`].
@@ -90,13 +126,15 @@ pub struct RenderMirror {
     rows: Vec<MirrorRow>,
     /// Scratch damage flags retained across captures; never part of row data.
     dirty: Vec<bool>,
-    /// Native snapshots and their pending row indexes. Packed scratch is
-    /// reused by viewport position; only pending rows are decoded after lock.
-    packed: Vec<PackedMirrorRow>,
-    pending: Vec<usize>,
-    native_no_matches: HashMap<StableRowIndex, NativeNoMatch>,
-    scan_text: String,
-    scan_seqnos: Vec<SequenceNo>,
+    /// Owned source snapshots reused across captures. Logical context can
+    /// extend outside the viewport, but never retains unrelated scrollback.
+    snapshots: Vec<RenderRowSnapshot>,
+    snapshot_count: usize,
+    pending: Vec<PendingGroup>,
+    logical_scans: HashMap<StableRowIndex, LogicalScan>,
+    scan_source: Vec<SourceRow>,
+    resolved_rows: Vec<MirrorRow>,
+    hyperlink_scanner: MirrorHyperlinkScanner,
     first: StableRowIndex,
     dimensions: Option<RenderableDimensions>,
     cursor: StableCursorPosition,
@@ -181,102 +219,89 @@ impl RenderMirror {
     /// Forgets every row, so the next capture copies all of them.
     pub fn invalidate(&mut self) {
         self.rows.clear();
-        for row in self.pending.drain(..) {
-            self.packed[row].clear();
+        for row in &mut self.snapshots {
+            row.clear();
         }
-        self.native_no_matches.clear();
+        self.snapshot_count = 0;
+        self.pending.clear();
+        self.logical_scans.clear();
         self.witness = None;
     }
 
     /// Finishes native capture once its caller has released the terminal
     /// lock. Only owned raw cells and referenced side entries are read here.
-    pub(crate) fn resolve_pending(&mut self) {
-        for row in self.pending.drain(..) {
-            self.rows[row].update_from_packed(
-                self.first + row as StableRowIndex,
-                &self.packed[row],
-                self.generation,
-            );
-            self.packed[row].clear();
-        }
-    }
-
-    /// Proves that scanning an entirely native, unlinked logical line would
-    /// change no cells. Cached proofs read only row metadata on idle captures.
-    /// Anything uncertain uses the existing mutable-Line scanner instead.
-    fn native_no_match(
-        &mut self,
-        screen: &frankenterm_term::screen::Screen,
-        logical: &Range<StableRowIndex>,
-        rules: &[Rule],
-        generation: u64,
-    ) -> bool {
-        let phys = screen.stable_range(logical);
-        if phys.is_empty()
-            || screen.phys_to_stable_row_index(phys.start) != logical.start
-            || screen.phys_to_stable_row_index(phys.end) != logical.end
-        {
-            return false;
-        }
-        if phys.start > 0 {
-            if screen
-                .render_row(phys.start - 1)
-                .is_none_or(|row| row.last_cell_was_wrapped())
-            {
-                return false;
+    pub(crate) fn resolve_pending(&mut self, rules: &[Rule]) {
+        for group in self.pending.drain(..) {
+            let snapshots = &mut self.snapshots[group.snapshots.clone()];
+            if self.resolved_rows.len() < snapshots.len() {
+                self.resolved_rows
+                    .resize_with(snapshots.len(), || MirrorRow::empty(0, 0));
             }
-        }
-        if screen
-            .render_row(phys.end - 1)
-            .is_none_or(|row| row.last_cell_was_wrapped())
-        {
-            // The 1,024-cell cap can split a logical line; the mutable
-            // scanner walks backward again, possibly changing that grouping.
-            // Only complete natural lines are safe to certify here.
-            return false;
-        }
-        self.scan_seqnos.clear();
-        for physical in phys.clone() {
-            let Some(row) = screen.render_row(physical) else {
-                return false;
-            };
-            if physical + 1 < phys.end && !row.last_cell_was_wrapped() {
-                return false;
-            }
-            match row {
-                RenderRowRef::Page { seqno, .. } if seqno != SEQ_ZERO => {
-                    self.scan_seqnos.push(seqno);
+            let resolved = &mut self.resolved_rows[..snapshots.len()];
+            let native = snapshots.iter().all(RenderRowSnapshot::is_packed);
+            if rules.is_empty() || native {
+                for (offset, (source, row)) in snapshots.iter().zip(resolved.iter_mut()).enumerate()
+                {
+                    source.resolve(
+                        row,
+                        group.stable.start + offset as StableRowIndex,
+                        self.generation,
+                    );
                 }
-                _ => return false,
             }
-        }
-        if let Some(known) = self.native_no_matches.get_mut(&logical.start) {
-            if known.end == logical.end && known.seqnos == self.scan_seqnos {
-                known.generation = generation;
-                return true;
-            }
-        }
 
-        self.scan_text.clear();
-        let mut previous = None;
-        for physical in phys {
-            let Some(row) = screen.render_row(physical) else {
-                return false;
-            };
-            if !row.append_unlinked_native_scan_text(&mut self.scan_text, &mut previous) {
-                return false;
+            if rules.is_empty() {
+                for row in resolved.iter_mut() {
+                    row.clear_implicit_hyperlinks();
+                }
+            } else {
+                self.last.hyperlink_scans += 1;
+                if !native || !self.hyperlink_scanner.apply(resolved, rules) {
+                    // Storage-sensitive Unicode concatenation, unusual widths
+                    // and authoritative legacy edits use the existing scanner
+                    // on owned Lines. None of these edits reaches the terminal.
+                    let mut lines: Vec<_> = snapshots
+                        .iter_mut()
+                        .map(RenderRowSnapshot::take_line)
+                        .collect();
+                    for line in &mut lines {
+                        line.invalidate_implicit_hyperlinks(line.current_seqno());
+                    }
+                    Line::apply_hyperlink_rules(rules, &mut lines.iter_mut().collect::<Vec<_>>());
+                    for (offset, (line, row)) in lines.iter().zip(resolved.iter_mut()).enumerate() {
+                        row.update_from_line(
+                            group.stable.start + offset as StableRowIndex,
+                            line,
+                            self.generation,
+                        );
+                    }
+                }
+            }
+
+            for (offset, row) in resolved.iter_mut().enumerate() {
+                let stable = group.stable.start + offset as StableRowIndex;
+                if let Ok(index) = usize::try_from(stable - self.first) {
+                    if let Some(slot) = self.rows.get_mut(index) {
+                        if group.planted_skip != Some(stable) {
+                            std::mem::swap(slot, row);
+                        } else if slot.stable() != stable {
+                            slot.clear(stable, 0);
+                        }
+                    }
+                }
+                // Do not retain image or hyperlink owners from offscreen
+                // context or the viewport row displaced by the swap.
+                row.clear(0, 0);
+            }
+            for source in snapshots {
+                source.clear();
             }
         }
-        // This is a conservative proof: even an empty or non-cell-aligned
-        // RuleMatch falls back to the production scanner's exact semantics.
-        if !Rule::match_hyperlinks(&self.scan_text, rules).is_empty() {
-            return false;
-        }
-        let known = self.native_no_matches.entry(logical.start).or_default();
-        known.end = logical.end;
-        known.generation = generation;
-        std::mem::swap(&mut known.seqnos, &mut self.scan_seqnos);
-        true
+        // Keep empty buffers across idle frames and one-row updates. Context
+        // extends by at most one capped group on either side of the viewport.
+        self.snapshots
+            .truncate(self.rows.len().saturating_add(2 * MAX_LOGICAL_LINE_LEN));
+        self.snapshot_count = 0;
     }
 
     /// The mirror's row at `stable`, if it holds one.
@@ -300,7 +325,6 @@ impl RenderMirror {
             }
         }
         self.rows.resize_with(rows, || MirrorRow::empty(0, 0));
-        self.packed.truncate(rows);
         self.first = first;
         self.dirty.resize(rows, false);
     }
@@ -321,8 +345,8 @@ pub fn capture_terminal_rows(
 /// The lock-held phase used by `LocalPane`: native rows are copied as packed
 /// cells, with only referenced style/grapheme/link/image entries. The caller
 /// must release its terminal lock and call `RenderMirror::resolve_pending`
-/// before exposing the mirror to rendering. Legacy edited rows still copy
-/// through their authoritative Line, including implicit hyperlink mutations.
+/// with the same rules before exposing the mirror to rendering. Legacy edited
+/// rows copy their authoritative Line; all hyperlink mutations are render-side.
 pub(crate) fn capture_terminal_rows_deferred(
     term: &mut Terminal,
     mirror: &mut RenderMirror,
@@ -339,9 +363,9 @@ fn capture_rows(
     request: &CaptureRequest<'_>,
     planted_skip: Option<StableRowIndex>,
 ) -> Option<CaptureStats> {
-    let stats = capture_rows_deferred(term, mirror, request, planted_skip)?;
-    mirror.resolve_pending();
-    Some(stats)
+    capture_rows_deferred(term, mirror, request, planted_skip)?;
+    mirror.resolve_pending(request.rules);
+    Some(mirror.last)
 }
 
 fn capture_rows_deferred(
@@ -413,93 +437,74 @@ fn capture_rows_deferred(
     }
 
     let generation = mirror.generation.wrapping_add(1);
-    if full {
-        mirror.native_no_matches.clear();
-    }
-
-    // Implicit hyperlinks: rescanning a logical line that holds a link
-    // rewrites every row of it (with the line's highest seqno), so rescan
-    // each logical line touching the viewport that holds a row being copied
-    // or a row never scanned, inside the viewport or beyond it (new output
-    // wrapped below a scrolled-back viewport), and copy all of its visible
-    // rows.
-    if !request.rules.is_empty() {
-        for range in logical_lines_to_rescan(term.screen(), first..end, &mirror.dirty) {
-            if mirror.native_no_match(term.screen(), &range, request.rules, generation) {
-                continue;
-            }
-            let mut widened: Vec<Range<StableRowIndex>> = Vec::new();
-            term.screen_mut()
-                .for_each_logical_line_in_stable_range_mut(range, |logical, lines| {
-                    Line::apply_hyperlink_rules(request.rules, lines);
-                    widened.push(logical);
-                    true
-                });
-            for logical in widened {
-                for stable in logical.start.max(first)..logical.end.min(end) {
-                    mirror.dirty[(stable - first) as usize] = true;
-                }
-            }
-        }
-    }
-    mirror
-        .native_no_matches
-        .retain(|_, known| known.generation == generation);
-
-    // Refresh only dirty rows in their existing buffers. Clean rows stay at
-    // their aligned position, with no placeholder or replacement row table.
     let mut stats = CaptureStats {
         rows_examined: rows,
         full,
         ..CaptureStats::default()
     };
-    {
+    if request.rules.is_empty() {
+        mirror.logical_scans.clear();
         let screen = term.screen();
         let phys = screen.stable_range(&(first..end));
         for physical in phys {
-            if let Some(line) = screen.render_row(physical) {
-                let stable = screen.phys_to_stable_row_index(physical);
-                let Some(row) = usize::try_from(stable - first).ok() else {
-                    continue;
-                };
-                let Some(slot) = mirror.rows.get_mut(row) else {
-                    continue;
-                };
-                if !mirror.dirty[row] {
-                    continue;
+            let stable = screen.phys_to_stable_row_index(physical);
+            let Ok(index) = usize::try_from(stable - first) else {
+                continue;
+            };
+            if mirror.dirty.get(index) != Some(&true) {
+                continue;
+            }
+            capture_group(screen, stable..stable + 1, mirror, &mut stats, planted_skip);
+        }
+    } else {
+        if full {
+            mirror.logical_scans.clear();
+        }
+        let screen = term.screen();
+        // One whole-viewport traversal matches Screen's bounded grouping.
+        // Rewalking backwards separately for each cap-split group can produce
+        // different overlaps, so each group is captured and resolved once.
+        for logical in logical_line_groups(screen, first..end) {
+            let visible = logical.start.max(first)..logical.end.min(end);
+            if visible.is_empty() {
+                continue;
+            }
+            mirror.scan_source.clear();
+            for physical in screen.stable_range(&logical) {
+                if let Some(row) = screen.render_row(physical) {
+                    mirror.scan_source.push(SourceRow::from_row(&row));
                 }
-                mirror.dirty[row] = false;
-                if planted_skip == Some(stable) {
-                    // The planted fault: keep the stale copy, as a capture
-                    // that missed this dirty row would.
-                    if slot.stable() != stable {
-                        slot.clear(stable, 0);
-                    }
-                    continue;
+            }
+            let unchanged = mirror
+                .logical_scans
+                .get(&logical.start)
+                .is_some_and(|known| {
+                    known.end == logical.end
+                        && known.source == mirror.scan_source
+                        && known.source.iter().all(|row| row.seqno != SEQ_ZERO)
+                });
+            let needs_copy = visible.clone().any(|stable| {
+                mirror
+                    .row_index(stable)
+                    .is_none_or(|index| mirror.rows[index].always_recapture())
+            });
+            if !unchanged || needs_copy {
+                capture_group(screen, logical.clone(), mirror, &mut stats, planted_skip);
+            } else {
+                for stable in visible {
+                    mirror.dirty[(stable - first) as usize] = false;
                 }
-                let cells = match line {
-                    RenderRowRef::Line(line) => {
-                        slot.update_from_line(stable, line, generation);
-                        slot.cells().len()
-                    }
-                    RenderRowRef::Page {
-                        page,
-                        row: native,
-                        seqno,
-                    } => {
-                        if mirror.packed.len() <= row {
-                            mirror.packed.resize_with(row + 1, PackedMirrorRow::default);
-                        }
-                        let cells = mirror.packed[row].capture(page, native, seqno);
-                        mirror.pending.push(row);
-                        stats.packed_rows += 1;
-                        cells
-                    }
-                };
-                stats.rows_captured += 1;
-                stats.cells_captured += cells;
+            }
+            let known = mirror.logical_scans.entry(logical.start).or_default();
+            known.end = logical.end;
+            known.generation = generation;
+            if !unchanged {
+                std::mem::swap(&mut known.source, &mut mirror.scan_source);
             }
         }
+        mirror
+            .logical_scans
+            .retain(|_, known| known.generation == generation);
     }
     // Rows the screen does not have (none for a resident viewport) stay
     // blank rather than leaving the mirror short.
@@ -519,17 +524,49 @@ fn capture_rows_deferred(
     Some(stats)
 }
 
+/// Copies only source-owned bytes and handles. Unicode segmentation, regex
+/// matching, legacy normalization and semantic conversion happen in resolution.
+fn capture_group(
+    screen: &frankenterm_term::screen::Screen,
+    stable: Range<StableRowIndex>,
+    mirror: &mut RenderMirror,
+    stats: &mut CaptureStats,
+    planted_skip: Option<StableRowIndex>,
+) {
+    let start = mirror.snapshot_count;
+    for physical in screen.stable_range(&stable) {
+        let Some(source) = screen.render_row(physical) else {
+            continue;
+        };
+        let index = mirror.snapshot_count;
+        if index == mirror.snapshots.len() {
+            mirror.snapshots.push(RenderRowSnapshot::default());
+        }
+        let cells = mirror.snapshots[index].capture(source);
+        mirror.snapshot_count += 1;
+        let row = screen.phys_to_stable_row_index(physical);
+        if let Ok(index_in_viewport) = usize::try_from(row - mirror.first) {
+            if let Some(dirty) = mirror.dirty.get_mut(index_in_viewport) {
+                *dirty = false;
+                if planted_skip != Some(row) {
+                    stats.rows_captured += 1;
+                    stats.cells_captured += cells;
+                    stats.packed_rows += usize::from(mirror.snapshots[index].is_packed());
+                }
+            }
+        }
+    }
+    mirror.pending.push(PendingGroup {
+        stable,
+        snapshots: start..mirror.snapshot_count,
+        planted_skip,
+    });
+}
+
 /// Rows grouped into one logical line at most, in cells: the cap
 /// `Screen::for_each_logical_line_in_stable_range_mut` applies, mirrored so
 /// both find the same logical lines.
 const MAX_LOGICAL_LINE_LEN: usize = 1024;
-
-/// What deciding a rescan needs from one row.
-struct RowFacts {
-    wrapped: bool,
-    len: usize,
-    scanned: bool,
-}
 
 /// Rows of a screen read on demand, in small chunks, without mutable
 /// access, so clean page-engine rows stay native and a capture reads beyond
@@ -537,7 +574,7 @@ struct RowFacts {
 struct RowReader<'a> {
     screen: &'a frankenterm_term::screen::Screen,
     start: usize,
-    rows: std::collections::VecDeque<RowFacts>,
+    rows: std::collections::VecDeque<SourceRow>,
     /// The screen has no rows past the last one read.
     at_end: bool,
 }
@@ -559,21 +596,17 @@ impl<'a> RowReader<'a> {
         reader
     }
 
-    fn read(&self, phys: Range<usize>) -> Vec<RowFacts> {
+    fn read(&self, phys: Range<usize>) -> Vec<SourceRow> {
         let mut rows = Vec::with_capacity(phys.len());
         for physical in phys {
             if let Some(line) = self.screen.render_row(physical) {
-                rows.push(RowFacts {
-                    wrapped: line.last_cell_was_wrapped(),
-                    len: line.len(),
-                    scanned: line.implicit_hyperlinks_are_scanned(),
-                });
+                rows.push(SourceRow::from_row(&line));
             }
         }
         rows
     }
 
-    fn get(&mut self, phys: usize) -> Option<&RowFacts> {
+    fn get(&mut self, phys: usize) -> Option<&SourceRow> {
         while phys < self.start {
             let from = self.start.saturating_sub(Self::CHUNK);
             let rows = self.read(from..self.start);
@@ -601,14 +634,11 @@ impl<'a> RowReader<'a> {
     }
 }
 
-/// The stable ranges of the logical lines touching `viewport` that need an
-/// implicit-hyperlink rescan: those holding a row marked in `dirty` (indexed
-/// from `viewport.start`) or a row never scanned, found the way
-/// `Screen::for_each_logical_line_in_stable_range_mut` groups rows.
-fn logical_lines_to_rescan(
+/// The exact bounded groups Screen's whole-viewport logical iterator visits.
+/// Metadata-only traversal keeps native rows packed even when rules match.
+fn logical_line_groups(
     screen: &frankenterm_term::screen::Screen,
     viewport: Range<StableRowIndex>,
-    dirty: &[bool],
 ) -> Vec<Range<StableRowIndex>> {
     let phys = screen.stable_range(&viewport);
     if phys.is_empty() {
@@ -638,7 +668,6 @@ fn logical_lines_to_rescan(
         }
         let mut total = 0usize;
         let mut end_inclusive = row;
-        let mut unscanned = false;
         let mut index = row;
         while let Some(line) = reader.get(index) {
             if total > 0 && logical_len_exceeds(total, line.len) {
@@ -646,7 +675,6 @@ fn logical_lines_to_rescan(
             }
             end_inclusive = index;
             total = total.saturating_add(line.len);
-            unscanned |= !line.scanned;
             if !line.wrapped {
                 break;
             }
@@ -654,11 +682,7 @@ fn logical_lines_to_rescan(
         }
         let logical = screen.phys_to_stable_row_index(row)
             ..screen.phys_to_stable_row_index(end_inclusive + 1);
-        let copied = (logical.start.max(viewport.start)..logical.end.min(viewport.end))
-            .any(|stable| dirty.get((stable - viewport.start) as usize) == Some(&true));
-        if unscanned || copied {
-            rescan.push(logical);
-        }
+        rescan.push(logical);
         row = end_inclusive + 1;
     }
     rescan
@@ -681,7 +705,7 @@ pub fn capture_pane_rows(
     mirror: &mut RenderMirror,
     request: &CaptureRequest<'_>,
 ) -> CaptureStats {
-    mirror.native_no_matches.clear();
+    mirror.logical_scans.clear();
     let dimensions = pane.get_dimensions();
     let seqno = pane.get_current_seqno();
     let alt_screen = pane.render_facts().alt_screen_active;
@@ -733,9 +757,7 @@ pub fn capture_pane_rows(
         }
         let run = first + run_start as StableRowIndex..first + row as StableRowIndex;
         let (lines_first, mut lines) = pane.get_lines(run);
-        if !request.rules.is_empty() {
-            apply_rules_by_logical_line(request.rules, &mut lines);
-        }
+        stats.hyperlink_scans += apply_rules_by_logical_line(request.rules, &mut lines);
         for (offset, line) in lines.iter().enumerate() {
             let stable = lines_first + offset as StableRowIndex;
             let Some(index) = usize::try_from(stable - first).ok() else {
@@ -767,8 +789,17 @@ pub fn capture_pane_rows(
 }
 
 /// Applies `rules` to copied rows, one logical (wrapped) line at a time.
-fn apply_rules_by_logical_line(rules: &[Rule], lines: &mut [Line]) {
+fn apply_rules_by_logical_line(rules: &[Rule], lines: &mut [Line]) -> usize {
+    // The source may have been scanned by another view with another rule set.
+    // Removing rules must also remove old implicit links from these copies.
+    for line in lines.iter_mut() {
+        line.invalidate_implicit_hyperlinks(line.current_seqno());
+    }
+    if rules.is_empty() {
+        return 0;
+    }
     let mut start = 0;
+    let mut scanned = 0;
     while start < lines.len() {
         let mut end = start;
         while end + 1 < lines.len() && lines[end].last_cell_was_wrapped() {
@@ -776,8 +807,10 @@ fn apply_rules_by_logical_line(rules: &[Rule], lines: &mut [Line]) {
         }
         let mut logical: Vec<&mut Line> = lines[start..=end].iter_mut().collect();
         Line::apply_hyperlink_rules(rules, &mut logical);
+        scanned += 1;
         start = end + 1;
     }
+    scanned
 }
 
 #[cfg(test)]
@@ -846,7 +879,9 @@ mod tests {
         capture_terminal_rows(term, mirror, &LIVE).expect("resident viewport")
     }
 
-    /// The Line-based reference: every viewport row copied afresh.
+    /// Independent oracle: Screen's real immutable logical iterator assembles
+    /// owned Lines, and the existing Line scanner resolves each group. It does
+    /// not use the mirror's grouping, snapshots or semantic rule matcher.
     fn fresh(term: &mut Terminal, request: &CaptureRequest<'_>) -> RenderMirror {
         let dimensions = terminal_get_dimensions(term);
         let first = request
@@ -855,29 +890,24 @@ mod tests {
             .max(dimensions.scrollback_top)
             .min(dimensions.physical_top);
         let end = first + dimensions.viewport_rows as StableRowIndex;
-        if !request.rules.is_empty() {
-            term.screen_mut()
-                .for_each_logical_line_in_stable_range_mut(first..end, |_, lines| {
-                    Line::apply_hyperlink_rules(request.rules, lines);
-                    true
-                });
-        }
         let mut mirror = RenderMirror::new();
         mirror.first = first;
         mirror.dimensions = Some(dimensions);
         mirror.cursor = terminal_get_cursor_position(term);
         let screen = term.screen();
-        let phys = screen.stable_range(&(first..end));
-        screen.with_phys_lines(phys.clone(), |lines| {
-            mirror
-                .rows
-                .extend(lines.iter().enumerate().map(|(index, line)| {
-                    MirrorRow::from_line(
-                        screen.phys_to_stable_row_index(phys.start + index),
-                        line,
-                        0,
-                    )
-                }));
+        screen.for_each_logical_line_in_stable_range(first..end, |logical, source| {
+            let mut lines: Vec<_> = source.iter().map(|line| (**line).clone()).collect();
+            for line in &mut lines {
+                line.invalidate_implicit_hyperlinks(line.current_seqno());
+            }
+            Line::apply_hyperlink_rules(request.rules, &mut lines.iter_mut().collect::<Vec<_>>());
+            for (offset, line) in lines.iter().enumerate() {
+                let stable = logical.start + offset as StableRowIndex;
+                if (first..end).contains(&stable) {
+                    mirror.rows.push(MirrorRow::from_line(stable, line, 0));
+                }
+            }
+            true
         });
         mirror
     }
@@ -885,6 +915,7 @@ mod tests {
     type RowContent<'a> = (
         StableRowIndex,
         SequenceNo,
+        MirrorLineMode,
         &'a [MirrorCell],
         &'a str,
         &'a [Arc<Hyperlink>],
@@ -897,6 +928,7 @@ mod tests {
         (
             row.stable(),
             row.seqno(),
+            row.line_mode(),
             row.cells(),
             row.all_text(),
             row.hyperlinks(),
@@ -1226,7 +1258,7 @@ mod tests {
         // The parser is free to replace page side tables before rendering
         // finishes: the first phase must own all its referenced payloads.
         term.advance_bytes("\x1bc\x1b[38;2;200;100;0mreplacement");
-        mirror.resolve_pending();
+        mirror.resolve_pending(LIVE.rules);
         assert!(mirror.pending.is_empty());
         assert_eq!(difference(&mirror, &reference), None);
         assert_eq!(mirror.rows()[0].text(&mirror.rows()[0].cells()[0]), "界");
@@ -1236,6 +1268,153 @@ mod tests {
         );
         capture(&mut term, &mut mirror);
         assert_eq!(difference(&mirror, &fresh(&mut term, &LIVE)), None);
+    }
+
+    #[test]
+    fn implicit_rules_run_only_after_owned_capture_and_survive_source_replacement() {
+        let rules = [Rule::new(r"https?://\S+", "$0").unwrap()];
+        let request = CaptureRequest {
+            rules: &rules,
+            ..LIVE
+        };
+        let mut term = terminal_with_engine(3, 10, GridEngine::Page);
+        term.advance_bytes("https://example.test/path");
+        let expected = fresh(&mut term, &request);
+        let mut mirror = RenderMirror::new();
+        let stats = capture_terminal_rows_deferred(&mut term, &mut mirror, &request).unwrap();
+        assert_eq!((stats.rows_captured, stats.packed_rows), (3, 3));
+        assert_eq!(stats.hyperlink_scans, 0, "capture cannot execute rules");
+        assert!(mirror.rows().iter().all(|row| row.cells().is_empty()));
+        assert!((0..3).all(|row| matches!(
+            term.screen().render_row(row),
+            Some(RenderRowRef::Page { .. })
+        )));
+
+        term.advance_bytes("\x1bcreplaced");
+        mirror.resolve_pending(request.rules);
+        assert_eq!(mirror.last_capture().hyperlink_scans, 1);
+        assert_eq!(difference(&mirror, &expected), None);
+        assert_eq!(
+            mirror.rows()[0].hyperlinks()[0].uri(),
+            "https://example.test/path"
+        );
+    }
+
+    #[test]
+    fn each_mirror_resolves_its_rules_and_disabling_removes_previously_scanned_links() {
+        let first_rules = [Rule::new(r"issue-\d+", "https://first.test/$0").unwrap()];
+        let second_rules = [Rule::new(r"issue-\d+", "https://second.test/$0").unwrap()];
+        for engine in [GridEngine::Legacy, GridEngine::Page] {
+            let mut term = terminal_with_engine(1, 64, engine);
+            term.advance_bytes("issue-17 \x1b]8;;https://explicit.test\x1b\\OSC8\x1b]8;;\x1b\\");
+            term.screen_mut()
+                .for_each_logical_line_in_stable_range_mut(0..1, |_, lines| {
+                    Line::apply_hyperlink_rules(&first_rules, lines);
+                    true
+                });
+            let source = term.screen().phys_line(0).clone();
+            assert!(source.implicit_hyperlinks_are_scanned());
+            let sequence = term.current_seqno();
+            let first_request = CaptureRequest {
+                rules: &first_rules,
+                ..LIVE
+            };
+            let second_request = CaptureRequest {
+                rules: &second_rules,
+                ..LIVE
+            };
+            let mut first = RenderMirror::new();
+            let mut second = RenderMirror::new();
+            capture_terminal_rows(&mut term, &mut first, &first_request).unwrap();
+            capture_terminal_rows(&mut term, &mut second, &second_request).unwrap();
+            assert_eq!(
+                first.rows()[0].hyperlinks()[0].uri(),
+                "https://first.test/issue-17"
+            );
+            assert_eq!(
+                second.rows()[0].hyperlinks()[0].uri(),
+                "https://second.test/issue-17"
+            );
+            assert_eq!(
+                term.screen().phys_line(0),
+                &source,
+                "rendering cannot change shared rule state"
+            );
+
+            let disabled = CaptureRequest {
+                rules_generation: 1,
+                ..LIVE
+            };
+            capture_terminal_rows(&mut term, &mut first, &disabled).unwrap();
+            assert_eq!(first.rows()[0].hyperlinks().len(), 1);
+            assert_eq!(
+                first.rows()[0].hyperlinks()[0].uri(),
+                "https://explicit.test"
+            );
+            assert!(first.rows()[0]
+                .hyperlink(&first.rows()[0].cells()[0])
+                .is_none());
+            assert_eq!(difference(&first, &fresh(&mut term, &disabled)), None);
+            let idle = capture_terminal_rows(&mut term, &mut second, &second_request).unwrap();
+            assert_eq!((idle.rows_captured, idle.hyperlink_scans), (0, 0));
+
+            let enabled_again = CaptureRequest {
+                rules_generation: 2,
+                ..second_request
+            };
+            capture_terminal_rows(&mut term, &mut first, &enabled_again).unwrap();
+            assert_eq!(difference(&first, &second), None);
+            assert_eq!(term.current_seqno(), sequence);
+            assert_eq!(term.screen().phys_line(0), &source);
+
+            // Remote/cold pane copies also discard a source's stale rule epoch.
+            let mut copies = vec![source.clone()];
+            apply_rules_by_logical_line(&second_rules, &mut copies);
+            assert_eq!(
+                MirrorRow::from_line(0, &copies[0], 0).hyperlinks()[0].uri(),
+                "https://second.test/issue-17"
+            );
+            apply_rules_by_logical_line(&[], &mut copies);
+            assert!(copies[0].visible_cells().all(|cell| cell
+                .attrs()
+                .hyperlink()
+                .is_none_or(|link| !link.is_implicit())));
+        }
+    }
+
+    #[test]
+    fn owned_group_boundaries_match_the_screen_iterator_across_cap_and_viewport_shifts() {
+        let rules = [Rule::new(r"issue-\d+", "https://tracker.test/$0").unwrap()];
+        for cols in [400, 600, 1200] {
+            let mut term = terminal_with_engine(4, cols, GridEngine::Page);
+            term.advance_bytes(format!(
+                "{}issue-17{}",
+                "x".repeat(cols - 3),
+                "x".repeat(cols * 6)
+            ));
+            let dimensions = terminal_get_dimensions(&mut term);
+            let mut mirror = RenderMirror::new();
+            for first in 0..=dimensions.physical_top {
+                let viewport = first..first + 4;
+                let mut expected = Vec::new();
+                term.screen().for_each_logical_line_in_stable_range(
+                    viewport.clone(),
+                    |range, _| {
+                        expected.push(range);
+                        true
+                    },
+                );
+                assert_eq!(logical_line_groups(term.screen(), viewport), expected);
+                let request = CaptureRequest {
+                    viewport_top: Some(first),
+                    rules: &rules,
+                    ..LIVE
+                };
+                capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
+                assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+                assert!(mirror.snapshots.len() <= 4 + 2 * MAX_LOGICAL_LINE_LEN);
+            }
+        }
     }
 
     #[test]
@@ -1281,8 +1460,8 @@ mod tests {
         };
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert_eq!(
-            stats.packed_rows, 2,
-            "only matching logical lines need authoritative Line views"
+            stats.packed_rows, 4,
+            "matching hyperlinks must not materialize authoritative Line views"
         );
         assert!(!mirror.rows()[0].hyperlinks().is_empty());
         assert!(!mirror.rows()[1].hyperlinks().is_empty());
@@ -1298,20 +1477,24 @@ mod tests {
         assert!(mirror.rows()[1].hyperlinks().is_empty());
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
 
-        // Disabling scanning cannot resurrect a stale packed page behind an
-        // edited Line. Both row sources can coexist in the same capture.
+        // An unrelated authoritative edit still wins over the stale page.
+        // Disabling scanning must handle both source forms in one capture.
+        let seqno = term.current_seqno();
+        term.screen_mut()
+            .line_mut(2)
+            .set_cell(0, Cell::new('!', CellAttributes::blank()), seqno);
         term.advance_bytes("\x1b[4;1Hnative");
         let request = CaptureRequest {
             rules_generation: 2,
             ..LIVE
         };
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
-        assert_eq!(stats.packed_rows, 1);
+        assert_eq!(stats.packed_rows, 3);
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
     }
 
     #[test]
-    fn default_rules_keep_native_no_match_rows_packed_and_mirrors_independent() {
+    fn default_rules_keep_native_rows_packed_and_skip_idle_resolution() {
         let rules = config::default_hyperlink_rules();
         assert_eq!(rules.len(), 6);
         let request = CaptureRequest {
@@ -1319,25 +1502,27 @@ mod tests {
             ..LIVE
         };
         let mut term = terminal_with_engine(4, 64, GridEngine::Page);
-        term.advance_bytes("first ordinary log row\r\n界面 ready 🚀\r\nthird row\r\nfourth row");
+        term.advance_bytes(
+            "first ordinary log row\r\n界面 ready 🚀\r\nhttps://example.test\r\nfourth row",
+        );
         let mut first = RenderMirror::new();
         let mut second = RenderMirror::new();
         for mirror in [&mut first, &mut second] {
             let stats = capture_terminal_rows(&mut term, mirror, &request).unwrap();
             assert_eq!((stats.rows_captured, stats.packed_rows), (4, 4));
-            assert_eq!(mirror.native_no_matches.len(), 4);
+            assert_eq!(mirror.logical_scans.len(), 4);
+            assert_eq!(stats.hyperlink_scans, 4);
+            assert!(!mirror.rows()[2].hyperlinks().is_empty());
             let row_storage: Vec<_> = mirror
                 .rows()
                 .iter()
                 .map(|row| (row.cells().as_ptr(), row.all_text().as_ptr()))
                 .collect();
-            mirror.scan_text.clear();
-            mirror.scan_text.push_str("already scanned");
             let stats = capture_terminal_rows(&mut term, mirror, &request).unwrap();
             assert_eq!((stats.rows_captured, stats.packed_rows), (0, 0));
             assert_eq!(
-                mirror.scan_text, "already scanned",
-                "idle certificate hits must not rebuild text or run regexes"
+                stats.hyperlink_scans, 0,
+                "idle positive and negative results must not rebuild text or run regexes"
             );
             assert_eq!(
                 mirror
@@ -1362,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn native_no_match_certificates_are_pruned_as_output_scrolls() {
+    fn logical_scan_certificates_are_pruned_as_output_scrolls() {
         let rules = config::default_hyperlink_rules();
         let request = CaptureRequest {
             rules: &rules,
@@ -1374,18 +1559,22 @@ mod tests {
             term.advance_bytes(format!("ordinary log row {step}\r\n"));
             capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
             let end = mirror.first() + 4;
-            assert!(mirror.native_no_matches.len() <= 4);
+            assert!(mirror.logical_scans.len() <= 4);
+            assert!(
+                mirror.snapshots.len() <= 4,
+                "owned context stays viewport-bounded"
+            );
             assert!(mirror
-                .native_no_matches
+                .logical_scans
                 .iter()
                 .all(|(start, known)| *start >= mirror.first() && known.end <= end));
         }
         mirror.invalidate();
-        assert!(mirror.native_no_matches.is_empty());
+        assert!(mirror.logical_scans.is_empty());
     }
 
     #[test]
-    fn native_negative_proof_is_invalidated_when_new_rules_match_unchanged_text() {
+    fn native_rule_epoch_is_invalidated_when_new_rules_match_unchanged_text() {
         let defaults = config::default_hyperlink_rules();
         let mut term = terminal_with_engine(1, 40, GridEngine::Page);
         term.advance_bytes("issue-17");
@@ -1400,7 +1589,7 @@ mod tests {
                 .packed_rows,
             1
         );
-        assert_eq!(mirror.native_no_matches.len(), 1);
+        assert_eq!(mirror.logical_scans.len(), 1);
         let seqno = term.current_seqno();
         let changed = [Rule::new(r"issue-\d+", "https://tracker.test/$0").unwrap()];
         let request = CaptureRequest {
@@ -1410,9 +1599,9 @@ mod tests {
         };
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert!(stats.full);
-        assert_eq!(stats.packed_rows, 0);
+        assert_eq!(stats.packed_rows, 1);
         assert_eq!(term.current_seqno(), seqno, "no output forced the rescan");
-        assert!(mirror.native_no_matches.is_empty());
+        assert_eq!(mirror.logical_scans.len(), 1);
         assert_eq!(
             mirror.rows()[0].hyperlinks()[0].uri(),
             "https://tracker.test/issue-17"
@@ -1420,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn native_link_matches_fall_back_for_wrapped_urls_wide_padding_and_email() {
+    fn native_link_matches_resolve_owned_wrapped_urls_wide_padding_and_email() {
         let rules = config::default_hyperlink_rules();
         let request = CaptureRequest {
             rules: &rules,
@@ -1438,7 +1627,7 @@ mod tests {
             assert!(mirror.rows().iter().any(|row| !row.hyperlinks().is_empty()));
             assert!(matches!(
                 term.screen().render_row(0),
-                Some(RenderRowRef::Line(_))
+                Some(RenderRowRef::Page { .. })
             ));
             if text.starts_with('界') {
                 let row = &mirror.rows()[0];
@@ -1453,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn native_negative_proof_includes_a_continuation_below_the_viewport() {
+    fn logical_scan_certificate_includes_a_continuation_below_the_viewport() {
         let rules = config::default_hyperlink_rules();
         let mut term = terminal_with_engine(4, 10, GridEngine::Page);
         term.advance_bytes("a\r\nb\r\nc\r\nsee https:zzzz\r\n\r\n\r\n");
@@ -1466,22 +1655,22 @@ mod tests {
         let mut mirror = RenderMirror::new();
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert_eq!(stats.packed_rows, 4);
-        let proof = mirror.native_no_matches.get(&3).unwrap();
-        assert_eq!((proof.end, proof.seqnos.len()), (5, 2));
+        let proof = mirror.logical_scans.get(&3).unwrap();
+        assert_eq!((proof.end, proof.source.len()), (5, 2));
         assert!(mirror.rows()[3].hyperlinks().is_empty());
         let unchanged = mirror.rows()[3].seqno();
 
         term.advance_bytes("\x1b[1;1H//ab.cd");
         assert_eq!(term.screen().render_row(3).unwrap().seqno(), unchanged);
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
-        assert_eq!((stats.rows_captured, stats.packed_rows), (1, 0));
+        assert_eq!((stats.rows_captured, stats.packed_rows), (1, 1));
         assert_eq!(mirror.rows()[3].hyperlinks()[0].uri(), "https://ab.cd");
-        assert!(!mirror.native_no_matches.contains_key(&3));
+        assert!(mirror.logical_scans.contains_key(&3));
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
     }
 
     #[test]
-    fn native_no_match_proofs_refuse_cap_split_lines_and_authoritative_edits() {
+    fn owned_scans_preserve_cap_split_lines_and_authoritative_edits() {
         let rules = config::default_hyperlink_rules();
         let request = CaptureRequest {
             rules: &rules,
@@ -1492,12 +1681,9 @@ mod tests {
         let mut mirror = RenderMirror::new();
         capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         for row in 0..3 {
-            assert!(!mirror
-                .native_no_matches
-                .contains_key(&(row as StableRowIndex)));
             assert!(matches!(
                 term.screen().render_row(row),
-                Some(RenderRowRef::Line(_))
+                Some(RenderRowRef::Page { .. })
             ));
         }
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
@@ -1518,11 +1704,11 @@ mod tests {
             mirror.rows()[0].hyperlinks()[0].uri(),
             "https://explicit.test"
         );
-        assert!(mirror.native_no_matches.is_empty());
+        assert!(!mirror.logical_scans.get(&0).unwrap().source[0].native);
     }
 
     #[test]
-    fn the_line_oracle_catches_a_forged_native_no_match_certificate() {
+    fn the_line_oracle_catches_a_forged_logical_scan_certificate() {
         let rules = config::default_hyperlink_rules();
         let request = CaptureRequest {
             rules: &rules,
@@ -1539,8 +1725,8 @@ mod tests {
         oracle.advance_bytes(output);
         // Planted fault: falsely claim the old negative scan covered the
         // new contents. The independent Line scanner must expose the error.
-        mirror.native_no_matches.get_mut(&0).unwrap().seqnos[0] =
-            term.screen().render_row(0).unwrap().seqno();
+        mirror.logical_scans.get_mut(&0).unwrap().source[0] =
+            SourceRow::from_row(&term.screen().render_row(0).unwrap());
         capture_terminal_rows(&mut term, &mut mirror, &request).unwrap();
         assert!(mirror.rows()[0].hyperlinks().is_empty());
         assert!(difference(&mirror, &fresh(&mut oracle, &request)).is_some());

@@ -24,6 +24,13 @@ pub fn line_view(page: &Page, row: u32, seqno: SequenceNo) -> Line {
     let cells: Vec<Cell> = (0..header.len())
         .map(|x| page.legacy_cell(row, x))
         .collect();
+    line_from_cells(cells, header, seqno)
+}
+
+/// Rebuild a page row from either live or copied cells. Keeping the storage
+/// form and line flags here also gives the render snapshot an exact owned
+/// fallback for unusual grapheme boundaries without materializing a live view.
+pub(crate) fn line_from_cells(cells: Vec<Cell>, header: RowHeader, seqno: SequenceNo) -> Line {
     let has_link = header.has(RowHeader::HYPERLINK)
         && cells.iter().any(|cell| {
             cell.attrs()

@@ -7,16 +7,18 @@
 //! terminal pointer crosses the language boundary.
 
 use crate::config::GridEngine;
-use crate::pagegrid::{CellStyle, Glyph, PackedCell, Page, RichStyle};
+use crate::pagegrid::{CellStyle, Glyph, PackedCell, Page, RichStyle, RowHeader};
 use crate::{Line, StableRowIndex, Terminal};
 use frankenterm_bidi::Direction;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
-use termwiz::cell::{Blink, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
+use termwiz::cell::{
+    Blink, Cell, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign,
+};
 use termwiz::cellcluster::CellCluster;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
-use termwiz::hyperlink::Hyperlink;
+use termwiz::hyperlink::{Hyperlink, Rule};
 use termwiz::image::ImageCell;
 use termwiz::surface::line::CellRef;
 use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
@@ -76,6 +78,51 @@ const VALIGN_SHIFT: u32 = 12;
 const IMAGE: u32 = 1 << 14;
 const SEMANTIC_SHIFT: u32 = 15;
 
+/// DEC line sizing, independent of cell widths and terminal column count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MirrorLineMode {
+    #[default]
+    SingleWidth,
+    DoubleWidth,
+    DoubleHeightTop,
+    DoubleHeightBottom,
+}
+
+impl MirrorLineMode {
+    fn from_line(line: &Line) -> Self {
+        if line.is_double_height_top() {
+            Self::DoubleHeightTop
+        } else if line.is_double_height_bottom() {
+            Self::DoubleHeightBottom
+        } else if line.is_double_width() {
+            Self::DoubleWidth
+        } else {
+            Self::SingleWidth
+        }
+    }
+
+    fn from_header(header: RowHeader) -> Self {
+        if header.has(RowHeader::DOUBLE_HEIGHT_TOP) {
+            Self::DoubleHeightTop
+        } else if header.has(RowHeader::DOUBLE_HEIGHT_BOTTOM) {
+            Self::DoubleHeightBottom
+        } else if header.has(RowHeader::DOUBLE_WIDTH) {
+            Self::DoubleWidth
+        } else {
+            Self::SingleWidth
+        }
+    }
+
+    fn apply(self, line: &mut Line, seqno: SequenceNo) {
+        match self {
+            Self::SingleWidth => {}
+            Self::DoubleWidth => line.set_double_width(seqno),
+            Self::DoubleHeightTop => line.set_double_height_top(seqno),
+            Self::DoubleHeightBottom => line.set_double_height_bottom(seqno),
+        }
+    }
+}
+
 /// A terminal row borrowed only while its terminal lock is held. Looking up
 /// a native row or its damage facts does not construct a legacy `Line` view.
 pub enum RenderRowRef<'a> {
@@ -84,10 +131,40 @@ pub enum RenderRowRef<'a> {
         page: &'a Page,
         row: u32,
         seqno: SequenceNo,
+        /// A live legacy view would additionally compress this scrollback row.
+        compress: bool,
     },
 }
 
 impl RenderRowRef<'_> {
+    /// Line geometry without constructing a native row's legacy view.
+    pub fn line_mode(&self) -> MirrorLineMode {
+        match self {
+            Self::Line(line) => MirrorLineMode::from_line(line),
+            Self::Page { page, row, .. } => MirrorLineMode::from_header(page.header(*row)),
+        }
+    }
+
+    /// The cursor's logical width at an exact visible-cell start. A cursor
+    /// explicitly placed on a wide character's spacer covers one cell, as
+    /// does a cursor past the row's stored content.
+    pub fn cursor_cell_width(&self, col: usize) -> u8 {
+        match self {
+            Self::Line(line) => line
+                .get_cell(col)
+                .map_or(1, |cell| cell.width().clamp(1, 2) as u8),
+            Self::Page { page, row, .. } => {
+                if col < page.row_len(*row) {
+                    let cell = page.cell(*row, col);
+                    if !cell.is_hidden() && cell.is_wide() {
+                        return 2;
+                    }
+                }
+                1
+            }
+        }
+    }
+
     pub fn seqno(&self) -> SequenceNo {
         match self {
             Self::Line(line) => line.current_seqno(),
@@ -127,83 +204,6 @@ impl RenderRowRef<'_> {
             Self::Page { .. } => false,
         }
     }
-
-    /// Appends the native row's hyperlink scan text without building a Line.
-    /// Returns false when existing links or ambiguous grapheme boundaries
-    /// require the legacy scanner. `previous` carries the actual last scalar
-    /// across wrapped rows, excluding the artificial wide-cell padding.
-    /// On refusal, the caller must discard the partial text and fall back.
-    pub fn append_unlinked_native_scan_text(
-        &self,
-        text: &mut String,
-        previous: &mut Option<char>,
-    ) -> bool {
-        // A bounded cell count does not bound combining-sequence bytes.
-        // Larger inputs keep the existing scanner without growing this
-        // additional retained scratch buffer beyond a normal text window.
-        const MAX_SCAN_BYTES: usize = 64 * 1024;
-        let Self::Page { page, row, .. } = self else {
-            return false;
-        };
-        let words = page.row_words(*row);
-        if words.last().is_some_and(|word| {
-            let cell = PackedCell::from_bits(*word);
-            cell.is_wide() && !cell.is_hidden()
-        }) {
-            // Appending to a vector Line with a truncated wide spacer can
-            // hide the next row's first cell. Leave that case to the oracle.
-            return false;
-        }
-        for (col, word) in words.iter().enumerate() {
-            let cell = PackedCell::from_bits(*word);
-            if cell.has_hyperlink() {
-                // Explicit links split scan runs; implicit ones may need
-                // removal. Neither is a no-match proof for an unlinked row.
-                return false;
-            }
-            if cell.is_hidden() {
-                continue;
-            }
-            let mut utf8 = [0_u8; 4];
-            let glyph = match page.glyph(*row, col) {
-                Glyph::Blank => " ",
-                Glyph::Char(ch) => ch.encode_utf8(&mut utf8),
-                Glyph::Cluster(glyph) => glyph,
-            };
-            if text
-                .len()
-                .checked_add(glyph.len())
-                .and_then(|len| len.checked_add(usize::from(cell.is_wide())))
-                .is_none_or(|len| len > MAX_SCAN_BYTES)
-            {
-                return false;
-            }
-            if cell.has_grapheme() {
-                let mut graphemes = finl_unicode::grapheme_clusters::Graphemes::new(glyph);
-                if graphemes.next() != Some(glyph) || graphemes.next().is_some() {
-                    // Legacy Cell permits more than one grapheme in a
-                    // cell; clustered concatenation can split it again.
-                    return false;
-                }
-            }
-            let Some(first) = glyph.chars().next() else {
-                return false;
-            };
-            if !frankenterm_surface::line::clustered_append_breaks(*previous, first) {
-                // Concatenating clustered Lines can resegment a regional
-                // indicator, combining mark or ZWJ across a cell boundary.
-                return false;
-            }
-            *previous = glyph.chars().next_back();
-            text.push_str(glyph);
-            if cell.is_wide() {
-                // HyperlinkScanRun::push includes this unmatchable spacer
-                // even though visible-cell iteration skips the stored word.
-                text.push(' ');
-            }
-        }
-        true
-    }
 }
 
 /// An owned snapshot of one native page row. Copying retains raw packed
@@ -213,6 +213,8 @@ impl RenderRowRef<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct PackedMirrorRow {
     seqno: SequenceNo,
+    header: RowHeader,
+    compress: bool,
     cells: Vec<u64>,
     styles: HashMap<u32, RichStyle>,
     graphemes: Vec<(usize, std::ops::Range<usize>)>,
@@ -227,15 +229,15 @@ impl PackedMirrorRow {
     pub fn capture(&mut self, page: &Page, row: u32, seqno: SequenceNo) -> usize {
         self.clear();
         self.seqno = seqno;
+        self.header = page.header(row);
         self.cells.extend_from_slice(page.row_words(row));
         let mut visible = 0;
         let mut last_rich_id = 0;
         for (col, word) in self.cells.iter().enumerate() {
             let cell = PackedCell::from_bits(*word);
-            if cell.is_hidden() {
-                continue;
+            if !cell.is_hidden() {
+                visible += 1;
             }
-            visible += 1;
             if let CellStyle::Rich(id) = cell.style() {
                 if id != last_rich_id {
                     self.styles
@@ -272,12 +274,122 @@ impl PackedMirrorRow {
     /// their reusable allocations. A subsequent legacy-row capture must not
     /// leave an old native image or hyperlink payload retained here.
     pub fn clear(&mut self) {
+        self.header = RowHeader::default();
+        self.compress = false;
         self.cells.clear();
         self.styles.clear();
         self.graphemes.clear();
         self.text.clear();
         self.links.clear();
         self.images.clear();
+    }
+
+    /// Exact legacy representation, made solely from owned bytes after the
+    /// terminal lock is released. Hidden cells retain their own attributes;
+    /// they can become visible when a truncated wide cell is concatenated.
+    fn to_line(&self, clear_implicit: bool) -> Line {
+        let mut grapheme = 0;
+        let mut hyperlink = 0;
+        let mut image = 0;
+        let cells = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(col, word)| {
+                let cell = PackedCell::from_bits(*word);
+                let mut attrs = crate::pagegrid::cell::style_attributes_with(cell.style(), |id| {
+                    *self.styles.get(&id).expect("a copied rich style")
+                });
+                attrs
+                    .set_semantic_type(cell.semantic())
+                    .set_wrapped(cell.is_wrapped())
+                    .set_protected(cell.is_protected());
+                if let Some((_, link)) = self.links.get(hyperlink).filter(|(at, _)| *at == col) {
+                    if !clear_implicit || !link.is_implicit() {
+                        attrs.set_hyperlink(Some(Arc::clone(link)));
+                    }
+                    hyperlink += 1;
+                }
+                while let Some(attachment) = self.images.get(image).filter(|item| item.col == col) {
+                    attrs.attach_image(Box::new(attachment.image.clone()));
+                    image += 1;
+                }
+                let mut utf8 = [0_u8; 4];
+                let text = if let Some((_, range)) =
+                    self.graphemes.get(grapheme).filter(|(at, _)| *at == col)
+                {
+                    grapheme += 1;
+                    &self.text[range.clone()]
+                } else {
+                    cell.first_char().unwrap_or(' ').encode_utf8(&mut utf8)
+                };
+                Cell::new_grapheme_with_width(text, if cell.is_wide() { 2 } else { 1 }, attrs)
+            })
+            .collect();
+        let mut line = crate::pagegrid::view::line_from_cells(cells, self.header, self.seqno);
+        if self.compress {
+            line.compress_for_scrollback();
+        }
+        line
+    }
+}
+
+/// One immutable source row owned by a pending render capture. Native rows
+/// retain packed bytes; only an already-authoritative legacy row is cloned.
+#[derive(Debug, Clone, Default)]
+pub struct RenderRowSnapshot {
+    packed: PackedMirrorRow,
+    line: Option<Line>,
+}
+
+impl RenderRowSnapshot {
+    pub fn capture(&mut self, source: RenderRowRef<'_>) -> usize {
+        match source {
+            RenderRowRef::Line(line) => {
+                self.packed.clear();
+                self.line = Some(line.clone());
+                line.visible_cells().count()
+            }
+            RenderRowRef::Page {
+                page,
+                row,
+                seqno,
+                compress,
+            } => {
+                self.line = None;
+                let cells = self.packed.capture(page, row, seqno);
+                self.packed.compress = compress;
+                cells
+            }
+        }
+    }
+
+    pub fn is_packed(&self) -> bool {
+        self.line.is_none()
+    }
+
+    pub fn resolve(&self, row: &mut MirrorRow, stable: StableRowIndex, generation: u64) {
+        match &self.line {
+            Some(line) => row.update_from_line(stable, line, generation),
+            None => row.update_from_packed(stable, &self.packed, generation),
+        }
+    }
+
+    /// Consumes a captured legacy owner without cloning it a second time.
+    /// Native reconstruction borrows only this snapshot's own copied bytes.
+    /// It removes old implicit side entries before rebuilding storage: an
+    /// imported page can carry them without the legacy scan-state bits that
+    /// `Line::invalidate_implicit_hyperlinks` requires.
+    pub fn take_line(&mut self) -> Line {
+        match self.line.take() {
+            Some(line) => line,
+            None => self.packed.to_line(true),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.packed.clear();
+        self.line = None;
     }
 }
 
@@ -418,6 +530,9 @@ pub struct MirrorRow {
     stable: StableRowIndex,
     seqno: SequenceNo,
     generation: u64,
+    line_mode: MirrorLineMode,
+    physical_len: usize,
+    wrapped: bool,
     cells: Vec<MirrorCell>,
     text: String,
     links: Vec<Arc<Hyperlink>>,
@@ -431,6 +546,9 @@ impl MirrorRow {
             stable,
             seqno: SEQ_ZERO,
             generation,
+            line_mode: MirrorLineMode::SingleWidth,
+            physical_len: 0,
+            wrapped: false,
             cells: Vec::new(),
             text: String::new(),
             links: Vec::new(),
@@ -455,6 +573,9 @@ impl MirrorRow {
     pub fn update_from_line(&mut self, stable: StableRowIndex, line: &Line, generation: u64) {
         self.clear(stable, generation);
         self.seqno = line.current_seqno();
+        self.line_mode = MirrorLineMode::from_line(line);
+        self.physical_len = line.len();
+        self.wrapped = line.last_cell_was_wrapped();
         self.cells.reserve(line.len());
         self.text.reserve(line.len());
         for cell in line.visible_cells() {
@@ -498,6 +619,15 @@ impl MirrorRow {
     ) {
         self.clear(stable, generation);
         self.seqno = packed.seqno;
+        self.line_mode = MirrorLineMode::from_header(packed.header);
+        self.physical_len = packed.cells.len();
+        self.wrapped = packed
+            .cells
+            .iter()
+            .rev()
+            .map(|word| PackedCell::from_bits(*word))
+            .find(|cell| !cell.is_hidden())
+            .is_some_and(PackedCell::is_wrapped);
         self.cells.reserve(packed.cells.len());
         self.text.reserve(packed.cells.len());
         let mut grapheme = 0;
@@ -514,6 +644,19 @@ impl MirrorRow {
             let cell = PackedCell::from_bits(*word);
             if cell.is_hidden() {
                 continue;
+            }
+            while packed
+                .graphemes
+                .get(grapheme)
+                .is_some_and(|(at, _)| *at < col)
+            {
+                grapheme += 1;
+            }
+            while packed.links.get(hyperlink).is_some_and(|(at, _)| *at < col) {
+                hyperlink += 1;
+            }
+            while packed.images.get(image).is_some_and(|item| item.col < col) {
+                image += 1;
             }
             let (flags, fg, bg, underline_color) = match cell.style() {
                 CellStyle::Inline(style) => {
@@ -602,6 +745,9 @@ impl MirrorRow {
         self.stable = stable;
         self.seqno = SEQ_ZERO;
         self.generation = generation;
+        self.line_mode = MirrorLineMode::SingleWidth;
+        self.physical_len = 0;
+        self.wrapped = false;
         self.cells.clear();
         self.text.clear();
         self.links.clear();
@@ -617,6 +763,9 @@ impl MirrorRow {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    pub fn line_mode(&self) -> MirrorLineMode {
+        self.line_mode
     }
     pub fn cells(&self) -> &[MirrorCell] {
         &self.cells
@@ -648,6 +797,70 @@ impl MirrorRow {
         cell.link
             .checked_sub(1)
             .and_then(|index| self.links.get(index))
+    }
+
+    /// Removes render-generated links while preserving OSC 8 links and all
+    /// cell geometry. Rule changes belong to this mirror, never to the source
+    /// terminal's global "already scanned" bit.
+    pub fn clear_implicit_hyperlinks(&mut self) {
+        let mut kept = 0;
+        for old in 0..self.links.len() {
+            let replacement = if self.links[old].is_implicit() {
+                0
+            } else {
+                self.links.swap(old, kept);
+                kept += 1;
+                kept
+            };
+            if replacement != old + 1 {
+                for cell in &mut self.cells {
+                    if cell.link == old + 1 {
+                        cell.link = replacement;
+                    }
+                }
+            }
+        }
+        self.links.truncate(kept);
+    }
+
+    fn set_cell_hyperlink(&mut self, cell: usize, link: &Arc<Hyperlink>) {
+        // Rule matches arrive longest first. As VecStorage writeback does,
+        // preserve the first accepted match when later rules overlap it.
+        if self.cells[cell].link != 0 {
+            return;
+        }
+        let index = self
+            .links
+            .iter()
+            .position(|known| Arc::ptr_eq(known, link) || **known == **link)
+            .unwrap_or_else(|| {
+                self.links.push(Arc::clone(link));
+                self.links.len() - 1
+            });
+        self.cells[cell].link = index + 1;
+    }
+
+    fn canonicalize_hyperlinks(&mut self) {
+        let mut kept = 0;
+        for index in 0..self.cells.len() {
+            let link = self.cells[index].link;
+            if link == 0 || link <= kept {
+                continue;
+            }
+            let next = kept + 1;
+            self.links.swap(link - 1, kept);
+            if link != next {
+                for cell in &mut self.cells {
+                    if cell.link == link {
+                        cell.link = next;
+                    } else if cell.link == next {
+                        cell.link = link;
+                    }
+                }
+            }
+            kept = next;
+        }
+        self.links.truncate(kept);
     }
 
     /// Rebuild attributes used by the existing desktop shaping path. Image
@@ -712,7 +925,175 @@ impl MirrorRow {
                 self.seqno,
             );
         }
+        self.line_mode.apply(&mut line, self.seqno);
+        line.set_last_cell_was_wrapped(self.wrapped, self.seqno);
         line
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MirrorScanCell {
+    bytes: std::ops::Range<usize>,
+    row: usize,
+    cell: usize,
+}
+
+/// Reusable rule resolution over owned semantic rows. It mirrors the Line
+/// scanner's byte-to-cell alignment, wide padding and explicit-link barriers.
+/// Ambiguous concatenation uses the exact owned-Line fallback instead.
+#[derive(Debug, Clone, Default)]
+pub struct MirrorHyperlinkScanner {
+    text: String,
+    cells: Vec<MirrorScanCell>,
+}
+
+impl MirrorHyperlinkScanner {
+    /// Resolves one complete, already bounded logical group. A refusal leaves
+    /// rows untouched so the caller can run Line::apply_hyperlink_rules on
+    /// its original owned snapshots. No live terminal reference is accepted.
+    pub fn apply(&mut self, rows: &mut [MirrorRow], rules: &[Rule]) -> bool {
+        if !rules.is_empty() && !Self::can_scan(rows) {
+            return false;
+        }
+        for row in rows.iter_mut() {
+            row.clear_implicit_hyperlinks();
+        }
+        if rules.is_empty() {
+            return true;
+        }
+
+        self.text.clear();
+        self.cells.clear();
+        for row in 0..rows.len() {
+            for index in 0..rows[row].cells.len() {
+                let cell = rows[row].cells[index];
+                if rows[row].hyperlink(&cell).is_some() || cell.width == 0 {
+                    self.finish_run(rows, rules);
+                    continue;
+                }
+                let start = self.text.len();
+                self.text.push_str(rows[row].text(&cell));
+                let end = self.text.len();
+                if start != end {
+                    self.cells.push(MirrorScanCell {
+                        bytes: start..end,
+                        row,
+                        cell: index,
+                    });
+                    for _ in 1..cell.width {
+                        self.text.push(' ');
+                    }
+                }
+            }
+        }
+        self.finish_run(rows, rules);
+        for row in rows.iter_mut() {
+            row.canonicalize_hyperlinks();
+        }
+        // Line's split-back path carries the logical maximum when any link,
+        // including an explicit link, survives. Source damage is tracked
+        // independently by the capture's exact per-row sequence certificate.
+        if rows.iter().any(|row| !row.links.is_empty()) {
+            let seqno = rows.iter().map(|row| row.seqno).max().unwrap_or(SEQ_ZERO);
+            for row in rows {
+                row.seqno = seqno;
+            }
+        }
+        true
+    }
+
+    fn can_scan(rows: &[MirrorRow]) -> bool {
+        const MAX_SCAN_BYTES: usize = 64 * 1024;
+        const MAX_SCAN_CELLS: usize = 1024;
+        let mut bytes = 0usize;
+        let mut cells = 0usize;
+        let mut previous = None;
+        let mode = rows.first().map(|row| row.line_mode);
+        for row in rows {
+            // The legacy concatenation/split-back path preserves its first
+            // row's line flags. Let that path handle mixed DEC line modes.
+            if Some(row.line_mode) != mode {
+                return false;
+            }
+            let mut column = 0usize;
+            for cell in &row.cells {
+                cells += 1;
+                if cells > MAX_SCAN_CELLS {
+                    return false;
+                }
+                if cell.col != column || !(1..=2).contains(&cell.width) {
+                    return false;
+                }
+                column = column.saturating_add(cell.width);
+                let glyph = row.text(cell);
+                let Some(next_bytes) = bytes
+                    .checked_add(glyph.len())
+                    .and_then(|len| len.checked_add(cell.width - 1))
+                    .filter(|len| *len <= MAX_SCAN_BYTES)
+                else {
+                    return false;
+                };
+                bytes = next_bytes;
+                let Some(first) = glyph.chars().next() else {
+                    return false;
+                };
+                if first.len_utf8() != glyph.len() {
+                    let mut graphemes = finl_unicode::grapheme_clusters::Graphemes::new(glyph);
+                    if graphemes.next() != Some(glyph) || graphemes.next().is_some() {
+                        return false;
+                    }
+                }
+                if !frankenterm_surface::line::clustered_append_breaks(previous, first) {
+                    return false;
+                }
+                // Artificial wide padding is not part of clustered storage;
+                // carry the true scalar across cells and physical rows.
+                previous = if first.len_utf8() == glyph.len() {
+                    Some(first)
+                } else {
+                    glyph.chars().next_back()
+                };
+            }
+            if column != row.physical_len {
+                // A missing wide spacer can consume the next physical row's
+                // first cell when legacy Lines are appended.
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish_run(&mut self, rows: &mut [MirrorRow], rules: &[Rule]) {
+        if !self.text.is_empty() {
+            for matched in Rule::match_hyperlinks(&self.text, rules) {
+                let Some(first) = self
+                    .cells
+                    .iter()
+                    .position(|cell| cell.bytes.start == matched.range.start)
+                else {
+                    continue;
+                };
+                let mut end = first;
+                let mut aligned = false;
+                for cell in &self.cells[first..] {
+                    if cell.bytes.start >= matched.range.end || cell.bytes.end > matched.range.end {
+                        break;
+                    }
+                    end += 1;
+                    if cell.bytes.end == matched.range.end {
+                        aligned = true;
+                        break;
+                    }
+                }
+                if aligned {
+                    for cell in &self.cells[first..end] {
+                        rows[cell.row].set_cell_hyperlink(cell.cell, &matched.link);
+                    }
+                }
+            }
+        }
+        self.text.clear();
+        self.cells.clear();
     }
 }
 
@@ -1325,7 +1706,10 @@ mod tests {
             assert!(!source.is_empty());
             assert!(!source.last_cell_was_wrapped());
             assert!(!source.implicit_hyperlinks_are_scanned());
-            let RenderRowRef::Page { page, row, seqno } = source else {
+            let RenderRowRef::Page {
+                page, row, seqno, ..
+            } = source
+            else {
                 panic!("ordinary native output should remain packed");
             };
             let mut packed = PackedMirrorRow::default();
@@ -1370,6 +1754,41 @@ mod tests {
     }
 
     #[test]
+    fn cursor_geometry_reads_native_headers_and_exact_cell_starts_without_views() {
+        for (escape, mode) in [
+            ("\x1b#5", MirrorLineMode::SingleWidth),
+            ("\x1b#6", MirrorLineMode::DoubleWidth),
+            ("\x1b#3", MirrorLineMode::DoubleHeightTop),
+            ("\x1b#4", MirrorLineMode::DoubleHeightBottom),
+        ] {
+            let mut term = terminal_with_engine(2, 8, GridEngine::Page);
+            term.advance_bytes(format!("\x1b[2;1H{escape}你x\x1b[2;1H"));
+            let source = term.screen().render_row(1).unwrap();
+            assert!(matches!(source, RenderRowRef::Page { .. }));
+            assert_eq!(source.line_mode(), mode);
+            for (col, width) in [(0, 2), (1, 1), (2, 1), (7, 1), (usize::MAX, 1)] {
+                assert_eq!(source.cursor_cell_width(col), width, "{mode:?} at {col}");
+            }
+            assert_eq!(term.screen().cached_page_views(), 0);
+            let legacy = RenderRowRef::Line(term.screen().phys_line(1));
+            assert_eq!(legacy.line_mode(), mode);
+            for (col, width) in [(0, 2), (1, 1), (2, 1), (7, 1), (usize::MAX, 1)] {
+                assert_eq!(legacy.cursor_cell_width(col), width, "{mode:?} at {col}");
+            }
+
+            term.increment_seqno();
+            let seqno = term.current_seqno();
+            let line = term.screen_mut().line_mut(1);
+            line.set_single_width(seqno);
+            line.set_cell(0, Cell::new('n', CellAttributes::blank()), seqno);
+            let source = term.screen().render_row(1).unwrap();
+            assert!(matches!(source, RenderRowRef::Line(_)));
+            assert_eq!(source.line_mode(), MirrorLineMode::SingleWidth);
+            assert_eq!(source.cursor_cell_width(0), 1);
+        }
+    }
+
+    #[test]
     fn packed_rows_match_legacy_views_with_wide_cells_clusters_and_rich_styles() {
         use crate::pagegrid::view::{line_view, store_line};
 
@@ -1399,6 +1818,7 @@ mod tests {
                         page: &page,
                         row,
                         seqno: 77,
+                        compress: false,
                     };
                     assert_eq!(facts.len(), view.len());
                     assert_eq!(facts.last_cell_was_wrapped(), view.last_cell_was_wrapped());
@@ -1407,6 +1827,7 @@ mod tests {
                     // No page pointer, style id, or grapheme-arena borrow may
                     // outlive capture, including when storage is recycled.
                     drop(page);
+                    assert_eq!(packed.to_line(false), view, "owned legacy fallback");
                     let mut converted = MirrorRow::empty(0, 0);
                     converted.update_from_packed(19, &packed, 8);
                     assert_eq!(
@@ -1419,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn native_hyperlink_scan_text_keeps_wide_padding_and_rejects_ambiguous_cells() {
+    fn owned_hyperlink_scan_keeps_wide_padding_and_rejects_ambiguous_cells() {
         use crate::pagegrid::view::store_line;
 
         let mut page = Page::new(32, 4, 1);
@@ -1429,15 +1850,22 @@ mod tests {
             wide,
             &Line::from_text("界https://example.test", &CellAttributes::blank(), 1, None)
         ));
-        let source = |row| RenderRowRef::Page {
-            page: &page,
-            row,
-            seqno: 1,
+        let convert = |page: &Page, row| {
+            let mut packed = PackedMirrorRow::default();
+            packed.capture(page, row, 1);
+            let mut converted = MirrorRow::empty(0, 0);
+            converted.update_from_packed(0, &packed, 0);
+            converted
         };
-        let mut text = String::new();
-        let mut previous = None;
-        assert!(source(wide).append_unlinked_native_scan_text(&mut text, &mut previous));
-        assert_eq!(text, "界 https://example.test");
+        let rules = [Rule::new(r"https?://\S+", "$0").unwrap()];
+        let mut scanner = MirrorHyperlinkScanner::default();
+        let mut rows = [convert(&page, wide)];
+        assert!(scanner.apply(&mut rows, &rules));
+        assert!(rows[0].hyperlink(&rows[0].cells()[0]).is_none());
+        assert_eq!(
+            rows[0].hyperlink(&rows[0].cells()[1]).unwrap().uri(),
+            "https://example.test"
+        );
 
         // A cell may legally hold more than one grapheme. Legacy clustered
         // append can split it, so a negative scan must not guess its padding.
@@ -1450,29 +1878,19 @@ mod tests {
             1,
         );
         assert!(store_line(&mut page, multiple, &line));
-        text.clear();
-        text.push('q');
-        previous = Some('q');
-        assert!(!RenderRowRef::Page {
-            page: &page,
-            row: multiple,
-            seqno: 1,
-        }
-        .append_unlinked_native_scan_text(&mut text, &mut previous));
+        let mut rows = [convert(&page, multiple)];
+        let original = rows.clone();
+        assert!(!scanner.apply(&mut rows, &rules));
+        assert_eq!(rows, original, "a refusal leaves the owned fallback intact");
 
         let truncated = page.grow(1).unwrap();
         let line = Line::from_cells(vec![Cell::new('界', CellAttributes::blank())], 1);
         assert!(store_line(&mut page, truncated, &line));
-        assert!(!RenderRowRef::Page {
-            page: &page,
-            row: truncated,
-            seqno: 1,
-        }
-        .append_unlinked_native_scan_text(&mut String::new(), &mut None));
+        assert!(!scanner.apply(&mut [convert(&page, truncated)], &rules));
     }
 
     #[test]
-    fn native_scan_text_bounds_bytes_and_rejects_joining_unicode_boundaries() {
+    fn owned_scan_bounds_bytes_and_rejects_joining_unicode_boundaries() {
         use crate::pagegrid::view::store_line;
 
         let mut page = Page::new(16, 2, 1);
@@ -1495,19 +1913,201 @@ mod tests {
             next,
             &Line::from_text("next", &CellAttributes::blank(), 1, None),
         ));
-        let source = |row| RenderRowRef::Page {
-            page: &page,
-            row,
-            seqno: 1,
+        let source = |row| {
+            let mut packed = PackedMirrorRow::default();
+            packed.capture(&page, row, 1);
+            let mut converted = MirrorRow::empty(0, 0);
+            converted.update_from_packed(0, &packed, 0);
+            converted
         };
-        let mut text = String::new();
-        let mut previous = None;
-        assert!(source(first).append_unlinked_native_scan_text(&mut text, &mut previous));
-        assert!(!source(next).append_unlinked_native_scan_text(&mut text, &mut previous));
+        assert!(MirrorHyperlinkScanner::can_scan(&[source(first)]));
+        assert!(!MirrorHyperlinkScanner::can_scan(&[
+            source(first),
+            source(next)
+        ]));
 
-        let mut full = "x".repeat(64 * 1024);
-        assert!(!source(first).append_unlinked_native_scan_text(&mut full, &mut None));
-        assert_eq!(full.len(), 64 * 1024, "refusal cannot grow the scan buffer");
+        let huge = format!("e{}", "\u{301}".repeat(40_000));
+        let line = Line::from_cells(
+            vec![Cell::new_grapheme(&huge, CellAttributes::blank(), None)],
+            1,
+        );
+        let mut scanner = MirrorHyperlinkScanner::default();
+        let rules = [Rule::new("e", "$0").unwrap()];
+        assert!(!scanner.apply(&mut [MirrorRow::from_line(0, &line, 0)], &rules));
+        assert_eq!(
+            scanner.text.capacity(),
+            0,
+            "refusal cannot grow the scan buffer"
+        );
+    }
+
+    #[test]
+    fn owned_hyperlink_rules_match_legacy_overlap_barriers_and_byte_alignment() {
+        let rules = [
+            Rule::new("abc LINK abc", "https://crossing.test").unwrap(),
+            Rule::new("abc", "https://long.test").unwrap(),
+            Rule::new("b", "https://short.test").unwrap(),
+            Rule::new("界 ", "https://padding.test").unwrap(),
+            Rule::new("e", "https://partial-grapheme.test").unwrap(),
+            Rule::new("^", "https://empty.test").unwrap(),
+        ];
+        let mut explicit = Line::from_text("abc LINK abc", &CellAttributes::blank(), 7, None);
+        let link = Arc::new(Hyperlink::new("https://explicit.test"));
+        for (offset, ch) in "LINK".chars().enumerate() {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_hyperlink(Some(Arc::clone(&link)));
+            explicit.set_cell(4 + offset, Cell::new(ch, attrs), 7);
+        }
+        explicit.set_has_hyperlink(true);
+        for line in [
+            explicit,
+            Line::from_text("界abc", &CellAttributes::blank(), 7, None),
+            Line::from_text("e\u{301}", &CellAttributes::blank(), 7, None),
+        ] {
+            let mut expected = line.clone();
+            Line::apply_hyperlink_rules(&rules, &mut [&mut expected]);
+            let mut rows = [MirrorRow::from_line(0, &line, 1)];
+            assert!(MirrorHyperlinkScanner::default().apply(&mut rows, &rules));
+            assert_eq!(rows[0], MirrorRow::from_line(0, &expected, 1));
+            assert!(rows[0].hyperlinks().iter().all(|link| {
+                !matches!(
+                    link.uri(),
+                    "https://short.test"
+                        | "https://padding.test"
+                        | "https://partial-grapheme.test"
+                        | "https://empty.test"
+                        | "https://crossing.test"
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn packed_fallback_keeps_hidden_side_entries_without_exposing_them() {
+        use crate::pagegrid::view::{line_view, store_line};
+        let mut hidden_attrs = CellAttributes::blank();
+        hidden_attrs
+            .set_foreground(ColorAttribute::TrueColorWithPaletteFallback(
+                SrgbaTuple(0.2, 0.4, 0.6, 0.5),
+                19,
+            ))
+            .set_hyperlink(Some(Arc::new(Hyperlink::new("https://hidden.test"))));
+        let mut visible_attrs = CellAttributes::blank();
+        visible_attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://visible.test"))));
+        let line = Line::from_cells(
+            vec![
+                Cell::new('界', CellAttributes::blank()),
+                Cell::new_grapheme_with_width("hidden", 1, hidden_attrs),
+                Cell::new_grapheme_with_width("e\u{301}", 1, visible_attrs),
+            ],
+            9,
+        );
+        let mut page = Page::new(8, 1, 1);
+        let native = page.grow(9).unwrap();
+        assert!(store_line(&mut page, native, &line));
+        let expected = line_view(&page, native, 9);
+        let mut packed = PackedMirrorRow::default();
+        packed.capture(&page, native, 9);
+        drop(page);
+        assert_eq!(packed.to_line(false), expected);
+        let mut row = MirrorRow::empty(0, 0);
+        row.update_from_packed(0, &packed, 1);
+        assert_eq!(row, MirrorRow::from_line(0, &expected, 1));
+        assert_eq!(row.all_text(), "界e\u{301}");
+        assert_eq!(row.hyperlinks().len(), 1);
+        assert_eq!(row.hyperlinks()[0].uri(), "https://visible.test");
+    }
+
+    #[test]
+    fn packed_fallback_discards_imported_implicit_links_without_scan_state() {
+        use crate::pagegrid::view::store_line;
+
+        let old = Arc::new(Hyperlink::new_implicit("https://old.test/AB"));
+        let explicit = Arc::new(Hyperlink::new("https://explicit.test"));
+        let mut implicit_attrs = CellAttributes::blank();
+        implicit_attrs.set_hyperlink(Some(Arc::clone(&old)));
+        let mut explicit_attrs = CellAttributes::blank();
+        explicit_attrs.set_hyperlink(Some(Arc::clone(&explicit)));
+        let source = Line::from_cells(
+            vec![
+                Cell::new_grapheme_with_width("AB", 2, implicit_attrs.clone()),
+                Cell::blank_with_attrs(implicit_attrs),
+                Cell::new('E', explicit_attrs),
+            ],
+            9,
+        );
+        assert!(!source.implicit_hyperlinks_are_scanned());
+        let mut page = Page::new(8, 1, 1);
+        let native = page.grow(9).unwrap();
+        assert!(store_line(&mut page, native, &source));
+        let mut snapshot = RenderRowSnapshot::default();
+        snapshot.capture(RenderRowRef::Page {
+            page: &page,
+            row: native,
+            seqno: 9,
+            compress: false,
+        });
+        drop(page);
+        let rules = [Rule::new("AB", "https://new.test/$0").unwrap()];
+        let mut rows = [MirrorRow::empty(0, 0)];
+        snapshot.resolve(&mut rows[0], 0, 1);
+        assert!(!MirrorHyperlinkScanner::default().apply(&mut rows, &rules));
+
+        let mut owned = snapshot.take_line();
+        assert!(owned.get_cell(0).unwrap().attrs().hyperlink().is_none());
+        assert_eq!(
+            owned.get_cell(2).unwrap().attrs().hyperlink(),
+            Some(&explicit)
+        );
+        Line::apply_hyperlink_rules(&rules, &mut [&mut owned]);
+        assert_eq!(
+            owned
+                .get_cell(0)
+                .unwrap()
+                .attrs()
+                .hyperlink()
+                .unwrap()
+                .uri(),
+            "https://new.test/AB"
+        );
+        assert_eq!(
+            owned.get_cell(2).unwrap().attrs().hyperlink(),
+            Some(&explicit)
+        );
+        assert_eq!(source.get_cell(0).unwrap().attrs().hyperlink(), Some(&old));
+    }
+
+    #[test]
+    fn dec_line_modes_survive_native_snapshot_clear_and_line_roundtrip() {
+        use crate::pagegrid::view::store_line;
+        for mode in [
+            MirrorLineMode::SingleWidth,
+            MirrorLineMode::DoubleWidth,
+            MirrorLineMode::DoubleHeightTop,
+            MirrorLineMode::DoubleHeightBottom,
+        ] {
+            let mut line = Line::from_text("wide", &CellAttributes::blank(), 7, None);
+            mode.apply(&mut line, 7);
+            let mut page = Page::new(12, 1, 1);
+            let row = page.grow(7).unwrap();
+            assert!(store_line(&mut page, row, &line));
+            let mut snapshot = RenderRowSnapshot::default();
+            snapshot.capture(RenderRowRef::Page {
+                page: &page,
+                row,
+                seqno: 7,
+                compress: false,
+            });
+            drop(page);
+            let mut converted = MirrorRow::empty(0, 0);
+            snapshot.resolve(&mut converted, 0, 1);
+            assert_eq!(converted.line_mode(), mode);
+            assert_eq!(converted, MirrorRow::from_line(0, &line, 1));
+            assert_eq!(MirrorLineMode::from_line(&converted.to_line()), mode);
+            assert_eq!(MirrorLineMode::from_line(&snapshot.take_line()), mode);
+            converted.clear(0, 2);
+            assert_eq!(converted.line_mode(), MirrorLineMode::SingleWidth);
+        }
     }
 
     #[test]
