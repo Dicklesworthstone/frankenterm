@@ -453,8 +453,8 @@ impl MetalRenderer {
         }
     }
 
-    /// The layer's drawable size, in pixels, as the last rendered frame set
-    /// it; `(0, 0)` before the first.
+    /// The layer's configured drawable size, in pixels; `(0, 0)` before a
+    /// frame or visibility change configures it, and `(1, 1)` while parked.
     #[must_use]
     pub fn drawable_size(&self) -> (u32, u32) {
         self.drawable_size.get()
@@ -596,6 +596,21 @@ impl MetalRenderer {
             self.layer.setOpaque(opaque);
         }
         CATransaction::commit();
+    }
+
+    /// Parks an occluded window's drawable pool at one pixel, or restores
+    /// its latest size before rendering resumes. Call on the renderer's
+    /// owning thread with the display link paused; in-flight command
+    /// buffers retain their own drawables until completion. Scenes, glyph
+    /// atlases and frame buffers remain available for the first visible
+    /// frame. A zero-sized surface stays at one pixel until it can draw.
+    pub fn set_surface_occluded(&self, occluded: bool, width: u32, height: u32) {
+        let (width, height) = if occluded || width == 0 || height == 0 {
+            (1, 1)
+        } else {
+            (width, height)
+        };
+        self.fit_drawable(width, height);
     }
 
     /// [`Self::render_frame`] into an offscreen `width x height` texture,
@@ -1181,6 +1196,41 @@ mod tests {
         );
         assert!(caps.unified_memory, "{caps}");
         assert_ne!(caps.name, "");
+    }
+
+    #[test]
+    fn parking_and_restoring_the_drawable_preserves_glyphs_and_frame_buffers() {
+        let renderer = MetalRenderer::offscreen().expect("this test needs a Metal renderer");
+        let glyph = renderer
+            .insert_glyph(AtlasKind::Grayscale, 1, 1, &[255])
+            .unwrap();
+        let allocations = renderer.frame_stats().buffer_allocations;
+        for (occluded, width, height, expected) in [
+            (false, 1600, 900, (1600, 900)),
+            (true, 1600, 900, (1, 1)),
+            (false, 1600, 900, (1600, 900)),
+            (true, 1600, 900, (1, 1)),
+            (true, 1920, 1080, (1, 1)),
+            (false, 1920, 1080, (1920, 1080)),
+            (true, 1920, 1080, (1, 1)),
+            (false, 0, 0, (1, 1)),
+            (false, 0, 900, (1, 1)),
+            (false, 1600, 0, (1, 1)),
+            (false, 800, 600, (800, 600)),
+        ] {
+            renderer.set_surface_occluded(occluded, width, height);
+            assert_eq!(renderer.drawable_size(), expected);
+            let size = renderer.layer.drawableSize();
+            assert_eq!(
+                (size.width, size.height),
+                (f64::from(expected.0), f64::from(expected.1))
+            );
+            assert!(
+                renderer.touch_glyph(&glyph),
+                "parking preserves atlas slots"
+            );
+            assert_eq!(renderer.frame_stats().buffer_allocations, allocations);
+        }
     }
 
     /// ft-yccm0.4.7.3: the target is sRGB and clears take linear light, yet

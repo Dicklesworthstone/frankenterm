@@ -195,6 +195,55 @@ pub trait FrameDriver {
     /// A display refresh tick passed without a frame. A driver that holds
     /// something from the tick (a display link's drawable) releases it.
     fn tick_skipped(&mut self) {}
+
+    /// How long the window must stay occluded before parking its surface.
+    /// Frames and display ticks pause immediately; this grace period avoids
+    /// reallocating drawable pools while briefly switching between windows.
+    fn occlusion_grace_period(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// The window stayed occluded through its grace period, or became
+    /// visible after parking. Runs on the render thread, with the display
+    /// link paused. A driver can park its drawable pool while hidden and
+    /// restore `surface`'s latest size before the link restarts and acquires
+    /// a drawable, even when the size matches the last rendered frame.
+    fn occlusion_changed(&mut self, _surface: &Surface) {}
+}
+
+/// One pending park deadline per occlusion, cancelled when visible. Once
+/// parked, the thread can wait indefinitely without a polling timer.
+#[derive(Default)]
+struct OcclusionState {
+    park_at: Option<Instant>,
+    parked: bool,
+}
+
+impl OcclusionState {
+    fn begin(&mut self, now: Instant, grace: Duration) {
+        self.park_at = now.checked_add(grace);
+        self.parked = false;
+    }
+
+    fn park_if_due(&mut self, now: Instant) -> bool {
+        if self.park_at.is_some_and(|at| at <= now) {
+            self.park_at = None;
+            self.parked = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn time_until_park(&self, now: Instant) -> Option<Duration> {
+        self.park_at.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// Whether the driver must restore a pool that was actually parked.
+    fn resume(&mut self) -> bool {
+        self.park_at = None;
+        std::mem::take(&mut self.parked)
+    }
 }
 
 /// Display refresh ticks for a render thread: a display link
@@ -624,6 +673,7 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
     let mut qos: Option<ThreadQos> = None;
     let mut redraw_at: Option<Instant> = None;
     let mut paused = false;
+    let mut occlusion = OcclusionState::default();
     let mut running = false;
     let mut cadence = VsyncCadence::default();
     let mut activity = Activity::default();
@@ -635,23 +685,37 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
         let surface = shared.mailbox.read();
         follow_qos(&mut qos, &surface);
         if surface.state.occluded {
+            if running {
+                source.set_running(false);
+                running = false;
+            }
+            if !paused {
+                occlusion.begin(Instant::now(), driver.occlusion_grace_period());
+            }
+            if occlusion.park_if_due(Instant::now()) {
+                driver.occlusion_changed(&surface);
+            }
             if !paused {
                 log::debug!("render thread: paused while occluded");
                 shared.pauses.fetch_add(1, Ordering::Relaxed);
                 paused = true;
             }
-            if running {
-                source.set_running(false);
-                running = false;
-            }
             // Swallow output wakes; only a post (which always interrupts)
             // can make the window visible again.
             shared.pending.store(true, Ordering::Release);
             redraw_at = None;
-            source.wait(None);
+            let timeout = occlusion.time_until_park(Instant::now());
+            if matches!(source.wait(timeout), VsyncWait::Tick(_)) {
+                // A callback already queued when the link paused may still
+                // hand us a drawable. Do not retain it throughout occlusion.
+                driver.tick_skipped();
+            }
             continue;
         }
         if paused {
+            if occlusion.resume() {
+                driver.occlusion_changed(&surface);
+            }
             log::debug!("render thread: resumed");
             paused = false;
         }
@@ -727,6 +791,7 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
     let mut redraw_at: Option<Instant> = None;
     // The generation of the surface that paused the thread.
     let mut paused: Option<u64> = None;
+    let mut occlusion = OcclusionState::default();
     loop {
         loop {
             if shared.stop.load(Ordering::Acquire) {
@@ -738,7 +803,11 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
                 if shared.mailbox.generation() != generation {
                     break;
                 }
-                std::thread::park();
+                match occlusion.time_until_park(Instant::now()) {
+                    Some(delay) if delay.is_zero() => break,
+                    Some(delay) => std::thread::park_timeout(delay),
+                    None => std::thread::park(),
+                }
                 continue;
             }
             let now = Instant::now();
@@ -761,6 +830,12 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
         follow_qos(&mut qos, &surface);
         if surface.state.occluded {
             if paused.is_none() {
+                occlusion.begin(Instant::now(), driver.occlusion_grace_period());
+            }
+            if occlusion.park_if_due(Instant::now()) {
+                driver.occlusion_changed(&surface);
+            }
+            if paused.is_none() {
                 log::debug!("render thread: paused while occluded");
                 shared.pauses.fetch_add(1, Ordering::Relaxed);
             }
@@ -771,6 +846,9 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
             continue;
         }
         if paused.take().is_some() {
+            if occlusion.resume() {
+                driver.occlusion_changed(&surface);
+            }
             log::debug!("render thread: resumed");
         }
         // The frame below shows everything that happened before this point;
@@ -829,6 +907,9 @@ mod tests {
         /// geometry it was built for.
         frames: Vec<((u32, u32, u32), (u32, u32, u32))>,
         reconfigured: Vec<SurfaceState>,
+        occlusions: Vec<SurfaceState>,
+        drawable: (u32, u32, u32),
+        skipped: u64,
         torn: usize,
         qos: Vec<Option<ThreadQos>>,
         /// Each frame's effective base priority (ft-yccm0.6).
@@ -836,8 +917,8 @@ mod tests {
         dropped_on: Option<std::thread::ThreadId>,
     }
 
-    /// Records what the render thread asks of it. Its drawable is sized only
-    /// by `reconfigure`, like a CAMetalLayer's drawableSize.
+    /// Records what the render thread asks of it, including parking and
+    /// restoring its drawable on occlusion transitions.
     struct RecordingDriver {
         record: Arc<Mutex<Record>>,
         drawable: (u32, u32, u32),
@@ -848,8 +929,24 @@ mod tests {
         fn reconfigure(&mut self, surface: &Surface) {
             self.drawable = surface.state.geometry();
             let mut record = self.record.lock().unwrap();
+            record.drawable = self.drawable;
             record.torn += usize::from(!is_correlated(&surface.state));
             record.reconfigured.push(surface.state);
+        }
+
+        fn occlusion_changed(&mut self, surface: &Surface) {
+            self.drawable = if surface.state.occluded {
+                (1, 1, surface.state.dpi)
+            } else {
+                surface.state.geometry()
+            };
+            let mut record = self.record.lock().unwrap();
+            record.drawable = self.drawable;
+            record.occlusions.push(surface.state);
+        }
+
+        fn tick_skipped(&mut self) {
+            self.record.lock().unwrap().skipped += 1;
         }
 
         fn frame(&mut self, surface: &Surface) -> FrameReport {
@@ -1063,6 +1160,74 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn timer_pacing_restores_same_size_and_resized_occluded_surfaces() {
+        let (thread, record) =
+            spawn_recording(correlated(0), Duration::from_millis(1), Duration::ZERO);
+        assert!(eventually(|| thread.stats().frames_presented > 0));
+        let mut visible = correlated(0);
+        for (index, restored) in [correlated(0), correlated(17)].into_iter().enumerate() {
+            thread.post_surface(SurfaceState {
+                occluded: true,
+                ..visible
+            });
+            assert!(eventually(|| thread.stats().pauses == index as u64 + 1));
+            let paused = thread.stats().frames_built;
+            thread.post_surface(SurfaceState {
+                occluded: true,
+                ..restored
+            });
+            for _ in 0..50 {
+                thread.waker().wake();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(thread.stats().frames_built, paused);
+            {
+                let record = record.lock().unwrap();
+                assert_eq!(record.occlusions.len(), index * 2 + 1);
+                assert_eq!((record.drawable.0, record.drawable.1), (1, 1));
+            }
+            thread.post_surface(restored);
+            assert!(eventually(|| thread.stats().frames_built > paused));
+            let record = record.lock().unwrap();
+            assert_eq!(record.occlusions.len(), index * 2 + 2);
+            assert_eq!(record.occlusions.last(), Some(&restored));
+            assert_eq!(
+                record.frames.last(),
+                Some(&(restored.geometry(), restored.geometry()))
+            );
+            assert_eq!(record.reconfigured.len(), index + 1);
+            visible = restored;
+        }
+    }
+
+    #[test]
+    fn occlusion_grace_cancels_brief_hides_and_parks_once_without_polling() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(5);
+        let mut occlusion = OcclusionState::default();
+        occlusion.begin(start, grace);
+        assert_eq!(occlusion.time_until_park(start), Some(grace));
+        let before = start + grace - Duration::from_nanos(1);
+        assert!(!occlusion.park_if_due(before));
+        assert_eq!(
+            occlusion.time_until_park(before),
+            Some(Duration::from_nanos(1))
+        );
+        assert!(!occlusion.resume(), "a brief hide never parked the pool");
+        assert_eq!(occlusion.time_until_park(start + grace), None);
+        assert!(!occlusion.park_if_due(start + grace));
+
+        let next_hide = start + grace;
+        occlusion.begin(next_hide, grace);
+        assert!(!occlusion.park_if_due(next_hide));
+        assert!(occlusion.park_if_due(next_hide + grace));
+        assert_eq!(occlusion.time_until_park(next_hide + grace), None);
+        assert!(!occlusion.park_if_due(next_hide + grace + grace));
+        assert!(occlusion.resume(), "a parked pool needs restoration");
+        assert!(!occlusion.resume(), "restoration happens only once");
+    }
+
     /// The class follows focus, and it is the priority the thread actually
     /// runs at, not only the class it asked for: in a process without an
     /// application task role (a test binary, a GUI started from a shell)
@@ -1185,6 +1350,8 @@ mod tests {
 
     enum LinkMessage {
         Tick(Duration),
+        /// A callback queued before the display link was paused.
+        QueuedTick(Duration),
         Interrupt,
     }
 
@@ -1192,6 +1359,7 @@ mod tests {
     struct LinkLog {
         running: Vec<bool>,
         ranges: Vec<FrameRateRange>,
+        drawables_at_start: Vec<(u32, u32, u32)>,
     }
 
     /// A display link the test ticks by hand. A paused link drops ticks,
@@ -1204,6 +1372,7 @@ mod tests {
         /// The ticks returned before the thread last entered `wait`.
         settled: Arc<AtomicU64>,
         log: Arc<Mutex<LinkLog>>,
+        record: Option<Arc<Mutex<Record>>>,
     }
 
     impl VsyncSource for FakeLink {
@@ -1232,7 +1401,7 @@ mod tests {
                 match message {
                     LinkMessage::Interrupt => return VsyncWait::Interrupted,
                     LinkMessage::Tick(_) if !self.running => continue,
-                    LinkMessage::Tick(interval) => {
+                    LinkMessage::Tick(interval) | LinkMessage::QueuedTick(interval) => {
                         self.returned += 1;
                         return VsyncWait::Tick(VsyncTick { interval });
                     }
@@ -1242,7 +1411,15 @@ mod tests {
 
         fn set_running(&mut self, running: bool) {
             self.running = running;
-            self.log.lock().unwrap().running.push(running);
+            let drawable = self
+                .record
+                .as_ref()
+                .map(|record| record.lock().unwrap().drawable);
+            let mut log = self.log.lock().unwrap();
+            log.running.push(running);
+            if running && let Some(drawable) = drawable {
+                log.drawables_at_start.push(drawable);
+            }
         }
 
         fn set_rate_range(&mut self, range: FrameRateRange) {
@@ -1268,8 +1445,16 @@ mod tests {
         /// A tick of a running link; returns once the thread has drawn or
         /// skipped it and is waiting again.
         fn tick(&self, interval: Duration) {
+            self.send_tick(LinkMessage::Tick(interval));
+        }
+
+        fn queued_tick_while_paused(&self, interval: Duration) {
+            self.send_tick(LinkMessage::QueuedTick(interval));
+        }
+
+        fn send_tick(&self, tick: LinkMessage) {
             self.expected.set(self.expected.get() + 1);
-            self.tx.send(LinkMessage::Tick(interval)).unwrap();
+            self.tx.send(tick).unwrap();
             let expected = self.expected.get();
             assert!(
                 eventually(|| self.settled.load(Ordering::Acquire) >= expected),
@@ -1312,6 +1497,7 @@ mod tests {
             returned: 0,
             settled: Arc::clone(&settled),
             log: Arc::clone(&log),
+            record: None,
         };
         let thread = RenderThread::spawn_paced(
             "ft-render-link-test".to_string(),
@@ -1402,6 +1588,104 @@ mod tests {
         link.tick(hz(60.0));
         assert_eq!(thread.stats().frames_built, 2);
         assert_eq!(thread.stats().link_starts, 2);
+    }
+
+    #[test]
+    fn occluded_surfaces_are_restored_before_the_display_link_restarts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let settled = Arc::new(AtomicU64::new(0));
+        let log = Arc::new(Mutex::new(LinkLog::default()));
+        let record = Arc::new(Mutex::new(Record::default()));
+        let driver_record = Arc::clone(&record);
+        let link = FakeLink {
+            rx,
+            tx: tx.clone(),
+            running: false,
+            returned: 0,
+            settled: Arc::clone(&settled),
+            log: Arc::clone(&log),
+            record: Some(Arc::clone(&record)),
+        };
+        let thread = RenderThread::spawn_paced(
+            "ft-render-occlusion-test".to_string(),
+            SurfaceState {
+                occluded: true,
+                ..correlated(0)
+            },
+            hz(60.0),
+            move || {
+                (
+                    RecordingDriver {
+                        record: driver_record,
+                        drawable: (0, 0, 0),
+                        frame_time: Duration::ZERO,
+                    },
+                    Some(Box::new(link) as Box<dyn VsyncSource>),
+                )
+            },
+        )
+        .unwrap();
+        let link = LinkHandle {
+            tx,
+            settled,
+            expected: std::cell::Cell::new(0),
+            log,
+        };
+        assert!(eventually(|| thread.stats().pauses == 1));
+        assert!(
+            link.running().is_empty(),
+            "an initially hidden link stays paused"
+        );
+        for (index, restored) in [correlated(0), correlated(0), correlated(19)]
+            .into_iter()
+            .enumerate()
+        {
+            let paused = thread.stats().frames_built;
+            thread.post_surface(SurfaceState {
+                occluded: true,
+                ..restored
+            });
+            for _ in 0..50 {
+                thread.waker().wake();
+            }
+            link.queued_tick_while_paused(hz(60.0));
+            assert_eq!(thread.stats().frames_built, paused);
+            assert_eq!(record.lock().unwrap().skipped, index as u64 + 1);
+
+            thread.post_surface(restored);
+            assert!(eventually(|| {
+                link.log.lock().unwrap().drawables_at_start.len() == index + 1
+            }));
+            assert_eq!(
+                link.log.lock().unwrap().drawables_at_start.last(),
+                Some(&restored.geometry()),
+                "restore the latest size before the link acquires a drawable"
+            );
+            link.tick(hz(60.0));
+            assert_eq!(thread.stats().frames_built, paused + 1);
+            assert_eq!(
+                record.lock().unwrap().frames.last(),
+                Some(&(restored.geometry(), restored.geometry()))
+            );
+            if index < 2 {
+                thread.post_surface(SurfaceState {
+                    occluded: true,
+                    ..restored
+                });
+                assert!(eventually(|| thread.stats().pauses == index as u64 + 2));
+            }
+        }
+        let record = record.lock().unwrap();
+        assert_eq!(
+            record.occlusions.len(),
+            6,
+            "one hook per visibility transition"
+        );
+        assert_eq!(
+            record.reconfigured.len(),
+            2,
+            "same-size restoration needs the hook"
+        );
     }
 
     /// Busy output asks a 120 Hz display for its full rate when max_fps

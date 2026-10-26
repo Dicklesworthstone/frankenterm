@@ -303,6 +303,19 @@ impl FrameDriver for MetalDriver {
         self.link_update.borrow_mut().take();
     }
 
+    fn occlusion_grace_period(&self) -> Duration {
+        super::SURFACE_PARK_DELAY
+    }
+
+    fn occlusion_changed(&mut self, surface: &Surface) {
+        // The link is stopped before parking and resumes only after this
+        // hook restores the latest size, including a resize while hidden.
+        self.link_update.borrow_mut().take();
+        let (width, height, _) = surface.state.geometry();
+        self.renderer
+            .set_surface_occluded(surface.state.occluded, width, height);
+    }
+
     fn frame(&mut self, surface: &Surface) -> FrameReport {
         let request = Arc::clone(&self.request.lock().unwrap_or_else(PoisonError::into_inner));
         let (width, height, dpi) = surface.state.geometry();

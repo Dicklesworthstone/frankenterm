@@ -196,6 +196,10 @@ impl MetalRenderer {
         match *self {}
     }
 
+    pub fn set_surface_occluded(&self, _occluded: bool, _width: u32, _height: u32) {
+        match *self {}
+    }
+
     pub fn render_clear(
         &self,
         _width: u32,
