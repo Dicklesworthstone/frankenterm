@@ -1,6 +1,7 @@
 use crate::db::FontDatabase;
 use crate::locator::{new_locator, FontLocator};
 use crate::parser::ParsedFont;
+use crate::rasterizer::cache::{RasterCache, RasterKey};
 use crate::rasterizer::{new_rasterizer, FontRasterizer};
 use crate::shaper::{new_shaper, FontShaper, PresentationWidth};
 use anyhow::{Context, Error};
@@ -115,14 +116,132 @@ mod scale_font_tests {
         fonts
     }
 
-    fn glyph_pixels(font: &LoadedFont, infos: &[GlyphInfo]) -> Vec<RasterizedGlyph> {
+    struct CountedRasterizer {
+        calls: Rc<Cell<usize>>,
+        fail_first: bool,
+    }
+
+    impl FontRasterizer for CountedRasterizer {
+        fn rasterize_glyph(
+            &self,
+            glyph_pos: u32,
+            _size: f64,
+            _dpi: u32,
+        ) -> anyhow::Result<RasterizedGlyph> {
+            let calls = self.calls.get() + 1;
+            self.calls.set(calls);
+            if self.fail_first && calls == 1 {
+                anyhow::bail!("transient rasterization failure");
+            }
+            Ok(RasterizedGlyph {
+                data: vec![glyph_pos as u8, 2, 3, 255],
+                width: 1,
+                height: 1,
+                bearing_x: units::PixelLength::new(2.0),
+                bearing_y: units::PixelLength::new(3.0),
+                has_color: true,
+                is_scaled: true,
+            })
+        }
+    }
+
+    fn count_rasters(
+        font: &LoadedFont,
+        fallback: FallbackIdx,
+        fail_first: bool,
+    ) -> Rc<Cell<usize>> {
+        let calls = Rc::new(Cell::new(0));
+        font.rasterizers.borrow_mut().insert(
+            fallback,
+            Box::new(CountedRasterizer {
+                calls: Rc::clone(&calls),
+                fail_first,
+            }),
+        );
+        calls
+    }
+
+    #[test]
+    fn pane_consumers_rasterize_once_and_mutable_title_copy_cannot_poison_pixels() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let calls = count_rasters(&font, 0, false);
+        let source = font.rasterize_glyph(17, 0).unwrap();
+        for _ in 0..200 {
+            // The panes resolve the same loaded font but use independent
+            // GlyphCaches. They must reuse source pixels, not just a shaped run.
+            let pane_font = fonts.default_font().unwrap();
+            let raster = pane_font.rasterize_glyph(17, 0).unwrap();
+            assert!(Rc::ptr_eq(&source, &raster));
+            assert_eq!(raster.bearing_x, units::PixelLength::new(2.0));
+            assert_eq!(raster.bearing_y, units::PixelLength::new(3.0));
+        }
+        assert_eq!(calls.get(), 1);
+        let mut title = Rc::unwrap_or_clone(font.rasterize_glyph(17, 0).unwrap());
+        title.data.fill(0);
+        assert_eq!(font.rasterize_glyph(17, 0).unwrap().data, [17, 2, 3, 255]);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn shared_rasters_keep_fallbacks_and_scale_identities_separate() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let base_calls = count_rasters(&original, 0, false);
+        let fallback_calls = count_rasters(&original, 1, false);
+        let base = original.rasterize_glyph(17, 0).unwrap();
+        let fallback = original.rasterize_glyph(17, 1).unwrap();
+        assert!(!Rc::ptr_eq(&base, &fallback));
+        assert_eq!(base_calls.get(), 1);
+        assert_eq!(fallback_calls.get(), 1);
+
+        fonts.change_scaling(1.25, 96);
+        let scaled = fonts.default_font().unwrap();
+        assert_ne!(original.id(), scaled.id());
+        let scaled_calls = count_rasters(&scaled, 0, false);
+        let scaled_pixels = scaled.rasterize_glyph(17, 0).unwrap();
+        assert!(!Rc::ptr_eq(&base, &scaled_pixels));
+        assert_eq!(scaled_calls.get(), 1);
+        assert!(Rc::ptr_eq(&base, &original.rasterize_glyph(17, 0).unwrap()));
+        assert_eq!(base_calls.get(), 1);
+    }
+
+    #[test]
+    fn raster_errors_are_retryable_and_configuration_reload_retires_cached_pixels() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let calls = count_rasters(&font, 0, true);
+        assert!(font.rasterize_glyph(17, 0).is_err());
+        let recovered = font.rasterize_glyph(17, 0).unwrap();
+        assert!(Rc::ptr_eq(
+            &recovered,
+            &font.rasterize_glyph(17, 0).unwrap()
+        ));
+        assert_eq!(calls.get(), 2);
+
+        fonts.config_changed(&fonts.config()).unwrap();
+        // An externally held outgoing font is still valid. The configuration
+        // has nevertheless released the old bitmap cache, so this must miss.
+        let refreshed = font.rasterize_glyph(17, 0).unwrap();
+        assert!(!Rc::ptr_eq(&recovered, &refreshed));
+        assert_eq!(calls.get(), 3);
+        drop(fonts);
+        assert_eq!(font.rasterize_glyph(17, 0).unwrap().data, [17, 2, 3, 255]);
+        assert_eq!(
+            calls.get(),
+            4,
+            "a retired configuration has no hidden cache owner"
+        );
+    }
+
+    fn glyph_pixels(font: &LoadedFont, infos: &[GlyphInfo]) -> Vec<Rc<RasterizedGlyph>> {
         infos
             .iter()
             .map(|info| font.rasterize_glyph(info.glyph_pos, info.font_idx).unwrap())
             .collect()
     }
 
-    fn assert_same_pixels(expected: &[RasterizedGlyph], actual: &[RasterizedGlyph]) {
+    fn assert_same_pixels(expected: &[Rc<RasterizedGlyph>], actual: &[Rc<RasterizedGlyph>]) {
         assert_eq!(expected.len(), actual.len());
         for (expected, actual) in expected.iter().zip(actual) {
             assert_eq!(expected.data, actual.data);
@@ -1345,18 +1464,32 @@ impl LoadedFont {
         }
     }
 
+    /// Returns immutable source pixels shared across the configuration's
+    /// pane-local atlas caches. Callers that tint/rewrite pixels must own a
+    /// copy. Layout offsets and atlas placement are deliberately not cached.
     pub fn rasterize_glyph(
         &self,
         glyph_pos: u32,
         fallback: FallbackIdx,
-    ) -> anyhow::Result<RasterizedGlyph> {
+    ) -> anyhow::Result<Rc<RasterizedGlyph>> {
+        let config = self.font_config.upgrade();
+        let key = RasterKey {
+            font: self.id,
+            fallback,
+            glyph: glyph_pos,
+        };
+        if let Some(config) = &config {
+            if let Some(glyph) = config.raster_cache.borrow_mut().get(key) {
+                return Ok(glyph);
+            }
+        }
+
         let mut rasterizers = self.rasterizers.borrow_mut();
-        if let Some(raster) = rasterizers.get(&fallback) {
+        let glyph = if let Some(raster) = rasterizers.get(&fallback) {
             raster.rasterize_glyph(glyph_pos, self.font_size, self.dpi)
         } else {
-            let raster_selection = self
-                .font_config
-                .upgrade()
+            let raster_selection = config
+                .as_ref()
                 .map_or(FontRasterizerSelection::default(), |c| {
                     c.config.borrow().font_rasterizer
                 });
@@ -1371,7 +1504,16 @@ impl LoadedFont {
             let result = raster.rasterize_glyph(glyph_pos, self.font_size, self.dpi);
             rasterizers.insert(fallback, raster);
             result
+        }?;
+        drop(rasterizers);
+        let glyph = Rc::new(glyph);
+        if let Some(config) = config {
+            config
+                .raster_cache
+                .borrow_mut()
+                .insert(key, Rc::clone(&glyph));
         }
+        Ok(glyph)
     }
 
     pub fn clone_handles(&self) -> Vec<ParsedFont> {
@@ -1873,6 +2015,7 @@ fn reuse_previous_scale_fonts() -> bool {
 
 struct FontConfigInner {
     fonts: RefCell<HashMap<TextStyle, Rc<LoadedFont>>>,
+    raster_cache: RefCell<RasterCache>,
     previous_scale_fonts: RefCell<Option<PreviousScaleFonts>>,
     metrics: RefCell<Option<FontMetrics>>,
     dpi: RefCell<usize>,
@@ -1905,6 +2048,7 @@ impl FontConfigInner {
         let locator = new_locator(config.font_locator);
         Ok(Self {
             fonts: RefCell::new(HashMap::new()),
+            raster_cache: RefCell::new(RasterCache::default()),
             previous_scale_fonts: RefCell::new(None),
             locator,
             metrics: RefCell::new(None),
@@ -1931,6 +2075,7 @@ impl FontConfigInner {
         *self.config.borrow_mut() = config.clone();
         // Config was reloaded, invalidate our caches
         fonts.clear();
+        self.raster_cache.borrow_mut().clear();
         self.previous_scale_fonts.borrow_mut().take();
         self.title_font.borrow_mut().take();
         self.pane_select_font.borrow_mut().take();
