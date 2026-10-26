@@ -1,9 +1,22 @@
-//! Recorder retention manager (operational engine).
+//! Recorder retention manager — UNWIRED INFRASTRUCTURE (not an operational engine).
 //!
-//! Bead: wa-oegrb.3.5
+//! Bead: wa-oegrb.3.5 · wiring tracked by ft-y7x56
 //!
-//! Implements the operational half of the retention policy defined in
-//! `recorder-governance-policy.md`. The DTOs (`RetentionConfig`,
+//! This module implements the retention-sweep *algorithm* from
+//! `recorder-governance-policy.md` (tier transitions and purge-candidate
+//! selection over `SegmentMeta`) and is unit-tested, but it is **not wired to
+//! any production path**. No scheduler, runtime, or storage code instantiates
+//! `RetentionManager` or applies its `sweep()` decisions, and nothing populates
+//! its in-memory segment set outside tests. The production recorder backend is
+//! AppendLog (the frankensqlite backend this engine's tier/phase lifecycle
+//! targets is config-gated off); there is no `RetentionConfig` in the loaded
+//! production `Config`, and no purge sink. **Configured recorder retention
+//! windows are therefore NOT enforced in production today.** Treat this as
+//! reviewed-but-dormant infrastructure: wiring it is a subsystem build (data
+//! source, storage model, config, scheduler, and a data-loss-sensitive purge
+//! sink), tracked by `ft-y7x56` — not a narrow scheduler hook.
+//!
+//! The DTOs (`RetentionConfig`,
 //! `RetentionError`, `SensitivityTier`, `SegmentPhase`, `SegmentMeta`,
 //! `RetentionStats`, `RetentionAuditEvent`, `RetentionAuditType`) live
 //! in the leaf crate `frankenterm-core-audit-types`
