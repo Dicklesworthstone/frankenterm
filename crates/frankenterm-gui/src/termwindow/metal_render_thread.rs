@@ -41,12 +41,13 @@ use frankenterm_gui::render_thread::{
     SurfaceState, VsyncSource, VsyncTick, VsyncWait,
 };
 use frankenterm_renderer_metal::{
-    ClearColor, FrameOutcome, GridExtent, LinkUpdate, LinkWait, MetalDisplayLink, MetalRenderer,
-    MetalRendererHandoff, SolidRect,
+    ClearColor, FrameOutcome, FramePresentation, GridExtent, LinkUpdate, LinkWait,
+    MetalDisplayLink, MetalRenderer, MetalRendererHandoff, SolidRect,
 };
 use mux::pane::PaneId;
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -231,6 +232,71 @@ struct RenderFonts {
     metrics: RenderMetrics,
 }
 
+/// The callback owns this bounded state, never the render driver. GPU
+/// failure recovery and skipped-drawable recovery are separate: a successful
+/// command completion must not cancel a skipped last frame's redraw.
+#[derive(Debug, Default)]
+struct PresentationFeedback {
+    retry: FrameRetry,
+    state: Mutex<PresentationState>,
+}
+
+#[derive(Debug, Default)]
+struct PresentationState {
+    latest_presented: Option<u64>,
+    size: [u32; 2],
+    /// A fast first callback can precede render-thread handle installation.
+    unreported_presents: u64,
+    waker: Option<RenderWaker>,
+}
+
+impl PresentationFeedback {
+    fn set_waker(&self, waker: RenderWaker) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.waker.is_none() {
+                waker.record_presented(state.unreported_presents);
+                state.unreported_presents = 0;
+                state.waker = Some(waker.clone());
+            }
+        }
+        self.retry.set_waker(waker);
+    }
+
+    fn observe(&self, presentation: FramePresentation) {
+        let succeeded = presentation.presented_at.is_some();
+        if let Some(at) = presentation.presented_at {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // Two drawable callbacks can run on different Metal-managed
+            // threads. An old callback still counts as a present, but may
+            // never make the displayed size regress after a newer resize.
+            if state
+                .latest_presented
+                .is_none_or(|latest| presentation.frame > latest)
+            {
+                state.latest_presented = Some(presentation.frame);
+                state.size = presentation.size;
+            }
+            if let Some(waker) = &state.waker {
+                waker.record_presented(1);
+            } else {
+                state.unreported_presents = state.unreported_presents.saturating_add(1);
+            }
+            drop(state);
+            metrics::histogram!("gui.metal.submit_to_present_seconds").record(
+                at.saturating_duration_since(presentation.submitted_at)
+                    .as_secs_f64(),
+            );
+        } else {
+            metrics::counter!("gui.metal.render_thread.drawable_skipped").increment(1);
+        }
+        // This wakes only for a skipped frame. A successful callback updates
+        // counters and cancels obsolete retry state without producing output.
+        self.retry
+            .complete(presentation.frame, succeeded, Instant::now());
+    }
+}
+
 /// Draws a window's Metal frames on its render thread.
 struct MetalDriver {
     request: Arc<Mutex<Arc<MetalFrameRequest>>>,
@@ -238,9 +304,11 @@ struct MetalDriver {
     fonts: Option<RenderFonts>,
     /// Shared only with GPU completion handlers; owns no renderer objects.
     retry: Arc<FrameRetry>,
-    /// The drawable size of the last presented frame, width in the high 32
-    /// bits: what the window shows now.
-    presented_size: Arc<AtomicU64>,
+    presentation: Arc<PresentationFeedback>,
+    /// Submission geometry for unattached-layer GPU tests. Actual displayed
+    /// geometry lives exclusively in `presentation`'s callback state.
+    #[cfg(test)]
+    submitted_size: Arc<AtomicU64>,
     /// The display link's latest update, when the link paces this thread.
     /// Active frames use this drawable; the first idle wake acquires one
     /// directly while the display link is still paused.
@@ -345,13 +413,18 @@ impl FrameDriver for MetalDriver {
 
 impl MetalDriver {
     fn draw(&mut self, surface: &Surface, require_link_update: bool) -> FrameReport {
-        if let Some(at) = self.retry.wait_until(Instant::now()) {
+        let now = Instant::now();
+        if let Some(at) = self
+            .retry
+            .wait_until(now)
+            .max(self.presentation.retry.wait_until(now))
+        {
             // Release this tick's drawable while deferred. The scheduler
             // preserves the retry deadline and still honors max_fps,
             // occlusion, resize and shutdown without a blocking sleep here.
             self.link_update.borrow_mut().take();
             return FrameReport {
-                presented: false,
+                submitted: false,
                 redraw_at: Some(at),
             };
         }
@@ -418,23 +491,22 @@ impl MetalDriver {
             }
         }
         match outcome {
-            Ok(FrameOutcome::Presented) => {
-                let (width, height) = self.renderer.drawable_size();
-                self.presented_size.store(
-                    (u64::from(width) << 32) | u64::from(height),
-                    Ordering::Relaxed,
-                );
-                // The GUI's own presented-frame count and cap, which the
-                // throughput harness checks its screen-capture FPS meter
-                // against (ft-yccm0.1.4), as the WebGpu paint records them;
-                // nv9 read 0 presents/s from a Metal window without this.
-                let frames = FrameLedger::global();
-                frames.set_max_fps(request.config.max_fps);
-                frames.record_present();
+            Ok(FrameOutcome::Submitted) => {
+                #[cfg(test)]
+                {
+                    let (width, height) = self.renderer.drawable_size();
+                    self.submitted_size.store(
+                        (u64::from(width) << 32) | u64::from(height),
+                        Ordering::Relaxed,
+                    );
+                }
+                // The backend records actual presents and timestamps in its
+                // drawable callback, including the main-thread Metal path.
+                FrameLedger::global().set_max_fps(request.config.max_fps);
                 // Blinking text or a blinking cursor draws again when its
                 // blink next moves (ft-yccm0.4.7.3).
                 FrameReport {
-                    presented: true,
+                    submitted: true,
                     redraw_at: self.panes.redraw_at(),
                 }
             }
@@ -442,7 +514,7 @@ impl MetalDriver {
             // The link's drawable predates a resize: draw on the next tick,
             // whose drawable has the new size.
             Ok(FrameOutcome::DrawableResized) => FrameReport {
-                presented: false,
+                submitted: false,
                 redraw_at: Some(Instant::now()),
             },
             Err(err) => {
@@ -452,7 +524,7 @@ impl MetalDriver {
                 FrameLedger::global().record_present_failure();
                 log::warn!("render thread: Metal frame failed: {err:#}");
                 FrameReport {
-                    presented: false,
+                    submitted: false,
                     redraw_at: Some(Instant::now()),
                 }
             }
@@ -468,7 +540,9 @@ pub(crate) struct MetalRenderThread {
     output: Arc<MetalOutputWake>,
     surface: std::cell::Cell<SurfaceState>,
     #[cfg(test)]
-    presented_size: Arc<AtomicU64>,
+    submitted_size: Arc<AtomicU64>,
+    #[cfg(test)]
+    presentation: Arc<PresentationFeedback>,
     #[cfg(test)]
     rows_rebuilt: Arc<Mutex<std::collections::HashMap<PaneId, u64>>>,
 }
@@ -492,8 +566,12 @@ impl MetalRenderThread {
         let driver_request = Arc::clone(&request);
         let retry = Arc::new(FrameRetry::default());
         let driver_retry = Arc::clone(&retry);
-        let presented_size = Arc::new(AtomicU64::new(0));
-        let driver_presented_size = Arc::clone(&presented_size);
+        let presentation = Arc::new(PresentationFeedback::default());
+        let driver_presentation = Arc::clone(&presentation);
+        #[cfg(test)]
+        let submitted_size = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let driver_submitted_size = Arc::clone(&submitted_size);
         #[cfg(test)]
         let rows_rebuilt = Arc::new(Mutex::new(std::collections::HashMap::new()));
         #[cfg(test)]
@@ -507,7 +585,9 @@ impl MetalRenderThread {
                 panes: MetalPanes::default(),
                 fonts: None,
                 retry: driver_retry,
-                presented_size: driver_presented_size,
+                presentation: driver_presentation,
+                #[cfg(test)]
+                submitted_size: driver_submitted_size,
                 link_update: Rc::new(RefCell::new(None)),
                 paced_by_link: pacing == Pacing::DisplayLink,
                 opaque: None,
@@ -520,7 +600,6 @@ impl MetalRenderThread {
                 .renderer
                 .set_frame_completion_handler(Some(Arc::new(move |completion| {
                     if !completion.succeeded {
-                        FrameLedger::global().record_present_failure();
                         metrics::counter!("gui.metal.render_thread.gpu_frame_failed").increment(1);
                     }
                     completion_retry.complete(
@@ -528,6 +607,12 @@ impl MetalRenderThread {
                         completion.succeeded,
                         Instant::now(),
                     );
+                })));
+            let presentation = Arc::clone(&driver.presentation);
+            driver
+                .renderer
+                .set_frame_presentation_handler(Some(Arc::new(move |event| {
+                    presentation.observe(event);
                 })));
             // The link is created here, on the render thread whose run loop
             // runs it (ft-yccm0.4.1.3); before macOS 14 there is none.
@@ -556,6 +641,7 @@ impl MetalRenderThread {
             (driver, source)
         })?;
         retry.set_waker(thread.waker());
+        presentation.set_waker(thread.waker());
         output.set_panes(panes);
         output.set_waker(Some(thread.waker()));
         Ok(Self {
@@ -564,7 +650,9 @@ impl MetalRenderThread {
             output,
             surface: std::cell::Cell::new(surface),
             #[cfg(test)]
-            presented_size,
+            submitted_size,
+            #[cfg(test)]
+            presentation,
             #[cfg(test)]
             rows_rebuilt,
         })
@@ -581,11 +669,20 @@ impl MetalRenderThread {
             .unwrap_or(0)
     }
 
-    /// The drawable size of the last presented frame; `(0, 0)` before one.
+    /// The drawable size of the last submitted frame; `(0, 0)` before one.
     #[cfg(test)]
-    pub(crate) fn presented_size(&self) -> (u32, u32) {
-        let size = self.presented_size.load(Ordering::Relaxed);
+    pub(crate) fn submitted_size(&self) -> (u32, u32) {
+        let size = self.submitted_size.load(Ordering::Relaxed);
         ((size >> 32) as u32, size as u32)
+    }
+
+    #[cfg(test)]
+    fn presented_size(&self) -> [u32; 2] {
+        self.presentation
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .size
     }
 
     /// Publishes the window state for the next frame and asks for it.
@@ -777,6 +874,87 @@ fn request_panes(request: &MetalFrameRequest) -> Vec<PaneId> {
         }
     }
     panes
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    fn feedback(frame: u64, size: [u32; 2], displayed: bool) -> FramePresentation {
+        let submitted_at = Instant::now();
+        FramePresentation {
+            frame,
+            size,
+            submitted_at,
+            presented_time: if displayed { 100.125 } else { 0.0 },
+            presented_at: displayed.then_some(submitted_at + Duration::from_millis(125)),
+        }
+    }
+
+    #[test]
+    fn delayed_drawable_feedback_cannot_regress_resize_or_revive_old_retry() {
+        let feedback_state = PresentationFeedback::default();
+        let now = Instant::now();
+        feedback_state.observe(feedback(3, [800, 600], true));
+        feedback_state.observe(feedback(1, [640, 480], true));
+        feedback_state.observe(feedback(4, [1024, 768], false));
+        assert!(feedback_state.retry.wait_until(now).is_some());
+        feedback_state.observe(feedback(2, [640, 480], true));
+        assert!(
+            feedback_state.retry.wait_until(now).is_some(),
+            "an older displayed frame cancelled the newest skipped frame"
+        );
+        {
+            let state = feedback_state.state.lock().unwrap();
+            assert_eq!(state.size, [800, 600]);
+            assert_eq!(state.latest_presented, Some(3));
+            assert_eq!(state.unreported_presents, 3);
+        }
+        feedback_state.observe(feedback(5, [1200, 900], true));
+        feedback_state.observe(feedback(0, [1, 1], false));
+        assert_eq!(feedback_state.retry.wait_until(now), None);
+        let state = feedback_state.state.lock().unwrap();
+        assert_eq!(state.size, [1200, 900]);
+        assert_eq!(state.unreported_presents, 4);
+    }
+
+    struct IdleDriver;
+
+    impl FrameDriver for IdleDriver {
+        fn reconfigure(&mut self, _surface: &Surface) {}
+        fn frame(&mut self, _surface: &Surface) -> FrameReport {
+            FrameReport::default()
+        }
+    }
+
+    #[test]
+    fn early_presentation_is_counted_once_and_success_never_wakes_idle_rendering() {
+        let feedback_state = PresentationFeedback::default();
+        feedback_state.observe(feedback(0, [80, 40], true));
+        let thread = RenderThread::spawn(
+            "presentation-feedback-test".into(),
+            SurfaceState {
+                occluded: true,
+                ..SurfaceState::default()
+            },
+            Duration::from_millis(16),
+            || IdleDriver,
+        )
+        .unwrap();
+        feedback_state.set_waker(thread.waker());
+        assert_eq!(thread.stats().frames_presented, 1);
+        feedback_state.set_waker(thread.waker());
+        assert_eq!(thread.stats().frames_presented, 1);
+        let before = thread.stats();
+        feedback_state.observe(feedback(1, [80, 40], true));
+        let after = thread.stats();
+        assert_eq!(after.frames_presented, 2);
+        assert_eq!(after.frames_submitted, 0);
+        assert_eq!(after.wakes, before.wakes);
+        feedback_state.observe(feedback(2, [80, 40], false));
+        assert_eq!(thread.stats().frames_presented, 2);
+        assert_eq!(thread.stats().wakes, before.wakes + 1);
+    }
 }
 
 /// Native macOS tests: the real Metal renderer, unattached to a window
@@ -972,18 +1150,19 @@ mod tests {
     /// The acceptance test: while a thread named `main`, standing in for
     /// the AppKit thread, is blocked for 200 ms, output keeps reaching the
     /// pane's terminal, the delivering side wakes the render thread
-    /// directly, and real Metal frames of the pane keep being presented.
+    /// directly, and real Metal frames of the pane keep being submitted.
+    /// The unattached layer cannot establish on-screen presentation.
     ///
     /// The output is applied as the mux's pty reader applies parsed output.
     /// Writing to the pane's pty instead blocked once `cat`'s echo filled the
     /// pty buffers, since no reader drains them here.
     #[test]
-    fn frames_keep_presenting_while_the_main_thread_is_blocked() {
+    fn frames_keep_submitting_while_the_main_thread_is_blocked() {
         let pane = TestPane::new(9_412_001);
         let pane_id = pane.0.pane_id();
         let output = Arc::new(MetalOutputWake::default());
         let render = spawn(&pane, &output);
-        assert!(eventually(|| render.stats().frames_presented > 0));
+        assert!(eventually(|| render.stats().frames_submitted > 0));
 
         let before = render.stats();
         let feeding = std::sync::atomic::AtomicBool::new(true);
@@ -1021,14 +1200,14 @@ mod tests {
             blocked_for
         });
         let after = render.stats();
-        let presented = after.frames_presented - before.frames_presented;
+        let submitted = after.frames_submitted - before.frames_submitted;
         eprintln!(
-            "[BENCH] render thread: {presented} Metal frames presented while main was blocked for {blocked_for:?}"
+            "[BENCH] render thread: {submitted} Metal frames submitted while main was blocked for {blocked_for:?}"
         );
         // At most ~50 at the 4 ms interval; honest slack for a loaded host.
         assert!(
-            presented >= 10,
-            "{presented} frames presented while the main thread was blocked for {blocked_for:?}"
+            submitted >= 10,
+            "{submitted} frames submitted while the main thread was blocked for {blocked_for:?}"
         );
         assert!(!output.wake_for(pane_id + 1), "other panes do not wake it");
     }
@@ -1042,7 +1221,7 @@ mod tests {
         let pane_id = pane.0.pane_id();
         let output = Arc::new(MetalOutputWake::default());
         let render = spawn(&pane, &output);
-        assert!(eventually(|| render.stats().frames_presented > 0));
+        assert!(eventually(|| render.stats().frames_submitted > 0));
         const POSTS: u32 = 400;
         for n in 0..POSTS {
             render.post_surface(surface(800 + n, 500 + n / 2));
@@ -1053,9 +1232,9 @@ mod tests {
         }
         let last = (800 + POSTS - 1, 500 + (POSTS - 1) / 2);
         assert!(
-            eventually(|| render.presented_size() == last),
-            "the window shows {:?}, not the last size {:?}",
-            render.presented_size(),
+            eventually(|| render.submitted_size() == last),
+            "the last submission has size {:?}, expected {:?}",
+            render.submitted_size(),
             last
         );
         let stats = render.stats();
@@ -1067,27 +1246,20 @@ mod tests {
         );
     }
 
-    /// nv9: the throughput harness checks its FPS meter against the GUI's
-    /// own FrameLedger, which read 0 presents/s from a Metal window. Every
-    /// frame the render thread presents now counts there. Other tests may
-    /// present at the same time, so the ledger's growth is a lower bound.
+    /// An unattached layer proves GPU submission, not on-screen display.
+    /// The old test incorrectly counted every successful submit as a present.
     #[test]
-    fn every_presented_frame_counts_in_the_frame_ledger() {
+    fn unattached_layer_submissions_do_not_claim_displayed_frames() {
         let pane = TestPane::new(9_412_005);
         let pane_id = pane.0.pane_id();
         let output = Arc::new(MetalOutputWake::default());
-        let before = FrameLedger::global().snapshot().presented_total;
         let render = spawn(&pane, &output);
         assert!(eventually(|| {
             output.wake_for(pane_id);
-            render.stats().frames_presented >= 5
+            render.stats().frames_submitted >= 5
         }));
-        let presented = render.stats().frames_presented;
-        let counted = FrameLedger::global().snapshot().presented_total - before;
-        assert!(
-            counted >= presented,
-            "{presented} frames presented, {counted} counted in the frame ledger"
-        );
+        assert_eq!(render.stats().frames_presented, 0);
+        assert_eq!(render.presented_size(), [0, 0]);
     }
 
     /// Dropping the handle stops output wakes, then stops and joins the
@@ -1099,7 +1271,7 @@ mod tests {
         let pane_id = pane.0.pane_id();
         let output = Arc::new(MetalOutputWake::default());
         let render = spawn(&pane, &output);
-        assert!(eventually(|| render.stats().frames_presented > 0));
+        assert!(eventually(|| render.stats().frames_submitted > 0));
         assert!(render.is_running());
         assert!(output.wake_for(pane_id));
         let started = Instant::now();
@@ -1141,7 +1313,7 @@ mod tests {
             busy.vsync_ticks > 0,
             "the display link never ticked (is the test layer on a display?)"
         );
-        assert!(busy.frames_presented > 0, "no frame was presented");
+        assert!(busy.frames_submitted > 0, "no frame was submitted");
 
         // Quiet: within a few ticks the link pauses and stops ticking.
         std::thread::sleep(Duration::from_millis(200));
@@ -1219,12 +1391,12 @@ mod tests {
         assert!(eventually(|| {
             render.rows_rebuilt(active_id) > 0 && render.rows_rebuilt(inactive_id) > 0
         }));
-        // Settled: woken frames are presented and rebuild no row.
+        // Settled: woken frames are submitted and rebuild no row.
         let counts = || {
             (
                 render.rows_rebuilt(active_id),
                 render.rows_rebuilt(inactive_id),
-                render.stats().frames_presented,
+                render.stats().frames_submitted,
             )
         };
         assert!(
@@ -1255,7 +1427,7 @@ mod tests {
         // A few more frames, each woken by the inactive pane.
         assert!(eventually(|| {
             output.wake_for(inactive_id);
-            render.stats().frames_presented >= frames_before + 3
+            render.stats().frames_submitted >= frames_before + 3
         }));
         let (active_after, inactive_after, frames_after) = counts();
         let rebuilt = inactive_after - inactive_before;

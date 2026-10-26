@@ -57,6 +57,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
+    # MTLDrawable.presentedTime is a CFTimeInterval.
+    "objc2-core-foundation",
     "MTL4ArgumentTable",
     "MTL4CommandAllocator",
     "MTL4CommandBuffer",

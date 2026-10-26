@@ -107,9 +107,9 @@
 //!    Record writes check the entire slice's byte count before serializing;
 //!    each initialized record array is copied within that checked range,
 //!    without constructing references to uninitialized GPU memory.
-//! 6. **FFI-BLOCK: completion handlers.** `addCompletedHandler:` (Metal 3)
-//!    and `addFeedbackHandler:` (Metal 4) take an Objective-C block, and the
-//!    handler dereferences the command buffer or feedback object Metal passes.
+//! 6. **FFI-BLOCK: completion handlers.** `addCompletedHandler:` (Metal 3),
+//!    `addFeedbackHandler:` (Metal 4) and `addPresentedHandler:` take an
+//!    Objective-C block. The handler borrows only the object Metal passes.
 //!    *Invariant:* Metal copies the block, so the local `RcBlock` may drop
 //!    after the call; the closure owns only `Send + Sync + 'static` state (a
 //!    `CompletionToken`, an `Arc<AtomicU64>` and an optional owned completion
@@ -118,6 +118,9 @@
 //!    object Metal passes is valid for the duration of the handler. The slot
 //!    is freed before notifying the observer, which receives only a copied
 //!    frame id and success flag, never a native object or renderer reference.
+//!    Presentation handlers retain only owned counters, timing/extent values
+//!    and an optional Send + Sync observer; they neither retain a drawable
+//!    nor hold a frame slot. They are registered before requesting presentation.
 //! 7. **FFI-COMMIT: Metal 4 commit.** `commit:count:options:` takes a C
 //!    array of command buffers.
 //!    *Invariant:* the pointer addresses a live one-element array for the
@@ -355,6 +358,60 @@ pub struct FrameCompletion {
 /// use owned thread-safe state to request recovery on the render thread.
 pub type FrameCompletionHandler = std::sync::Arc<dyn Fn(FrameCompletion) + Send + Sync + 'static>;
 
+/// Actual drawable feedback, independent of GPU command completion. A
+/// successful submission can still be skipped by the window server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramePresentation {
+    /// The same renderer-local sequence as [`FrameCompletion::frame`].
+    pub frame: u64,
+    /// The drawable's actual texture extent, not the layer's current size.
+    pub size: [u32; 2],
+    /// Sampled immediately before the presentation request is submitted.
+    pub submitted_at: std::time::Instant,
+    /// Metal's `presentedTime`, in host-clock seconds. Zero means skipped.
+    pub presented_time: f64,
+    /// The actual host timestamp mapped to Rust's monotonic clock. `None`
+    /// means skipped or invalid timing; it never substitutes callback time.
+    pub presented_at: Option<std::time::Instant>,
+}
+
+impl FramePresentation {
+    #[cfg(any(target_os = "macos", test))]
+    fn from_host_time(
+        frame: u64,
+        size: [u32; 2],
+        submitted_at: std::time::Instant,
+        submitted_host: f64,
+        presented_time: f64,
+    ) -> Self {
+        let presented_at = if submitted_host.is_finite()
+            && submitted_host > 0.0
+            && presented_time.is_finite()
+            && presented_time > 0.0
+            && presented_time >= submitted_host
+        {
+            std::time::Duration::try_from_secs_f64(presented_time - submitted_host)
+                .ok()
+                .and_then(|elapsed| submitted_at.checked_add(elapsed))
+        } else {
+            None
+        };
+        Self {
+            frame,
+            size,
+            submitted_at,
+            presented_time,
+            presented_at,
+        }
+    }
+}
+
+/// Called on a Metal-managed thread after the drawable's presentation
+/// decision. Observers must not panic or retain the renderer/drawable. A
+/// GPU completion can precede or follow this callback; it remains separate.
+pub type FramePresentationHandler =
+    std::sync::Arc<dyn Fn(FramePresentation) + Send + Sync + 'static>;
+
 /// Frame pacing and allocation counters of a [`MetalRenderer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameStats {
@@ -363,6 +420,13 @@ pub struct FrameStats {
     pub frames_completed: u64,
     /// Frames whose command buffer finished in error.
     pub frames_failed: u64,
+    /// Drawables with a valid, nonzero actual presentation timestamp.
+    pub frames_presented: u64,
+    /// Drawable callbacks with no valid presentation timestamp.
+    pub frames_skipped: u64,
+    /// Submitted drawables whose platform exposes no presentation callback.
+    /// These count as neither presented nor skipped.
+    pub presentation_unavailable: u64,
     /// Frames committed and not yet finished.
     pub in_flight: usize,
     /// The most frames ever in flight at once (at most [`FRAME_SLOTS`]).
@@ -696,8 +760,9 @@ impl FrameScene<'_> {
 /// The outcome of a successfully encoded frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
-    /// A drawable was cleared, scheduled for presentation and committed.
-    Presented,
+    /// A drawable was scheduled for presentation and committed. This says
+    /// nothing about GPU success or whether the drawable reaches the display.
+    Submitted,
     /// The window has a zero-sized extent, so there was nothing to draw.
     ZeroSize,
     /// The drawable a display link handed over predates a resize
@@ -805,6 +870,33 @@ fn window_handle_kind(handle: &raw_window_handle::RawWindowHandle) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_presentation_time_does_not_depend_on_callback_arrival() {
+        // The callback is being processed long after both submit and display.
+        let submitted = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let event = FramePresentation::from_host_time(7, [640, 480], submitted, 100.0, 100.125);
+        assert_eq!(event.frame, 7);
+        assert_eq!(event.size, [640, 480]);
+        assert_eq!(event.presented_time, 100.125);
+        assert_eq!(
+            event.presented_at,
+            Some(submitted + std::time::Duration::from_millis(125))
+        );
+    }
+
+    #[test]
+    fn skipped_or_invalid_presentation_timestamps_never_become_presents() {
+        let submitted = std::time::Instant::now();
+        for timestamp in [0.0, -1.0, 99.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            let event = FramePresentation::from_host_time(1, [1, 1], submitted, 100.0, timestamp);
+            assert!(event.presented_at.is_none(), "{timestamp}");
+        }
+        for anchor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let event = FramePresentation::from_host_time(1, [1, 1], submitted, anchor, 101.0);
+            assert!(event.presented_at.is_none(), "{anchor}");
+        }
+    }
     use std::num::NonZeroU32;
 
     fn probe(name: &str, unified: bool, families: &[GpuFamily]) -> DeviceCapabilities {

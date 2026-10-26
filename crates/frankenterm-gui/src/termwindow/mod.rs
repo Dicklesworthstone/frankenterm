@@ -5416,7 +5416,7 @@ impl TermWindow {
                     // ft-yccm0.4.2.1: the frame slots are sized for the grid.
                     None => metal.render_clear(width, height, request.grid, request.clear),
                 };
-                if let (Ok(frankenterm_renderer_metal::FrameOutcome::Presented), Some(path)) =
+                if let (Ok(frankenterm_renderer_metal::FrameOutcome::Submitted), Some(path)) =
                     (&outcome, snapshot_path)
                 {
                     // The panes are shaped now: a frame not final yet
@@ -5447,13 +5447,11 @@ impl TermWindow {
             self.defer_render_snapshot(readiness);
         }
         match outcome {
-            Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
-                // The GUI's own presented-frame count and cap, which the
-                // throughput harness checks its FPS meter against
-                // (ft-yccm0.1.4), as the WebGpu paint records them.
+            Ok(frankenterm_renderer_metal::FrameOutcome::Submitted) => {
+                // Native drawable callbacks record actual presentation;
+                // command submission alone does not mean this frame appeared.
                 let frames = frankenterm_alloc::resource_ledger::FrameLedger::global();
                 frames.set_max_fps(self.config.max_fps);
-                frames.record_present();
                 self.settle_presented_selection_frames(captured_generation.value, 0);
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,

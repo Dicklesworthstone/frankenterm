@@ -137,6 +137,13 @@ impl MetalRenderer {
         match *self {}
     }
 
+    pub fn set_frame_presentation_handler(
+        &self,
+        _handler: Option<crate::FramePresentationHandler>,
+    ) {
+        match *self {}
+    }
+
     #[must_use]
     pub fn frame_stats(&self) -> FrameStats {
         match *self {}
