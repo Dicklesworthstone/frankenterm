@@ -17,10 +17,11 @@
 //! Glyph instances live in fixed regions, `capacity` instances per ring row
 //! ([`text_region`]), so one row's upload never moves another row. Unused
 //! instances in a region are zero: no glyph and no decoration, so the vertex
-//! shader collapses them to an empty quad and the text draw covers
-//! `rows * capacity` instances. The capacity starts at one instance per cell
-//! (or the fullest row) and grows by half when a row outgrows it, which
-//! re-lays the slot out once.
+//! shader collapses them to an empty quad. Buffers reserve `rows * capacity`
+//! instances, but the text draw ends at the last populated ring row's last
+//! instance; entirely empty grids submit no text draw. The capacity starts
+//! at one instance per cell (or the fullest row) and grows by half when a
+//! row outgrows it, which re-lays the slot out once.
 
 use crate::cell_bg::CellBgGrid;
 use crate::cell_text::CellTextGrid;
@@ -106,10 +107,23 @@ impl UploadPlan {
         self.cell_rows.len() as u64 * cell_row + self.text_rows.len() as u64 * text_row
     }
 
-    /// Instances the text draw covers for a grid of `extent`.
+    /// Instances reserved in the slot for a grid of `extent`. Buffer sizing
+    /// must use this full layout even when [`Self::draw_instances`] is smaller.
     #[must_use]
     pub fn instances(&self, extent: GridExtent) -> usize {
         usize::try_from(u64::from(extent.rows) * u64::from(self.capacity)).unwrap_or(usize::MAX)
+    }
+
+    /// The fixed-layout prefix that contains every text instance. Empty
+    /// regions before the last glyph retain their positions, while trailing
+    /// padding and empty rows need no vertex shader invocations.
+    #[must_use]
+    pub fn draw_instances(&self, text: &CellTextGrid) -> usize {
+        text.last_nonempty_ring_row().map_or(0, |row| {
+            let count = text.ring_row_len(row).min(self.capacity as usize);
+            row.saturating_mul(self.capacity as usize)
+                .saturating_add(count)
+        })
     }
 }
 
@@ -579,6 +593,48 @@ mod tests {
         assert!(grown.capacity >= 5);
     }
 
+    #[test]
+    fn text_draws_trim_only_the_unused_suffix_of_the_full_ring_layout() {
+        let (cells, mut text) = grids(6, 4);
+        let mut slot = SlotModel::default();
+        let empty = slot.upload(&cells, &text);
+        assert_eq!(empty.instances(cells.extent()), 24);
+        assert_eq!(empty.draw_instances(&text), 0);
+        assert_eq!(slot.text.len(), 24 * CELL_TEXT_INSTANCE_BYTES);
+        assert_eq!(empty.bytes(cells.extent()), 6 * (4 * 4 + 4 * 24 + 16));
+
+        text.push(0, CellText::new(1, [1, 2, 3, 255]));
+        let first = slot.upload(&cells, &text);
+        assert_eq!(first.draw_instances(&text), 1);
+        text.push(3, CellText::new(0, [4, 5, 6, 255]));
+        text.push(3, CellText::new(2, [7, 8, 9, 255]));
+        let sparse = slot.upload(&cells, &text);
+        assert_eq!(sparse.instances(cells.extent()), 24);
+        assert_eq!(
+            sparse.draw_instances(&text),
+            14,
+            "internal empty regions keep their offsets"
+        );
+        assert_eq!(slot.upload(&cells, &text).draw_instances(&text), 14);
+
+        text.clear_row(3);
+        let shorter = slot.upload(&cells, &text);
+        assert_eq!(shorter.draw_instances(&text), 1);
+        assert_eq!(
+            shorter.bytes(cells.extent()),
+            4 * 24 + 16,
+            "the old row is still cleared in full"
+        );
+        assert_eq!(slot.text.len(), 24 * CELL_TEXT_INSTANCE_BYTES);
+        assert!(
+            slot.text[CELL_TEXT_INSTANCE_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        text.clear_row(0);
+        assert_eq!(slot.upload(&cells, &text).draw_instances(&text), 0);
+    }
+
     /// Randomized writes, clears, scrolls, new grids and resizes: every
     /// slot's buffers equal the full-rebuild layout of the current grids
     /// after each frame it receives.
@@ -633,6 +689,23 @@ mod tests {
             );
             assert_eq!(slot.text, expected_text, "frame {frame}: glyph instances");
             assert_eq!(slot.table, expected_table, "frame {frame}: row table");
+            // A full row scan is the independent oracle for the cached tail.
+            let last = (0..text.ring_rows())
+                .rev()
+                .find(|&row| text.ring_row_len(row) > 0);
+            assert_eq!(text.last_nonempty_ring_row(), last, "frame {frame}: tail");
+            let drawn = plan.draw_instances(&text);
+            let expected_drawn = last.map_or(0, |row| {
+                row * plan.capacity as usize + text.ring_row_len(row)
+            });
+            assert_eq!(drawn, expected_drawn, "frame {frame}: draw prefix");
+            assert!(drawn <= plan.instances(cells.extent()));
+            assert!(
+                slot.text[drawn * CELL_TEXT_INSTANCE_BYTES..]
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "frame {frame}: omitted instances are empty"
+            );
         }
     }
 }

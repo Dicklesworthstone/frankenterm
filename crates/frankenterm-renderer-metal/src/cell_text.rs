@@ -294,6 +294,10 @@ pub struct CellTextGrid {
     /// The instance bytes of each ring row, so a row uploads as one slice;
     /// cleared rows keep their capacity.
     ring: Vec<Vec<[u8; CELL_TEXT_INSTANCE_BYTES]>>,
+    /// One bit per nonempty ring row, so clearing the last occupied row
+    /// finds its predecessor by words rather than scanning every row.
+    occupied_rows: Vec<u64>,
+    last_nonempty_ring_row: Option<usize>,
     len: usize,
     changes: RowChanges,
 }
@@ -319,6 +323,8 @@ impl CellTextGrid {
             cols: extent.cols,
             row_offset: 0,
             ring: (0..stored).map(|_| Vec::new()).collect(),
+            occupied_rows: vec![0; stored.div_ceil(64)],
+            last_nonempty_ring_row: None,
             len: 0,
             changes: RowChanges::new(stored),
         }
@@ -334,6 +340,14 @@ impl CellTextGrid {
     #[must_use]
     pub fn ring_rows(&self) -> usize {
         self.ring.len()
+    }
+
+    /// The last ring row holding an instance, independent of the logical
+    /// scroll offset. Cached so a draw can omit the unused suffix without
+    /// scanning the grid each frame.
+    #[must_use]
+    pub fn last_nonempty_ring_row(&self) -> Option<usize> {
+        self.last_nonempty_ring_row
     }
 
     /// The instances in ring row `ring_row`.
@@ -391,6 +405,13 @@ impl CellTextGrid {
             return false;
         };
         let ring_row = u16::try_from(index).expect("ring rows past u16::MAX are not stored");
+        if self.ring[index].is_empty() {
+            self.occupied_rows[index / 64] |= 1_u64 << (index % 64);
+            self.last_nonempty_ring_row = Some(
+                self.last_nonempty_ring_row
+                    .map_or(index, |last| last.max(index)),
+            );
+        }
         self.ring[index].push(instance.with_ring_row(ring_row).0);
         self.len += 1;
         self.changes.touch(index);
@@ -404,6 +425,19 @@ impl CellTextGrid {
         {
             self.len -= self.ring[index].len();
             self.ring[index].clear();
+            self.occupied_rows[index / 64] &= !(1_u64 << (index % 64));
+            if self.last_nonempty_ring_row == Some(index) {
+                self.last_nonempty_ring_row = self.occupied_rows[..=index / 64]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(word, bits)| {
+                        (*bits != 0).then(|| {
+                            word * 64
+                                + usize::try_from(bits.ilog2()).expect("a bit index fits usize")
+                        })
+                    });
+            }
             self.changes.touch(index);
         }
     }
@@ -883,6 +917,68 @@ mod tests {
         text.scroll_up(10);
         assert!(text.is_empty());
         CellTextGrid::new(GridExtent::default()).scroll_up(1);
+    }
+
+    #[test]
+    fn occupied_row_tail_tracks_word_boundaries_and_clones() {
+        let mut text = CellTextGrid::new(GridExtent::new(130, 3));
+        assert_eq!(text.last_nonempty_ring_row(), None);
+        for row in [0, 63, 64, 127, 129] {
+            assert!(text.push(row, CellText::new(0, WHITE)));
+            assert_eq!(
+                text.last_nonempty_ring_row(),
+                Some(usize::try_from(row).unwrap())
+            );
+        }
+        let mut cloned = text.clone();
+        cloned.clear_row(129);
+        assert_eq!(cloned.last_nonempty_ring_row(), Some(127));
+        assert_eq!(text.last_nonempty_ring_row(), Some(129));
+        text.clear_row(0);
+        assert_eq!(text.last_nonempty_ring_row(), Some(129));
+        for (row, last) in [
+            (129, Some(127)),
+            (127, Some(64)),
+            (64, Some(63)),
+            (63, None),
+        ] {
+            text.clear_row(row);
+            assert_eq!(text.last_nonempty_ring_row(), last);
+        }
+        assert!(text.is_empty());
+        assert!(text.occupied_rows.iter().all(|word| *word == 0));
+        assert!(!text.push(130, CellText::new(0, WHITE)));
+        assert!(!text.push(0, CellText::new(3, WHITE)));
+        text.clear_row(130);
+        assert_eq!(text.last_nonempty_ring_row(), None);
+    }
+
+    #[test]
+    fn occupied_row_tail_follows_both_scroll_directions() {
+        let mut text = CellTextGrid::new(GridExtent::new(6, 3));
+        for row in [0, 2, 5] {
+            text.push(row, CellText::new(0, WHITE));
+        }
+        text.scroll_up(1);
+        assert_eq!(text.last_nonempty_ring_row(), Some(5));
+        // Logical row 5 now occupies physical ring row 0.
+        text.push(5, CellText::new(0, WHITE));
+        assert_eq!(text.last_nonempty_ring_row(), Some(5));
+        // Scrolling down exposes ring rows 5 and 0, leaving only row 2.
+        text.scroll_down(2);
+        assert_eq!(text.row_offset(), 5);
+        assert_eq!(text.last_nonempty_ring_row(), Some(2));
+        text.push(0, CellText::new(0, WHITE));
+        assert_eq!(text.last_nonempty_ring_row(), Some(5));
+        text.clear_row(0);
+        assert_eq!(text.last_nonempty_ring_row(), Some(2));
+        text.scroll_up(6);
+        assert!(text.is_empty());
+        assert_eq!(text.last_nonempty_ring_row(), None);
+        assert_eq!(
+            CellTextGrid::new(GridExtent::default()).last_nonempty_ring_row(),
+            None
+        );
     }
 
     #[test]
