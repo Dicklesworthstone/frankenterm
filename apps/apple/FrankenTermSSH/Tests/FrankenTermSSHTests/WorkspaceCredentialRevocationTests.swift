@@ -211,8 +211,13 @@ final class WorkspaceCredentialRevocationTests: XCTestCase {
                     key: fixture.host, confirmedByUser: true)
                 XCTFail("A failed write was reported as a saved refusal")
             } catch { XCTAssertEqual(error as? FTError, .storage) }
+            // This run of the app refuses the key whether or not it was saved;
+            // a relaunch knows only what was saved.
             let observed = try await refuses(fixture.store, fixture.installed.id, fixture.host)
-            XCTAssertEqual(observed, afterPublication)
+            XCTAssertTrue(observed, "a refusal whose write failed still holds")
+            let relaunched = try await refuses(WorkspaceStore(persistence: persistence, vault: fixture.vault),
+                                               fixture.installed.id, fixture.host)
+            XCTAssertEqual(relaunched, afterPublication)
             let receipt = try await manager.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",
                 key: fixture.host, confirmedByUser: true)
             XCTAssertEqual(receipt.affectedWorkspaceIDs, [fixture.installed.id])

@@ -49,6 +49,8 @@ struct ftssh_session {
     uint8_t write_buffer[FTSSH_WRITE_CAPACITY];
     size_t write_length, write_offset;
     uint64_t accepted, written, received;
+    /* Bytes the transport handed to its socket or outer channel. */
+    uint64_t sent;
     size_t receive_budget;
     int limited_receive, output_eof;
 };
@@ -109,6 +111,7 @@ static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length,
         if(count < 0 || (size_t)count > length || p->socket_failed) {
             s->socket_failed = 1; return -ECONNRESET;
         }
+        s->sent += (uint64_t)count;
         return count;
     }
 #ifdef MSG_NOSIGNAL
@@ -116,6 +119,7 @@ static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length,
 #endif
     ssize_t result = send(fd, data, length, flags);
     if((result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) || (!result && length)) s->socket_failed = 1;
+    if(result > 0) s->sent += (uint64_t)result;
     return result < 0 ? -errno : result;
 }
 static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, int flags, void **abstract) {
@@ -627,10 +631,14 @@ int ftssh_keepalive(ftssh_session *s) {
     if(queued < 0 || getsockopt(s->fd, SOL_SOCKET, SO_SNDBUF, &capacity, &length)) return FTSSH_UNSUPPORTED;
     if(capacity - queued < (s->parent ? 8192 : 4096)) return FTSSH_AGAIN;
     int next = 0;
+    uint64_t sent = s->sent;
     if(libssh2_keepalive_send(s->ssh, &next)) return fail(s, FTSSH_IO);
     /* Still pending despite the room checked above: fail rather than block input. */
     if((libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) ||
        (s->parent && (libssh2_session_block_directions(s->parent->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND))) return fail(s, FTSSH_IO);
+    /* libssh2 skips a keepalive within 2 s of its last (by whole seconds of
+     * wall time) and still reports success: nothing left, no reply is due. */
+    if(s->sent == sent) return FTSSH_AGAIN;
     return FTSSH_OK;
 }
 int ftssh_directions(ftssh_session *s) {

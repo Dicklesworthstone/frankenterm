@@ -82,7 +82,7 @@ for name, result, args in [
     ("ftssh_admit_write", I, [P, P, Z]), ("ftssh_flush_write", I, [P]),
     ("ftssh_read", I, [P, P, Z, C.POINTER(Z)]),
     ("ftssh_completion_step", I, [P, C.POINTER(Completion)]),
-    ("ftssh_resize", I, [P, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32]),
+    ("ftssh_resize", I, [P, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32]), ("ftssh_keepalive", I, [P]),
     ("ftssh_directions", I, [P]), ("ftssh_descriptor", I, [P]),
     ("ftssh_get_stats", I, [P, C.POINTER(Stats)]), ("ftssh_close", I, [P]), ("ftssh_destroy", I, [C.POINTER(P)]),
 ]:
@@ -681,6 +681,21 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(guarded.before, 0x123456789abcdef0)
         self.assertEqual(guarded.after, 0xfedcba9876543210)
         self.assertGreater(guarded.stats.received, 0)
+
+    def test_a_keepalive_libssh2_holds_back_is_reported_as_not_sent(self):
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertEqual(DRIVER.ftssh_keepalive(handle), 0)
+        # Once the socket buffer is empty again (the 4 KiB one start() sets
+        # defers any probe while bytes are queued), libssh2 is asked, and it
+        # sends at most one per 2 s, reporting a skipped one as sent: no
+        # reply is due for it.
+        time.sleep(0.3)
+        self.assertEqual(DRIVER.ftssh_keepalive(handle), 1)
+        time.sleep(3)
+        self.assertEqual(DRIVER.ftssh_keepalive(handle), 0)
 
     def test_completion_control_flood_yields_after_bounded_receive_quantum(self):
         handle, server, key = self.start(completion="controlFlood")

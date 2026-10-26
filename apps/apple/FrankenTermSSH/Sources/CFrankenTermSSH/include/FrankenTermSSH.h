@@ -126,7 +126,8 @@ int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,
 /* Liveness probe for a live shell: one keepalive request that asks the server
  * to reply, so a responsive server's bytes advance received_bytes. Call at
  * least 2 s apart. AGAIN means nothing was sent (a write, resize or library
- * packet is pending, or the socket buffer is nearly full); UNSUPPORTED means
+ * packet is pending, the socket buffer is nearly full, or libssh2 held back a
+ * probe within 2 s of its last); UNSUPPORTED means
  * the platform cannot report queued socket bytes. Never leaves a half-sent
  * packet that would block later writes: if one remains, the session fails. */
 int ftssh_keepalive(ftssh_session *session);

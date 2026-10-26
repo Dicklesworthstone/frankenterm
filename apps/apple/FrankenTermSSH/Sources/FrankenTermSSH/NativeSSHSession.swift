@@ -36,6 +36,19 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
         }
     }
 
+    /// The machine's SSH server answered, and another attempt would get the
+    /// same answer: its encryption, host key or key policy ended this one. A
+    /// reset, a close or a timeout says nothing about the next attempt.
+    public var isMachineAnswer: Bool {
+        switch self {
+        case .invalidChallenge, .jumpAuthenticationRequired: true
+        case let .native(code):
+            [FTSSH_NEGOTIATION, FTSSH_HOST_REJECTED, FTSSH_AUTH_REJECTED, FTSSH_CHALLENGE, FTSSH_UNSUPPORTED,
+             FTSSH_AUTH_FAILED].contains(Int(code))
+        default: false
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .invalidInput: "The connection settings are not valid."

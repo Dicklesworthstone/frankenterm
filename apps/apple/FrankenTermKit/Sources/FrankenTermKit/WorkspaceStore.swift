@@ -283,6 +283,10 @@ public actor WorkspaceStore {
     private let vault: any WorkspaceCredentialVault
     private let sshAuthorizationOwner = UUID()
     private let credentialImportOwner = UUID()
+    /// Host-key refusals made in this process. A refusal whose write failed
+    /// still holds until the app quits; a retry saves it.
+    private var processHostRevocations: Set<HostRevocation> = []
+    private var processScopedHostRevocations: Set<ScopedHostRevocation> = []
     private static let catalogLimit = 16 * 1024 * 1024
     private static let journalLimit = 128 * 1024
     static let importHistoryLimit = 4096
@@ -826,10 +830,14 @@ public actor WorkspaceStore {
             try recover(catalog: &catalog)
             guard let workspace = catalog.workspaces.first(where: { $0.id == workspaceID }),
                   let trust = try workspace.document().hostTrust.first(where: { $0.id == trustID }) else { throw FTError.stale }
-            catalog.hostRevocations.insert(.init(host: trust.host, port: trust.port, key: key))
-            catalog.scopedHostRevocations.insert(.init(workspaceID: workspaceID, scope: trust.canonicalTrustScope, key: key))
+            let endpoint = HostRevocation(host: trust.host, port: trust.port, key: key)
+            let scoped = ScopedHostRevocation(workspaceID: workspaceID, scope: trust.canonicalTrustScope, key: key)
+            catalog.hostRevocations.insert(endpoint)
+            catalog.scopedHostRevocations.insert(scoped)
             guard catalog.hostRevocations.count <= Self.hostRevocationLimit,
                   catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit else { throw FTError.limit("store.host_revocations") }
+            processHostRevocations.insert(endpoint)
+            processScopedHostRevocations.insert(scoped)
             try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
         }
     }
@@ -845,6 +853,7 @@ public actor WorkspaceStore {
                 throw FTError.limit("store.host_revocations")
             }
             catalog.hostRevocations.insert(entry)
+            processHostRevocations.insert(entry)
             try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
         }
     }
@@ -997,11 +1006,13 @@ public actor WorkspaceStore {
     private func hostRevocations(_ workspaceID: UUID?, document: WorkspaceDocument,
                                  catalog: Catalog) -> [String: Set<WorkspaceDocument.HostKey>] {
         var result: [String: Set<WorkspaceDocument.HostKey>] = [:]
-        for revocation in catalog.scopedHostRevocations where revocation.workspaceID == workspaceID {
+        for revocation in catalog.scopedHostRevocations.union(processScopedHostRevocations)
+        where revocation.workspaceID == workspaceID {
             result[revocation.scope, default: []].insert(revocation.key)
         }
+        let endpoints = catalog.hostRevocations.union(processHostRevocations)
         for trust in document.hostTrust {
-            result[trust.canonicalTrustScope, default: []].formUnion(catalog.hostRevocations.filter {
+            result[trust.canonicalTrustScope, default: []].formUnion(endpoints.filter {
                 $0.host == trust.host && $0.port == trust.port
             }.map(\.key))
         }

@@ -188,6 +188,9 @@ public actor WorkspaceNativeSSHConnection {
             throw NativeSSHError.jumpConnectionFailed
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            // No answer from the hop stays that: the caller tries the next
+            // route and says the jump host could not be reached.
+            if let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
             throw NativeSSHError.jumpConnectionFailed
         }
     }
@@ -469,8 +472,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     private var nextLivenessProbe: ContinuousClock.Instant?
     /// The device took a new network route since the last liveness check.
     private var routeChanged = false
-    /// When a keepalive last left. libssh2 sends at most one per 2 s and
-    /// reports a skipped one as sent.
+    /// When a keepalive last left. libssh2 sends at most one per 2 s, by its
+    /// own whole-second clock; one it holds back comes back deferred.
     private var lastProbe: ContinuousClock.Instant?
     private static let probeSpacing: Duration = .seconds(2)
     private var mux: MuxAttachment?
@@ -945,10 +948,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     nextLivenessProbe = lastProbe + Self.probeSpacing
                     return
                 }
+                let (received, silent, deadline) = (lastReceived, silentIntervals, nextLivenessProbe)
                 routeChanged = false
                 lastReceived = event.accounting.receivedBytes; silentIntervals = liveness.missedReplies
                 nextLivenessProbe = now + liveness.interval
-                try await probe(driver: driver, now: now)
+                if try await probe(driver: driver, now: now) || !probing { return }
+                // Nothing left (a write or packet was pending, or libssh2 held
+                // it back), so no reply is due: the deadlines stand as they
+                // were, and the next turn tries again after the spacing.
+                (lastReceived, silentIntervals) = (received, silent)
+                routeChanged = true
+                nextLivenessProbe = min(deadline ?? now + Self.probeSpacing, now + Self.probeSpacing)
                 return
             }
             routeChanged = false
@@ -972,11 +982,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         try await probe(driver: driver, now: now)
     }
 
-    private func probe(driver: NativeSSHDriver, now: ContinuousClock.Instant) async throws {
+    /// True when the keepalive left.
+    @discardableResult
+    private func probe(driver: NativeSSHDriver, now: ContinuousClock.Instant) async throws -> Bool {
         switch try await session.keepalive(driver: driver) {
-        case .sent: lastProbe = now
-        case .deferred: break
-        case .unavailable: probing = false
+        case .sent: lastProbe = now; return true
+        case .deferred: return false
+        case .unavailable: probing = false; return false
         }
     }
 
