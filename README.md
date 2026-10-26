@@ -571,7 +571,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 **When ft might not be ideal:**
 - Single-shell / single-agent usage where orchestration is unnecessary
 - Environments that only need a lightweight interactive terminal and no swarm control plane
-- Use cases that require a non-WezTerm mux backend (by design, `ft` is a wezterm-fork)
+- Use cases that require driving a different mux backend (tmux, Zellij, kitty) — by design, `ft` runs on its own in-tree terminal engine, not an abstraction over arbitrary multiplexers
 
 ---
 
@@ -690,9 +690,9 @@ Live collectors snapshot the world at the moment of failure. The bundle is porta
 
 ---
 
-## Why a WezTerm Fork
+## Why FrankenTerm Owns Its Terminal Engine
 
-`ft` is a **wezterm-fork mux runtime**, not an abstraction layer over arbitrary terminal multiplexers. This is a deliberate architectural decision; understanding the rationale clarifies the project's scope.
+FrankenTerm runs on its own terminal engine — a fully vendored, **in-tree** fork of WezTerm's `mux`/`termwiz`/`term` crates that the project now owns and has diverged, not a live dependency on upstream WezTerm and not an abstraction layer over arbitrary terminal multiplexers. The terminal-emulation core *began* as a WezTerm fork; everything built on top of it — the watcher capture loop, the pattern/change-point engine, Robot Mode + MCP, missions and transactions, the policy gate, and the operating-envelope contract — is FrankenTerm's own. This section explains why that engine is vendored and owned rather than wrapped, and how upstream fixes are still harvested.
 
 ### The decision
 
@@ -4361,7 +4361,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 
 ### What ft doesn't do yet
 
-- **A non-WezTerm mux backend** — by design. `ft` is a wezterm-fork (per ft-zoxxq stance), not an abstraction layer over arbitrary mux engines.
+- **Driving a different mux backend** (tmux, Zellij, kitty) — by design. `ft` runs on its own vendored, in-tree terminal engine, not an abstraction layer over arbitrary mux engines.
 - **Live remote-pane text reads in distributed mode** — remote panes are searchable and visible in state, but `get-text` is intentionally unavailable there.
 - **Arbitrary GUI automation** — the core product is terminal / state orchestration, not desktop automation.
 - **Green release gates across every finish-line lane** — the release-gate machinery exists, but the current gate status still depends on the latest artifact bundles. Specifically, the high-scale memory envelope wording for 200+ panes is held back until the target-class hardware gate signs a non-skipped artifact (currently `skipped_not_proven`).

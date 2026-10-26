@@ -5,7 +5,7 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release is `v0.15.21` (2026-10-14), the first GitHub Release since `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Versions `0.15.2` through `0.15.12` were local builds and release-candidate git tags without GitHub Releases; their changes ship in `0.15.21`.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published **GitHub Release** is `v0.15.1` (2026-08-21). `v0.15.21` (2026-10-14) is the newest **git tag** and the current shipping build, but it has **no GitHub Release** (`gh release view v0.15.21` → not found). The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Versions `0.15.2` through `0.15.20` are local builds and release-candidate git tags without GitHub Releases; their changes ship in the `v0.15.21` build.
 
 Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through the local `0.15.2` build (2026-09-05) and subsequent development. The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
@@ -16,7 +16,7 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main) | HEAD | — | Next public release |
-| [v0.15.21](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Release | 2026-10-14 | Idle GUI windows stop repainting, smaller GPU atlases, tab order kept across restarts, macOS 11+ bundles, vendored-library and rustls security updates |
+| [v0.15.21](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Tag (current build; no Release) | 2026-10-14 | Idle GUI windows stop repainting, smaller GPU atlases, tab order kept across restarts, macOS 11+ bundles, vendored-library and rustls security updates |
 | `v0.15.2` | Local build; no current GitHub Release | 2026-09-05 | CLI finds the GUI, mux survives connects, `ft web` answers and streams live; signing and installer verification implemented |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
@@ -29,13 +29,49 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ## [Unreleased]
 
-Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main>
+Compare against the latest tag: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.21...main>
 
-## [0.15.21] -- 2026-10-14 (GitHub Release)
+Development since the `v0.15.21` tag (2026-10-14 → 2026-10-25; 723 non-merge commits). The headline work is a **native iOS / Apple FrankenTerm client** that attaches to the muxes running on a Mac, alongside air-gapped QR workspace transfer, guardian/recovery/checkpoint durability hardening, and a terminal-rendering performance pass. None of this is a published GitHub Release yet — the latest GitHub Release remains [`v0.15.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1).
+
+### Native iOS / Apple client
+
+New workspace members `apps/ios`, `apps/apple`, `crates/frankenterm-mobile-mux`, and `crates/frankenterm-mobile-attach` bring a first-class iOS app that attaches to a FrankenTerm mux on a Mac. Machines exported from the desktop sign in on the phone in the background, an SSH PTY attaches to a single mux pane, and a hardware keyboard switches machines and panes. The mux protocol gained phone-facing delivery signals — marking output the phone has not yet shown and flagging sent input that is still unanswered — plus bounded output delivery that no longer drops parser state under backpressure.
+
+- Representative commits: [`2522a81`](https://github.com/Dicklesworthstone/frankenterm/commit/2522a8132), [`0f72298`](https://github.com/Dicklesworthstone/frankenterm/commit/0f722986f), [`1b62c71`](https://github.com/Dicklesworthstone/frankenterm/commit/1b62c7097), [`8f4f934`](https://github.com/Dicklesworthstone/frankenterm/commit/8f4f934f8), [`31d447c`](https://github.com/Dicklesworthstone/frankenterm/commit/31d447c63), [`edc608d`](https://github.com/Dicklesworthstone/frankenterm/commit/edc608d7e), [`381c08e`](https://github.com/Dicklesworthstone/frankenterm/commit/381c08e41)
+
+### Air-gapped QR workspace transfer
+
+A workspace can be exported, carried across an air gap, and restored with encrypted backups and live QR repair. Restore upgrades SSH identities without replacing protected keys, requires precise workspace-replacement review, and exports route-scoped OpenSSH trust files.
+
+- Representative commits: [`d4d6a0c`](https://github.com/Dicklesworthstone/frankenterm/commit/d4d6a0c1d), [`de906aa`](https://github.com/Dicklesworthstone/frankenterm/commit/de906aab7), [`5537cd0`](https://github.com/Dicklesworthstone/frankenterm/commit/5537cd070), [`6617534`](https://github.com/Dicklesworthstone/frankenterm/commit/6617534f5)
+
+### Guardian, recovery, and checkpoint durability
+
+Crash-recovery hardening: periodic recovery now reconciles a latched whole-mux store instead of disabling itself, output resumes after journal-capacity pressure, a guardian birth that fails before its claim closes now tears down the child it started, and checkpoint restore replays Kitty images, placements, and cell image layers exactly when the guardian admits graphics.
+
+- Representative commits: [`c133eab`](https://github.com/Dicklesworthstone/frankenterm/commit/c133eabbb), [`1b94fa7`](https://github.com/Dicklesworthstone/frankenterm/commit/1b94fa7d6), [`379b3c1`](https://github.com/Dicklesworthstone/frankenterm/commit/379b3c16b), [`22b65de`](https://github.com/Dicklesworthstone/frankenterm/commit/22b65de59), [`e6a2f92`](https://github.com/Dicklesworthstone/frankenterm/commit/e6a2f92de)
+
+### Terminal rendering and parser performance
+
+Fast paths across `pagegrid`, `term`, `surface`, and `escape-parser`: a printed run's width is summed once while its cells are checked, the newest row is found as the tail page's last row, a lone printable character is written straight into the row as a run of one, and a letter with its combining marks prints at a known width.
+
+- Representative commits: [`f541f62`](https://github.com/Dicklesworthstone/frankenterm/commit/f541f627d), [`fb570a9`](https://github.com/Dicklesworthstone/frankenterm/commit/fb570a9f5), [`427210d`](https://github.com/Dicklesworthstone/frankenterm/commit/427210d8d), [`90c4187`](https://github.com/Dicklesworthstone/frankenterm/commit/90c418747)
+
+### SSH, config, and fleet viewer
+
+Imported workspaces connect through one authenticated jump host; RSA-SHA2 hosts are supported with verified mux authentication; `freetype_lcd_filter`, `text_gamma`, and `text_contrast` config options land ([#130](https://github.com/Dicklesworthstone/frankenterm/pull/130)); and indexed captured-history search is wired into the browser fleet viewer with a cancellable search controller.
+
+- Representative commits: [`d67aaa2`](https://github.com/Dicklesworthstone/frankenterm/commit/d67aaa296), [`c54b828`](https://github.com/Dicklesworthstone/frankenterm/commit/c54b82883), [`de07940`](https://github.com/Dicklesworthstone/frankenterm/commit/de0794052), [`88806ae`](https://github.com/Dicklesworthstone/frankenterm/commit/88806aa2e)
+
+### Housekeeping
+
+Ongoing provenance tracking and beads closeouts (~25 `chore(provenance)` and 90+ beads commits) accompany the above; the upstream-backport provenance lives in `frankenterm/PROVENANCE.json` and the workstream records in `.beads/`.
+
+## [0.15.21] -- 2026-10-14 (git tag; current shipping build, no GitHub Release)
 
 Compare against the previous public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.21>
 
-Version `0.15.21` is the first GitHub Release since `v0.15.1`. It carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Entries below that say native qualification remains pending were not separately qualified for this release; diagnostic models do not establish release acceptance or measured performance gains.
+Version `0.15.21` is the current shipping build and newest git tag, not a GitHub Release (the latest published Release remains `v0.15.1`). It carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Entries below that say native qualification remains pending were not separately qualified for this release; diagnostic models do not establish release acceptance or measured performance gains.
 
 ### Highlights from the final candidate days (2026-10-12 to 2026-10-14)
 
@@ -1469,11 +1505,11 @@ Migration: re-run `ft setup --wezterm` to update your `wezterm.lua`. The ft-mana
 
 Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are changelog milestones reconstructed from history, not published GitHub Releases.
 
-`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.15.1` tag below and `v0.15.21` have a GitHub Release; the `v0.15.2`–`v0.15.12` candidate tags and `backup-before-rewrite` do not.
+`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.15.1` tag below has a GitHub Release; `v0.15.21`, the `v0.15.2`–`v0.15.12` candidate tags and `backup-before-rewrite` do not.
 
 | Tag / Ref | Kind | Date | Points to | Description |
 |-----------|------|------|-----------|-------------|
-| [`v0.15.21`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Release | 2026-10-14 | tag `v0.15.21` | First GitHub Release since `v0.15.1`; idle-window repaint and GPU-memory cuts, tab order across restarts, macOS 11+ bundles, security updates |
+| [`v0.15.21`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.21) | Tag (no GitHub Release) | 2026-10-14 | tag `v0.15.21` | Current shipping build, first since `v0.15.1`; idle-window repaint and GPU-memory cuts, tab order across restarts, macOS 11+ bundles, security updates |
 | `v0.15.2`–`v0.15.12` and their `-rc`/`-analyzer` tags | Git tags (no GitHub Release) | 2026-09-01 to 2026-09-22 | tags | Local builds and release candidates; their changes ship in `v0.15.21` |
 | [`v0.15.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | tag `v0.15.1` | Complete platform artifacts and macOS GUI installation |
 | [`v0.15.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | tag `v0.15.0` | Sampled paste tracing over additive PDU99 (source only) |
