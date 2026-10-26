@@ -2016,7 +2016,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         terminal.input.insertText("d")
         let text = try await hostFile(out, containing: "\n")
         let keys = text.trimmingCharacters(in: .newlines).components(separatedBy: "^[").filter { !$0.isEmpty }
-        XCTAssertEqual(keys.map(\.last), ["D", "C"], "the left arrow repeated once, the right one was touched (got \(text))")
+        XCTAssertEqual(keys.map(\.last), ["D", "C"], "the left arrow repeated once, the right one was touched "
+            + "(got \(text); screen: \(terminal.renderer.accessibilityValue ?? ""))")
         await scene.close()
         await assertReleased(session, connections: live.connections)
     }
