@@ -243,4 +243,34 @@ final class TerminalNavigationTests: XCTestCase {
             XCTAssertNil(gesture.finish(width: 320, velocityX: velocity))
         }
     }
+
+    func testNextUnseenOutputFollowsTheRingFromWhatIsOnScreenAndWraps() {
+        typealias Source = TerminalUnseenOutput.Source
+        // A: mux with panes 1-3; B: a direct session; C: mux with panes 7 and 4 (its own order).
+        let ring = [Source(machineID: "A", paneID: 1), Source(machineID: "A", paneID: 2), Source(machineID: "A", paneID: 3),
+                    Source(machineID: "B"), Source(machineID: "C", paneID: 7), Source(machineID: "C", paneID: 4)]
+        func next(_ current: Source?, _ unseen: [Source]) -> Source? {
+            TerminalUnseenOutput.next(after: current, ring: ring, unseen: Set(unseen))
+        }
+        let a1 = ring[0], a2 = ring[1], a3 = ring[2], b = ring[3], c7 = ring[4], c4 = ring[5]
+        XCTAssertNil(next(a2, []), "nothing waiting: nowhere to go")
+        XCTAssertEqual(next(a2, [a3, b]), a3, "a later pane of the machine on screen comes first")
+        XCTAssertEqual(next(a2, [a1, c4]), c4, "then the following machines, in their pane order")
+        XCTAssertEqual(next(a2, [a1]), a1, "and wraps to the panes before the one on screen")
+        XCTAssertEqual(next(c4, [c7, b]), b, "wrapping from the end of the ring")
+        XCTAssertEqual(next(b, [c4, c7]), c7, "a machine's panes in its own order, not by number")
+        XCTAssertNil(next(a2, [a2]), "the source on screen is never next")
+        XCTAssertEqual(next(a2, [a2, b]), b)
+        XCTAssertEqual(next(Source(machineID: "A"), [a2, a1]), a1,
+                       "a machine whose shown pane is unknown counts from its first pane")
+        XCTAssertEqual(next(nil, [c7, b]), b, "with nothing on screen, from the start")
+        XCTAssertEqual(next(Source(machineID: "gone"), [c4]), c4)
+        XCTAssertNil(next(a2, [Source(machineID: "D")]), "a source outside the ring is never chosen")
+        // Repeated presses, each from where the last one landed, visit every waiting source once.
+        var visited: [Source] = [], at = b, waiting: Set = [a1, a3, c7]
+        while let target = TerminalUnseenOutput.next(after: at, ring: ring, unseen: waiting) {
+            visited.append(target); waiting.remove(target); at = target
+        }
+        XCTAssertEqual(visited, [c7, a1, a3])
+    }
 }

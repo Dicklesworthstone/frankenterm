@@ -1349,6 +1349,80 @@ final class TerminalSessionControllerTests: XCTestCase {
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
+    /// Next New Output: when a mux pane prints on a machine off screen, one
+    /// action shows that machine and then that pane, not the pane the machine
+    /// last showed. Both machines attach to the disposable mux; beta shows
+    /// the pane that prints, so for beta it is not news. (Named to run before
+    /// the test that ends a pane of the disposable mux.)
+    func testAMuxPaneThatPrintsOnAMachineOffScreenIsWhereNextNewOutputGoes() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath + ".next"
+        let run = UUID().uuidString.prefix(8)
+        func show(_ pane: Int, _ session: TerminalSessionController, replacing view: NativeTerminalView) async throws
+            -> NativeTerminalView {
+            session.showPane(pane)
+            for _ in 0..<400 where session.muxState?.shown != pane || session.paneNavigationBusy || session.terminal === view {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertEqual(session.muxState?.shown, pane)
+            view.removeFromSuperview()
+            return try shown(session)
+        }
+        let alphaSession = try await connect(scene, "alpha")
+        var alpha = try shown(alphaSession)
+        let first = try XCTUnwrap(alphaSession.muxState?.shown)
+        guard let other = alphaSession.muxState?.panes.first(where: { $0.paneId != first })?.paneId else {
+            alpha.removeFromSuperview(); await scene.close()
+            throw XCTSkip("The mux needs a second pane")
+        }
+        // Alpha has shown both panes and is back on its first when it leaves.
+        alpha = try await show(other, alphaSession, replacing: alpha)
+        alpha = try await show(first, alphaSession, replacing: alpha)
+        alpha.removeFromSuperview()
+        let betaSession = try await connect(scene, "beta")
+        var beta = try await shownAfterSelecting(scene, "beta", connected: betaSession)
+        if betaSession.muxState?.shown != other { beta = try await show(other, betaSession, replacing: beta) }
+        // Past the settle for alpha's pane leaving the screen.
+        try await Task.sleep(for: .milliseconds(3_500))
+
+        try await type("echo NEXT-\(run) | tee \(out)", into: beta)
+        _ = try await hostFile(out, containing: "NEXT-\(run)")
+        let alphaControl = try XCTUnwrap(alphaSession.muxControl)
+        for _ in 0..<600 where !alphaControl.current.unread.contains(other) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(alphaControl.current.unread.contains(other), "alpha, off screen, has the pane that printed unread")
+        XCTAssertEqual(alphaControl.current.shown, first, "alpha still shows its first pane")
+        for _ in 0..<200 where !scene.hasUnseenOutputElsewhere { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(scene.hasUnseenOutputElsewhere, "Next New Output is offered")
+
+        scene.showNextUnseenOutput()
+        for _ in 0..<400 where scene.selectedMachineID != "alpha" || alphaSession.muxState?.shown != other
+            || alphaSession.paneNavigationBusy {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(scene.selectedMachineID, "alpha", "Next New Output shows the machine")
+        XCTAssertEqual(alphaSession.muxState?.shown, other, "and then the pane that printed, not the one it last showed")
+        XCTAssertFalse(alphaControl.current.unread.contains(other), "showing the pane reads it")
+        XCTAssertNil(scene.problem)
+        alpha = try shown(alphaSession)
+        let text = try await screen(alpha, containing: "NEXT-\(run)")
+        XCTAssertTrue(text.contains("NEXT-\(run)"), "the pane on screen is the one that printed")
+
+        // With nothing waiting, it stays put.
+        for _ in 0..<200 where scene.hasUnseenOutputElsewhere { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertFalse(scene.hasUnseenOutputElsewhere)
+        scene.showNextUnseenOutput()
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(scene.selectedMachineID, "alpha")
+        XCTAssertEqual(alphaSession.muxState?.shown, other)
+        alpha.removeFromSuperview(); beta.removeFromSuperview()
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
     /// A noisy neighbor: while a machine off screen floods output, commands
     /// typed on the one on screen show their output promptly, the flood is
     /// read through to its end, and the app does not grow with what it reads.

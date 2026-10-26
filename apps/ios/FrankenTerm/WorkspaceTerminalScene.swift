@@ -596,6 +596,74 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         } catch { report(error) }
     }
 
+    /// A machine or pane other than the one on screen has output the phone
+    /// has not shown, so Next New Output has somewhere to go.
+    var hasUnseenOutputElsewhere: Bool {
+        navigationMachineIDs.contains(where: hasUnseenOutput)
+            || selectedSession?.muxState.map { state in state.unread.contains { $0 != state.shown } } == true
+    }
+
+    /// Shows the next machine or mux pane with output not yet shown, in ring
+    /// order after the one on screen: the machine switch a chip tap makes,
+    /// then the pane switch ⌘] makes. Output alone never moves the screen.
+    func showNextUnseenOutput() {
+        guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              selectedSession?.clipboardIsPresenting != true, selectedSession?.paneNavigationBusy != true,
+              let target = nextUnseenOutput() else { return }
+        let appearance = appearanceGeneration
+        Task {
+            do {
+                if target.machineID != self.selectedMachineID {
+                    try await whileBusy {
+                        guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput,
+                              self.navigationMachineIDs.contains(target.machineID) else { throw TerminalNavigationError.stale }
+                        guard let plan = try self.navigation.navigation.plan(machineID: target.machineID) else { return }
+                        try await self.navigation.perform(plan)
+                    }
+                }
+                guard let paneID = target.paneID else { return }
+                // The machine's own view settles first, as after a chip tap.
+                for _ in 0..<40 {
+                    guard self.appearanceGeneration == appearance, !self.closed, self.selectedMachineID == target.machineID,
+                          let session = self.selectedSession, session.phase == .live, let control = session.muxControl,
+                          control.current.panes.contains(where: { $0.paneId == paneID }) else {
+                        throw TerminalNavigationError.stale
+                    }
+                    if control.current.shown == paneID { return }
+                    await session.waitForOverviewPresentation()
+                    if !session.paneNavigationBusy {
+                        try await session.navigatePane(control.inputRouting.navigation(pane: paneID))
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+            } catch { report(error) }
+        }
+    }
+
+    private func nextUnseenOutput() -> TerminalUnseenOutput.Source? {
+        var ring: [TerminalUnseenOutput.Source] = [], unseen: Set<TerminalUnseenOutput.Source> = []
+        var current = selectedMachineID.map { TerminalUnseenOutput.Source(machineID: $0) }
+        for id in navigationMachineIDs {
+            let selected = id == selectedMachineID
+            // A machine off screen keeps its mux state current without a view.
+            if let session = sessions[id], session.phase == .live, let state = session.muxControl?.current,
+               !state.panes.isEmpty {
+                for pane in state.panes {
+                    let source = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
+                    ring.append(source)
+                    if selected, pane.paneId == state.shown { current = source }
+                    else if status(of: id) == .live, state.unread.contains(pane.paneId) { unseen.insert(source) }
+                }
+            } else {
+                let source = TerminalUnseenOutput.Source(machineID: id)
+                ring.append(source)
+                if hasUnseenOutput(id) { unseen.insert(source) }
+            }
+        }
+        return TerminalUnseenOutput.next(after: current, ring: ring, unseen: unseen)
+    }
+
     var permitsCanvasNavigation: Bool {
         !closed && foreground && onScreen && !overviewBlocksInput && !groupAppearanceBlocksInput && appearanceSelection == nil
             && selectedSession?.clipboardIsPresenting != true
@@ -1597,23 +1665,41 @@ struct WorkspaceTerminalScreen: View {
 /// Every machine as a chip in its own colors, with its state (live,
 /// connecting, needs attention, disconnected) at a glance and the one on screen
 /// raised. Tap a chip to switch; swipe the terminal with one finger to step
-/// through them in order.
+/// through them in order. While a machine or pane off screen has new output,
+/// the strip ends in Next New Output (⌘J), which goes to each in turn.
 private struct MachineStrip: View {
     let scene: WorkspaceTerminalScene
     @Namespace private var raised
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(scene.navigationMachines) { machine in chip(machine).id(machine.id) }
+        HStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(scene.navigationMachines) { machine in chip(machine).id(machine.id) }
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 8)
                 }
-                .padding(.horizontal, 12).padding(.vertical, 8)
+                .onChange(of: scene.selectedMachineID, initial: true) { _, id in
+                    withAnimation(.snappy) { proxy.scrollTo(id, anchor: .center) }
+                }
             }
-            .onChange(of: scene.selectedMachineID, initial: true) { _, id in
-                withAnimation(.snappy) { proxy.scrollTo(id, anchor: .center) }
+            if scene.hasUnseenOutputElsewhere {
+                Button { withAnimation(.snappy) { scene.showNextUnseenOutput() } } label: {
+                    Image(systemName: "arrow.forward.circle.fill").font(.title3)
+                        .foregroundStyle(Color.accentColor)
+                        .overlay(alignment: .topTrailing) { UnseenBadge() }
+                        .frame(width: 44, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .transition(.scale.combined(with: .opacity))
+                .accessibilityLabel("Next New Output")
+                .accessibilityHint("Shows the next machine or pane with output you have not seen.")
+                .accessibilityIdentifier("terminal.unseen.next")
             }
         }
+        .animation(.snappy, value: scene.hasUnseenOutputElsewhere)
         .background(.ultraThinMaterial)
     }
 
@@ -1842,7 +1928,8 @@ private final class WorkspaceCanvasView: UIView {
     func retireNavigation() { controls?.retire(suspendNavigation: false); controls = nil }
 
     /// A hardware keyboard switches as the strips and swipes do: ⇧⌘] ⇧⌘[ for
-    /// machines, ⌘] ⌘[ for a mux's panes; ⇧⌘D composes a command. UIKit asks
+    /// machines, ⌘] ⌘[ for a mux's panes, ⌘J for the next new output;
+    /// ⇧⌘D composes a command. UIKit asks
     /// the terminal's ancestors, so these work while a terminal has the
     /// keyboard. The untitled shifted spellings match a keyboard that reports
     /// ⇧] as "}".
@@ -1867,8 +1954,11 @@ private final class WorkspaceCanvasView: UIView {
                 UIKeyCommand(title: "Previous Pane", action: #selector(previousPane), input: "[", modifierFlags: .command)
             ]
         }
+        commands.append(UIKeyCommand(title: "Next New Output", action: #selector(nextUnseenOutput),
+                                     input: "j", modifierFlags: .command))
         return commands
     }
+    @objc private func nextUnseenOutput() { scene?.showNextUnseenOutput() }
     @objc private func composeCommand() { scene?.selectedSession?.composeCommand() }
     @objc private func nextMachine() { scene?.stepMachine(forward: true) }
     @objc private func previousMachine() { scene?.stepMachine(forward: false) }

@@ -427,9 +427,35 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(marked.waitForExistence(timeout: 20), "the first machine printed while away and is marked")
         XCTAssertFalse(chip(app, second, "connected, new output").exists, "the machine on screen is never marked")
         snapshot("15-unread-mark")
-        marked.tap()
-        waitFor("AWAY-first-10", in: screen, timeout: 10, "the mark leads to the new output")
+        // The strip then ends in Next New Output, which goes to it.
+        let nextNew = app.buttons["terminal.unseen.next"]
+        XCTAssertTrue(nextNew.waitForExistence(timeout: 5), "Next New Output is offered while a machine is marked")
+        nextNew.tap()
+        waitFor("AWAY-first-10", in: screen, timeout: 10, "Next New Output leads to the new output")
         XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 5), "being on screen clears the mark")
+        XCTAssertTrue(nextNew.waitForNonExistence(timeout: 5), "with nothing unseen, Next New Output goes away")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
+
+        // ⌘J does the same from a hardware keyboard, here to the second machine.
+        app.typeKey("]", modifierFlags: [.command, .shift])
+        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the second machine")
+        app.typeText("sleep 6; echo LATER-$FT_WHO-$((6+6))\n")
+        waitFor("sleep 6; echo LATER", in: screen, timeout: 10, "the command is running before the switch")
+        app.typeKey("[", modifierFlags: [.command, .shift])
+        waitFor("AWAY-first-10", in: screen, timeout: 10, "⇧⌘[ shows the first machine")
+        XCTAssertTrue(chip(app, second, "connected, new output").waitForExistence(timeout: 20),
+                      "the second machine printed while away and is marked")
+        app.typeKey("j", modifierFlags: .command)
+        waitFor("LATER-second-12", in: screen, timeout: 10, "⌘J leads to the new output")
+        XCTAssertTrue(chip(app, second, "connected").waitForExistence(timeout: 5), "being on screen clears the mark")
+        app.typeKey("j", modifierFlags: .command)
+        never("AWAY-first-10", in: screen, "with nothing unseen, ⌘J stays put")
+        snapshot("15b-next-new-output")
+        app.typeText("echo STAY-$FT_WHO-$((7+7))\n")
+        waitFor("STAY-second-14", in: screen, timeout: 30, "typing after ⌘J reaches the machine it showed")
+        // Later tests relaunch into the first machine.
+        chip(app, inputs.machine, "connected").tap()
+        waitFor("AWAY-first-10", in: screen, timeout: 10, "the strip shows the first machine again")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
         app.typeKey("k", modifierFlags: .command)
         let overview = app.navigationBars["Fleet Overview"]

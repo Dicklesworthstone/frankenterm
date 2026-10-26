@@ -294,6 +294,35 @@ public struct TerminalNavigation: Sendable {
     public func viewport(for pane: TerminalNavigationPaneID) -> TerminalNavigationViewport? { viewports[pane] }
 }
 
+/// Where output the phone has not shown is waiting, in the ring's order:
+/// machines as the strip lists them, a mux machine's panes in its pane order.
+/// Next New Output steps through it from what is on screen and wraps, so
+/// repeated presses visit each waiting source in turn. Choosing grants no input.
+public enum TerminalUnseenOutput {
+    /// A machine's own terminal (no pane), or one pane of its mux.
+    public struct Source: Hashable, Sendable {
+        public let machineID: String, paneID: Int?
+        public init(machineID: String, paneID: Int? = nil) { self.machineID = machineID; self.paneID = paneID }
+    }
+
+    /// The first unseen source after `current` in `ring`, wrapping; never
+    /// `current` itself. A current source missing from the ring (its pane
+    /// list not read yet) counts from its machine's first entry.
+    public static func next(after current: Source?, ring: [Source], unseen: Set<Source>) -> Source? {
+        guard !unseen.isEmpty, !ring.isEmpty else { return nil }
+        var start = 0
+        if let current {
+            if let index = ring.firstIndex(of: current) { start = index + 1 }
+            else if let index = ring.firstIndex(where: { $0.machineID == current.machineID }) { start = index }
+        }
+        for offset in 0..<ring.count {
+            let source = ring[(start + offset) % ring.count]
+            if source != current, unseen.contains(source) { return source }
+        }
+        return nil
+    }
+}
+
 /// Gesture classification is independent of UIKit so finger-count, direction,
 /// interruption and settling rules can be tested. Distances are logical points;
 /// times are monotonic seconds from one gesture's start, never wall clock time.
