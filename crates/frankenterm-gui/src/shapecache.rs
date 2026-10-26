@@ -2,12 +2,17 @@ use crate::customglyph::BlockKey;
 use crate::glyphcache::CachedGlyph;
 use ahash::{AHashMap, AHasher};
 use config::TextStyle;
+use frankenterm_font::LoadedFontId;
 use frankenterm_font::shaper::GlyphInfo;
 use frankenterm_font::units::*;
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use termwiz::cell::Presentation;
+use termwiz::cellcluster::CellCluster;
+use wezterm_bidi::Direction;
 
 const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
 const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
@@ -17,10 +22,172 @@ thread_local! {
         RefCell::new(ShapedRunInterner::default());
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub struct ShapeCacheKey {
-    pub style: TextStyle,
+/// Every input that can change shaping, including the paragraph surrounding a
+/// run. Paint attributes and the run's screen position are deliberately absent.
+/// The native Metal path uses its interned style id; WebGpu uses `TextStyle`.
+#[derive(Clone, Debug)]
+pub struct ShapeCacheKey<S = TextStyle> {
+    pub style: S,
     pub text: String,
+    font: LoadedFontId,
+    range: Option<(usize, usize)>,
+    emoji: bool,
+    rtl: bool,
+    cells: ShapeCells,
+}
+
+/// Canonical single-width ASCII needs no arrays. Other runs retain only the
+/// maps that differ, rather than padding one `(usize, u8)` pair per UTF-8 byte.
+#[derive(Clone, Debug)]
+struct ShapeCells {
+    len: usize,
+    indices: Vec<usize>,
+    widths: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BorrowedShapeCells<'a> {
+    Implicit(usize),
+    Cluster {
+        cluster: &'a CellCluster,
+        origin: usize,
+    },
+    Stored(&'a ShapeCells),
+}
+
+impl<'a> BorrowedShapeCells<'a> {
+    fn new(cluster: &'a CellCluster) -> Self {
+        if cluster.has_implicit_cell_mapping() {
+            return Self::Implicit(cluster.text.len());
+        }
+        // Only cell identity and ordering affect the shaper. Normalizing by
+        // the smallest index permits reuse at another column, including RTL
+        // runs, without wrapping or conflating distinct cells.
+        let origin = (0..cluster.text.len())
+            .map(|byte| cluster.byte_to_cell_idx(byte))
+            .min()
+            .unwrap_or(0);
+        let cells = Self::Cluster { cluster, origin };
+        if (0..cells.len()).all(|byte| cells.cell(byte) == (byte, 1)) {
+            Self::Implicit(cells.len())
+        } else {
+            cells
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Implicit(len) => len,
+            Self::Cluster { cluster, .. } => cluster.text.len(),
+            Self::Stored(cells) => cells.len,
+        }
+    }
+
+    fn cell(self, byte: usize) -> (usize, u8) {
+        match self {
+            Self::Implicit(_) => (byte, 1),
+            Self::Cluster { cluster, origin } => (
+                cluster.byte_to_cell_idx(byte) - origin,
+                cluster.byte_to_cell_width(byte),
+            ),
+            Self::Stored(cells) => (
+                cells.indices.get(byte).copied().unwrap_or(byte),
+                cells.widths.get(byte).copied().unwrap_or(1),
+            ),
+        }
+    }
+
+    fn is_implicit(self) -> bool {
+        match self {
+            Self::Implicit(_) => true,
+            Self::Cluster { .. } => false,
+            Self::Stored(cells) => cells.indices.is_empty() && cells.widths.is_empty(),
+        }
+    }
+
+    fn to_owned(self) -> ShapeCells {
+        let len = self.len();
+        if self.is_implicit() {
+            return ShapeCells {
+                len,
+                indices: Vec::new(),
+                widths: Vec::new(),
+            };
+        }
+        let indices = if (0..len).all(|byte| self.cell(byte).0 == byte) {
+            Vec::new()
+        } else {
+            (0..len).map(|byte| self.cell(byte).0).collect()
+        };
+        let widths = if (0..len).all(|byte| self.cell(byte).1 == 1) {
+            Vec::new()
+        } else {
+            (0..len).map(|byte| self.cell(byte).1).collect()
+        };
+        ShapeCells {
+            len,
+            indices,
+            widths,
+        }
+    }
+}
+
+impl PartialEq for BorrowedShapeCells<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() || self.is_implicit() != other.is_implicit() {
+            return false;
+        }
+        self.is_implicit() || (0..self.len()).all(|byte| self.cell(byte) == other.cell(byte))
+    }
+}
+
+impl Eq for BorrowedShapeCells<'_> {}
+
+impl Hash for BorrowedShapeCells<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        self.is_implicit().hash(state);
+        if !self.is_implicit() {
+            for byte in 0..self.len() {
+                self.cell(byte).hash(state);
+            }
+        }
+    }
+}
+
+impl<S> ShapeCacheKey<S> {
+    fn borrowed(&self) -> BorrowedShapeCacheKey<'_, S> {
+        BorrowedShapeCacheKey {
+            style: &self.style,
+            text: &self.text,
+            font: self.font,
+            range: self.range,
+            emoji: self.emoji,
+            rtl: self.rtl,
+            cells: BorrowedShapeCells::Stored(&self.cells),
+        }
+    }
+
+    /// Heap storage owned by the key, separate from the shaper output.
+    pub fn heap_bytes(&self) -> usize {
+        self.text.capacity()
+            + self.cells.indices.capacity() * std::mem::size_of::<usize>()
+            + self.cells.widths.capacity()
+    }
+}
+
+impl<S: PartialEq> PartialEq for ShapeCacheKey<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.borrowed() == other.borrowed()
+    }
+}
+
+impl<S: Eq> Eq for ShapeCacheKey<S> {}
+
+impl<S: Hash> Hash for ShapeCacheKey<S> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.borrowed().hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -370,55 +537,95 @@ fn glyph_bitmap_pixel_width(glyph: &CachedGlyph) -> u32 {
 /// It's a bit involved to make this work; more details can be
 /// found in the excellent guide here:
 /// <https://github.com/sunshowers-code/borrow-complex-key-example/blob/main/src/lib.rs>
-#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BorrowedShapeCacheKey<'a> {
-    pub style: &'a TextStyle,
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BorrowedShapeCacheKey<'a, S = TextStyle> {
+    pub style: &'a S,
     pub text: &'a str,
+    font: LoadedFontId,
+    range: Option<(usize, usize)>,
+    emoji: bool,
+    rtl: bool,
+    cells: BorrowedShapeCells<'a>,
 }
 
-impl<'a> BorrowedShapeCacheKey<'a> {
-    pub fn to_owned(&self) -> ShapeCacheKey {
-        ShapeCacheKey {
-            style: self.style.clone(),
-            text: self.text.to_owned(),
-        }
-    }
-}
+impl<S> Copy for BorrowedShapeCacheKey<'_, S> {}
 
-pub trait ShapeCacheKeyTrait: std::fmt::Debug {
-    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k>;
-}
-
-impl ShapeCacheKeyTrait for ShapeCacheKey {
-    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k> {
-        BorrowedShapeCacheKey {
-            style: &self.style,
-            text: &self.text,
-        }
-    }
-}
-
-impl<'a> ShapeCacheKeyTrait for BorrowedShapeCacheKey<'a> {
-    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k> {
+impl<S> Clone for BorrowedShapeCacheKey<'_, S> {
+    fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a> std::borrow::Borrow<dyn ShapeCacheKeyTrait + 'a> for ShapeCacheKey {
-    fn borrow(&self) -> &(dyn ShapeCacheKeyTrait + 'a) {
+impl<'a, S> BorrowedShapeCacheKey<'a, S> {
+    pub fn new(
+        style: &'a S,
+        font: LoadedFontId,
+        cluster: &'a CellCluster,
+        context: Option<(&'a str, Range<usize>)>,
+    ) -> Self {
+        let (text, range) = match context {
+            Some((text, range)) => (text, Some((range.start, range.end))),
+            None => (cluster.text.as_str(), None),
+        };
+        Self {
+            style,
+            text,
+            font,
+            range,
+            emoji: cluster.presentation == Presentation::Emoji,
+            rtl: cluster.direction == Direction::RightToLeft,
+            cells: BorrowedShapeCells::new(cluster),
+        }
+    }
+}
+
+impl<S: Clone> BorrowedShapeCacheKey<'_, S> {
+    pub fn to_owned(&self) -> ShapeCacheKey<S> {
+        ShapeCacheKey {
+            style: self.style.clone(),
+            text: self.text.to_owned(),
+            font: self.font,
+            range: self.range,
+            emoji: self.emoji,
+            rtl: self.rtl,
+            cells: self.cells.to_owned(),
+        }
+    }
+}
+
+pub trait ShapeCacheKeyTrait<S = TextStyle>: std::fmt::Debug {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S>;
+}
+
+impl<S: std::fmt::Debug> ShapeCacheKeyTrait<S> for ShapeCacheKey<S> {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S> {
+        self.borrowed()
+    }
+}
+
+impl<S: std::fmt::Debug> ShapeCacheKeyTrait<S> for BorrowedShapeCacheKey<'_, S> {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S> {
+        *self
+    }
+}
+
+impl<'a, S: std::fmt::Debug + 'a> std::borrow::Borrow<dyn ShapeCacheKeyTrait<S> + 'a>
+    for ShapeCacheKey<S>
+{
+    fn borrow(&self) -> &(dyn ShapeCacheKeyTrait<S> + 'a) {
         self
     }
 }
 
-impl<'a> PartialEq for dyn ShapeCacheKeyTrait + 'a {
+impl<S: PartialEq> PartialEq for dyn ShapeCacheKeyTrait<S> + '_ {
     fn eq(&self, other: &Self) -> bool {
         self.key().eq(&other.key())
     }
 }
 
-impl<'a> Eq for dyn ShapeCacheKeyTrait + 'a {}
+impl<S: Eq> Eq for dyn ShapeCacheKeyTrait<S> + '_ {}
 
-impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
+impl<S: Hash> Hash for dyn ShapeCacheKeyTrait<S> + '_ {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.key().hash(state)
     }
@@ -443,6 +650,132 @@ mod test {
     use termwiz::cell::CellAttributes;
     use termwiz::surface::{Line, SEQ_ZERO};
     use wezterm_bidi::Direction;
+
+    fn key_cluster(text: &str) -> termwiz::cellcluster::CellCluster {
+        let clusters =
+            Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None).cluster(None);
+        termwiz::cellcluster::CellCluster::concat(&clusters.iter().collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn shape_keys_compare_all_inputs_without_paint_or_screen_position() {
+        use super::BorrowedShapeCacheKey;
+
+        let style = 7u32;
+        let cluster = key_cluster("ffi");
+        let key =
+            |cluster, context| BorrowedShapeCacheKey::new(&style, 11, cluster, context).to_owned();
+        let base = key(&cluster, Some(("office ffi", 1..4)));
+        assert_ne!(base, key(&cluster, Some(("affice ffi", 1..4))), "neighbors");
+        assert_ne!(base, key(&cluster, Some(("office ffi", 7..10))), "range");
+        assert_ne!(key(&cluster, None), key(&cluster, Some(("ffi", 0..3))));
+        assert_ne!(
+            base,
+            BorrowedShapeCacheKey::new(&8u32, 11, &cluster, Some(("office ffi", 1..4))).to_owned()
+        );
+        assert_ne!(
+            base,
+            BorrowedShapeCacheKey::new(&style, 12, &cluster, Some(("office ffi", 1..4))).to_owned()
+        );
+        let mut changed = cluster.clone();
+        changed.direction = Direction::RightToLeft;
+        assert_ne!(key(&cluster, None), key(&changed, None));
+        changed = cluster.clone();
+        changed.presentation = termwiz::cell::Presentation::Emoji;
+        assert_ne!(key(&cluster, None), key(&changed, None));
+
+        changed = cluster.clone();
+        changed.first_cell_idx = 42;
+        changed
+            .attrs
+            .set_foreground(termwiz::color::ColorAttribute::PaletteIndex(3));
+        assert_eq!(key(&cluster, None), key(&changed, None));
+
+        let narrow = key_cluster("A");
+        let wide = Line::from_cells(
+            vec![termwiz::cell::Cell::new_grapheme_with_width(
+                "A",
+                2,
+                CellAttributes::default(),
+            )],
+            SEQ_ZERO,
+        )
+        .cluster(None);
+        assert_ne!(key(&narrow, None), key(&wide[0], None), "cell widths");
+        let separate = key_cluster("ab");
+        let grouped = Line::from_cells(
+            vec![termwiz::cell::Cell::new_grapheme_with_width(
+                "ab",
+                2,
+                CellAttributes::default(),
+            )],
+            SEQ_ZERO,
+        )
+        .cluster(None);
+        assert_eq!(separate.width, grouped[0].width);
+        assert_ne!(
+            key(&separate, None),
+            key(&grouped[0], None),
+            "cell ownership"
+        );
+    }
+
+    #[test]
+    fn borrowed_and_owned_shape_keys_agree_for_implicit_and_explicit_maps() {
+        use super::{BorrowedShapeCacheKey, BorrowedShapeCells, ShapeCacheKeyTrait};
+        use std::hash::{Hash, Hasher};
+
+        fn hash(value: &(impl Hash + ?Sized)) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let style = TextStyle::default();
+        for text in ["ASCII", "A\u{301}", "界", "😀"] {
+            let cluster = key_cluster(text);
+            let borrowed = BorrowedShapeCacheKey::new(&style, 9, &cluster, None);
+            let owned = borrowed.to_owned();
+            assert_eq!(borrowed, owned.borrowed());
+            assert_eq!(hash(&borrowed), hash(&owned));
+            assert_eq!(hash(&borrowed), hash(&owned as &dyn ShapeCacheKeyTrait));
+            assert_eq!(
+                owned.heap_bytes(),
+                owned.text.capacity()
+                    + owned.cells.indices.capacity() * std::mem::size_of::<usize>()
+                    + owned.cells.widths.capacity()
+            );
+        }
+
+        let ascii = key_cluster("AB");
+        let implicit = BorrowedShapeCacheKey::new(&style, 9, &ascii, None);
+        assert!(matches!(implicit.cells, BorrowedShapeCells::Implicit(2)));
+        assert_eq!(
+            implicit.to_owned().heap_bytes(),
+            2,
+            "ASCII keeps no map arrays"
+        );
+
+        // Bidi extracts an ASCII run from a cluster whose non-ASCII prefix
+        // required explicit maps. Its normalized mapping is still canonical.
+        let bidi = Line::from_text("éאבAB", &CellAttributes::default(), SEQ_ZERO, None)
+            .cluster(Some(wezterm_bidi::ParagraphDirectionHint::LeftToRight));
+        let explicit = bidi.iter().find(|cluster| cluster.text == "AB").unwrap();
+        assert!(!explicit.has_implicit_cell_mapping());
+        let explicit = BorrowedShapeCacheKey::new(&style, 9, explicit, None);
+        assert_eq!(implicit, explicit);
+        assert_eq!(hash(&implicit), hash(&explicit));
+
+        let mut saturated = ascii.clone();
+        saturated.first_cell_idx = usize::MAX;
+        assert!(!saturated.has_implicit_cell_mapping());
+        let saturated = BorrowedShapeCacheKey::new(&style, 9, &saturated, None);
+        assert_ne!(
+            implicit, saturated,
+            "saturation merges cells and changes shaping"
+        );
+        assert_eq!(saturated, saturated.to_owned().borrowed());
+    }
 
     fn shape_infos_and_glyphs(
         render_metrics: &RenderMetrics,

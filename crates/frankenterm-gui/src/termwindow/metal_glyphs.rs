@@ -33,10 +33,9 @@
 //! premultiplied color in the BGRA atlas.
 //!
 //! The caches are WebGpu's:
-//! - Shaper output for a cluster shaped without paragraph context is kept
-//!   by font style and text, in an LFU cache as large as WebGpu's
-//!   (`shape_cache_size`). Shapes with paragraph context depend on their
-//!   line and are not kept.
+//! - Shaper output is kept by font, style, text, paragraph context, direction,
+//!   presentation and cell mapping, in an LFU cache as large as WebGpu's
+//!   (`shape_cache_size`). Contextual runs reuse only an exact shaping input.
 //! - A laid-out glyph is kept by WebGpu's glyph key: the font, the fallback
 //!   face, the glyph, its cell count, the font style and whether a space
 //!   follows it. As in WebGpu, the first layout of a key (with its shaper
@@ -58,6 +57,7 @@
 use super::metal_images::{ImageSlices, Slice};
 use crate::customglyph::BlockKey;
 use crate::glyphcache::GlyphCache;
+use crate::shapecache::{BorrowedShapeCacheKey, ShapeCacheKey, ShapeCacheKeyTrait};
 use crate::utilsprites::RenderMetrics;
 use config::TextStyle;
 use frankenterm_font::shaper::PresentationWidth;
@@ -144,8 +144,8 @@ pub(crate) struct FontGlyphs {
     /// The default font style, which the password lock is shaped in, kept
     /// where its address stays put while the address map holds it.
     lock_style: Rc<TextStyle>,
-    /// Shaper output for clusters shaped without paragraph context.
-    shapes: LfuCache<(u32, String), Rc<Vec<GlyphInfo>>>,
+    /// Shaper output keyed by the complete cluster or paragraph context.
+    shapes: LfuCache<ShapeCacheKey<u32>, Rc<Vec<GlyphInfo>>>,
     /// Laid-out font glyphs, `None` for inkless ones.
     glyphs: HashMap<GlyphKey, Option<LaidGlyph>>,
     /// Custom block glyphs placed in the grayscale atlas.
@@ -461,6 +461,7 @@ impl FontGlyphs {
                 {
                     attempts += 1;
                     self.chain_changed = true;
+                    self.shapes.clear();
                 }
                 Err(err) => {
                     log::warn!("Metal glyphs: shaping {:?} failed: {err:#}", cluster.text);
@@ -531,6 +532,30 @@ impl FontGlyphs {
         laid
     }
 
+    /// Retains only atlas-independent shaper output. Borrowed keys avoid
+    /// cloning the paragraph or its cell maps on a hit. A fallback-chain
+    /// change must reach the scene rebuild before any result becomes reusable.
+    fn cached_shape(
+        &mut self,
+        style_id: u32,
+        font: &Rc<LoadedFont>,
+        cluster: &CellCluster,
+        context: Option<(&str, Range<usize>)>,
+    ) -> Option<Rc<Vec<GlyphInfo>>> {
+        let key = BorrowedShapeCacheKey::new(&style_id, font.id(), cluster, context.clone());
+        let reusable = !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire);
+        if reusable {
+            if let Some(infos) = self.shapes.get(&key as &dyn ShapeCacheKeyTrait<u32>) {
+                return Some(Rc::clone(infos));
+            }
+        }
+        let infos = Rc::new(self.run_shaper(font, cluster, context)?);
+        if !self.chain_changed && !self.fallback_resolved.load(Ordering::Acquire) {
+            self.shapes.put(key.to_owned(), Rc::clone(&infos));
+        }
+        Some(infos)
+    }
+
     /// Shapes `cluster` (a cluster, or a run of them joined) with `style`,
     /// as the WebGpu renderer's `cached_cluster_shape` does, and lays out
     /// its glyphs. Empty when shaping failed.
@@ -548,24 +573,8 @@ impl FontGlyphs {
             }
         };
         let style_id = self.style_id(style);
-        let infos = if context.is_some() {
-            match self.run_shaper(&font, cluster, context) {
-                Some(infos) => Rc::new(infos),
-                None => return Rc::new(Vec::new()),
-            }
-        } else {
-            let key = (style_id, cluster.text.clone());
-            match self.shapes.get(&key) {
-                Some(infos) => Rc::clone(infos),
-                None => match self.run_shaper(&font, cluster, None) {
-                    Some(infos) => {
-                        let infos = Rc::new(infos);
-                        self.shapes.put(key, Rc::clone(&infos));
-                        infos
-                    }
-                    None => return Rc::new(Vec::new()),
-                },
-            }
+        let Some(infos) = self.cached_shape(style_id, &font, cluster, context) else {
+            return Rc::new(Vec::new());
         };
         let mut glyphs = Vec::with_capacity(infos.len());
         for (index, info) in infos.iter().enumerate() {
@@ -742,6 +751,71 @@ impl GlyphSource for FontGlyphs {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_shapes_hit_across_atlas_resets_but_not_fallback_changes() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let style = config.font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, renderer, &metrics);
+        let style_id = glyphs.style_id(&style);
+        let clusters = Line::from_text("ffi", &CellAttributes::blank(), 0, None).cluster(None);
+        let cluster = &clusters[0];
+        let context = Some(("office ffi", 7..10));
+        let expected = glyphs.run_shaper(&font, cluster, context.clone()).unwrap();
+        assert!(
+            expected.iter().all(|info| info.cluster >= 7),
+            "Metal keeps absolute clusters"
+        );
+        let cached = glyphs
+            .cached_shape(style_id, &font, cluster, context.clone())
+            .unwrap();
+        let hit = glyphs
+            .cached_shape(style_id, &font, cluster, context.clone())
+            .unwrap();
+        assert_eq!(cached.as_ref(), &expected);
+        assert!(Rc::ptr_eq(&cached, &hit));
+
+        glyphs.reset = true;
+        assert!(glyphs.begin_frame());
+        let hit = glyphs
+            .cached_shape(style_id, &font, cluster, context.clone())
+            .unwrap();
+        assert!(
+            Rc::ptr_eq(&cached, &hit),
+            "atlas rebuilds keep shaper output"
+        );
+
+        glyphs.chain_changed = true;
+        let changed = glyphs
+            .cached_shape(style_id, &font, cluster, context.clone())
+            .unwrap();
+        assert!(
+            !Rc::ptr_eq(&cached, &changed),
+            "changed chains cannot hit old output"
+        );
+        assert!(glyphs.take_chain_changed());
+        assert!(glyphs.shapes.is_empty());
+        let fresh = glyphs
+            .cached_shape(style_id, &font, cluster, context.clone())
+            .unwrap();
+        assert!(!Rc::ptr_eq(&cached, &fresh));
+
+        glyphs.fallback_resolved.store(true, Ordering::Release);
+        let pending = glyphs
+            .cached_shape(style_id, &font, cluster, context)
+            .unwrap();
+        assert!(!Rc::ptr_eq(&fresh, &pending));
+        assert!(
+            glyphs.begin_frame(),
+            "completion requires a full scene rebuild"
+        );
+        assert!(glyphs.shapes.is_empty());
+    }
 
     #[test]
     fn persistent_cache_pages_cover_glyphs_and_sprites_but_not_transient_images() {
