@@ -278,6 +278,15 @@ impl Page {
         self.buf[self.seqno_index(self.header(row).slot())] as SequenceNo
     }
 
+    /// The packed cells of a row, including its hidden wide-cell spacers.
+    /// A render snapshot copies this contiguous slice without materializing
+    /// legacy cells or cloning the page and its unrelated side tables.
+    pub fn row_words(&self, row: u32) -> &[u64] {
+        let header = self.header(row);
+        let start = self.cell_index(header.slot(), 0);
+        &self.buf[start..start + header.len()]
+    }
+
     /// The stored cell at column `x` (`x <= cols`); zero past the row's
     /// length.
     pub fn cell(&self, row: u32, x: usize) -> PackedCell {

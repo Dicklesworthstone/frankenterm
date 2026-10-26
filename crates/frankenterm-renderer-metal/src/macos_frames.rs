@@ -12,8 +12,9 @@ use crate::atlas::AtlasKind;
 use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TEXT_SHADER, TextUniforms, atlas_texture_index};
 use crate::frame::{
-    CELL_TEXT_INSTANCE_BYTES, FRAME_SLOTS, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW,
-    SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES, grown_capacity,
+    CELL_TEXT_INSTANCE_BYTES, CompletionToken, FRAME_SLOTS, FrameUniforms, GridExtent,
+    ROW_TABLE_BYTES_PER_ROW, SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES,
+    grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
 use crate::ui_quads::{
@@ -21,7 +22,10 @@ use crate::ui_quads::{
     ui_uniforms_bytes,
 };
 use crate::uploads::{SlotUploads, UploadPlan, row_table_entry};
-use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
+use crate::{
+    ClearColor, FRAME_SLOT_TIMEOUT, FrameCompletion, FrameCompletionHandler, FrameError,
+    MAX_TEXTURE_EXTENT, SubmissionPath,
+};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{
     GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose,
@@ -44,7 +48,7 @@ use objc2_metal::{
     MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -1416,6 +1420,7 @@ pub(crate) struct Metal3Submission {
     /// One render pass descriptor per slot, reused every frame.
     passes: Vec<Retained<MTLRenderPassDescriptor>>,
     failed: Arc<AtomicU64>,
+    completion_handler: RefCell<Option<FrameCompletionHandler>>,
 }
 
 pub(crate) struct Metal4Submission {
@@ -1427,6 +1432,7 @@ pub(crate) struct Metal4Submission {
     bound: Vec<Cell<Option<u64>>>,
     passes: Vec<Retained<MTL4RenderPassDescriptor>>,
     failed: Arc<AtomicU64>,
+    completion_handler: RefCell<Option<FrameCompletionHandler>>,
     /// Creates a window frame's argument tables.
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Per slot, one argument table per draw of a window frame
@@ -1452,6 +1458,7 @@ impl Submission {
                 .map(|_| MTLRenderPassDescriptor::renderPassDescriptor())
                 .collect(),
             failed: Arc::new(AtomicU64::new(0)),
+            completion_handler: RefCell::new(None),
         })
     }
 
@@ -1505,6 +1512,7 @@ impl Submission {
                 .map(|_| MTL4RenderPassDescriptor::new())
                 .collect(),
             failed: Arc::new(AtomicU64::new(0)),
+            completion_handler: RefCell::new(None),
             device: device.retain(),
             window_tables: (0..FRAME_SLOTS)
                 .map(|_| std::cell::RefCell::new(Vec::new()))
@@ -1548,6 +1556,14 @@ impl Submission {
             Self::Metal3(metal3) => metal3.failed.load(Ordering::Relaxed),
             Self::Metal4(metal4) => metal4.failed.load(Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn set_completion_handler(&self, handler: Option<FrameCompletionHandler>) {
+        let target = match self {
+            Self::Metal3(metal3) => &metal3.completion_handler,
+            Self::Metal4(metal4) => &metal4.completion_handler,
+        };
+        *target.borrow_mut() = handler;
     }
 
     /// Encodes one frame into the leased slot and commits it: a render pass
@@ -2001,6 +2017,26 @@ impl UiPipeline {
     }
 }
 
+/// Release the GPU slot before a recovery observer can wake and submit a
+/// replacement frame. Both submission APIs use exactly this completion path.
+fn finish_frame(
+    token: &CompletionToken,
+    failed: &AtomicU64,
+    handler: Option<&FrameCompletionHandler>,
+    succeeded: bool,
+) {
+    if !succeeded {
+        failed.fetch_add(1, Ordering::Relaxed);
+    }
+    token.complete();
+    if let Some(handler) = handler {
+        handler(FrameCompletion {
+            frame: token.frame(),
+            succeeded,
+        });
+    }
+}
+
 impl Metal3Submission {
     fn encode_frame(
         &self,
@@ -2205,22 +2241,25 @@ impl Metal3Submission {
         }
         let token = lease.submit();
         let failed = Arc::clone(&self.failed);
+        let completion = self.completion_handler.borrow().clone();
         let handler = RcBlock::new(
             move |commands: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 #[allow(unsafe_code)]
                 // SAFETY: FFI-BLOCK. Metal passes the command buffer that
                 // completed, valid for the duration of the handler.
                 let status = unsafe { commands.as_ref() }.status();
-                if status != MTLCommandBufferStatus::Completed {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                }
-                token.complete();
+                finish_frame(
+                    &token,
+                    &failed,
+                    completion.as_ref(),
+                    status == MTLCommandBufferStatus::Completed,
+                );
             },
         );
         #[allow(unsafe_code)]
         // SAFETY: FFI-BLOCK. Metal copies the block, so the local `handler`
-        // may drop after this call. The closure owns only a CompletionToken
-        // and an Arc<AtomicU64>, both Send + Sync and 'static, because Metal
+        // may drop after this call. The closure owns only a CompletionToken,
+        // an Arc<AtomicU64> and a Send + Sync + 'static completion observer, because Metal
         // runs it on a thread of its own choosing. It is added before commit,
         // as Metal requires.
         unsafe {
@@ -2555,22 +2594,20 @@ impl Metal4Submission {
         let options = MTL4CommitOptions::new();
         let token = lease.submit();
         let failed = Arc::clone(&self.failed);
+        let completion = self.completion_handler.borrow().clone();
         let handler = RcBlock::new(
             move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
                 #[allow(unsafe_code)]
                 // SAFETY: FFI-BLOCK. Metal passes the commit's feedback object,
                 // valid for the duration of the handler.
                 let error = unsafe { feedback.as_ref() }.error();
-                if error.is_some() {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                }
-                token.complete();
+                finish_frame(&token, &failed, completion.as_ref(), error.is_none());
             },
         );
         #[allow(unsafe_code)]
         // SAFETY: FFI-BLOCK. Metal copies the block, so the local `handler`
-        // may drop after this call. The closure owns only a CompletionToken
-        // and an Arc<AtomicU64>, both Send + Sync and 'static, because Metal
+        // may drop after this call. The closure owns only a CompletionToken,
+        // an Arc<AtomicU64> and a Send + Sync + 'static completion observer, because Metal
         // runs feedback handlers on a queue of its own choosing.
         unsafe {
             options.addFeedbackHandler(RcBlock::as_ptr(&handler));
@@ -3558,6 +3595,81 @@ mod tests {
         if let Some(set) = frames.residency() {
             set.removeAllocation(ProtocolObject::from_ref(&*target));
             set.commit();
+        }
+    }
+
+    #[test]
+    fn failed_gpu_completion_releases_its_slot_before_notifying_recovery() {
+        let ring = SlotRing::new();
+        let lease = ring.acquire(LONG).unwrap();
+        let slot = lease.slot();
+        let frame = lease.frame();
+        let token = lease.submit();
+        let failed = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let completed_ring = Arc::clone(&ring);
+        let completed_failed = Arc::clone(&failed);
+        let handler: FrameCompletionHandler = Arc::new(move |completion| {
+            let _ = tx.send((
+                completion,
+                completed_ring.state(slot),
+                completed_failed.load(Ordering::Relaxed),
+            ));
+        });
+        finish_frame(&token, &failed, Some(&handler), false);
+        assert_eq!(
+            rx.recv_timeout(LONG).unwrap(),
+            (
+                FrameCompletion {
+                    frame,
+                    succeeded: false,
+                },
+                SlotState::Free,
+                1,
+            )
+        );
+        assert_eq!(ring.frames_completed(), 1);
+        assert_eq!(ring.in_flight(), 0);
+    }
+
+    #[test]
+    fn both_submission_paths_deliver_their_actual_gpu_completions() {
+        let device = device();
+        for metal4 in [false, true] {
+            if metal4 && !supports_metal4(&device) {
+                continue;
+            }
+            let mut frames = FrameSlots::new(device.clone(), SMALL, private_ledger()).unwrap();
+            let submission = if metal4 {
+                Submission::metal4(&device, &frames).expect("Metal 4 submission")
+            } else {
+                Submission::metal3(device.newCommandQueue().unwrap(), &frames)
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            submission.set_completion_handler(Some(Arc::new(move |completion| {
+                let _ = tx.send(completion);
+            })));
+            run_offscreen_frames(&submission, &mut frames, SMALL, 6);
+            let mut completions = (0..6)
+                .map(|_| rx.recv_timeout(LONG).unwrap())
+                .collect::<Vec<_>>();
+            completions.sort_unstable_by_key(|completion| completion.frame);
+            assert_eq!(
+                completions,
+                (0..6)
+                    .map(|frame| FrameCompletion {
+                        frame,
+                        succeeded: true,
+                    })
+                    .collect::<Vec<_>>()
+            );
+            submission.set_completion_handler(None);
+            run_offscreen_frames(&submission, &mut frames, SMALL, 1);
+            assert!(
+                rx.try_recv().is_err(),
+                "a removed observer was called again"
+            );
+            assert_eq!(submission.failed_frames(), 0);
         }
     }
 

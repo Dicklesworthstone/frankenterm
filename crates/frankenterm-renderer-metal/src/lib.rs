@@ -112,9 +112,12 @@
 //!    handler dereferences the command buffer or feedback object Metal passes.
 //!    *Invariant:* Metal copies the block, so the local `RcBlock` may drop
 //!    after the call; the closure owns only `Send + Sync + 'static` state (a
-//!    `CompletionToken`, an `Arc<AtomicU64>`) because Metal runs it on a
+//!    `CompletionToken`, an `Arc<AtomicU64>` and an optional owned completion
+//!    observer) because Metal runs it on a
 //!    thread of its choosing; the handler is added before the commit; the
-//!    object Metal passes is valid for the duration of the handler.
+//!    object Metal passes is valid for the duration of the handler. The slot
+//!    is freed before notifying the observer, which receives only a copied
+//!    frame id and success flag, never a native object or renderer reference.
 //! 7. **FFI-COMMIT: Metal 4 commit.** `commit:count:options:` takes a C
 //!    array of command buffers.
 //!    *Invariant:* the pointer addresses a live one-element array for the
@@ -337,6 +340,20 @@ impl fmt::Display for SubmissionPath {
         f.write_str(self.as_str())
     }
 }
+
+/// The GPU finished one submitted frame. This is command completion, not
+/// confirmation that the drawable reached the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCompletion {
+    /// Monotonically increasing within this renderer's frame-slot ring.
+    pub frame: u64,
+    pub succeeded: bool,
+}
+
+/// Observes GPU completion on a Metal-managed thread, after the frame slot
+/// is available again. Implementations must not panic or retain the renderer;
+/// use owned thread-safe state to request recovery on the render thread.
+pub type FrameCompletionHandler = std::sync::Arc<dyn Fn(FrameCompletion) + Send + Sync + 'static>;
 
 /// Frame pacing and allocation counters of a [`MetalRenderer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

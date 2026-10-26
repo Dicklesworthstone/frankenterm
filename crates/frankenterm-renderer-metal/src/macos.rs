@@ -434,6 +434,13 @@ impl MetalRenderer {
         self.submission_note.as_deref()
     }
 
+    /// Observes future GPU completions so an asynchronous failure can wake
+    /// a render thread that has already gone idle. In-flight frames retain
+    /// the handler installed when they were submitted.
+    pub fn set_frame_completion_handler(&self, handler: Option<crate::FrameCompletionHandler>) {
+        self.submission.set_completion_handler(handler);
+    }
+
     /// Frame pacing and allocation counters.
     #[must_use]
     pub fn frame_stats(&self) -> FrameStats {

@@ -22,6 +22,10 @@
 //! The link pauses while nothing changes; an idle output/input wake draws
 //! once immediately before resuming it. Earlier macOS paces to the
 //! `max_fps` interval instead.
+//!
+//! A submitted frame can still fail later on the GPU. Completion feedback
+//! wakes the render thread even after output stops, and retries back off
+//! before taking another snapshot or acquiring a drawable.
 
 use super::TermWindow;
 use super::metal_chrome::ChromeFrame;
@@ -33,8 +37,8 @@ use frankenterm_font::FontConfiguration;
 #[cfg(test)]
 use frankenterm_gui::render_thread::RenderThreadStats;
 use frankenterm_gui::render_thread::{
-    FrameDriver, FrameRateRange, FrameReport, RenderThread, RenderWaker, Surface, SurfaceState,
-    VsyncSource, VsyncTick, VsyncWait,
+    FrameDriver, FrameRateRange, FrameReport, FrameRetry, RenderThread, RenderWaker, Surface,
+    SurfaceState, VsyncSource, VsyncTick, VsyncWait,
 };
 use frankenterm_renderer_metal::{
     ClearColor, FrameOutcome, GridExtent, LinkUpdate, LinkWait, MetalDisplayLink, MetalRenderer,
@@ -232,6 +236,8 @@ struct MetalDriver {
     request: Arc<Mutex<Arc<MetalFrameRequest>>>,
     panes: MetalPanes,
     fonts: Option<RenderFonts>,
+    /// Shared only with GPU completion handlers; owns no renderer objects.
+    retry: Arc<FrameRetry>,
     /// The drawable size of the last presented frame, width in the high 32
     /// bits: what the window shows now.
     presented_size: Arc<AtomicU64>,
@@ -339,6 +345,16 @@ impl FrameDriver for MetalDriver {
 
 impl MetalDriver {
     fn draw(&mut self, surface: &Surface, require_link_update: bool) -> FrameReport {
+        if let Some(at) = self.retry.wait_until(Instant::now()) {
+            // Release this tick's drawable while deferred. The scheduler
+            // preserves the retry deadline and still honors max_fps,
+            // occlusion, resize and shutdown without a blocking sleep here.
+            self.link_update.borrow_mut().take();
+            return FrameReport {
+                presented: false,
+                redraw_at: Some(at),
+            };
+        }
         let request = Arc::clone(&self.request.lock().unwrap_or_else(PoisonError::into_inner));
         let (width, height, dpi) = surface.state.geometry();
         if self.opaque != Some(request.opaque) {
@@ -474,6 +490,8 @@ impl MetalRenderThread {
         let panes = request_panes(&request);
         let request = Arc::new(Mutex::new(Arc::new(request)));
         let driver_request = Arc::clone(&request);
+        let retry = Arc::new(FrameRetry::default());
+        let driver_retry = Arc::clone(&retry);
         let presented_size = Arc::new(AtomicU64::new(0));
         let driver_presented_size = Arc::clone(&presented_size);
         #[cfg(test)]
@@ -488,6 +506,7 @@ impl MetalRenderThread {
                 request: driver_request,
                 panes: MetalPanes::default(),
                 fonts: None,
+                retry: driver_retry,
                 presented_size: driver_presented_size,
                 link_update: Rc::new(RefCell::new(None)),
                 paced_by_link: pacing == Pacing::DisplayLink,
@@ -496,6 +515,20 @@ impl MetalRenderThread {
                 rows_rebuilt: driver_rows_rebuilt,
                 renderer: Rc::new(handoff.into_renderer()),
             };
+            let completion_retry = Arc::clone(&driver.retry);
+            driver
+                .renderer
+                .set_frame_completion_handler(Some(Arc::new(move |completion| {
+                    if !completion.succeeded {
+                        FrameLedger::global().record_present_failure();
+                        metrics::counter!("gui.metal.render_thread.gpu_frame_failed").increment(1);
+                    }
+                    completion_retry.complete(
+                        completion.frame,
+                        completion.succeeded,
+                        Instant::now(),
+                    );
+                })));
             // The link is created here, on the render thread whose run loop
             // runs it (ft-yccm0.4.1.3); before macOS 14 there is none.
             let link = if driver.paced_by_link {
@@ -522,6 +555,7 @@ impl MetalRenderThread {
             });
             (driver, source)
         })?;
+        retry.set_waker(thread.waker());
         output.set_panes(panes);
         output.set_waker(Some(thread.waker()));
         Ok(Self {

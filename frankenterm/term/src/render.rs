@@ -7,8 +7,10 @@
 //! terminal pointer crosses the language boundary.
 
 use crate::config::GridEngine;
+use crate::pagegrid::{CellStyle, Glyph, PackedCell, Page, RichStyle};
 use crate::{Line, StableRowIndex, Terminal};
 use frankenterm_bidi::Direction;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 use termwiz::cell::{Blink, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
@@ -17,7 +19,7 @@ use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::ImageCell;
 use termwiz::surface::line::CellRef;
-use termwiz::surface::{CursorShape, CursorVisibility, SEQ_ZERO, SequenceNo};
+use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MirrorColor {
@@ -73,6 +75,134 @@ const OVERLINE: u32 = 1 << 11;
 const VALIGN_SHIFT: u32 = 12;
 const IMAGE: u32 = 1 << 14;
 const SEMANTIC_SHIFT: u32 = 15;
+
+/// A terminal row borrowed only while its terminal lock is held. Looking up
+/// a native row or its damage facts does not construct a legacy `Line` view.
+pub enum RenderRowRef<'a> {
+    Line(&'a Line),
+    Page {
+        page: &'a Page,
+        row: u32,
+        seqno: SequenceNo,
+    },
+}
+
+impl RenderRowRef<'_> {
+    pub fn seqno(&self) -> SequenceNo {
+        match self {
+            Self::Line(line) => line.current_seqno(),
+            Self::Page { seqno, .. } => *seqno,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Line(line) => line.len(),
+            Self::Page { page, row, .. } => page.row_len(*row),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn last_cell_was_wrapped(&self) -> bool {
+        match self {
+            Self::Line(line) => line.last_cell_was_wrapped(),
+            Self::Page { page, row, .. } => page
+                .row_words(*row)
+                .iter()
+                .rev()
+                .map(|word| PackedCell::from_bits(*word))
+                .find(|cell| !cell.is_hidden())
+                .is_some_and(PackedCell::is_wrapped),
+        }
+    }
+
+    pub fn implicit_hyperlinks_are_scanned(&self) -> bool {
+        match self {
+            Self::Line(line) => line.implicit_hyperlinks_are_scanned(),
+            // A hyperlink scan edits a Line, making that view authoritative.
+            // A native write invalidates that scan when it returns to pages.
+            Self::Page { .. } => false,
+        }
+    }
+}
+
+/// An owned snapshot of one native page row. Copying retains raw packed
+/// words and only their referenced side entries. No page reference escapes
+/// the terminal lock; style/color conversion happens in `update_from_packed`
+/// after the caller releases it. All scratch capacities survive recapture.
+#[derive(Debug, Clone, Default)]
+pub struct PackedMirrorRow {
+    seqno: SequenceNo,
+    cells: Vec<u64>,
+    styles: HashMap<u32, RichStyle>,
+    graphemes: Vec<(usize, std::ops::Range<usize>)>,
+    text: String,
+    links: Vec<(usize, Arc<Hyperlink>)>,
+    images: Vec<MirrorImage>,
+}
+
+impl PackedMirrorRow {
+    /// Copies one row and returns its visible cell count. The effective
+    /// sequence includes PageList damage floors, not just the page word.
+    pub fn capture(&mut self, page: &Page, row: u32, seqno: SequenceNo) -> usize {
+        self.clear();
+        self.seqno = seqno;
+        self.cells.extend_from_slice(page.row_words(row));
+        let mut visible = 0;
+        let mut last_rich_id = 0;
+        for (col, word) in self.cells.iter().enumerate() {
+            let cell = PackedCell::from_bits(*word);
+            if cell.is_hidden() {
+                continue;
+            }
+            visible += 1;
+            if let CellStyle::Rich(id) = cell.style() {
+                if id != last_rich_id {
+                    self.styles
+                        .entry(id)
+                        .or_insert_with(|| *page.styles().get(id).expect("a live rich style"));
+                    last_rich_id = id;
+                }
+            }
+            if cell.has_grapheme() {
+                if let Glyph::Cluster(text) = page.glyph(row, col) {
+                    let start = self.text.len();
+                    self.text.push_str(text);
+                    self.graphemes.push((col, start..self.text.len()));
+                }
+            }
+            if cell.has_hyperlink() {
+                if let Some(link) = page.hyperlink(row, col) {
+                    self.links.push((col, Arc::clone(link)));
+                }
+            }
+            if cell.has_image() {
+                if let Some(images) = page.cell_images(row, col) {
+                    self.images.extend(images.iter().map(|image| MirrorImage {
+                        col,
+                        image: (**image).clone(),
+                    }));
+                }
+            }
+        }
+        visible
+    }
+
+    /// Releases captured side-data owners after resolution, retaining only
+    /// their reusable allocations. A subsequent legacy-row capture must not
+    /// leave an old native image or hyperlink payload retained here.
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.styles.clear();
+        self.graphemes.clear();
+        self.text.clear();
+        self.links.clear();
+        self.images.clear();
+    }
+}
 
 /// One visible cell. Wide-character spacers are not separate entries.
 /// Host-sized indexes retain the complete grapheme; wire limits are checked by
@@ -276,6 +406,116 @@ impl MirrorRow {
                     }));
             }
             self.cells.push(converted);
+        }
+    }
+
+    /// Resolves a copied native row after releasing the terminal lock. The
+    /// conversion writes the same semantic cells as `update_from_line`,
+    /// without constructing temporary `Cell`, `CellAttributes` or `Line`
+    /// objects for packed text. Only the snapshot's own side entries are read.
+    pub fn update_from_packed(
+        &mut self,
+        stable: StableRowIndex,
+        packed: &PackedMirrorRow,
+        generation: u64,
+    ) {
+        self.clear(stable, generation);
+        self.seqno = packed.seqno;
+        self.cells.reserve(packed.cells.len());
+        self.text.reserve(packed.cells.len());
+        let mut grapheme = 0;
+        let mut hyperlink = 0;
+        let mut image = 0;
+        let mut last_rich_id = 0;
+        let mut rich_colors = (
+            0,
+            MirrorColor::Default,
+            MirrorColor::Default,
+            MirrorColor::Default,
+        );
+        for (col, word) in packed.cells.iter().enumerate() {
+            let cell = PackedCell::from_bits(*word);
+            if cell.is_hidden() {
+                continue;
+            }
+            let (flags, fg, bg, underline_color) = match cell.style() {
+                CellStyle::Inline(style) => {
+                    let color = |code: u16| match code {
+                        0 => MirrorColor::Default,
+                        code => MirrorColor::Palette((code - 1).min(255) as u8),
+                    };
+                    (
+                        u32::from(style.attrs()),
+                        color(style.fg()),
+                        color(style.bg()),
+                        MirrorColor::Default,
+                    )
+                }
+                CellStyle::Rich(id) => {
+                    // True-color runs commonly repeat one style for most
+                    // of a row. Decode its colors once and avoid a hash
+                    // lookup and float conversion for every text cell.
+                    if id != last_rich_id {
+                        let style = packed.styles.get(&id).expect("a copied rich style");
+                        rich_colors = (
+                            u32::from(style.attrs),
+                            MirrorColor::from_attribute(style.fg),
+                            MirrorColor::from_attribute(style.bg),
+                            MirrorColor::from_attribute(style.underline_color),
+                        );
+                        last_rich_id = id;
+                    }
+                    rich_colors
+                }
+            };
+            let text_start = self.text.len();
+            if let Some((_, range)) = packed.graphemes.get(grapheme).filter(|(at, _)| *at == col) {
+                self.text.push_str(&packed.text[range.clone()]);
+                grapheme += 1;
+            } else {
+                self.text.push(cell.first_char().unwrap_or(' '));
+            }
+            let link =
+                if let Some((_, link)) = packed.links.get(hyperlink).filter(|(at, _)| *at == col) {
+                    hyperlink += 1;
+                    self.links
+                        .iter()
+                        .position(|known| Arc::ptr_eq(known, link) || **known == **link)
+                        .unwrap_or_else(|| {
+                            self.links.push(Arc::clone(link));
+                            self.links.len() - 1
+                        })
+                        + 1
+                } else {
+                    0
+                };
+            let image_start = self.images.len();
+            while let Some(attachment) = packed.images.get(image).filter(|item| item.col == col) {
+                // Match Page::cell_attributes -> attach_image exactly, even
+                // for equal z-indices whose insertion order may be reversed.
+                let at = self.images[image_start..]
+                    .binary_search_by(|known| {
+                        known.image.z_index().cmp(&attachment.image.z_index())
+                    })
+                    .unwrap_or_else(|at| at);
+                self.images.insert(image_start + at, attachment.clone());
+                image += 1;
+            }
+            let has_images = self.images.len() != image_start;
+            self.has_images |= has_images;
+            self.cells.push(MirrorCell {
+                text_start,
+                text_len: self.text.len() - text_start,
+                col,
+                width: if cell.is_wide() { 2 } else { 1 },
+                flags: flags
+                    | ((cell.semantic() as u32) << SEMANTIC_SHIFT)
+                    | if has_images { IMAGE } else { 0 },
+                link,
+                fg,
+                bg,
+                underline_color,
+            });
         }
     }
 
@@ -966,17 +1206,21 @@ mod tests {
     use termwiz::cell::Cell;
 
     #[derive(Debug)]
-    struct Config;
+    struct Config(GridEngine);
     impl TerminalConfiguration for Config {
         fn color_palette(&self) -> ColorPalette {
             ColorPalette::default()
         }
         fn grid_engine(&self) -> GridEngine {
-            GridEngine::Legacy
+            self.0
         }
     }
 
     fn terminal(rows: usize, cols: usize) -> Terminal {
+        terminal_with_engine(rows, cols, GridEngine::Legacy)
+    }
+
+    fn terminal_with_engine(rows: usize, cols: usize, engine: GridEngine) -> Terminal {
         Terminal::new_bounded_output(
             TerminalSize {
                 rows,
@@ -985,12 +1229,184 @@ mod tests {
                 pixel_height: rows * 16,
                 dpi: 96,
             },
-            Arc::new(Config),
+            Arc::new(Config(engine)),
             "FrankenTerm",
             "render-frame-test",
             BoundedOutputLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn native_snapshot_and_row_facts_construct_no_legacy_line_views() {
+        let mut term = terminal_with_engine(2, 24, GridEngine::Page);
+        term.advance_bytes("\x1b[1;31mfirst row\r\n\x1b[38;2;17;34;51msecond row");
+        assert_eq!(term.screen().cached_page_views(), 0);
+        let mut rows = Vec::new();
+        for physical in 0..2 {
+            let source = term.screen().render_row(physical).unwrap();
+            assert!(!source.is_empty());
+            assert!(!source.last_cell_was_wrapped());
+            assert!(!source.implicit_hyperlinks_are_scanned());
+            let RenderRowRef::Page { page, row, seqno } = source else {
+                panic!("ordinary native output should remain packed");
+            };
+            let mut packed = PackedMirrorRow::default();
+            let count = packed.capture(page, row, seqno);
+            let mut converted = MirrorRow::empty(physical as StableRowIndex, 9);
+            converted.update_from_packed(physical as StableRowIndex, &packed, 9);
+            assert_eq!(converted.cells().len(), count);
+            rows.push(converted);
+        }
+        assert_eq!(
+            term.screen().cached_page_views(),
+            0,
+            "both metadata reads and packed capture must avoid OnceLock Line views"
+        );
+        for (physical, row) in rows.iter().enumerate() {
+            let reference = MirrorRow::from_line(
+                physical as StableRowIndex,
+                term.screen().phys_line(physical),
+                9,
+            );
+            assert_eq!(*row, reference);
+        }
+        assert_eq!(
+            term.screen().cached_page_views(),
+            2,
+            "the oracle builds views"
+        );
+
+        term.increment_seqno();
+        let seqno = term.current_seqno();
+        term.screen_mut()
+            .line_mut(0)
+            .set_cell(0, Cell::new('!', CellAttributes::blank()), seqno);
+        assert!(matches!(
+            term.screen().render_row(0),
+            Some(RenderRowRef::Line(_))
+        ));
+        assert!(matches!(
+            term.screen().render_row(1),
+            Some(RenderRowRef::Page { .. })
+        ));
+    }
+
+    #[test]
+    fn packed_rows_match_legacy_views_with_wide_cells_clusters_and_rich_styles() {
+        use crate::pagegrid::view::{line_view, store_line};
+
+        let streams = [
+            "\x1b[1;3;4:3;5;7;9;53mstyled\x1b[0m\r\n\x1b[2;8;74mhalf\x1b[0m",
+            "\x1b[38;5;200;48;5;21mindexed\r\n\x1b[38;2;17;34;51;48;2;91;81;71;58;2;4;5;6mtrue color",
+            "界界界界界界界e\u{301} 👩\u{200d}💻 ❤\u{fe0f} 🇯🇵",
+            "\x1b]8;;https://example.test/explicit\x1b\\wide界link\x1b]8;;\x1b\\ tail",
+            "\x1b]133;A\x1b\\prompt\x1b]133;B\x1b\\input\x1b]133;C\x1b\\output",
+        ];
+        for stream in streams {
+            let mut term = terminal(4, 12);
+            term.advance_bytes(stream);
+            for line in term.screen().all_lines() {
+                for compressed in [false, true] {
+                    let mut line = line.clone();
+                    if compressed {
+                        line.compress_for_scrollback();
+                    }
+                    let mut page = Page::new(12, 1, 1);
+                    let row = page.grow(1).unwrap();
+                    assert!(store_line(&mut page, row, &line));
+                    let mut packed = PackedMirrorRow::default();
+                    packed.capture(&page, row, 77);
+                    let view = line_view(&page, row, 77);
+                    let facts = RenderRowRef::Page {
+                        page: &page,
+                        row,
+                        seqno: 77,
+                    };
+                    assert_eq!(facts.len(), view.len());
+                    assert_eq!(facts.last_cell_was_wrapped(), view.last_cell_was_wrapped());
+                    let expected = MirrorRow::from_line(19, &view, 8);
+
+                    // No page pointer, style id, or grapheme-arena borrow may
+                    // outlive capture, including when storage is recycled.
+                    drop(page);
+                    let mut converted = MirrorRow::empty(0, 0);
+                    converted.update_from_packed(19, &packed, 8);
+                    assert_eq!(
+                        converted, expected,
+                        "stream {stream:?}, compressed={compressed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_snapshot_owns_images_and_links_and_matches_equal_z_order() {
+        use crate::pagegrid::view::{line_view, store_line};
+        use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
+
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            2,
+            1,
+            vec![255, 0, 0, 255, 0, 0, 255, 255],
+        )));
+        let released = Arc::downgrade(&data);
+        let mut attrs = CellAttributes::blank();
+        attrs
+            .set_foreground(ColorAttribute::TrueColorWithPaletteFallback(
+                SrgbaTuple(0.2, 0.4, 0.6, 0.5),
+                9,
+            ))
+            .set_underline_color(ColorAttribute::PaletteIndex(17))
+            .set_semantic_type(SemanticType::Prompt)
+            .set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.test/image"))));
+        for (left, z) in [(0.0, 2), (0.5, -1), (0.5, 2)] {
+            attrs.attach_image(Box::new(ImageCell::with_z_index(
+                TextureCoordinate::new_f32(left, 0.0),
+                TextureCoordinate::new_f32(left + 0.5, 1.0),
+                Arc::clone(&data),
+                z,
+                1,
+                2,
+                3,
+                4,
+                Some(7),
+                None,
+            )));
+        }
+        let mut line = Line::from_text("x", &CellAttributes::blank(), 4, None);
+        line.set_cell(0, Cell::new_grapheme("e\u{301}", attrs, None), 4);
+        let mut page = Page::new(8, 1, 1);
+        let native = page.grow(1).unwrap();
+        assert!(store_line(&mut page, native, &line));
+        let expected = MirrorRow::from_line(0, &line_view(&page, native, 4), 7);
+        let mut packed = PackedMirrorRow::default();
+        packed.capture(&page, native, 4);
+        let allocation = packed.cells.as_ptr();
+        drop(page);
+        drop(line);
+        drop(data);
+
+        let mut row = MirrorRow::empty(0, 0);
+        row.update_from_packed(0, &packed, 7);
+        assert_eq!(row, expected);
+        assert_eq!(row.images().len(), 3);
+        assert_eq!(row.images()[0].image.padding(), (1, 2, 3, 4));
+        assert_eq!(row.hyperlinks()[0].uri(), "https://example.test/image");
+        packed.clear();
+        assert_eq!(
+            packed.cells.as_ptr(),
+            allocation,
+            "scratch capacity survives"
+        );
+        assert!(packed.images.is_empty() && packed.links.is_empty());
+        drop(expected);
+        row.clear(1, 8);
+        assert!(
+            released.upgrade().is_none(),
+            "cleared scratch cannot pin old image data"
+        );
     }
 
     fn witness() -> RenderFrameWitness {

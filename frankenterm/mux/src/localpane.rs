@@ -6918,8 +6918,10 @@ impl LocalPane {
         let mut term = self.terminal.lock_as(TerminalLockHolder::Paint);
         #[cfg(feature = "disruptor-pane-io")]
         self.drain_action_ring_locked(&mut term);
-        let stats = crate::render_mirror::capture_terminal_rows(&mut term, mirror, request)?;
+        let stats =
+            crate::render_mirror::capture_terminal_rows_deferred(&mut term, mirror, request)?;
         drop(term);
+        mirror.resolve_pending();
         if hide_cursor {
             mirror.hide_cursor();
         }
