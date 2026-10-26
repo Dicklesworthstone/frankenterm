@@ -47,6 +47,9 @@ typedef struct {
  * max_allocated bounds libssh2 allocations, not OpenSSL/system socket memory.
  */
 int ftssh_create(int connected_fd, size_t max_allocated, ftssh_session **result);
+/* FTSSH_NEGOTIATION: the server answered, and no exchange both accept was
+ * agreed. A transport that failed or closed first, with no disconnect message
+ * from the server, is FTSSH_IO. */
 int ftssh_handshake(ftssh_session *session);
 int ftssh_copy_host_key(ftssh_session *session, uint8_t *output, size_t capacity, size_t *length);
 int ftssh_copy_method(ftssh_session *session, int method, char *output, size_t capacity);

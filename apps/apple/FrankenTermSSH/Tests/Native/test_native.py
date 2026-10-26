@@ -697,6 +697,64 @@ class NativeSSHTests(unittest.TestCase):
         time.sleep(3)
         self.assertEqual(DRIVER.ftssh_keepalive(handle), 0)
 
+    def handshake_against(self, serve):
+        """The handshake's result against a raw server running serve(peer, finished)."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        finished, errors = threading.Event(), []
+        def run():
+            peer, _ = listener.accept()
+            peer.settimeout(3)
+            try:
+                serve(peer, finished)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                peer.close()
+        thread = threading.Thread(target=run)
+        thread.start()
+        sock = socket.create_connection(listener.getsockname(), timeout=3)
+        sock.settimeout(None)
+        handle = P()
+        self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
+        sock.detach()
+        self.handles.append(handle)
+        try:
+            return self.advance(handle, DRIVER.ftssh_handshake, (-1003, -1004))
+        finally:
+            finished.set()
+            thread.join(3)
+            listener.close()
+            self.assertFalse(errors)
+
+    def test_a_transport_lost_mid_exchange_is_not_a_negotiation_answer(self):
+        def read_client_kexinit(peer):
+            seen = b""
+            while b"\r\n" not in seen or len(seen.split(b"\r\n", 1)[1]) < 6:
+                part = peer.recv(4096)
+                self.assertTrue(part, "the client sent its key exchange")
+                seen += part
+        for reset in [False, True]:
+            with self.subTest(reset=reset):
+                def lost(peer, finished):
+                    peer.sendall(b"SSH-2.0-FrankenTermTest\r\n")
+                    read_client_kexinit(peer)
+                    if reset:
+                        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.assertEqual(self.handshake_against(lost), -1003)
+        # A server that answers with no cipher this client accepts is an answer.
+        payload = bytes([20]) + bytes(16) + b"".join(ssh_string(name) for name in [
+            b"curve25519-sha256", b"ssh-ed25519", b"3des-cbc", b"3des-cbc", b"hmac-sha2-256-etm@openssh.com",
+            b"hmac-sha2-256-etm@openssh.com", b"none", b"none", b"", b""]) + b"\x00" + bytes(4)
+        padding = 8 - (5 + len(payload)) % 8
+        padding += 8 if padding < 4 else 0
+        kexinit = struct.pack(">IB", 1 + len(payload) + padding, padding) + payload + bytes(padding)
+        def mismatched(peer, finished):
+            peer.sendall(b"SSH-2.0-FrankenTermTest\r\n" + kexinit)
+            finished.wait(5)
+        self.assertEqual(self.handshake_against(mismatched), -1004)
+
     def test_completion_control_flood_yields_after_bounded_receive_quantum(self):
         handle, server, key = self.start(completion="controlFlood")
         self.assertEqual(self.authenticate(handle, server, key), 0)

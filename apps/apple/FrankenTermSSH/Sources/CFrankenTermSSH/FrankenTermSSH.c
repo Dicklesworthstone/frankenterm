@@ -40,6 +40,9 @@ struct ftssh_session {
     size_t public_length, challenge_length, signature_length;
     int signature_consumed, resize_pending;
     int auth_methods_checked, sign_callback_entered, sign_error, socket_failed;
+    /* The server sent a disconnect message: it answered, unlike a transport
+     * that failed or closed without a word. */
+    int peer_disconnected;
     uint32_t geometry[4], resize_geometry[4];
     /* A command channel (no PTY) carries binary data, so stderr is dropped. */
     char command[FTSSH_COMMAND_CAPACITY + 1];
@@ -154,7 +157,7 @@ static void socket_disconnected(LIBSSH2_SESSION *ssh, int reason, const char *me
                                 const char *language, int language_length, void **abstract) {
     (void)ssh; (void)reason; (void)message; (void)message_length; (void)language; (void)language_length;
     ftssh_session *s = *abstract;
-    s->socket_failed = 1;
+    s->socket_failed = 1; s->peer_disconnected = 1;
 }
 static int fail(ftssh_session *s, int code) {
     s->phase = FAILED; s->terminal_error = code; return code;
@@ -237,7 +240,11 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
 }
 int ftssh_handshake(ftssh_session *s) {
     int rc = check(s, HANDSHAKE); if(rc) return rc;
-    rc = result(s, libssh2_session_handshake(s->ssh, s->fd), FTSSH_NEGOTIATION);
+    rc = libssh2_session_handshake(s->ssh, s->fd);
+    /* libssh2 reports a transport lost mid-exchange as a key exchange failure;
+     * our callbacks saw the loss, and it is not the server's answer. */
+    if(rc && rc != LIBSSH2_ERROR_EAGAIN && s->socket_failed && !s->peer_disconnected) return fail(s, FTSSH_IO);
+    rc = result(s, rc, FTSSH_NEGOTIATION);
     if(rc == FTSSH_OK) s->phase = PEER;
     return rc;
 }
