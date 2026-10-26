@@ -106,10 +106,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// terminal key pressed repeats here while it stays down, as on a desktop.
     /// A key-row arrow held down repeats the same way.
     private var repeatingKey: (usage: UInt16, timer: Timer)?
-    /// Whether the key-row arrow now held has repeated: its lift sends no extra key.
-    private var rowKeyRepeated = false
+    /// The key-row arrows held now, and whether each has repeated: one that
+    /// did sends no extra key as its finger lifts.
+    private var heldRowKeys: [UInt16: Bool] = [:]
     /// The pause before a held key repeats, then the time between repeats.
-    var keyRepeat: (delay: TimeInterval, interval: TimeInterval) = (0.4, 0.1)
+    public var keyRepeat: (delay: TimeInterval, interval: TimeInterval) = (0.4, 0.1)
     private var retiring = false
     private var enteredWindow = false
     private var keyboardRequested = false
@@ -551,20 +552,20 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// A held arrow repeats with the modifiers set when it was touched.
     private func holdRowKey(_ usage: UInt16) {
         let modifiers = accessoryModifiers.modifiers
-        rowKeyRepeated = false
+        heldRowKeys[usage] = false
         startRepeating(usage) { view in
             guard view.session.accounting.pendingEvents == 0 else { return }
             view.typed {
                 try view.session.key(TerminalHardwareKey(usage: usage, modifiers: modifiers), phase: .press)
-                view.accessoryModifiers.consume(); view.rowKeyRepeated = true
+                view.accessoryModifiers.consume(); view.heldRowKeys[usage] = true
             }
         }
     }
-    /// Whether the hold that ends here repeated its key.
+    /// Whether the hold that ends here repeated its key. Another arrow held
+    /// meanwhile has its own answer.
     private func endRowHold(_ usage: UInt16) -> Bool {
         stopRepeating(usage)
-        defer { rowKeyRepeated = false }
-        return rowKeyRepeated
+        return heldRowKeys.removeValue(forKey: usage) == true
     }
     private func finishPresses(_ presses: Set<UIPress>) -> Set<UIPress> {
         var unhandled = Set<UIPress>()

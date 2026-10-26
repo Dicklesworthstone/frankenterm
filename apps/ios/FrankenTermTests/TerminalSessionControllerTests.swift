@@ -1989,6 +1989,38 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// Two fingers on the key row's arrows: each sends what its own finger
+    /// did. One that repeated sends nothing more as it lifts, though another
+    /// arrow was touched meanwhile; a quick touch sends one.
+    func testTwoArrowsHeldAtOnceSendWhatEachFingerDid() async throws {
+        let live = try await liveScene(), scene = live.scene, out = live.outPath + ".arrows"
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        let row = terminal.input.inputAccessoryView
+        let left = try XCTUnwrap(button("terminal.key.Left arrow", in: row))
+        let right = try XCTUnwrap(button("terminal.key.Right arrow", in: row))
+        let control = try XCTUnwrap(button("terminal.key.Control modifier", in: row))
+        try await type("echo started > \(out).started; cat -v > \(out)", into: terminal)
+        _ = try await hostFile(out + ".started", containing: "started")
+        try await Task.sleep(for: .milliseconds(500))
+        // One repeat soon after a touch, then none for the rest of the test.
+        terminal.input.keyRepeat = (delay: 0.05, interval: 60)
+        left.sendActions(for: .touchDown)
+        try await Task.sleep(for: .milliseconds(500))
+        right.sendActions(for: .touchDown)
+        left.sendActions(for: .touchUpInside)
+        right.sendActions(for: .touchUpInside)
+        terminal.input.insertText("\n")
+        control.sendActions(for: .touchUpInside)
+        terminal.input.insertText("d")
+        let text = try await hostFile(out, containing: "\n")
+        let keys = text.trimmingCharacters(in: .newlines).components(separatedBy: "^[").filter { !$0.isEmpty }
+        XCTAssertEqual(keys.map(\.last), ["D", "C"], "the left arrow repeated once, the right one was touched (got \(text))")
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// Ctrl+C from the key row stops a flood on the machine on screen: the
     /// key is not held behind the output, and the next command runs.
     func testCtrlCStopsAFloodOnTheMachineOnScreen() async throws {
