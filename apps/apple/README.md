@@ -154,6 +154,8 @@ The accessory row provides Esc, Tab, arrows, and one-shot/locked Ctrl and Alt. I
 
 ## Verification status and commands
 
+**Local connection preferences, VoiceOver reading, and expanded source-key formats:** all 70 Kit source files and 88 test files typecheck on Linux with Swift 6.4.1. Focused XCTest harnesses executed 43 cases with zero failures: 18 source-key, eight accessibility, 11 connection-intent, and six persistent-preference cases. The storage cases cover relaunch, reimport/removal/reintroduction, workspace scoping, interrupted publication, catalog migration, and malformed preferences without credential deletion. The production and test sources compiled in Swift 6 mode; only temporary manual XCTest discovery used Swift 5 compatibility mode. The source-key run includes all 22 independent key pairs, 64 padding variants, and the published AES/bcrypt vectors. Its first run caught a malformed 40-byte expected bcrypt literal; both portable and Apple tests now use the independently checked OpenBSD value. The complete SwiftPM run was blocked by shared disk/memory pressure. These additions still require Apple SDK/runtime qualification; the earlier complete-package and native results below do not establish that qualification.
+
 The new Search Output and retained-output screens, their late-keyboard fence,
 and the updated app-hosted SSH assertions have Swift frontend syntax validation
 in this executor. They still need an Apple SDK build and hosted run; they are

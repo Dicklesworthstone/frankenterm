@@ -59,7 +59,7 @@ final class AppleOpenSSHSourceKeyTests: XCTestCase {
         let salt = try Data(ftHex: "3a62f0f0dbcef823cfcc854856ea1028")
         let expected = [
             32: try Data(ftHex: "204438175eee7ce136c91b49a67923ff9988c989613180333f97684bc78093e8"),
-            40: try Data(ftHex: "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a76"),
+            40: try Data(ftHex: "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7"),
             48: try Data(ftHex: "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7616731a1800133b4")
         ]
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
