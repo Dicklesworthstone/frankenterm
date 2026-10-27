@@ -43,6 +43,7 @@ const EVENT_PHONE_SIZE: u32 = 9;
 const EVENT_MOUSE_GRAB: u32 = 10;
 const EVENT_ACTIVITY: u32 = 11;
 const EVENT_INCARNATION: u32 = 12;
+const EVENT_PHONE_SIZE_RESTORED: u32 = 13;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -216,6 +217,9 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
             vec![u8::from(grabbed)],
         ),
         Some(Event::Activity { pane_id }) => (EVENT_ACTIVITY, pane_id as u64, 0, 0, Vec::new()),
+        Some(Event::PhoneSizeRestored { pane_id }) => {
+            (EVENT_PHONE_SIZE_RESTORED, pane_id as u64, 0, 0, Vec::new())
+        }
         Some(Event::PhoneSize {
             pane_id,
             desktop,
@@ -687,8 +691,8 @@ mod tests {
         assert_eq!(take_outgoing(session), [2, 1, 26]);
         assert!(take_outgoing(session).is_empty());
 
-        // A reply from a server newer than this client: codec_vers 71, version "x".
-        let reply = [5u8, 1, 27, 71, 1, b'x'];
+        // A reply from a server newer than this client: codec_vers 72, version "x".
+        let reply = [5u8, 1, 27, 72, 1, b'x'];
         // SAFETY: a live local buffer with its exact length.
         assert_eq!(
             unsafe { ft_mux_v1_receive(session, reply.as_ptr(), reply.len() as u32) },
@@ -714,7 +718,7 @@ mod tests {
             unsafe { ft_mux_v1_event_copy(session, 0, reason.as_mut_ptr(), length, &mut written) };
         assert_eq!((status, written), (0, length));
         let reason = String::from_utf8(reason).unwrap();
-        assert!(reason.contains("71"), "{}", reason);
+        assert!(reason.contains("72"), "{}", reason);
 
         // SAFETY: live local scalars.
         let status = unsafe {

@@ -613,9 +613,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         /// A size event names only a numeric pane. Persist its current server
         /// and topology witness here, where the authoritative list is owned.
         func rememberPhoneSize(pane: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int) {
-            guard let desktop, let listed = panes.first(where: { $0.paneId == pane }) else {
-                sizes.remove(pane: pane); return
-            }
+            // A nil desktop was emitted before acknowledgement by older
+            // native artifacts. It grants no authority to forget recovery.
+            guard let desktop, let listed = panes.first(where: { $0.paneId == pane }) else { return }
             sizes.set(pane: listed, incarnation: incarnation, desktop: desktop, rows: rows, columns: columns)
         }
     }
@@ -696,7 +696,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                                                 rows: record.rows, columns: record.columns) else { continue }
                 if pane != first.paneId { try client.restoreSize(pane: pane) }
             }
-            state.sizes.removeAll()
+            // Adoption and queued restores do not prove the server applied
+            // them. Keep each record until its explicit confirmed event.
             state.shown = first.paneId; state.shownPane.set(first, incarnation: state.incarnation)
             try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
@@ -763,6 +764,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.ready = true
             case .incarnation(let incarnation):
                 guard incarnation.count == 16,
+                      incarnation.contains(where: { $0 != 0 }),
                       state.incarnation == nil || state.incarnation == incarnation else {
                     throw TerminalMuxError.failed("The mux server identity changed. Reconnect before using its panes.")
                 }
@@ -824,6 +826,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.retitle(pane: pane, title: title)
             case .paneGone(let pane):
                 state.control.inputRouting.remove(pane: pane)
+                state.sizes.remove(pane: pane)
                 state.grabs[pane] = nil
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
@@ -836,6 +839,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.queries.receive(pane: pane, context: context)
             case .phoneSize(let pane, let desktop, let rows, let columns):
                 state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
+            case .phoneSizeRestored(let pane):
+                state.sizes.remove(pane: pane)
             case .mouseGrab(let pane, let grabbed):
                 guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
                 state.grabs[pane] = grabbed ? true : nil
@@ -1186,12 +1191,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             guard let typedTo else { return true }
             return (try? state.client.unansweredInput(pane: typedTo)) == false
         }
-        var restored: [Int] = [], failed = false
+        var failed = false
         // Nothing is on screen now; only sizes and the session's end matter.
         func settle() {
             while let event = try? state.client.nextEvent() {
                 switch event {
-                case .phoneSize(let pane, .none, _, _): restored.append(pane)
+                case .phoneSizeRestored(let pane), .paneGone(let pane):
+                    state.sizes.remove(pane: pane)
                 case .phoneSize(let pane, let desktop, let rows, let columns):
                     state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
                 case .failed: failed = true
@@ -1215,8 +1221,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         settle()
         if !inputAnswered() { state.shownPane.markInputUnconfirmed(); state.control.recordInputUnconfirmed() }
-        guard !failed, (try? state.client.restoring()) == false else { return }
-        for pane in restored { state.sizes.remove(pane: pane) }
+        // `restoring() == false` can also follow rejection or disconnect.
+        // Only the confirmed events above retire durable recovery records.
     }
 
     func validateForeground() async throws {

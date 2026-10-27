@@ -101,9 +101,13 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case paneGone(paneID: Int)
     case searchResults(paneID: Int, TerminalMuxSearchResults)
     case context(paneID: Int, TerminalMuxContext)
-    /// The phone's size (rows x columns) is in effect for the pane, and
-    /// `desktop` is the size to give back; or, without `desktop`, no longer.
+    /// The phone's size (rows x columns) may be in effect for the pane, and
+    /// `desktop` is the size to give back. A nil desktop from an older native
+    /// artifact is unconfirmed and cannot retire a saved recovery record.
     case phoneSize(paneID: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int)
+    /// The server acknowledged the current desktop-size restore, with no
+    /// newer phone resize superseding it. The saved record may be retired.
+    case phoneSizeRestored(paneID: Int)
     /// The pane's program asked for the mouse (a tap is then a click), or stopped.
     case mouseGrab(paneID: Int, grabbed: Bool)
     /// A pane not on screen has new output.
@@ -125,6 +129,7 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 
         fileprivate var isValid: Bool {
             paneId >= 0 && tabId >= 0 && windowId >= 0 && incarnation.count == 16
+                && incarnation.contains(where: { $0 != 0 })
                 && (1...512).contains(rows) && (1...512).contains(columns)
                 && (1...4096).contains(desktop.rows) && (1...4096).contains(desktop.cols)
                 && UInt32(exactly: desktop.pixelWidth) != nil && UInt32(exactly: desktop.pixelHeight) != nil
@@ -152,7 +157,8 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     /// remembered size to the native client. The client still checks its own
     /// current dimensions at adoption. Duplicate pane IDs are not authority.
     public func records(matching panes: [TerminalMuxPane], incarnation: Data?) -> [Int: Record] {
-        guard let incarnation, incarnation.count == 16 else { return [:] }
+        guard let incarnation, incarnation.count == 16,
+              incarnation.contains(where: { $0 != 0 }) else { return [:] }
         var seen = Set<Int>()
         guard panes.allSatisfy({ seen.insert($0.paneId).inserted }) else { return [:] }
         return lock.withLock {

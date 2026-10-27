@@ -23,7 +23,8 @@ pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// A current FrankenTerm's own mux (a Mac's GUI, reached through its relay):
 /// the rolling-upgrade window `codec::CODEC_VERSION_MIN_SUPPORTED..=
 /// CODEC_VERSION`. Every PDU the phone uses has kept one schema across it.
-pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=70;
+/// Version 71 is additive; it does not change the layouts used by this client.
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=71;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
 /// in SendPaste (an input serial follows the text) and ErrorResponse (a

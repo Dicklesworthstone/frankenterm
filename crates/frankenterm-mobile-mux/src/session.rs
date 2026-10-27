@@ -84,16 +84,22 @@ pub enum Event {
         pane_id: usize,
         lines: Vec<ContextLine>,
     },
-    /// The phone's size (`rows` by `cols`) is now in effect for the pane and
-    /// `desktop` is the size to give back; or, with no `desktop`, it no longer
-    /// is. Kept across connections, it lets the next session give a pane its
-    /// size back when this one ended without doing so
-    /// ([`Session::adopt_phone_size`]).
+    /// The phone's size (`rows` by `cols`) may be in effect for the pane and
+    /// `desktop` is the size to give back. Kept across connections, it lets
+    /// the next session restore a pane after a lost connection. An absent
+    /// `desktop` is not a successful restoration receipt: only
+    /// [`Event::PhoneSizeRestored`] or removal of the pane retires the record.
     PhoneSize {
         pane_id: usize,
         desktop: Option<TerminalSize>,
         rows: usize,
         cols: usize,
+    },
+    /// The server acknowledged the exact outstanding desktop-size restore,
+    /// with no newer phone resize superseding it. This retires that pane's
+    /// saved recovery record; merely queueing a resize does not.
+    PhoneSizeRestored {
+        pane_id: usize,
     },
     /// The pane's program asked for the mouse, or stopped: while it has it,
     /// a tap is a click ([`Session::click`]).
@@ -128,6 +134,11 @@ enum Request {
     },
     /// A resize of a shown pane, whose drawing waits for the answer.
     Resize {
+        pane_id: usize,
+    },
+    /// A desktop-size restore. Only its matching successful reply can retire
+    /// a saved recovery record, and only while this restore is still current.
+    RestoreSize {
         pane_id: usize,
     },
     /// Asks for the pane's changes once a resize is answered, so its new
@@ -174,6 +185,10 @@ struct PaneSizing {
     /// this serial is answered, a listed size may still be the phone's
     /// (`u64::MAX`: not restored yet).
     phone_until: Option<u64>,
+    /// Only a list requested after this serial may replace `desktop`.
+    /// A successful restore advances it past every already-issued request,
+    /// excluding delayed snapshots captured before its acknowledgement.
+    desktop_list_after: u64,
 }
 
 #[derive(Debug, Default)]
@@ -593,6 +608,7 @@ impl Session {
         let sizing = self.sizing.entry(pane_id).or_insert(PaneSizing {
             desktop: pane.size,
             phone_until: None,
+            desktop_list_after: 0,
         });
         sizing.phone_until = Some(u64::MAX);
         let desktop = sizing.desktop;
@@ -641,6 +657,7 @@ impl Session {
             PaneSizing {
                 desktop,
                 phone_until: Some(u64::MAX),
+                desktop_list_after: 0,
             },
         );
         true
@@ -669,17 +686,16 @@ impl Session {
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.size_settled();
         }
-        self.send_resize(tab_id, pane_id, sizing.desktop, Request::Action);
+        self.send_resize(
+            tab_id,
+            pane_id,
+            sizing.desktop,
+            Request::RestoreSize { pane_id },
+        );
         let restored = self.next_serial;
         if let Some(sizing) = self.sizing.get_mut(&pane_id) {
             sizing.phone_until = Some(restored);
         }
-        self.events.push_back(Event::PhoneSize {
-            pane_id,
-            desktop: None,
-            rows: 0,
-            cols: 0,
-        });
     }
 
     /// Whether a size [`Session::restore_size`] gave back is still
@@ -749,12 +765,17 @@ impl Session {
             let sizing = self.sizing.entry(pane.pane_id).or_insert(PaneSizing {
                 desktop: pane.size,
                 phone_until: None,
+                desktop_list_after: 0,
             });
+            if serial <= sizing.desktop_list_after {
+                continue;
+            }
             match sizing.phone_until {
-                Some(until) if serial <= until => {}
+                Some(until) if serial <= until || self.requests.contains_key(&until) => {}
                 _ => {
                     sizing.desktop = pane.size;
                     sizing.phone_until = None;
+                    sizing.desktop_list_after = serial;
                 }
             }
         }
@@ -812,6 +833,11 @@ impl Session {
                 }
                 _ => Err(crate::Error::Frame("a reply too large to read")),
             };
+        }
+        if matches!(&request, Some(Request::RestoreSize { .. }))
+            && !matches!(frame.ident, ident::UNIT_RESPONSE | ident::ERROR_RESPONSE)
+        {
+            return Err(crate::Error::Frame("a restore received an unexpected reply"));
         }
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
@@ -953,8 +979,24 @@ impl Session {
                 }
             }
             ident::UNIT_RESPONSE => {
-                if let Some(Request::Resize { pane_id }) = request {
-                    self.poll(pane_id);
+                if !frame.body.is_empty() {
+                    return Err(crate::Error::Frame("a unit reply contains unexpected data"));
+                }
+                match request {
+                    Some(Request::Resize { pane_id }) => self.poll(pane_id),
+                    Some(Request::RestoreSize { pane_id }) => {
+                        if let Some(sizing) = self.sizing.get_mut(&pane_id)
+                            && sizing.phone_until == Some(frame.serial)
+                        {
+                            // A list issued before this acknowledgement may
+                            // still arrive with the old phone-sized snapshot.
+                            // Keep request identity and snapshot freshness as
+                            // separate fences; neither stands in for the other.
+                            sizing.desktop_list_after = self.next_serial;
+                            self.events.push_back(Event::PhoneSizeRestored { pane_id });
+                        }
+                    }
+                    _ => {}
                 }
             }
             ident::PANE_REMOVED => {
@@ -1002,6 +1044,16 @@ impl Session {
                         self.pane_gone(pane_id);
                     }
                     Some(Request::Resize { pane_id }) => self.poll(pane_id),
+                    Some(Request::RestoreSize { pane_id }) => {
+                        if let Some(sizing) = self.sizing.get_mut(&pane_id)
+                            && sizing.phone_until == Some(frame.serial)
+                        {
+                            // The server did not restore it. Preserve the
+                            // original desktop dimensions and permit a later
+                            // explicit restore; no recovery receipt is emitted.
+                            sizing.phone_until = Some(u64::MAX);
+                        }
+                    }
                     Some(Request::Lines { pane_id, ranges }) => {
                         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
                             mirror.apply_lines(wire::LineEntries::default(), &ranges);

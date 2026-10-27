@@ -442,7 +442,7 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 #[test]
 fn a_server_on_another_protocol_is_refused() {
     // Between v0.13 and the current window, and past it.
-    for version in [48, 71] {
+    for version in [48, 72] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.pump();
@@ -453,7 +453,7 @@ fn a_server_on_another_protocol_is_refused() {
         });
         let reason = reason.expect("a failure");
         assert!(
-            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("70"),
+            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("71"),
             "{reason}"
         );
         assert_eq!(harness.server.requests, ["GetCodecVersion"]);
@@ -461,10 +461,21 @@ fn a_server_on_another_protocol_is_refused() {
 }
 
 #[test]
+fn the_current_window_keeps_earlier_servers_and_accepts_its_new_upper_bound() {
+    for version in [61, 70, 71] {
+        let mut harness = Harness::new(4, 20);
+        harness.server.codec_vers = version;
+        harness.attach();
+        assert!(harness.session.is_ready(), "codec version {version}");
+        assert_mirrored(&mut harness);
+    }
+}
+
+#[test]
 fn a_current_mux_like_a_macs_gui_is_spoken_to_in_its_own_layout() {
     use termwiz::input::{KeyCode, Modifiers};
     let mut harness = Harness::new(5, 24);
-    harness.server.codec_vers = 70;
+    harness.server.codec_vers = 71;
     harness.quiet_output(&numbered(0, 12));
     harness.attach();
     assert_mirrored(&mut harness);
@@ -525,7 +536,7 @@ fn lists(harness: &Harness) -> usize {
 #[test]
 fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 70;
+    harness.server.codec_vers = 71;
     harness.attach();
     let named = harness
         .events
@@ -562,7 +573,7 @@ fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
 #[test]
 fn a_current_muxs_topology_changes_list_the_panes_again() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 70;
+    harness.server.codec_vers = 71;
     harness.attach();
     // A new title needs no list.
     harness.server.topology(TopologyEventKind::TabTitleChanged {
@@ -594,7 +605,7 @@ fn a_current_muxs_topology_changes_list_the_panes_again() {
 #[test]
 fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 70;
+    harness.server.codec_vers = 71;
     harness.server.unfenced = true;
     harness.attach();
     assert!(
@@ -1062,6 +1073,25 @@ fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
     assert_eq!(harness.server.resizes.len(), count, "restored once");
 }
 
+fn restored_sizes(harness: &Harness) -> usize {
+    harness
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::PhoneSizeRestored { .. }))
+        .count()
+}
+
+/// Removes the queued restore so a test can control its answer independently
+/// of the server. Other requests must already have drained through the harness.
+fn queued_restore_serial(harness: &mut Harness) -> u64 {
+    let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+    reader.push(&harness.session.take_outgoing());
+    let request = reader.next_frame().unwrap().expect("one queued restore");
+    assert_eq!(request.ident, 14);
+    assert!(reader.next_frame().unwrap().is_none());
+    request.serial
+}
+
 #[test]
 fn a_restore_is_restoring_until_the_server_answers_it() {
     let mut harness = Harness::new(6, 20);
@@ -1080,6 +1110,7 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
     harness.session.restore_size(pane);
     harness.pump();
     assert!(harness.session.restoring());
+    assert_eq!(restored_sizes(&harness), 0, "queueing is not a receipt");
     harness.hold_requests = false;
     harness.hold = true;
     harness.pump();
@@ -1095,9 +1126,11 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
         harness.session.restoring(),
         "applied, but the phone cannot know yet"
     );
+    assert_eq!(restored_sizes(&harness), 0, "the answer is still withheld");
     harness.hold = false;
     harness.pump();
     assert!(!harness.session.restoring());
+    assert_eq!(restored_sizes(&harness), 1);
 
     // A connection that ended waits for nothing.
     harness.session.resize(pane, 10, 32);
@@ -1107,7 +1140,145 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
     harness.pump();
     assert!(harness.session.restoring());
     harness.session.closed();
+    harness.pump();
     assert!(!harness.session.restoring());
+    assert_eq!(restored_sizes(&harness), 1, "a dropped restore has no receipt");
+}
+
+#[test]
+fn a_rejected_restore_and_a_later_list_preserve_the_original_desktop_size() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    harness.session.restore_size(pane);
+    let rejected = queued_restore_serial(&mut harness);
+
+    // The restore has not reached the server. A list asked for afterward
+    // still reports the phone's size and must not redefine the desktop size.
+    harness.session.refresh_panes();
+    harness.pump();
+    assert!(harness.session.restoring());
+    assert_eq!((harness.session.panes()[0].size.rows, harness.session.panes()[0].size.cols), (10, 32));
+    let refusal = varbincode::serialize(&"Error: resize refused".to_owned()).unwrap();
+    harness.session.receive(&server_frame(0, rejected, &refusal, false));
+    harness.pump();
+    assert!(harness.session.is_ready());
+    assert!(!harness.session.restoring());
+    assert_eq!(restored_sizes(&harness), 0, "an error is not successful restoration");
+
+    harness.session.restore_size(pane);
+    harness.pump();
+    let restored = harness.server.resizes.last().unwrap();
+    assert_eq!((restored.rows, restored.cols), (6, 20));
+    assert_eq!(restored_sizes(&harness), 1);
+}
+
+#[test]
+fn a_list_taken_before_restore_ack_cannot_rebase_desktop_after_it() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    harness.session.restore_size(pane);
+    let restore = queued_restore_serial(&mut harness);
+
+    // Capture a real server list while the restore is still pending and
+    // the pane is phone-sized. Hold its response across the restore ACK.
+    harness.hold = true;
+    harness.session.refresh_panes();
+    harness.pump();
+    let before_ack = std::mem::take(&mut harness.server.to_phone);
+    assert!(!before_ack.is_empty(), "a held phone-sized pane list");
+
+    // The server completes restoration before the delayed snapshot reaches
+    // the client. Its request serial alone cannot prove snapshot freshness.
+    harness.server.term.resize(support::size(6, 20));
+    harness
+        .session
+        .receive(&server_frame(10, restore, &[], false));
+    harness.hold = false;
+    harness.pump();
+    assert_eq!(restored_sizes(&harness), 1);
+    harness.session.receive(&before_ack);
+    harness.pump();
+
+    harness.session.resize(pane, 11, 33);
+    harness.pump();
+    harness.session.restore_size(pane);
+    harness.pump();
+    let restored = harness.server.resizes.last().unwrap();
+    assert_eq!((restored.rows, restored.cols), (6, 20));
+    assert_eq!(restored_sizes(&harness), 2);
+
+    // A list requested after the ACK is authoritative for a later desktop
+    // resize, so the freshness fence does not permanently freeze geometry.
+    harness.server.term.resize(support::size(8, 26));
+    harness.session.refresh_panes();
+    harness.pump();
+    harness.session.resize(pane, 12, 34);
+    harness.pump();
+    harness.session.restore_size(pane);
+    harness.pump();
+    let restored = harness.server.resizes.last().unwrap();
+    assert_eq!((restored.rows, restored.cols), (8, 26));
+    assert_eq!(restored_sizes(&harness), 3);
+}
+
+#[test]
+fn a_superseded_restore_reply_cannot_retire_a_newer_phone_size() {
+    for reply in [0, 10] {
+        let mut harness = Harness::new(6, 20);
+        harness.attach();
+        let pane = harness.server.pane_id;
+        harness.session.resize(pane, 10, 32);
+        harness.pump();
+        harness.session.restore_size(pane);
+        let old = queued_restore_serial(&mut harness);
+
+        harness.session.resize(pane, 11, 33);
+        harness.pump();
+        harness.session.restore_size(pane);
+        harness.hold_requests = true;
+        harness.pump();
+        assert!(harness.session.restoring());
+        let body = if reply == 0 {
+            varbincode::serialize(&"Error: old resize refused".to_owned()).unwrap()
+        } else {
+            Vec::new()
+        };
+        harness.session.receive(&server_frame(reply, old, &body, false));
+        harness.pump();
+        assert!(harness.session.restoring(), "the newer restore is still pending");
+        assert_eq!(restored_sizes(&harness), 0, "a superseded answer cannot retire recovery");
+
+        harness.hold_requests = false;
+        harness.pump();
+        assert_eq!(restored_sizes(&harness), 1);
+        let restored = harness.server.resizes.last().unwrap();
+        assert_eq!((restored.rows, restored.cols), (6, 20));
+        // Replaying the earlier serial cannot manufacture another receipt.
+        harness.session.receive(&server_frame(10, old, &[], false));
+        harness.pump();
+        assert_eq!(restored_sizes(&harness), 1);
+    }
+}
+
+#[test]
+fn a_malformed_restore_acknowledgement_never_retires_recovery() {
+    let mut harness = Harness::new(6, 20);
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.resize(pane, 10, 32);
+    harness.pump();
+    harness.session.restore_size(pane);
+    let restore = queued_restore_serial(&mut harness);
+    harness.session.receive(&server_frame(10, restore, &[1], false));
+    harness.pump();
+    assert!(!harness.session.is_ready());
+    assert_eq!(restored_sizes(&harness), 0);
 }
 
 /// The phone can tell whether what it sent reached the pane: input is
@@ -1224,11 +1395,8 @@ fn a_size_left_by_a_dropped_connection_is_given_back_by_the_next() {
     harness.pump();
     let restored = harness.server.resizes.last().copied().expect("a restore");
     assert_eq!((restored.rows, restored.cols), (6, 20));
-    assert_eq!(
-        phone_sizes(&harness),
-        [(pane, None, 0, 0)],
-        "the record is cleared"
-    );
+    assert!(phone_sizes(&harness).is_empty(), "queueing emitted no retirement");
+    assert_eq!(restored_sizes(&harness), 1, "the successful answer retires the record");
 
     // Once restored, a later list shows the desktop's size: nothing to adopt.
     harness.session.refresh_panes();

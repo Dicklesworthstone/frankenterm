@@ -210,9 +210,15 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *   CONTEXT    pane_id; payload: JSON {request, lines: [{row, text}]}
  *   PHONE_SIZE pane_id, rows, cols: the phone's size is in effect for the
  *              pane; payload: JSON {rows, cols, pixel_width, pixel_height,
- *              dpi}, the desktop's size to give back. An empty payload (rows
- *              and cols 0): it no longer is. Keep the latest per pane across
- *              connections for ft_mux_v1_adopt_phone_size.
+ *              dpi}, the desktop's size to give back. Keep the latest per pane
+ *              across connections for ft_mux_v1_adopt_phone_size. An empty
+ *              payload is not confirmation: older artifacts emitted it when
+ *              merely queueing a restore. Retain recovery until PHONE_SIZE_RESTORED
+ *              or authoritative PANE_GONE.
+ *   PHONE_SIZE_RESTORED pane_id; no payload, rows and cols 0: the server
+ *              acknowledged this pane's current outstanding desktop-size restore,
+ *              without a newer phone resize superseding it. The saved recovery
+ *              record may now be retired.
  *   MOUSE_GRAB pane_id; payload: one byte, 1 when the pane's program has
  *              asked for the mouse (a tap is then a click), 0 when not
  *   ACTIVITY   pane_id: a pane not on screen has new output. A hidden pane
@@ -238,6 +244,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_MOUSE_GRAB 10u
 #define FT_MUX_EVENT_ACTIVITY 11u
 #define FT_MUX_EVENT_INCARNATION 12u
+#define FT_MUX_EVENT_PHONE_SIZE_RESTORED 13u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u

@@ -31,7 +31,7 @@ final class NativeMuxClientTests: XCTestCase {
     func testACurrentServerNamesItsRunBeforeItsPanesAndPushesTheirChanges() throws {
         let client = try NativeMuxClient()
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [2, 1, 26])
-        try client.receive(frame(ident: 27, serial: 1, body: leb(70) + text("current")))
+        try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("current")))
         XCTAssertEqual(try events(client), [.ready(serverVersion: "current")])
         // ListPanesCoherent(supported and required: a fenced snapshot), serial 2.
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [4, 2, 81, 1, 1])
@@ -86,25 +86,49 @@ final class NativeMuxClientTests: XCTestCase {
         try client.write(pane: 7, bytes: Data("ls\r".utf8))
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [7, 4, 9, 7, 3] + Array("ls\r".utf8))
 
-        // Sizing the pane to the phone says what to give back, and giving it
-        // back says it is done.
+        // Sizing the pane says what to give back. Queueing the restore must
+        // not say it is done before the server's exact successful answer.
         try client.resize(pane: 7, rows: 40, columns: 54)
         let desktop = TerminalMuxSize(rows: 24, cols: 80, pixelWidth: 640, pixelHeight: 384, dpi: 96)
         XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: desktop, rows: 40, columns: 54)])
         try client.restoreSize(pane: 7)
-        XCTAssertEqual(try events(client), [.phoneSize(paneID: 7, desktop: nil, rows: 0, columns: 0)])
+        XCTAssertEqual(try events(client), [], "a queued request is not a restoration receipt")
         // Until the server answers the restore (the last Resize, 14), it may
         // not have applied it. These frames are short: one-byte lengths.
         XCTAssertTrue(try client.restoring())
-        var sent = Array(try client.outgoing(limit: 4096)), restore: UInt8?
-        while let length = sent.first.map(Int.init), sent.count > length {
-            if sent[2] == 14 { restore = sent[1] }
-            sent.removeFirst(length + 1)
+        func takeRestoreSerial() throws -> UInt64 {
+            var sent = Array(try client.outgoing(limit: 4096)), restore: UInt8?
+            while let length = sent.first.map(Int.init), sent.count > length {
+                if sent[2] == 14 { restore = sent[1] }
+                sent.removeFirst(length + 1)
+            }
+            return UInt64(try XCTUnwrap(restore))
         }
-        try client.receive(frame(ident: 10, serial: UInt64(try XCTUnwrap(restore)), body: []))
+        try client.receive(frame(ident: 10, serial: try takeRestoreSerial(), body: []))
         XCTAssertFalse(try client.restoring())
+        XCTAssertEqual(try events(client), [.phoneSizeRestored(paneID: 7)])
         // The listed pane is 24 x 80, not a phone size left behind.
         XCTAssertFalse(try client.adoptPhoneSize(pane: 7, desktop: desktop, rows: 40, columns: 54))
+
+        try client.resize(pane: 7, rows: 41, columns: 55)
+        try client.restoreSize(pane: 7)
+        let older = try takeRestoreSerial()
+        try client.resize(pane: 7, rows: 42, columns: 56)
+        try client.restoreSize(pane: 7)
+        let newer = try takeRestoreSerial()
+        XCTAssertEqual(try events(client), [
+            .phoneSize(paneID: 7, desktop: desktop, rows: 41, columns: 55),
+            .phoneSize(paneID: 7, desktop: desktop, rows: 42, columns: 56)
+        ])
+        try client.receive(frame(ident: 10, serial: older, body: []))
+        XCTAssertTrue(try client.restoring())
+        XCTAssertEqual(try events(client), [], "an old ACK cannot retire the newer resize")
+        try client.receive(frame(ident: 0, serial: newer, body: text("Error: resize refused")))
+        XCTAssertFalse(try client.restoring())
+        XCTAssertEqual(try events(client), [], "rejection is not a successful restoration")
+        try client.restoreSize(pane: 7)
+        try client.receive(frame(ident: 10, serial: try takeRestoreSerial(), body: []))
+        XCTAssertEqual(try events(client), [.phoneSizeRestored(paneID: 7)])
 
         // A click is a press and a release: two SendMouseEvent (12) frames.
         _ = try client.outgoing(limit: 4096)
@@ -119,11 +143,11 @@ final class NativeMuxClientTests: XCTestCase {
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        // Newer than the current window this client speaks (61..70).
-        try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("v0.16")))
+        // Newer than the current window this client speaks (61..71).
+        try client.receive(frame(ident: 27, serial: 1, body: leb(72) + text("v0.16")))
         let all = try events(client)
         guard case let .failed(reason)? = all.first, all.count == 1 else { return XCTFail("\(all)") }
-        XCTAssertTrue(reason.contains("71") && reason.contains("46") && reason.contains("70"), reason)
+        XCTAssertTrue(reason.contains("72") && reason.contains("46") && reason.contains("71"), reason)
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "nothing more is sent")
     }
 

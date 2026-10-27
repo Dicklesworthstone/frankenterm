@@ -443,6 +443,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: restarted).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: nil).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data()).isEmpty)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data(repeating: 0, count: 16)).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data(repeating: 1, count: 17)).isEmpty)
         XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run).count, 1,
                        "a failed comparison does not mutate the retained record")
@@ -488,6 +489,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         malformed.append(try JSONSerialization.data(withJSONObject: ["4": legacy]))
         for (field, value) in [("paneId", -1 as Any), ("tabId", -1 as Any), ("windowId", -1 as Any),
                                ("rows", 0 as Any), ("columns", 513 as Any),
+                               ("incarnation", Data(repeating: 0, count: 16).base64EncodedString() as Any),
                                ("incarnation", Data(repeating: 1, count: 15).base64EncodedString() as Any)] {
             var bad = record; bad[field] = value
             malformed.append(try JSONSerialization.data(withJSONObject: ["4": bad]))
@@ -519,7 +521,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         let run = Data(repeating: 0x1c, count: 16), pane = phoneSizedPane(4), other = phoneSizedPane(9)
         let sizes = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
         sizes.set(pane: other, incarnation: run, desktop: desktop, rows: 40, columns: 54)
-        for identity in [nil, Data(), Data(repeating: 0, count: 17)] as [Data?] {
+        for identity in [nil, Data(), Data(repeating: 0, count: 16), Data(repeating: 0, count: 17)] as [Data?] {
             sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
             sizes.set(pane: pane, incarnation: identity, desktop: desktop, rows: 40, columns: 54)
             XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])

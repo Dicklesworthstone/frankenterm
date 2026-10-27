@@ -118,6 +118,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
                 let desktop = payload.isEmpty ? nil : try decoder.decode(TerminalMuxSize.self, from: payload)
                 return .phoneSize(paneID: paneID, desktop: desktop, rows: Int(rows), columns: Int(cols))
+            case UInt32(FT_MUX_EVENT_PHONE_SIZE_RESTORED):
+                guard payload.isEmpty, rows == 0, cols == 0 else { throw TerminalModelError.invalid }
+                return .phoneSizeRestored(paneID: paneID)
             default: throw TerminalModelError.invalid
             }
         }
