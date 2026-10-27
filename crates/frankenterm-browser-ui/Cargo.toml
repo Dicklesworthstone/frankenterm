@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
+frankenterm-terminal-wire = { path = "../frankenterm-terminal-wire" }
 # Same frankentui revision as the native TUI (workspace `ftui`). No terminal
 # backend: the browser host drives the program through ftui-web.
 ftui-core = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "befbd2471a1ec4a6b8ce0a0df32116c317cca9db" }

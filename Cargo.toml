@@ -8,6 +8,7 @@ members = [
     "crates/frankenterm-mobile-mux",
     "crates/frankenterm-core",
     "crates/frankenterm-browser-ui",
+    "crates/frankenterm-terminal-wire",
     "crates/frankenterm-redactor",
     "crates/frankenterm-core-ars",
     "crates/frankenterm-core-tantivy",
