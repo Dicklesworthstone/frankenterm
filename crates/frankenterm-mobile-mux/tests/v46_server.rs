@@ -441,10 +441,12 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 
 #[test]
 fn a_server_on_another_protocol_is_refused() {
-    // Between v0.13 and the current window, and past it.
+    // Between v0.13 and the current window, and past it with an oldest
+    // accepted version past this app's newest.
     for version in [48, 72] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
+        harness.server.min_supported = version;
         harness.pump();
         assert!(!harness.session.is_ready());
         let reason = harness.events.iter().find_map(|event| match event {
@@ -458,6 +460,25 @@ fn a_server_on_another_protocol_is_refused() {
         );
         assert_eq!(harness.server.requests, ["GetCodecVersion"]);
     }
+}
+
+#[test]
+fn a_newer_server_that_still_accepts_this_apps_protocol_is_spoken_to() {
+    let mut harness = Harness::new(5, 24);
+    harness.server.codec_vers = codec::CODEC_VERSION + 1;
+    harness.server.min_supported = codec::CODEC_VERSION_MIN_SUPPORTED;
+    harness.quiet_output(&numbered(0, 12));
+    harness.attach();
+    assert!(harness.session.is_ready());
+    assert_eq!(
+        &harness.server.requests[..2],
+        ["GetCodecVersion", "ListPanesCoherent"]
+    );
+    assert_mirrored(&mut harness);
+    let pane = harness.server.pane_id;
+    harness.session.paste(pane, "three");
+    harness.pump();
+    assert_eq!(harness.server.pastes, ["three"]);
 }
 
 #[test]

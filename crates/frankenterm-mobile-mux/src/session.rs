@@ -842,7 +842,10 @@ impl Session {
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
                 let version: CodecVersion = wire::decode(&frame.body)?;
-                if let Some(dialect) = Dialect::of(version.codec_vers) {
+                let min_supported = wire::decode::<wire::CodecWindow>(&frame.body)
+                    .ok()
+                    .map(|window| window.min_supported);
+                if let Some(dialect) = Dialect::of(version.codec_vers, min_supported) {
                     self.dialect = dialect;
                     self.ready = true;
                     self.events.push_back(Event::Ready {

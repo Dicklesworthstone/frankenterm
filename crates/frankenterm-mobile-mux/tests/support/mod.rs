@@ -204,6 +204,8 @@ pub struct Server {
     pub pane_id: usize,
     pub tab_id: usize,
     pub codec_vers: usize,
+    /// The oldest version it accepts, which its PDU 27 reply ends with.
+    pub min_supported: usize,
     pub compress: bool,
     pub title: String,
     pub written: Vec<u8>,
@@ -246,6 +248,7 @@ impl Server {
             pane_id: 7,
             tab_id: 3,
             codec_vers: 46,
+            min_supported: 46,
             compress: false,
             title: "agent".to_owned(),
             written: Vec::new(),
@@ -279,10 +282,13 @@ impl Server {
     }
 
     /// The layout this server reads: v46, or the current one from codec 61.
+    /// A server newer than this codec reads the newest layout this codec
+    /// has, as a newer server keeps its PDUs within its accepted window.
     /// (A version outside both reads the protocol check, which is the same
     /// in every dialect, and nothing after it.)
     fn dialect(&self) -> MuxWireDialect {
-        MuxWireDialect::current(self.codec_vers).unwrap_or(MuxWireDialect::LEGACY46)
+        MuxWireDialect::current(self.codec_vers.min(codec::CODEC_VERSION))
+            .unwrap_or(MuxWireDialect::LEGACY46)
     }
 
     /// Phone bytes, split into frames by the desktop codec's decoder for the
@@ -309,7 +315,7 @@ impl Server {
                     version_string: "20260727-v0.13.0".to_owned(),
                     executable_path: "/home/u/.local/bin/frankenterm-mux-server".into(),
                     config_file_path: None,
-                    min_supported: 46,
+                    min_supported: self.min_supported,
                 };
                 self.reply(27, serial, &reply);
             }

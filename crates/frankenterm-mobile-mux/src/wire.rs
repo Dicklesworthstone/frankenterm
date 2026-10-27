@@ -37,10 +37,17 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    pub fn of(codec_version: usize) -> Option<Self> {
+    /// A server newer than this app still speaks the current layout while
+    /// the oldest version it accepts (`min_supported`) reaches this app's
+    /// newest: the codec raises that floor with any breaking change, so this
+    /// is the overlap the desktop client's `check_compat` agrees on.
+    pub fn of(codec_version: usize, min_supported: Option<usize>) -> Option<Self> {
+        let newest = *CURRENT_VERSIONS.end();
         if LEGACY_VERSIONS.contains(&codec_version) {
             Some(Self::Legacy)
-        } else if CURRENT_VERSIONS.contains(&codec_version) {
+        } else if CURRENT_VERSIONS.contains(&codec_version)
+            || (codec_version > newest && min_supported.is_some_and(|min| min <= newest))
+        {
             Some(Self::Current)
         } else {
             None
@@ -95,6 +102,17 @@ pub struct GetCodecVersion {}
 pub struct CodecVersion {
     pub codec_vers: usize,
     pub version_string: String,
+}
+
+/// All of PDU 27 from a current server; a v0.13 server's ends before
+/// `min_supported`.
+#[derive(Deserialize, Debug)]
+pub struct CodecWindow {
+    pub codec_vers: usize,
+    pub version_string: String,
+    pub executable_path: String,
+    pub config_file_path: Option<String>,
+    pub min_supported: usize,
 }
 
 #[derive(Serialize)]
