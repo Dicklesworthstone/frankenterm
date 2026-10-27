@@ -2,7 +2,43 @@
  * signing, partial authentication and transport loss are in test_native.py. */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+static void observed_free(void *pointer);
+#define free observed_free
 #include "../../Sources/CFrankenTermSSH/FrankenTermSSH.c"
+#undef free
+
+static void *watched_allocation;
+static size_t watched_size;
+static unsigned int wiped_releases;
+static void observed_free(void *pointer) {
+    if(pointer && pointer == watched_allocation) {
+        const uint8_t *payload = (const uint8_t *)((allocation_header *)pointer + 1);
+        for(size_t i = 0; i < watched_size; i++) assert(payload[i] == 0);
+        watched_allocation = NULL;
+        wiped_releases++;
+    }
+    free(pointer);
+}
+
+static void test_authentication_allocations_are_erased_before_free(void) {
+    ftssh_session session = {0};
+    session.phase = AUTH; session.limit = 65536;
+    void *context = &session;
+    uint8_t *original = allocate(32, &context);
+    assert(original);
+    memset(original, 0xa5, 32);
+    /* Changing phases cannot discard the original allocation's sensitivity. */
+    session.phase = LIVE;
+    watched_allocation = (allocation_header *)original - 1; watched_size = 32;
+    uint8_t *replacement = resize_allocation(original, 64, &context);
+    assert(replacement && wiped_releases == 1 && !watched_allocation);
+    for(size_t i = 0; i < 32; i++) assert(replacement[i] == 0xa5);
+    memset(replacement + 32, 0x5a, 32);
+    watched_allocation = (allocation_header *)replacement - 1; watched_size = 64;
+    release(replacement, &context);
+    assert(wiped_releases == 2 && !watched_allocation && session.allocated == 0);
+}
 
 static ftssh_session authentication(void) {
     ftssh_session session = {0};
@@ -17,27 +53,27 @@ static void test_method_tokens(void) {
         "keyboard-interactive,publickey,password", "publickey,publickey"
     };
     for(size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++)
-        assert(publickey_method(accepted[i]) == FTSSH_OK);
+        assert(authentication_method(accepted[i], "publickey") == FTSSH_OK);
     const char *unsupported[] = {
         "", "password", "not-publickey", "publickey-extra", "xpublickey",
         "PUBLICKEY", "publickey@server.example", "password,not-publickey"
     };
     for(size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
-        assert(publickey_method(unsupported[i]) == FTSSH_UNSUPPORTED);
+        assert(authentication_method(unsupported[i], "publickey") == FTSSH_UNSUPPORTED);
     const char *malformed[] = {
         ",publickey", "publickey,", "publickey,,password", "publickey,password\n",
         "publickey, password", "publickey,\x7f", "publickey,\x80"
     };
     for(size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++)
-        assert(publickey_method(malformed[i]) == FTSSH_AUTH_FAILED);
-    assert(publickey_method(NULL) == FTSSH_AUTH_FAILED);
+        assert(authentication_method(malformed[i], "publickey") == FTSSH_AUTH_FAILED);
+    assert(authentication_method(NULL, "publickey") == FTSSH_AUTH_FAILED);
     char at_limit[1025], over_limit[1026];
     memset(at_limit, 'x', sizeof(at_limit));
     memcpy(at_limit, "publickey,", 10); at_limit[1024] = 0;
-    assert(publickey_method(at_limit) == FTSSH_OK);
+    assert(authentication_method(at_limit, "publickey") == FTSSH_OK);
     memset(over_limit, 'x', sizeof(over_limit));
     memcpy(over_limit, "publickey,", 10); over_limit[1025] = 0;
-    assert(publickey_method(over_limit) == FTSSH_LIMIT);
+    assert(authentication_method(over_limit, "publickey") == FTSSH_LIMIT);
 }
 
 static void test_refusal_requires_unsigned_offer_evidence(void) {
@@ -116,6 +152,7 @@ static void test_progress_and_success_require_signature(void) {
 }
 
 int main(void) {
+    test_authentication_allocations_are_erased_before_free();
     test_method_tokens();
     test_refusal_requires_unsigned_offer_evidence();
     test_non_refusal_failures_and_callback_evidence();
