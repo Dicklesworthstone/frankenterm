@@ -432,11 +432,17 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
             await transport.waitUntilWriting()
             try await coordinator.disconnect(source)
             _ = try await running.value
+            let outcomes = try await coordinator.takeOutcomes(source)
             var delivery = TerminalInputDelivery()
-            delivery.record(try await coordinator.takeOutcomes(source))
+            delivery.record(outcomes)
             XCTAssertTrue(delivery.unsent, "the queued input never left (\(answer))")
             XCTAssertEqual(delivery.unanswered, unanswered, "the written input's arrival is unknown (\(answer))")
             XCTAssertFalse(delivery.stoppedPartway)
+            // A mux server's confirmation, and its pane's own notice, speak for written input.
+            var mux = TerminalInputDelivery()
+            mux.record(outcomes, serverConfirms: true)
+            XCTAssertTrue(mux.unsent, "\(answer)")
+            XCTAssertFalse(mux.unanswered, "\(answer)")
             let message = try XCTUnwrap(delivery.message(machine: "Alpha"))
             XCTAssertEqual(message.contains("It may or may not have arrived."), unanswered, message)
             XCTAssertTrue(message.contains("never left this phone and was not sent."), message)

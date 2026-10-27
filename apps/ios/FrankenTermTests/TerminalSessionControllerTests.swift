@@ -2194,6 +2194,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         for _ in 0..<300 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.disconnected)))
         XCTAssertTrue(first.dropped)
+        XCTAssertTrue(first.inputDelivery.isEmpty, "the pane's own notice tells it, once (\(first.inputDelivery))")
         view.removeFromSuperview()
         await assertReleased(first, connections: live.connections)
         try await Task.sleep(for: .seconds(3))

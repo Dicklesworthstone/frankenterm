@@ -968,7 +968,7 @@ final class TerminalSessionController {
             presenter.onInterruptedInput = { [weak self] outcomes in
                 guard let self else { return }
                 var delivery = self.inputDelivery
-                delivery.record(outcomes)
+                delivery.record(outcomes, serverConfirms: self.attachedToMux)
                 if delivery != self.inputDelivery { self.inputDelivery = delivery }
             }
             self.presenter = presenter
@@ -1544,7 +1544,8 @@ final class TerminalSessionController {
                     if retainEndedOutput { retainedOutputFailure = Self.describe(error) }
                 }
             }
-            if dropped, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
+            // A mux pane's own notice tells input its server had not confirmed.
+            if dropped, !attachedToMux, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
                 inputDelivery.endedUnanswered()
             }
             do { try await runtime.close(); self.runtime = nil }

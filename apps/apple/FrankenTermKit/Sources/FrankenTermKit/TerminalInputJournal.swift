@@ -66,13 +66,17 @@ public struct TerminalInputDelivery: Hashable, Sendable {
 
     /// Interrupted outcomes. Transport acceptance alone is not one: whoever
     /// saw the connection end reports unanswered input with `endedUnanswered`.
-    public mutating func record(_ outcomes: [TerminalInputOutcome]) {
+    /// A mux server confirms what it wrote, and the pane's own notice tells
+    /// input it had not confirmed; for a mux, only input that never left this
+    /// phone or stopped partway is recorded here.
+    public mutating func record(_ outcomes: [TerminalInputOutcome], serverConfirms: Bool = false) {
         for outcome in outcomes where outcome.kind == .encodedInput || outcome.kind == .paste {
             switch outcome.disposition {
             case .definitelyNotWritten: unsent = true
             case .connectionLost(let tailUnknown):
-                if tailUnknown || outcome.acceptedOriginalBytes > 0 || outcome.acceptedCleanupBytes > 0 { unanswered = true }
-                else { unsent = true }
+                if tailUnknown || outcome.acceptedOriginalBytes > 0 || outcome.acceptedCleanupBytes > 0 {
+                    if !serverConfirms { unanswered = true }
+                } else { unsent = true }
             case .cancelledAfterPrefix: stoppedPartway = true
             case .transportAccepted, .cancelledBeforeWrite: break
             }
