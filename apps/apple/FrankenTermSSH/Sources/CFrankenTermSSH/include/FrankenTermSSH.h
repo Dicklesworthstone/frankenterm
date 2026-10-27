@@ -24,7 +24,8 @@ enum {
     FTSSH_AUTH_FAILED = -1011
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
-       FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024 };
+       FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024,
+       FTSSH_MAX_JUMP_HOPS = 3 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -44,7 +45,9 @@ typedef struct {
 /* On success consumes this connected SOCK_STREAM descriptor. On failure leaves
  * it owned by the caller, but may have set O_NONBLOCK/FD_CLOEXEC/SO_NOSIGPIPE.
  * The descriptor must have no other concurrent reader/writer or shared owner.
- * max_allocated bounds libssh2 allocations, not OpenSSL/system socket memory.
+ * max_allocated bounds libssh2 allocations and the owned 64 KiB encrypted-output
+ * queue, not OpenSSL/system socket memory. A budget too small for initialization
+ * fails without consuming the descriptor.
  */
 int ftssh_create(int connected_fd, size_t max_allocated, ftssh_session **result);
 /* FTSSH_NEGOTIATION: the server answered, and no exchange both accept was
@@ -90,8 +93,10 @@ int ftssh_supply_signature(ftssh_session *session, const uint8_t *blob, size_t l
  * outer handle into a fresh inner SSH handle and sets *outer to NULL. Failure
  * leaves the outer handle owned by the caller. The inner handle's callbacks
  * consume ONLY the direct-tcpip channel; the root descriptor supplies readiness,
- * never destination plaintext. Its one serial owner drives and closes both
- * library sessions. No transport sharing or second jump is supported.
+ * never destination plaintext. Its one serial owner drives and closes the
+ * entire chain. Up to FTSSH_MAX_JUMP_HOPS transit sessions are supported;
+ * each child still requires separate peer verification and authentication.
+ * No transit shell, transport sharing or unbounded nesting is supported.
  */
 int ftssh_begin_forward(ftssh_session *session, const char *host, size_t host_length, uint16_t port);
 int ftssh_forward_step(ftssh_session *session);
@@ -108,7 +113,9 @@ int ftssh_shell_step(ftssh_session *session);
 /* Admission copies the whole bounded unit or accepts nothing. Success means
  * accepted into this adapter's single 16 KiB slot, NOT remote delivery. */
 int ftssh_admit_write(ftssh_session *session, const uint8_t *bytes, size_t length);
-/* Retains the exact write pointer and length across libssh2 EAGAIN. */
+/* Retains the exact write pointer and length across libssh2 EAGAIN. A completed
+ * write receipt requires ciphertext to drain through every hop into the root
+ * socket; accepting it into an encrypted-output queue alone is insufficient. */
 int ftssh_flush_write(ftssh_session *session);
 int ftssh_read(ftssh_session *session, uint8_t *output, size_t capacity, size_t *length);
 /* Only after read returned EOF with all buffered output drained. Make bounded
@@ -134,8 +141,9 @@ int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,
  * the platform cannot report queued socket bytes. Never leaves a half-sent
  * packet that would block later writes: if one remains, the session fails. */
 int ftssh_keepalive(ftssh_session *session);
-/* RETRY requests a cooperative yield, then another bounded turn without
- * waiting for new socket bytes (the outer receive quantum was exhausted). */
+/* Advances one bounded encrypted-output turn. RETRY requests a cooperative
+ * yield, then another turn without waiting for new socket bytes (queued output
+ * advanced or an ancestor's receive quantum was exhausted). */
 int ftssh_directions(ftssh_session *session);
 int ftssh_descriptor(ftssh_session *session);
 int ftssh_get_stats(ftssh_session *session, ftssh_stats *result);

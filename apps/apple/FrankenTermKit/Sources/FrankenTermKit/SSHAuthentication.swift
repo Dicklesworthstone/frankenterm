@@ -223,7 +223,7 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     public let workspaceID: UUID, workspaceRevision: UUID
     public let routeID: String, credentialID: String, host: String, port: UInt16, user: String
     public let routeMode: String, jumpRouteIDs: [String]
-    /// A store-validated exact single-hop dependency, never a generic transit
+    /// A store-validated member of the exact bounded hop chain, never a generic transit
     /// bypass. Nil means this route is being authenticated as a destination.
     public let transitForRouteID: String?
     public let algorithm: String, fingerprint: String, presentedHostKey: WorkspaceDocument.HostKey

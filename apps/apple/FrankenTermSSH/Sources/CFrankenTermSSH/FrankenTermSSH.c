@@ -27,12 +27,20 @@
  */
 enum phase { HANDSHAKE, PEER, APPROVED, AUTH, AUTHENTICATED, FORWARD_OPENING, FORWARD_READY,
              OPENING, PTY, SHELL, LIVE, FAILED, CLOSED };
+enum { EGRESS_CAPACITY = 65536, EGRESS_RESERVE = 49152 };
 struct ftssh_session {
     LIBSSH2_SESSION *ssh;
     LIBSSH2_CHANNEL *channel;
     /* Owned exclusively after forward_adopt. Both libraries are driven by the
      * same actor; no other owner may access the adopted outer session. */
     struct ftssh_session *parent;
+    unsigned int forwarding_depth;
+    /* Owned ciphertext, charged to the same local/global allocation budget.
+     * A libssh2 send callback accepts a complete packet here. Calling a parent
+     * library from that callback can deadlock its pending channel-data packet
+     * against a read-side WINDOW_ADJUST at another nesting level. */
+    uint8_t *egress;
+    size_t egress_head, egress_count, egress_flight, write_receipt;
     int fd, phase, terminal_error, closing;
     size_t limit, allocated, peak;
     char user[257], algorithm[65];
@@ -101,33 +109,30 @@ static void *resize_allocation(void *pointer, size_t size, void **abstract) {
     memcpy(replacement, pointer, size < previous ? size : previous);
     release(pointer, abstract); return replacement;
 }
+static int drain_egress(ftssh_session *s, int *progress);
+static int egress_empty(ftssh_session *s) {
+    for(; s; s = s->parent) if(s->egress_count) return 0;
+    return 1;
+}
 static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length, int flags, void **abstract) {
+    (void)fd; (void)flags;
     ftssh_session *s = *abstract;
     if(s->closing) return -ECONNRESET;
-    if(s->parent) {
-        ftssh_session *p = s->parent;
-        if(p->closing || p->phase != FORWARD_READY || p->socket_failed) return -ECONNRESET;
-        p->receive_budget = 32768; p->limited_receive = 1;
-        ssize_t count = libssh2_channel_write_ex(p->channel, 0, data, length);
-        p->limited_receive = 0;
-        if(count == LIBSSH2_ERROR_EAGAIN || count == 0) return -EAGAIN;
-        if(count < 0 || (size_t)count > length || p->socket_failed) {
-            s->socket_failed = 1; return -ECONNRESET;
-        }
-        s->sent += (uint64_t)count;
-        return count;
+    if(!s->egress || length > EGRESS_CAPACITY - s->egress_count) {
+        s->socket_failed = 1; s->terminal_error = FTSSH_LIMIT; return -ENOBUFS;
     }
-#ifdef MSG_NOSIGNAL
-    flags |= MSG_NOSIGNAL;
-#endif
-    ssize_t result = send(fd, data, length, flags);
-    if((result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) || (!result && length)) s->socket_failed = 1;
-    if(result > 0) s->sent += (uint64_t)result;
-    return result < 0 ? -errno : result;
+    size_t tail = (s->egress_head + s->egress_count) % EGRESS_CAPACITY;
+    size_t first = length < EGRESS_CAPACITY - tail ? length : EGRESS_CAPACITY - tail;
+    memcpy(s->egress + tail, data, first);
+    memcpy(s->egress, (const uint8_t *)data + first, length - first);
+    s->egress_count += length; s->sent += (uint64_t)length;
+    return (ssize_t)length;
 }
 static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, int flags, void **abstract) {
     ftssh_session *s = *abstract;
     if(s->closing) return -ECONNRESET;
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) { s->socket_failed = 1; return -ECONNRESET; }
     if(s->limited_receive) {
         if(!s->receive_budget) return -EAGAIN;
         if(length > s->receive_budget) length = s->receive_budget;
@@ -136,6 +141,7 @@ static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, in
     if(s->parent) {
         ftssh_session *p = s->parent;
         if(p->closing || p->phase != FORWARD_READY || p->socket_failed) return -ECONNRESET;
+        if(p->egress_count > EGRESS_CAPACITY - EGRESS_RESERVE) return -EAGAIN;
         p->receive_budget = 32768; p->limited_receive = 1;
         result = libssh2_channel_read_ex(p->channel, 0, data, length);
         p->limited_receive = 0;
@@ -153,6 +159,46 @@ static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, in
     }
     return result < 0 ? -errno : result;
 }
+
+/* One finite turn per layer. Parent writes keep the exact owned span across
+ * EAGAIN; appending later ciphertext cannot change that outstanding span.
+ * A parent library can only invoke callbacks on an earlier ancestor, so this
+ * bounded recursion never re-enters the library that is currently executing. */
+static int drain_egress(ftssh_session *s, int *progress) {
+    if(!s || s->closing || s->socket_failed) return FTSSH_IO;
+    if(s->parent && drain_egress(s->parent, progress) < 0) return FTSSH_IO;
+    for(unsigned int turns = 0; s->egress_count && turns < 4; turns++) {
+        size_t contiguous = EGRESS_CAPACITY - s->egress_head;
+        if(contiguous > s->egress_count) contiguous = s->egress_count;
+        ssize_t count;
+        if(s->parent) {
+            ftssh_session *p = s->parent;
+            if(p->phase != FORWARD_READY || p->egress_count > EGRESS_CAPACITY - EGRESS_RESERVE) break;
+            if(!s->egress_flight) s->egress_flight = contiguous < 16384 ? contiguous : 16384;
+            p->receive_budget = 32768; p->limited_receive = 1;
+            count = libssh2_channel_write_ex(p->channel, 0, (const char *)s->egress + s->egress_head, s->egress_flight);
+            p->limited_receive = 0;
+            if(count == LIBSSH2_ERROR_EAGAIN || count == 0) {
+                if(drain_egress(p, progress) < 0) return FTSSH_IO;
+                break;
+            }
+            if(count < 0 || (size_t)count > s->egress_flight || p->socket_failed) return FTSSH_IO;
+            s->egress_flight = 0;
+        } else {
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+            count = send(s->fd, s->egress + s->egress_head, contiguous, flags);
+            if(count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if(count <= 0 || (size_t)count > contiguous) { s->socket_failed = 1; return FTSSH_IO; }
+        }
+        s->egress_head = (s->egress_head + (size_t)count) % EGRESS_CAPACITY;
+        s->egress_count -= (size_t)count; *progress = 1;
+        if(s->parent && drain_egress(s->parent, progress) < 0) return FTSSH_IO;
+    }
+    return s->egress_count ? FTSSH_AGAIN : FTSSH_OK;
+}
 static void socket_disconnected(LIBSSH2_SESSION *ssh, int reason, const char *message, int message_length,
                                 const char *language, int language_length, void **abstract) {
     (void)ssh; (void)reason; (void)message; (void)message_length; (void)language; (void)language_length;
@@ -167,6 +213,16 @@ static int check(ftssh_session *s, int expected) {
     if(s->phase == CLOSED) return FTSSH_CLOSED;
     if(s->phase == FAILED) return s->terminal_error;
     return s->phase == expected ? FTSSH_OK : FTSSH_STATE;
+}
+static int prepare_egress(ftssh_session *s) {
+    if(s->phase == CLOSED) return FTSSH_CLOSED;
+    if(s->phase == FAILED) return s->terminal_error;
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) return fail(s, s->terminal_error == FTSSH_LIMIT ? FTSSH_LIMIT : FTSSH_IO);
+    for(ftssh_session *p = s; p; p = p->parent)
+        if(p->egress_count > EGRESS_CAPACITY - EGRESS_RESERVE) return FTSSH_AGAIN;
+    s->receive_budget = 32768; s->limited_receive = 1;
+    return FTSSH_OK;
 }
 static int equal(const uint8_t *a, const uint8_t *b, size_t n) {
     unsigned int difference = 0;
@@ -217,6 +273,12 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     s->fd = fd; s->limit = maximum; s->phase = HANDSHAKE;
     s->ssh = libssh2_session_init_ex(allocate, release, resize_allocation, s);
     if(!s->ssh) { free(s); atomic_fetch_sub(&global_sessions, 1); return FTSSH_LIMIT; }
+    void *context = s;
+    s->egress = allocate(EGRESS_CAPACITY, &context);
+    if(!s->egress) {
+        libssh2_session_free(s->ssh); free(s);
+        atomic_fetch_sub(&global_sessions, 1); return FTSSH_LIMIT;
+    }
     libssh2_session_set_blocking(s->ssh, 0);
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_SEND, (libssh2_cb_generic *)socket_send);
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_RECV, (libssh2_cb_generic *)socket_receive);
@@ -232,7 +294,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     for(size_t i = 0; i < sizeof(policies)/sizeof(policies[0]); i++) {
         if(libssh2_session_method_pref(s->ssh, policies[i].method, policies[i].allowed)) {
             /* Creation has not taken ownership of the caller's fd yet. */
-            s->closing = 1; libssh2_session_free(s->ssh); free(s);
+            s->closing = 1; libssh2_session_free(s->ssh); release(s->egress, &context); free(s);
             atomic_fetch_sub(&global_sessions, 1); return FTSSH_UNSUPPORTED;
         }
     }
@@ -240,6 +302,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
 }
 int ftssh_handshake(ftssh_session *s) {
     int rc = check(s, HANDSHAKE); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
     rc = libssh2_session_handshake(s->ssh, s->fd);
     /* libssh2 reports a transport lost mid-exchange as a key exchange failure;
      * our callbacks saw the loss, and it is not the server's answer. */
@@ -386,6 +449,7 @@ static int authentication_result(ftssh_session *s, int rc, int authenticated, in
 }
 int ftssh_authentication_step(ftssh_session *s) {
     int rc = check(s, AUTH); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
     if(!s->auth_methods_checked) {
         s->receive_budget = 32768; s->limited_receive = 1;
         const char *methods = libssh2_userauth_list(s->ssh, s->user, (unsigned int)strlen(s->user));
@@ -438,7 +502,7 @@ static void store_u32(uint8_t *out, uint32_t value) {
 }
 int ftssh_begin_forward(ftssh_session *s, const char *host, size_t length, uint16_t port) {
     int rc = check(s, AUTHENTICATED); if(rc) return rc;
-    if(s->parent) return FTSSH_UNSUPPORTED;
+    if(s->forwarding_depth >= FTSSH_MAX_JUMP_HOPS) return FTSSH_UNSUPPORTED;
     if(!host || !length || length > 253 || !port) return FTSSH_INVALID;
     for(size_t i = 0; i < length; i++) {
         unsigned char c = (unsigned char)host[i];
@@ -457,6 +521,7 @@ int ftssh_begin_forward(ftssh_session *s, const char *host, size_t length, uint1
 }
 int ftssh_forward_step(ftssh_session *s) {
     int rc = check(s, FORWARD_OPENING); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
     s->receive_budget = 32768; s->limited_receive = 1;
     s->channel = libssh2_channel_open_ex(s->ssh, "direct-tcpip", 12, 128 * 1024, 16384,
                                         (const char *)s->forward_request, (unsigned int)s->forward_length);
@@ -471,14 +536,15 @@ int ftssh_forward_adopt(ftssh_session **outer, size_t maximum, ftssh_session **i
     *inner = NULL;
     ftssh_session *p = *outer;
     int rc = check(p, FORWARD_READY); if(rc) return rc;
-    if(p->parent) return FTSSH_UNSUPPORTED;
+    if(p->forwarding_depth >= FTSSH_MAX_JUMP_HOPS) return FTSSH_UNSUPPORTED;
     ftssh_session *s = NULL;
     /* libssh2 requires a real descriptor for nonblocking-state bookkeeping.
      * It is only a readiness identity for the inner library: callbacks below
      * route every byte through p->channel, never directly through this fd. */
     rc = ftssh_create(p->fd, maximum, &s);
     if(rc) return rc;
-    s->parent = p; *outer = NULL; *inner = s;
+    s->parent = p; s->forwarding_depth = p->forwarding_depth + 1;
+    *outer = NULL; *inner = s;
     return FTSSH_OK;
 }
 int ftssh_begin_shell(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint32_t h) {
@@ -496,7 +562,7 @@ int ftssh_begin_command(ftssh_session *s, const char *command, size_t length) {
 }
 int ftssh_shell_step(ftssh_session *s) {
     if(!s) return FTSSH_INVALID;
-    int rc;
+    int rc = prepare_egress(s); if(rc) return rc;
     if(s->phase == OPENING) {
         s->channel = libssh2_channel_open_ex(s->ssh, "session", 7, 128 * 1024, 16384, NULL, 0);
         if(!s->channel) return libssh2_session_last_errno(s->ssh) == LIBSSH2_ERROR_EAGAIN ? FTSSH_AGAIN : fail(s, FTSSH_CHANNEL);
@@ -530,25 +596,42 @@ int ftssh_admit_write(ftssh_session *s, const uint8_t *bytes, size_t length) {
     memcpy(s->write_buffer, bytes, length); s->write_length = length; s->write_offset = 0;
     s->accepted += length; return FTSSH_OK;
 }
-int ftssh_flush_write(ftssh_session *s) {
-    int rc = check(s, LIVE); if(rc) return rc;
-    if(!s->write_length) return FTSSH_OK;
-    size_t left = s->write_length - s->write_offset;
-    ssize_t count = libssh2_channel_write_ex(s->channel, 0, (const char *)s->write_buffer + s->write_offset, left);
-    if(count == LIBSSH2_ERROR_EAGAIN || count == 0) return FTSSH_AGAIN;
-    if(count < 0 || (size_t)count > left) return fail(s, FTSSH_IO);
-    s->written += (size_t)count; s->write_offset += (size_t)count;
+static int finish_write_receipt(ftssh_session *s) {
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) return fail(s, FTSSH_IO);
+    if(!egress_empty(s)) return FTSSH_AGAIN;
+    /* Preserve the existing physical handoff boundary: libssh2 accepting a
+     * plaintext packet into ciphertext queues is not yet a completed write. */
+    s->written += s->write_receipt; s->write_offset += s->write_receipt;
+    s->write_receipt = 0;
     if(s->write_offset == s->write_length) {
         memset(s->write_buffer, 0, s->write_length); s->write_offset = 0; s->write_length = 0;
         return FTSSH_OK;
     }
     return FTSSH_AGAIN;
 }
+int ftssh_flush_write(ftssh_session *s) {
+    int rc = check(s, LIVE); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
+    if(s->write_receipt || !s->write_length) return finish_write_receipt(s);
+    size_t left = s->write_length - s->write_offset;
+    s->limited_receive = 1;
+    ssize_t count = libssh2_channel_write_ex(s->channel, 0, (const char *)s->write_buffer + s->write_offset, left);
+    s->limited_receive = 0;
+    if(count == LIBSSH2_ERROR_EAGAIN || count == 0) return FTSSH_AGAIN;
+    if(count < 0 || (size_t)count > left) return fail(s, FTSSH_IO);
+    s->write_receipt = (size_t)count;
+    return finish_write_receipt(s);
+}
 int ftssh_read(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length) {
     int rc = check(s, LIVE); if(rc) return rc;
     if(!out || !length || !capacity || capacity > 16384) return FTSSH_INVALID;
     *length = 0;
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) return fail(s, FTSSH_IO);
+    s->receive_budget = 32768; s->limited_receive = 1;
     ssize_t count = libssh2_channel_read_ex(s->channel, 0, (char *)out, capacity);
+    s->limited_receive = 0;
     if(count == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
     if(count < 0 || (size_t)count > capacity) return fail(s, FTSSH_IO);
     if(count == 0) {
@@ -605,10 +688,19 @@ int ftssh_resize(ftssh_session *s, uint32_t c, uint32_t r, uint32_t w, uint32_t 
     uint32_t requested[4] = {c, r, w, h};
     if(s->write_length) return FTSSH_AGAIN;
     if(s->resize_pending && memcmp(s->resize_geometry, requested, sizeof(requested))) return FTSSH_STATE;
-    memcpy(s->resize_geometry, requested, sizeof(requested)); s->resize_pending = 1;
-    rc = result(s, libssh2_channel_request_pty_size_ex(s->channel, (int)c, (int)r, (int)w, (int)h), FTSSH_CHANNEL);
-    if(rc == FTSSH_OK) { memcpy(s->geometry, requested, sizeof(requested)); s->resize_pending = 0; }
-    return rc;
+    rc = prepare_egress(s); if(rc) return rc;
+    memcpy(s->resize_geometry, requested, sizeof(requested));
+    if(s->resize_pending != 2) {
+        s->resize_pending = 1;
+        rc = result(s, libssh2_channel_request_pty_size_ex(s->channel, (int)c, (int)r, (int)w, (int)h), FTSSH_CHANNEL);
+        if(rc) return rc;
+        s->resize_pending = 2;
+    }
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) return fail(s, FTSSH_IO);
+    if(!egress_empty(s)) return FTSSH_AGAIN;
+    memcpy(s->geometry, requested, sizeof(requested)); s->resize_pending = 0;
+    return FTSSH_OK;
 }
 /* Bytes accepted by the kernel but not yet sent, or -1 when unknown. */
 static int unsent_socket_bytes(int fd) {
@@ -625,24 +717,32 @@ static int unsent_socket_bytes(int fd) {
 }
 int ftssh_keepalive(ftssh_session *s) {
     int rc = check(s, LIVE); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
+    if(!egress_empty(s)) return FTSSH_AGAIN;
     /* libssh2 binds a partly sent packet to the caller's buffer and refuses any
      * other packet until that exact buffer is resent; its keepalive buffer is
      * its own stack frame. Send only when nothing is pending and the whole
      * packet fits in the socket buffer, so it cannot be left half sent. */
     if(s->write_length || s->resize_pending ||
        (libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND)) return FTSSH_AGAIN;
-    if(s->parent && ((libssh2_session_block_directions(s->parent->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) ||
-                    libssh2_channel_window_write_ex(s->parent->channel, NULL) < 4096)) return FTSSH_AGAIN;
+    for(ftssh_session *p = s->parent; p; p = p->parent) {
+        if(p->closing || p->phase != FORWARD_READY || p->socket_failed) return fail(s, FTSSH_IO);
+        if((libssh2_session_block_directions(p->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) ||
+           libssh2_channel_window_write_ex(p->channel, NULL) < 4096) return FTSSH_AGAIN;
+    }
     int capacity = 0, queued = unsent_socket_bytes(s->fd);
     socklen_t length = sizeof(capacity);
     if(queued < 0 || getsockopt(s->fd, SOL_SOCKET, SO_SNDBUF, &capacity, &length)) return FTSSH_UNSUPPORTED;
-    if(capacity - queued < (s->parent ? 8192 : 4096)) return FTSSH_AGAIN;
+    if(capacity - queued < 4096 * (int)(s->forwarding_depth + 1)) return FTSSH_AGAIN;
     int next = 0;
     uint64_t sent = s->sent;
     if(libssh2_keepalive_send(s->ssh, &next)) return fail(s, FTSSH_IO);
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0 || !egress_empty(s)) return fail(s, FTSSH_IO);
     /* Still pending despite the room checked above: fail rather than block input. */
-    if((libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) ||
-       (s->parent && (libssh2_session_block_directions(s->parent->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND))) return fail(s, FTSSH_IO);
+    for(ftssh_session *p = s; p; p = p->parent) {
+        if(libssh2_session_block_directions(p->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) return fail(s, FTSSH_IO);
+    }
     /* libssh2 skips a keepalive within 2 s of its last (by whole seconds of
      * wall time) and still reports success: nothing left, no reply is due. */
     if(s->sent == sent) return FTSSH_AGAIN;
@@ -650,23 +750,31 @@ int ftssh_keepalive(ftssh_session *s) {
 }
 int ftssh_directions(ftssh_session *s) {
     if(!s || !s->ssh || s->phase >= FAILED) return 0;
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) { fail(s, FTSSH_IO); return FTSSH_RETRY; }
     /* Inner write may need an outer WINDOW_ADJUST read, and inner read may
      * need an outer packet write. Waiting on the inner hint would busy-spin. */
-    int directions = libssh2_session_block_directions(s->parent ? s->parent->ssh : s->ssh);
+    ftssh_session *root = s;
+    int retry = progress || ((s->phase == AUTH || s->phase == FORWARD_OPENING) && s->receive_budget == 0);
+    while(root->parent) {
+        root = root->parent;
+        if(root->receive_budget == 0) retry = 1;
+    }
+    int directions = libssh2_session_block_directions(root->ssh);
+    if(root->egress_count) directions |= LIBSSH2_SESSION_BLOCK_OUTBOUND;
     return (directions & LIBSSH2_SESSION_BLOCK_INBOUND ? FTSSH_READ : 0) |
            (directions & LIBSSH2_SESSION_BLOCK_OUTBOUND ? FTSSH_WRITE : 0) |
-           ((s->parent && s->parent->receive_budget == 0) ||
-            ((s->phase == AUTH || s->phase == FORWARD_OPENING) && s->receive_budget == 0) ? FTSSH_RETRY : 0);
+           (retry ? FTSSH_RETRY : 0);
 }
 int ftssh_descriptor(ftssh_session *s) { return s ? s->fd : -1; }
 int ftssh_get_stats(ftssh_session *s, ftssh_stats *out) {
     if(!s || !out) return FTSSH_INVALID;
     *out = (ftssh_stats){s->allocated, s->peak, s->write_length - s->write_offset, s->accepted, s->written,
                          s->terminal_error, s->received};
-    if(s->parent) {
-        out->allocated_bytes += s->parent->allocated;
-        /* Sum of the two independently measured peaks is a conservative bound. */
-        out->peak_allocated_bytes += s->parent->peak;
+    for(ftssh_session *p = s->parent; p; p = p->parent) {
+        out->allocated_bytes += p->allocated;
+        /* Sum of independently measured peaks is a conservative chain bound. */
+        out->peak_allocated_bytes += p->peak;
     }
     return FTSSH_OK;
 }
@@ -676,6 +784,7 @@ int ftssh_close(ftssh_session *s) {
     /* Force callback failure even if libssh2 was mid-EAGAIN. No teardown packet
      * can wait for peer cooperation and no stale fd can be used after close. */
     s->closing = 1;
+    s->egress_head = 0; s->egress_count = 0; s->egress_flight = 0; s->write_receipt = 0;
     if(s->parent) {
         int rc = ftssh_close(s->parent);
         s->fd = -1;
@@ -685,6 +794,10 @@ int ftssh_close(ftssh_session *s) {
         int rc = libssh2_session_free(s->ssh);
         if(rc != 0) return fail(s, FTSSH_IO); // retain ownership for explicit retry
         s->ssh = NULL; s->channel = NULL;
+    }
+    if(s->egress) {
+        memset(s->egress, 0, EGRESS_CAPACITY);
+        void *context = s; release(s->egress, &context); s->egress = NULL;
     }
     memset(s->signature, 0, sizeof(s->signature));
     memset(s->write_buffer, 0, sizeof(s->write_buffer));

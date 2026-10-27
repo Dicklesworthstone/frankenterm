@@ -31,7 +31,7 @@ mod router;
 mod server;
 mod sse;
 mod ui_assets;
-mod websocket;
+pub mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;
 pub(crate) use middleware::BodySizeGuard;

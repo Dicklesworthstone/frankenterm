@@ -11,13 +11,13 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
     /// require SHA-2 signatures; RSA credentials, certificates and password/MFA
-    /// are not enabled. Exactly one public-key jump is supported. A mux route
+    /// are not enabled. Up to three ordered public-key jumps are supported. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
         hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
-        maximumJumpHops: 1)
+        maximumJumpHops: 3)
 
     private final class Retirement: @unchecked Sendable {
         private let lock = NSLock()
@@ -189,7 +189,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
               authorization.host == endpoint.host, authorization.port == endpoint.port,
               authorization.transitForRouteID == transitForRouteID,
               transitForRouteID != nil || Self.routeSupport.routeModes.contains(authorization.routeMode),
-              authorization.jumpRouteIDs == allowedJumpRouteIDs, allowedJumpRouteIDs.count <= 1,
+              authorization.jumpRouteIDs == allowedJumpRouteIDs, allowedJumpRouteIDs.count <= 3,
               Self.routeSupport.credentialAlgorithms.contains(authorization.algorithm) else {
             throw SSHAuthenticationError.denied
         }

@@ -135,6 +135,95 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         }
     }
 
+    private var multiJumpSupport: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 3)
+    }
+
+    private func multiTransitFixture(nested: Bool = false) async throws -> Fixture {
+        try await fixture { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            let baseRoute = routes[0], baseTrust = trusts[0]
+            routes[0]["jump_routes"] = nested ? ["hop3"] : ["hop1", "hop2", "hop3"]
+            for index in 1...3 {
+                var hop = baseRoute, trust = baseTrust
+                hop["id"] = "hop\(index)"; hop["host"] = "jump\(index).example.invalid"
+                hop["host_trust_ref"] = "hop-trust\(index)"; hop["session_creation"] = nil
+                hop["jump_routes"] = nested && index > 1 ? ["hop\(index - 1)"] : [] as [String]
+                trust["id"] = "hop-trust\(index)"; trust["host"] = "jump\(index).example.invalid"
+                routes.append(hop); trusts.append(trust)
+            }
+            // A valid independent route is still not a transit dependency.
+            var unrelated = baseRoute
+            unrelated["id"] = "unrelated"; routes.append(unrelated)
+            workspace["routes"] = routes; workspace["host_trust"] = trusts
+        }
+    }
+
+    func testThreeHopAuthorizationUsesReviewedOrderAndExactDestinationScope() async throws {
+        for nested in [false, true] {
+            let f = try await multiTransitFixture(nested: nested)
+            XCTAssertEqual(try f.archive.workspace.orderedJumpRoutes(forRouteID: "route").map(\.id),
+                           ["hop1", "hop2", "hop3"])
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                 support: multiJumpSupport)
+            await broker.resume()
+            for index in 1...3 {
+                let authorization = try await broker.authorization(workspaceID: f.installed.id,
+                    expectedRevision: f.installed.revision, routeID: "hop\(index)", credentialID: "key",
+                    presentedHostKey: f.pin, transitForRouteID: "route")
+                XCTAssertEqual(authorization.host, "jump\(index).example.invalid")
+                XCTAssertEqual(authorization.transitForRouteID, "route")
+                XCTAssertEqual(authorization.jumpRouteIDs, nested && index > 1 ? ["hop\(index - 1)"] : [])
+                await expectFailure {
+                    _ = try await broker.authorization(workspaceID: f.installed.id,
+                        expectedRevision: f.installed.revision, routeID: "hop\(index)", credentialID: "key",
+                        presentedHostKey: f.pin)
+                }
+            }
+            await expectFailure {
+                _ = try await broker.authorization(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "unrelated", credentialID: "key", presentedHostKey: f.pin, transitForRouteID: "route")
+            }
+        }
+    }
+
+    func testThreeHopTransitCannotBypassSmallerTransportProfile() async throws {
+        let f = try await multiTransitFixture()
+        let signer = DelayedSSHSigner(f.key.container, delayIdentity: true)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: jumpSupport)
+        await broker.resume()
+        for index in 1...3 {
+            await expectFailure {
+                _ = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "hop\(index)", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                    transitForRouteID: "route")
+            }
+        }
+        XCTAssertEqual(signer.calls, 0)
+    }
+
+    func testAnyRevokedAncestorInvalidatesEveryTransitGrantForTheDestination() async throws {
+        for revokedIndex in 1...3 {
+            let f = try await multiTransitFixture(nested: true)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                 support: multiJumpSupport)
+            await broker.resume()
+            let selected = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "hop3", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(), transitForRouteID: "route")
+            try await broker.validate(selected)
+            try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "hop-trust\(revokedIndex)", key: f.pin)
+            await expectFailure { try await broker.validate(selected) }
+            for index in 1...3 {
+                await expectFailure {
+                    _ = try await broker.authorization(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        routeID: "hop\(index)", credentialID: "key", presentedHostKey: f.pin, transitForRouteID: "route")
+                }
+            }
+        }
+    }
+
     func testTransitAuthorizationRetainsExactDestinationWithoutLeafSessionPolicy() async throws {
         // A mux preference is inert for a transit hop, even when this profile
         // only enables direct destination shells. Neither case needs a PTY.

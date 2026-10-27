@@ -511,18 +511,32 @@ class NativeSSHTests(unittest.TestCase):
         return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
 
     def test_one_hop_owns_independent_exchange_and_transit_never_opens_a_shell(self):
+        self.exercise_forwarding_chain(1)
+
+    def test_two_hops_own_independent_exchanges_and_only_the_destination_terminal(self):
+        self.exercise_forwarding_chain(2)
+
+    def test_three_hops_preserve_backpressure_accounting_and_refuse_a_fourth_hop(self):
+        self.exercise_forwarding_chain(3)
+
+    def forwarding_chain(self, hop_count):
         destination_key = ed25519.Ed25519PrivateKey.generate()
-        hop_key = ec.generate_private_key(ec.SECP256R1())
         destination = LoopbackServer(destination_key)
-        hop = LoopbackServer(hop_key, forward_to=destination.address)
-        self.servers.extend([hop, destination])
-        sock = socket.create_connection(hop.address, timeout=3)
+        peers, keys = [destination], [destination_key]
+        for _ in range(hop_count):
+            key = ec.generate_private_key(ec.SECP256R1())
+            peers.insert(0, LoopbackServer(key, forward_to=peers[0].address))
+            keys.insert(0, key)
+        self.servers.extend(peers)
+        sock = socket.create_connection(peers[0].address, timeout=3)
         sock.settimeout(None)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         handle = P()
         self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
         sock.detach(); self.handles.append(handle)
-        self.assertEqual(self.authenticate(handle, hop, hop_key), 0)
+        return handle, peers, keys
+
+    def forwarded(self, handle, destination):
         host = b"target.internal.invalid"
         self.assertEqual(DRIVER.ftssh_begin_forward(handle, host, len(host), destination.address[1]), 0)
         self.advance(handle, DRIVER.ftssh_forward_step)
@@ -534,8 +548,18 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_forward_adopt(C.byref(handle), 2 * 1024 * 1024, C.byref(child)), 0)
         self.assertFalse(handle.value)
         self.handles.append(child)
-        self.assertEqual(self.authenticate(child, destination, destination_key), 0)
-        self.assertEqual(DRIVER.ftssh_begin_forward(child, host, len(host), destination.address[1]), -1010)
+        return child
+
+    def exercise_forwarding_chain(self, hop_count):
+        child, peers, keys = self.forwarding_chain(hop_count)
+        destination = peers[-1]
+        for index, (peer, key) in enumerate(zip(peers, keys)):
+            self.assertEqual(self.authenticate(child, peer, key), 0)
+            if index < hop_count:
+                child = self.forwarded(child, peers[index + 1])
+        if hop_count == 3:
+            host = b"target.internal.invalid"
+            self.assertEqual(DRIVER.ftssh_begin_forward(child, host, len(host), destination.address[1]), -1010)
         self.assertEqual(DRIVER.ftssh_begin_shell(child, 80, 24, 0, 0), 0)
         self.advance(child, DRIVER.ftssh_shell_step)
         self.advance(child, lambda h: DRIVER.ftssh_resize(h, 132, 42, 1000, 700))
@@ -562,27 +586,82 @@ class NativeSSHTests(unittest.TestCase):
             stats = Stats()
             self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
             self.assertLessEqual(stats.pending, 16384)
-            self.assertLessEqual(stats.peak, 4 * 1024 * 1024)
+            self.assertLessEqual(stats.peak, (hop_count + 1) * 2 * 1024 * 1024)
             if rc == 3:
                 eof = True
                 break
             self.wait(child)
-        self.assertTrue(eof)
+        self.assertTrue(eof, {"hops": hop_count, "admitted": admitted, "written": stats.written,
+                              "pending": stats.pending, "received": len(received), "server_received": len(destination.received),
+                              "directions": DRIVER.ftssh_directions(child), "server_errors": [peer.errors for peer in peers]})
         self.assertEqual(admitted, len(payload))
         self.assertEqual(stats.accepted, len(payload))
         self.assertEqual(stats.written, len(payload))
         self.assertEqual(received, b"ready\r\nstderr\r\n" + payload)
         self.assertEqual(destination.received, payload)
         self.assertIn(("resize", 132, 42), destination.events)
-        self.assertEqual([e[0] for e in hop.events if e[0] in ["channel", "pty", "shell"]], [])
-        self.assertEqual([e[1] for e in hop.events if e[0] == "authentication"], [0, 1])
-        self.assertEqual([e[1] for e in destination.events if e[0] == "authentication"], [0, 1])
-        self.assertNotEqual(hop.host_blob, destination.host_blob)
+        self.assertEqual(len({peer.host_blob for peer in peers}), hop_count + 1)
+        self.assertEqual(len({public_blob(key) for key in keys}), hop_count + 1)
+        for index, peer in enumerate(peers):
+            authentication = [e for e in peer.events if e[0] == "authentication"]
+            self.assertEqual([e[1] for e in authentication], [0, 1])
+            self.assertTrue(all(e[3] == public_blob(keys[index]) for e in authentication))
+            if index < hop_count:
+                self.assertEqual([e for e in peer.events if e[0] in ["channel", "pty", "shell", "resize"]], [])
+                self.assertEqual([e for e in peer.events if e[0] == "forward"],
+                                 [("forward", b"target.internal.invalid", peers[index + 1].address[1])])
         self.assertEqual(DRIVER.ftssh_close(child), 0)
         stats = Stats()
         self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
         self.assertEqual(stats.allocated, 0)
-        self.assertLessEqual(stats.peak, 4 * 1024 * 1024)
+        self.assertLessEqual(stats.peak, (hop_count + 1) * 2 * 1024 * 1024)
+        for peer in peers:
+            self.assertTrue(peer.done.wait(2), "closing the destination retained an ancestor transport")
+
+    def test_deep_host_pin_rejection_closes_every_ancestor_without_offering_a_key(self):
+        child, peers, keys = self.forwarding_chain(3)
+        for index in range(2):
+            self.assertEqual(self.authenticate(child, peers[index], keys[index]), 0)
+            child = self.forwarded(child, peers[index + 1])
+        self.advance(child, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(child, DRIVER.ftssh_copy_host_key), peers[2].host_blob)
+        wrong = peers[0].host_blob
+        self.assertEqual(DRIVER.ftssh_approve_host_key(child, wrong, len(wrong)), -1005)
+        self.assertEqual([e for e in peers[2].events if e[0] == "authentication"], [])
+        self.assertEqual(peers[3].accepted_connections, 0)
+        self.assertEqual(DRIVER.ftssh_close(child), 0)
+        stats = Stats()
+        self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
+        self.assertEqual(stats.allocated, 0)
+        for peer in peers[:3]:
+            self.assertTrue(peer.done.wait(2), "deep host rejection retained an ancestor transport")
+        for peer in peers:
+            self.assertEqual([e for e in peer.events if e[0] in ["channel", "pty", "shell"]], [])
+
+    def test_three_hop_close_with_inflight_output_releases_all_owned_buffers(self):
+        child, peers, keys = self.forwarding_chain(3)
+        for index, (peer, key) in enumerate(zip(peers, keys)):
+            self.assertEqual(self.authenticate(child, peer, key), 0)
+            if index < 3:
+                child = self.forwarded(child, peers[index + 1])
+        self.assertEqual(DRIVER.ftssh_begin_shell(child, 80, 24, 0, 0), 0)
+        self.advance(child, DRIVER.ftssh_shell_step)
+        payload = b"inflight-chain-close\r\n" * 700
+        stats = Stats()
+        for _ in range(128):
+            self.assertIn(DRIVER.ftssh_admit_write(child, payload, len(payload)), (0, 1))
+            self.assertIn(DRIVER.ftssh_flush_write(child), (0, 1))
+            self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
+            if stats.pending:
+                break
+        self.assertGreater(stats.pending, 0, "fixture did not retain a pending physical write receipt")
+        self.assertLess(stats.written, stats.accepted)
+        self.assertEqual(DRIVER.ftssh_close(child), 0)
+        self.assertEqual(DRIVER.ftssh_get_stats(child, C.byref(stats)), 0)
+        self.assertEqual(stats.allocated, 0)
+        self.assertEqual(stats.pending, 0)
+        for peer in peers:
+            self.assertTrue(peer.done.wait(2), "closing in-flight output retained an ancestor transport")
 
     def test_real_authentication_pty_unicode_data_and_resize_for_four_key_families(self):
         keys = [ed25519.Ed25519PrivateKey.generate()] + [ec.generate_private_key(c) for c in [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()]]

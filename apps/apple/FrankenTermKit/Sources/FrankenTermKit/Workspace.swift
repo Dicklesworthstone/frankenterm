@@ -654,6 +654,26 @@ public struct WorkspaceDocument: Sendable {
         raw = discarded == 0 ? data : try sanitized.encoded()
     }
 
+    /// Expand the declared ordered graph into the actual SSH transit sequence.
+    /// A hop's own dependencies precede that hop; no host-name deduplication or
+    /// undeclared proxy lookup may change the reviewed route. Parsing bounds the
+    /// complete expansion to three transit sessions, including nested hops.
+    public func orderedJumpRoutes(forRouteID id: String) throws -> [Route] {
+        let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
+        guard let destination = routeMap[id] else { throw FTError.stale }
+        var result: [Route] = []
+        func appendDependencies(of route: Route, path: Set<String>) throws {
+            for next in route.jumpRoutes {
+                guard !path.contains(next), let hop = routeMap[next] else { throw FTError.malformed("route.jump_graph") }
+                try appendDependencies(of: hop, path: path.union([next]))
+                guard result.count < 3 else { throw FTError.limit("route.jump_graph") }
+                result.append(hop)
+            }
+        }
+        try appendDependencies(of: destination, path: [id])
+        return result
+    }
+
     public func readiness(forRouteID id: String, availableCredentialIDs: Set<String>, reviewedTrustIDs: Set<String> = [],
                           revokedCredentialFingerprints: Set<String> = [], locallyRejectedTrustIDs: Set<String> = [],
                           locallyRevokedHostKeys: [String: Set<HostKey>] = [:],
@@ -722,8 +742,9 @@ public struct WorkspaceDocument: Sendable {
             // This is a scoped configuration query, not a free-standing claim
             // that any route may be treated as a transit host. Authentication
             // also requires the destination's complete durable readiness.
-            guard support.maximumJumpHops >= 1, let destination = routeMap[destinationID],
-                  destination.jumpRoutes == [id], let hop = routeMap[id], hop.jumpRoutes.isEmpty else {
+            let chain = try orderedJumpRoutes(forRouteID: destinationID)
+            guard !chain.isEmpty, chain.count <= support.maximumJumpHops,
+                  chain.contains(where: { $0.id == id }) else {
                 throw FTError.stale
             }
             return try evaluate(id, transit: true)

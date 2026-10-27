@@ -175,6 +175,71 @@ class WorkspaceInteropTests(unittest.TestCase):
                     hop.close()
                     destination.close()
 
+    def test_two_and_three_hop_workspaces_preserve_every_peer_authorization(self):
+        cases = [(2, "jump-chain-success"), (2, "jump-chain-wrong-hop")]
+        cases += [(3, mode) for mode in [
+            "jump-chain-success", "jump-chain-auth-only", "jump-chain-wrong-hop", "jump-chain-wrong-destination",
+            "jump-chain-revoked", "jump-chain-revoke-first-hop", "jump-chain-revoke-middle-hop", "jump-chain-revoke-last-hop",
+            "jump-chain-cancel-signature", "jump-chain-revoke-during-signature", "jump-chain-hop-key-fallback", "jump-chain-hop-refused"]]
+        for hop_count, mode in cases:
+            with self.subTest(hops=hop_count, mode=mode):
+                destination_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+                keys = [ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32 * (index + 1), 32 * (index + 2))))
+                        for index in range(hop_count)]
+                destination = fixture.LoopbackServer(destination_key)
+                repeats = mode in ["jump-chain-hop-key-fallback", "jump-chain-hop-refused"]
+                peers = []
+                for index in reversed(range(hop_count)):
+                    target = peers[0] if peers else destination
+                    peers.insert(0, fixture.LoopbackServer(keys[index], forward_to=target.address,
+                        connections=2 if repeats else 1,
+                        reject=mode == "jump-chain-hop-refused" and index == hop_count - 1))
+                try:
+                    chain = [{"port": peer.address[1], "hostKey": base64.b64encode(peer.host_blob).decode()} for peer in peers]
+                    environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(destination.address[1]),
+                        FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(destination.host_blob).decode(),
+                        FT_WORKSPACE_SSH_JUMP_CHAIN=json.dumps(chain), FT_WORKSPACE_SSH_TEST_MODE=mode)
+                    result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=25)
+                    output = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 0, output[-18000:])
+                    self.assertIn("Executed 1 test", output)
+                    self.assertNotIn("skipped", output.lower())
+                    no_hops = mode == "jump-chain-revoked"
+                    no_target = no_hops or mode in ["jump-chain-wrong-hop", "jump-chain-hop-refused"]
+                    for index, peer in enumerate(peers):
+                        self.assertEqual(peer.accepted_connections, 0 if no_hops else (2 if repeats else 1))
+                        offers = [e for e in peer.events if e[0] == "authentication"]
+                        if no_hops or (mode == "jump-chain-wrong-hop" and index == hop_count - 1):
+                            expected = []
+                        elif repeats and index == hop_count - 1:
+                            expected = [0, 0, 1] if mode == "jump-chain-hop-key-fallback" else [0, 0]
+                        else:
+                            expected = [0, 1, 0, 1] if repeats else [0, 1]
+                        self.assertEqual([e[1] for e in offers], expected)
+                        if repeats and index == hop_count - 1:
+                            self.assertEqual(offers[0][3], fixture.public_blob(destination_key))
+                            self.assertTrue(all(e[3] == fixture.public_blob(keys[index]) for e in offers[1:]))
+                        else:
+                            self.assertTrue(all(e[3] == fixture.public_blob(keys[index]) for e in offers))
+                        self.assertEqual([e for e in peer.events if e[0] in ["channel", "pty", "shell", "resize"]], [])
+                        if peer.accepted_connections:
+                            self.assertTrue(peer.done.wait(2), "retired destination retained a hop's live server work")
+                    self.assertEqual(destination.accepted_connections, 0 if no_target else 1)
+                    offers = [e for e in destination.events if e[0] == "authentication"]
+                    expected = [] if no_target or mode == "jump-chain-wrong-destination" else (
+                        [0] if mode in ["jump-chain-cancel-signature", "jump-chain-revoke-during-signature"] else [0, 1])
+                    self.assertEqual([e[1] for e in offers], expected)
+                    self.assertTrue(all(e[3] == fixture.public_blob(destination_key) for e in offers))
+                    self.assertEqual(any(e[0] == "shell" for e in destination.events), mode == "jump-chain-success")
+                    self.assertEqual(destination.received,
+                        "Imported key → owned terminal.\rEND-SESSION\r".encode() if mode == "jump-chain-success" else b"")
+                    if mode == "jump-chain-success":
+                        self.assertIn(("resize", 132, 42), destination.events)
+                finally:
+                    for peer in peers:
+                        peer.close()
+                    destination.close()
+
 
 class ObservedServerEvents(list):
     """Observe the real server boundary, independently of the Swift actor."""

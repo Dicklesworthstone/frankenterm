@@ -255,14 +255,16 @@ public actor NativeSSHSession {
     /// Creates an independently authenticated SSH transport inside this exact
     /// approved hop. Success consumes this outer owner; only the returned actor
     /// can drive either library session. There is no transit PTY, exec, socket
-    /// listener or shared forwarding transport. A second hop is unsupported.
+    /// listener or shared forwarding transport. At most three transit sessions
+    /// belong to the returned chain; every ancestor retains its own authority.
     public func forward(to endpoint: NativeSSHEndpoint, timeout: Duration = .seconds(15),
                         maximumNativeBytes: Int = 2 * 1024 * 1024) async throws -> NativeSSHSession {
         let deadline = try deadline(timeout)
-        guard phase == .authenticated, operation == nil, forwardingWitnesses.isEmpty,
+        guard phase == .authenticated, operation == nil,
               let authority = authentication, let peer, let identity else {
             throw phase == .closed ? NativeSSHError.closed : .busy
         }
+        guard forwardingWitnesses.count < Int(FTSSH_MAX_JUMP_HOPS) else { throw NativeSSHError.native(Int32(FTSSH_UNSUPPORTED)) }
         guard (65536...4 * 1024 * 1024).contains(maximumNativeBytes) else { throw NativeSSHError.invalidInput }
         try Task.checkCancellation()
         let token = UUID(); operation = token; phase = .opening
@@ -270,6 +272,7 @@ public actor NativeSSHSession {
         defer { timer.cancel(); if operation == token { operation = nil } }
         do {
             return try await withTaskCancellationHandler {
+                try await validateForwardingPath()
                 try await authority.validate(peer: peer, identity: identity)
                 try current(token, deadline)
                 try requireOK(endpoint.host.withCString {
@@ -282,13 +285,15 @@ public actor NativeSSHSession {
                     try requireAgain(result)
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
+                try await validateForwardingPath()
                 try await authority.validate(peer: peer, identity: identity)
                 try current(token, deadline)
                 let transferred = try native.forwarded(maximumNativeBytes: maximumNativeBytes)
                 // No suspension point after native ownership moves. Closing
                 // this consumed actor must never cancel the child's hop grant.
                 let child = NativeSSHSession(native: transferred, endpoint: endpoint,
-                    witnesses: [.init(authority: authority, peer: peer, identity: identity)])
+                    witnesses: forwardingWitnesses + [.init(authority: authority, peer: peer, identity: identity)])
+                forwardingWitnesses.removeAll()
                 authentication = nil; self.peer = nil; self.identity = nil
                 phase = .closed; operation = nil
                 return child
