@@ -9,6 +9,8 @@ extern "C" {
 
 /* Native libssh2 ownership boundary. This does not implement SSH or a terminal.
  * One serial owner calls a handle; no function may overlap another on that handle.
+ * During keyboard-interactive authentication the bounded native worker owns all
+ * libssh2 access. Only its documented control/snapshot APIs may run until joined.
  * No pointer into libssh2 crosses this API. All outputs are bounded copies.
  * The caller owns socket connection, deadlines, readiness and workspace policy.
  * Authentication and creation of a remote shell are separate deliberate steps.
@@ -17,11 +19,13 @@ typedef struct ftssh_session ftssh_session;
 enum {
     FTSSH_OK = 0, FTSSH_AGAIN = 1, FTSSH_SIGNATURE_NEEDED = 2, FTSSH_EOF = 3,
     FTSSH_YIELD = 4, FTSSH_PASSWORD_NEEDED = 5,
+    FTSSH_INTERACTIVE_NEEDED = 6, FTSSH_INTERACTIVE_FINISHED = 7,
     FTSSH_INVALID = -1000, FTSSH_STATE = -1001, FTSSH_LIMIT = -1002,
     FTSSH_IO = -1003, FTSSH_NEGOTIATION = -1004, FTSSH_HOST_REJECTED = -1005,
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
     FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010,
-    FTSSH_AUTH_FAILED = -1011, FTSSH_PASSWORD_FAILED = -1012
+    FTSSH_AUTH_FAILED = -1011, FTSSH_PASSWORD_FAILED = -1012,
+    FTSSH_INTERACTIVE_FAILED = -1013, FTSSH_AUTH_TIMEOUT = -1014
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
        FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024,
@@ -29,7 +33,11 @@ enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
        /* Canonical RSA through 8192 bits, exponent through 64 bits. The
         * signature bound includes the SSH algorithm and signature strings. */
        FTSSH_PUBLIC_KEY_CAPACITY = 1053, FTSSH_CHALLENGE_CAPACITY = 1536,
-       FTSSH_SIGNATURE_CAPACITY = 1044 };
+       FTSSH_SIGNATURE_CAPACITY = 1044,
+       FTSSH_INTERACTIVE_ROUND_CAPACITY = 4, FTSSH_INTERACTIVE_PROMPT_CAPACITY = 8,
+       FTSSH_INTERACTIVE_TITLE_CAPACITY = 256, FTSSH_INTERACTIVE_INSTRUCTION_CAPACITY = 1024,
+       FTSSH_INTERACTIVE_PROMPT_TEXT_CAPACITY = 1024, FTSSH_INTERACTIVE_CHALLENGE_CAPACITY = 8192,
+       FTSSH_INTERACTIVE_RESPONSE_CAPACITY = 1024, FTSSH_INTERACTIVE_ENCODED_RESPONSES_CAPACITY = 8228 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -85,6 +93,49 @@ int ftssh_begin_password_authentication(ftssh_session *session, const char *user
  * survives EAGAIN, is cleared on a terminal result/close, and is never returned.
  */
 int ftssh_supply_password(ftssh_session *session, const uint8_t *password, size_t length);
+/* Select keyboard-interactive only after exact host approval. At most two native
+ * workers exist globally, including completed workers not yet joined; each has
+ * a 512 KiB stack outside the libssh2 allocation budget. The worker exclusively
+ * owns this session and every adopted parent, including nonblocking I/O. Its
+ * finite monotonic deadline includes method discovery and every prompt wait.
+ * timeout_milliseconds is 1..120000. No key/password fallback or partial-auth
+ * continuation is inferred. Success requires at least one answered challenge
+ * (an explicitly answered zero-prompt information round counts). A worker
+ * allocation failure sends no auth request.
+ */
+int ftssh_begin_interactive_authentication(ftssh_session *session, const char *user, size_t user_length,
+                                         uint32_t timeout_milliseconds);
+/* While the worker exists, authentication_step returns AGAIN, INTERACTIVE_NEEDED,
+ * or INTERACTIVE_FINISHED. descriptor/directions refer to its notification pipe,
+ * never the network socket. All other ordinary access (including stats) returns
+ * STATE. A notification is only a wakeup; recheck authentication_step.
+ *
+ * Challenge encoding uses big-endian u32 length-prefixed UTF-8 title/instructions,
+ * then u32 prompt count, then [u8 echo (0/1), length-prefixed prompt] per prompt.
+ * Strings contain no NUL. Each published round is numbered 1..ROUND_CAPACITY.
+ * The returned bytes are public untrusted server text, never local host identity.
+ */
+int ftssh_copy_interactive_challenge(ftssh_session *session, uint8_t *output, size_t capacity,
+                                   size_t *length, uint32_t *round);
+/* Response encoding: big-endian u32 count followed by that many length-prefixed
+ * byte strings, each 0..RESPONSE_CAPACITY without NUL. Exact pending round/count
+ * and one submission are required. Empty response lists acknowledge information
+ * rounds. The copied answers are cleared after callback consumption or failure.
+ */
+int ftssh_supply_interactive_responses(ftssh_session *session, uint32_t round,
+                                     const uint8_t *responses, size_t length);
+/* Nonblocking cancellation: wake prompt/socket waits without touching libssh2.
+ * Idempotent when no worker exists. close/destroy also request cancellation but
+ * return AGAIN while the worker remains owned; no native state is freed then.
+ */
+int ftssh_cancel_interactive_authentication(ftssh_session *session);
+/* Join and release the worker, returning its final authentication result. This
+ * may wait: call on an isolated blocking worker, never a cooperative executor or
+ * UI thread, after FINISHED or cancellation. No other handle call may overlap.
+ * Every normal terminal result restores ordinary exclusive handle ownership.
+ * A join failure retains ownership and returns STATE rather than freeing it.
+ */
+int ftssh_finish_interactive_authentication(ftssh_session *session);
 /* Discovers supported methods after host approval, then offers only this key.
  * FTSSH_AUTH_REJECTED means the server explicitly refused the unsigned public
  * key offer before entering the signing callback. Only that result permits an

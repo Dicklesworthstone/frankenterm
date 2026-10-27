@@ -49,6 +49,10 @@ for name, result, args in [
     ("ssh_message_free", None, [P]), ("ssh_message_reply_default", I, [P]),
     ("ssh_message_service_reply_success", I, [P]), ("ssh_message_auth_user", C.c_char_p, [P]),
     ("ssh_message_auth_password", C.c_char_p, [P]),
+    ("ssh_message_auth_kbdint_is_response", I, [P]),
+    ("ssh_message_auth_interactive_request", I, [P, C.c_char_p, C.c_char_p, C.c_uint, C.POINTER(C.c_char_p), P]),
+    ("ssh_userauth_kbdint_getnanswers", I, [P]),
+    ("ssh_userauth_kbdint_getanswer", C.c_char_p, [P, C.c_uint]),
     ("ssh_message_auth_pubkey", P, [P]), ("ssh_message_auth_publickey_state", I, [P]),
     ("ssh_message_auth_reply_pk_ok_simple", I, [P]), ("ssh_message_auth_reply_success", I, [P, I]),
     ("ssh_message_auth_reply_pk_ok", I, [P, P, P]),
@@ -83,6 +87,11 @@ for name, result, args in [
     ("ftssh_approve_host_key", I, [P, P, Z]),
     ("ftssh_begin_authentication", I, [P, P, Z, P, Z]), ("ftssh_authentication_step", I, [P]),
     ("ftssh_begin_password_authentication", I, [P, P, Z]), ("ftssh_supply_password", I, [P, P, Z]),
+    ("ftssh_begin_interactive_authentication", I, [P, P, Z, C.c_uint32]),
+    ("ftssh_copy_interactive_challenge", I, [P, P, Z, C.POINTER(Z), C.POINTER(C.c_uint32)]),
+    ("ftssh_supply_interactive_responses", I, [P, C.c_uint32, P, Z]),
+    ("ftssh_cancel_interactive_authentication", I, [P]),
+    ("ftssh_finish_interactive_authentication", I, [P]),
     ("ftssh_copy_challenge", I, [P, P, Z, C.POINTER(Z)]), ("ftssh_supply_signature", I, [P, P, Z]),
     ("ftssh_begin_forward", I, [P, P, Z, C.c_uint16]), ("ftssh_forward_step", I, [P]),
     ("ftssh_forward_adopt", I, [C.POINTER(P), Z, C.POINTER(P)]),
@@ -156,7 +165,8 @@ def signature(key, data):
 class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
-                 forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None):
+                 forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None,
+                 interactive_rounds=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
@@ -167,6 +177,16 @@ class LoopbackServer:
             raise ValueError("test password must be bounded synthetic bytes")
         self.public = public_blob(key)
         self.password = password
+        if interactive_rounds is not None:
+            if not 1 <= len(interactive_rounds) <= 8:
+                raise ValueError("test interactive rounds must be bounded")
+            for challenge in interactive_rounds:
+                if (len(challenge["prompts"]) > 16 or len(challenge["responses"]) != len(challenge["prompts"])
+                        or len(challenge["name"]) > 2048 or len(challenge["instruction"]) > 16384
+                        or any(len(prompt) > 16384 for prompt, _ in challenge["prompts"])
+                        or any(len(response) > 2048 for response in challenge["responses"])):
+                    raise ValueError("test interactive challenge must be bounded")
+        self.interactive_rounds = interactive_rounds
         self.host_key = host_key or ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.host_signature = host_signature
@@ -265,7 +285,9 @@ class LoopbackServer:
                 return  # client rejection/cancellation is an exercised path
             password_method = self.auth_mode == "publickeyDisabled" or (
                 self.password is not None and self.auth_mode != "passwordDisabled")
-            SERVER.ssh_set_auth_methods(session, 2 if password_method else 4)
+            interactive_method = self.interactive_rounds is not None and self.auth_mode != "interactiveDisabled"
+            SERVER.ssh_set_auth_methods(session, 16 if interactive_method else 2 if password_method else 4)
+            interactive_round = 0
             if verification_observer is not None:
                 SERVER.ssh_set_blocking(session, 0)
             while not self.stop.is_set():
@@ -317,6 +339,43 @@ class LoopbackServer:
                                 SERVER.ssh_string_free(language)
                         else:
                             SERVER.ssh_message_auth_reply_success(message, 0)
+                    elif kind == 1 and subtype == 16:
+                        user = SERVER.ssh_message_auth_user(message)
+                        if SERVER.ssh_message_auth_kbdint_is_response(message):
+                            if not self.interactive_rounds or not 1 <= interactive_round <= len(self.interactive_rounds):
+                                raise RuntimeError("test received an unrequested interactive response")
+                            expected = self.interactive_rounds[interactive_round - 1]["responses"]
+                            count = SERVER.ssh_userauth_kbdint_getnanswers(session)
+                            matched = count == len(expected) and all(
+                                SERVER.ssh_userauth_kbdint_getanswer(session, index) == value
+                                for index, value in enumerate(expected))
+                            self.events.append(("interactive-response", interactive_round, count, matched))
+                            if not matched or self.reject:
+                                SERVER.ssh_message_reply_default(message)
+                                continue
+                            if interactive_round == len(self.interactive_rounds):
+                                if self.auth_mode == "interactivePartial":
+                                    SERVER.ssh_set_auth_methods(session, 4)
+                                    SERVER.ssh_message_auth_reply_success(message, 1)
+                                else:
+                                    SERVER.ssh_message_auth_reply_success(message, 0)
+                                continue
+                        else:
+                            self.events.append(("interactive-request", user))
+                            if not interactive_method or user != b"operator" or self.reject:
+                                SERVER.ssh_message_reply_default(message)
+                                continue
+                            if self.auth_mode == "interactiveImmediateSuccess":
+                                SERVER.ssh_message_auth_reply_success(message, 0)
+                                continue
+                            interactive_round = 0
+                        challenge = self.interactive_rounds[interactive_round]
+                        prompts = (C.c_char_p * len(challenge["prompts"]))(*(text for text, _ in challenge["prompts"]))
+                        echo = (C.c_char * len(challenge["prompts"]))(*(bytes([int(echo)]) for _, echo in challenge["prompts"]))
+                        if SERVER.ssh_message_auth_interactive_request(message, challenge["name"], challenge["instruction"],
+                                len(challenge["prompts"]), prompts, echo):
+                            raise RuntimeError("test interactive challenge send failed")
+                        interactive_round += 1
                     elif kind == 1 and subtype == 4:
                         pubkey = SERVER.ssh_message_auth_pubkey(message)
                         encoded = P()
@@ -539,6 +598,10 @@ class NativeSSHTests(unittest.TestCase):
         for handle in self.handles:
             if not handle.value:
                 continue
+            # A failed assertion during a conversation still joins its owned
+            # worker before releasing any session or adopted parent.
+            if DRIVER.ftssh_close(handle) == 1:
+                self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(handle), -1009)
             self.assertEqual(DRIVER.ftssh_close(handle), 0)
             stats = Stats()
             self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
@@ -549,10 +612,10 @@ class NativeSSHTests(unittest.TestCase):
             server.close()
 
     def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal", password=None,
-              user_signature=None):
+              user_signature=None, interactive_rounds=None):
         key = key or ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
         server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode, password=password,
-                                user_signature=user_signature)
+                                user_signature=user_signature, interactive_rounds=interactive_rounds)
         self.servers.append(server)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -622,6 +685,259 @@ class NativeSSHTests(unittest.TestCase):
 
     def password_events(self, server):
         return [event for event in server.events if event[0] == "password-authentication"]
+
+    @staticmethod
+    def interactive_round(responses=(b"synthetic-password",), prompts=None, name=b"Server challenge", instruction=b"Sign in"):
+        if prompts is None:
+            prompts = [(b"Password: ", False)] * len(responses)
+        return {"name": name, "instruction": instruction, "prompts": prompts, "responses": list(responses)}
+
+    def begin_interactive(self, handle, server, timeout=3000):
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, b"operator", 8, timeout), 0)
+
+    def interactive_challenge(self, handle, expected_round, expected):
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (6,)), 6)
+        output, length, round_id = C.create_string_buffer(8192), Z(), C.c_uint32()
+        self.assertEqual(DRIVER.ftssh_copy_interactive_challenge(handle, output, 1, C.byref(length), C.byref(round_id)), -1002)
+        self.assertEqual((length.value, round_id.value), (0, 0))
+        self.assertEqual(DRIVER.ftssh_copy_interactive_challenge(handle, output, len(output), C.byref(length), C.byref(round_id)), 0)
+        self.assertEqual(round_id.value, expected_round)
+        packet = ssh_string(expected["name"]) + ssh_string(expected["instruction"]) + struct.pack(">I", len(expected["prompts"]))
+        packet += b"".join(bytes([int(echo)]) + ssh_string(text) for text, echo in expected["prompts"])
+        self.assertEqual(output.raw[:length.value], packet)
+
+    def answer_interactive(self, handle, round_id, answers):
+        encoded = struct.pack(">I", len(answers)) + b"".join(ssh_string(value) for value in answers)
+        owned = C.create_string_buffer(encoded)
+        self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, round_id, owned, len(encoded)), 0)
+        C.memset(owned, 0, len(owned))
+        self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, round_id, encoded, len(encoded)), -1001)
+
+    def finish_interactive(self, handle, expected=0):
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (7,), timeout=5), 7)
+        self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(handle), expected)
+
+    def test_interactive_multiple_rounds_echo_and_information_reach_a_real_terminal(self):
+        rounds = [
+            self.interactive_round(["pāss 界".encode(), b"operator"], [(b"Password: ", False), (b"Account: ", True)]),
+            self.interactive_round([], [], instruction=b"Confirm this sign-in"),
+            self.interactive_round([b"123456"], [(b"One-time code: ", False)]),
+        ]
+        handle, server, _ = self.start(interactive_rounds=rounds)
+        self.begin_interactive(handle, server)
+        for number, challenge in enumerate(rounds, 1):
+            self.interactive_challenge(handle, number, challenge)
+            self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(Stats())), -1001)
+            self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1001)
+            self.assertEqual(DRIVER.ftssh_shell_step(handle), -1001)
+            self.assertEqual(DRIVER.ftssh_handshake(handle), -1001)
+            self.answer_interactive(handle, number, challenge["responses"])
+        self.finish_interactive(handle)
+        self.assertEqual([event for event in server.events if event[0] == "interactive-response"],
+                         [("interactive-response", 1, 2, True), ("interactive-response", 2, 0, True),
+                          ("interactive-response", 3, 1, True)])
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        payload = "Interactive → terminal 🦀\rEND-SESSION\r".encode()
+        self.assertEqual(DRIVER.ftssh_admit_write(handle, payload, len(payload)), 0)
+        received, eof = bytearray(), False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.assertIn(DRIVER.ftssh_flush_write(handle), (0, 1))
+            output, count = C.create_string_buffer(256), Z()
+            result = DRIVER.ftssh_read(handle, output, len(output), C.byref(count))
+            self.assertIn(result, (0, 1, 3))
+            received += output.raw[:count.value]
+            if result == 3:
+                eof = True
+                break
+            self.wait(handle)
+        self.assertTrue(eof)
+        self.assertEqual(received, b"ready\r\nstderr\r\n" + payload)
+        self.assertEqual(server.received, payload)
+
+    def test_interactive_requires_exact_host_approval_and_bounded_start(self):
+        handle, server, _ = self.start(interactive_rounds=[self.interactive_round()])
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, b"operator", 8, 3000), -1001)
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, b"operator", 8, 3000), -1001)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        for user, length, timeout in [(None, 1, 3000), (b"", 0, 3000), (b"bad\x00user", 8, 3000),
+                                      (b"u" * 257, 257, 3000), (b"operator", 8, 0), (b"operator", 8, 120001)]:
+            self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, user, length, timeout), -1000)
+        self.assertEqual([event for event in server.events if event[0].startswith("authentication")], [])
+
+    def test_interactive_replies_require_current_round_shape_utf8_and_capacity(self):
+        challenge = self.interactive_round([b""], [(b"Optional response: ", False)])
+        handle, server, _ = self.start(interactive_rounds=[challenge])
+        self.begin_interactive(handle, server)
+        self.interactive_challenge(handle, 1, challenge)
+        for encoded in [b"", b"\x00\x00\x00", struct.pack(">I", 9),
+                        struct.pack(">I", 1) + ssh_string(b"x" * 1025),
+                        struct.pack(">I", 1) + ssh_string(b"a\x00b"),
+                        struct.pack(">I", 1) + ssh_string(b"\xff"),
+                        struct.pack(">I", 1) + ssh_string(b"") + b"trailing"]:
+            self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, 1, encoded, len(encoded)), -1000)
+        encoded = struct.pack(">I", 1) + ssh_string(b"")
+        self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, 0, encoded, len(encoded)), -1001)
+        self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, 2, encoded, len(encoded)), -1001)
+        self.assertEqual(DRIVER.ftssh_supply_interactive_responses(handle, 1, struct.pack(">I", 0), 4), -1001)
+        self.answer_interactive(handle, 1, [b""])
+        self.finish_interactive(handle)
+
+    def test_interactive_all_eight_capacity_sized_responses_are_owned(self):
+        challenge = self.interactive_round([bytes([65 + i]) * 1024 for i in range(8)])
+        handle, server, _ = self.start(interactive_rounds=[challenge])
+        self.begin_interactive(handle, server)
+        self.interactive_challenge(handle, 1, challenge)
+        self.answer_interactive(handle, 1, challenge["responses"])
+        self.finish_interactive(handle)
+        self.assertIn(("interactive-response", 1, 8, True), server.events)
+
+    def test_interactive_ssh_boolean_echo_is_normalized_before_publication(self):
+        # SSH booleans treat every nonzero octet as true. libssh2's decoder
+        # normalizes that wire value before it reaches the callback contract.
+        challenge = self.interactive_round([b"operator"], [(b"Account: ", 2)])
+        handle, server, _ = self.start(interactive_rounds=[challenge])
+        self.begin_interactive(handle, server)
+        normalized = {**challenge, "prompts": [(b"Account: ", True)]}
+        self.interactive_challenge(handle, 1, normalized)
+        self.answer_interactive(handle, 1, challenge["responses"])
+        self.finish_interactive(handle)
+
+    def test_interactive_unsupported_none_and_challengeless_success_do_not_authenticate(self):
+        for mode in ["interactiveDisabled", "noneSucceeds", "interactiveImmediateSuccess"]:
+            with self.subTest(mode=mode):
+                handle, server, _ = self.start(interactive_rounds=[self.interactive_round()], auth_mode=mode)
+                self.begin_interactive(handle, server)
+                self.finish_interactive(handle, -1010)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+                self.assertEqual([event for event in server.events if event[0] == "interactive-response"], [])
+
+    def test_interactive_wrong_or_partial_response_is_terminal_without_key_retry(self):
+        for mode, response in [("normal", b"wrong"), ("interactivePartial", b"synthetic-password")]:
+            with self.subTest(mode=mode):
+                challenge = self.interactive_round()
+                handle, server, key = self.start(interactive_rounds=[challenge], auth_mode=mode)
+                self.begin_interactive(handle, server)
+                self.interactive_challenge(handle, 1, challenge)
+                self.answer_interactive(handle, 1, [response])
+                self.finish_interactive(handle, -1013)
+                blob = public_blob(key)
+                self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), -1013)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1013)
+                self.assertEqual([event for event in server.events if event[0] in ("authentication", "channel", "shell")], [])
+
+    def test_interactive_server_bounds_and_round_budget_fail_before_unbounded_prompting(self):
+        cases = [
+            (self.interactive_round(name=b"x" * 257), -1002),
+            (self.interactive_round(instruction=b"x" * 1025), -1002),
+            (self.interactive_round([b"x"] * 9), -1002),
+            (self.interactive_round([b"x"], [(b"x" * 1025, False)]), -1007),
+            (self.interactive_round([b"x"] * 8, [(b"x" * 1024, False)] * 8), -1007),
+            (self.interactive_round([b"x"], [(b"\xed\xa0\x80", False)]), -1007),
+        ]
+        for challenge, failure in cases:
+            with self.subTest(failure=failure, name_bytes=len(challenge["name"]), prompts=len(challenge["prompts"])):
+                handle, server, _ = self.start(interactive_rounds=[challenge])
+                self.begin_interactive(handle, server)
+                self.finish_interactive(handle, failure)
+                self.assertEqual([event for event in server.events if event[0] == "interactive-response"], [])
+        challenge = self.interactive_round()
+        handle, server, _ = self.start(interactive_rounds=[challenge] * 5)
+        self.begin_interactive(handle, server)
+        for number in range(1, 5):
+            self.interactive_challenge(handle, number, challenge)
+            self.answer_interactive(handle, number, challenge["responses"])
+        self.finish_interactive(handle, -1002)
+        self.assertEqual(len([event for event in server.events if event[0] == "interactive-response"]), 4)
+
+    def test_interactive_cancellation_joins_before_native_destroy(self):
+        challenge = self.interactive_round()
+        handle, server, _ = self.start(interactive_rounds=[challenge])
+        self.begin_interactive(handle, server)
+        self.interactive_challenge(handle, 1, challenge)
+        pointer = handle.value
+        started = time.monotonic()
+        self.assertEqual(DRIVER.ftssh_close(handle), 1)
+        self.assertEqual(DRIVER.ftssh_destroy(C.byref(handle)), 1)
+        self.assertEqual(handle.value, pointer)
+        self.finish_interactive(handle, -1009)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(Stats())), 0)
+        self.assertEqual([event for event in server.events if event[0] == "interactive-response"], [])
+
+    def test_interactive_native_deadline_expires_while_awaiting_user(self):
+        challenge = self.interactive_round()
+        handle, server, _ = self.start(interactive_rounds=[challenge])
+        self.begin_interactive(handle, server, timeout=250)
+        self.interactive_challenge(handle, 1, challenge)
+        deadline = time.monotonic() + 2
+        while True:
+            result = DRIVER.ftssh_authentication_step(handle)
+            if result == 7:
+                break
+            self.assertIn(result, (1, 6))
+            self.assertLess(time.monotonic(), deadline)
+            self.wait(handle)
+        self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(handle), -1014)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1014)
+        self.assertEqual([event for event in server.events if event[0] == "interactive-response"], [])
+
+    def test_interactive_worker_admission_remains_charged_until_join(self):
+        challenge = self.interactive_round()
+        active = []
+        for _ in range(2):
+            handle, server, _ = self.start(interactive_rounds=[challenge])
+            self.begin_interactive(handle, server)
+            self.interactive_challenge(handle, 1, challenge)
+            active.append(handle)
+        third, server, _ = self.start(interactive_rounds=[challenge])
+        self.advance(third, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(third, server.host_blob, len(server.host_blob)), 0)
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(third, b"operator", 8, 3000), -1002)
+        self.assertEqual(DRIVER.ftssh_cancel_interactive_authentication(active[0]), 0)
+        self.advance(active[0], DRIVER.ftssh_authentication_step, (7,))
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(third, b"operator", 8, 3000), -1002)
+        self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(active[0]), -1009)
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(third, b"operator", 8, 3000), 0)
+        self.interactive_challenge(third, 1, challenge)
+        for handle in [active[1], third]:
+            self.assertEqual(DRIVER.ftssh_cancel_interactive_authentication(handle), 0)
+            self.finish_interactive(handle, -1009)
+
+    def test_interactive_destination_and_transit_own_the_complete_hop_chain(self):
+        for interactive_hop in [False, True]:
+            with self.subTest(interactive_hop=interactive_hop):
+                keys = [ed25519.Ed25519PrivateKey.generate(), ed25519.Ed25519PrivateKey.generate()]
+                challenge = self.interactive_round([b"654321"], [(b"Verification code: ", False)])
+                destination = LoopbackServer(keys[1], interactive_rounds=None if interactive_hop else [challenge])
+                hop = LoopbackServer(keys[0], interactive_rounds=[challenge] if interactive_hop else None,
+                                     forward_to=destination.address)
+                self.servers.extend([hop, destination])
+                sock = socket.create_connection(hop.address, timeout=3)
+                sock.settimeout(None)
+                handle = P()
+                self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
+                sock.detach(); self.handles.append(handle)
+                for index, peer in enumerate([hop, destination]):
+                    if peer.interactive_rounds:
+                        self.begin_interactive(handle, peer)
+                        self.interactive_challenge(handle, 1, challenge)
+                        self.answer_interactive(handle, 1, challenge["responses"])
+                        self.finish_interactive(handle)
+                    else:
+                        self.assertEqual(self.authenticate(handle, peer, keys[index]), 0)
+                    if index == 0:
+                        handle = self.forwarded(handle, destination)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                self.assertEqual([event for event in hop.events if event[0] in ("channel", "pty", "shell")], [])
+                self.assertIn(("shell",), destination.events)
 
     def rsa_challenge(self, handle, server, key):
         self.advance(handle, DRIVER.ftssh_handshake)

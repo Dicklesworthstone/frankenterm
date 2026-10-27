@@ -3,11 +3,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <linux/sockios.h>
@@ -21,19 +23,25 @@
 /* Audited exception: opaque libssh2 handles, POSIX socket ownership, aligned
  * allocator headers and synchronous C callbacks are confined to this file.
  * Bounds are checked before copy/allocation. The Swift owner serializes calls.
- * Callbacks never invoke Swift, block, throw, or retain a borrowed argument.
+ * Keyboard-interactive alone transfers libssh2 ownership to a bounded pthread;
+ * its synchronous callback waits there for an owned response or cancellation.
+ * No callback invokes Swift, throws, or retains a borrowed argument.
  * The library owns callback signatures through the same supplied allocator.
  * No global signal handler, key-file loading, shell command or trace is used.
  */
 enum phase { HANDSHAKE, PEER, APPROVED, AUTH, AUTHENTICATED, FORWARD_OPENING, FORWARD_READY,
              OPENING, PTY, SHELL, LIVE, FAILED, CLOSED };
 enum { EGRESS_CAPACITY = 65536, EGRESS_RESERVE = 49152 };
+struct interactive_worker;
 struct ftssh_session {
     LIBSSH2_SESSION *ssh;
     LIBSSH2_CHANNEL *channel;
     /* Owned exclusively after forward_adopt. Both libraries are driven by the
      * same actor; no other owner may access the adopted outer session. */
     struct ftssh_session *parent;
+    /* The leaf owns the worker allocation. Every adopted ancestor points to
+     * that same owner only while the worker exclusively drives the chain. */
+    struct interactive_worker *interactive, *worker_owner;
     unsigned int forwarding_depth;
     /* Owned ciphertext, charged to the same local/global allocation budget.
      * A libssh2 send callback accepts a complete packet here. Calling a parent
@@ -68,9 +76,26 @@ struct ftssh_session {
     size_t receive_budget;
     int limited_receive, output_eof;
 };
-typedef union { max_align_t alignment; size_t size; } allocation_header;
+struct interactive_worker {
+    ftssh_session *session;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    int notification[2], control[2];
+    _Atomic int cancelled;
+    int done, result, callback_error, pending, supplied;
+    uint32_t round, prompt_count;
+    uint64_t deadline_milliseconds;
+    uint8_t challenge[FTSSH_INTERACTIVE_CHALLENGE_CAPACITY];
+    uint8_t responses[FTSSH_INTERACTIVE_ENCODED_RESPONSES_CAPACITY];
+    size_t challenge_length, response_length;
+};
+typedef union {
+    max_align_t alignment;
+    struct { size_t size; int sensitive; } metadata;
+} allocation_header;
 static _Atomic size_t global_allocated;
 static _Atomic unsigned int global_sessions;
+static _Atomic unsigned int global_interactive_workers;
 static const size_t global_limit = 16u * 1024u * 1024u;
 static pthread_once_t initialization = PTHREAD_ONCE_INIT;
 static int initialized;
@@ -89,7 +114,8 @@ static void *allocate(size_t size, void **abstract) {
     if(total > s->limit - s->allocated || !reserve(total)) return NULL;
     allocation_header *h = malloc(total);
     if(!h) { atomic_fetch_sub(&global_allocated, total); return NULL; }
-    h->size = total; s->allocated += total;
+    h->metadata.size = total; h->metadata.sensitive = s->phase == AUTH;
+    s->allocated += total;
     if(s->allocated > s->peak) s->peak = s->allocated;
     return h + 1;
 }
@@ -97,7 +123,14 @@ static void release(void *pointer, void **abstract) {
     if(!pointer) return;
     ftssh_session *s = *abstract;
     allocation_header *h = (allocation_header *)pointer - 1;
-    size_t total = h->size;
+    size_t total = h->metadata.size;
+    /* libssh2 frees keyboard-interactive answers and its assembled plaintext
+     * authentication packet through this allocator. Preserve their sensitivity
+     * past authentication and reallocation, then wipe before returning memory. */
+    if(h->metadata.sensitive) {
+        volatile uint8_t *bytes = pointer;
+        for(size_t i = 0; i < total - sizeof(*h); i++) bytes[i] = 0;
+    }
     s->allocated -= total; atomic_fetch_sub(&global_allocated, total);
     free(h);
 }
@@ -108,7 +141,9 @@ static void *resize_allocation(void *pointer, size_t size, void **abstract) {
     allocation_header *old = (allocation_header *)pointer - 1;
     void *replacement = allocate(size, abstract);
     if(!replacement) return NULL;
-    size_t previous = old->size - sizeof(allocation_header);
+    allocation_header *next = (allocation_header *)replacement - 1;
+    next->metadata.sensitive |= old->metadata.sensitive;
+    size_t previous = old->metadata.size - sizeof(allocation_header);
     memcpy(replacement, pointer, size < previous ? size : previous);
     release(pointer, abstract); return replacement;
 }
@@ -120,7 +155,7 @@ static int egress_empty(ftssh_session *s) {
 static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length, int flags, void **abstract) {
     (void)fd; (void)flags;
     ftssh_session *s = *abstract;
-    if(s->closing) return -ECONNRESET;
+    if(s->closing || (s->worker_owner && atomic_load(&s->worker_owner->cancelled))) return -ECONNRESET;
     if(!s->egress || length > EGRESS_CAPACITY - s->egress_count) {
         s->socket_failed = 1; s->terminal_error = FTSSH_LIMIT; return -ENOBUFS;
     }
@@ -133,7 +168,7 @@ static ssize_t socket_send(libssh2_socket_t fd, const void *data, size_t length,
 }
 static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, int flags, void **abstract) {
     ftssh_session *s = *abstract;
-    if(s->closing) return -ECONNRESET;
+    if(s->closing || (s->worker_owner && atomic_load(&s->worker_owner->cancelled))) return -ECONNRESET;
     int progress = 0;
     if(drain_egress(s, &progress) < 0) { s->socket_failed = 1; return -ECONNRESET; }
     if(s->limited_receive) {
@@ -221,6 +256,7 @@ static int fail(ftssh_session *s, int code) {
 }
 static int check(ftssh_session *s, int expected) {
     if(!s) return FTSSH_INVALID;
+    if(s->worker_owner) return FTSSH_STATE;
     if(s->phase == CLOSED) return FTSSH_CLOSED;
     if(s->phase == FAILED) return s->terminal_error;
     return s->phase == expected ? FTSSH_OK : FTSSH_STATE;
@@ -335,6 +371,7 @@ int ftssh_handshake(ftssh_session *s) {
 int ftssh_copy_host_key(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length) {
     if(!s || !out || !length) return FTSSH_INVALID;
     *length = 0;
+    if(s->worker_owner) return FTSSH_STATE;
     if(s->phase < PEER || s->phase >= FAILED) return FTSSH_STATE;
     size_t n = 0; int type = 0;
     const char *key = libssh2_session_hostkey(s->ssh, &n, &type);
@@ -344,6 +381,7 @@ int ftssh_copy_host_key(ftssh_session *s, uint8_t *out, size_t capacity, size_t 
 }
 int ftssh_copy_method(ftssh_session *s, int method, char *out, size_t capacity) {
     if(!s || !out || !capacity || method < 0 || method > LIBSSH2_METHOD_COMP_SC) return FTSSH_INVALID;
+    if(s->worker_owner) return FTSSH_STATE;
     if(s->phase < PEER || s->phase >= FAILED) return FTSSH_STATE;
     const char *value = libssh2_session_methods(s->ssh, method);
     if(!value) return FTSSH_UNSUPPORTED;
@@ -533,7 +571,339 @@ static int password_authentication_result(ftssh_session *s, int rc, int authenti
     default: return fail(s, FTSSH_PASSWORD_FAILED);
     }
 }
+
+static void store_u32(uint8_t *out, uint32_t value);
+static int transport_directions(ftssh_session *s);
+
+static uint64_t monotonic_milliseconds(void) {
+    struct timespec now;
+    if(clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+static void signal_pipe(int fd) {
+    uint8_t byte = 1;
+    ssize_t written;
+    do { written = write(fd, &byte, 1); } while(written < 0 && errno == EINTR);
+    /* EAGAIN already means the notification remains readable. Both ends stay
+     * open until the worker is joined, so cancellation cannot cause SIGPIPE. */
+}
+static void drain_pipe(int fd) {
+    uint8_t bytes[64];
+    for(unsigned int turn = 0; turn < 4; turn++) {
+        ssize_t n = read(fd, bytes, sizeof(bytes));
+        if(n <= 0 && errno != EINTR) break;
+    }
+}
+static int owned_pipe(int ends[2]) {
+    if(pipe(ends)) return 0;
+    for(unsigned int i = 0; i < 2; i++) {
+        int flags = fcntl(ends[i], F_GETFL), descriptor_flags = fcntl(ends[i], F_GETFD);
+        if(flags < 0 || descriptor_flags < 0 || fcntl(ends[i], F_SETFL, flags | O_NONBLOCK) < 0 ||
+           fcntl(ends[i], F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+            close(ends[0]); close(ends[1]); ends[0] = ends[1] = -1; return 0;
+        }
+    }
+    return 1;
+}
+static void clear_interactive_responses(struct interactive_worker *worker) {
+    volatile uint8_t *bytes = worker->responses;
+    for(size_t i = 0; i < sizeof(worker->responses); i++) bytes[i] = 0;
+    worker->response_length = 0;
+}
+static int interactive_stop(struct interactive_worker *worker) {
+    if(atomic_load(&worker->cancelled)) return FTSSH_CLOSED;
+    uint64_t now = monotonic_milliseconds();
+    if(!now) return FTSSH_IO;
+    return now >= worker->deadline_milliseconds ? FTSSH_AUTH_TIMEOUT : FTSSH_OK;
+}
+/* The only blocking waits occur on the admitted pthread. A separate control
+ * pipe wakes both socket polling and callback waits; the UI never needs a lock
+ * held across those waits. Every iteration rechecks the monotonic deadline. */
+static int interactive_wait(struct interactive_worker *worker, int directions) {
+    int stopped = interactive_stop(worker); if(stopped) return stopped;
+    uint64_t now = monotonic_milliseconds();
+    if(!now) return FTSSH_IO;
+    if(now >= worker->deadline_milliseconds) return FTSSH_AUTH_TIMEOUT;
+    uint64_t remaining = worker->deadline_milliseconds - now;
+    int milliseconds = remaining > 100 ? 100 : (int)remaining;
+    struct pollfd descriptors[2] = {
+        { worker->control[0], POLLIN, 0 },
+        { directions ? worker->session->fd : -1,
+          (short)((directions & FTSSH_READ ? POLLIN : 0) | (directions & FTSSH_WRITE ? POLLOUT : 0)), 0 }
+    };
+    int rc = poll(descriptors, 2, milliseconds);
+    if(rc < 0 && errno != EINTR) return FTSSH_IO;
+    if(descriptors[0].revents & POLLIN) drain_pipe(worker->control[0]);
+    if((descriptors[0].revents | descriptors[1].revents) & POLLNVAL) return FTSSH_IO;
+    return interactive_stop(worker);
+}
+static int interactive_text(const uint8_t *text, size_t length) {
+    if(length && !text) return 0;
+    for(size_t i = 0; i < length;) {
+        uint8_t first = text[i++];
+        if(first == 0) return 0;
+        if(first < 0x80) continue;
+        unsigned int following;
+        uint8_t minimum = 0x80, maximum = 0xbf;
+        if(first >= 0xc2 && first <= 0xdf) following = 1;
+        else if(first >= 0xe0 && first <= 0xef) {
+            following = 2;
+            if(first == 0xe0) minimum = 0xa0;
+            if(first == 0xed) maximum = 0x9f;
+        } else if(first >= 0xf0 && first <= 0xf4) {
+            following = 3;
+            if(first == 0xf0) minimum = 0x90;
+            if(first == 0xf4) maximum = 0x8f;
+        } else return 0;
+        if(following > length - i || text[i] < minimum || text[i] > maximum) return 0;
+        i++;
+        for(unsigned int n = 1; n < following; n++, i++)
+            if(text[i] < 0x80 || text[i] > 0xbf) return 0;
+    }
+    return 1;
+}
+static int interactive_string(uint8_t **output, size_t *left, const void *text, size_t length) {
+    if(*left < 4 || length > *left - 4 || !interactive_text(text, length)) return 0;
+    store_u32(*output, (uint32_t)length);
+    if(length) memcpy(*output + 4, text, length);
+    *output += 4 + length; *left -= 4 + length; return 1;
+}
+static void interactive_callback(const char *name, int name_length, const char *instruction,
+                                  int instruction_length, int prompt_count,
+                                  const LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts,
+                                  LIBSSH2_USERAUTH_KBDINT_RESPONSE *responses, void **abstract) {
+    ftssh_session *s = *abstract;
+    struct interactive_worker *worker = s->interactive;
+    int error = interactive_stop(worker);
+    if(error) goto rejected;
+    if(name_length < 0 || name_length > FTSSH_INTERACTIVE_TITLE_CAPACITY ||
+       instruction_length < 0 || instruction_length > FTSSH_INTERACTIVE_INSTRUCTION_CAPACITY ||
+       prompt_count < 0 || prompt_count > FTSSH_INTERACTIVE_PROMPT_CAPACITY ||
+       (prompt_count && (!prompts || !responses)) || worker->round >= FTSSH_INTERACTIVE_ROUND_CAPACITY) {
+        error = FTSSH_LIMIT; goto rejected;
+    }
+    pthread_mutex_lock(&worker->lock);
+    uint8_t *output = worker->challenge; size_t left = sizeof(worker->challenge);
+    int valid = interactive_string(&output, &left, name, (size_t)name_length) &&
+                interactive_string(&output, &left, instruction, (size_t)instruction_length);
+    if(valid && left >= 4) { store_u32(output, (uint32_t)prompt_count); output += 4; left -= 4; }
+    else valid = 0;
+    for(int i = 0; valid && i < prompt_count; i++) {
+        if(prompts[i].length > FTSSH_INTERACTIVE_PROMPT_TEXT_CAPACITY ||
+           (prompts[i].echo != 0 && prompts[i].echo != 1) || !left) { valid = 0; break; }
+        *output++ = prompts[i].echo; left--;
+        valid = interactive_string(&output, &left, prompts[i].text, prompts[i].length);
+    }
+    if(!valid) { pthread_mutex_unlock(&worker->lock); error = FTSSH_CHALLENGE; goto rejected; }
+    worker->challenge_length = (size_t)(output - worker->challenge);
+    worker->round++; worker->prompt_count = (uint32_t)prompt_count;
+    worker->pending = 1; worker->supplied = 0;
+    signal_pipe(worker->notification[1]);
+    pthread_mutex_unlock(&worker->lock);
+    for(;;) {
+        error = interactive_stop(worker); if(error) goto rejected;
+        pthread_mutex_lock(&worker->lock);
+        if(worker->supplied) {
+            /* Copy into libssh2-owned allocations only on its owning thread.
+             * Its configured allocator releases these after sending a response. */
+            const uint8_t *cursor = worker->responses + 4;
+            size_t remaining = worker->response_length - 4;
+            for(int i = 0; i < prompt_count; i++) {
+                const uint8_t *answer; size_t length;
+                if(!field(&cursor, &remaining, &answer, &length)) { error = FTSSH_CHALLENGE; break; }
+                void *context = s;
+                char *owned = allocate(length + 1, &context);
+                if(!owned) { error = FTSSH_LIMIT; break; }
+                if(length) memcpy(owned, answer, length);
+                owned[length] = 0;
+                responses[i].text = owned; responses[i].length = (unsigned int)length;
+            }
+            clear_interactive_responses(worker);
+            worker->pending = 0; worker->supplied = 0;
+            pthread_mutex_unlock(&worker->lock);
+            if(error) goto rejected;
+            return;
+        }
+        pthread_mutex_unlock(&worker->lock);
+        error = interactive_wait(worker, 0); if(error) goto rejected;
+    }
+rejected:
+    worker->callback_error = error;
+    /* The void callback cannot defer or return a retry error. Prevent even an
+     * empty response from being sent when this exact conversation is retired. */
+    s->closing = 1;
+}
+static int interactive_result(ftssh_session *s, int rc) {
+    if(s->socket_failed) return FTSSH_IO;
+    switch(rc) {
+    case LIBSSH2_ERROR_ALLOC: return FTSSH_LIMIT;
+    case LIBSSH2_ERROR_SOCKET_NONE: case LIBSSH2_ERROR_SOCKET_SEND:
+    case LIBSSH2_ERROR_SOCKET_DISCONNECT: case LIBSSH2_ERROR_SOCKET_RECV:
+    case LIBSSH2_ERROR_BAD_SOCKET: return FTSSH_IO;
+    case LIBSSH2_ERROR_METHOD_NONE: case LIBSSH2_ERROR_METHOD_NOT_SUPPORTED:
+    case LIBSSH2_ERROR_ALGO_UNSUPPORTED: return FTSSH_UNSUPPORTED;
+    default: return FTSSH_INTERACTIVE_FAILED;
+    }
+}
+static void *interactive_run(void *argument) {
+    struct interactive_worker *worker = argument;
+    ftssh_session *s = worker->session;
+    int answer = FTSSH_INTERACTIVE_FAILED;
+    for(;;) {
+        answer = interactive_stop(worker); if(answer) break;
+        int rc = prepare_egress(s);
+        if(rc < 0) { answer = rc; break; }
+        if(rc == FTSSH_OK && !s->auth_methods_checked) {
+            const char *methods = libssh2_userauth_list(s->ssh, s->user, (unsigned int)strlen(s->user));
+            s->limited_receive = 0;
+            if(libssh2_userauth_authenticated(s->ssh)) { answer = FTSSH_UNSUPPORTED; break; }
+            if(methods) {
+                answer = authentication_method(methods, "keyboard-interactive");
+                if(answer) break;
+                s->auth_methods_checked = 1;
+            } else {
+                rc = libssh2_session_last_errno(s->ssh);
+                if(rc != LIBSSH2_ERROR_EAGAIN) { answer = interactive_result(s, rc); break; }
+            }
+        }
+        if(rc == FTSSH_OK && s->auth_methods_checked) {
+            s->receive_budget = 32768; s->limited_receive = 1;
+            rc = libssh2_userauth_keyboard_interactive_ex(s->ssh, s->user, (unsigned int)strlen(s->user),
+                                                         interactive_callback);
+            s->limited_receive = 0;
+            if(worker->callback_error) { answer = worker->callback_error; break; }
+            answer = interactive_stop(worker); if(answer) break;
+            if(rc == 0 && libssh2_userauth_authenticated(s->ssh)) {
+                answer = worker->round ? FTSSH_OK : FTSSH_UNSUPPORTED;
+                break;
+            }
+            if(rc != LIBSSH2_ERROR_EAGAIN) { answer = interactive_result(s, rc); break; }
+        }
+        int directions = transport_directions(s);
+        if(directions & FTSSH_RETRY) continue;
+        answer = interactive_wait(worker, directions ? directions : FTSSH_READ);
+        if(answer) break;
+    }
+    pthread_mutex_lock(&worker->lock);
+    clear_interactive_responses(worker);
+    worker->pending = 0; worker->supplied = 0;
+    worker->result = answer; worker->done = 1;
+    signal_pipe(worker->notification[1]);
+    pthread_mutex_unlock(&worker->lock);
+    return NULL;
+}
+static void interactive_dispose(ftssh_session *s, struct interactive_worker *worker) {
+    for(unsigned int i = 0; i < 2; i++) {
+        if(worker->notification[i] >= 0) close(worker->notification[i]);
+        if(worker->control[i] >= 0) close(worker->control[i]);
+    }
+    pthread_mutex_destroy(&worker->lock);
+    clear_interactive_responses(worker);
+    void *context = s; release(worker, &context);
+    atomic_fetch_sub(&global_interactive_workers, 1);
+}
+int ftssh_begin_interactive_authentication(ftssh_session *s, const char *user, size_t user_length,
+                                         uint32_t timeout_milliseconds) {
+    int rc = check(s, APPROVED); if(rc) return rc;
+    if(!user || !user_length || user_length > 256 || !timeout_milliseconds || timeout_milliseconds > 120000)
+        return FTSSH_INVALID;
+    for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
+    uint64_t now = monotonic_milliseconds(); if(!now) return FTSSH_IO;
+    unsigned int count = atomic_load(&global_interactive_workers);
+    do { if(count >= 2) return FTSSH_LIMIT; }
+    while(!atomic_compare_exchange_weak(&global_interactive_workers, &count, count + 1));
+    void *context = s;
+    struct interactive_worker *worker = allocate(sizeof(*worker), &context);
+    if(!worker) { atomic_fetch_sub(&global_interactive_workers, 1); return FTSSH_LIMIT; }
+    memset(worker, 0, sizeof(*worker)); atomic_init(&worker->cancelled, 0);
+    worker->notification[0] = worker->notification[1] = worker->control[0] = worker->control[1] = -1;
+    if(pthread_mutex_init(&worker->lock, NULL)) {
+        release(worker, &context); atomic_fetch_sub(&global_interactive_workers, 1); return FTSSH_LIMIT;
+    }
+    if(!owned_pipe(worker->notification) || !owned_pipe(worker->control)) {
+        interactive_dispose(s, worker); return FTSSH_IO;
+    }
+    worker->session = s; worker->deadline_milliseconds = now + timeout_milliseconds;
+    pthread_attr_t attributes;
+    if(pthread_attr_init(&attributes)) { interactive_dispose(s, worker); return FTSSH_LIMIT; }
+    rc = pthread_attr_setstacksize(&attributes, 512u * 1024u);
+    if(!rc) {
+        memcpy(s->user, user, user_length); s->user[user_length] = 0;
+        s->phase = AUTH; s->interactive = worker;
+        for(ftssh_session *p = s; p; p = p->parent) p->worker_owner = worker;
+        rc = pthread_create(&worker->thread, &attributes, interactive_run, worker);
+    }
+    pthread_attr_destroy(&attributes);
+    if(rc) {
+        s->phase = APPROVED; s->interactive = NULL;
+        for(ftssh_session *p = s; p; p = p->parent) p->worker_owner = NULL;
+        interactive_dispose(s, worker); return FTSSH_LIMIT;
+    }
+    return FTSSH_OK;
+}
+int ftssh_copy_interactive_challenge(ftssh_session *s, uint8_t *output, size_t capacity,
+                                   size_t *length, uint32_t *round) {
+    if(!s || !output || !length || !round) return FTSSH_INVALID;
+    *length = 0; *round = 0;
+    struct interactive_worker *worker = s->interactive; if(!worker) return FTSSH_STATE;
+    pthread_mutex_lock(&worker->lock);
+    int rc = FTSSH_STATE;
+    if(worker->pending && !worker->supplied && !worker->done && !interactive_stop(worker)) {
+        if(worker->challenge_length > capacity) rc = FTSSH_LIMIT;
+        else {
+            memcpy(output, worker->challenge, worker->challenge_length);
+            *length = worker->challenge_length; *round = worker->round; rc = FTSSH_OK;
+        }
+    }
+    pthread_mutex_unlock(&worker->lock); return rc;
+}
+int ftssh_supply_interactive_responses(ftssh_session *s, uint32_t round, const uint8_t *responses, size_t length) {
+    if(!s || !responses || length < 4 || length > FTSSH_INTERACTIVE_ENCODED_RESPONSES_CAPACITY) return FTSSH_INVALID;
+    struct interactive_worker *worker = s->interactive; if(!worker) return FTSSH_STATE;
+    uint32_t count = (uint32_t)responses[0] << 24 | (uint32_t)responses[1] << 16 | (uint32_t)responses[2] << 8 | responses[3];
+    if(count > FTSSH_INTERACTIVE_PROMPT_CAPACITY) return FTSSH_INVALID;
+    const uint8_t *cursor = responses + 4; size_t left = length - 4;
+    for(uint32_t i = 0; i < count; i++) {
+        const uint8_t *value; size_t n;
+        if(!field(&cursor, &left, &value, &n) || n > FTSSH_INTERACTIVE_RESPONSE_CAPACITY || !interactive_text(value, n))
+            return FTSSH_INVALID;
+    }
+    if(left) return FTSSH_INVALID;
+    pthread_mutex_lock(&worker->lock);
+    int rc = FTSSH_STATE;
+    if(worker->pending && !worker->supplied && !worker->done && !interactive_stop(worker) &&
+       worker->round == round && worker->prompt_count == count) {
+        memcpy(worker->responses, responses, length); worker->response_length = length; worker->supplied = 1;
+        signal_pipe(worker->control[1]); rc = FTSSH_OK;
+    }
+    pthread_mutex_unlock(&worker->lock); return rc;
+}
+int ftssh_cancel_interactive_authentication(ftssh_session *s) {
+    if(!s) return FTSSH_INVALID;
+    struct interactive_worker *worker = s->interactive;
+    if(worker && !atomic_exchange(&worker->cancelled, 1)) signal_pipe(worker->control[1]);
+    return FTSSH_OK;
+}
+int ftssh_finish_interactive_authentication(ftssh_session *s) {
+    if(!s) return FTSSH_INVALID;
+    struct interactive_worker *worker = s->interactive; if(!worker) return FTSSH_STATE;
+    if(pthread_join(worker->thread, NULL)) return FTSSH_STATE;
+    int answer = atomic_load(&worker->cancelled) ? FTSSH_CLOSED : worker->result;
+    for(ftssh_session *p = s; p; p = p->parent) p->worker_owner = NULL;
+    s->interactive = NULL;
+    interactive_dispose(s, worker);
+    if(answer == FTSSH_OK) { s->phase = AUTHENTICATED; return FTSSH_OK; }
+    return fail(s, answer);
+}
 int ftssh_authentication_step(ftssh_session *s) {
+    if(s && s->interactive) {
+        struct interactive_worker *worker = s->interactive;
+        pthread_mutex_lock(&worker->lock);
+        drain_pipe(worker->notification[0]);
+        int status = worker->done ? FTSSH_INTERACTIVE_FINISHED :
+            (worker->pending && !worker->supplied && !interactive_stop(worker) ? FTSSH_INTERACTIVE_NEEDED : FTSSH_AGAIN);
+        pthread_mutex_unlock(&worker->lock); return status;
+    }
     int rc = check(s, AUTH); if(rc) return rc;
     rc = prepare_egress(s); if(rc) return rc;
     if(!s->auth_methods_checked) {
@@ -662,6 +1032,7 @@ int ftssh_begin_command(ftssh_session *s, const char *command, size_t length) {
 }
 int ftssh_shell_step(ftssh_session *s) {
     if(!s) return FTSSH_INVALID;
+    if(s->worker_owner) return FTSSH_STATE;
     int rc = prepare_egress(s); if(rc) return rc;
     if(s->phase == OPENING) {
         s->channel = libssh2_channel_open_ex(s->ssh, "session", 7, 128 * 1024, 16384, NULL, 0);
@@ -848,7 +1219,7 @@ int ftssh_keepalive(ftssh_session *s) {
     if(s->sent == sent) return FTSSH_AGAIN;
     return FTSSH_OK;
 }
-int ftssh_directions(ftssh_session *s) {
+static int transport_directions(ftssh_session *s) {
     if(!s || !s->ssh || s->phase >= FAILED) return 0;
     int progress = 0;
     if(drain_egress(s, &progress) < 0) { fail(s, FTSSH_IO); return FTSSH_RETRY; }
@@ -866,9 +1237,17 @@ int ftssh_directions(ftssh_session *s) {
            (directions & LIBSSH2_SESSION_BLOCK_OUTBOUND ? FTSSH_WRITE : 0) |
            (retry ? FTSSH_RETRY : 0);
 }
-int ftssh_descriptor(ftssh_session *s) { return s ? s->fd : -1; }
+int ftssh_directions(ftssh_session *s) {
+    if(s && s->interactive) return FTSSH_READ;
+    if(s && s->worker_owner) return 0;
+    return transport_directions(s);
+}
+int ftssh_descriptor(ftssh_session *s) {
+    return s ? (s->interactive ? s->interactive->notification[0] : s->fd) : -1;
+}
 int ftssh_get_stats(ftssh_session *s, ftssh_stats *out) {
     if(!s || !out) return FTSSH_INVALID;
+    if(s->worker_owner) return FTSSH_STATE;
     *out = (ftssh_stats){s->allocated, s->peak, s->write_length - s->write_offset, s->accepted, s->written,
                          s->terminal_error, s->received};
     for(ftssh_session *p = s->parent; p; p = p->parent) {
@@ -880,6 +1259,8 @@ int ftssh_get_stats(ftssh_session *s, ftssh_stats *out) {
 }
 int ftssh_close(ftssh_session *s) {
     if(!s) return FTSSH_INVALID;
+    if(s->interactive) { ftssh_cancel_interactive_authentication(s); return FTSSH_AGAIN; }
+    if(s->worker_owner) return FTSSH_STATE;
     if(s->phase == CLOSED) return FTSSH_OK;
     /* Force callback failure even if libssh2 was mid-EAGAIN. No teardown packet
      * can wait for peer cooperation and no stale fd can be used after close. */
