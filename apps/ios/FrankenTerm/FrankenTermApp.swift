@@ -3052,6 +3052,9 @@ private struct MachineWorkspaceView: View {
         return ids.compactMap { map[$0] }
     }
     var body: some View {
+        // The navigation bar and the edges past the pages take the shown
+        // machine's colors, as the terminal's do.
+        let shownBackground = machines.first { $0.id == selection }.flatMap { theme(for: $0)?.background } ?? "#10223C"
         TabView(selection: $selection) {
             ForEach(machines) { machine in
                 let theme = theme(for: machine)
@@ -3113,9 +3116,12 @@ private struct MachineWorkspaceView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
                     .background(Color(ftHex: theme?.background ?? "#10223C"))
+                    // System controls (chevrons, switches) read against the page.
+                    .environment(\.colorScheme, TerminalSessionTarget.isDark(theme?.background ?? "#10223C") ? .dark : .light)
                     .tag(machine.id)
             }
         }.tabViewStyle(.page(indexDisplayMode: .always))
+            .background(Color(ftHex: shownBackground).ignoresSafeArea())
             .sheet(isPresented: $showKeys) { WorkspaceKeysSheet(workspaceID: workspaceID, model: model) }
             .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
                 if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
@@ -3126,6 +3132,9 @@ private struct MachineWorkspaceView: View {
                 }
             }
             .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(ftHex: shownBackground), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(TerminalSessionTarget.isDark(shownBackground) ? .dark : .light, for: .navigationBar)
             .navigationDestination(item: $terminal) { open in
                 if let connections = model.connections {
                     // Watched here: this page is not updated while the
@@ -3182,7 +3191,10 @@ private struct MachineWorkspaceView: View {
                 } label: {
                     // A session that is already running opens where it is.
                     let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
+                    // Black or white on the accent, whichever reads better;
+                    // the page's theme foreground would not.
                     Label(live ? "Open Terminal" : "Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
+                        .foregroundStyle(TerminalSessionTarget.isDark(theme?.accent ?? "#3B82F6") ? Color.white : Color.black)
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
                 }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent).disabled(model.busy)
                 // Tailscale only: say so before the first attempt waits out a timeout.

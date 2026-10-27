@@ -1326,12 +1326,16 @@ struct WorkspaceTerminalScreen: View {
         let overviewSessionID = scene.overviewSessionID
         let backgroundHex = machine.flatMap { scene.themes[$0.id]?.background }
         let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
+        // The navigation bar and the strips' material sit on the theme's
+        // background, so their text follows it.
+        let chrome: ColorScheme = TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light
         VStack(spacing: 0) {
-            MachineStrip(scene: scene)
+            MachineStrip(scene: scene).environment(\.colorScheme, chrome)
             if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
                 PaneStrip(session: session, state: mux,
                           accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
                           onKeyboard: { Task { await scene.activateKeyboard() } })
+                    .environment(\.colorScheme, chrome)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             ZStack {
@@ -1381,7 +1385,7 @@ struct WorkspaceTerminalScreen: View {
             WorkspaceFleetOverviewScreen(scene: scene)
         }
         .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light, for: .navigationBar)
+        .toolbarColorScheme(chrome, for: .navigationBar)
         .task {
             let connect = connectOnOpen && !initialConnectionConsumed
             initialConnectionConsumed = true
@@ -1780,7 +1784,7 @@ private struct MachineStrip: View {
                 Text(verbatim: machine.name).font(.subheadline.weight(selected ? .semibold : .medium)).lineLimit(1)
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
-            .foregroundStyle(selected ? Color(ftHex: theme?.foreground ?? "#FFFFFF") : Color.primary.opacity(status == .live ? 0.9 : 0.6))
+            .foregroundStyle(selected ? Color(ftHex: theme?.foreground ?? "#FFFFFF") : Color.primary.opacity(status == .live ? 0.9 : 0.75))
             .background {
                 if selected {
                     Capsule().fill(Color(ftHex: theme?.background ?? "#1C1C1E"))
