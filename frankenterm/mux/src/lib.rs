@@ -13328,12 +13328,11 @@ fn schedule_pane_reader_eof(
     }
 }
 
-fn publish_guardian_checkpoint_after_typed_delivery(
+fn publish_guardian_live_checkpoint(
     pane: &Weak<dyn Pane>,
     generation: &Arc<PaneRegistrationGeneration>,
     pane_id: PaneId,
-    segment: GuardianOutputSegmentIdentity,
-    output: GuardianOutputAppendReceipt,
+    delivered_boundary: Option<(GuardianOutputSegmentIdentity, GuardianOutputAppendReceipt)>,
 ) -> anyhow::Result<()> {
     let _generation_lease = generation
         .try_acquire()
@@ -13349,14 +13348,22 @@ fn publish_guardian_checkpoint_after_typed_delivery(
     if operation.wire_identity() != generation.wire_identity {
         return Err(LiveParserCheckpointError::StaleRegistration.into());
     }
-    operation
-        .capture_and_publish_guardian_checkpoint(
+    match delivered_boundary {
+        Some((segment, output)) => operation.capture_and_publish_guardian_checkpoint(
             segment,
             output,
             mux.guardian_checkpoint_limits(),
             GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
-        )
-        .map(drop)
+        ),
+        // An acknowledged idle completion has no new record. Use only the
+        // parser's retained authenticated cursor, including a restored prefix;
+        // never manufacture a receipt or capture ahead of parsed bytes.
+        None => operation.capture_current_guardian_checkpoint(
+            mux.guardian_checkpoint_limits(),
+            GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
+        ),
+    }
+    .map(drop)
 }
 
 /// Whether a live checkpoint may be adopted now: always without a recovery
@@ -13459,6 +13466,13 @@ fn read_from_guardian_live_output(
                 break;
             }
         };
+        if delivery.is_idle() != delivered_boundary.is_none() {
+            log::error!(
+                "guardian record reader returned a mismatched typed delivery state: pane {}",
+                pane_id
+            );
+            break;
+        }
         let now = Instant::now();
         if checkpoint_schedule.is_due(now)
             && delivery.has_durable_replay_page_ack()
@@ -13472,21 +13486,30 @@ fn read_from_guardian_live_output(
             )
             .increment(1);
             checkpoint_schedule.record_outcome(now, true);
+        } else if checkpoint_schedule.is_due(now)
+            && delivery.is_idle()
+            && generation
+                .live_parser_checkpoint
+                .state
+                .lock()
+                .guardian_cursor
+                .is_none()
+        {
+            // A genesis pane with no authenticated output yet has no record
+            // prefix to capture. Keep polling without manufacturing authority
+            // or treating the ordinary empty state as a publication failure.
+            checkpoint_schedule.record_outcome(now, true);
         } else if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
-            let Some((segment, output)) = delivered_boundary else {
-                log::error!(
-                    "guardian record reader returned success without one typed delivery: pane {}",
-                    pane_id
-                );
-                break;
-            };
+            // An idle capture publishes the final delivered output. Repeated
+            // identical captures reuse their acknowledged catalog identity;
+            // they do not evict older members or independently resolve a
+            // journal whose retained-checkpoint floor still blocks reclaim.
             let started_at = Instant::now();
-            match publish_guardian_checkpoint_after_typed_delivery(
+            match publish_guardian_live_checkpoint(
                 &pane,
                 &generation,
                 pane_id,
-                segment,
-                output,
+                delivered_boundary,
             ) {
                 Ok(()) => {
                     metrics::counter!(
@@ -13515,7 +13538,9 @@ fn read_from_guardian_live_output(
         }
         // Later snapshots resume from the newest checkpoint adopted, live or
         // for a recovery root, whose boundary this reader already delivered,
-        // and stop pinning the one the pane was restored from.
+        // and stop pinning the one the pane was restored from. Empty replay
+        // completions must reach this handoff too: a quiet pane may have a new
+        // recovery root even when it has no next record to deliver.
         let reanchor = generation.guardian_adoptions.lock().reanchor.take();
         if let Some((checkpoint_id, capture_generation)) = reanchor {
             reader.reanchor(checkpoint_id, capture_generation);
