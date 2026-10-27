@@ -1,5 +1,6 @@
 #!/bin/bash
-# Prepare the narrowly patched libssh2 used for signed-key MFA continuation.
+# Prepare libssh2's signed-key MFA evidence and corrected RSA-certificate
+# signature negotiation. The same patch/source digest binds both features.
 # The Cargo registry remains untouched. The patch accepts only the reviewed
 # source bytes, and every cached result is checked before reuse.
 # Usage: bash scripts/prepare-libssh2-auth-source.sh UPSTREAM_SOURCE CACHE_DIR
