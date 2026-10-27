@@ -8,9 +8,9 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::storage::{WorkflowAttemptPhase, WorkflowExecutionBudget};
 use tracing::{debug, warn};
 
-const MAX_WORKFLOW_TOTAL_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
 const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -228,22 +228,46 @@ async fn wait_required_duration_with_cx(
 
 fn cap_wait_by_workflow_deadline(
     requested: Duration,
-    workflow_started_at: Instant,
-    workflow_total_deadline_ms: u64,
+    budget: &WorkflowExecutionBudget,
+    last_observed: Instant,
 ) -> Duration {
-    if workflow_total_deadline_ms == 0 {
-        return requested;
-    }
-    if workflow_total_deadline_ms > MAX_WORKFLOW_TOTAL_DEADLINE_MS {
+    let mut observed = budget.clone();
+    if observed
+        .observe_time(now_ms(), elapsed_ms(last_observed))
+        .is_err()
+    {
         return Duration::ZERO;
     }
+    observed
+        .remaining_ms
+        .map_or(requested, |remaining| requested.min(Duration::from_millis(remaining)))
+}
 
-    let Some(deadline) =
-        workflow_started_at.checked_add(Duration::from_millis(workflow_total_deadline_ms))
-    else {
-        return Duration::ZERO;
-    };
-    requested.min(deadline.saturating_duration_since(Instant::now()))
+fn workflow_budget_error(reason: &'static str) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason.to_string()))
+}
+
+fn is_workflow_budget_revision_conflict(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(crate::error::StorageError::Database(reason))
+            if reason == "workflow_budget_revision_conflict"
+    )
+}
+
+fn is_invalid_workflow_budget(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(crate::error::StorageError::Database(reason))
+            if matches!(
+                reason.as_str(),
+                "workflow_budget_invalid_state"
+                    | "workflow_budget_invalid_payload"
+                    | "workflow_budget_identity_mismatch"
+                    | "workflow_budget_invalid_deadline"
+                    | "workflow_budget_invalid_retry"
+            )
+    )
 }
 
 fn normalized_retry_backoff_multiplier(multiplier: f64) -> f64 {
@@ -326,6 +350,33 @@ fn retry_backoff_delay(base_delay_ms: u64, retry_attempt: usize, multiplier: f64
         return Duration::from_millis(u64::MAX);
     }
     Duration::from_millis((scaled_ms.ceil() as u64).max(base_delay_ms))
+}
+
+fn budget_after_step_result(
+    budget: &WorkflowExecutionBudget,
+    result: &StepResult,
+    now: i64,
+) -> crate::Result<WorkflowExecutionBudget> {
+    let mut next = budget.clone();
+    if let StepResult::Retry { delay_ms } = result
+        && let Some(ordinal) = admit_retry_ordinal(budget.retries, budget.max_retries_per_step)
+    {
+        let delay = retry_backoff_delay(*delay_ms, ordinal, budget.retry_backoff_multiplier);
+        let effective_delay_ms = u64::try_from(delay.as_millis())
+            .map_err(|_| workflow_budget_error("workflow_budget_retry_delay_overflow"))?;
+        let not_before = now
+            .checked_add(
+                i64::try_from(effective_delay_ms)
+                    .map_err(|_| workflow_budget_error("workflow_budget_retry_delay_overflow"))?,
+            )
+            .ok_or_else(|| workflow_budget_error("workflow_budget_retry_delay_overflow"))?;
+        next.phase = WorkflowAttemptPhase::RetryWaiting;
+        next.retries = ordinal;
+        next.retry_not_before_ms = Some(not_before);
+        next.retry_base_delay_ms = *delay_ms;
+        next.retry_effective_delay_ms = effective_delay_ms;
+    }
+    Ok(next)
 }
 
 fn invalid_jump_target_reason(step: usize, step_count: usize) -> Option<String> {
@@ -685,14 +736,16 @@ pub struct WorkflowRunnerConfig {
     pub retry_backoff_multiplier: f64,
     /// Maximum retries per step
     pub max_retries_per_step: usize,
-    /// ft-3p7re: maximum total wall-clock time a single workflow execution
-    /// may run from `run_workflow` entry to natural completion. Exceeding
+    /// Maximum total time from original execution creation to completion,
+    /// including retry waits and time spent stopped between restarts. Exceeding
     /// this deadline triggers the same cleanup path as a cx-cancellation:
     /// `fail_execution`, `mark_trigger_event_handled("error")`, lock
     /// release, and a terminal-action audit row, then returns
     /// `WorkflowExecutionResult::Error`. Default 600_000 ms (10 min) — a
     /// pathologically retrying workflow can no longer pin a pane forever.
-    /// Set to `0` to disable the overall deadline (legacy behavior).
+    /// The original deadline and retry policy are persisted at creation and
+    /// cannot be increased by a restarted runner's configuration. Set to `0`
+    /// to disable the overall deadline for newly created executions.
     pub workflow_total_deadline_ms: u64,
 }
 
@@ -1109,7 +1162,23 @@ impl WorkflowRunner {
             )
             .await
         {
-            Ok(_execution) => {
+            Ok(execution) => {
+                if let Err(error) = self
+                    .initialize_execution_budget_with_cx(cx, &execution_id, execution.started_at)
+                    .await
+                {
+                    let error = self
+                        .persist_budget_failure_with_fresh_cx(
+                            &workflow_name,
+                            &execution_id,
+                            pane_id,
+                            0,
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                    return WorkflowStartResult::Error { error };
+                }
                 // ft-rlbvg: handoff to downstream `run_workflow_inner`,
                 // which takes its own `held_lock_release_guard` at
                 // entry. We must keep the lock entry alive for that
@@ -1201,7 +1270,23 @@ impl WorkflowRunner {
             )
             .await
         {
-            Ok(_execution) => {
+            Ok(execution) => {
+                if let Err(error) = self
+                    .initialize_execution_budget_with_cx(cx, execution_id, execution.started_at)
+                    .await
+                {
+                    let error = self
+                        .persist_budget_failure_with_fresh_cx(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            0,
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                    return ManualWorkflowRunOutcome::StartError { error };
+                }
                 // Handoff to `run_workflow_inner`, which takes its own RAII
                 // release guard at entry — defuse (consume without
                 // releasing) exactly like the detection path.
@@ -1273,7 +1358,7 @@ impl WorkflowRunner {
         let workflow_name = workflow.name().to_string();
         let step_count = workflow.step_count();
         let mut current_step = start_step;
-        let mut retries = 0;
+        let mut budget_observed_at = start_time;
         let mut jump_count: usize = 0;
         // Prevent infinite loops from backward JumpTo cycles.
         // A workflow with N steps should never need more than N*10 jumps.
@@ -1308,7 +1393,104 @@ impl WorkflowRunner {
                 "terminal workflow execution cannot start or resume",
             );
         }
-        let start_action_id_result = if start_step == 0 {
+
+        // A missing legacy budget cannot establish how many attempts or how
+        // much time were already consumed. Never reconstruct that authority
+        // from advisory logs, the current config, or a new invocation clock.
+        let loaded_budget = self
+            .storage
+            .get_workflow_budget_with_cx(cx, execution_id)
+            .await;
+        let mut budget = match loaded_budget {
+            Ok(Some(budget)) => budget,
+            Ok(None) => {
+                return self
+                    .settle_budget_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        None,
+                        "workflow_budget_missing",
+                    )
+                    .await;
+            }
+            Err(error) => {
+                if !is_invalid_workflow_budget(&error) {
+                    return workflow_execution_error(
+                        execution_id,
+                        "workflow_budget_load_unavailable",
+                    );
+                }
+                return self
+                    .settle_budget_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        None,
+                        "workflow_budget_invalid_resume_state",
+                    )
+                    .await;
+            }
+        };
+        let budget_rejection = budget.validate().err().or_else(|| {
+            if budget.started_at_ms != execution_record.started_at {
+                Some("workflow_budget_start_mismatch")
+            } else {
+                None
+            }
+        });
+        if let Some(reason) = budget_rejection {
+            return self
+                .settle_budget_failure(
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    current_step,
+                    None,
+                    reason,
+                )
+                .await;
+        }
+        if budget.current_step != start_step {
+            // A different runner may have progressed since resume inspected
+            // the cursor. Refuse stale admission without settling its owner.
+            return workflow_execution_error(execution_id, "workflow_budget_step_mismatch");
+        }
+        if budget.phase == WorkflowAttemptPhase::InFlight {
+            // Admission precedes effects. Without a durable ownership lease,
+            // a crash and another live process are indistinguishable: refuse
+            // replay and leave its execution/trigger untouched for recovery.
+            return workflow_execution_error(
+                execution_id,
+                "workflow_budget_indeterminate_attempt",
+            );
+        }
+        let is_first_admission = budget.revision == 0 && start_step == 0;
+        let observed_budget = budget.clone();
+        if let Err(error) = self
+            .persist_execution_budget_with_cx(
+                cx,
+                execution_id,
+                &mut budget,
+                observed_budget,
+                &mut budget_observed_at,
+            )
+            .await
+        {
+            return self
+                .settle_budget_write_failure(
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    current_step,
+                    None,
+                    &error,
+                )
+                .await;
+        }
+        let start_action_id_result = if is_first_admission {
             record_workflow_start_action_with_cx(
                 cx,
                 &self.storage,
@@ -1393,6 +1575,9 @@ impl WorkflowRunner {
             .await;
         let mut ctx =
             WorkflowContext::new(self.storage.clone(), pane_id, capabilities, execution_id)
+                .with_config(WorkflowConfig {
+                    default_wait_timeout_ms: self.config.step_timeout_ms,
+                })
                 .with_injector(self.injector.clone());
 
         // Attach the already-validated execution's optional trigger context.
@@ -1527,68 +1712,6 @@ impl WorkflowRunner {
         }
 
         while current_step < step_count {
-            // ft-3p7re: per-step overall-deadline seam. If the workflow
-            // has been running longer than `workflow_total_deadline_ms`,
-            // treat it as a runaway and run the same cleanup sequence as
-            // a cx-cancel (fail_execution + mark_trigger_event_handled +
-            // lock release + terminal-action audit) so the pane lock and
-            // trigger state don't leak. `workflow_total_deadline_ms == 0`
-            // disables the deadline (legacy behavior).
-            let deadline_ms = self.config.workflow_total_deadline_ms;
-            if deadline_ms > 0 {
-                let elapsed_ms =
-                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let invalid_deadline_ms = deadline_ms > MAX_WORKFLOW_TOTAL_DEADLINE_MS;
-                if invalid_deadline_ms || elapsed_ms >= deadline_ms {
-                    let reason = if invalid_deadline_ms {
-                        format!(
-                            "run_workflow invalid overall deadline at step {current_step}: \
-                             workflow_total_deadline_ms {deadline_ms}ms exceeds max \
-                             {MAX_WORKFLOW_TOTAL_DEADLINE_MS}ms"
-                        )
-                    } else {
-                        format!(
-                            "run_workflow exceeded overall deadline at step {current_step}: \
-                             elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
-                        )
-                    };
-                    let mut reported_error = reason.clone();
-                    if let Err(error) = self.fail_execution_with_cx(cx, execution_id, &reason).await
-                    {
-                        reported_error
-                            .push_str(&format!("; failure-state persistence also failed: {error}"));
-                    }
-                    if let Err(error) = self
-                        .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
-                        .await
-                    {
-                        reported_error
-                            .push_str(&format!("; trigger-state persistence also failed: {error}"));
-                    }
-                    if let Err(error) = record_workflow_terminal_action_with_cx(
-                        cx,
-                        &self.storage,
-                        &workflow_name,
-                        execution_id,
-                        pane_id,
-                        "workflow_error",
-                        "error",
-                        Some(&reason),
-                        Some(current_step),
-                        None,
-                        start_action_id,
-                    )
-                    .await
-                    {
-                        reported_error.push_str(&format!("; terminal audit also failed: {error}"));
-                    }
-                    return WorkflowExecutionResult::Error {
-                        execution_id: Some(execution_id.to_string()),
-                        error: reported_error,
-                    };
-                }
-            }
-
             // Tick 181: per-step cancellation seam. On cx-cancel
             // we do the same cleanup sequence as a plan-validation
             // error (fail_execution + mark_trigger_event_handled +
@@ -1619,6 +1742,70 @@ impl WorkflowRunner {
                     execution_id: Some(execution_id.to_string()),
                     error: reported_error,
                 };
+            }
+
+            if budget.phase == WorkflowAttemptPhase::RetryWaiting {
+                let retry_wait_ms = budget
+                    .retry_not_before_ms
+                    .map(|at| u64::try_from(at.saturating_sub(now_ms()).max(0)).unwrap_or(0))
+                    .unwrap_or(0);
+                let wait = cap_wait_by_workflow_deadline(
+                    Duration::from_millis(retry_wait_ms),
+                    &budget,
+                    budget_observed_at,
+                );
+                if let Err(error) = wait_duration_with_cx(cx, wait, "workflow retry backoff").await {
+                    let reason = error.to_string();
+                    if let Err(cleanup_error) = self
+                        .persist_cancelled_execution_with_fresh_cx(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            &reason,
+                            current_step,
+                            start_action_id,
+                        )
+                        .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("{reason}; independent cancellation cleanup failed: {cleanup_error}"),
+                        );
+                    }
+                    return WorkflowExecutionResult::Aborted {
+                        execution_id: execution_id.to_string(),
+                        reason,
+                        step_index: current_step,
+                        elapsed_ms: elapsed_ms(start_time),
+                    };
+                }
+            }
+
+            // Charge and commit admission before calling workflow code. A
+            // crash anywhere after this write and before a durable result is
+            // an indeterminate attempt, never a fresh allowance on restart.
+            let mut admitted_budget = budget.clone();
+            admitted_budget.phase = WorkflowAttemptPhase::InFlight;
+            if let Err(error) = self
+                .persist_execution_budget_with_cx(
+                    cx,
+                    execution_id,
+                    &mut budget,
+                    admitted_budget,
+                    &mut budget_observed_at,
+                )
+                .await
+            {
+                return self
+                    .settle_budget_write_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        start_action_id,
+                        &error,
+                    )
+                    .await;
             }
 
             let step_plan = ctx.get_step_plan(current_step).cloned();
@@ -1694,6 +1881,46 @@ impl WorkflowRunner {
                 );
                 workflow.execute_step_cx(cx, &mut ctx, current_step).await
             };
+
+            // Publish retry admission before its advisory log and before any
+            // sleep. A restart can recover this exact ordinal and due time
+            // even if the process died before logging the returned result.
+            let result_budget = match budget_after_step_result(&budget, &step_result, now_ms()) {
+                Ok(next) => next,
+                Err(error) => {
+                    return self
+                        .settle_budget_failure(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            current_step,
+                            start_action_id,
+                            &error.to_string(),
+                        )
+                        .await;
+                }
+            };
+            if let Err(error) = self
+                .persist_execution_budget_with_cx(
+                    cx,
+                    execution_id,
+                    &mut budget,
+                    result_budget,
+                    &mut budget_observed_at,
+                )
+                .await
+            {
+                return self
+                    .settle_budget_write_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        start_action_id,
+                        &error,
+                    )
+                    .await;
+            }
 
             // Log step result
             let result_type = match &step_result {
@@ -1816,6 +2043,16 @@ impl WorkflowRunner {
                 let mut data = serde_json::json!({
                     "step_result": &log_step_result,
                 });
+                if matches!(&step_result, StepResult::Retry { .. }) {
+                    data["retry_budget"] = serde_json::json!({
+                        "admitted": budget.phase == WorkflowAttemptPhase::RetryWaiting,
+                        "retry_ordinal": budget.retries,
+                        "max_retries": budget.max_retries_per_step,
+                        "base_delay_ms": budget.retry_base_delay_ms,
+                        "effective_delay_ms": budget.retry_effective_delay_ms,
+                        "not_before_ms": budget.retry_not_before_ms,
+                    });
+                }
 
                 // Include idempotency key from plan if executing in plan-first mode
                 if let Some(idempotency_key) = ctx.get_step_idempotency_key(current_step) {
@@ -1917,11 +2154,16 @@ impl WorkflowRunner {
             match step_result {
                 StepResult::Continue => {
                     current_step += 1;
-                    retries = 0;
 
                     // Update execution state
                     if let Err(e) = self
-                        .update_execution_step_with_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1933,20 +2175,16 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                if let Err(error) = record_workflow_terminal_action_with_cx(
-                                    cx,
-                                    &self.storage,
-                                    &workflow_name,
-                                    execution_id,
-                                    pane_id,
-                                    "workflow_aborted",
-                                    "aborted",
-                                    Some(&reason),
-                                    Some(current_step),
-                                    None,
-                                    start_action_id,
-                                )
-                                .await
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
                                 {
                                     return workflow_execution_error(
                                         execution_id,
@@ -2068,11 +2306,16 @@ impl WorkflowRunner {
                         };
                     }
                     current_step = step;
-                    retries = 0;
 
                     // Update execution state
                     if let Err(e) = self
-                        .update_execution_step_with_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -2084,20 +2327,16 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                if let Err(error) = record_workflow_terminal_action_with_cx(
-                                    cx,
-                                    &self.storage,
-                                    &workflow_name,
-                                    execution_id,
-                                    pane_id,
-                                    "workflow_aborted",
-                                    "aborted",
-                                    Some(&reason),
-                                    Some(current_step),
-                                    None,
-                                    start_action_id,
-                                )
-                                .await
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
                                 {
                                     return workflow_execution_error(
                                         execution_id,
@@ -2169,14 +2408,12 @@ impl WorkflowRunner {
                         steps_executed: current_step + 1,
                     };
                 }
-                StepResult::Retry { delay_ms } => {
-                    let Some(next_retry_ordinal) =
-                        admit_retry_ordinal(retries, self.config.max_retries_per_step)
-                    else {
+                StepResult::Retry { .. } => {
+                    if budget.phase != WorkflowAttemptPhase::RetryWaiting {
                         let elapsed_ms = elapsed_ms(start_time);
                         let reason = format!(
                             "Max retries ({}) exceeded at step {}",
-                            self.config.max_retries_per_step, current_step
+                            budget.max_retries_per_step, current_step
                         );
 
                         // Cleanup and release lock
@@ -2219,81 +2456,18 @@ impl WorkflowRunner {
                             step_index: current_step,
                             elapsed_ms,
                         };
-                    };
-                    retries = next_retry_ordinal;
-
-                    let retry_delay = retry_backoff_delay(
-                        delay_ms,
-                        retries,
-                        self.config.retry_backoff_multiplier,
-                    );
-                    let effective_delay_ms =
-                        u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX);
+                    }
                     debug!(
                         execution_id,
                         step_index = current_step,
-                        retry_attempt = retries,
-                        base_delay_ms = delay_ms,
-                        effective_delay_ms,
-                        retry_backoff_multiplier = self.config.retry_backoff_multiplier,
+                        retry_attempt = budget.retries,
+                        base_delay_ms = budget.retry_base_delay_ms,
+                        effective_delay_ms = budget.retry_effective_delay_ms,
+                        retry_backoff_multiplier = budget.retry_backoff_multiplier,
                         "Workflow step scheduled for exponential-backoff retry"
                     );
-                    // Cancellation during backoff must abort promptly instead
-                    // of sleeping until the retry delay elapses.
-                    if let Err(e) = wait_duration_with_cx(
-                        cx,
-                        cap_wait_by_workflow_deadline(
-                            retry_delay,
-                            start_time,
-                            self.config.workflow_total_deadline_ms,
-                        ),
-                        "workflow retry backoff",
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Workflow retry backoff aborted"
-                        );
-                        match e {
-                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                                reason,
-                            )) => {
-                                if let Err(cleanup_error) = self
-                                    .persist_cancelled_execution_with_fresh_cx(
-                                        &workflow_name,
-                                        execution_id,
-                                        pane_id,
-                                        &reason,
-                                        current_step,
-                                        start_action_id,
-                                    )
-                                    .await
-                                {
-                                    return workflow_execution_error(
-                                        execution_id,
-                                        format!(
-                                            "{reason}; independent cancellation cleanup failed: \
-                                             {cleanup_error}"
-                                        ),
-                                    );
-                                }
-                                return WorkflowExecutionResult::Aborted {
-                                    execution_id: execution_id.to_string(),
-                                    reason,
-                                    step_index: current_step,
-                                    elapsed_ms: elapsed_ms(start_time),
-                                };
-                            }
-                            other => {
-                                return WorkflowExecutionResult::Error {
-                                    execution_id: Some(execution_id.to_string()),
-                                    error: other.to_string(),
-                                };
-                            }
-                        }
-                    }
+                    // The next loop iteration (including a restart) consumes
+                    // the persisted due time before admitting this retry.
                 }
                 StepResult::Abort { reason } => {
                     let elapsed_ms = elapsed_ms(start_time);
@@ -2399,8 +2573,8 @@ impl WorkflowRunner {
                     );
                     let timeout = cap_wait_by_workflow_deadline(
                         timeout,
-                        start_time,
-                        self.config.workflow_total_deadline_ms,
+                        &budget,
+                        budget_observed_at,
                     );
 
                     if let Err(e) = wait_condition_pause_with_cx(
@@ -2456,11 +2630,16 @@ impl WorkflowRunner {
 
                     // Continue to next step after wait
                     current_step += 1;
-                    retries = 0;
 
                     // Update execution back to running
                     if let Err(e) = self
-                        .update_execution_step_with_cx(cx, execution_id, current_step)
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -2472,20 +2651,16 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                if let Err(error) = record_workflow_terminal_action_with_cx(
-                                    cx,
-                                    &self.storage,
-                                    &workflow_name,
-                                    execution_id,
-                                    pane_id,
-                                    "workflow_aborted",
-                                    "aborted",
-                                    Some(&reason),
-                                    Some(current_step),
-                                    None,
-                                    start_action_id,
-                                )
-                                .await
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
                                 {
                                     return workflow_execution_error(
                                         execution_id,
@@ -2617,8 +2792,8 @@ impl WorkflowRunner {
                                 );
                                 let timeout = cap_wait_by_workflow_deadline(
                                     timeout,
-                                    start_time,
-                                    self.config.workflow_total_deadline_ms,
+                                    &budget,
+                                    budget_observed_at,
                                 );
 
                                 if let Err(e) = wait_condition_pause_with_cx(
@@ -2675,10 +2850,15 @@ impl WorkflowRunner {
 
                             // Continue to next step
                             current_step += 1;
-                            retries = 0;
 
                             if let Err(e) = self
-                                .update_execution_step_with_cx(cx, execution_id, current_step)
+                                .update_execution_step_with_cx(
+                                    cx,
+                                    execution_id,
+                                    current_step,
+                                    &mut budget,
+                                    &mut budget_observed_at,
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -2690,20 +2870,16 @@ impl WorkflowRunner {
                                     crate::Error::Workflow(
                                         crate::error::WorkflowError::Aborted(reason),
                                     ) => {
-                                        if let Err(error) = record_workflow_terminal_action_with_cx(
-                                            cx,
-                                            &self.storage,
-                                            &workflow_name,
-                                            execution_id,
-                                            pane_id,
-                                            "workflow_aborted",
-                                            "aborted",
-                                            Some(&reason),
-                                            Some(current_step),
-                                            None,
-                                            start_action_id,
-                                        )
-                                        .await
+                                        if let Err(error) = self
+                                            .persist_cancelled_execution_with_fresh_cx(
+                                                &workflow_name,
+                                                execution_id,
+                                                pane_id,
+                                                &reason,
+                                                current_step,
+                                                start_action_id,
+                                            )
+                                            .await
                                         {
                                             return workflow_execution_error(
                                                 execution_id,
@@ -3546,13 +3722,54 @@ impl WorkflowRunner {
                         );
                         continue;
                     }
-                    Err(e) => {
+                    Err(error) => {
+                        // A temporary read failure or a cancelled request
+                        // proves nothing about the stored execution. Preserve
+                        // its state so the owner can retry the inspection.
+                        if !is_invalid_workflow_budget(&error) || cx.checkpoint().is_err() {
+                            results.push(workflow_execution_error(
+                                &record.id,
+                                "workflow_resume_unavailable",
+                            ));
+                            continue;
+                        }
+                        let release_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+                            record.pane_id,
+                            &record.workflow_name,
+                            &record.id,
+                            self.config.max_concurrent,
+                        ) {
+                            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(guard)) => guard,
+                            _ => {
+                                results.push(workflow_execution_error(
+                                    &record.id,
+                                    "workflow_budget_resume_busy",
+                                ));
+                                continue;
+                            }
+                        };
                         tracing::warn!(
                             execution_id = %record.id,
-                            error = %e,
+                            failure_class = "workflow_budget_invalid_resume_state",
                             explicit_cx = true,
                             "Failed to load workflow state for resume (cx)"
                         );
+                        // A corrupt durable authority record must become a
+                        // visible terminal failure, not an endless invisible
+                        // skip on every watcher restart. Do not echo stored
+                        // payload contents through resume diagnostics.
+                        results.push(
+                            self.settle_budget_failure(
+                                &record.workflow_name,
+                                &record.id,
+                                record.pane_id,
+                                record.current_step,
+                                None,
+                                "workflow_budget_invalid_resume_state",
+                            )
+                            .await,
+                        );
+                        drop(release_guard);
                         continue;
                     }
                 };
@@ -3618,6 +3835,157 @@ impl WorkflowRunner {
     }
 
     // --- Private helper methods ---
+
+    async fn initialize_execution_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        started_at_ms: i64,
+    ) -> crate::Result<()> {
+        let budget = WorkflowExecutionBudget::new(
+            started_at_ms,
+            now_ms(),
+            self.config.workflow_total_deadline_ms,
+            self.config.max_retries_per_step,
+            self.config.retry_backoff_multiplier,
+        )
+        .map_err(workflow_budget_error)?;
+        self.storage
+            .create_workflow_budget_with_cx(cx, execution_id, budget)
+            .await
+    }
+
+    /// Commit one authority transition and debit elapsed time from the last
+    /// successful write. Sampling the new monotonic anchor before awaiting
+    /// storage ensures queue/commit latency is charged by the next checkpoint.
+    async fn persist_execution_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        budget: &mut WorkflowExecutionBudget,
+        mut next: WorkflowExecutionBudget,
+        observed_at: &mut Instant,
+    ) -> crate::Result<()> {
+        let next_observed_at = Instant::now();
+        let observed_wall_ms = now_ms();
+        next.observe_time(observed_wall_ms, elapsed_ms(*observed_at))
+            .map_err(workflow_budget_error)?;
+        if budget.phase == WorkflowAttemptPhase::InFlight
+            && next.phase == WorkflowAttemptPhase::RetryWaiting
+        {
+            next.retry_not_before_ms = Some(
+                observed_wall_ms
+                    .checked_add(i64::try_from(next.retry_effective_delay_ms).map_err(|_| {
+                        workflow_budget_error("workflow_budget_retry_delay_overflow")
+                    })?)
+                    .ok_or_else(|| {
+                        workflow_budget_error("workflow_budget_retry_delay_overflow")
+                    })?,
+            );
+        }
+        next.revision = budget
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| workflow_budget_error("workflow_budget_revision_exhausted"))?;
+        if !self
+            .storage
+            .compare_exchange_workflow_budget_with_cx(
+                cx,
+                execution_id,
+                budget.revision,
+                next.clone(),
+            )
+            .await?
+        {
+            // Keep lost authority distinct from an aborted workflow. The
+            // winning writer may be running in another process, and neither
+            // its execution nor its terminal audit belongs to this loser.
+            return Err(crate::error::StorageError::Database(
+                "workflow_budget_revision_conflict".to_string(),
+            )
+            .into());
+        }
+        *budget = next;
+        *observed_at = next_observed_at;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_budget_write_failure(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        error: &crate::Error,
+    ) -> WorkflowExecutionResult {
+        if is_workflow_budget_revision_conflict(error) {
+            return workflow_execution_error(execution_id, "workflow_budget_revision_conflict");
+        }
+        self.settle_budget_failure(
+            workflow_name,
+            execution_id,
+            pane_id,
+            current_step,
+            start_action_id,
+            &error.to_string(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_budget_failure(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        reason: &str,
+    ) -> WorkflowExecutionResult {
+        let reported = self
+            .persist_budget_failure_with_fresh_cx(
+                workflow_name,
+                execution_id,
+                pane_id,
+                current_step,
+                start_action_id,
+                reason,
+            )
+            .await;
+        workflow_execution_error(execution_id, reported)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_budget_failure_with_fresh_cx(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        reason: &str,
+    ) -> String {
+        let mut reported = reason.to_string();
+        if let Err(error) = self
+            .persist_terminal_failure_with_fresh_cx(
+                workflow_name,
+                execution_id,
+                pane_id,
+                reason,
+                current_step,
+                start_action_id,
+                "error",
+                "workflow_error",
+                "error",
+            )
+            .await
+        {
+            reported.push_str(&format!("; independent cleanup also failed: {error}"));
+        }
+        reported
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn persist_terminal_failure_with_fresh_cx(
@@ -3724,49 +4092,44 @@ impl WorkflowRunner {
         }
     }
 
-    /// Updates per-step progress using one explicit capability context.
-    /// Routes both the read (get_workflow_with_cx) and
-    /// the write (upsert_workflow_with_cx) through storage cx-first
-    /// siblings. The "externally modified" check stays inline —
-    /// it's a pure status-enum match on the already-fetched record
-    /// so no cx threading is needed.
-    ///
-    /// This is the per-step progress-tracking write, called 4x
-    /// inside `run_workflow_inner`'s step loop on the normal
-    /// (non-error) path. Threading cx here means a cancelled
-    /// parent cx releases the writer-queue reserve immediately
-    /// under backpressure instead of waiting for drain.
+    /// Advance the authoritative cursor and clear waiting state in the same
+    /// storage transaction. A separate read/upsert could overwrite another
+    /// runner's progress or an external terminal decision after the CAS.
     async fn update_execution_step_with_cx(
         &self,
         cx: &crate::cx::Cx,
         execution_id: &str,
         step: usize,
+        budget: &mut WorkflowExecutionBudget,
+        budget_observed_at: &mut Instant,
     ) -> crate::Result<()> {
-        let mut record = self
-            .storage
-            .get_workflow_with_cx(cx, execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
+        let mut next_budget = budget.clone();
+        next_budget.current_step = step;
+        next_budget.phase = WorkflowAttemptPhase::Ready;
+        next_budget.retries = 0;
+        next_budget.retry_not_before_ms = None;
+        next_budget.retry_base_delay_ms = 0;
+        next_budget.retry_effective_delay_ms = 0;
+        if let Err(error) = self
+            .persist_execution_budget_with_cx(
+                cx,
+                execution_id,
+                budget,
+                next_budget,
+                budget_observed_at,
+            )
+            .await
+        {
+            if is_workflow_budget_revision_conflict(&error) {
+                return Err(error);
+            }
+            // Every progress caller settles this abort with a fresh context,
+            // including the terminal audit when the caller was cancelled.
             return Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "Workflow externally modified to status: {}",
-                    record.status
-                )),
+                crate::error::WorkflowError::Aborted(error.to_string()),
             ));
         }
-
-        record.current_step = step;
-        record.status = "running".to_string();
-        record.wait_condition = None;
-        record.updated_at = now_ms();
-
-        self.storage.upsert_workflow_with_cx(cx, record).await
+        Ok(())
     }
 
     /// Persists a waiting state under the workflow's explicit Cx.
@@ -5031,6 +5394,412 @@ mod tests {
         (storage, runner, lock_manager)
     }
 
+    struct DurableRetryProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for DurableRetryProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "durable_retry_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Observes durable admission before attempting a retryable effect"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("retry", "Retry until the original allowance is spent")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            let storage = Arc::clone(ctx.storage());
+            let execution_id = ctx.execution_id().to_string();
+            Box::pin(async move {
+                let cx = crate::cx::for_testing();
+                let admitted = storage
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(admitted.phase, WorkflowAttemptPhase::InFlight);
+                assert_eq!(
+                    admitted.retries,
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                    "the durable ordinal must precede every independently counted effect"
+                );
+                StepResult::retry(250)
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_retry_budget_survives_interrupted_wait_and_database_reopen() {
+        run_async_test(async {
+            use futures::future::{Either, select};
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retry_restart.db");
+            let path = path.to_str().unwrap();
+            let (storage, mut runner, locks) = unlimited_gate_runner(path).await;
+            runner.config.max_retries_per_step = 2;
+            runner.config.retry_backoff_multiplier = 3.0;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let workflow: Arc<dyn Workflow> = Arc::new(DurableRetryProbeWorkflow {
+                calls: Arc::clone(&calls),
+            });
+            runner.register_workflow(Arc::clone(&workflow));
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let start = runner
+                .handle_detection(77, &unlimited_gate_detection(), None)
+                .await;
+            let execution_id = start.execution_id().unwrap().to_string();
+            let cx = crate::cx::for_testing();
+            let running = Box::pin(runner.run_workflow_with_cx(
+                &cx,
+                77,
+                Arc::clone(&workflow),
+                &execution_id,
+                0,
+            ));
+            let observe_committed_retry = Box::pin(async {
+                loop {
+                    let budget = storage
+                        .get_workflow_budget_with_cx(&cx, &execution_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let logs = storage.get_step_logs(&execution_id).await.unwrap();
+                    if budget.phase == WorkflowAttemptPhase::RetryWaiting
+                        && budget.retries == 2
+                        && logs.iter().filter(|log| log.result_type == "retry").count() == 2
+                        && let Some(log) = logs.iter().rev().find(|log| log.result_type == "retry")
+                    {
+                        let data: serde_json::Value =
+                            serde_json::from_str(log.result_data.as_deref().unwrap()).unwrap();
+                        assert_eq!(data["retry_budget"]["retry_ordinal"], 2);
+                        assert_eq!(data["retry_budget"]["base_delay_ms"], 250);
+                        assert_eq!(data["retry_budget"]["effective_delay_ms"], 750);
+                        return budget;
+                    }
+                    crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            });
+            let persisted = match crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(5),
+                select(running, observe_committed_retry),
+            )
+            .await
+            .expect("the production runner must reach its committed retry wait")
+            {
+                Either::Right((budget, interrupted_run)) => {
+                    // This is the crash boundary: no cancellation cleanup or
+                    // terminal write runs when the admitted future disappears.
+                    drop(interrupted_run);
+                    budget
+                }
+                Either::Left((result, _)) => panic!("runner passed the cutpoint: {result:?}"),
+            };
+            assert_eq!(persisted.retries, 2);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(locks.is_locked(77).is_none());
+            drop(runner);
+            storage.shutdown().await.unwrap();
+            drop(storage);
+
+            let (reopened, mut resumed_runner, resumed_locks) = unlimited_gate_runner(path).await;
+            // A restarted runner must not replace any part of the policy
+            // captured by the original execution.
+            resumed_runner.config.max_retries_per_step = 20;
+            resumed_runner.config.retry_backoff_multiplier = 1.0;
+            resumed_runner.config.workflow_total_deadline_ms = 0;
+            resumed_runner.register_workflow(workflow);
+            let resumed = resumed_runner.resume_incomplete_with_cx(&cx).await;
+            assert_eq!(resumed.len(), 1);
+            assert!(matches!(
+                &resumed[0],
+                WorkflowExecutionResult::Aborted { reason, .. }
+                    if reason.contains("Max retries (2)")
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert!(resumed_locks.is_locked(77).is_none());
+            let retained = reopened
+                .get_workflow_budget_with_cx(&cx, &execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.deadline_at_ms, persisted.deadline_at_ms);
+            assert_eq!(retained.max_retries_per_step, 2);
+            assert_eq!(retained.retry_backoff_multiplier.to_bits(), 3.0_f64.to_bits());
+            assert!(retained.remaining_ms <= persisted.remaining_ms);
+            assert!(resumed_runner.resume_incomplete_with_cx(&cx).await.is_empty());
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    struct CompetingBudgetWriterWorkflow {
+        winning_budget: Arc<std::sync::Mutex<Option<WorkflowExecutionBudget>>>,
+    }
+
+    impl Workflow for CompetingBudgetWriterWorkflow {
+        fn name(&self) -> &'static str {
+            "competing_budget_writer"
+        }
+
+        fn description(&self) -> &'static str {
+            "Advances durable authority before the current runner can settle its result"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let storage = Arc::clone(ctx.storage());
+            let execution_id = ctx.execution_id().to_string();
+            let winning_budget = Arc::clone(&self.winning_budget);
+            Box::pin(async move {
+                let cx = crate::cx::for_testing();
+                let budget = storage
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(budget.phase, WorkflowAttemptPhase::InFlight);
+                let mut next = budget.clone();
+                next.observe_time(now_ms(), 0).unwrap();
+                next.revision += 1;
+                assert!(storage
+                    .compare_exchange_workflow_budget_with_cx(
+                        &cx,
+                        &execution_id,
+                        budget.revision,
+                        next.clone(),
+                    )
+                    .await
+                    .unwrap());
+                *winning_budget.lock().unwrap() = Some(next);
+                StepResult::done(serde_json::json!({ "ok": true }))
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_budget_revision_loser_does_not_settle_the_winner() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("budget_revision_conflict.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let winning_budget = Arc::new(std::sync::Mutex::new(None));
+            let workflow: Arc<dyn Workflow> = Arc::new(CompetingBudgetWriterWorkflow {
+                winning_budget: Arc::clone(&winning_budget),
+            });
+            let cx = crate::cx::for_testing();
+            let execution_id = "budget_revision_conflict";
+            let result = runner
+                .run_workflow_manual_with_cx(&cx, 77, workflow, execution_id, None)
+                .await;
+            assert!(matches!(
+                result,
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error { error, .. })
+                    if error == "workflow_budget_revision_conflict"
+            ));
+            assert!(locks.is_locked(77).is_none());
+            let record = storage.get_workflow(execution_id).await.unwrap().unwrap();
+            assert_eq!(record.status, "running");
+            assert!(record.completed_at.is_none());
+            assert!(record.error.is_none());
+            assert_eq!(
+                storage
+                    .get_workflow_budget_with_cx(&cx, execution_id)
+                    .await
+                    .unwrap(),
+                winning_budget.lock().unwrap().clone(),
+            );
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery::default())
+                .await
+                .unwrap();
+            assert!(!audit.iter().any(|action| matches!(
+                action.action_kind.as_str(),
+                "workflow_completed" | "workflow_aborted" | "workflow_error"
+            )));
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_invalid_initial_budget_settles_state_and_terminal_audit() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("invalid_initial_budget.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.workflow_total_deadline_ms = u64::MAX;
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let workflow: Arc<dyn Workflow> = Arc::new(CompletionPersistenceProbeWorkflow {
+                calls: Arc::clone(&calls),
+            });
+            let cx = crate::cx::for_testing();
+            let execution_id = "invalid_initial_budget";
+            assert!(matches!(
+                runner
+                    .run_workflow_manual_with_cx(&cx, 77, workflow, execution_id, None)
+                    .await,
+                ManualWorkflowRunOutcome::StartError { error }
+                    if error.contains("workflow_budget_invalid_deadline")
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(locks.is_locked(77).is_none());
+            let record = storage.get_workflow(execution_id).await.unwrap().unwrap();
+            assert_eq!(record.status, "failed");
+            assert!(record.completed_at.is_some());
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    action_kind: Some("workflow_error".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audit.len(), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_resume_rejects_missing_expired_rollback_and_indeterminate_budgets() {
+        run_async_test(async {
+            for (case, expected_reason) in [
+                ("missing", "workflow_budget_missing"),
+                ("in_flight", "workflow_budget_indeterminate_attempt"),
+                ("expired", "workflow_budget_expired"),
+                ("rollback", "workflow_budget_clock_rollback"),
+                ("malformed", "workflow_budget_invalid_resume_state"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{case}.db"));
+                let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let workflow: Arc<dyn Workflow> = Arc::new(CompletionPersistenceProbeWorkflow {
+                    calls: Arc::clone(&calls),
+                });
+                runner.register_workflow(Arc::clone(&workflow));
+                seed_test_pane(&storage, 77, now_ms()).await;
+                let cx = crate::cx::for_testing();
+                let execution_id = if case == "missing" {
+                    runner
+                        .engine
+                        .start(&storage, workflow.name(), 77, None, None)
+                        .await
+                        .unwrap()
+                        .id
+                } else {
+                    let start = runner
+                        .handle_detection(77, &unlimited_gate_detection(), None)
+                        .await;
+                    let id = start.execution_id().unwrap().to_string();
+                    locks.release(77, &id);
+                    let budget = storage
+                        .get_workflow_budget_with_cx(&cx, &id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut next = budget.clone();
+                    next.revision += 1;
+                    match case {
+                        "in_flight" => next.phase = WorkflowAttemptPhase::InFlight,
+                        "expired" => next.remaining_ms = Some(0),
+                        "rollback" => {
+                            next.observe_time(next.last_observed_at_ms + 10_000, 10_000)
+                                .unwrap();
+                        }
+                        "malformed" => {}
+                        _ => unreachable!(),
+                    }
+                    if case == "malformed" {
+                        let connection = rusqlite::Connection::open(&path).unwrap();
+                        connection.execute(
+                            "UPDATE workflow_execution_budgets SET budget_json = ?1 WHERE workflow_id = ?2",
+                            ["private-synthetic-payload-must-not-escape", id.as_str()],
+                        ).unwrap();
+                    } else {
+                        assert!(storage
+                            .compare_exchange_workflow_budget_with_cx(&cx, &id, budget.revision, next)
+                            .await
+                            .unwrap());
+                    }
+                    id
+                };
+                let original_record = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+                let original_budget = if case == "in_flight" {
+                    storage
+                        .get_workflow_budget_with_cx(&cx, &execution_id)
+                        .await
+                        .unwrap()
+                } else {
+                    None
+                };
+                let results = runner.resume_incomplete_with_cx(&cx).await;
+                assert_eq!(results.len(), 1, "{case} must report its failed admission");
+                assert!(matches!(
+                    &results[0],
+                    WorkflowExecutionResult::Error { error, .. }
+                        if error.contains(expected_reason)
+                            && !error.contains("private-synthetic-payload")
+                ), "{case}: {:?}", results[0]);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "{case}");
+                assert!(locks.is_locked(77).is_none(), "{case}");
+                let record = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+                if case == "in_flight" {
+                    // Another process may still own the admitted attempt.
+                    // Without its ownership lease, recovery must neither
+                    // replay effects nor write a terminal failure for it.
+                    assert_eq!(record.status, original_record.status);
+                    assert_eq!(record.updated_at, original_record.updated_at);
+                    assert_eq!(record.completed_at, original_record.completed_at);
+                    assert_eq!(record.error, original_record.error);
+                    assert_eq!(
+                        storage
+                            .get_workflow_budget_with_cx(&cx, &execution_id)
+                            .await
+                            .unwrap(),
+                        original_budget,
+                    );
+                    assert!(storage
+                        .get_audit_actions(crate::storage::AuditQuery::default())
+                        .await
+                        .unwrap()
+                        .is_empty());
+                } else {
+                    assert_eq!(record.status, "failed", "{case}");
+                    assert!(record.completed_at.is_some(), "{case}");
+                    assert!(runner.resume_incomplete_with_cx(&cx).await.is_empty(), "{case}");
+                }
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
     #[test]
     fn workflow_runner_shutdown_notify_wakes_idle_loop_and_settles() {
         run_async_test(async {
@@ -5965,12 +6734,14 @@ mod tests {
         #[test]
         fn workflow_deadline_cap_leaves_waits_uncapped_when_disabled() {
             let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 0, 3, 2.0).unwrap();
             let started_at = Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .expect("test instant subtracts");
 
             assert_eq!(
-                cap_wait_by_workflow_deadline(requested, started_at, 0),
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
                 requested
             );
         }
@@ -5978,11 +6749,13 @@ mod tests {
         #[test]
         fn workflow_deadline_cap_limits_wait_to_remaining_budget() {
             let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
             let started_at = Instant::now()
                 .checked_sub(Duration::from_millis(900))
                 .expect("test instant subtracts");
 
-            let capped = cap_wait_by_workflow_deadline(requested, started_at, 1_000);
+            let capped = cap_wait_by_workflow_deadline(requested, &budget, started_at);
 
             assert!(
                 capped <= Duration::from_millis(100),
@@ -5993,12 +6766,14 @@ mod tests {
         #[test]
         fn workflow_deadline_cap_returns_zero_after_deadline() {
             let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
             let started_at = Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .expect("test instant subtracts");
 
             assert_eq!(
-                cap_wait_by_workflow_deadline(requested, started_at, 1_000),
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
                 Duration::ZERO
             );
         }
@@ -6007,9 +6782,12 @@ mod tests {
         fn workflow_deadline_cap_fails_closed_when_deadline_overflows() {
             let requested = Duration::from_secs(60);
             let started_at = Instant::now();
+            let wall_now = now_ms();
+            let mut budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
+            budget.workflow_total_deadline_ms = u64::MAX;
 
             assert_eq!(
-                cap_wait_by_workflow_deadline(requested, started_at, u64::MAX),
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
                 Duration::ZERO,
                 "overflowing workflow_total_deadline_ms must not disable the wait cap"
             );

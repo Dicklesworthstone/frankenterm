@@ -538,7 +538,7 @@ pub use self::types::{
 pub use self::types::{
     AgentMetricBreakdown, DailyMetricSummary, LimitWindowRecord, MaintenanceRecord, MetricQuery,
     MetricType, PreparedPlanRecord, SecretScanReportRecord, UsageMetricRecord,
-    WorkflowActionPlanRecord, WorkflowRecord,
+    WorkflowActionPlanRecord, WorkflowAttemptPhase, WorkflowExecutionBudget, WorkflowRecord,
 };
 
 // br-ft-8bvg0 slice 6: notification + saved search + bookmark +
@@ -1045,6 +1045,24 @@ enum WriteCommand {
         workflow: WorkflowRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Create an execution without resetting an existing identity.
+    CreateWorkflow {
+        workflow: WorkflowRecord,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Create original execution authority; never overwrite an existing budget.
+    CreateWorkflowBudget {
+        workflow_id: String,
+        budget: WorkflowExecutionBudget,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Atomically advance budget admission and its authoritative step cursor.
+    CompareExchangeWorkflowBudget {
+        workflow_id: String,
+        expected_revision: u64,
+        next: WorkflowExecutionBudget,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     AbortWorkflow {
         expected: Box<WorkflowRecord>,
         action: AuditActionRecord,
@@ -1467,6 +1485,9 @@ impl std::fmt::Debug for WriteCommand {
             Self::DeleteEventMute { .. } => "DeleteEventMute",
             Self::UpsertPane { .. } => "UpsertPane",
             Self::UpsertWorkflow { .. } => "UpsertWorkflow",
+            Self::CreateWorkflow { .. } => "CreateWorkflow",
+            Self::CreateWorkflowBudget { .. } => "CreateWorkflowBudget",
+            Self::CompareExchangeWorkflowBudget { .. } => "CompareExchangeWorkflowBudget",
             Self::AbortWorkflow { .. } => "AbortWorkflow",
             Self::UpsertActionPlan { .. } => "UpsertActionPlan",
             Self::InsertPreparedPlan { .. } => "InsertPreparedPlan",
@@ -7717,6 +7738,76 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// Create an execution identity exactly once. Unlike progress upserts, a
+    /// duplicate start must not overwrite a running or terminal execution.
+    pub async fn create_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow: WorkflowRecord,
+    ) -> Result<()> {
+        Self::checkpoint_storage_operation(cx, "create_workflow")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::CreateWorkflow { workflow, respond: tx })
+            .await
+            .map_err(|error| Self::writer_send_error("create_workflow", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Create a fresh workflow's budget before admitting any step. A crash
+    /// between execution creation and this write leaves missing authority and
+    /// therefore fails closed on resume; it never grants a new retry allowance.
+    pub async fn create_workflow_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+        budget: WorkflowExecutionBudget,
+    ) -> Result<()> {
+        Self::checkpoint_storage_operation(cx, "create_workflow_budget")?;
+        budget.validate().map_err(workflow_budget_storage_error)?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::CreateWorkflowBudget {
+                    workflow_id: workflow_id.to_string(),
+                    budget,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("create_workflow_budget", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Compare-and-set admission. The writer commits the budget and execution
+    /// cursor in one transaction. After queue admission the caller retains the
+    /// authoritative response even if its Cx is subsequently cancelled.
+    pub async fn compare_exchange_workflow_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+        expected_revision: u64,
+        next: WorkflowExecutionBudget,
+    ) -> Result<bool> {
+        Self::checkpoint_storage_operation(cx, "compare_exchange_workflow_budget")?;
+        next.validate().map_err(workflow_budget_storage_error)?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::CompareExchangeWorkflowBudget {
+                    workflow_id: workflow_id.to_string(),
+                    expected_revision,
+                    next,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("compare_exchange_workflow_budget", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
     /// Atomically abort the observed active execution, settle its owned trigger,
     /// audit it and retire its start-action undo authority. False means the
     /// observed state changed. The writer runs `on_commit` before responding,
@@ -9626,6 +9717,24 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_workflow_backend(backend, &workflow_id)
+            })
+        })
+        .await
+    }
+
+    /// Load strict budget authority. Unlike advisory workflow JSON columns,
+    /// malformed payloads are errors and are never converted into absence.
+    pub async fn get_workflow_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowExecutionBudget>> {
+        Self::checkpoint_storage_operation(cx, "get_workflow_budget")?;
+        let db_path = Arc::clone(&self.db_path);
+        let workflow_id = workflow_id.to_string();
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_workflow_budget_backend(backend, &workflow_id)
             })
         })
         .await
@@ -13550,6 +13659,8 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         | WriteCommand::UpsertEventMute { respond, .. }
         | WriteCommand::UpsertPane { respond, .. }
         | WriteCommand::UpsertWorkflow { respond, .. }
+        | WriteCommand::CreateWorkflow { respond, .. }
+        | WriteCommand::CreateWorkflowBudget { respond, .. }
         | WriteCommand::UpsertActionPlan { respond, .. }
         | WriteCommand::InsertPreparedPlan { respond, .. }
         | WriteCommand::InsertStepLog { respond, .. }
@@ -13570,6 +13681,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         | WriteCommand::FinalizeEventDelivery { respond, .. }
         | WriteCommand::ReleaseEventDelivery { respond, .. }
         | WriteCommand::AbortWorkflow { respond, .. }
+        | WriteCommand::CompareExchangeWorkflowBudget { respond, .. }
         | WriteCommand::SetEventTriageState { respond, .. }
         | WriteCommand::AddEventLabel { respond, .. }
         | WriteCommand::RemoveEventLabel { respond, .. }
@@ -19055,6 +19167,35 @@ fn dispatch_write_command_raw(
             let result = upsert_workflow_backend(backend, &workflow);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::CreateWorkflow { workflow, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = create_workflow_backend(backend, &workflow);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::CreateWorkflowBudget {
+            workflow_id,
+            budget,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = create_workflow_budget_backend(backend, &workflow_id, &budget);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::CompareExchangeWorkflowBudget {
+            workflow_id,
+            expected_revision,
+            next,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = compare_exchange_workflow_budget_backend(
+                backend,
+                &workflow_id,
+                expected_revision,
+                &next,
+            );
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::AbortWorkflow {
             expected,
             action,
@@ -22537,6 +22678,168 @@ fn abort_workflow_backend(
              WHERE actor_id = ?1 AND action_kind = 'workflow_start')",
             &[ToSqlValue::Text(&expected.id)],
         ).map_err(|error| storage_backend_error("Retire aborted workflow undo", error))?;
+            Ok(true)
+        },
+    )
+}
+
+fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowRecord) -> Result<()> {
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "create workflow execution",
+        || {
+            let existing = backend
+                .query_row_typed(
+                    "SELECT id FROM workflow_executions WHERE id = ?1",
+                    &[ToSqlValue::Text(&workflow.id)],
+                )
+                .map_err(|error| storage_backend_error("Check new workflow identity", error))?;
+            if existing.is_some() {
+                return Err(StorageError::Database("workflow_execution_already_exists".into()).into());
+            }
+            upsert_workflow_backend(backend, workflow)
+        },
+    )
+}
+
+fn workflow_budget_storage_error(reason: &'static str) -> crate::Error {
+    StorageError::Database(reason.to_string()).into()
+}
+
+fn query_workflow_budget_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+) -> Result<Option<WorkflowExecutionBudget>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT b.budget_json, b.revision, e.started_at
+             FROM workflow_execution_budgets b
+             JOIN workflow_executions e ON e.id = b.workflow_id
+             WHERE b.workflow_id = ?1",
+            &[ToSqlValue::Text(workflow_id)],
+        )
+        .map_err(|error| storage_backend_error("Load workflow budget", error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let reader = CellRowReader::new(&row);
+    let payload = reader
+        .string(0)
+        .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_state"))?;
+    let revision = reader
+        .i64(1)
+        .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_state"))?;
+    let started_at = reader
+        .i64(2)
+        .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_state"))?;
+    let budget: WorkflowExecutionBudget = serde_json::from_str(&payload)
+        .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_payload"))?;
+    budget.validate().map_err(workflow_budget_storage_error)?;
+    if u64::try_from(revision).ok() != Some(budget.revision) || started_at != budget.started_at_ms {
+        return Err(workflow_budget_storage_error("workflow_budget_identity_mismatch"));
+    }
+    Ok(Some(budget))
+}
+
+fn create_workflow_budget_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+    budget: &WorkflowExecutionBudget,
+) -> Result<()> {
+    budget.validate().map_err(workflow_budget_storage_error)?;
+    if budget.revision != 0
+        || budget.current_step != 0
+        || budget.retries != 0
+        || budget.phase != WorkflowAttemptPhase::Ready
+    {
+        return Err(workflow_budget_storage_error("workflow_budget_invalid_initial_state"));
+    }
+    let payload = serde_json::to_string(budget)
+        .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_payload"))?;
+    let created = backend
+        .query_row_typed(
+            "INSERT INTO workflow_execution_budgets (workflow_id, revision, budget_json)
+             SELECT id, 0, ?1 FROM workflow_executions
+             WHERE id = ?2 AND started_at = ?3 AND current_step = 0 AND status = 'running'
+               AND NOT EXISTS (SELECT 1 FROM workflow_step_logs WHERE workflow_id = ?2)
+               AND NOT EXISTS (SELECT 1 FROM workflow_execution_budgets WHERE workflow_id = ?2)
+             RETURNING workflow_id",
+            &[
+                ToSqlValue::Text(&payload),
+                ToSqlValue::Text(workflow_id),
+                ToSqlValue::Integer(budget.started_at_ms),
+            ],
+        )
+        .map_err(|error| storage_backend_error("Create workflow budget", error))?;
+    if created.is_none() {
+        return Err(workflow_budget_storage_error("workflow_budget_initialization_refused"));
+    }
+    Ok(())
+}
+
+fn compare_exchange_workflow_budget_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+    expected_revision: u64,
+    next: &WorkflowExecutionBudget,
+) -> Result<bool> {
+    next.validate().map_err(workflow_budget_storage_error)?;
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "workflow budget admission",
+        || {
+            let previous = query_workflow_budget_backend(backend, workflow_id)?
+                .ok_or_else(|| workflow_budget_storage_error("workflow_budget_missing"))?;
+            if previous.revision != expected_revision {
+                return Ok(false);
+            }
+            previous
+                .validate_successor(next)
+                .map_err(workflow_budget_storage_error)?;
+            let payload = serde_json::to_string(next)
+                .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_payload"))?;
+            let changed = backend
+                .query_row_typed(
+                    "UPDATE workflow_execution_budgets SET revision = ?1, budget_json = ?2
+                     WHERE workflow_id = ?3 AND revision = ?4
+                       AND EXISTS (SELECT 1 FROM workflow_executions
+                                   WHERE id = ?3 AND started_at = ?5
+                                     AND status IN ('running', 'waiting'))
+                     RETURNING workflow_id",
+                    &[
+                        ToSqlValue::Integer(u64_to_i64(next.revision, "workflow budget revision")?),
+                        ToSqlValue::Text(&payload),
+                        ToSqlValue::Text(workflow_id),
+                        ToSqlValue::Integer(u64_to_i64(expected_revision, "workflow budget revision")?),
+                        ToSqlValue::Integer(next.started_at_ms),
+                    ],
+                )
+                .map_err(|error| storage_backend_error("Advance workflow budget", error))?;
+            if changed.is_none() {
+                return Ok(false);
+            }
+            // Keep operator-facing state in the same transaction. Resume still
+            // consults the budget, since legacy log/status writers are advisory.
+            let cursor = backend
+                .query_row_typed(
+                    "UPDATE workflow_executions SET current_step = ?1,
+                     updated_at = MAX(updated_at, ?2),
+                     status = CASE WHEN ?4 = 1 THEN 'running' ELSE status END,
+                     wait_condition = CASE WHEN ?4 = 1 THEN NULL ELSE wait_condition END
+                     WHERE id = ?3 AND status IN ('running', 'waiting') RETURNING id",
+                    &[
+                        ToSqlValue::Integer(usize_to_i64(next.current_step, "workflow budget step")?),
+                        ToSqlValue::Integer(next.last_observed_at_ms),
+                        ToSqlValue::Text(workflow_id),
+                        ToSqlValue::Integer(i64::from(next.phase == WorkflowAttemptPhase::Ready)),
+                    ],
+                )
+                .map_err(|error| storage_backend_error("Advance workflow budget cursor", error))?;
+            if cursor.is_none() {
+                return Err(workflow_budget_storage_error("workflow_budget_cursor_conflict"));
+            }
             Ok(true)
         },
     )
@@ -36453,6 +36756,102 @@ fn seed_workflow_execution_backend(
         ],
     )
     .unwrap();
+}
+
+#[test]
+fn workflow_budget_create_only_and_cas_preserve_authoritative_cursor() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    seed_workflow_execution_backend(&backend, "budget-cas", "test", 1, 0, "running", 1_000, 1_000);
+    let budget = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 2, 2.0).unwrap();
+    create_workflow_budget_backend(&backend, "budget-cas", &budget).unwrap();
+    assert!(create_workflow_budget_backend(&backend, "budget-cas", &budget).is_err());
+    assert_eq!(query_workflow_budget_backend(&backend, "budget-cas").unwrap(), Some(budget.clone()));
+
+    let mut admitted = budget.clone();
+    admitted.revision = 1;
+    admitted.phase = WorkflowAttemptPhase::InFlight;
+    assert!(compare_exchange_workflow_budget_backend(&backend, "budget-cas", 0, &admitted).unwrap());
+    assert!(!compare_exchange_workflow_budget_backend(&backend, "budget-cas", 0, &admitted).unwrap());
+    backend.execute("UPDATE workflow_executions SET status = 'waiting', wait_condition = '{}' WHERE id = 'budget-cas'").unwrap();
+    let mut progressed = admitted.clone();
+    progressed.revision = 2;
+    progressed.current_step = 3;
+    progressed.phase = WorkflowAttemptPhase::Ready;
+    progressed.observe_time(1_200, 200).unwrap();
+    assert!(compare_exchange_workflow_budget_backend(&backend, "budget-cas", 1, &progressed).unwrap());
+    let record = query_workflow_backend(&backend, "budget-cas").unwrap().unwrap();
+    assert_eq!(record.current_step, 3);
+    assert_eq!(record.updated_at, 1_200);
+    assert_eq!(record.status, "running");
+    assert!(record.wait_condition.is_none());
+    assert_eq!(query_workflow_budget_backend(&backend, "budget-cas").unwrap(), Some(progressed));
+}
+
+#[test]
+fn workflow_start_duplicate_identity_preserves_existing_progress_and_terminal_evidence() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    for status in ["running", "completed", "failed", "aborted"] {
+        seed_workflow_execution_backend(&backend, status, "original", 1, 4, status, 1_000, 2_000);
+        let original = query_workflow_backend(&backend, status).unwrap().unwrap();
+        let mut repeated = original.clone();
+        repeated.workflow_name = "replacement".to_string();
+        repeated.current_step = 0;
+        repeated.status = "running".to_string();
+        repeated.started_at = 3_000;
+        repeated.updated_at = 3_000;
+        assert!(create_workflow_backend(&backend, &repeated).is_err());
+        let retained = query_workflow_backend(&backend, status).unwrap().unwrap();
+        assert_eq!(retained.workflow_name, "original");
+        assert_eq!(retained.current_step, 4);
+        assert_eq!(retained.status, status);
+        assert_eq!(retained.started_at, 1_000);
+        assert_eq!(retained.updated_at, 2_000);
+    }
+}
+
+#[test]
+fn workflow_budget_cursor_failure_rolls_back_admission_and_terminal_owner_refuses_it() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    for id in ["budget-rollback", "budget-terminal"] {
+        seed_workflow_execution_backend(&backend, id, "test", 1, 0, "running", 1_000, 1_000);
+    }
+    let budget = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 2, 2.0).unwrap();
+    create_workflow_budget_backend(&backend, "budget-rollback", &budget).unwrap();
+    create_workflow_budget_backend(&backend, "budget-terminal", &budget).unwrap();
+    backend.execute_batch(
+        "CREATE TRIGGER reject_budget_cursor BEFORE UPDATE ON workflow_executions
+         WHEN NEW.id = 'budget-rollback'
+         BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END;
+         UPDATE workflow_executions SET status = 'aborted' WHERE id = 'budget-terminal';",
+    ).unwrap();
+    let mut admitted = budget.clone();
+    admitted.revision = 1;
+    admitted.phase = WorkflowAttemptPhase::InFlight;
+    assert!(compare_exchange_workflow_budget_backend(&backend, "budget-rollback", 0, &admitted).is_err());
+    assert_eq!(query_workflow_budget_backend(&backend, "budget-rollback").unwrap(), Some(budget.clone()));
+    assert_eq!(query_workflow_backend(&backend, "budget-rollback").unwrap().unwrap().current_step, 0);
+    assert!(!compare_exchange_workflow_budget_backend(&backend, "budget-terminal", 0, &admitted).unwrap());
+    assert_eq!(query_workflow_budget_backend(&backend, "budget-terminal").unwrap(), Some(budget));
+}
+
+#[test]
+fn workflow_budget_rejects_corruption_without_disclosing_payload() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    seed_workflow_execution_backend(&backend, "budget-corrupt", "test", 1, 0, "running", 1_000, 1_000);
+    let budget = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 2, 2.0).unwrap();
+    create_workflow_budget_backend(&backend, "budget-corrupt", &budget).unwrap();
+    backend.execute("UPDATE workflow_execution_budgets SET revision = 1 WHERE workflow_id = 'budget-corrupt'").unwrap();
+    let error = query_workflow_budget_backend(&backend, "budget-corrupt").unwrap_err();
+    assert!(error.to_string().contains("workflow_budget_identity_mismatch"));
+    backend.execute("UPDATE workflow_execution_budgets SET budget_json = 'private fixture content' WHERE workflow_id = 'budget-corrupt'").unwrap();
+    let error = query_workflow_budget_backend(&backend, "budget-corrupt").unwrap_err();
+    assert!(error.to_string().contains("workflow_budget_invalid_payload"));
+    assert!(!error.to_string().contains("private fixture content"));
+    assert!(query_workflow_budget_backend(&backend, "missing-budget").unwrap().is_none());
 }
 
 fn seed_prepared_plan_raw_backend(

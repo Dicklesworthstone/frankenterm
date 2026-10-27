@@ -34,22 +34,20 @@ impl PaneMetadata {
 }
 
 /// Configuration for a workflow execution.
+///
+/// Retry limits and backoff belong exclusively to [`WorkflowRunnerConfig`]
+/// and the execution's durable budget, never to a per-step context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     /// Default timeout for wait conditions (milliseconds)
     pub default_wait_timeout_ms: u64,
-    /// Maximum number of retries per step
-    pub max_step_retries: u32,
-    /// Delay between retry attempts (milliseconds)
-    pub retry_delay_ms: u64,
 }
 
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             default_wait_timeout_ms: 30_000, // 30 seconds
-            max_step_retries: 3,
-            retry_delay_ms: 1_000, // 1 second
         }
     }
 }
@@ -651,38 +649,37 @@ mod tests {
     fn workflow_config_default_values() {
         let config = WorkflowConfig::default();
         assert_eq!(config.default_wait_timeout_ms, 30_000);
-        assert_eq!(config.max_step_retries, 3);
-        assert_eq!(config.retry_delay_ms, 1_000);
     }
 
     #[test]
     fn workflow_config_serde_roundtrip() {
         let config = WorkflowConfig {
             default_wait_timeout_ms: 60_000,
-            max_step_retries: 5,
-            retry_delay_ms: 2_500,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: WorkflowConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.default_wait_timeout_ms, 60_000);
-        assert_eq!(restored.max_step_retries, 5);
-        assert_eq!(restored.retry_delay_ms, 2_500);
+    }
+
+    #[test]
+    fn workflow_context_config_rejects_competing_retry_policy() {
+        for field in ["max_step_retries", "retry_delay_ms"] {
+            let mut value = serde_json::json!({ "default_wait_timeout_ms": 30_000 });
+            value[field] = serde_json::json!(3);
+            assert!(serde_json::from_value::<WorkflowConfig>(value).is_err());
+        }
     }
 
     #[test]
     fn workflow_config_clone() {
         let config = WorkflowConfig {
             default_wait_timeout_ms: 10_000,
-            max_step_retries: 1,
-            retry_delay_ms: 500,
         };
         let cloned = config.clone();
         assert_eq!(
             cloned.default_wait_timeout_ms,
             config.default_wait_timeout_ms
         );
-        assert_eq!(cloned.max_step_retries, config.max_step_retries);
-        assert_eq!(cloned.retry_delay_ms, config.retry_delay_ms);
     }
 
     // ========================================================================
@@ -750,15 +747,11 @@ mod tests {
         let storage = make_storage();
         let custom_config = WorkflowConfig {
             default_wait_timeout_ms: 120_000,
-            max_step_retries: 10,
-            retry_delay_ms: 5_000,
         };
         let ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-005")
             .with_config(custom_config);
 
         assert_eq!(ctx.config().default_wait_timeout_ms, 120_000);
-        assert_eq!(ctx.config().max_step_retries, 10);
-        assert_eq!(ctx.config().retry_delay_ms, 5_000);
         assert_eq!(ctx.default_wait_timeout_ms(), 120_000);
     }
 

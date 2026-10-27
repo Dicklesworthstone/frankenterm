@@ -107,13 +107,9 @@ fn arb_pane_lock_info() -> impl Strategy<Value = PaneLockInfo> {
 }
 
 fn arb_workflow_config() -> impl Strategy<Value = WorkflowConfig> {
-    (1000u64..120_000, 1u32..10, 100u64..30_000).prop_map(
-        |(default_wait_timeout_ms, max_step_retries, retry_delay_ms)| WorkflowConfig {
-            default_wait_timeout_ms,
-            max_step_retries,
-            retry_delay_ms,
-        },
-    )
+    (1000u64..120_000).prop_map(|default_wait_timeout_ms| WorkflowConfig {
+        default_wait_timeout_ms,
+    })
 }
 
 // =============================================================================
@@ -154,8 +150,6 @@ proptest! {
         let json = serde_json::to_string(&val).unwrap();
         let back: WorkflowConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(val.default_wait_timeout_ms, back.default_wait_timeout_ms);
-        prop_assert_eq!(val.max_step_retries, back.max_step_retries);
-        prop_assert_eq!(val.retry_delay_ms, back.retry_delay_ms);
     }
 }
 
@@ -295,8 +289,6 @@ proptest! {
     fn workflow_config_default_has_safe_values(_dummy in 0u8..1) {
         let config = WorkflowConfig::default();
         prop_assert!(config.default_wait_timeout_ms > 0);
-        prop_assert!(config.max_step_retries > 0);
-        prop_assert!(config.retry_delay_ms > 0);
     }
 
     #[test]

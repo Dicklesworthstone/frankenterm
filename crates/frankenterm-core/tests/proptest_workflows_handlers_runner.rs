@@ -1246,7 +1246,7 @@ proptest! {
             let (execution_id, result) = start_and_run(&runner, workflow, DEADLINE_RULE).await;
 
             prop_assert!(
-                matches!(result, WorkflowExecutionResult::Error { ref error, .. } if error.contains("workflow_total_deadline_ms")),
+                matches!(result, WorkflowExecutionResult::Error { ref error, .. } if error.contains("workflow_budget_expired")),
                 "overall deadline overrun should fail execution; got {result:?}"
             );
             prop_assert!(
@@ -1263,7 +1263,7 @@ proptest! {
                 record
                     .error
                     .as_deref()
-                    .is_some_and(|error| error.contains("workflow_total_deadline_ms")),
+                    .is_some_and(|error| error.contains("workflow_budget_expired")),
                 "deadline reason should persist: {:?}",
                 record.error
             );

@@ -99,6 +99,41 @@ ft workflow status <execution_id>
 
 Tip: If you are unsure, run workflows with `--dry-run` first.
 
+### Workflow restart budgets
+
+Schema v48 stores each new execution's budget separately from its step logs.
+The original total deadline, per-step retry limit, and backoff multiplier remain
+fixed across restarts and configuration changes. Setting
+`workflow_total_deadline_ms = 0` disables the total deadline only for new
+executions started with that setting; it does not remove an existing execution's
+deadline. Finite deadlines must be between 1 ms and 24 hours.
+
+The runner charges monotonic elapsed time while running and keeps a fixed epoch
+deadline that also charges downtime. An observed wall-clock rollback is refused
+with `workflow_budget_clock_rollback`; exhausted time returns
+`workflow_budget_expired`. Retry counts, effective backoff delays, and the next
+permitted attempt time are committed before sleeping. Restarting preserves the
+retry ordinal and waits for any remaining delay.
+
+The v48 migration intentionally does not backfill budgets for older executions.
+An incomplete legacy execution without a budget is rejected with
+`workflow_budget_missing` before further effects. Step logs and current settings
+cannot establish its remaining allowance. Inspect the execution with
+`ft workflow status <execution_id>` and review prior effects before deciding
+whether to start a new execution. Editing stored budget state is not a recovery
+mechanism.
+
+Two errors preserve another runner's possible ownership:
+
+| Reason | Meaning and behavior |
+| --- | --- |
+| `workflow_budget_indeterminate_attempt` | A persisted `InFlight` attempt may have performed effects or may still be running in a peer. Resume returns an error without blindly replaying it or terminating that execution or its trigger. |
+| `workflow_budget_revision_conflict` | Another writer advanced the budget first. The losing invocation returns an error without failing the winner or changing its terminal audit. |
+
+For these errors, inspect execution status and any active owner before taking
+another action. A restart alone does not establish that repeating the attempt is
+safe.
+
 ---
 
 ## Flow 2: why → prepare → approve → commit

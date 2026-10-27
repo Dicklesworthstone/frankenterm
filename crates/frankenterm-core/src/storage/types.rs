@@ -854,6 +854,264 @@ pub struct WorkflowRecord {
     pub completed_at: Option<i64>,
 }
 
+/// Durable admission state for a workflow step. An interrupted in-flight
+/// attempt has an unknown delivery outcome and must not be replayed blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAttemptPhase {
+    /// The next step has not been admitted yet.
+    Ready,
+    /// Admission committed before calling the step or performing its effect.
+    InFlight,
+    /// A retry and its delay committed before sleeping.
+    RetryWaiting,
+}
+
+/// Authoritative execution budget, separate from advisory workflow step logs.
+///
+/// Schema v48 intentionally does not backfill this state for older executions:
+/// their consumed attempts and elapsed monotonic time cannot be reconstructed
+/// safely. New runner starts create this record before any step admission.
+/// Missing, malformed, or interrupted in-flight state fails closed on resume.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionBudget {
+    /// Strict payload format version; no fields are defaulted on decode.
+    pub schema_version: u32,
+    /// Compare-and-set revision, also stored independently in the SQL row.
+    pub revision: u64,
+    /// Original execution timestamp, immutable across restarts.
+    pub started_at_ms: i64,
+    /// Original runner deadline policy; zero disables the total deadline.
+    pub workflow_total_deadline_ms: u64,
+    /// Fixed epoch deadline, never recomputed from a resumed invocation.
+    pub deadline_at_ms: Option<i64>,
+    /// Wall-clock high-water mark used to reject observed clock rollback.
+    pub last_observed_at_ms: i64,
+    /// Remaining allowance after both wall-clock and monotonic elapsed time.
+    pub remaining_ms: Option<u64>,
+    /// Authoritative resume cursor, independent of step-log ordering.
+    pub current_step: usize,
+    /// Consecutive retry ordinal already admitted for this step.
+    pub retries: usize,
+    /// Retry policy captured from the runner at original admission.
+    pub max_retries_per_step: usize,
+    /// Backoff policy captured from the runner at original admission.
+    pub retry_backoff_multiplier: f64,
+    /// Durable delivery state of the current attempt.
+    pub phase: WorkflowAttemptPhase,
+    /// Earliest epoch time at which the committed retry may execute.
+    pub retry_not_before_ms: Option<i64>,
+    /// Requested retry delay, retained for audit and replay inspection.
+    pub retry_base_delay_ms: u64,
+    /// Actual backoff delay, retained even when the total deadline is shorter.
+    pub retry_effective_delay_ms: u64,
+}
+
+impl WorkflowExecutionBudget {
+    /// Maximum supported finite workflow duration (24 hours).
+    pub const MAX_TOTAL_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Create a fresh budget from the original execution start and runner
+    /// policy. Setup time consumes the same allowance as step execution.
+    pub fn new(
+        started_at_ms: i64,
+        now_ms: i64,
+        workflow_total_deadline_ms: u64,
+        max_retries_per_step: usize,
+        retry_backoff_multiplier: f64,
+    ) -> Result<Self, &'static str> {
+        if started_at_ms < 0 || now_ms < started_at_ms {
+            return Err("workflow_budget_clock_rollback");
+        }
+        if workflow_total_deadline_ms > Self::MAX_TOTAL_DEADLINE_MS {
+            return Err("workflow_budget_invalid_deadline");
+        }
+        let deadline_at_ms = if workflow_total_deadline_ms == 0 {
+            None
+        } else {
+            Some(
+                started_at_ms
+                    .checked_add(
+                        i64::try_from(workflow_total_deadline_ms)
+                            .map_err(|_| "workflow_budget_invalid_deadline")?,
+                    )
+                    .ok_or("workflow_budget_invalid_deadline")?,
+            )
+        };
+        let budget = Self {
+            schema_version: 1,
+            revision: 0,
+            started_at_ms,
+            workflow_total_deadline_ms,
+            deadline_at_ms,
+            last_observed_at_ms: now_ms,
+            remaining_ms: deadline_at_ms.map(|deadline| {
+                u64::try_from(deadline.saturating_sub(now_ms).max(0)).unwrap_or(0)
+            }),
+            current_step: 0,
+            retries: 0,
+            max_retries_per_step,
+            retry_backoff_multiplier,
+            phase: WorkflowAttemptPhase::Ready,
+            retry_not_before_ms: None,
+            retry_base_delay_ms: 0,
+            retry_effective_delay_ms: 0,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    /// Validate a complete persisted payload without repairing or defaulting
+    /// missing authority. Errors are finite, content-free reason codes.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1
+            || i64::try_from(self.revision).is_err()
+            || i64::try_from(self.current_step).is_err()
+            || i64::try_from(self.max_retries_per_step).is_err()
+            || self.started_at_ms < 0
+            || self.last_observed_at_ms < self.started_at_ms
+            || self.retries > self.max_retries_per_step
+            || !self.retry_backoff_multiplier.is_finite()
+            || self.retry_backoff_multiplier < 1.0
+        {
+            return Err("workflow_budget_invalid_state");
+        }
+        if self.workflow_total_deadline_ms > Self::MAX_TOTAL_DEADLINE_MS {
+            return Err("workflow_budget_invalid_deadline");
+        }
+        match (self.deadline_at_ms, self.remaining_ms) {
+            (None, None) if self.workflow_total_deadline_ms == 0 => {}
+            (Some(deadline), Some(remaining)) if self.workflow_total_deadline_ms > 0 => {
+                let duration = i64::try_from(self.workflow_total_deadline_ms)
+                    .map_err(|_| "workflow_budget_invalid_deadline")?;
+                if self.started_at_ms.checked_add(duration) != Some(deadline)
+                    || remaining > self.workflow_total_deadline_ms
+                    || remaining
+                        > u64::try_from(deadline.saturating_sub(self.last_observed_at_ms).max(0))
+                            .unwrap_or(0)
+                {
+                    return Err("workflow_budget_invalid_deadline");
+                }
+            }
+            _ => return Err("workflow_budget_invalid_deadline"),
+        }
+        if self.retries == 0 {
+            if self.phase == WorkflowAttemptPhase::RetryWaiting
+                || self.retry_not_before_ms.is_some()
+                || self.retry_base_delay_ms != 0
+                || self.retry_effective_delay_ms != 0
+            {
+                return Err("workflow_budget_invalid_retry");
+            }
+        } else if self.phase == WorkflowAttemptPhase::Ready
+            || self.retry_not_before_ms.is_none_or(|at| at < self.started_at_ms)
+            || self.retry_effective_delay_ms < self.retry_base_delay_ms
+        {
+            return Err("workflow_budget_invalid_retry");
+        }
+        Ok(())
+    }
+
+    /// Charge time since the last successful budget persistence. Monotonic
+    /// time prevents an in-process clock adjustment from refunding allowance;
+    /// the immutable epoch deadline also charges downtime across restart.
+    /// An observed wall-clock rollback is refused rather than guessed around.
+    pub fn observe_time(
+        &mut self,
+        now_ms: i64,
+        elapsed_monotonic_ms: u64,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+        if now_ms < self.last_observed_at_ms {
+            return Err("workflow_budget_clock_rollback");
+        }
+        let wall_elapsed = u64::try_from(now_ms - self.last_observed_at_ms)
+            .map_err(|_| "workflow_budget_clock_rollback")?;
+        self.last_observed_at_ms = now_ms;
+        if let (Some(remaining), Some(deadline)) = (self.remaining_ms, self.deadline_at_ms) {
+            let until_deadline =
+                u64::try_from(deadline.saturating_sub(now_ms).max(0)).unwrap_or(0);
+            let remaining = remaining
+                .saturating_sub(wall_elapsed.max(elapsed_monotonic_ms))
+                .min(until_deadline);
+            self.remaining_ms = Some(remaining);
+            if remaining == 0 {
+                return Err("workflow_budget_expired");
+            }
+        }
+        Ok(())
+    }
+
+    /// Check immutable policy, non-refundable time and legal admission
+    /// transitions before the writer commits a new revision.
+    pub(crate) fn validate_successor(&self, next: &Self) -> Result<(), &'static str> {
+        self.validate()?;
+        next.validate()?;
+        if self.revision.checked_add(1) != Some(next.revision)
+            || self.started_at_ms != next.started_at_ms
+            || self.workflow_total_deadline_ms != next.workflow_total_deadline_ms
+            || self.deadline_at_ms != next.deadline_at_ms
+            || self.max_retries_per_step != next.max_retries_per_step
+            || self.retry_backoff_multiplier.to_bits() != next.retry_backoff_multiplier.to_bits()
+            || next.last_observed_at_ms < self.last_observed_at_ms
+            || next.remaining_ms > self.remaining_ms
+        {
+            return Err("workflow_budget_invalid_transition");
+        }
+        if let (Some(previous), Some(remaining)) = (self.remaining_ms, next.remaining_ms) {
+            let wall_elapsed = u64::try_from(next.last_observed_at_ms - self.last_observed_at_ms)
+                .map_err(|_| "workflow_budget_invalid_transition")?;
+            if remaining > previous.saturating_sub(wall_elapsed) {
+                return Err("workflow_budget_invalid_transition");
+            }
+        }
+        let same_attempt = next.current_step == self.current_step && next.retries == self.retries;
+        let valid = match (self.phase, next.phase) {
+            (WorkflowAttemptPhase::Ready | WorkflowAttemptPhase::RetryWaiting,
+             WorkflowAttemptPhase::InFlight) => same_attempt,
+            (WorkflowAttemptPhase::Ready, WorkflowAttemptPhase::Ready)
+            | (WorkflowAttemptPhase::InFlight, WorkflowAttemptPhase::InFlight)
+            | (WorkflowAttemptPhase::RetryWaiting, WorkflowAttemptPhase::RetryWaiting) => same_attempt,
+            (WorkflowAttemptPhase::InFlight, WorkflowAttemptPhase::RetryWaiting) => {
+                next.current_step == self.current_step
+                    && self.retries.checked_add(1) == Some(next.retries)
+            }
+            (WorkflowAttemptPhase::InFlight, WorkflowAttemptPhase::Ready) => next.retries == 0,
+            _ => false,
+        };
+        if !valid {
+            return Err("workflow_budget_invalid_transition");
+        }
+        if self.phase == WorkflowAttemptPhase::RetryWaiting
+            && next.phase == WorkflowAttemptPhase::InFlight
+            && next.retry_not_before_ms.is_none_or(|at| next.last_observed_at_ms < at)
+        {
+            return Err("workflow_budget_retry_not_due");
+        }
+        if self.phase == WorkflowAttemptPhase::InFlight
+            && next.phase == WorkflowAttemptPhase::RetryWaiting
+        {
+            let delay = i64::try_from(next.retry_effective_delay_ms)
+                .map_err(|_| "workflow_budget_retry_delay_overflow")?;
+            let not_before = next.last_observed_at_ms
+                .checked_add(delay)
+                .ok_or("workflow_budget_retry_delay_overflow")?;
+            if next.retry_not_before_ms != Some(not_before) {
+                return Err("workflow_budget_invalid_retry");
+            }
+        }
+        if (self.phase == next.phase || self.phase == WorkflowAttemptPhase::RetryWaiting)
+            && (self.retry_not_before_ms != next.retry_not_before_ms
+                || self.retry_base_delay_ms != next.retry_base_delay_ms
+                || self.retry_effective_delay_ms != next.retry_effective_delay_ms)
+        {
+            return Err("workflow_budget_invalid_transition");
+        }
+        Ok(())
+    }
+}
+
 /// Workflow action plan record (canonical JSON + hash).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowActionPlanRecord {
@@ -1422,6 +1680,127 @@ impl PaneReservationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_budget_roundtrip_rejects_missing_unknown_and_invalid_authority() {
+        let budget = WorkflowExecutionBudget::new(1_000, 1_100, 10_000, 3, 2.0).unwrap();
+        let encoded = serde_json::to_value(&budget).unwrap();
+        let decoded: WorkflowExecutionBudget = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, budget);
+        assert_eq!(decoded.remaining_ms, Some(9_900));
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove("retries");
+        assert!(serde_json::from_value::<WorkflowExecutionBudget>(missing).is_err());
+        let mut unknown = encoded;
+        unknown["future_budget_override"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowExecutionBudget>(unknown).is_err());
+        for multiplier in [f64::NAN, f64::INFINITY, 0.5] {
+            assert!(WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 3, multiplier).is_err());
+        }
+        assert!(WorkflowExecutionBudget::new(i64::MAX, i64::MAX, 1, 3, 2.0).is_err());
+        assert!(WorkflowExecutionBudget::new(1_000, 999, 10_000, 3, 2.0).is_err());
+    }
+
+    #[test]
+    fn workflow_budget_restart_charges_downtime_without_refunding_monotonic_time() {
+        let mut budget = WorkflowExecutionBudget::new(1_000, 1_000, 1_000, 3, 2.0).unwrap();
+        budget.observe_time(1_100, 250).unwrap();
+        assert_eq!(budget.remaining_ms, Some(750));
+        for now in [1_200, 1_300, 1_400] {
+            budget = serde_json::from_str(&serde_json::to_string(&budget).unwrap()).unwrap();
+            budget.observe_time(now, 0).unwrap();
+            assert_eq!(budget.deadline_at_ms, Some(2_000));
+        }
+        assert_eq!(budget.remaining_ms, Some(450));
+        assert_eq!(budget.observe_time(1_399, 0), Err("workflow_budget_clock_rollback"));
+        assert_eq!(budget.remaining_ms, Some(450));
+        assert_eq!(budget.observe_time(2_100, 0), Err("workflow_budget_expired"));
+        assert_eq!(budget.remaining_ms, Some(0));
+    }
+
+    #[test]
+    fn workflow_budget_saturates_elapsed_and_preserves_explicit_disabled_deadline() {
+        let mut bounded = WorkflowExecutionBudget::new(10, 10, 100, 0, 1.0).unwrap();
+        assert_eq!(bounded.observe_time(10, u64::MAX), Err("workflow_budget_expired"));
+        assert_eq!(bounded.remaining_ms, Some(0));
+        let mut disabled = WorkflowExecutionBudget::new(10, 10, 0, 0, 1.0).unwrap();
+        disabled.observe_time(i64::MAX, u64::MAX).unwrap();
+        assert_eq!(disabled.remaining_ms, None);
+        assert_eq!(disabled.deadline_at_ms, None);
+        assert_eq!(disabled.observe_time(10, 0), Err("workflow_budget_clock_rollback"));
+    }
+
+    #[test]
+    fn workflow_budget_admission_preserves_retry_and_delay_across_crash_boundaries() {
+        let original = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 1, 2.0).unwrap();
+        let mut admitted = original.clone();
+        admitted.revision += 1;
+        admitted.phase = WorkflowAttemptPhase::InFlight;
+        original.validate_successor(&admitted).unwrap();
+
+        // A committed admission survives a crash before the step result. It
+        // cannot become a fresh Ready attempt by hydration or a new start.
+        let restored: WorkflowExecutionBudget =
+            serde_json::from_str(&serde_json::to_string(&admitted).unwrap()).unwrap();
+        assert_eq!(restored.phase, WorkflowAttemptPhase::InFlight);
+        let mut waiting = restored.clone();
+        waiting.revision += 1;
+        waiting.phase = WorkflowAttemptPhase::RetryWaiting;
+        waiting.retries = 1;
+        waiting.retry_base_delay_ms = 500;
+        waiting.retry_effective_delay_ms = 500;
+        waiting.retry_not_before_ms = Some(1_500);
+        restored.validate_successor(&waiting).unwrap();
+
+        // Restart before or after sleeping preserves the same ordinal and
+        // not-before authority; admission before the persisted delay fails.
+        let mut retry = waiting.clone();
+        retry.revision += 1;
+        retry.phase = WorkflowAttemptPhase::InFlight;
+        retry.observe_time(1_499, 0).unwrap();
+        assert_eq!(waiting.validate_successor(&retry), Err("workflow_budget_retry_not_due"));
+        retry.observe_time(1_500, 0).unwrap();
+        waiting.validate_successor(&retry).unwrap();
+        assert_eq!(retry.retries, 1);
+        let mut exhausted = retry.clone();
+        exhausted.revision += 1;
+        exhausted.phase = WorkflowAttemptPhase::RetryWaiting;
+        exhausted.retries = 2;
+        assert!(retry.validate_successor(&exhausted).is_err());
+    }
+
+    #[test]
+    fn workflow_budget_successor_refuses_policy_time_and_delay_refunds() {
+        let initial = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 3, 2.0).unwrap();
+        let mut admitted = initial.clone();
+        admitted.revision = 1;
+        admitted.phase = WorkflowAttemptPhase::InFlight;
+        initial.validate_successor(&admitted).unwrap();
+        let mut next = admitted.clone();
+        next.revision += 1;
+        next.max_retries_per_step += 1;
+        assert!(admitted.validate_successor(&next).is_err());
+        next = admitted.clone();
+        next.revision += 1;
+        next.observe_time(1_200, 500).unwrap();
+        admitted.validate_successor(&next).unwrap();
+        let mut refunded = next.clone();
+        refunded.revision += 1;
+        refunded.last_observed_at_ms += 100;
+        assert!(refunded.validate().is_ok(), "original deadline alone misses the refund");
+        assert!(next.validate_successor(&refunded).is_err());
+        let mut early = admitted.clone();
+        early.revision += 1;
+        early.phase = WorkflowAttemptPhase::RetryWaiting;
+        early.retries = 1;
+        early.retry_base_delay_ms = 500;
+        early.retry_effective_delay_ms = 500;
+        early.retry_not_before_ms = Some(1_000);
+        assert_eq!(admitted.validate_successor(&early), Err("workflow_budget_invalid_retry"));
+        early.retry_effective_delay_ms = u64::MAX;
+        early.retry_not_before_ms = Some(i64::MAX);
+        assert_eq!(admitted.validate_successor(&early), Err("workflow_budget_retry_delay_overflow"));
+    }
 
     /// br-ft-bbhwz: free_ratio handles edge cases — empty db,
     /// freelist > total pages, both zero. Pinned at the type

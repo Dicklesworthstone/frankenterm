@@ -239,13 +239,9 @@ fn arb_pane_lock_info() -> impl Strategy<Value = PaneLockInfo> {
 }
 
 fn arb_workflow_config() -> impl Strategy<Value = WorkflowConfig> {
-    (1000..120_000u64, 0..10u32, 100..30_000u64).prop_map(
-        |(default_wait_timeout_ms, max_step_retries, retry_delay_ms)| WorkflowConfig {
-            default_wait_timeout_ms,
-            max_step_retries,
-            retry_delay_ms,
-        },
-    )
+    (1000..120_000u64).prop_map(|default_wait_timeout_ms| WorkflowConfig {
+        default_wait_timeout_ms,
+    })
 }
 
 fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
@@ -409,8 +405,6 @@ proptest! {
         let json = serde_json::to_string(&c).unwrap();
         let back: WorkflowConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(c.default_wait_timeout_ms, back.default_wait_timeout_ms);
-        prop_assert_eq!(c.max_step_retries, back.max_step_retries);
-        prop_assert_eq!(c.retry_delay_ms, back.retry_delay_ms);
     }
 
     // -- WorkflowStepPolicyDecision --
@@ -509,8 +503,6 @@ proptest! {
     fn workflow_config_default_has_sane_values(_dummy in 0..1u8) {
         let cfg = WorkflowConfig::default();
         prop_assert_eq!(cfg.default_wait_timeout_ms, 30_000);
-        prop_assert_eq!(cfg.max_step_retries, 3);
-        prop_assert_eq!(cfg.retry_delay_ms, 1_000);
     }
 
     // -- StepResult constructors match predicates --

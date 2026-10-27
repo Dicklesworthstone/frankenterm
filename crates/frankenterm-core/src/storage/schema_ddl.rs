@@ -103,7 +103,10 @@
 /// append cannot permanently omit the event.
 /// Bumped 45 -> 46 for serialized connector dispatch ownership and ingress cursors.
 /// Bumped 46 -> 47 to retain audit target identity independently of observed panes.
-pub const SCHEMA_VERSION: i32 = 47;
+/// Bumped 47 -> 48 to persist authoritative workflow retry and total-deadline
+/// budgets. Legacy executions deliberately receive no inferred budget: resume
+/// must fail closed instead of refunding attempts or extending a deadline.
+pub const SCHEMA_VERSION: i32 = 48;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -793,6 +796,14 @@ CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_executions(status);
 CREATE INDEX IF NOT EXISTS idx_workflows_started ON workflow_executions(started_at);
 CREATE INDEX IF NOT EXISTS idx_workflows_trigger_event_id
     ON workflow_executions(trigger_event_id) WHERE trigger_event_id IS NOT NULL;
+
+-- Workflow execution budgets: authoritative progress and retry/deadline limits.
+-- Never infer or backfill a budget from legacy workflow records or step logs.
+CREATE TABLE IF NOT EXISTS workflow_execution_budgets (
+    workflow_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    budget_json TEXT NOT NULL
+);
 
 -- Workflow step logs: execution history for audit and debugging
 CREATE TABLE IF NOT EXISTS workflow_step_logs (
