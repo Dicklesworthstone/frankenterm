@@ -261,7 +261,9 @@ private actor MacExportEngine {
         sourceKeyOwner = operationID
         guard let selection,
               let reference = selection.workspace.credentials.first(where: { $0.id == credentialID }) else { throw FTError.stale }
-        let selected = try keyUnlocker.select(pem: SelectedLocalFile.read(url, limit: FTLimit.key), reference: reference)
+        var sourceBytes = try SelectedLocalFile.read(url, limit: FTLimit.key)
+        defer { sourceBytes.resetBytes(in: 0..<sourceBytes.count) }
+        let selected = try keyUnlocker.select(pem: sourceBytes, reference: reference)
         do { try Task.checkCancellation() }
         catch { retireKeyRequest(); throw error }
         switch selected {
@@ -732,7 +734,7 @@ private final class MacExportModel {
             panel.directoryURL = privateHint.deletingLastPathComponent()
             panel.nameFieldStringValue = privateHint.lastPathComponent
         }
-        panel.message = "Choose the matching OpenSSH Ed25519, ECDSA or RSA key, or a clear ECDSA SEC1/PKCS#8 or RSA PKCS#1/PKCS#8 PEM key. ECDSA supports P-256/P-384/P-521; RSA supports 2048–8192 bits with SHA-2 signatures. Protected OpenSSH files using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits) are unlocked locally after you enter their passphrase."
+        panel.message = "Choose the matching OpenSSH Ed25519, ECDSA or RSA key, or an ECDSA/RSA PEM key. ECDSA supports P-256/P-384/P-521; RSA supports 2048–8192 bits with SHA-2 signatures. Protected OpenSSH keys and PKCS#8 files using PBES2, PBKDF2 and AES-CBC are unlocked locally after you enter their passphrase. Clear SEC1, PKCS#1 and PKCS#8 files are also supported."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
@@ -1094,7 +1096,14 @@ private final class MacExportModel {
             } else if error == .unsupported("source_key.cipher") || error == .unsupported("source_key.kdf") {
                 message = "This protected key uses an unsupported format. Source unlocking supports OpenSSH bcrypt with AES-CTR or AES-CBC using 128-, 192-, or 256-bit keys."
             } else if error == .unsupported("source_key.encrypted_pem") {
-                message = "This encrypted PEM format is not supported. Source unlocking accepts protected OpenSSH files; SEC1 and PKCS#8 ECDSA files must already be clear."
+                message = "This older encrypted PEM format is not supported. Choose a matching protected OpenSSH key or a PKCS#8 key protected with PBES2, PBKDF2 and AES-CBC."
+            } else if [.unsupported("source_key.pkcs8_encryption"), .unsupported("source_key.pkcs8_kdf"),
+                       .unsupported("source_key.pkcs8_prf"), .unsupported("source_key.pkcs8_cipher")].contains(error) {
+                message = "This PKCS#8 file uses unsupported protection. Supported files use PBES2, PBKDF2 with HMAC-SHA1, SHA256, SHA384 or SHA512, and AES-CBC with 128-, 192- or 256-bit keys."
+            } else if error == .limit("source_key.pbkdf2_parameters") {
+                message = "This PKCS#8 file exceeds the supported unlock limits: 1–1,000,000 PBKDF2 iterations and an 8–64 byte salt. Choose another matching supported key file or keep its public reference."
+            } else if error == .limit("source_key.pkcs8_der") {
+                message = "This encrypted PKCS#8 file exceeds the supported single-key size. Choose another matching supported key file or keep its public reference."
             } else if error == .limit("source_key.passphrase") {
                 message = "Enter a passphrase between 1 and 1,024 UTF-8 bytes."
             } else if error == .malformed("ssh.include_cycle") {
@@ -1467,7 +1476,7 @@ private struct MacExportView: View {
                     }
                     Text("One private record serves every selected reference to the same public key. Keeping a reference only removes any private material already loaded for that identity.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Supported source keys: OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits), plus clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 PEM files. Protected OpenSSH keys support bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits). RSA connections require SHA-2 signatures. Certificates, hardware keys, and capture from the running Mac workspace need additional support.")
+                    Text("Supported source keys: OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits), plus ECDSA/RSA PEM files. Protected OpenSSH files use bcrypt with AES-CTR or AES-CBC; encrypted PKCS#8 files use PBES2, PBKDF2 and AES-CBC. Clear SEC1, PKCS#1 and PKCS#8 files are also supported. RSA connections require SHA-2 signatures. Certificates and hardware-bound keys still require a separately supported credential path.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
@@ -1676,8 +1685,15 @@ private struct SourceKeyUnlockSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Unlock selected source key", systemImage: "key.fill").font(.title2.bold())
             Text(verbatim: request.credentialID).font(.headline)
+            if case .encryptedPKCS8 = request.protection {
+                Text("Expected workspace identity").font(.caption.bold())
+            }
             Text(verbatim: request.algorithm + "\n" + request.fingerprint)
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            if case .encryptedPKCS8 = request.protection {
+                Text("This PKCS#8 file keeps its public identity encrypted too. After unlocking, its key must match this algorithm and fingerprint before it can be included.")
+                    .font(.callout)
+            }
             Text("Enter this key file's passphrase. The key is checked locally and included only in the encrypted transfer you approve.")
                 .font(.callout)
             SecureField("Source-key passphrase", text: $passphrase)

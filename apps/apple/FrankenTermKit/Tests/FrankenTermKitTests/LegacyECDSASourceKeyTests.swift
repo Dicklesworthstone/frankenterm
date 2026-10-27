@@ -213,16 +213,26 @@ final class LegacyECDSASourceKeyTests: XCTestCase {
                                                 using: LegacyDERProbeCryptography()))
     }
 
-    func testEncryptedLegacyPEMIsExplicitlyUnsupportedWithoutWorkOrPrompt() async throws {
+    func testMislabeledPKCS8AndTraditionalEncryptedPEMAreRejectedWithoutWorkOrPrompt() async throws {
         let fixture = try XCTUnwrap(Fixtures.load().keys.first)
-        let protectedPKCS8 = pem(try der(fixture.pkcs8PEM), label: "ENCRYPTED PRIVATE KEY")
-        let protectedSEC1 = Data(fixture.sec1PEM.replacingOccurrences(of: "-----BEGIN EC PRIVATE KEY-----\n",
-            with: "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n").utf8)
+        // A clear PrivateKeyInfo relabeled as EncryptedPrivateKeyInfo is
+        // malformed, even though actual bounded PBES2 containers now work.
+        // Traditional Proc-Type/DEK-Info protection remains unsupported.
+        let mislabeled = pem(try der(fixture.pkcs8PEM), label: "ENCRYPTED PRIVATE KEY")
+        var cases: [(Data, FTError)] = [(mislabeled, .malformed("source_key.der_tag"))]
+        let procType = "Proc-Type: 4,ENCRYPTED\n"
+        let dekInfo = "DEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n"
+        for headers in [procType, dekInfo, procType + dekInfo] {
+            let bytes = Data(fixture.sec1PEM.replacingOccurrences(of: "-----BEGIN EC PRIVATE KEY-----\n",
+                with: "-----BEGIN EC PRIVATE KEY-----\n" + headers).utf8)
+            cases.append((bytes, .unsupported("source_key.encrypted_pem")))
+        }
         let reference = try workspace(algorithm: fixture.algorithm, fingerprint: fixture.fingerprint).credentials[0]
-        for bytes in [protectedPKCS8, protectedSEC1] {
+        for (bytes, expected) in cases {
             var picker = OpenSSHSourceKeyUnlocker(using: LegacyDERProbeCryptography())
             XCTAssertThrowsError(try picker.select(pem: bytes, reference: reference)) {
-                XCTAssertEqual($0 as? FTError, .unsupported("source_key.encrypted_pem"))
+                XCTAssertEqual($0 as? FTError, expected)
+                XCTAssertFalse($0 is LegacyDERProbeError, "Rejected input reached native cryptography.")
             }
             XCTAssertNil(picker.request)
         }
@@ -299,6 +309,9 @@ private struct LegacyDERProbeCryptography: AirGapCryptography {
     func ed25519PublicKey(seed: Data) throws -> Data { try base.ed25519PublicKey(seed: seed) }
     func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data { try base.ecdsaPublicKey(scalar: scalar, curve: curve) }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw LegacyDERProbeError.unexpectedNativeWork }
+    func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32, prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
+        throw LegacyDERProbeError.unexpectedNativeWork
+    }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw LegacyDERProbeError.unexpectedNativeWork }
     func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw LegacyDERProbeError.unexpectedNativeWork }
 }

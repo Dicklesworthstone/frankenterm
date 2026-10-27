@@ -1,5 +1,42 @@
 import Foundation
 import COpenSSHBcrypt
+import CryptoExtras
+
+/// Existing encrypted source compatibility through pinned Swift CryptoExtras:
+/// CommonCrypto on Apple, BoringSSL on Linux. Bounds apply before native work.
+/// The unchecked-rounds API is needed only to read already-encrypted files
+/// below a new-key recommendation; this code never encrypts a source file.
+enum PKCS8SourcePrimitives {
+    static func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
+                       prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
+        guard (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.count),
+              (8...64).contains(salt.count),
+              (1...EncryptedPKCS8SourceKey.maximumIterations).contains(iterations),
+              [16, 24, 32].contains(outputByteCount) else {
+            throw FTError.limit("source_key.pbkdf2_parameters")
+        }
+        try Task.checkCancellation()
+        let function: KDF.Insecure.PBKDF2.HashFunction
+        switch prf {
+        case .hmacSHA1: function = .insecureSHA1
+        case .hmacSHA256: function = .sha256
+        case .hmacSHA384: function = .sha384
+        case .hmacSHA512: function = .sha512
+        }
+        let key = try KDF.Insecure.PBKDF2.deriveKey(from: passphrase, salt: salt, using: function,
+            outputByteCount: outputByteCount, unsafeUncheckedRounds: Int(iterations))
+        try Task.checkCancellation()
+        var result = key.withUnsafeBytes { Data($0) }
+        do {
+            guard result.count == outputByteCount else { throw FTError.malformed("source_key.kdf_output") }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
+}
 
 /// Shared admission and ownership for the pinned OpenSSH PBKDF. Its C target
 /// has no platform crypto dependency: each operation receives one maintained

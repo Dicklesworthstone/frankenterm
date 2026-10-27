@@ -54,12 +54,14 @@ public actor WorkspaceNativeSSHConnection {
                                authenticationTimeout: Duration = .seconds(60),
                                liveness: WorkspaceSSHLiveness = .standard,
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
-                               attachMux: Bool = true) async throws -> WorkspaceNativeSSHConnection {
+                               attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
+                               requiresExistingMux: Bool = false) async throws -> WorkspaceNativeSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
             store: store, broker: broker, journal: journal, networkActivity: networkActivity,
             connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, liveness: liveness,
-            muxClientFactory: muxClientFactory, attachMux: attachMux)
+            muxClientFactory: muxClientFactory, attachMux: attachMux, muxAccessMode: muxAccessMode,
+            requiresExistingMux: requiresExistingMux)
     }
 
     public static func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
@@ -73,7 +75,8 @@ public actor WorkspaceNativeSSHConnection {
                                authenticationTimeout: Duration = .seconds(60),
                                liveness: WorkspaceSSHLiveness = .standard,
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
-                               attachMux: Bool = true) async throws -> WorkspaceNativeSSHConnection {
+                               attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
+                               requiresExistingMux: Bool = false) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         try Task.checkCancellation()
         let foreground = try await broker.foregroundLease()
@@ -109,6 +112,9 @@ public actor WorkspaceNativeSSHConnection {
         } else {
             muxCommand = attachMux && muxClientFactory != nil ? defaultMuxCommand : nil
         }
+        // An explicit Observe/Use Existing Pane request cannot manufacture a
+        // direct shell when its mux transport is absent or disabled.
+        guard !requiresExistingMux || muxCommand != nil else { throw TerminalMuxError.unavailable }
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         let hops = try document.orderedJumpRoutes(forRouteID: routeID)
         let hopChoices = try hops.map { hop -> [WorkspaceSSHAuthenticationChoice] in
@@ -159,7 +165,7 @@ public actor WorkspaceNativeSSHConnection {
                 channelID: session.channelID)
             let transport = WorkspaceNativeSSHTransport(session: session, identity: identity, broker: broker,
                 foreground: foreground, networkLease: lease, authority: authority, liveness: liveness,
-                muxControl: muxCommand == nil ? nil : TerminalMuxControl())
+                muxControl: muxCommand == nil ? nil : TerminalMuxControl(accessMode: muxAccessMode))
             let mux = muxCommand.flatMap { command in muxClientFactory.map { (command: command, factory: $0) } }
             return WorkspaceNativeSSHConnection(transport: transport, peer: peer, scope: scope, mux: mux)
         } catch {
@@ -707,11 +713,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             // still at the phone's size. Reused IDs after a restart, topology
             // changes and legacy records cannot resize a replacement shell.
             // The pane about to be shown keeps its desktop size for later.
-            for (pane, record) in state.sizes.records(matching: state.panes, incarnation: state.incarnation)
-                .sorted(by: { $0.key < $1.key }) {
-                guard try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
-                                                rows: record.rows, columns: record.columns) else { continue }
-                if pane != first.paneId { try client.restoreSize(pane: pane) }
+            if control.accessMode.controlsSize {
+                for (pane, record) in state.sizes.records(matching: state.panes, incarnation: state.incarnation)
+                    .sorted(by: { $0.key < $1.key }) {
+                    guard try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
+                                                    rows: record.rows, columns: record.columns) else { continue }
+                    if pane != first.paneId { try client.restoreSize(pane: pane) }
+                }
             }
             // Adoption and queued restores do not prove the server applied
             // them. Keep each record until its explicit confirmed event.
@@ -804,10 +812,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // a size someone else gave the pane while 256 history rows
                 // still fit beside both screens. A pane someone else made
                 // larger is asked back to the phone's size.
-                let own = UInt32(rows) == state.geometry.rows && UInt32(columns) == state.geometry.columns
+                let own = rows == Int(state.geometry.rows) && columns == Int(state.geometry.columns)
                 guard (1...512).contains(rows), (1...512).contains(columns),
                       rows * columns <= TerminalSessionGeometry.maximumShownCells,
-                      own || (rows * 2 + 256) * columns <= 65536 else {
+                      !state.control.accessMode.controlsSize || own || (rows * 2 + 256) * columns <= 65536 else {
+                    guard state.control.accessMode.controlsSize else {
+                        let reason = "This shared pane is too large to view on this phone. Its size was not changed."
+                        state.control.recordFailure(reason)
+                        throw TerminalMuxError.failed(reason)
+                    }
                     // The mirror counts this output as drawn; draw the pane
                     // again from scratch once it is back at the phone's size.
                     try state.client.resize(pane: pane, rows: Int(state.geometry.rows),
@@ -883,7 +896,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         if let requested = state.control.takeRequest(), requested != state.shown,
            state.panes.contains(where: { $0.paneId == requested }) {
             if let old = state.shown, state.showing {
-                try state.client.hide(pane: old); try state.client.restoreSize(pane: old)
+                try state.client.hide(pane: old)
+                if state.control.accessMode.controlsSize { try state.client.restoreSize(pane: old) }
             }
             state.shown = requested; state.showing = false
             state.shownPane.set(state.panes.first { $0.paneId == requested }, incarnation: state.incarnation)
@@ -908,13 +922,16 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         let visible = state.control.current.visible
         if visible, !state.showing {
-            try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
+            if state.control.accessMode.controlsSize {
+                try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
+            }
             try state.client.show(pane: pane)
             state.showing = true
             // Back on screen: its pane strip may be a hidden interval old.
             state.nextListing = .now
         } else if !visible, state.showing {
-            try state.client.hide(pane: pane); try state.client.restoreSize(pane: pane)
+            try state.client.hide(pane: pane)
+            if state.control.accessMode.controlsSize { try state.client.restoreSize(pane: pane) }
             state.showing = false
         }
         state.control.setMouseGrabbed(state.grabs[pane] ?? false)
@@ -925,7 +942,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// encoding it. Superseded/hidden gestures never move to the shown pane.
     private func dispatchMuxPointer(driver: NativeSSHDriver) async throws {
         guard let state = mux, state.control.inputRouting.hasPendingPointers else { return }
-        guard state.showing, state.control.current.visible else {
+        guard state.control.accessMode.permitsInput, state.showing, state.control.current.visible else {
             state.control.inputRouting.discardPointers(); return
         }
         guard try await flushMux(driver: driver) else { return }
@@ -1012,6 +1029,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     }
 
     func writeMux(_ bytes: Data, destination: TerminalMuxInputRouting.Destination) async throws -> TerminalTransportWrite {
+        guard muxControl?.accessMode.permitsInput == true else { throw TerminalInputError.unavailable }
         do {
             try await validateForeground()
             guard let driver, let state = mux else { throw NativeSSHError.closed }
@@ -1137,6 +1155,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             try await validateForeground()
             guard let driver else { throw NativeSSHError.closed }
             if let state = mux {
+                // The immutable observing connection never owns remote size.
+                // Its renderer fits the received grid locally instead.
+                guard state.control.accessMode.controlsSize else { return }
                 // A mux pane has no PTY here: the server resizes it, and the
                 // pane's next output arrives at the new size, which completes
                 // this request through the ordered update path.
@@ -1201,7 +1222,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// unanswered input is told now and marked for the next connection to tell.
     private func settleBeforeClose(_ state: MuxAttachment, driver: NativeSSHDriver) async {
         if let pane = state.shown, state.showing {
-            try? state.client.hide(pane: pane); try? state.client.restoreSize(pane: pane)
+            try? state.client.hide(pane: pane)
+            if state.control.accessMode.controlsSize { try? state.client.restoreSize(pane: pane) }
         }
         let typedTo = state.shownPane.record?.paneId
         func inputAnswered() -> Bool {
@@ -1272,6 +1294,9 @@ private struct WorkspaceMuxInputWriter: TerminalInputWriter {
     let routing: TerminalMuxInputRouting
     let destination: TerminalMuxInputRouting.Destination
     func validateInputAdmission() throws { try routing.validateAdmission(destination) }
+    func validateCleanupAdmission() throws {
+        guard routing.permitsInput else { throw TerminalInputError.unavailable }
+    }
     func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite {
         try await transport.writeMux(bytes, destination: destination)
     }

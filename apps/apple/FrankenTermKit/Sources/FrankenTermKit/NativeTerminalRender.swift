@@ -14,6 +14,9 @@ public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     public var fontRevision: UInt64 = 1
     public var boldBrightensANSI = false
     public var cursorBlink = true
+    /// Fit the received shared grid without changing its remote dimensions.
+    /// The configured size remains the user's upper bound, not a PTY request.
+    public var fitsRemoteGrid = false
     public init() {}
     fileprivate func validate() throws {
         guard fontRevision > 0, !fontName.isEmpty, fontName.utf8.count <= 256,
@@ -723,6 +726,7 @@ private final class NativeTerminalFrameBuilder {
     private let configuration: NativeTerminalRenderConfiguration, scale: Double
     private let viewport: SIMD2<Int>, blinkPhase: UInt64
     private let baseFont: CTFont
+    private let rasterFontSize: Double
     /// Only kCTFontCascadeListAttribute; reapplied to every derived face, since
     /// copying a font with new symbolic traits need not keep a custom cascade.
     private let cascade: CTFontDescriptor?
@@ -760,21 +764,48 @@ private final class NativeTerminalFrameBuilder {
         // An explicit cascade of the configured fallbacks that are actually
         // installed: an unknown name is skipped rather than letting Core Text
         // substitute an unrelated face for it.
-        let installed = configuration.fallbackFontNames.compactMap { name -> CTFontDescriptor? in
+        let installed = configuration.fallbackFontNames.filter { name in
             let candidate = CTFontCreateWithName(name as CFString, size, nil)
-            guard CTFontCopyPostScriptName(candidate) as String == name else { return nil }
-            return CTFontDescriptorCreateWithNameAndSize(name as CFString, size)
+            return CTFontCopyPostScriptName(candidate) as String == name
         }
-        cascade = installed.isEmpty ? nil : CTFontDescriptorCreateWithAttributes(
-            [kCTFontCascadeListAttribute: installed] as CFDictionary)
+        func fontCascade(size: Double) -> CTFontDescriptor? {
+            guard !installed.isEmpty else { return nil }
+            let descriptors = installed.map { CTFontDescriptorCreateWithNameAndSize($0 as CFString, size) }
+            return CTFontDescriptorCreateWithAttributes([kCTFontCascadeListAttribute: descriptors] as CFDictionary)
+        }
+        var fittedCascade = fontCascade(size: size)
         let primary = CTFontCreateWithName(configuration.fontName as CFString, size, nil)
-        baseFont = cascade.map { CTFontCreateCopyWithAttributes(primary, size, nil, $0) } ?? primary
-        var character: UniChar = 77, glyph: CGGlyph = 0, advance = CGSize.zero
-        guard CTFontGetGlyphsForCharacters(baseFont, &character, &glyph, 1) else { throw TerminalRenderError.unavailable }
-        CTFontGetAdvancesForGlyphs(baseFont, .horizontal, &glyph, &advance, 1)
-        cellWidth = ceil(advance.width)
-        ascent = ceil(CTFontGetAscent(baseFont))
-        cellHeight = ceil(CTFontGetAscent(baseFont) + CTFontGetDescent(baseFont) + CTFontGetLeading(baseFont))
+        let original = fittedCascade.map { CTFontCreateCopyWithAttributes(primary, size, nil, $0) } ?? primary
+        func metrics(_ font: CTFont) throws -> (width: Double, height: Double, ascent: Double) {
+            var character: UniChar = 77, glyph: CGGlyph = 0, advance = CGSize.zero
+            guard CTFontGetGlyphsForCharacters(font, &character, &glyph, 1) else { throw TerminalRenderError.unavailable }
+            CTFontGetAdvancesForGlyphs(font, .horizontal, &glyph, &advance, 1)
+            return (ceil(advance.width), ceil(CTFontGetAscent(font) + CTFontGetDescent(font) + CTFontGetLeading(font)),
+                    ceil(CTFontGetAscent(font)))
+        }
+        let initial = try metrics(original)
+        var fitted = original, fittedSize = size, measured = initial
+        if configuration.fitsRemoteGrid {
+            let fit = try TerminalGridFit(columns: frame.columns, rows: frame.rows,
+                cellWidth: initial.width, cellHeight: initial.height, pixelWidth: viewport.x, pixelHeight: viewport.y)
+            fittedSize *= fit.scale
+            // Font hinting can round metrics differently at a new size. Bound
+            // correction work and validate the actual raster metrics, not an
+            // assumed linear scale. This runs on the preparation worker.
+            for _ in 0..<4 {
+                fittedCascade = fontCascade(size: fittedSize)
+                fitted = CTFontCreateCopyWithAttributes(original, fittedSize, nil, fittedCascade)
+                measured = try metrics(fitted)
+                if fit.contains(cellWidth: measured.width, cellHeight: measured.height) { break }
+                fittedSize *= min(fit.maximumCellWidth / max(measured.width, 1),
+                                  fit.maximumCellHeight / max(measured.height, 1)) * 0.99
+            }
+            guard fit.contains(cellWidth: measured.width, cellHeight: measured.height) else {
+                throw TerminalRenderError.capacity
+            }
+        }
+        cascade = fittedCascade; baseFont = fitted; rasterFontSize = fittedSize
+        cellWidth = measured.width; cellHeight = measured.height; ascent = measured.ascent
         guard cellWidth.isFinite, cellHeight.isFinite, cellWidth >= 1, cellHeight >= 1,
               cellWidth <= 256, cellHeight <= 512 else { throw TerminalRenderError.capacity }
     }
@@ -851,7 +882,7 @@ private final class NativeTerminalFrameBuilder {
         return NativePreparedTerminalFrame(semantic: frame, lease: lease, generation: generation,
             resources: resources, viewport: viewport, instanceCount: instances.count / 24,
             clear: uniform.clear.linearPremultiplied, caret: caret,
-            fontName: CTFontCopyPostScriptName(baseFont) as String, fontPointSize: CGFloat(configuration.fontPointSize),
+            fontName: CTFontCopyPostScriptName(baseFont) as String, fontPointSize: CGFloat(rasterFontSize / scale),
             fittingColumns: fittingColumns,
             fittingRows: max(1, min(512, TerminalSessionGeometry.maximumShownCells / fittingColumns,
                                     Int(Double(viewport.y) / cellHeight))),
@@ -895,7 +926,7 @@ private final class NativeTerminalFrameBuilder {
         var traits: CTFontSymbolicTraits = []
         if cell.intensity == 1 { traits.insert(.traitBold) }
         if cell.italic { traits.insert(.traitItalic) }
-        let size = configuration.fontPointSize * scale * (cell.verticalAlignment == 0 ? 1 : 0.75)
+        let size = rasterFontSize * (cell.verticalAlignment == 0 ? 1 : 0.75)
         let derived: CTFont
         if let font = CTFontCreateCopyWithSymbolicTraits(baseFont, size, nil, traits, [.traitBold,.traitItalic]) {
             derived = font

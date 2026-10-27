@@ -43,15 +43,15 @@ let package = Package(
         // Independent loopback test driver only; not linked into the app.
         .executableTarget(name: "FrankenTermSSHInteropProbe", dependencies: ["FrankenTermSSHIntegration", "FrankenTermSSH",
                 .product(name: "FrankenTermKit", package: "FrankenTermKit")],
-                path: "Tests/Interop", exclude: ["PumpProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py"],
+                path: "Tests/Interop", exclude: ["PumpProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py", "test_mux_observation.py"],
                 sources: ["SessionProbe.swift"]),
         // Published legacy UUID-bound adapter probe, retained independently.
         .executableTarget(name: "TerminalPumpProbe", dependencies: ["FrankenTermSSHIntegration"],
-                path: "Tests/Interop", exclude: ["SessionProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py"],
+                path: "Tests/Interop", exclude: ["SessionProbe.swift", "WorkspaceProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py", "test_mux_observation.py"],
                 sources: ["PumpProbe.swift"]),
         // Independently generated keys, protected broker races, durable journal.
         .executableTarget(name: "WorkspaceSSHProbe", dependencies: testDependencies,
-                path: "Tests/Interop", exclude: ["SessionProbe.swift", "PumpProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py"],
+                path: "Tests/Interop", exclude: ["SessionProbe.swift", "PumpProbe.swift", "test_swift.py", "test_pump.py", "test_workspace.py", "test_password.py", "test_interactive.py", "test_mux_observation.py"],
                 sources: ["WorkspaceProbe.swift"])
     ],
     cLanguageStandard: .c11

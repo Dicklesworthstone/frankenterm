@@ -44,6 +44,15 @@ struct LegacyECDSASourceKey: Sendable, CustomStringConvertible, CustomDebugStrin
               der.count <= Self.maximumDERBytes, der.base64EncodedString() == encoded else {
             throw FTError.malformed("source_key.der")
         }
+        try self.init(der: der, pkcs8: pkcs8)
+    }
+
+    /// Decryption supplies bounded DER directly, avoiding an intermediate
+    /// plaintext PEM/base64 string that the selected-file owner cannot erase.
+    init(pkcs8DER: Data) throws { try self.init(der: pkcs8DER, pkcs8: true) }
+
+    private init(der: Data, pkcs8: Bool) throws {
+        guard !der.isEmpty, der.count <= Self.maximumDERBytes else { throw FTError.limit("source_key.der") }
         var document = LegacyECDSADERReader(der)
         var root = LegacyECDSADERReader(try document.read(tag: 0x30))
         try document.finish()

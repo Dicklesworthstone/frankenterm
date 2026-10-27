@@ -5,7 +5,7 @@ public enum OpenSSHSourceKeyError: Error, Equatable, Sendable, LocalizedError {
     case passphraseRequired, incorrectPassphraseOrDamagedKey, identityMismatch, attemptsExhausted
     public var errorDescription: String? {
         switch self {
-        case .passphraseRequired: return "Enter the passphrase for this selected OpenSSH key file."
+        case .passphraseRequired: return "Enter the passphrase for this selected private key file."
         case .incorrectPassphraseOrDamagedKey: return "The passphrase is incorrect or the selected key file is damaged."
         case .identityMismatch: return "The selected key does not match the approved workspace identity."
         case .attemptsExhausted: return "This key file reached the unlock-attempt limit. Choose the file again to start a new attempt."
@@ -181,16 +181,35 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
         public let credentialID: String
         public let algorithm: String
         public let fingerprint: String
-        public let bcryptRounds: UInt32
+        public let protection: SourceKeyProtection
+        public var bcryptRounds: UInt32? {
+            if case let .openSSH(rounds) = protection { return rounds }
+            return nil
+        }
         public let attemptsRemaining: Int
     }
     public enum Selection: Sendable, CustomDebugStringConvertible {
         case ready(PrivateKeyRecord), passphraseRequired(Request)
         public var debugDescription: String { "OpenSSHSourceKeyUnlocker.Selection([redacted])" }
     }
+    private enum Source: Sendable {
+        case openSSH(OpenSSHSourceKey), encryptedPKCS8(EncryptedPKCS8SourceKey)
+        var protection: SourceKeyProtection? {
+            switch self {
+            case let .openSSH(source): source.bcryptRounds.map { .openSSH(bcryptRounds: $0) }
+            case let .encryptedPKCS8(source): source.protection
+            }
+        }
+        func unlock(passphrase: Data, credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
+            switch self {
+            case let .openSSH(source): try source.unlock(passphrase: passphrase, credentialID: credentialID, using: crypto)
+            case let .encryptedPKCS8(source): try source.unlock(passphrase: passphrase, credentialID: credentialID, using: crypto)
+            }
+        }
+    }
     private struct Pending: Sendable {
         let id: UUID
-        let source: OpenSSHSourceKey
+        let source: Source
         let reference: WorkspaceDocument.Credential
         var attempts = 0
     }
@@ -200,24 +219,36 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
     public init(using crypto: C) { self.crypto = crypto }
 
     public var request: Request? {
-        guard let pending, let rounds = pending.source.bcryptRounds else { return nil }
+        guard let pending, let protection = pending.source.protection else { return nil }
         return .init(id: pending.id, credentialID: pending.reference.id, algorithm: pending.reference.algorithm,
-                     fingerprint: pending.reference.fingerprint, bcryptRounds: rounds,
+                     fingerprint: pending.reference.fingerprint, protection: protection,
                      attemptsRemaining: Self.maximumAttempts - pending.attempts)
     }
 
-    /// The untrusted public header must match the explicit approved reference
-    /// before any password prompt; the private-derived identity is still checked
-    /// after decryption. Selecting another file retires the previous request.
+    /// An OpenSSH public header must match the approved reference before a
+    /// prompt. Encrypted PKCS#8 hides that identity, so its request describes
+    /// only the expected reference. Every decrypted key must match it before
+    /// admission. Selecting another file retires the previous request.
     public mutating func select(pem: Data, reference: WorkspaceDocument.Credential) throws -> Selection {
         pending = nil
         try Task.checkCancellation()
-        let source = try OpenSSHSourceKey(pem: pem, using: crypto)
-        guard source.algorithm == reference.algorithm, source.fingerprint(using: crypto) == reference.fingerprint else {
-            throw OpenSSHSourceKeyError.identityMismatch
-        }
-        if !source.isEncrypted {
-            return .ready(try source.unlock(credentialID: reference.id, using: crypto))
+        let source: Source
+        if EncryptedPKCS8SourceKey.recognizes(pem) {
+            let encrypted = try EncryptedPKCS8SourceKey(pem: pem)
+            guard reference.algorithm == "ssh-rsa"
+                || SSHECDSACurve.allCases.contains(where: { $0.algorithm == reference.algorithm }) else {
+                throw FTError.unsupported("source_key.family")
+            }
+            source = .encryptedPKCS8(encrypted)
+        } else {
+            let openSSH = try OpenSSHSourceKey(pem: pem, using: crypto)
+            guard openSSH.algorithm == reference.algorithm, openSSH.fingerprint(using: crypto) == reference.fingerprint else {
+                throw OpenSSHSourceKeyError.identityMismatch
+            }
+            if !openSSH.isEncrypted {
+                return .ready(try openSSH.unlock(credentialID: reference.id, using: crypto))
+            }
+            source = .openSSH(openSSH)
         }
         try Task.checkCancellation()
         pending = .init(id: UUID(), source: source, reference: reference)
@@ -239,7 +270,8 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
         do {
             let key = try selected.source.unlock(passphrase: passphrase, credentialID: selected.reference.id, using: crypto)
             try Task.checkCancellation()
-            guard "SHA256:" + crypto.sha256(key.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "")
+            guard try SSHPublicIdentity(blob: key.publicBlob).algorithm == selected.reference.algorithm,
+                  "SHA256:" + crypto.sha256(key.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "")
                     == selected.reference.fingerprint else { throw OpenSSHSourceKeyError.identityMismatch }
             pending = nil
             return key

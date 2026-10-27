@@ -246,12 +246,15 @@ final class TerminalSessionControllerTests: XCTestCase {
         let relaunch: () async throws -> LiveScene
     }
 
-    /// `relayPort` routes the machines through a relay to the live sshd.
+    /// `relayPort` routes the machines through a relay to the live sshd. Existing
+    /// input tests explicitly start in interactive mode; observer tests exercise
+    /// the app's View Only default separately.
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
                            creation: TerminalSessionCreation = .onSelect,
                            muxCommand: String? = nil, directAfterMux: Bool = false,
                            machineIDs: [String] = ["alpha", "beta"],
-                           autoConnect: Bool = false, relayPort: UInt16? = nil) async throws -> LiveScene {
+                           autoConnect: Bool = false, relayPort: UInt16? = nil,
+                           initialMuxAccessMode: TerminalMuxAccessMode = .interactive) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
         guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init), let user = environment["FT_LIVE_SSH_USER"],
               let pem = environment["FT_LIVE_SSH_KEY_PEM_B64"].flatMap({ Data(base64Encoded: $0) }),
@@ -291,7 +294,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             let scene = try WorkspaceTerminalScene(workspaceID: installed.id, revision: installed.revision,
                                                    workspaceName: "Scene", machines: machines, initialMachineID: "alpha",
                                                    connections: connections, autoConnect: autoConnect,
-                                                   watchesNetworkPath: false)
+                                                   watchesNetworkPath: false, initialMuxAccessMode: initialMuxAccessMode)
             try await appear(scene, selecting: "alpha")
             return LiveScene(connections: connections, scene: scene, outPath: outPath, relaunch: launch)
         }
@@ -1562,9 +1565,9 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A machine whose mux attachment dropped reattaches by itself, but if its
-    /// mux is gone by then, no shell opens in its place: it waits, signed in on
-    /// its direct route, for New Session. Needs the disposable mux.
-    func testAMachineWhoseMuxIsGoneAfterADropWaitsForNewSession() async throws {
+    /// mux is gone by then, that exact existing-session intent fails without
+    /// replacing it with a direct shell. Needs the disposable mux.
+    func testAMachineWhoseMuxIsGoneAfterADropKeepsItsExistingSessionIntent() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let sshPort = environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init),
               let command = environment["FT_LIVE_MUX_COMMAND"], let outPath = environment["FT_LIVE_SSH_OUT"] else {
@@ -1597,17 +1600,107 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await relay.up()
         for _ in 0..<400 {
             if let session = scene.sessions["alpha"], session !== first,
-               session.phase == .ready || session.phase == .live { break }
+               session.phase == .failed(TerminalSessionController.describe(TerminalMuxError.unavailable)) { break }
             try await Task.sleep(for: .milliseconds(50))
         }
         // Nothing opens later either.
         try await Task.sleep(for: .seconds(2))
         let back = try XCTUnwrap(scene.sessions["alpha"])
-        XCTAssertEqual(back.phase, .ready, "signed in, with no shell opened in place of the mux")
-        XCTAssertTrue(back.shellOnly, "on the direct route")
-        XCTAssertTrue(scene.requiresNewSession("alpha"), "a new shell waits for New Session")
+        XCTAssertEqual(back.phase, .failed(TerminalSessionController.describe(TerminalMuxError.unavailable)))
+        XCTAssertTrue(back.requiresExistingMux)
+        XCTAssertFalse(back.shellOnly, "A dropped shared terminal keeps its existing mux route")
+        XCTAssertTrue(back.route.mux)
+        XCTAssertNil(back.terminal)
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    func testSharedMuxViewOnlyNeedsAnExplicitSettledReconnectBeforeInput() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux")
+        }
+        let live = try await liveScene(muxCommand: command, machineIDs: ["alpha"], initialMuxAccessMode: .viewOnly)
+        let scene = live.scene, observer = try await connect(live.scene, "alpha")
+        XCTAssertEqual(observer.phase, .live)
+        XCTAssertTrue(observer.attachedToMux); XCTAssertTrue(observer.requiresExistingMux)
+        XCTAssertTrue(observer.isViewingOnly)
+        let original = try shown(observer)
+        XCTAssertTrue(original.input.isReadOnly)
+        XCTAssertFalse(original.input.canBecomeFirstResponder)
+        XCTAssertFalse(original.input.canReviewPaste)
+        XCTAssertTrue(original.renderer.configuration.fitsRemoteGrid)
+        await scene.activateKeyboard()
+        original.requestKeyboard(true)
+        original.input.insertText("must not type")
+        XCTAssertFalse(original.input.isFirstResponder)
+        let pending = await live.connections.coordinator.accounting()
+        XCTAssertEqual(pending.retainedBytes, 0); XCTAssertEqual(pending.retainedRecords, 0)
+        original.removeFromSuperview()
+
+        scene.reconnectMux(.interactive, machineID: "alpha", controllerID: observer.id)
+        for _ in 0..<400 where scene.sessions["alpha"] === observer || scene.sessions["alpha"]?.phase != .live {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let interactive = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertTrue(observer.settled, "The old native owner settled before mode authority changed")
+        XCTAssertTrue(observer.requiresExistingMux, "Stop preserves the successful existing-mux intent")
+        XCTAssertNotEqual(interactive.id, observer.id)
+        XCTAssertEqual(interactive.muxAccessMode, .interactive)
+        XCTAssertTrue(interactive.requiresExistingMux); XCTAssertFalse(interactive.isViewingOnly)
+        let active = try shown(interactive)
+        XCTAssertFalse(active.input.isReadOnly)
+        XCTAssertFalse(active.renderer.configuration.fitsRemoteGrid)
+        let marker = "OBSERVER-CONTROL-\(UUID().uuidString.prefix(8))"
+        try await type("echo \(marker) > \(live.outPath)", into: active)
+        let received = try await hostFile(live.outPath, containing: marker)
+        XCTAssertTrue(received.contains(marker), "Explicit Use Terminal reaches the existing shared pane")
+        active.removeFromSuperview()
+        // A stale confirmation from the first observer cannot replace its new owner.
+        scene.reconnectMux(.viewOnly, machineID: "alpha", controllerID: observer.id)
+        XCTAssertTrue(scene.sessions["alpha"] === interactive)
+        scene.reconnectMux(.viewOnly, machineID: "alpha", controllerID: interactive.id)
+        for _ in 0..<400 where scene.sessions["alpha"] === interactive || scene.sessions["alpha"]?.phase != .live {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let returned = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertTrue(interactive.settled); XCTAssertTrue(returned.isViewingOnly)
+        XCTAssertTrue(returned.requiresExistingMux)
+        await scene.close()
+        await assertReleased(observer, connections: live.connections)
+        await assertReleased(interactive, connections: live.connections)
+        await assertReleased(returned, connections: live.connections)
+    }
+
+    func testFormerMuxAttachmentNeverCreatesAShellWhenItsMuxIsMissingAfterStop() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let command = env["FT_LIVE_MUX_COMMAND"], let outPath = env["FT_LIVE_SSH_OUT"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND and TEST_RUNNER_FT_LIVE_SSH_OUT")
+        }
+        for mode in [TerminalMuxAccessMode.viewOnly, .interactive] {
+            // This disposable relay command answers exactly its first attachment.
+            // Neither terminal types a command to arrange the failure.
+            let once = "\(outPath).mux-once-\(UUID().uuidString.prefix(8))"
+            let live = try await liveScene(muxCommand: "test ! -e \(once) && { : > \(once); \(command); }",
+                directAfterMux: true, machineIDs: ["alpha"], initialMuxAccessMode: mode)
+            let scene = live.scene, first = try await connect(live.scene, "alpha")
+            XCTAssertEqual(first.phase, .live); XCTAssertEqual(first.isViewingOnly, mode == .viewOnly)
+            XCTAssertTrue(first.requiresExistingMux)
+            scene.disconnect("alpha", expectedControllerID: first.id)
+            await first.stop()
+            XCTAssertTrue(first.settled); XCTAssertTrue(first.requiresExistingMux)
+            let replacement = try await connect(scene, "alpha")
+            for _ in 0..<200 where !replacement.settled { try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertNotEqual(replacement.id, first.id)
+            XCTAssertTrue(replacement.requiresExistingMux)
+            XCTAssertEqual(replacement.muxAccessMode, mode)
+            XCTAssertEqual(replacement.phase, .failed(TerminalSessionController.describe(TerminalMuxError.unavailable)))
+            XCTAssertFalse(replacement.shellOnly, "An existing mux must not become a direct SSH shell")
+            XCTAssertTrue(replacement.route.mux)
+            XCTAssertNil(replacement.terminal)
+            await scene.close()
+            await assertReleased(first, connections: live.connections)
+            await assertReleased(replacement, connections: live.connections)
+        }
     }
 
     /// A network change while a machine is live gives its next drop a new
@@ -2525,6 +2618,16 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(pending, 0)
         XCTAssertTrue(records.isEmpty)
         await scene.close()
+    }
+
+    func testWorkspaceSceneStartsSharedTerminalIntentInViewOnly() async throws {
+        let (connections, scene, _) = try dormantScene()
+        scene.connect("machine")
+        let controller = try XCTUnwrap(scene.sessions["machine"])
+        XCTAssertEqual(controller.muxAccessMode, .viewOnly)
+        XCTAssertFalse(controller.requiresExistingMux, "Generic Connect can still discover a direct-only machine")
+        await scene.close()
+        await assertReleased(controller, connections: connections)
     }
 
     func testConcurrentSceneClosesJoinAndPreventScheduledConnectionStartup() async throws {

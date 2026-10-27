@@ -123,6 +123,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// A user retry may replace an ended owner once its cleanup has joined;
     /// imported warm-up intent alone never restarts an authentication failure.
     @ObservationIgnored private var requestedConnections: Set<String> = []
+    /// Local choices survive reconnects in this scene. A fresh scene begins
+    /// shared panes in View Only; these are not restorable server leases.
+    @ObservationIgnored private var muxAccessSelections: [String: TerminalMuxAccessMode] = [:]
+    @ObservationIgnored private let initialMuxAccessMode: TerminalMuxAccessMode
+    @ObservationIgnored private var existingMuxRequired: Set<String> = []
+    private(set) var changingMuxModes: Set<String> = []
+    @ObservationIgnored private var muxModeJobs: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     /// False disables group warming and automatic retries; explicit actions
     /// still use the same bounded scheduler (also useful to hosted tests).
     @ObservationIgnored private let autoConnect: Bool
@@ -132,9 +139,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     init(workspaceID: UUID, revision: UUID, workspaceName: String, machines: [SceneMachine],
          initialMachineID: String, connections: MobileConnections,
          initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true,
-         maximumRetainedConnections: Int = 16, watchesNetworkPath: Bool = true) throws {
+         maximumRetainedConnections: Int = 16, watchesNetworkPath: Bool = true,
+         initialMuxAccessMode: TerminalMuxAccessMode = .viewOnly) throws {
         self.workspaceID = workspaceID; self.revision = revision; self.autoConnect = autoConnect
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
+        self.initialMuxAccessMode = initialMuxAccessMode
         residency = try .init(limit: maximumRetainedConnections)
         connectionIntent = try TerminalConnectionIntent(
             machines: machines.map { .init(id: $0.id, autoConnect: $0.autoConnect) },
@@ -810,7 +819,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
             reconnectingFrom: preservingSuccessfulCandidate ? previous : nil,
             retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : previous,
-            inputDelivery: previous?.inputDelivery ?? .init())
+            inputDelivery: previous?.inputDelivery ?? .init(),
+            muxAccessMode: muxAccessSelections[machineID] ?? previous?.muxAccessMode ?? initialMuxAccessMode,
+            requiresExistingMux: existingMuxRequired.contains(machineID) || previous?.requiresExistingMux == true)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
             // Releasing an unused sign-in did not end a remote terminal and
@@ -874,6 +885,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Ends a machine's session; it stays disconnected until Connect.
     func disconnect(_ machineID: String, expectedControllerID: UUID? = nil) {
         guard !closed, expectedControllerID == nil || sessions[machineID]?.id == expectedControllerID else { return }
+        muxModeJobs.removeValue(forKey: machineID)?.task.cancel()
+        changingMuxModes.remove(machineID)
         do { try connectionIntent.disconnect(machineID) }
         catch { report(error); return }
         requestedConnections.remove(machineID)
@@ -889,6 +902,30 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func disconnectAll() {
         for machine in machines where machine.target != nil { disconnect(machine.id) }
+    }
+
+    /// A mode change never changes authority under already admitted input.
+    /// The old connection settles first; its uncertainty remains visible on
+    /// the replacement, and an absent mux cannot become a new SSH shell.
+    func reconnectMux(_ mode: TerminalMuxAccessMode, machineID: String, controllerID: UUID) {
+        guard permitsTerminalCreation, let session = sessions[machineID], session.id == controllerID,
+              session.phase == .live, session.attachedToMux, session.muxAccessMode != mode,
+              !session.clipboardIsPresenting, !session.localInputNeedsDecision,
+              muxModeJobs[machineID] == nil else { return }
+        disconnect(machineID, expectedControllerID: controllerID)
+        muxAccessSelections[machineID] = mode
+        existingMuxRequired.insert(machineID)
+        changingMuxModes.insert(machineID)
+        let id = UUID()
+        let task = Task { [weak self, session] in
+            await session.stop()
+            guard let self, self.muxModeJobs[machineID]?.id == id else { return }
+            self.muxModeJobs[machineID] = nil; self.changingMuxModes.remove(machineID)
+            guard !Task.isCancelled, self.permitsTerminalCreation,
+                  self.sessions[machineID] === session, session.settled else { return }
+            self.requestConnection(machineID, terminal: true)
+        }
+        muxModeJobs[machineID] = (id, task)
     }
 
     /// Three operations at most prepare approved machines, selected first.
@@ -1083,8 +1120,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               sessions[selection.machineID]?.phase == .live,
               source == nil || bindings[selection.machineID]?.source == source,
               showKeyboard || selectedSession?.terminal?.isSceneActive == true else { return }
+        let displayKeyboard = showKeyboard && selectedSession?.isViewingOnly != true
         if navigation.phase == .ready, owner.keyboard?.acceptsInput == true {
-            if showKeyboard { selectedSession?.terminal?.requestKeyboard(true) }
+            if displayKeyboard { selectedSession?.terminal?.requestKeyboard(true) }
             return
         }
         guard navigation.phase == .inactive else { return }
@@ -1098,7 +1136,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               showKeyboard || (selectedSession?.terminal?.isSceneActive == true
                   && selectedSession?.terminal?.sceneActivityGeneration == activity) else { return }
         let request = UUID()
-        keyboardPresentation = (request, selection, showKeyboard)
+        keyboardPresentation = (request, selection, displayKeyboard)
         defer { if keyboardPresentation?.id == request { keyboardPresentation = nil } }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
@@ -1121,6 +1159,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         canvasGeneration = UUID()
         pathMonitor?.cancel(); pathMonitor = nil
         cancelReconnects()
+        for job in muxModeJobs.values { job.task.cancel() }
         for job in controllerJobs.values { job.task.cancel() }
         navigation.suspend()
         for controller in sessions.values {
@@ -1137,6 +1176,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let controllers = Array(sessions.values), navigation = self.navigation
         let reconnects = reconnectJobs.values.map(\.task)
         let operations = controllerJobs.values.map(\.task)
+        let modeChanges = muxModeJobs.values.map(\.task)
         let overview = overviewJob?.task
         let appearance = groupAppearanceJob?.task
         let release = capacityReleaseJob
@@ -1147,6 +1187,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             for reconnect in reconnects { await reconnect.value }
             for controller in controllers { await controller.stop() }
             for operation in operations { await operation.value }
+            for change in modeChanges { await change.value }
             await navigation.joinSuspension()
         }
         closing = job
@@ -1344,6 +1385,7 @@ struct WorkspaceTerminalScreen: View {
     @State private var retainedOutput: TerminalRetainedOutput?
     /// A machine attached to its mux searches its panes' history on the server.
     @State private var muxSearch: TerminalSessionController?
+    @State private var useTerminalReview: TerminalSessionController?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -1356,6 +1398,7 @@ struct WorkspaceTerminalScreen: View {
         VStack(spacing: 0) {
             MachineStrip(scene: scene).environment(\.colorScheme, chrome)
             if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
+                muxAccessBar(session).environment(\.colorScheme, chrome)
                 PaneStrip(session: session, state: mux,
                           accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
                           onKeyboard: { Task { await scene.activateKeyboard() } })
@@ -1403,6 +1446,17 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
         .sheet(item: $muxSearch) { session in MuxSearchScreen(session: session) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
+        .confirmationDialog("Use this shared terminal?",
+            isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
+            titleVisibility: .visible, presenting: useTerminalReview) { session in
+                Button("Reconnect and Use Terminal") {
+                    scene.reconnectMux(.interactive, machineID: session.target.machineID, controllerID: session.id)
+                    useTerminalReview = nil
+                }
+                Button("Keep Viewing", role: .cancel) { useTerminalReview = nil }
+            } message: { session in
+                Text("Reconnect to \(session.target.machineName) to type, paste and use the mouse. Its shared pane will resize to fit this phone. Other connected clients can still type and resize it.")
+            }
         .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
             if !visible { scene.dismissOverview() }
         }), onDismiss: { if let overviewSessionID { scene.finishOverviewDismissal(overviewSessionID) } }) {
@@ -1445,14 +1499,14 @@ struct WorkspaceTerminalScreen: View {
                     .keyboardShortcut("f", modifiers: .command)
                     .accessibilityIdentifier("terminal.history.open")
                 Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
-                    .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
+                    .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
                     // ⇧⌘D is the canvas's key command: a SwiftUI shortcut on a
                     // button inside this menu never fired (UI test 3).
                     Button("Compose Command", systemImage: "square.and.pencil") { session.composeCommand() }
-                        .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
+                        .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
                         .accessibilityIdentifier("terminal.command.open")
                     Button("Select Output", systemImage: "doc.on.doc") { session.inspectOutput() }
                         .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
@@ -1493,6 +1547,28 @@ struct WorkspaceTerminalScreen: View {
             } label: { Label("More", systemImage: "ellipsis.circle") }
                 .accessibilityIdentifier("terminal.more")
         }
+    }
+
+    private func muxAccessBar(_ session: TerminalSessionController) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Label(session.isViewingOnly ? "View Only" : "Using Shared Terminal",
+                      systemImage: session.isViewingOnly ? "eye" : "keyboard").font(.caption.weight(.semibold))
+                Text(session.isViewingOnly ? "Shared size · Input is off" : "Phone size · Other clients may also interact")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button(session.isViewingOnly ? "Use Terminal" : "View Only") {
+                if session.isViewingOnly { useTerminalReview = session }
+                else { scene.reconnectMux(.viewOnly, machineID: session.target.machineID, controllerID: session.id) }
+            }
+            .font(.caption.weight(.semibold)).buttonStyle(.bordered)
+            .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision
+                || scene.changingMuxModes.contains(session.target.machineID))
+            .accessibilityIdentifier("terminal.mux.access.change")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6).background(.thinMaterial)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("terminal.mux.access")
     }
 
     private func inputRecoveryBanner(_ recovery: TerminalKeyboardRecovery, session: TerminalSessionController) -> some View {
@@ -1867,16 +1943,18 @@ private struct PaneStrip: View {
                     withAnimation(.snappy) { proxy.scrollTo(shown, anchor: .center) }
                 }
             }
-            Button(action: onKeyboard) {
-                Image(systemName: state.mouseGrabbed ? "keyboard.badge.ellipsis" : "keyboard")
-                    .font(.callout)
-                    .foregroundStyle(state.mouseGrabbed ? accent : Color.primary.opacity(0.7))
-                    .frame(width: 44, height: 36)
-                    .contentShape(Rectangle())
+            if !session.isViewingOnly {
+                Button(action: onKeyboard) {
+                    Image(systemName: state.mouseGrabbed ? "keyboard.badge.ellipsis" : "keyboard")
+                        .font(.callout)
+                        .foregroundStyle(state.mouseGrabbed ? accent : Color.primary.opacity(0.7))
+                        .frame(width: 44, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Show keyboard")
+                .accessibilityHint(state.mouseGrabbed ? "Taps on this program are clicks." : "")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Show keyboard")
-            .accessibilityHint(state.mouseGrabbed ? "Taps on this program are clicks." : "")
         }
         .background(.ultraThinMaterial.opacity(0.85))
         .sensoryFeedback(.selection, trigger: state.shown)
@@ -2011,6 +2089,7 @@ private final class WorkspaceCanvasView: UIView {
     }
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { scene?.selectedSession?.isViewingOnly == true }
 
     @objc private func tapped() {
         // A live terminal handles its own taps: the keyboard, a selection.
@@ -2029,7 +2108,7 @@ private final class WorkspaceCanvasView: UIView {
     override var keyCommands: [UIKeyCommand]? {
         guard let scene else { return nil }
         var commands: [UIKeyCommand] = []
-        if let session = scene.selectedSession, session.phase == .live, session.terminal != nil {
+        if let session = scene.selectedSession, session.phase == .live, session.terminal != nil, !session.isViewingOnly {
             commands.append(UIKeyCommand(title: "Compose Command", action: #selector(composeCommand),
                                          input: "d", modifierFlags: [.command, .shift]))
         }
@@ -2061,6 +2140,10 @@ private final class WorkspaceCanvasView: UIView {
     /// Switching machines cross-fades between their terminals.
     func show(_ terminal: NativeTerminalView?) {
         terminal?.keyboardHolder = keyboardHolder
+        if terminal?.input.isReadOnly == true {
+            keyboardHolder.release()
+            if !isFirstResponder { _ = becomeFirstResponder() }
+        } else if isFirstResponder { _ = resignFirstResponder() }
         // A machine whose terminal is on its way takes the keyboard when it
         // comes (or the holder's deadline lets it go); its page takes none.
         if terminal == nil, scene?.selectedSession.map({ $0.phase == .idle }) ?? true { keyboardHolder.release() }
