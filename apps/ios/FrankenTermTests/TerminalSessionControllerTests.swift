@@ -2302,8 +2302,13 @@ final class TerminalSessionControllerTests: XCTestCase {
                 .map { $0.split(separator: " ").compactMap { Int($0) } }.filter { $0.count == 2 }
         }
         let phoneSize = [small.rows, small.columns]
-        for _ in 0..<200 where !(sizes().contains { $0[1] > 250 } && sizes().last == phoneSize) {
-            try await Task.sleep(for: .milliseconds(50))
+        func askedBack() -> Bool { sizes().contains { $0[1] > 250 } && sizes().last == phoneSize }
+        // The shell reads the size when its WINCH trap runs, which can be after
+        // the phone already asked the pane back. A wider layout tries again;
+        // the second device sends it only if its first request settled.
+        for width in [1376.0, 1440, 1504] where !askedBack() {
+            if width > 1376 { large.frame = CGRect(x: 0, y: 0, width: width, height: 1032) }
+            for _ in 0..<200 where !askedBack() { try await Task.sleep(for: .milliseconds(50)) }
         }
         XCTAssertTrue(sizes().contains { $0[1] > 250 }, "the second device gave the pane its size (\(sizes()))")
         XCTAssertEqual(sizes().last, phoneSize, "the phone asked its pane back (\(sizes()))")

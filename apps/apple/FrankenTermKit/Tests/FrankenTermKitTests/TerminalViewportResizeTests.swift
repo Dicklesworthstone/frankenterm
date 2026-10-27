@@ -76,6 +76,27 @@ final class TerminalViewportResizeTests: XCTestCase {
         try owner.didApply(geometry(90), source: source); await owner.waitUntilSettled()
         let count = await probe.count(); XCTAssertEqual(count, 1); XCTAssertFalse(owner.isPending)
     }
+    /// A mux pane can take someone else's size before, or instead of, the one
+    /// asked for. That settles the request, so the next layout is still sent.
+    func testSomeoneElsesSizeSettlesTheRequestAndTheNextLayoutIsSent() async throws {
+        let (owner, probe, source) = try setup()
+        try owner.propose(geometry(90), source: source); await owner.waitUntilSettled()
+        try owner.didApply(geometry(70), source: source)
+        XCTAssertEqual(owner.applied, try geometry(70)); XCTAssertFalse(owner.isPending)
+        try owner.propose(geometry(100), source: source); await owner.waitUntilSettled()
+        var values = await probe.requested(); XCTAssertEqual(values, try [geometry(90), geometry(100)])
+        try owner.didApply(geometry(100), source: source)
+
+        // Also while the request's admission has not returned yet.
+        await probe.configure(paused: true)
+        try owner.propose(geometry(110), source: source); try await waitForPark(probe)
+        try owner.didApply(geometry(60), source: source)
+        try owner.propose(geometry(120), source: source)
+        await probe.configure(); await probe.release(.queued)
+        await owner.waitUntilSettled(); await owner.waitUntilSettled()
+        values = await probe.requested()
+        XCTAssertEqual(values, try [geometry(90), geometry(100), geometry(110), geometry(120)])
+    }
     func testCompletionBeforeAdmissionReturnDoesNotLoseTheNextResize() async throws {
         let (owner, probe, source) = try setup()
         await probe.configure(paused: true)

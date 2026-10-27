@@ -42,10 +42,13 @@ public final class TerminalViewportResize<Source: Equatable & Sendable> {
 
     /// Call only after the canonical model has consumed the corresponding
     /// source-bound update. It may race the request's asynchronous return.
+    /// A mux pane can take someone else's size before, or instead of, the one
+    /// asked for. That settles the request too: waiting for the asked size
+    /// would hold every later layout behind one that may never arrive.
     public func didApply(_ geometry: TerminalSessionGeometry, source: Source) throws {
         try validate(source)
         applied = geometry
-        if flight?.geometry == geometry { flight?.completed = true }
+        if flight != nil { flight?.completed = true }
         if flight?.admitted == true, flight?.completed == true { flight = nil }
         if desired == applied, flight == nil { desired = nil }
         signalProgress()
