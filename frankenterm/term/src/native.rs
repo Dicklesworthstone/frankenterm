@@ -496,25 +496,38 @@ impl NativeTerminal {
         output: &mut [u8],
     ) -> Result<usize, NativeTerminalError> {
         self.live()?;
-        if geometry_revision == 0 || geometry_revision != self.witness.geometry_revision
+        if geometry_revision == 0
+            || geometry_revision != self.witness.geometry_revision
             || self.terminal.synchronized_output()
         {
             return Err(NativeTerminalError::Stale);
         }
         let size = self.config.size;
-        if column as usize >= size.cols || row as usize >= size.rows || modifiers & !31 != 0
+        if column as usize >= size.cols
+            || row as usize >= size.rows
+            || modifiers & !31 != 0
             || output.len() > MAX_INPUT_BYTES
         {
             return Err(NativeTerminalError::Invalid);
         }
         let (button, repetitions) = match action {
             NativeMouseAction::Click => (MouseButton::Left, 1),
-            NativeMouseAction::Wheel(steps) if steps != 0 && (-MAX_MOUSE_STEPS..=MAX_MOUSE_STEPS).contains(&steps) => {
-                (if steps < 0 { MouseButton::WheelUp(1) } else { MouseButton::WheelDown(1) }, steps.unsigned_abs() as usize)
+            NativeMouseAction::Wheel(steps)
+                if steps != 0 && (-MAX_MOUSE_STEPS..=MAX_MOUSE_STEPS).contains(&steps) =>
+            {
+                (
+                    if steps < 0 {
+                        MouseButton::WheelUp(1)
+                    } else {
+                        MouseButton::WheelDown(1)
+                    },
+                    steps.unsigned_abs() as usize,
+                )
             }
             NativeMouseAction::Wheel(_) => return Err(NativeTerminalError::Invalid),
         };
-        if self.terminal.is_mouse_grabbed() && self.terminal.mouse_uses_pixel_coordinates()
+        if self.terminal.is_mouse_grabbed()
+            && self.terminal.mouse_uses_pixel_coordinates()
             && (size.pixel_width < size.cols || size.pixel_height < size.rows)
         {
             return Err(NativeTerminalError::Unsupported);
@@ -531,8 +544,12 @@ impl NativeTerminal {
         let bytes = match action {
             NativeMouseAction::Click => self.terminal.encode_mouse_click(event),
             NativeMouseAction::Wheel(_) => self.terminal.encode_mouse_wheel(event),
-        }.map_err(|_| NativeTerminalError::Unsupported)?;
-        let count = bytes.len().checked_mul(repetitions).ok_or(NativeTerminalError::Capacity)?;
+        }
+        .map_err(|_| NativeTerminalError::Unsupported)?;
+        let count = bytes
+            .len()
+            .checked_mul(repetitions)
+            .ok_or(NativeTerminalError::Capacity)?;
         if count > output.len() {
             return Err(NativeTerminalError::Capacity);
         }
@@ -816,41 +833,94 @@ mod tests {
     fn mouse_click_is_pure_complete_mode_aware_and_capacity_atomic() {
         let mut terminal = terminal();
         let mut bytes = [0xa5; 128];
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap(), 0);
+        assert_eq!(
+            terminal
+                .encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes)
+                .unwrap(),
+            0
+        );
         terminal.feed(b"\x1b[?1000h\x1b[?1006h\x1b[6n").unwrap();
         let before = terminal.terminal.bounded_output_status().unwrap();
         let sequence = terminal.terminal.current_seqno();
         let expected = b"\x1b[<0;3;2M\x1b[<0;3;2m";
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes[..expected.len() - 1]), Err(NativeTerminalError::Capacity));
-        assert_eq!(bytes, [0xa5; 128], "a refused release must not leave a copied press");
+        assert_eq!(
+            terminal.encode_mouse(
+                NativeMouseAction::Click,
+                2,
+                1,
+                0,
+                1,
+                &mut bytes[..expected.len() - 1]
+            ),
+            Err(NativeTerminalError::Capacity)
+        );
+        assert_eq!(
+            bytes, [0xa5; 128],
+            "a refused release must not leave a copied press"
+        );
         for _ in 0..2 {
-            let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap();
+            let count = terminal
+                .encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes)
+                .unwrap();
             assert_eq!(&bytes[..count], expected);
         }
         assert_eq!(terminal.terminal.current_seqno(), sequence);
         assert_eq!(terminal.terminal.bounded_output_status().unwrap(), before);
         let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
-        assert_eq!(&bytes[..reply.bytes], b"\x1b[1;1R", "mouse encoding cannot consume parser replies");
-        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+        assert_eq!(
+            &bytes[..reply.bytes],
+            b"\x1b[1;1R",
+            "mouse encoding cannot consume parser replies"
+        );
+        terminal
+            .settle_reply(reply.sequence, BoundedReplyDisposition::Accepted)
+            .unwrap();
         terminal.feed(b"\x1b[?1006l").unwrap();
-        let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 3, 1, &mut bytes).unwrap();
-        assert_eq!(&bytes[..count], b"\x1b[M4#\"\x1b[M##\"", "legacy release is button 3, without modifiers");
+        let count = terminal
+            .encode_mouse(NativeMouseAction::Click, 2, 1, 3, 1, &mut bytes)
+            .unwrap();
+        assert_eq!(
+            &bytes[..count],
+            b"\x1b[M4#\"\x1b[M##\"",
+            "legacy release is button 3, without modifiers"
+        );
         terminal.feed(b"\x1b[?1000l").unwrap();
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap(), 0);
+        assert_eq!(
+            terminal
+                .encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn mouse_wheel_uses_tracking_or_canonical_alternate_screen_keys() {
         let mut terminal = terminal();
         let mut bytes = [0; 256];
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Wheel(-1), 0, 0, 0, 1, &mut bytes).unwrap(), 0);
+        assert_eq!(
+            terminal
+                .encode_mouse(NativeMouseAction::Wheel(-1), 0, 0, 0, 1, &mut bytes)
+                .unwrap(),
+            0
+        );
         terminal.feed(b"\x1b[?1002h\x1b[?1006h").unwrap();
-        let count = terminal.encode_mouse(NativeMouseAction::Wheel(-2), 2, 1, 4, 1, &mut bytes).unwrap();
+        let count = terminal
+            .encode_mouse(NativeMouseAction::Wheel(-2), 2, 1, 4, 1, &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[<72;3;2M\x1b[<72;3;2M");
         terminal.feed(b"\x1b[?1002l\x1b[?1049h\x1b[?1h").unwrap();
-        let count = terminal.encode_mouse(NativeMouseAction::Wheel(2), 0, 0, 0, 2, &mut bytes).unwrap();
+        let count = terminal
+            .encode_mouse(NativeMouseAction::Wheel(2), 0, 0, 0, 2, &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB");
-        assert_eq!(terminal.terminal.bounded_output_status().unwrap().pending_input_bytes, 0);
+        assert_eq!(
+            terminal
+                .terminal
+                .bounded_output_status()
+                .unwrap()
+                .pending_input_bytes,
+            0
+        );
     }
 
     #[test]
@@ -858,25 +928,73 @@ mod tests {
         let mut terminal = terminal();
         terminal.feed(b"\x1b[?1000h\x1b[?1016h").unwrap();
         let mut bytes = [0xa5; 128];
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes), Err(NativeTerminalError::Unsupported));
+        assert_eq!(
+            terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes),
+            Err(NativeTerminalError::Unsupported)
+        );
         let mut size = terminal.config().size;
-        size.pixel_width = 120; size.pixel_height = 60;
+        size.pixel_width = 120;
+        size.pixel_height = 60;
         terminal.resize(size).unwrap();
         for (action, column, row, geometry, expected) in [
-            (NativeMouseAction::Click, 2, 1, 1, NativeTerminalError::Stale),
-            (NativeMouseAction::Click, 12, 1, 2, NativeTerminalError::Invalid),
-            (NativeMouseAction::Click, 2, 3, 2, NativeTerminalError::Invalid),
-            (NativeMouseAction::Wheel(0), 2, 1, 2, NativeTerminalError::Invalid),
-            (NativeMouseAction::Wheel(i32::MIN), 2, 1, 2, NativeTerminalError::Invalid),
-            (NativeMouseAction::Wheel(33), 2, 1, 2, NativeTerminalError::Invalid),
+            (
+                NativeMouseAction::Click,
+                2,
+                1,
+                1,
+                NativeTerminalError::Stale,
+            ),
+            (
+                NativeMouseAction::Click,
+                12,
+                1,
+                2,
+                NativeTerminalError::Invalid,
+            ),
+            (
+                NativeMouseAction::Click,
+                2,
+                3,
+                2,
+                NativeTerminalError::Invalid,
+            ),
+            (
+                NativeMouseAction::Wheel(0),
+                2,
+                1,
+                2,
+                NativeTerminalError::Invalid,
+            ),
+            (
+                NativeMouseAction::Wheel(i32::MIN),
+                2,
+                1,
+                2,
+                NativeTerminalError::Invalid,
+            ),
+            (
+                NativeMouseAction::Wheel(33),
+                2,
+                1,
+                2,
+                NativeTerminalError::Invalid,
+            ),
         ] {
-            assert_eq!(terminal.encode_mouse(action, column, row, 0, geometry, &mut bytes), Err(expected));
+            assert_eq!(
+                terminal.encode_mouse(action, column, row, 0, geometry, &mut bytes),
+                Err(expected)
+            );
             assert_eq!(bytes, [0xa5; 128]);
         }
-        let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes).unwrap();
+        let count = terminal
+            .encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[<0;26;31M\x1b[<0;26;31m");
         terminal.feed(b"\x1b[?2026h").unwrap();
-        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes), Err(NativeTerminalError::Stale));
+        assert_eq!(
+            terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes),
+            Err(NativeTerminalError::Stale)
+        );
     }
 
     #[test]
@@ -888,12 +1006,15 @@ mod tests {
             u32::from_le_bytes(bytes[12..16].try_into().unwrap()) & flag
         };
         assert_eq!(captured_flag(&mut terminal), 0);
-        let mut size = terminal.config().size; size.cols = 300;
+        let mut size = terminal.config().size;
+        size.cols = 300;
         terminal.resize(size).unwrap();
         terminal.feed(b"\x1b[?1003h\x1b[?1005h").unwrap();
         assert_eq!(captured_flag(&mut terminal), flag);
         let mut bytes = [0; 128];
-        let count = terminal.encode_mouse(NativeMouseAction::Click, 250, 0, 0, 2, &mut bytes).unwrap();
+        let count = terminal
+            .encode_mouse(NativeMouseAction::Click, 250, 0, 0, 2, &mut bytes)
+            .unwrap();
         assert_eq!(&bytes[..count], b"\x1b[M \xc4\x9b!\x1b[M#\xc4\x9b!");
         terminal.feed(b"\x1b[?1003l").unwrap();
         assert_eq!(captured_flag(&mut terminal), 0);

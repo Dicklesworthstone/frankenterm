@@ -1503,7 +1503,11 @@ fn encode_frame(
         | if term.get_reverse_video() { 2 } else { 0 }
         | if term.is_alt_screen_active() { 4 } else { 0 }
         | if term.synchronized_output() { 8 } else { 0 }
-        | if term.is_mouse_grabbed() { RENDER_FRAME_FLAG_MOUSE_GRABBED } else { 0 }
+        | if term.is_mouse_grabbed() {
+            RENDER_FRAME_FLAG_MOUSE_GRABBED
+        } else {
+            0
+        }
         | RENDER_FRAME_FLAG_HISTORY
         | RENDER_FRAME_FLAG_SOFT_WRAPS;
     put_u32(&mut bytes, 12, flags);

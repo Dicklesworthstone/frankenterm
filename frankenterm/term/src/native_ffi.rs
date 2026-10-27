@@ -17,9 +17,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::native::{
-    NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig, NativeTerminalError as Error,
-    BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_REPLY_BYTES,
-    MAX_TEXT_BYTES,
+    NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig,
+    NativeTerminalError as Error, BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES,
+    MAX_INPUT_BYTES, MAX_REPLY_BYTES, MAX_TEXT_BYTES,
 };
 use crate::{BoundedReplyDisposition, TerminalSize};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
@@ -523,7 +523,12 @@ pub unsafe extern "C" fn ft_terminal_v1_encode_mouse(
         };
         let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
         let count = registry.session(session)?.encode_mouse(
-            action, column, row, modifiers, geometry_revision, output,
+            action,
+            column,
+            row,
+            modifiers,
+            geometry_revision,
+            output,
         )?;
         unsafe {
             output_scalar(written, count as u32)?;
@@ -892,17 +897,93 @@ mod tests {
         unsafe {
             assert_eq!(ft_terminal_v1_create(&config(), &mut session), 0);
             let modes = b"\x1b[?1000h\x1b[?1006h";
-            assert_eq!(ft_terminal_v1_feed(session, modes.as_ptr(), modes.len() as u32), 0);
-            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 9, &mut written), Error::Capacity as u32);
-            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
-            assert_eq!(ft_terminal_v1_encode_mouse(session, 2, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), Error::Invalid as u32);
-            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
-            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 2, bytes.as_mut_ptr(), 64, &mut written), Error::Stale as u32);
-            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
-            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), 0);
+            assert_eq!(
+                ft_terminal_v1_feed(session, modes.as_ptr(), modes.len() as u32),
+                0
+            );
+            assert_eq!(
+                ft_terminal_v1_encode_mouse(
+                    session,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    1,
+                    bytes.as_mut_ptr(),
+                    9,
+                    &mut written
+                ),
+                Error::Capacity as u32
+            );
+            assert_eq!(written, 0);
+            assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(
+                ft_terminal_v1_encode_mouse(
+                    session,
+                    2,
+                    0,
+                    1,
+                    1,
+                    0,
+                    1,
+                    bytes.as_mut_ptr(),
+                    64,
+                    &mut written
+                ),
+                Error::Invalid as u32
+            );
+            assert_eq!(written, 0);
+            assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(
+                ft_terminal_v1_encode_mouse(
+                    session,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    2,
+                    bytes.as_mut_ptr(),
+                    64,
+                    &mut written
+                ),
+                Error::Stale as u32
+            );
+            assert_eq!(written, 0);
+            assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(
+                ft_terminal_v1_encode_mouse(
+                    session,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    1,
+                    bytes.as_mut_ptr(),
+                    64,
+                    &mut written
+                ),
+                0
+            );
             assert_eq!(&bytes[..written as usize], b"\x1b[<0;2;2M\x1b[<0;2;2m");
             assert_eq!(ft_terminal_v1_release(session), 0);
-            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), Error::Stale as u32);
+            assert_eq!(
+                ft_terminal_v1_encode_mouse(
+                    session,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    1,
+                    bytes.as_mut_ptr(),
+                    64,
+                    &mut written
+                ),
+                Error::Stale as u32
+            );
             assert_eq!(written, 0);
         }
     }

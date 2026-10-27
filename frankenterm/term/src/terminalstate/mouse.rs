@@ -105,7 +105,12 @@ impl TerminalState {
         buf
     }
 
-    fn write_mouse_report(&mut self, event: MouseEvent, button: i8, release: bool) -> anyhow::Result<()> {
+    fn write_mouse_report(
+        &mut self,
+        event: MouseEvent,
+        button: i8,
+        release: bool,
+    ) -> anyhow::Result<()> {
         let bytes = self.encode_mouse_report(event, button, release);
         self.writer.write_all(&bytes)?;
         self.writer.flush()?;
@@ -123,7 +128,10 @@ impl TerminalState {
     #[cfg(feature = "native")]
     pub(crate) fn encode_mouse_click(&self, event: MouseEvent) -> anyhow::Result<Vec<u8>> {
         if event.kind != MouseEventKind::Press
-            || !matches!(event.button, MouseButton::Left | MouseButton::Middle | MouseButton::Right)
+            || !matches!(
+                event.button,
+                MouseButton::Left | MouseButton::Middle | MouseButton::Right
+            )
             || !self.current_mouse_buttons.is_empty()
         {
             bail!("complete mouse click requires an unowned button");
@@ -184,8 +192,11 @@ impl TerminalState {
         }
         if self.screen.is_alt_screen_active() {
             // Use the same negotiated keyboard modes as ordinary arrow keys.
-            return Ok(self.encode_key(key, KeyModifiers::NONE, true)?
-                .repeat(usize::from(self.config.alternate_buffer_wheel_scroll_speed()))
+            return Ok(self
+                .encode_key(key, KeyModifiers::NONE, true)?
+                .repeat(usize::from(
+                    self.config.alternate_buffer_wheel_scroll_speed(),
+                ))
                 .into_bytes());
         }
         Ok(Vec::new())
