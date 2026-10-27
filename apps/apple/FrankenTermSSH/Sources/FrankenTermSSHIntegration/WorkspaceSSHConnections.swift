@@ -3,15 +3,15 @@ import FrankenTermKit
 import FrankenTermSSH
 
 public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedError {
-    case offline, busy, capacity, stale, passwordHopRetryRequired
+    case offline, busy, capacity, stale, promptedHopRetryRequired
     public var errorDescription: String? {
         switch self {
         case .offline: return "Connections are paused. Resume while the app is active to connect."
         case .busy: return "This machine already has a connection or an attempt in progress."
         case .capacity: return "The connection limit has been reached. Close a session before connecting another machine."
         case .stale: return "This connection changed or closed. Select the machine again."
-        case .passwordHopRetryRequired:
-            return "The destination refused this key after a password sign-in to a jump host. Choose Retry to sign in again; the app will not automatically repeat a password prompt."
+        case .promptedHopRetryRequired:
+            return "The destination refused this key after an interactive sign-in to a jump host. Choose Retry to sign in again; the app will not automatically repeat authentication prompts."
         }
     }
 }
@@ -87,6 +87,7 @@ public actor WorkspaceSSHConnectionManager {
     /// machine's mux panes; without one every connection starts a shell.
     private let muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)?
     private let passwordPrompter: (any WorkspaceSSHPasswordPrompting)?
+    private let keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?
     private var foreground = false, requestedForeground = false, mustSuspend = false
     private var lifecycle = UUID()
     private var transition: Task<Void, Never>?
@@ -101,11 +102,13 @@ public actor WorkspaceSSHConnectionManager {
                 journal: TerminalSessionJournal, coordinator: TerminalInputCoordinator,
                 networkActivity: WorkspaceNetworkActivity = .shared, liveness: WorkspaceSSHLiveness = .standard,
                 muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
-                passwordPrompter: (any WorkspaceSSHPasswordPrompting)? = nil) {
+                passwordPrompter: (any WorkspaceSSHPasswordPrompting)? = nil,
+                keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)? = nil) {
         self.store = store; self.broker = broker; self.journal = journal
         self.coordinator = coordinator; self.networkActivity = networkActivity; self.liveness = liveness
         self.muxClientFactory = muxClientFactory
         self.passwordPrompter = passwordPrompter
+        self.keyboardInteractivePrompter = keyboardInteractivePrompter
     }
 
     public func resume() async {
@@ -317,13 +320,15 @@ public actor WorkspaceSSHConnectionManager {
         let store = self.store, broker = self.broker, journal = self.journal
         let coordinator = self.coordinator, networkActivity = self.networkActivity, liveness = self.liveness
         let muxClientFactory = self.muxClientFactory, passwordPrompter = self.passwordPrompter
+        let keyboardInteractivePrompter = self.keyboardInteractivePrompter
         let task = Task<WorkspaceSSHConnection, Error> {
             let fingerprints = try await credentialSnapshot(machine: machine, attemptID: attemptID,
                 generation: generation, expectedRevision: expectedRevision, authentication: authentication)
             let native = try await WorkspaceNativeSSHConnection.connect(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, machineID: machineID, routeID: routeID,
                 authentication: authentication, confirmedByUser: confirmedByUser,
-                store: store, broker: broker, passwordPrompter: passwordPrompter, journal: journal, networkActivity: networkActivity,
+                store: store, broker: broker, passwordPrompter: passwordPrompter,
+                keyboardInteractivePrompter: keyboardInteractivePrompter, journal: journal, networkActivity: networkActivity,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
                 liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux)
             do {

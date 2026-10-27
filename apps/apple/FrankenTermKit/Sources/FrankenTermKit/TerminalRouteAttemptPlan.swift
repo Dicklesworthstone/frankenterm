@@ -9,10 +9,18 @@ public enum TerminalRouteAttemptPlanError: Error, Equatable, Sendable {
 public enum WorkspaceSSHAuthenticationChoice: Hashable, Sendable {
     case publicKey(String)
     case password
+    case keyboardInteractive
 
     public var credentialID: String? {
         if case let .publicKey(id) = self { return id }
         return nil
+    }
+
+    public var requiresForegroundPrompt: Bool {
+        switch self {
+        case .publicKey: false
+        case .password, .keyboardInteractive: true
+        }
     }
 
     /// Choose the first usable permitted method in the saved order. Exhausting
@@ -26,7 +34,7 @@ public enum WorkspaceSSHAuthenticationChoice: Hashable, Sendable {
                 let keys = usableCredentialIDs.filter { route.credentialIDs.contains($0) }
                 if !keys.isEmpty { return keys.map(Self.publicKey) }
             case .password: return [.password]
-            case .keyboardInteractive: continue
+            case .keyboardInteractive: return [.keyboardInteractive]
             }
         }
         return []
@@ -98,7 +106,7 @@ public struct TerminalRouteAttemptPlan: Sendable {
             throw TerminalRouteAttemptPlanError.invalidRoutes
         }
         guard routes.allSatisfy({ route in
-            (1...9).contains(route.authenticationChoices.count)
+            (1...10).contains(route.authenticationChoices.count)
                 && route.credentialIDs.count <= 8
                 && Set(route.authenticationChoices).count == route.authenticationChoices.count
                 && route.credentialIDs.allSatisfy({ !$0.isEmpty })

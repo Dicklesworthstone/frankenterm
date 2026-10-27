@@ -14,10 +14,11 @@ import FrankenTermTerminal
 final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
     struct Scope: Equatable {
         let workspaceID: UUID, revision: UUID
+        let machineID: String
         let destinationRouteIDs: Set<String>
     }
     private(set) var request: WorkspaceSSHPasswordRequest?
-    var secret = ""
+    private(set) var secret = ""
     @ObservationIgnored private var active = false
     @ObservationIgnored private var scope: Scope?
     @ObservationIgnored private var continuation: CheckedContinuation<Data, Error>?
@@ -63,8 +64,9 @@ final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
         pending?.resume(throwing: CancellationError())
     }
     var canSubmit: Bool { (1...1024).contains(secret.utf8.count) && !secret.utf8.contains(0) }
-    func editSecret(_ value: String) {
-        guard value.utf8.count <= 1024, !value.utf8.contains(0) else { return }
+    func secretValue(requestID: UUID) -> String { request?.id == requestID ? secret : "" }
+    func editSecret(_ value: String, requestID: UUID) {
+        guard request?.id == requestID, value.utf8.count <= 1024, !value.utf8.contains(0) else { return }
         secret = value
     }
     func submit(requestID: UUID) {
@@ -90,13 +92,14 @@ struct MobileSSHPasswordSheet: View {
                         .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
                 Section {
-                    SecureField("SSH password", text: Binding(get: { prompt.secret }, set: { prompt.editSecret($0) }))
+                    SecureField("SSH password", text: Binding(get: { prompt.secretValue(requestID: request.id) },
+                        set: { prompt.editSecret($0, requestID: request.id) }))
                         .textContentType(.password).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .focused($focused).submitLabel(.go)
                         .onSubmit { prompt.submit(requestID: request.id) }
                         .accessibilityIdentifier("ssh.password.field")
                 } footer: {
-                    Text("The host key matches the workspace saved on this phone. This password is used once and is not saved. Password changes and verification-code prompts are not supported.")
+                    Text("The host key matches the workspace saved on this phone. This password is used once and is not saved. This prompt does not change the account's password.")
                 }
             }
             .navigationTitle("SSH Password").navigationBarTitleDisplayMode(.inline)
@@ -118,6 +121,156 @@ struct MobileSSHPasswordSheet: View {
     }
 }
 
+/// One foreground editor for an exact keyboard-interactive round. Echo policy
+/// comes from the bounded server challenge; no response is saved or reused.
+@MainActor
+@Observable
+final class MobileSSHKeyboardInteractivePrompt: WorkspaceSSHKeyboardInteractivePrompting {
+    private(set) var request: WorkspaceSSHKeyboardInteractiveRequest?
+    private(set) var answers: [String] = []
+    @ObservationIgnored private var active = false
+    @ObservationIgnored private var scope: MobileSSHPasswordPrompt.Scope?
+    @ObservationIgnored private var continuation: CheckedContinuation<[Data], Error>?
+
+    func setActive(_ value: Bool) {
+        active = value
+        if !value { cancelCurrent() }
+    }
+    func setScope(_ value: MobileSSHPasswordPrompt.Scope?) {
+        if scope != value { cancelCurrent() }
+        scope = value
+    }
+    private func permits(_ request: WorkspaceSSHKeyboardInteractiveRequest) -> Bool {
+        guard active, let scope else { return false }
+        let authorization = request.authorization
+        return scope.workspaceID == authorization.workspaceID && scope.revision == authorization.workspaceRevision
+            && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
+    }
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+        try Task.checkCancellation()
+        guard permits(request) else { throw SSHAuthenticationError.stale }
+        guard self.request == nil, continuation == nil else { throw SSHAuthenticationError.busy }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled, permits(request) else {
+                    continuation.resume(throwing: CancellationError()); return
+                }
+                answers = Array(repeating: "", count: request.challenge.prompts.count)
+                self.request = request; self.continuation = continuation
+            }
+        } onCancel: { self.cancel(requestID: request.id) }
+    }
+    nonisolated func cancel(requestID: UUID) {
+        Task { @MainActor in self.cancelNow(requestID: requestID) }
+    }
+    func cancelNow(requestID: UUID) {
+        guard request?.id == requestID else { return }
+        cancelCurrent()
+    }
+    private func cancelCurrent() {
+        let pending = continuation
+        continuation = nil; answers = []; request = nil
+        pending?.resume(throwing: CancellationError())
+    }
+    func answer(at index: Int, requestID: UUID) -> String {
+        guard request?.id == requestID, answers.indices.contains(index) else { return "" }
+        return answers[index]
+    }
+    func editAnswer(_ value: String, index: Int, requestID: UUID) {
+        guard request?.id == requestID, answers.indices.contains(index), value.utf8.count <= SSHKeyboardInteractiveChallenge.maximumResponseBytes,
+              !value.utf8.contains(0) else { return }
+        answers[index] = value
+    }
+    var canSubmit: Bool {
+        guard let request, answers.count == request.challenge.prompts.count else { return false }
+        return answers.allSatisfy { $0.utf8.count <= SSHKeyboardInteractiveChallenge.maximumResponseBytes && !$0.utf8.contains(0) }
+    }
+    func submit(requestID: UUID) {
+        guard let request, request.id == requestID, permits(request), canSubmit, let continuation else { return }
+        let bytes = answers.map { Data($0.utf8) }
+        self.continuation = nil; answers = []; self.request = nil
+        continuation.resume(returning: bytes)
+    }
+}
+
+@MainActor
+struct MobileSSHKeyboardInteractiveSheet: View {
+    @Bindable var prompt: MobileSSHKeyboardInteractivePrompt
+    let request: WorkspaceSSHKeyboardInteractiveRequest
+    @FocusState private var focused: Int?
+
+    private func answer(_ index: Int) -> Binding<String> {
+        Binding(get: { prompt.answer(at: index, requestID: request.id) },
+                set: { prompt.editAnswer($0, index: index, requestID: request.id) })
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(request.authorization.transitForRouteID == nil ? "Verified machine" : "Verified jump host") {
+                    Text(verbatim: "\(request.authorization.user)@\(request.authorization.host):\(request.authorization.port)")
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                    Text(verbatim: request.authorization.presentedHostKey.fingerprint)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                Section("Server challenge · Round \(request.challenge.round)") {
+                    if !request.challenge.name.isEmpty { Text(verbatim: request.challenge.name) }
+                    if !request.challenge.instruction.isEmpty { Text(verbatim: request.challenge.instruction) }
+                    ForEach(request.challenge.prompts.indices, id: \.self) { index in
+                        let field = request.challenge.prompts[index]
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(verbatim: field.text.isEmpty ? "Response \(index + 1)" : field.text)
+                            Group {
+                                if field.echo {
+                                    TextField("Response", text: answer(index))
+                                } else {
+                                    SecureField("Response", text: answer(index))
+                                }
+                            }
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .focused($focused, equals: index).submitLabel(.continue)
+                            .onSubmit {
+                                if index + 1 < request.challenge.prompts.count { focused = index + 1 }
+                                else { prompt.submit(requestID: request.id) }
+                            }
+                            .accessibilityLabel(field.text.isEmpty ? "Response \(index + 1)" : field.text)
+                            .accessibilityIdentifier("ssh.interactive.response.\(index)")
+                        }
+                    }
+                } footer: {
+                    Text("The challenge text comes from this verified server. Responses are sent only for this sign-in and are not saved. Continue also acknowledges an informational round with no fields.")
+                }
+            }
+            .navigationTitle("SSH Verification").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { prompt.cancelNow(requestID: request.id) }
+                        .accessibilityIdentifier("ssh.interactive.cancel")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Continue") { prompt.submit(requestID: request.id) }
+                        .disabled(!prompt.canSubmit || prompt.request?.id != request.id)
+                        .accessibilityIdentifier("ssh.interactive.submit")
+                }
+            }
+        }
+        .interactiveDismissDisabled()
+        .task { focused = request.challenge.prompts.isEmpty ? nil : 0 }
+        .onDisappear { prompt.cancelNow(requestID: request.id) }
+    }
+}
+
+enum MobileSSHAuthenticationSheetRequest: Identifiable {
+    case password(WorkspaceSSHPasswordRequest)
+    case keyboardInteractive(WorkspaceSSHKeyboardInteractiveRequest)
+    var id: UUID {
+        switch self {
+        case let .password(request): request.id
+        case let .keyboardInteractive(request): request.id
+        }
+    }
+}
+
 /// App-wide live-connection services over the app's single WorkspaceStore: one
 /// input coordinator, one durable shell-creation journal and one connection
 /// manager (which owns the authentication broker's foreground state).
@@ -128,6 +281,12 @@ final class MobileConnections {
     /// Durable record of sessions whose input may have unknown remote effects.
     let journal: TerminalSessionJournal
     let passwordPrompt = MobileSSHPasswordPrompt()
+    let keyboardInteractivePrompt = MobileSSHKeyboardInteractivePrompt()
+    var authenticationPrompt: MobileSSHAuthenticationSheetRequest? {
+        if let request = passwordPrompt.request { return .password(request) }
+        if let request = keyboardInteractivePrompt.request { return .keyboardInteractive(request) }
+        return nil
+    }
     private let broker: SSHAuthenticationBroker
     private var passwordLifecycle: Task<Void, Never>?
     // Failed cleanup retains its existing bounded connection/model owner even
@@ -150,16 +309,23 @@ final class MobileConnections {
         // does: the same panes, through the Rust mux client.
         manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal,
                                                 coordinator: coordinator, liveness: liveness,
-                                                muxClientFactory: { try NativeMuxClient() }, passwordPrompter: passwordPrompt)
+                                                muxClientFactory: { try NativeMuxClient() }, passwordPrompter: passwordPrompt,
+                                                keyboardInteractivePrompter: keyboardInteractivePrompt)
     }
 
-    func setPasswordForeground(_ active: Bool) {
+    func setAuthenticationForeground(_ active: Bool) {
         passwordPrompt.setActive(active)
+        keyboardInteractivePrompt.setActive(active)
         let prior = passwordLifecycle, broker = broker
         passwordLifecycle = Task {
             await prior?.value
             await broker.setPasswordForeground(active)
         }
+    }
+
+    func setAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
+        passwordPrompt.setScope(scope)
+        keyboardInteractivePrompt.setScope(scope)
     }
 
     /// Admits connections and retries any cleanup that failed earlier. Sessions
@@ -184,7 +350,7 @@ final class MobileConnections {
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
     var authenticationChoices: [WorkspaceSSHAuthenticationChoice]? = nil
-    var passwordJump = false
+    var promptingJump = false
     var mux = false
     var sessionCreation: TerminalSessionCreation = .onSelect
     var jumpHost: String? = nil
@@ -197,7 +363,7 @@ struct TerminalSessionRoute: Hashable, Sendable {
     var choices: [WorkspaceSSHAuthenticationChoice] {
         authenticationChoices ?? credentialIDs.map(WorkspaceSSHAuthenticationChoice.publicKey)
     }
-    var requiresPassword: Bool { passwordJump || choices.contains(.password) }
+    var requiresAuthenticationPrompt: Bool { promptingJump || choices.contains(where: \.requiresForegroundPrompt) }
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -208,7 +374,7 @@ struct TerminalSessionTarget: Hashable, Sendable {
     let routes: [TerminalSessionRoute]
     /// The machine theme as the terminal's base palette, and its background.
     let basePalette: [UInt8]?, background: String?
-    var requiresPassword: Bool { routes.contains(where: \.requiresPassword) }
+    var requiresAuthenticationPrompt: Bool { routes.contains(where: \.requiresAuthenticationPrompt) }
 
     init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String,
          routes: [TerminalSessionRoute], theme: WorkspaceDocument.Theme? = nil) {
@@ -951,7 +1117,7 @@ final class TerminalSessionController {
         presentationVisible = visible
         // A pending password belongs to this visible destination. Returning to
         // the same tab later must not revive its old prompt or queued attempt.
-        if !visible, target.requiresPassword, phase == .connecting { requestStop() }
+        if !visible, target.requiresAuthenticationPrompt, phase == .connecting { requestStop() }
         if visible { unseenShellOutput = false }
         muxObservation?.setActive(visible)
         // Only the machine on screen sizes its mux pane to the phone; the
@@ -1434,7 +1600,7 @@ final class TerminalSessionController {
         case let failure as SSHAuthenticationError: failure != .busy
         case let failure as NativeSSHError: failure == .invalidInput || failure.isMachineAnswer
         case let failure as WorkspaceSSHConnectionError:
-            failure == .capacity || failure == .stale || failure == .passwordHopRetryRequired
+            failure == .capacity || failure == .stale || failure == .promptedHopRetryRequired
         default: true
         }
     }
@@ -1466,7 +1632,7 @@ final class TerminalSessionController {
                 let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
                     authentication: attempt.selection.authentication, confirmedByUser: true,
-                    attachMux: !shellOnly && (!candidate.requiresPassword || candidate.mux))
+                    attachMux: !shellOnly && (!candidate.requiresAuthenticationPrompt || candidate.mux))
                 // Retain the owner before any following operation can throw.
                 // performStart checks cancellation before opening the channel.
                 connection = connected
@@ -1485,7 +1651,7 @@ final class TerminalSessionController {
                 // Local cancellation wins before another candidate is selected.
                 try checkStarting()
                 Self.log.error("route \(candidate.id, privacy: .public) sign-in failed: \(String(describing: error), privacy: .public)")
-                if error as? WorkspaceSSHConnectionError == .passwordHopRetryRequired {
+                if error as? WorkspaceSSHConnectionError == .promptedHopRetryRequired {
                     let hasNext = try rememberPasswordHopRefusal(attempt, plan: &plan)
                     throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
                         message: hasNext
@@ -1504,7 +1670,7 @@ final class TerminalSessionController {
                         port: candidate.networkPort, onTailnet: onTailnet, device: device)
                         ?? .init(title: "Couldn't connect to \(target.machineName)", message: Self.describe(error), remedy: .none)
                     if plan.hasCredentialRefusal {
-                        if candidate.passwordJump { passwordHopRetryPlan = plan }
+                        if candidate.promptingJump { passwordHopRetryPlan = plan }
                         _ = try plan.failed(.unreachable, attempt: attempt)
                         throw ConnectFailure(help: help)
                     }
@@ -1548,7 +1714,7 @@ final class TerminalSessionController {
     @discardableResult
     func rememberPasswordHopRefusal(_ attempt: TerminalRouteAttemptPlan.Attempt,
                                     plan: inout TerminalRouteAttemptPlan) throws -> Bool {
-        guard target.routes.contains(where: { $0.id == attempt.selection.routeID && $0.passwordJump }),
+        guard target.routes.contains(where: { $0.id == attempt.selection.routeID && $0.promptingJump }),
               case .publicKey = attempt.selection.authentication else { throw TerminalRouteAttemptPlanError.staleAttempt }
         let next = try plan.failed(.credentialRefused, attempt: attempt)
         passwordHopRetryPlan = next == nil ? nil : plan
@@ -1559,7 +1725,7 @@ final class TerminalSessionController {
     /// the direct-route choice for the person's next explicit Retry.
     @discardableResult
     func rememberPasswordMuxFallback() -> Bool {
-        guard route.requiresPassword, target.routes.contains(where: { !$0.mux }) else { return false }
+        guard route.requiresAuthenticationPrompt, target.routes.contains(where: { !$0.mux }) else { return false }
         shellOnly = true; passwordMuxRetry = true
         return true
     }

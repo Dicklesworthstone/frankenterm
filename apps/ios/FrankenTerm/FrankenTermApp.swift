@@ -228,7 +228,7 @@ final class MobileWorkspaceModel {
                 }
                 connections = try MobileConnections(store: created,
                     journalDirectory: support.appendingPathComponent("FrankenTermSessions", isDirectory: true))
-                connections?.setPasswordForeground(active)
+                connections?.setAuthenticationForeground(active)
                 updateConnectionLifecycle()
             }
             try await refreshWorkspaces(using: created, epoch: epoch)
@@ -286,7 +286,7 @@ final class MobileWorkspaceModel {
     /// usual grace period and ends the standing Face ID approval; returning
     /// reconnects whatever dropped meanwhile (WorkspaceTerminalScene).
     func setScenePhase(_ phase: ScenePhase) {
-        connections?.setPasswordForeground(phase == .active)
+        connections?.setAuthenticationForeground(phase == .active)
         if phase == .background {
             AppleSSHCredentialSigner.endApproval()
             beginBackgroundRun()
@@ -372,7 +372,7 @@ final class MobileWorkspaceModel {
     }
     func setRestoreVisible(_ value: Bool) {
         if value { credentialImport?.cancel() }
-        if value { connections?.passwordPrompt.setScope(nil) }
+        if value { connections?.setAuthenticationScope(nil) }
         showRestore = value
         // A just-dismissed request may already be retired. Re-present only the
         // status returned by the serialized lifecycle transition.
@@ -1288,9 +1288,10 @@ final class MobileWorkspaceModel {
         guard active else { return }
         if let screen, let workspace = workspaces.first(where: { $0.id == screen.workspaceID }),
            let document = try? workspace.document(), let machine = document.machines.first(where: { $0.id == screen.machineID }) {
-            connections?.passwordPrompt.setScope(.init(workspaceID: screen.workspaceID, revision: workspace.revision,
+            connections?.setAuthenticationScope(.init(workspaceID: screen.workspaceID, revision: workspace.revision,
+                                                       machineID: screen.machineID,
                                                        destinationRouteIDs: Set(machine.routeIDs)))
-        } else { connections?.passwordPrompt.setScope(nil) }
+        } else { connections?.setAuthenticationScope(nil) }
         if let screen, let data = try? JSONEncoder().encode(screen) {
             UserDefaults.standard.set(data, forKey: Self.liveScreenKey)
         } else { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
@@ -1731,9 +1732,14 @@ struct MobileWorkspaceRoot: View {
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
             OfflineRestoreSheet(model: model)
         }
-        .sheet(item: Binding(get: { model.connections?.passwordPrompt.request }, set: { _ in })) { request in
-            if let prompt = model.connections?.passwordPrompt {
-                MobileSSHPasswordSheet(prompt: prompt, request: request).id(request.id)
+        .sheet(item: Binding(get: { model.connections?.authenticationPrompt }, set: { _ in })) { request in
+            if let connections = model.connections {
+                switch request {
+                case let .password(value):
+                    MobileSSHPasswordSheet(prompt: connections.passwordPrompt, request: value).id(value.id)
+                case let .keyboardInteractive(value):
+                    MobileSSHKeyboardInteractiveSheet(prompt: connections.keyboardInteractivePrompt, request: value).id(value.id)
+                }
             }
         }
         .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
@@ -3349,12 +3355,12 @@ private struct MachineWorkspaceView: View {
             let choices = WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: readiness.usableCredentialIDs)
             guard !choices.isEmpty else { continue }
             let hop = hops.first
-            let passwordJump = hops.contains { hop in
+            let promptingJump = hops.contains { hop in
                 let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
-                return WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(.password)
+                return WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
             }
             routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
-                                authenticationChoices: choices, passwordJump: passwordJump,
+                                authenticationChoices: choices, promptingJump: promptingJump,
                                 mux: route.mode == "frankenterm_mux",
                                 sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
                                     : (route.sessionCreation == "manual" ? .manual : .onSelect),
