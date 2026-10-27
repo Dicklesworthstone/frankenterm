@@ -161,7 +161,10 @@ final class SessionTests: XCTestCase, @unchecked Sendable {
             XCTAssertThrowsError(try NativeSSHIdentity(user: user, publicKey: Data([1])))
         }
         XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data()))
-        XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: 513)))
+        // The native blob capacity holds an 8192-bit RSA key; one byte more is refused.
+        let capacity = Int(FTSSH_PUBLIC_KEY_CAPACITY)
+        XCTAssertNoThrow(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: capacity)))
+        XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: capacity + 1)))
     }
 
     func testCredentialRefusalDoesNotConflateAuthenticationAndConnectionFailures() {
