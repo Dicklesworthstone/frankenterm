@@ -197,7 +197,7 @@ final class WorkspaceConnectionTests: XCTestCase {
         }
     }
 
-    func testUnsupportedModeMultipleJumpsAndMissingSessionOrAuthenticationPoliciesNeverDial() async throws {
+    func testUnsupportedModeOrHopAndMissingSessionOrAuthenticationPoliciesNeverDial() async throws {
         for variant in 0..<4 {
             let fixture = try await SSHWorkspaceTestFixture.make { workspace in
                 var routes = workspace["routes"] as! [[String: Any]]
@@ -207,11 +207,14 @@ final class WorkspaceConnectionTests: XCTestCase {
                     routes[0]["session_creation"] = nil
                     routes[0]["attach_policy"] = "existing_only"
                 case 1:
+                    // Two hops are supported; an outer hop this phone cannot
+                    // sign in to (password only) is not.
                     var jump = routes[0]
                     jump["id"] = "jump-route"; jump["session_creation"] = nil
                     routes[0]["jump_routes"] = ["jump-route"]
                     var outerJump = jump
                     outerJump["id"] = "outer-jump-route"
+                    outerJump["authentication_methods"] = ["password"]
                     jump["jump_routes"] = ["outer-jump-route"]
                     routes.append(jump)
                     routes.append(outerJump)
