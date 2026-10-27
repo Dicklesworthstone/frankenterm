@@ -8,7 +8,7 @@ enum OpenSSHSourcePrimitives {
     static func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int,
                            sha512: ft_bcrypt_sha512_fn) throws -> Data {
         guard (1...1024).contains(passphrase.count), (16...64).contains(salt.count),
-              (1...64).contains(rounds), outputByteCount == 32 || outputByteCount == 48 else {
+              (1...64).contains(rounds), [32, 40, 48].contains(outputByteCount) else {
             throw FTError.limit("key.source_kdf")
         }
         // The native call is bounded but cannot be interrupted inside a round.
@@ -34,9 +34,9 @@ enum OpenSSHSourcePrimitives {
         }
     }
 
-    static func validateAESCTR(ciphertext: Data, key: Data, iv: Data) throws {
+    static func validateAES(ciphertext: Data, key: Data, iv: Data) throws {
         guard !ciphertext.isEmpty, ciphertext.count <= FTLimit.key, ciphertext.count.isMultiple(of: 16),
-              key.count == 16 || key.count == 32, iv.count == 16 else {
+              [16, 24, 32].contains(key.count), iv.count == 16 else {
             throw FTError.limit("key.source_cipher")
         }
         try Task.checkCancellation()
@@ -57,13 +57,22 @@ extension AppleCryptography {
     }
 
     public func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
-        try OpenSSHSourcePrimitives.validateAESCTR(ciphertext: ciphertext, key: key, iv: iv)
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: false)
+    }
+
+    public func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: true)
+    }
+
+    private func decryptSourceAES(_ ciphertext: Data, key: Data, iv: Data, cbc: Bool) throws -> Data {
+        try OpenSSHSourcePrimitives.validateAES(ciphertext: ciphertext, key: key, iv: iv)
         var result = Data(count: ciphertext.count)
         let status = result.withUnsafeMutableBytes { output in
             ciphertext.withUnsafeBytes { input in
                 key.withUnsafeBytes { keyBytes in
                     iv.withUnsafeBytes { ivBytes in
-                        ft_openssh_aes_ctr(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
+                        let decrypt = cbc ? ft_openssh_aes_cbc : ft_openssh_aes_ctr
+                        return decrypt(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
                             keyBytes.bindMemory(to: UInt8.self).baseAddress, key.count,
                             ivBytes.bindMemory(to: UInt8.self).baseAddress, iv.count,
                             output.bindMemory(to: UInt8.self).baseAddress, ciphertext.count)

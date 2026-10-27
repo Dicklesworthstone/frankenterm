@@ -12,7 +12,7 @@ typedef void (*ft_bcrypt_sha512_fn)(uint8_t *output,
 
 /* Returns 0 on success, -1 on rejected input or allocation failure.
  * Inputs are bounded before work: passphrase 1...1024 bytes, salt 16...64,
- * rounds 1...64, and output exactly 32 or 48 bytes for an AES key plus IV.
+ * rounds 1...64, and output exactly 32, 40 or 48 bytes for an AES key plus IV.
  * This bounded synchronous call is not interruptible mid-round. */
 int ft_openssh_bcrypt_pbkdf(const uint8_t *pass, size_t passlen,
     const uint8_t *salt, size_t saltlen, uint8_t *key, size_t keylen,
@@ -23,6 +23,12 @@ int ft_openssh_bcrypt_pbkdf(const uint8_t *pass, size_t passlen,
  * for complete, exact-length output; no private output survives failure.
  * This primitive is used solely inside source-key container validation. */
 int ft_openssh_aes_ctr(const uint8_t *ciphertext, size_t ciphertext_length,
+    const uint8_t *key, size_t key_length, const uint8_t *iv, size_t iv_length,
+    uint8_t *output, size_t output_length);
+/* Apple CommonCrypto AES-CBC without PKCS#7 padding. The source container's
+ * OpenSSH padding and identity are checked separately by the bounded parser.
+ * AES-128/192/256 and exactly one 16-byte IV have the same ownership contract. */
+int ft_openssh_aes_cbc(const uint8_t *ciphertext, size_t ciphertext_length,
     const uint8_t *key, size_t key_length, const uint8_t *iv, size_t iv_length,
     uint8_t *output, size_t output_length);
 #endif

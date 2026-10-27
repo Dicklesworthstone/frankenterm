@@ -204,7 +204,7 @@ ft_openssh_bcrypt_pbkdf(const uint8_t *pass, size_t passlen,
 {
     if (pass == NULL || salt == NULL || key == NULL || sha512 == NULL ||
         passlen == 0 || passlen > 1024 || saltlen < 16 || saltlen > 64 ||
-        rounds == 0 || rounds > 64 || (keylen != 32 && keylen != 48))
+        rounds == 0 || rounds > 64 || (keylen != 32 && keylen != 40 && keylen != 48))
         return -1;
     return ft_bcrypt_pbkdf_impl((const char *)pass, passlen, salt, saltlen,
         key, keylen, rounds, sha512);

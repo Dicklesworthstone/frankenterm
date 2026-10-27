@@ -27,9 +27,24 @@ public struct OpenSSHSourceKey: Sendable, CustomStringConvertible, CustomDebugSt
     public var debugDescription: String { description }
 
     private enum Cipher: String, Sendable {
-        case none, aes128CTR = "aes128-ctr", aes256CTR = "aes256-ctr"
-        var keyBytes: Int { self == .aes128CTR ? 16 : 32 }
+        case none
+        case aes128CTR = "aes128-ctr", aes192CTR = "aes192-ctr", aes256CTR = "aes256-ctr"
+        case aes128CBC = "aes128-cbc", aes192CBC = "aes192-cbc", aes256CBC = "aes256-cbc"
+        var keyBytes: Int {
+            switch self {
+            case .none: return 0
+            case .aes128CTR, .aes128CBC: return 16
+            case .aes192CTR, .aes192CBC: return 24
+            case .aes256CTR, .aes256CBC: return 32
+            }
+        }
         var blockBytes: Int { self == .none ? 8 : 16 }
+        var isCBC: Bool {
+            switch self {
+            case .aes128CBC, .aes192CBC, .aes256CBC: return true
+            default: return false
+            }
+        }
     }
     private let cipher: Cipher
     private let container: Data
@@ -118,7 +133,11 @@ public struct OpenSSHSourceKey: Sendable, CustomStringConvertible, CustomDebugSt
         defer { material.resetBytes(in: 0..<material.count) }
         guard material.count == cipher.keyBytes + 16 else { throw FTError.malformed("source_key.kdf_output") }
         try Task.checkCancellation()
-        var clear = try crypto.decryptAESCTR(privatePart, key: Data(material.prefix(cipher.keyBytes)), iv: Data(material.suffix(16)))
+        var key = Data(material.prefix(cipher.keyBytes)), iv = Data(material.suffix(16))
+        defer { key.resetBytes(in: 0..<key.count); iv.resetBytes(in: 0..<iv.count) }
+        var clear = try cipher.isCBC
+            ? crypto.decryptAESCBC(privatePart, key: key, iv: iv)
+            : crypto.decryptAESCTR(privatePart, key: key, iv: iv)
         defer { clear.resetBytes(in: 0..<clear.count) }
         try Task.checkCancellation()
         do {

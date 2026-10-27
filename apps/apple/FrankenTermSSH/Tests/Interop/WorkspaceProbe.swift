@@ -33,6 +33,7 @@ private struct ProbeCryptography: AirGapCryptography {
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data { throw WorkspaceProbeError.unsupported }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw WorkspaceProbeError.unsupported }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw WorkspaceProbeError.unsupported }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw WorkspaceProbeError.unsupported }
 }
 
 private final class ProbePersistence: WorkspacePersistence, @unchecked Sendable {

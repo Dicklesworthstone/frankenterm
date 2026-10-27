@@ -29,6 +29,7 @@ struct SSHWorkspaceTestCryptography: AirGapCryptography {
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data { throw SSHAuthenticationError.unavailable }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw SSHAuthenticationError.unavailable }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SSHAuthenticationError.unavailable }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SSHAuthenticationError.unavailable }
 }
 
 final class SSHWorkspaceTestPersistence: WorkspacePersistence, @unchecked Sendable {

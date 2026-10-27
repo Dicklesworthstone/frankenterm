@@ -128,13 +128,20 @@ struct TestCryptography: AirGapCryptography {
         })
     }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
-        try OpenSSHSourcePrimitives.validateAESCTR(ciphertext: ciphertext, key: key, iv: iv)
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: false)
+    }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: true)
+    }
+    private func decryptSourceAES(_ ciphertext: Data, key: Data, iv: Data, cbc: Bool) throws -> Data {
+        try OpenSSHSourcePrimitives.validateAES(ciphertext: ciphertext, key: key, iv: iv)
         var result = Data(count: ciphertext.count)
         let status = result.withUnsafeMutableBytes { output in
             ciphertext.withUnsafeBytes { input in
                 key.withUnsafeBytes { keyBytes in
                     iv.withUnsafeBytes { ivBytes in
-                        ft_test_aes_ctr(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
+                        let decrypt = cbc ? ft_test_aes_cbc : ft_test_aes_ctr
+                        return decrypt(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
                             keyBytes.bindMemory(to: UInt8.self).baseAddress, key.count,
                             ivBytes.bindMemory(to: UInt8.self).baseAddress, iv.count,
                             output.bindMemory(to: UInt8.self).baseAddress, ciphertext.count)
