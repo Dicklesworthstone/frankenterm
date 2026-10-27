@@ -440,6 +440,11 @@ swift build --only-use-versions-from-resolved-file --product WorkspaceSSHProbe -
 python Tests/Interop/test_workspace.py /tmp/libfrankenterm-ssh-tests.so .build/debug/FrankenTermSSHPackageTests.xctest .build/debug/WorkspaceSSHProbe
 ```
 
+On macOS, `swift build --build-tests` makes one bundle per test target, so the
+harness takes `.build/debug/FrankenTermSSHTests.xctest` (run through
+`xcrun xctest`) and a native library built as a `.dylib`. All 28 tests passed
+that way on 2026-10-27, including the two- and three-hop chains.
+
 The retained legacy `TerminalPumpProbe` independently covers all four signing
 families, a 96,030-byte hidden-pane stream, a 70,024-byte bracketed Unicode paste,
 source-owned replies, idle cancellation, failed outcome delivery and rejection
