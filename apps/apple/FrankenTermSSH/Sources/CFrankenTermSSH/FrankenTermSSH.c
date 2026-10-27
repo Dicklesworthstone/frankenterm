@@ -46,6 +46,9 @@ struct ftssh_session {
     char user[257], algorithm[65];
     uint8_t public_blob[512], challenge[1024], signature[256];
     size_t public_length, challenge_length, signature_length;
+    uint8_t password[FTSSH_PASSWORD_CAPACITY];
+    size_t password_length;
+    int password_authentication, password_supplied;
     int signature_consumed, resize_pending;
     int auth_methods_checked, sign_callback_entered, sign_error, socket_failed;
     /* The server sent a disconnect message: it answered, unlike a transport
@@ -205,7 +208,15 @@ static void socket_disconnected(LIBSSH2_SESSION *ssh, int reason, const char *me
     ftssh_session *s = *abstract;
     s->socket_failed = 1; s->peer_disconnected = 1;
 }
+static void clear_password(ftssh_session *s) {
+    /* A retained handle must not retain the completed prompt's secret. The
+     * volatile writes also survive optimization of a subsequent destroy. */
+    volatile uint8_t *bytes = s->password;
+    for(size_t i = 0; i < sizeof(s->password); i++) bytes[i] = 0;
+    s->password_length = 0;
+}
 static int fail(ftssh_session *s, int code) {
+    clear_password(s);
     s->phase = FAILED; s->terminal_error = code; return code;
 }
 static int check(ftssh_session *s, int expected) {
@@ -365,6 +376,21 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
     memcpy(s->public_blob, blob, length); s->public_length = length;
     s->phase = AUTH; return FTSSH_OK;
 }
+int ftssh_begin_password_authentication(ftssh_session *s, const char *user, size_t user_length) {
+    int rc = check(s, APPROVED); if(rc) return rc;
+    if(!user || !user_length || user_length > 256) return FTSSH_INVALID;
+    for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
+    memcpy(s->user, user, user_length); s->user[user_length] = 0;
+    s->password_authentication = 1; s->phase = AUTH;
+    return FTSSH_OK;
+}
+int ftssh_supply_password(ftssh_session *s, const uint8_t *password, size_t length) {
+    int rc = check(s, AUTH); if(rc) return rc;
+    if(!s->password_authentication || !s->auth_methods_checked || s->password_supplied) return FTSSH_STATE;
+    if(!password || !length || length > FTSSH_PASSWORD_CAPACITY) return FTSSH_INVALID;
+    memcpy(s->password, password, length); s->password_length = length; s->password_supplied = 1;
+    return FTSSH_OK;
+}
 static int reject_challenge(ftssh_session *s) {
     s->sign_error = FTSSH_CHALLENGE;
     return LIBSSH2_ERROR_INVAL;
@@ -400,8 +426,8 @@ static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t
 }
 
 /* The public library API returns a terminated name-list. Bound the complete
- * list and validate every token before accepting an exact publickey token. */
-static int publickey_method(const char *methods) {
+ * list and validate every token before accepting the exact selected method. */
+static int authentication_method(const char *methods, const char *wanted) {
     if(!methods) return FTSSH_AUTH_FAILED;
     size_t length = strnlen(methods, 1025), start = 0;
     if(length > 1024) return FTSSH_LIMIT;
@@ -410,7 +436,8 @@ static int publickey_method(const char *methods) {
     for(size_t i = 0; i <= length; i++) {
         if(i == length || methods[i] == ',') {
             if(i == start) return FTSSH_AUTH_FAILED;
-            if(i - start == 9 && memcmp(methods + start, "publickey", 9) == 0) found = 1;
+            size_t wanted_length = strlen(wanted);
+            if(i - start == wanted_length && memcmp(methods + start, wanted, wanted_length) == 0) found = 1;
             start = i + 1;
         } else if((unsigned char)methods[i] < 33 || (unsigned char)methods[i] > 126) {
             return FTSSH_AUTH_FAILED;
@@ -447,6 +474,23 @@ static int authentication_result(ftssh_session *s, int rc, int authenticated, in
     default: return fail(s, FTSSH_AUTH_FAILED);
     }
 }
+static int password_authentication_result(ftssh_session *s, int rc, int authenticated, int offered) {
+    if(s->socket_failed) return fail(s, FTSSH_IO);
+    if(authenticated && (!offered || !s->password_supplied)) return fail(s, FTSSH_UNSUPPORTED);
+    if(rc == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
+    if(!rc && authenticated) {
+        clear_password(s); s->phase = AUTHENTICATED; return FTSSH_OK;
+    }
+    switch(rc) {
+    case LIBSSH2_ERROR_ALLOC: return fail(s, FTSSH_LIMIT);
+    case LIBSSH2_ERROR_SOCKET_NONE: case LIBSSH2_ERROR_SOCKET_SEND:
+    case LIBSSH2_ERROR_SOCKET_DISCONNECT: case LIBSSH2_ERROR_SOCKET_RECV:
+    case LIBSSH2_ERROR_BAD_SOCKET: return fail(s, FTSSH_IO);
+    case LIBSSH2_ERROR_METHOD_NONE: case LIBSSH2_ERROR_METHOD_NOT_SUPPORTED:
+    case LIBSSH2_ERROR_ALGO_UNSUPPORTED: return fail(s, FTSSH_UNSUPPORTED);
+    default: return fail(s, FTSSH_PASSWORD_FAILED);
+    }
+}
 int ftssh_authentication_step(ftssh_session *s) {
     int rc = check(s, AUTH); if(rc) return rc;
     rc = prepare_egress(s); if(rc) return rc;
@@ -455,11 +499,22 @@ int ftssh_authentication_step(ftssh_session *s) {
         const char *methods = libssh2_userauth_list(s->ssh, s->user, (unsigned int)strlen(s->user));
         s->limited_receive = 0;
         int authenticated = libssh2_userauth_authenticated(s->ssh);
-        if(!methods || authenticated || s->socket_failed)
-            return authentication_result(s, libssh2_session_last_errno(s->ssh), authenticated, 0);
-        rc = publickey_method(methods);
+        if(!methods || authenticated || s->socket_failed) {
+            int error = libssh2_session_last_errno(s->ssh);
+            return s->password_authentication ? password_authentication_result(s, error, authenticated, 0)
+                                               : authentication_result(s, error, authenticated, 0);
+        }
+        rc = authentication_method(methods, s->password_authentication ? "password" : "publickey");
         if(rc) return fail(s, rc);
         s->auth_methods_checked = 1;
+    }
+    if(s->password_authentication) {
+        if(!s->password_supplied) return FTSSH_PASSWORD_NEEDED;
+        s->receive_budget = 32768; s->limited_receive = 1;
+        rc = libssh2_userauth_password_ex(s->ssh, s->user, (unsigned int)strlen(s->user),
+                                         (const char *)s->password, (unsigned int)s->password_length, NULL);
+        s->limited_receive = 0;
+        return password_authentication_result(s, rc, libssh2_userauth_authenticated(s->ssh), 1);
     }
     if(s->challenge_length && !s->signature_length) return FTSSH_SIGNATURE_NEEDED;
     void *context = s;
@@ -784,6 +839,7 @@ int ftssh_close(ftssh_session *s) {
     /* Force callback failure even if libssh2 was mid-EAGAIN. No teardown packet
      * can wait for peer cooperation and no stale fd can be used after close. */
     s->closing = 1;
+    clear_password(s);
     s->egress_head = 0; s->egress_count = 0; s->egress_flight = 0; s->write_receipt = 0;
     if(s->parent) {
         int rc = ftssh_close(s->parent);

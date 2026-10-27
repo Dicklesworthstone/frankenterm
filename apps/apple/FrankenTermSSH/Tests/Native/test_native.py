@@ -44,8 +44,11 @@ for name, result, args in [
     ("ssh_message_get", P, [P]), ("ssh_message_type", I, [P]), ("ssh_message_subtype", I, [P]),
     ("ssh_message_free", None, [P]), ("ssh_message_reply_default", I, [P]),
     ("ssh_message_service_reply_success", I, [P]), ("ssh_message_auth_user", C.c_char_p, [P]),
+    ("ssh_message_auth_password", C.c_char_p, [P]),
     ("ssh_message_auth_pubkey", P, [P]), ("ssh_message_auth_publickey_state", I, [P]),
     ("ssh_message_auth_reply_pk_ok_simple", I, [P]), ("ssh_message_auth_reply_success", I, [P, I]),
+    ("ssh_message_auth_reply_pk_ok", I, [P, P, P]),
+    ("ssh_string_from_char", P, [C.c_char_p]), ("ssh_string_free", None, [P]),
     ("ssh_message_channel_request_open_reply_accept", P, [P]),
     ("ssh_message_channel_request_open_destination", C.c_char_p, [P]),
     ("ssh_message_channel_request_open_destination_port", I, [P]),
@@ -75,6 +78,7 @@ for name, result, args in [
     ("ftssh_copy_host_key", I, [P, P, Z, C.POINTER(Z)]), ("ftssh_copy_method", I, [P, I, P, Z]),
     ("ftssh_approve_host_key", I, [P, P, Z]),
     ("ftssh_begin_authentication", I, [P, P, Z, P, Z]), ("ftssh_authentication_step", I, [P]),
+    ("ftssh_begin_password_authentication", I, [P, P, Z]), ("ftssh_supply_password", I, [P, P, Z]),
     ("ftssh_copy_challenge", I, [P, P, Z, C.POINTER(Z)]), ("ftssh_supply_signature", I, [P, P, Z]),
     ("ftssh_begin_forward", I, [P, P, Z, C.c_uint16]), ("ftssh_forward_step", I, [P]),
     ("ftssh_forward_adopt", I, [C.POINTER(P), Z, C.POINTER(P)]),
@@ -123,12 +127,15 @@ def signature(key, data):
 class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
-                 forward_to=None, forward_host="target.internal.invalid"):
+                 forward_to=None, forward_host="target.internal.invalid", password=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
             raise ValueError("test host signature must be an exact supported fixture value")
+        if password is not None and (not isinstance(password, bytes) or not 1 <= len(password) <= 1024):
+            raise ValueError("test password must be bounded synthetic bytes")
         self.public = public_blob(key)
+        self.password = password
         self.host_key = host_key or ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.host_signature = host_signature
@@ -204,7 +211,9 @@ class LoopbackServer:
                 raise RuntimeError("test accept failed")
             if SERVER.ssh_handle_key_exchange(session) != 0:
                 return  # client rejection/cancellation is an exercised path
-            SERVER.ssh_set_auth_methods(session, 2 if self.auth_mode == "publickeyDisabled" else 4)
+            password_method = self.auth_mode == "publickeyDisabled" or (
+                self.password is not None and self.auth_mode != "passwordDisabled")
+            SERVER.ssh_set_auth_methods(session, 2 if password_method else 4)
             while not self.stop.is_set():
                 message = SERVER.ssh_message_get(session)
                 if not message:
@@ -219,6 +228,34 @@ class LoopbackServer:
                             SERVER.ssh_message_auth_reply_success(message, 0)
                         else:
                             SERVER.ssh_message_reply_default(message)
+                    elif kind == 1 and subtype == 2:
+                        user = SERVER.ssh_message_auth_user(message)
+                        offered = SERVER.ssh_message_auth_password(message) or b""
+                        matched = self.password is not None and offered == self.password
+                        # Even synthetic credentials never enter event diagnostics.
+                        self.events.append(("password-authentication", user, len(offered), matched))
+                        if self.reject or not matched or user != b"operator":
+                            SERVER.ssh_message_reply_default(message)
+                        elif self.auth_mode == "passwordPartial":
+                            SERVER.ssh_set_auth_methods(session, 4)
+                            SERVER.ssh_message_auth_reply_success(message, 1)
+                        elif self.auth_mode == "passwordChange":
+                            # RFC 4252 assigns packet 60 to both PK_OK and
+                            # PASSWD_CHANGEREQ. Both contain exactly two SSH
+                            # strings. libssh's explicit public packet writer
+                            # emits bSS without reading public-key state, so
+                            # these strings produce a real encrypted password
+                            # change request, not a mocked client result.
+                            prompt = SERVER.ssh_string_from_char(b"Password expired")
+                            language = SERVER.ssh_string_from_char(b"en")
+                            try:
+                                if not prompt or not language or SERVER.ssh_message_auth_reply_pk_ok(message, prompt, language):
+                                    raise RuntimeError("test password-change response failed")
+                            finally:
+                                SERVER.ssh_string_free(prompt)
+                                SERVER.ssh_string_free(language)
+                        else:
+                            SERVER.ssh_message_auth_reply_success(message, 0)
                     elif kind == 1 and subtype == 4:
                         pubkey = SERVER.ssh_message_auth_pubkey(message)
                         encoded = P()
@@ -450,9 +487,9 @@ class NativeSSHTests(unittest.TestCase):
         for server in self.servers:
             server.close()
 
-    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal"):
+    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal", password=None):
         key = key or ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode)
+        server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode, password=password)
         self.servers.append(server)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -509,6 +546,151 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
         return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
+
+    def request_password(self, handle, server, terminal=(5,)):
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), 0)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, b"premature", 9), -1001)
+        return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
+
+    def password_events(self, server):
+        return [event for event in server.events if event[0] == "password-authentication"]
+
+    def test_password_cannot_probe_or_submit_before_host_key_approval(self):
+        handle, server, _ = self.start(password=b"test-password")
+        self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), -1001)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, b"test-password", 13), -1001)
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), -1001)
+        wrong = bytearray(server.host_blob)
+        wrong[-1] ^= 1
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, bytes(wrong), len(wrong)), -1005)
+        self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), -1005)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, b"test-password", 13), -1005)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([event for event in server.events if event[0] != "connection"], [])
+
+    def test_password_prompt_waits_for_supported_method_and_copies_unicode_once(self):
+        password = "pāssphrase 界 🦀".encode("utf-8")
+        handle, server, _ = self.start(password=password)
+        self.assertEqual(self.request_password(handle, server), 5)
+        self.assertEqual([event for event in server.events if event[0] == "authentication-methods"],
+                         [("authentication-methods", b"operator")])
+        for _ in range(5):
+            self.assertEqual(DRIVER.ftssh_authentication_step(handle), 5)
+        self.assertEqual(self.password_events(server), [])
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1001)
+        challenge, length = C.create_string_buffer(1024), Z()
+        self.assertEqual(DRIVER.ftssh_copy_challenge(handle, challenge, len(challenge), C.byref(length)), -1001)
+        self.assertEqual(DRIVER.ftssh_supply_signature(handle, b"not-a-signature", 15), -1001)
+        for value, count in [(None, 1), (b"", 0), (b"x" * 1025, 1025)]:
+            self.assertEqual(DRIVER.ftssh_supply_password(handle, value, count), -1000)
+        supplied = C.create_string_buffer(password)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, supplied, len(password)), 0)
+        C.memset(supplied, ord("x"), len(supplied))
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, b"second-attempt", 14), -1001)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step), 0)
+        self.assertEqual(self.password_events(server), [("password-authentication", b"operator", len(password), True)])
+        self.assertEqual([event for event in server.events if event[0] == "authentication"], [])
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertIn(("pty", b"xterm-256color", 80, 24), server.events)
+        self.assertIn(("shell",), server.events)
+
+    def test_password_accepts_capacity_boundary_and_rejects_invalid_user_before_probe(self):
+        password = b"p" * 1024
+        handle, server, _ = self.start(password=password)
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        for user, length in [(None, 1), (b"", 0), (b"u" * 257, 257), (b"bad\x00user", 8), (b"bad\nuser", 8)]:
+            self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, user, length), -1000)
+        self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (5,)), 5)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, password, len(password)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step), 0)
+        self.assertEqual(self.password_events(server), [("password-authentication", b"operator", 1024, True)])
+
+    def test_password_unsupported_and_none_success_never_request_a_secret(self):
+        for mode in ["passwordDisabled", "noneSucceeds"]:
+            with self.subTest(mode=mode):
+                handle, server, _ = self.start(password=b"test-password", auth_mode=mode)
+                self.assertEqual(self.request_password(handle, server, (-1010,)), -1010)
+                self.assertEqual(DRIVER.ftssh_supply_password(handle, b"test-password", 13), -1010)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+                self.assertEqual(self.password_events(server), [])
+                self.assertEqual([event for event in server.events if event[0] in ("channel", "pty", "shell")], [])
+
+    def test_password_wrong_partial_and_change_are_terminal_without_key_retry_evidence(self):
+        for mode, supplied in [("normal", b"incorrect"), ("passwordPartial", b"test-password"),
+                               ("passwordChange", b"test-password")]:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(password=b"test-password", auth_mode=mode)
+                self.assertEqual(self.request_password(handle, server), 5)
+                self.assertEqual(DRIVER.ftssh_supply_password(handle, supplied, len(supplied)), 0)
+                self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (-1012,)), -1012)
+                self.assertEqual(DRIVER.ftssh_authentication_step(handle), -1012)
+                self.assertEqual(DRIVER.ftssh_supply_password(handle, b"test-password", 13), -1012)
+                blob = public_blob(key)
+                self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), -1012)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1012)
+                self.assertEqual(self.password_events(server),
+                                 [("password-authentication", b"operator", len(supplied), mode != "normal")])
+                self.assertEqual([event for event in server.events if event[0] in ("authentication", "channel", "pty", "shell")], [])
+
+    def test_password_prompt_cancellation_closes_without_secret_or_live_allocation(self):
+        handle, server, _ = self.start(password=b"test-password")
+        self.assertEqual(self.request_password(handle, server), 5)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertEqual(DRIVER.ftssh_descriptor(handle), -1)
+        self.assertEqual(DRIVER.ftssh_supply_password(handle, b"test-password", 13), -1009)
+        self.assertEqual(DRIVER.ftssh_authentication_step(handle), -1009)
+        stats = Stats()
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
+        self.assertEqual((stats.allocated, stats.pending), (0, 0))
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual(self.password_events(server), [])
+
+    def test_password_and_key_can_authenticate_separate_forwarding_peers(self):
+        for password_hop in [True, False]:
+            with self.subTest(password_hop=password_hop):
+                keys = [ed25519.Ed25519PrivateKey.generate(), ed25519.Ed25519PrivateKey.generate()]
+                destination = LoopbackServer(keys[1], password=None if password_hop else b"destination-password")
+                hop = LoopbackServer(keys[0], password=b"hop-password" if password_hop else None,
+                                     forward_to=destination.address)
+                self.servers.extend([hop, destination])
+                sock = socket.create_connection(hop.address, timeout=3)
+                sock.settimeout(None)
+                handle = P()
+                self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
+                sock.detach(); self.handles.append(handle)
+                for index, peer in enumerate([hop, destination]):
+                    if peer.password is not None:
+                        self.assertEqual(self.request_password(handle, peer), 5)
+                        self.assertEqual(DRIVER.ftssh_supply_password(handle, peer.password, len(peer.password)), 0)
+                        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step), 0)
+                        self.assertEqual(self.password_events(peer),
+                                         [("password-authentication", b"operator", len(peer.password), True)])
+                        self.assertEqual([event for event in peer.events if event[0] == "authentication"], [])
+                    else:
+                        self.assertEqual(self.authenticate(handle, peer, keys[index]), 0)
+                        self.assertEqual(self.password_events(peer), [])
+                    if index == 0:
+                        handle = self.forwarded(handle, destination)
+                self.assertNotEqual(hop.host_blob, destination.host_blob)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                self.assertEqual([event for event in hop.events if event[0] in ("channel", "pty", "shell")], [])
+                self.assertIn(("shell",), destination.events)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                stats = Stats()
+                self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
+                self.assertEqual(stats.allocated, 0)
+                self.assertTrue(hop.done.wait(2))
+                self.assertTrue(destination.done.wait(2))
 
     def test_one_hop_owns_independent_exchange_and_transit_never_opens_a_shell(self):
         self.exercise_forwarding_chain(1)

@@ -16,16 +16,16 @@ extern "C" {
 typedef struct ftssh_session ftssh_session;
 enum {
     FTSSH_OK = 0, FTSSH_AGAIN = 1, FTSSH_SIGNATURE_NEEDED = 2, FTSSH_EOF = 3,
-    FTSSH_YIELD = 4,
+    FTSSH_YIELD = 4, FTSSH_PASSWORD_NEEDED = 5,
     FTSSH_INVALID = -1000, FTSSH_STATE = -1001, FTSSH_LIMIT = -1002,
     FTSSH_IO = -1003, FTSSH_NEGOTIATION = -1004, FTSSH_HOST_REJECTED = -1005,
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
     FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010,
-    FTSSH_AUTH_FAILED = -1011
+    FTSSH_AUTH_FAILED = -1011, FTSSH_PASSWORD_FAILED = -1012
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
        FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024,
-       FTSSH_MAX_JUMP_HOPS = 3 };
+       FTSSH_MAX_JUMP_HOPS = 3, FTSSH_PASSWORD_CAPACITY = 1024 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -62,10 +62,22 @@ int ftssh_copy_method(ftssh_session *session, int method, char *output, size_t c
  */
 int ftssh_approve_host_key(ftssh_session *session, const uint8_t *key, size_t length);
 
-/* One chosen public identity per connection; no password, agent enumeration,
- * automatic fallback, or private-key material enters this adapter. */
+/* One chosen public identity per connection; no agent enumeration, automatic
+ * fallback or private-key material enters this adapter. */
 int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t user_length,
                              const uint8_t *public_blob, size_t blob_length);
+/* Select password authentication only after the same exact host approval.
+ * No secret is requested or transmitted until authentication_step has checked
+ * the server's complete bounded method list and returned PASSWORD_NEEDED.
+ * This is the SSH password method, not keyboard-interactive or password change.
+ * Success without the selected method and partial authentication are refused.
+ */
+int ftssh_begin_password_authentication(ftssh_session *session, const char *user, size_t user_length);
+/* One complete secret, copied into owned bounded storage, after PASSWORD_NEEDED.
+ * Length is 1..FTSSH_PASSWORD_CAPACITY bytes. Resubmission is refused. The copy
+ * survives EAGAIN, is cleared on a terminal result/close, and is never returned.
+ */
+int ftssh_supply_password(ftssh_session *session, const uint8_t *password, size_t length);
 /* Discovers supported methods after host approval, then offers only this key.
  * FTSSH_AUTH_REJECTED means the server explicitly refused the unsigned public
  * key offer before entering the signing callback. Only that result permits an
@@ -74,7 +86,8 @@ int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t 
  * from partial authentication or some protocol failures. It NEVER permits key
  * fallback. No publickey method, or success without the selected key's signature,
  * is FTSSH_UNSUPPORTED. Every authentication failure terminates this handle;
- * no shell is opened.
+ * no shell is opened. For a selected password, PASSWORD_NEEDED requests one
+ * foreground response and PASSWORD_FAILED is terminal, never key-retry proof.
  */
 int ftssh_authentication_step(ftssh_session *session);
 /* Challenge is the exact bounded RFC 4252 preimage produced by libssh2. Its
